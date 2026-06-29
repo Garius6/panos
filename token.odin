@@ -13,6 +13,8 @@ TokenKind :: enum {
 	LParen,
 	RParen,
 	Ident,
+	Function,
+	End,
 	Return,
 	Let,
 	Semicolon,
@@ -25,7 +27,7 @@ Token :: struct {
 }
 
 token_to_string :: proc(t: Token) -> string {
-	return fmt.aprintf("Token(%v, %q)", t.kind, t.data)
+	return fmt.aprintf("Token(%v, %s)", t.kind, t.data)
 }
 
 TokenStream :: struct {
@@ -55,12 +57,4 @@ peek_token :: proc(s: ^TokenStream) -> ^Token {
 		return nil
 	}
 	return &s.tokens[s.current_idx]
-}
-
-can_insert_semicolon :: proc(kind: TokenKind) -> bool {
-	#partial switch kind {
-	case .Ident, .Number, .RParen, .Return:
-		return true
-	}
-	return false
 }

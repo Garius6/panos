@@ -92,14 +92,14 @@ run_file :: proc(filename: string) {
 
 	fmt.println("COMPILATION")
 	fmt.printf("--------------------------\n")
-	compiler, _ := new_compiler(&resolver_ctx, "__start")
+	compiler := new_compiler(&resolver_ctx, "__start")
 	compile(&compiler, &program)
 	print_assebler(&compiler)
 	fmt.printf("--------------------------\n\n")
 
 	fmt.println("EXECUTION")
 	fmt.printf("--------------------------\n")
-	vm := new_vm(compiler.function)
+	vm := new_vm(&compiler)
 	execute(vm)
 	print_vm(vm)
 	fmt.printf("--------------------------\n\n")

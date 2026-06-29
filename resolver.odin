@@ -8,37 +8,83 @@ Symbol :: struct {
 	name: string,
 }
 
+Scope :: struct {
+	parent:  ^Scope,
+	symbols: map[string]^Symbol,
+}
+
 Resolver_Ctx :: struct {
-	scopes:       [dynamic]map[string]^Symbol,
+	current_scope: ^Scope,
+	global_scope:  ^Scope,
 
 	// Side Tables
-	decl_symbols: map[Stmt]^Symbol, // Связывает Let_Stmt с созданным символом
-	node_symbols: map[Expr]^Symbol, // Связывает Ident_Expr с символом, на который он указывает
+	decl_symbols:  map[Decls]^Symbol,
+	stmt_symbols:  map[Stmt]^Symbol,
+	node_symbols:  map[Expr]^Symbol,
+}
+
+push_scope :: proc(resolver: ^Resolver_Ctx) {
+	new_scope := new(Scope)
+	new_scope.parent = resolver.current_scope
+	new_scope.symbols = make(map[string]^Symbol)
+	resolver.current_scope = new_scope
+}
+
+pop_scope :: proc(resolver: ^Resolver_Ctx) {
+	if resolver.current_scope.parent != nil {
+		resolver.current_scope = resolver.current_scope.parent
+	}
 }
 
 new_resolver_ctx :: proc() -> Resolver_Ctx {
 	ctx := Resolver_Ctx {
-		scopes       = make([dynamic]map[string]^Symbol),
-		decl_symbols = make(map[Stmt]^Symbol),
+		stmt_symbols = make(map[Stmt]^Symbol),
+		decl_symbols = make(map[Decls]^Symbol),
 		node_symbols = make(map[Expr]^Symbol),
 	}
-	// Открываем глобальную область видимости
-	append(&ctx.scopes, make(map[string]^Symbol))
+
+	push_scope(&ctx)
+	ctx.global_scope = ctx.current_scope
+
 	return ctx
 }
 
-lookup_symbol :: proc(ctx: ^Resolver_Ctx, name: string) -> ^Symbol {
-	#reverse for scope in ctx.scopes {
-		if sym, ok := scope[name]; ok {
-			return sym
-		}
+lookup_symbol :: proc(s: ^Scope, name: string) -> ^Symbol {
+	sym, found := s.symbols[name]
+	if found {
+		return sym
 	}
+
+	if s.parent != nil {
+		return lookup_symbol(s.parent, name)
+	}
+
 	return nil
 }
 
 resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program) {
-	for stmt in prog.statements {
-		resolve_stmt(ctx, stmt)
+	for decl in prog.decls {
+		resolve_decl(ctx, decl)
+	}
+}
+
+resolve_decl :: proc(ctx: ^Resolver_Ctx, decl: Decls) {
+	switch d in decl {
+	case ^Function_Decl:
+		sym := new(Symbol)
+		sym.name = d.name
+
+		if lookup_symbol(ctx.current_scope, sym.name) != nil {
+			fmt.panicf("Символ %s уже объявлен", sym.name)
+		}
+
+		ctx.decl_symbols[decl] = sym
+
+		push_scope(ctx)
+		for stmt in d.body {
+			resolve_stmt(ctx, stmt)
+		}
+		pop_scope(ctx)
 	}
 }
 
@@ -55,14 +101,13 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 		sym.name = s.name
 
 		// 3. Добавляем в текущую область видимости
-		current_scope := &ctx.scopes[len(ctx.scopes) - 1]
-		if _, exists := current_scope^[s.name]; exists {
-			fmt.panicf("Semantic Error: variable '%s' is already declared", s.name)
+		if lookup_symbol(ctx.current_scope, s.name) != nil {
+			fmt.panicf("Имя %s уже объявлено", s.name)
 		}
-		current_scope^[s.name] = sym
+		ctx.current_scope.symbols[s.name] = sym
 
 		// 4. Кэшируем создание в Side Table
-		ctx.decl_symbols[stmt] = sym
+		ctx.stmt_symbols[stmt] = sym
 
 	case ^Return_Stmt:
 		resolve_expr(ctx, s.value)
@@ -77,7 +122,7 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 
 	switch e in expr {
 	case ^Ident_Expr:
-		sym := lookup_symbol(ctx, e.name)
+		sym := lookup_symbol(ctx.current_scope, e.name)
 		if sym == nil {
 			fmt.panicf("Resolve Error: undefined variable '%s'", e.name)
 		}
@@ -97,9 +142,12 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 }
 
 print_resolver_ctx :: proc(resolver_ctx: Resolver_Ctx) {
-	for scope in resolver_ctx.scopes {
-		fmt.println(scope)
-	}
+
+	// for scopes in resolver_ctx.scopes {
+	// 	for key, value in scopes {
+	// 		fmt.printf("Область %s, символ: %s\n", key, value.name)
+	// 	}
+	// }
 
 	for decls in resolver_ctx.decl_symbols {
 		fmt.println(decls)

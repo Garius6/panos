@@ -21,25 +21,22 @@ Local :: struct {
 }
 
 Compiler :: struct {
-	function:    ^Compiled_Function,
-	res:         ^Resolver_Ctx,
-	locals:      [dynamic]Local,
-	scope_depth: int,
+	functions:        map[string]^Compiled_Function,
+	current_function: ^Compiled_Function,
+	res:              ^Resolver_Ctx,
+	locals:           [dynamic]Local,
+	scope_depth:      int,
 }
 
-new_compiler :: proc(res: ^Resolver_Ctx, name: string) -> (Compiler, ^Compiled_Function) {
-	fn := new(Compiled_Function)
-	fn.name = name
-	fn.instructions = make([dynamic]u8)
-	fn.constants = make([dynamic]Value)
+new_compiler :: proc(res: ^Resolver_Ctx, name: string) -> Compiler {
 
 	c := Compiler {
-		function    = fn,
+		functions   = make(map[string]^Compiled_Function),
 		res         = res,
 		locals      = make([dynamic]Local),
 		scope_depth = 0,
 	}
-	return c, fn
+	return c
 }
 
 Opcode :: enum u8 {
@@ -58,7 +55,7 @@ Opcode :: enum u8 {
 
 // Записать 1 байт в массив инструкций
 emit_byte :: proc(c: ^Compiler, byte: u8) {
-	append(&c.function.instructions, byte)
+	append(&c.current_function.instructions, byte)
 }
 
 // Записать опкод
@@ -68,8 +65,8 @@ emit_opcode :: proc(c: ^Compiler, op: Opcode) {
 
 // Сохранить константу и сгенерировать инструкцию для ее загрузки
 emit_constant :: proc(c: ^Compiler, value: Value) {
-	append(&c.function.constants, value)
-	idx := len(c.function.constants) - 1
+	append(&c.current_function.constants, value)
+	idx := len(c.current_function.constants) - 1
 
 	if idx > 255 {
 		fmt.panicf("Too many constants in one function!") // Для простоты используем 1 байт
@@ -85,29 +82,45 @@ emit_jump :: proc(c: ^Compiler, op: Opcode) -> int {
 	emit_opcode(c, op)
 	emit_byte(c, 0xff) // Фиктивный старший байт
 	emit_byte(c, 0xff) // Фиктивный младший байт
-	return len(c.function.instructions) - 2
+	return len(c.current_function.instructions) - 2
 }
 
 // Вызывается после того, как тело блока скомпилировано.
 // Вычисляет длину прыжка и "зашивает" ее поверх 0xFFFF.
 patch_jump :: proc(c: ^Compiler, offset: int) {
 	// Насколько далеко нужно прыгнуть (текущая длина минус адрес прыжка минус 2 байта операнда)
-	jump_length := len(c.function.instructions) - offset - 2
+	jump_length := len(c.current_function.instructions) - offset - 2
 
 	if jump_length > 65535 {
 		fmt.panicf("Too much code to jump over!")
 	}
 
-	c.function.instructions[offset] = u8((jump_length >> 8) & 0xff) // Старший байт
-	c.function.instructions[offset + 1] = u8(jump_length & 0xff) // Младший байт
+	c.current_function.instructions[offset] = u8((jump_length >> 8) & 0xff) // Старший байт
+	c.current_function.instructions[offset + 1] = u8(jump_length & 0xff) // Младший байт
 }
 
 compile :: proc(ctx: ^Compiler, program: ^Program) {
 
-	for stmt in program.statements {
-		compile_statement(ctx, stmt)
+	for decl in program.decls {
+		compile_decl(ctx, decl)
 	}
 
+}
+
+compile_decl :: proc(c: ^Compiler, decl: Decls) {
+	switch d in decl {
+	case ^Function_Decl:
+		function := new(Compiled_Function)
+		function.name = d.name
+
+		c.current_function = function
+
+		for stmt in d.body {
+			compile_statement(c, stmt)
+		}
+
+		c.functions[function.name] = function
+	}
 }
 
 compile_statement :: proc(ctx: ^Compiler, statement: Stmt) {
@@ -115,11 +128,11 @@ compile_statement :: proc(ctx: ^Compiler, statement: Stmt) {
 	case ^Let_Stmt:
 		compile_expr(ctx, stmt.value)
 
-		sym := ctx.res.decl_symbols[stmt]
+		sym := ctx.res.stmt_symbols[stmt]
 		append(&ctx.locals, Local{symbol = sym, depth = ctx.scope_depth})
 		slot_index := len(ctx.locals) - 1
 
-		ctx.function.frame_size = max(ctx.function.frame_size, len(ctx.locals))
+		ctx.current_function.frame_size = max(ctx.current_function.frame_size, len(ctx.locals))
 
 		emit_opcode(ctx, .Set_Local)
 		emit_byte(ctx, u8(slot_index))
@@ -181,68 +194,75 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 
 print_assebler :: proc(c: ^Compiler) {
 
-	instructions := c.function.instructions
-
 	builder: strings.Builder
 	strings.builder_init(&builder)
 	defer strings.builder_destroy(&builder)
 
-	for idx := 0; idx < len(instructions); idx += 1 {
-		current_opcode := Opcode(instructions[idx])
-		switch current_opcode {
-		case .Constant:
-			idx += 1
-			command := fmt.tprintf("CONSTANT: %d\n", instructions[idx])
-			strings.write_string(&builder, command)
+	prefix := "\t"
 
-		case .Add:
-			command := fmt.tprintf("ADD\n")
-			strings.write_string(&builder, command)
+	for name, f in c.functions {
 
-		case .Subtract:
-			command := fmt.tprintf("SUBSTACT\n")
-			strings.write_string(&builder, command)
+		function_name := fmt.tprintf("FUNCTION %s\n", name)
+		strings.write_string(&builder, function_name)
 
-		case .Multiply:
-			command := fmt.tprintf("MULTIPLY\n")
-			strings.write_string(&builder, command)
+		instructions := f.instructions
+		for idx := 0; idx < len(instructions); idx += 1 {
+			current_opcode := Opcode(instructions[idx])
+			switch current_opcode {
+			case .Constant:
+				idx += 1
+				command := fmt.tprintf("%sCONSTANT: %d\n", prefix, instructions[idx])
+				strings.write_string(&builder, command)
 
-		case .Divide:
-			command := fmt.tprintf("CONSTANT\n")
-			strings.write_string(&builder, command)
+			case .Add:
+				command := fmt.tprintf("%sADD\n", prefix)
+				strings.write_string(&builder, command)
 
-		case .Get_Local:
-			idx += 1
-			command := fmt.tprintf("GET_LOCAL: %d\n", instructions[idx])
-			strings.write_string(&builder, command)
+			case .Subtract:
+				command := fmt.tprintf("%sSUBSTACT\n", prefix)
+				strings.write_string(&builder, command)
 
-		case .Set_Local:
-			idx += 1
-			command := fmt.tprintf("SET_LOCAL: %d\n", instructions[idx])
-			strings.write_string(&builder, command)
+			case .Multiply:
+				command := fmt.tprintf("%sMULTIPLY\n", prefix)
+				strings.write_string(&builder, command)
 
-		case .Jump_If_False:
-			idx += 2
-			command := fmt.tprintf("JUMP_IF_FALSE\n")
-			strings.write_string(&builder, command)
+			case .Divide:
+				command := fmt.tprintf("%sCONSTANT\n", prefix)
+				strings.write_string(&builder, command)
 
-		case .Jump:
-			idx += 2
-			command := fmt.tprintf("JUMP\n")
-			strings.write_string(&builder, command)
+			case .Get_Local:
+				idx += 1
+				command := fmt.tprintf("%sGET_LOCAL: %d\n", prefix, instructions[idx])
+				strings.write_string(&builder, command)
 
-		case .Pop:
-			command := fmt.tprintf("POP\n")
-			strings.write_string(&builder, command)
+			case .Set_Local:
+				idx += 1
+				command := fmt.tprintf("%sSET_LOCAL: %d\n", prefix, instructions[idx])
+				strings.write_string(&builder, command)
 
-		case .Return:
-			command := fmt.tprintf("RETURN\n")
-			strings.write_string(&builder, command)
+			case .Jump_If_False:
+				idx += 2
+				command := fmt.tprintf("%sJUMP_IF_FALSE\n", prefix)
+				strings.write_string(&builder, command)
 
+			case .Jump:
+				idx += 2
+				command := fmt.tprintf("%sJUMP\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Pop:
+				command := fmt.tprintf("%sPOP\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Return:
+				command := fmt.tprintf("%sRETURN\n", prefix)
+				strings.write_string(&builder, command)
+
+			}
 		}
 	}
-
 	res := strings.to_string(builder)
 
 	fmt.println(res)
+
 }

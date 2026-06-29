@@ -2,6 +2,8 @@ package main
 
 import "core:fmt"
 
+Main_Function_Name :: "старт"
+
 CallFrame :: struct {
 	function:      ^Compiled_Function,
 	ip:            int, // Указатель текущей инструкции в ЭТОЙ функции
@@ -14,11 +16,16 @@ VM :: struct {
 	stack:              [dynamic]Value,
 }
 
-new_vm :: proc(main_func: ^Compiled_Function) -> ^VM {
+new_vm :: proc(compiler: ^Compiler) -> ^VM {
 
 	vm := new(VM)
 	vm.frames = make([dynamic]CallFrame)
-	vm.compiled_functions = make(map[string]^Compiled_Function)
+	vm.compiled_functions = compiler.functions
+
+	main_func, ok := vm.compiled_functions[Main_Function_Name]
+	if !ok {
+		fmt.panicf("Не определена функция 'старт'")
+	}
 
 	main_frame := CallFrame {
 		function      = main_func,

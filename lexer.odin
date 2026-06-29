@@ -23,16 +23,6 @@ tokenize :: proc(input: string) -> [dynamic]Token {
 		ch, width := utf8.decode_rune_in_string(l.input[l.pos:])
 
 		switch {
-		// Обработка ASI (Automatic Semicolon Insertion). Как в Go/Odin и тд
-		case ch == '\n':
-			if l.nest_level == 0 && len(tokens) > 0 {
-				last_tok := tokens[len(tokens) - 1]
-				if can_insert_semicolon(last_tok.kind) {
-					append(&tokens, Token{kind = .Semicolon, data = "\n"})
-				}
-			}
-			l.pos += width
-
 		case unicode.is_space(ch):
 			l.pos += width
 		case ch == ';':
@@ -93,7 +83,7 @@ tokenize :: proc(input: string) -> [dynamic]Token {
 			l.pos += width
 		case ch == '=':
 			if l.nest_level > 0 do l.nest_level -= 1
-			append(&tokens, Token{kind = .Assign, data = ")"})
+			append(&tokens, Token{kind = .Assign, data = "="})
 			l.pos += width
 
 		case:
@@ -103,10 +93,6 @@ tokenize :: proc(input: string) -> [dynamic]Token {
 				l.pos,
 			)
 		}
-	}
-
-	if len(tokens) > 0 && can_insert_semicolon(tokens[len(tokens) - 1].kind) {
-		append(&tokens, Token{kind = .Semicolon, data = "EOF"})
 	}
 
 	append(&tokens, Token{kind = .EOF, data = "EOF"})
@@ -119,5 +105,7 @@ keywords :: proc() -> map[string]TokenKind {
 	keywords["пер"] = .Let
 	keywords["истина"] = .Boolean
 	keywords["ложь"] = .Boolean
+	keywords["функ"] = .Function
+	keywords["конец"] = .End
 	return keywords
 }

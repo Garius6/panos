@@ -11,8 +11,18 @@ Parser_Error :: enum {
 	Cannot,
 }
 
+Function_Decl :: struct {
+	name: string,
+	args: [dynamic]string,
+	body: [dynamic]Stmt,
+}
+
+Decls :: union {
+	^Function_Decl,
+}
+
 Program :: struct {
-	statements: [dynamic]Stmt,
+	decls: [dynamic]Decls,
 }
 
 Stmt :: union {
@@ -68,9 +78,19 @@ Expr :: union {
 // Функция для печати всей программы
 print_program :: proc(prog: Program) {
 	fmt.println("Program")
-	for stmt, i in prog.statements {
-		is_last := i == len(prog.statements) - 1
-		print_stmt(stmt, "", is_last)
+	for decl in prog.decls {
+		print_decl(decl)
+	}
+}
+
+print_decl :: proc(decl: Decls) {
+	switch d in decl {
+	case ^Function_Decl:
+		fmt.printf("Function (%s)\n", d.name)
+		for stmt, i in d.body {
+			is_last := i == len(d.body) - 1
+			print_stmt(stmt, "", is_last)
+		}
 	}
 }
 
@@ -129,16 +149,52 @@ print_ast :: proc(expr: Expr, prefix: string = "", is_last: bool = true) {
 
 parse_program :: proc(p: ^Parser) -> Program {
 	prog := Program {
-		statements = make([dynamic]Stmt, context.allocator), // Использует динамическую арену
+		decls = make([dynamic]Decls),
 	}
 
 	for peek_token(p.stream).kind != .EOF {
-		stmt := parse_stmt(p)
-		if stmt != nil {
-			append(&prog.statements, stmt)
+		if peek_token(p.stream).kind != .Function {
+			fmt.panicf("Ожидалось объявление функции")
+		}
+		decl := parse_function(p)
+		if decl != nil {
+			append(&prog.decls, decl)
 		}
 	}
 	return prog
+}
+
+parse_function :: proc(p: ^Parser) -> ^Function_Decl {
+	expect(p, .Function)
+
+	function := new(Function_Decl)
+	function.args = make([dynamic]string)
+	function.body = make([dynamic]Stmt)
+
+	tok := next_token(p.stream)
+	if tok.kind != .Ident {
+		fmt.panicf("Ожидалось имя функции")
+	}
+
+	function.name = tok.data
+
+	expect(p, .LParen)
+
+	if tok = peek_token(p.stream); tok.kind == .Ident {
+		for tok = next_token(p.stream); tok.kind == .Ident; {
+			append(&function.args, tok.data)
+		}
+	}
+
+	expect(p, .RParen)
+
+	for peek_token(p.stream).kind != .End {
+		append(&function.body, parse_stmt(p))
+	}
+
+	expect(p, .End)
+
+	return function
 }
 
 parse_stmt :: proc(p: ^Parser) -> Stmt {
@@ -163,13 +219,14 @@ parse_return_stmt :: proc(p: ^Parser) -> Stmt {
 	stmt := new(Return_Stmt)
 
 	// Если после return сразу идет точка с запятой, выражение пустое
-	if peek_token(p.stream).kind == .Semicolon {
+	tok := peek_token(p.stream)
+	if tok.kind == .Semicolon || tok.kind == .End || tok.kind == .EOF {
 		stmt.value = nil
 	} else {
 		stmt.value = parse_expr(p, 0)
 	}
 
-	expect(p, .Semicolon) // Поглощаем ';'
+	consume_semicolon_or_newline(p)
 	return stmt
 }
 
@@ -178,7 +235,6 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 
 	stmt := new(Let_Stmt)
 
-	// Ожидаем идентификатор
 	ident_tok := next_token(p.stream)
 	if ident_tok.kind != .Ident {
 		fmt.panicf(
@@ -191,7 +247,7 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 
 	stmt.value = parse_expr(p, 0)
 
-	expect(p, .Semicolon)
+	consume_semicolon_or_newline(p)
 	return stmt
 }
 
@@ -199,10 +255,7 @@ parse_expr_stmt :: proc(p: ^Parser) -> Stmt {
 	stmt := new(Expr_Stmt)
 	stmt.expr = parse_expr(p, 0)
 
-	// Поглощаем опциональную или обязательную точку с запятой
-	if peek_token(p.stream).kind == .Semicolon {
-		next_token(p.stream)
-	}
+	consume_semicolon_or_newline(p)
 
 	return stmt
 }
@@ -247,7 +300,7 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 		rhs := parse_expr(p, rbp)
 		return new_unary(tok, rhs)
 	case:
-		error("unexpected token in nud position")
+		error("unexpected token %s in nud position", tok.data)
 	}
 
 	return nil
@@ -271,8 +324,8 @@ infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 	return 0, 0, false
 }
 
-error :: proc(message: string) {
-	fmt.panicf(message)
+error :: proc(format: string, args: ..any, loc := #caller_location) {
+	fmt.panicf(format, args, loc = loc)
 }
 
 expect :: proc(p: ^Parser, expected_kind: TokenKind) {
@@ -291,6 +344,19 @@ expect :: proc(p: ^Parser, expected_kind: TokenKind) {
 			expected_kind,
 			tok.kind,
 		)
+	}
+}
+
+consume_semicolon_or_newline :: proc(p: ^Parser) {
+	tok := peek_token(p.stream)
+	if tok.kind == .Semicolon {
+		next_token(p.stream) // Поглощаем явную ';'
+	} else if tok.kind == .EOF || tok.kind == .RParen {
+		// Здесь можно не поглощать, если мы достигли границы блока
+		return
+	} else {
+		// Если это не ';', но валидный конец выражения — просто игнорируем
+		// Либо можно логировать, что мы вставили "виртуальную" точку
 	}
 }
 

@@ -34,8 +34,13 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 }
 
 typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
-	for stmt in prog.statements {
-		check_stmt(ctx, stmt)
+	for decl in prog.decls {
+		switch d in decl {
+		case ^Function_Decl:
+			for stmt in d.body {
+				check_stmt(ctx, stmt)
+			}
+		}
 	}
 }
 
@@ -48,7 +53,7 @@ check_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) {
 		t := infer_expr(ctx, s.value)
 
 		// 2. Берем символ из таблицы резолвера и привязываем к нему тип
-		sym := ctx.res.decl_symbols[stmt]
+		sym := ctx.res.stmt_symbols[stmt]
 		ctx.symbol_types[sym] = t
 
 	case ^Return_Stmt:

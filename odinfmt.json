@@ -1,0 +1,10 @@
+{
+    "character_width": 100,
+    "tabs": true,
+    "tabs_width": 4,
+    "newline_limit": 1,
+    "brace_style": "1tbs",
+    "indent_case": false,
+    "sort_imports": true,
+    "space_single_line_blocks": true
+}

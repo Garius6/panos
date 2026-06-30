@@ -67,12 +67,18 @@ Binary_Expr :: struct {
 	right: Expr,
 }
 
+Call_Expr :: struct {
+	args:   [dynamic]Expr,
+	callee: Expr,
+}
+
 Expr :: union {
 	^Number_Expr,
 	^Boolean_Expr,
 	^Binary_Expr,
 	^Unary_Expr,
 	^Ident_Expr,
+	^Call_Expr,
 }
 
 // Функция для печати всей программы
@@ -144,6 +150,12 @@ print_ast :: proc(expr: Expr, prefix: string = "", is_last: bool = true) {
 		print_ast(e.right, next_prefix, true)
 	case ^Ident_Expr:
 		fmt.printf("%s%sIdent(%v)\n", prefix, marker, e.name)
+	case ^Call_Expr:
+		fmt.printf("%s%sCall()\n", prefix, marker)
+		print_ast(e.callee, next_prefix, false)
+		for arg in e.args {
+			print_ast(arg, next_prefix, false)
+		}
 	}
 }
 
@@ -277,8 +289,30 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 		if !is_infix || lbp < min_bp do break
 
 		next_token(p.stream)
-		right := parse_expr(p, rbp)
-		left = new_bin_op(op.kind, left, right)
+		if op.kind == .LParen {
+			// Вызов функции! `left` (то, что было до скобки) становится нашим callee
+			call := new(Call_Expr)
+			call.callee = left
+			call.args = make([dynamic]Expr)
+
+			// Парсим аргументы до закрывающей скобки
+			if peek_token(p.stream).kind != .RParen {
+				for {
+					append(&call.args, parse_expr(p, 0))
+					if peek_token(p.stream).kind == .Comma {
+						next_token(p.stream) // Съедаем запятую
+					} else {
+						break
+					}
+				}
+			}
+			expect(p, .RParen) // Съедаем ')'
+			left = call // Возвращаем собранный Call_Expr дальше по цепочке
+		} else {
+			// Обычный бинарный оператор (+, -, *, /)
+			right := parse_expr(p, rbp)
+			left = new_bin_op(op.kind, left, right)
+		}
 	}
 	return left
 }
@@ -320,6 +354,8 @@ infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 		return 60, 61, true
 	case .Plus, .Minus:
 		return 50, 51, true
+	case .LParen:
+		return 80, 0, true
 	}
 	return 0, 0, false
 }

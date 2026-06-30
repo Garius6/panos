@@ -16,11 +16,12 @@ VM :: struct {
 	stack:              [dynamic]Value,
 }
 
-new_vm :: proc(compiler: ^Compiler) -> ^VM {
-
+new_vm :: proc(compiled_functions: map[string]^Compiled_Function) -> ^VM {
 	vm := new(VM)
 	vm.frames = make([dynamic]CallFrame)
-	vm.compiled_functions = compiler.functions
+
+	// Берем переданный словарь напрямую
+	vm.compiled_functions = compiled_functions
 
 	main_func, ok := vm.compiled_functions[Main_Function_Name]
 	if !ok {
@@ -105,6 +106,68 @@ execute :: proc(vm: ^VM) {
 			// 4. Складываем и снова упаковываем в union
 			append(&vm.stack, Value(a + b))
 		case .Subtract, .Multiply, .Divide:
+		case .Call:
+			frame.ip += 1
+			arg_count := int(instructions[frame.ip])
+
+			// 1. Ищем функцию на стеке. Она лежит под всеми аргументами!
+			callee_index := len(vm.stack) - 1 - arg_count
+			callee_val := vm.stack[callee_index]
+
+			func_ptr, ok := callee_val.(^Compiled_Function)
+			if !ok {
+				fmt.panicf(
+					"Runtime Error: попытка вызвать не функцию (получено: %v)",
+					callee_val,
+				)
+			}
+
+			// 2. Создаем новый фрейм
+			new_frame := CallFrame {
+				function      = func_ptr,
+				ip            = 0,
+				frame_pointer = callee_index + 1, // Переменные начинаются прямо с аргументов
+			}
+
+			// 3. Выделяем место под локальные переменные (нули)
+			locals_to_allocate := func_ptr.frame_size - arg_count
+			for _ in 0 ..< locals_to_allocate {
+				append(&vm.stack, Value(f64(0)))
+			}
+
+			// 4. Запоминаем точку возврата для текущ��й функции
+			vm.frames[len(vm.frames) - 1].ip = frame.ip + 1
+
+			// 5. Переключаем контекст!
+			append(&vm.frames, new_frame)
+			continue // ВАЖНО: Начинаем новый цикл, пропуская frame.ip += 1 в конце
+
+		case .Return:
+			result: Value = f64(0) // Значение по умолчанию (если функция ничего не вернула)
+
+			// Вычисляем, где заканчиваются локальные переменные
+			base_frame_size := frame.frame_pointer + frame.function.frame_size
+
+			// Если на стеке есть что-то ВЫШЕ локальных переменных — это наш результат!
+			if len(vm.stack) > base_frame_size {
+				result = pop(&vm.stack)
+			}
+
+			// Очищаем весь кадр (локальные переменные, аргументы и саму вызванную функцию)
+			// Функция-callee лежит прямо перед frame_pointer
+			callee_index := frame.frame_pointer - 1
+
+			// В Odin функция resize мгновенно отсекает хвост массива (очищает стек)
+			resize(&vm.stack, callee_index)
+
+			// Кладем результат обратно на стек для той функции, которая нас вызывала
+			append(&vm.stack, result)
+
+			// Удаляем текущий фрейм
+			pop(&vm.frames)
+
+			// Если мы вышли из функции 'старт', программа сама завершится
+			continue
 
 		}
 

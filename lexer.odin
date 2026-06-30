@@ -85,6 +85,10 @@ tokenize :: proc(input: string) -> [dynamic]Token {
 			if l.nest_level > 0 do l.nest_level -= 1
 			append(&tokens, Token{kind = .Assign, data = "="})
 			l.pos += width
+		case ch == ',':
+			if l.nest_level > 0 do l.nest_level -= 1
+			append(&tokens, Token{kind = .Comma, data = ","})
+			l.pos += width
 
 		case:
 			fmt.panicf(

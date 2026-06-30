@@ -18,6 +18,7 @@ TokenKind :: enum {
 	Return,
 	Let,
 	Semicolon,
+	Comma,
 	EOF,
 }
 

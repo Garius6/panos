@@ -64,27 +64,35 @@ lookup_symbol :: proc(s: ^Scope, name: string) -> ^Symbol {
 
 resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program) {
 	for decl in prog.decls {
-		resolve_decl(ctx, decl)
+		#partial switch d in decl {
+		case ^Function_Decl:
+			sym := new(Symbol)
+			sym.name = d.name
+
+			// Функция всегда регистрируется в глобальном скоупе
+			if sym.name in ctx.global_scope.symbols {
+				fmt.panicf("Resolve Error: Символ '%s' уже объявлен", sym.name)
+			}
+
+			ctx.global_scope.symbols[sym.name] = sym
+			ctx.decl_symbols[decl] = sym
+		}
 	}
-}
 
-resolve_decl :: proc(ctx: ^Resolver_Ctx, decl: Decls) {
-	switch d in decl {
-	case ^Function_Decl:
-		sym := new(Symbol)
-		sym.name = d.name
+	for decl in prog.decls {
+		#partial switch d in decl {
+		case ^Function_Decl:
+			push_scope(ctx)
 
-		if lookup_symbol(ctx.current_scope, sym.name) != nil {
-			fmt.panicf("Символ %s уже объявлен", sym.name)
+			// В будущем здесь вы добавите параметры в Scope:
+			// for p in d.args { ... ctx.current_scope.symbols[p] = sym ... }
+
+			for stmt in d.body {
+				resolve_stmt(ctx, stmt)
+			}
+
+			pop_scope(ctx)
 		}
-
-		ctx.decl_symbols[decl] = sym
-
-		push_scope(ctx)
-		for stmt in d.body {
-			resolve_stmt(ctx, stmt)
-		}
-		pop_scope(ctx)
 	}
 }
 
@@ -93,15 +101,12 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 
 	switch s in stmt {
 	case ^Let_Stmt:
-		// 1. Сначала разрешаем правую часть (чтобы запретить `let a = a`)
 		resolve_expr(ctx, s.value)
 
-		// 2. Создаем новый символ
 		sym := new(Symbol)
 		sym.name = s.name
 
-		// 3. Добавляем в текущую область видимости
-		if lookup_symbol(ctx.current_scope, s.name) != nil {
+		if s.name in ctx.current_scope.symbols {
 			fmt.panicf("Имя %s уже объявлено", s.name)
 		}
 		ctx.current_scope.symbols[s.name] = sym
@@ -138,22 +143,62 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 
 	case ^Number_Expr:
 	case ^Boolean_Expr:
+	case ^Call_Expr:
+		resolve_expr(ctx, e.callee)
+
+		for arg in e.args {
+			resolve_expr(ctx, arg)
+		}
 	}
 }
 
-print_resolver_ctx :: proc(resolver_ctx: Resolver_Ctx) {
+print_resolver_ctx :: proc(ctx: ^Resolver_Ctx) {
+	fmt.println("\n================ ТАБЛИЦЫ РЕЗОЛВЕРА ================")
 
-	// for scopes in resolver_ctx.scopes {
-	// 	for key, value in scopes {
-	// 		fmt.printf("Область %s, символ: %s\n", key, value.name)
-	// 	}
-	// }
-
-	for decls in resolver_ctx.decl_symbols {
-		fmt.println(decls)
+	fmt.println(
+		"\n[1] ДЕКЛАРАЦИИ (decl_symbols) - Места создания глобальных символов:",
+	)
+	if len(ctx.decl_symbols) == 0 do fmt.println("  (пусто)")
+	for decl, sym in ctx.decl_symbols {
+		#partial switch d in decl {
+		case ^Function_Decl:
+			// %p выведет уникальный адрес объекта Symbol (например, 0x14000123450)
+			fmt.printf(
+				"  [FUNC] '%s' -> создало Символ по адресу %p\n",
+				d.name,
+				sym,
+			)
+		}
 	}
 
-	for nodes in resolver_ctx.node_symbols {
-		fmt.println(nodes)
+	fmt.println(
+		"\n[2] ЛОКАЛЬНЫЕ ПЕРЕМЕННЫЕ (stmt_symbols) - Места создания локальных символов:",
+	)
+	if len(ctx.stmt_symbols) == 0 do fmt.println("  (пусто)")
+	for stmt, sym in ctx.stmt_symbols {
+		#partial switch s in stmt {
+		case ^Let_Stmt:
+			fmt.printf(
+				"  [LET]  '%s' -> создало Символ по адресу %p\n",
+				s.name,
+				sym,
+			)
+		}
 	}
+
+	fmt.println(
+		"\n[3] ИСПОЛЬЗОВАНИЯ (node_symbols) - Куда ссылаются узлы AST:",
+	)
+	if len(ctx.node_symbols) == 0 do fmt.println("  (пусто)")
+	for expr, sym in ctx.node_symbols {
+		#partial switch e in expr {
+		case ^Ident_Expr:
+			fmt.printf(
+				"  [EXPR] Идентификатор '%s' -> ссылается на Символ %p\n",
+				e.name,
+				sym,
+			)
+		}
+	}
+	fmt.println("===================================================\n")
 }

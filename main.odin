@@ -76,12 +76,9 @@ run_file :: proc(filename: string) {
 	print_program(program)
 	fmt.printf("--------------------------\n\n")
 
-	fmt.println("SYMBOL TABLE")
-	fmt.printf("--------------------------\n")
 	resolver_ctx := new_resolver_ctx()
 	resolve_program(&resolver_ctx, program)
-	print_resolver_ctx(resolver_ctx)
-	fmt.printf("--------------------------\n\n")
+	print_resolver_ctx(&resolver_ctx)
 
 	fmt.println("TYPE CHECK")
 	fmt.printf("--------------------------\n")
@@ -92,14 +89,13 @@ run_file :: proc(filename: string) {
 
 	fmt.println("COMPILATION")
 	fmt.printf("--------------------------\n")
-	compiler := new_compiler(&resolver_ctx, "__start")
-	compile(&compiler, &program)
-	print_assebler(&compiler)
+	registry := compile_program(&resolver_ctx, &program)
+	print_assebler(registry)
 	fmt.printf("--------------------------\n\n")
 
 	fmt.println("EXECUTION")
 	fmt.printf("--------------------------\n")
-	vm := new_vm(&compiler)
+	vm := new_vm(registry)
 	execute(vm)
 	print_vm(vm)
 	fmt.printf("--------------------------\n\n")

@@ -6,6 +6,7 @@ import "core:strings"
 Value :: union {
 	f64,
 	bool,
+	^Compiled_Function,
 }
 
 Compiled_Function :: struct {
@@ -21,7 +22,7 @@ Local :: struct {
 }
 
 Compiler :: struct {
-	functions:        map[string]^Compiled_Function,
+	registry:         ^map[string]^Compiled_Function, // Указатель на глобальный реестр
 	current_function: ^Compiled_Function,
 	res:              ^Resolver_Ctx,
 	locals:           [dynamic]Local,
@@ -31,7 +32,6 @@ Compiler :: struct {
 new_compiler :: proc(res: ^Resolver_Ctx, name: string) -> Compiler {
 
 	c := Compiler {
-		functions   = make(map[string]^Compiled_Function),
 		res         = res,
 		locals      = make([dynamic]Local),
 		scope_depth = 0,
@@ -51,6 +51,7 @@ Opcode :: enum u8 {
 	Jump, // Операнд: 2 байта (смещение прыжка)
 	Pop, // Удалить вершину стека
 	Return, // Возврат из функции
+	Call,
 }
 
 // Записать 1 байт в массив инструкций
@@ -99,12 +100,48 @@ patch_jump :: proc(c: ^Compiler, offset: int) {
 	c.current_function.instructions[offset + 1] = u8(jump_length & 0xff) // Младший байт
 }
 
-compile :: proc(ctx: ^Compiler, program: ^Program) {
+compile_program :: proc(res: ^Resolver_Ctx, program: ^Program) -> map[string]^Compiled_Function {
+	registry := make(map[string]^Compiled_Function)
 
+	// ПРОХОД 1: Выделяем память под функции (Hoisting)
+	// Это позволит функции 'старт' вызывать функцию 'а', даже если 'а' объявлена ниже.
 	for decl in program.decls {
-		compile_decl(ctx, decl)
+		#partial switch d in decl {
+		case ^Function_Decl:
+			fn := new(Compiled_Function)
+			fn.name = d.name
+			// Инициализируем массивы функции
+			fn.instructions = make([dynamic]u8)
+			fn.constants = make([dynamic]Value)
+			registry[d.name] = fn
+		}
 	}
 
+	// ПРОХОД 2: Компиляция тел функций
+	for decl in program.decls {
+		#partial switch d in decl {
+		case ^Function_Decl:
+			// СОЗДАЕМ ЧИСТЫЙ КОНТЕКСТ ДЛЯ ЭТОЙ ФУНКЦИИ!
+			// Массив locals пуст, scope_depth = 0. Никаких утечек переменных.
+			ctx := Compiler {
+				registry         = &registry,
+				current_function = registry[d.name],
+				res              = res,
+				locals           = make([dynamic]Local),
+				scope_depth      = 0,
+			}
+
+			// Компилируем тело
+			for stmt in d.body {
+				compile_statement(&ctx, stmt)
+			}
+
+			// Защита: если программист забыл написать return, компилятор добавит его сам
+			emit_opcode(&ctx, .Return)
+		}
+	}
+
+	return registry // Возвращаем только готовые функции!}
 }
 
 compile_decl :: proc(c: ^Compiler, decl: Decls) {
@@ -119,7 +156,7 @@ compile_decl :: proc(c: ^Compiler, decl: Decls) {
 			compile_statement(c, stmt)
 		}
 
-		c.functions[function.name] = function
+		c.registry[function.name] = function
 	}
 }
 
@@ -175,10 +212,19 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			}
 		}
 
-		if slot_index == -1 do fmt.panicf("Compiler bug: local variable not found")
-
-		emit_opcode(ctx, .Get_Local)
-		emit_byte(ctx, u8(slot_index))
+		if slot_index != -1 {
+			// Это локальная переменная
+			emit_opcode(ctx, .Get_Local)
+			emit_byte(ctx, u8(slot_index))
+		} else {
+			// 2. Если не локальная, ищем в глобальном реестре функций!
+			if fn_ptr, ok := ctx.registry^[sym.name]; ok {
+				// Кладем саму функцию на стек как константу!
+				emit_constant(ctx, Value(fn_ptr))
+			} else {
+				fmt.panicf("Compiler Error: символ '%s' не найден", sym.name)
+			}
+		}
 
 	case ^Binary_Expr:
 		compile_expr(ctx, e.left)
@@ -188,11 +234,21 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		case .Plus:
 			emit_opcode(ctx, .Add)
 		}
-	}
 
+	case ^Call_Expr:
+		// 1. Кладем функцию на стек (выполнится код из Ident_Expr выше)
+		compile_expr(ctx, e.callee)
+
+		// 2. Кладем аргументы (если они есть)
+		// for arg in e.args do compile_expr(ctx, arg)
+
+		// 3. Вызываем!
+		emit_opcode(ctx, .Call)
+		emit_byte(ctx, 0) // Количество аргументов (пока 0)
+	}
 }
 
-print_assebler :: proc(c: ^Compiler) {
+print_assebler :: proc(registry: map[string]^Compiled_Function) {
 
 	builder: strings.Builder
 	strings.builder_init(&builder)
@@ -200,7 +256,7 @@ print_assebler :: proc(c: ^Compiler) {
 
 	prefix := "\t"
 
-	for name, f in c.functions {
+	for name, f in registry {
 
 		function_name := fmt.tprintf("FUNCTION %s\n", name)
 		strings.write_string(&builder, function_name)
@@ -256,6 +312,11 @@ print_assebler :: proc(c: ^Compiler) {
 
 			case .Return:
 				command := fmt.tprintf("%sRETURN\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Call:
+				idx += 1
+				command := fmt.tprintf("%sCALL\n", prefix)
 				strings.write_string(&builder, command)
 
 			}

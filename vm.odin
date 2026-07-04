@@ -284,10 +284,14 @@ execute :: proc(vm: ^VM) {
 			callee_index := frame.frame_pointer - 1
 
 			// В Odin функция resize мгновенно отсекает хвост массива (очищает стек)
-			resize(&vm.stack, callee_index)
+			resize_to := callee_index
+			if resize_to < 0 do resize_to = 0
+			resize(&vm.stack, resize_to)
 
-			// Кладем результат обратно на стек для той функции, которая нас вызывала
-			append(&vm.stack, result)
+			// Кладем результат только для функций с непустым возвращаемым типом.
+			if frame.function.returns_value {
+				append(&vm.stack, result)
+			}
 
 			// Удаляем текущий фрейм
 			pop(&vm.frames)
@@ -403,8 +407,6 @@ execute :: proc(vm: ^VM) {
 				)
 			}
 
-			append(&vm.stack, value)
-
 		case .Get_Index:
 			index := pop(&vm.stack)
 			receiver := pop(&vm.stack)
@@ -446,8 +448,6 @@ execute :: proc(vm: ^VM) {
 			} else {
 				fmt.panicf("Runtime Error: индексная запись поддерживает только массивы и соответствия")
 			}
-
-			append(&vm.stack, value)
 
 		case .Cast_Interface:
 			frame.ip += 1

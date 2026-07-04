@@ -154,10 +154,19 @@ next_token_lex :: proc(l: ^Lexer) -> Token {
 			data = "+",
 		}; advance(l)
 	case '-':
-		tok = Token {
-			kind = .Minus,
-			data = "-",
-		}; advance(l)
+		if peek_char(l) == '>' {
+			advance(l)
+			advance(l)
+			tok = Token {
+				kind = .Arrow,
+				data = "->",
+			}
+		} else {
+			tok = Token {
+				kind = .Minus,
+				data = "-",
+			}; advance(l)
+		}
 	case '*':
 		tok = Token {
 			kind = .Star,

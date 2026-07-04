@@ -12,14 +12,21 @@ Parser_Error :: enum {
 }
 
 Function_Decl :: struct {
-	name: string,
-	args: [dynamic]string,
-	body: [dynamic]Stmt,
+	name:        string,
+	args:        [dynamic]Param_Decl,
+	return_type: Type_Node,
+	body:        [dynamic]Stmt,
+}
+
+Param_Decl :: struct {
+	name:            string,
+	type_annotation: Type_Node,
 }
 
 Method_Signature :: struct {
-	name: string,
-	args: [dynamic]string,
+	name:        string,
+	args:        [dynamic]Param_Decl,
+	return_type: Type_Node,
 }
 
 Interface_Decl :: struct {
@@ -153,8 +160,9 @@ Tuple_Expr :: struct {
 }
 
 Lambda_Expr :: struct {
-	args: [dynamic]string,
-	body: [dynamic]Stmt,
+	args:        [dynamic]Param_Decl,
+	return_type: Type_Node,
+	body:        [dynamic]Stmt,
 }
 
 Array_Expr :: struct {
@@ -382,20 +390,9 @@ parse_interface_decl :: proc(p: ^Parser) -> ^Interface_Decl {
 		method_name := next_token(p.stream)
 		signature := Method_Signature {
 			name = method_name.data,
-			args = make([dynamic]string),
 		}
-
-		expect(p, .LParen)
-		if peek_token(p.stream).kind == .Ident {
-			append(&signature.args, next_token(p.stream).data)
-			for peek_token(p.stream).kind == .Comma {
-				next_token(p.stream)
-				arg_tok := next_token(p.stream)
-				if arg_tok.kind != .Ident do fmt.panicf("Ожидалось имя аргумента")
-				append(&signature.args, arg_tok.data)
-			}
-		}
-		expect(p, .RParen)
+		signature.args = parse_param_list(p)
+		signature.return_type = parse_required_return_type(p, "метода интерфейса")
 		append(&decl.methods, signature)
 		consume_semicolon_or_newline(p)
 	}
@@ -433,7 +430,7 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 		}
 
 		method := parse_function(p)
-		if len(method.args) == 0 || method.args[0] != "это" {
+		if len(method.args) == 0 || method.args[0].name != "это" {
 			fmt.panicf(
 				"Синтаксическая ошибка: первый аргумент метода '%s' структуры '%s' должен называться 'это'",
 				method.name,
@@ -452,24 +449,14 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 parse_function :: proc(p: ^Parser) -> ^Function_Decl {
 	expect(p, .Function)
 	function := new(Function_Decl)
-	function.args = make([dynamic]string)
 	function.body = make([dynamic]Stmt)
 
 	tok := next_token(p.stream)
 	if tok.kind != .Ident do fmt.panicf("Ожидалось имя функции")
 	function.name = tok.data
 
-	expect(p, .LParen)
-	if peek_token(p.stream).kind == .Ident {
-		append(&function.args, next_token(p.stream).data)
-		for peek_token(p.stream).kind == .Comma {
-			next_token(p.stream) // Съедаем запятую
-			tok_arg := next_token(p.stream)
-			if tok_arg.kind != .Ident do fmt.panicf("Ожидалось имя аргумента")
-			append(&function.args, tok_arg.data)
-		}
-	}
-	expect(p, .RParen)
+	function.args = parse_param_list(p)
+	function.return_type = parse_required_return_type(p, "функции")
 
 	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
 		append(&function.body, parse_stmt(p))
@@ -477,6 +464,45 @@ parse_function :: proc(p: ^Parser) -> ^Function_Decl {
 	expect(p, .End)
 
 	return function
+}
+
+parse_param_list :: proc(p: ^Parser) -> [dynamic]Param_Decl {
+	params := make([dynamic]Param_Decl)
+	expect(p, .LParen)
+
+	if peek_token(p.stream).kind != .RParen {
+		for {
+			param_tok := next_token(p.stream)
+			if param_tok.kind != .Ident do fmt.panicf("Ожидалось имя аргумента")
+
+			expect(p, .Colon)
+			param := Param_Decl {
+				name            = param_tok.data,
+				type_annotation = parse_type(p),
+			}
+			append(&params, param)
+
+			if peek_token(p.stream).kind == .Comma {
+				next_token(p.stream)
+				if peek_token(p.stream).kind == .RParen {
+					break
+				}
+			} else {
+				break
+			}
+		}
+	}
+
+	expect(p, .RParen)
+	return params
+}
+
+parse_required_return_type :: proc(p: ^Parser, owner: string) -> Type_Node {
+	if peek_token(p.stream).kind != .Arrow {
+		fmt.panicf("Синтаксическая ошибка: после объявления %s ожидается '-> Тип'", owner)
+	}
+	next_token(p.stream)
+	return parse_type(p)
 }
 
 parse_struct_decl :: proc(p: ^Parser) -> ^Struct_Decl {
@@ -515,6 +541,30 @@ parse_struct_decl :: proc(p: ^Parser) -> ^Struct_Decl {
 
 parse_type :: proc(p: ^Parser) -> Type_Node {
 	tok := next_token(p.stream)
+
+	if tok.kind == .Function {
+		t := new(Type_Function)
+		t.params = make([dynamic]Type_Node)
+
+		expect(p, .LParen)
+		if peek_token(p.stream).kind != .RParen {
+			for {
+				append(&t.params, parse_type(p))
+				if peek_token(p.stream).kind == .Comma {
+					next_token(p.stream)
+					if peek_token(p.stream).kind == .RParen {
+						break
+					}
+				} else {
+					break
+				}
+			}
+		}
+		expect(p, .RParen)
+		expect(p, .Arrow)
+		t.return_type = parse_type(p)
+		return t
+	}
 
 	if tok.kind == .Ident {
 		// НОВОЕ: Универсальный парсинг дженерик-типов: Массив(Число), Соответствие(Число, Строка)
@@ -805,22 +855,12 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 		return new_ident(tok)
 
 	case .Function:
-		// Лямбда-функции: функ(х) х + 1 конец
+		// Лямбда-функции: функ(х: Число) -> Число х + 1 конец
 		lam := new(Lambda_Expr)
-		lam.args = make([dynamic]string)
 		lam.body = make([dynamic]Stmt)
 
-		expect(p, .LParen)
-		if peek_token(p.stream).kind == .Ident {
-			tok_arg := next_token(p.stream)
-			append(&lam.args, tok_arg.data)
-			for peek_token(p.stream).kind == .Comma {
-				next_token(p.stream)
-				t_arg := next_token(p.stream)
-				append(&lam.args, t_arg.data)
-			}
-		}
-		expect(p, .RParen)
+		lam.args = parse_param_list(p)
+		lam.return_type = parse_required_return_type(p, "лямбды")
 
 		for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
 			append(&lam.body, parse_stmt(p))

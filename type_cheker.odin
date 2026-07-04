@@ -7,7 +7,6 @@ import "core:strings"
 // --- ТИПЫ ДАННЫХ ---
 
 Type_Kind :: enum {
-	Any,
 	Number,
 	Bool,
 	Void,
@@ -47,11 +46,10 @@ Struct_Field :: struct {
 }
 
 // Интернированные базовые типы
-TY_NUM := &Type{kind = .Number, name = "Number"}
-TY_BOOL := &Type{kind = .Bool, name = "Bool"}
-TY_VOID := &Type{kind = .Void, name = "Void"}
-TY_STRING := &Type{kind = .String, name = "String"}
-TY_ANY := &Type{kind = .Any, name = "Any"}
+TY_NUM := &Type{kind = .Number, name = "Число"}
+TY_BOOL := &Type{kind = .Bool, name = "Булево"}
+TY_VOID := &Type{kind = .Void, name = "Пусто"}
+TY_STRING := &Type{kind = .String, name = "Строка"}
 
 new_function_type :: proc(params: [dynamic]^Type, return_type: ^Type) -> ^Type {
 	t := new(Type)
@@ -80,7 +78,7 @@ new_map_type :: proc(key_type: ^Type, value_type: ^Type) -> ^Type {
 }
 
 is_valid_map_key_type :: proc(t: ^Type) -> bool {
-	return t.kind == .Number || t.kind == .Bool || t.kind == .String || t.kind == .Any
+	return t.kind == .Number || t.kind == .Bool || t.kind == .String
 }
 
 // --- КОНТЕКСТ ---
@@ -111,10 +109,63 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 	}
 }
 
+resolve_param_types :: proc(ctx: ^Type_Ctx, args: [dynamic]Param_Decl) -> [dynamic]^Type {
+	params := make([dynamic]^Type)
+	for arg in args {
+		append(&params, resolve_type_node(ctx, arg.type_annotation))
+	}
+	return params
+}
+
+function_type_from_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) -> ^Type {
+	params := resolve_param_types(ctx, d.args)
+	return_type := resolve_type_node(ctx, d.return_type)
+	return new_function_type(params, return_type)
+}
+
+interface_method_type_from_signature :: proc(
+	ctx: ^Type_Ctx,
+	iface_type: ^Type,
+	m: Method_Signature,
+) -> ^Type {
+	params := make([dynamic]^Type)
+	append(&params, iface_type)
+	for arg in m.args {
+		append(&params, resolve_type_node(ctx, arg.type_annotation))
+	}
+	return new_function_type(params, resolve_type_node(ctx, m.return_type))
+}
+
+bind_function_args :: proc(ctx: ^Type_Ctx, d: ^Function_Decl, func_type: ^Type) {
+	if args_syms, ok := ctx.res.func_args[d]; ok {
+		if len(args_syms) != len(func_type.params) {
+			fmt.panicf(
+				"Type Error: функция '%s' имеет рассинхронизированные аргументы",
+				d.name,
+			)
+		}
+		for arg_sym, i in args_syms {
+			ctx.symbol_types[arg_sym] = func_type.params[i]
+		}
+	}
+}
+
+interface_method_types_match :: proc(expected: ^Type, actual: ^Type) -> bool {
+	if expected == nil || actual == nil do return false
+	if expected.kind != .Function || actual.kind != .Function do return false
+	if len(expected.params) != len(actual.params) do return false
+	if !types_are_equal(actual.return_type, expected.return_type) do return false
+
+	for i in 1 ..< len(expected.params) {
+		if !types_are_equal(actual.params[i], expected.params[i]) do return false
+	}
+	return true
+}
+
 // --- ГЛАВНЫЙ ЦИКЛ ---
 
 typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
-	// ПРОХОД 1: Привязка типов к глобальным символам
+	// ПРОХОД 1: создаем номинальные типы до разбора полей и сигнатур.
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Struct_Decl:
@@ -122,35 +173,48 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			struct_type.kind = .Struct
 			struct_type.name = d.name
 			struct_type.fields = make([dynamic]Struct_Field)
+			struct_type.methods = make(map[string]^Symbol)
+			struct_type.implemented_interfaces = make([dynamic]^Type)
+
+			sym := ctx.res.decl_symbols[decl]
+			ctx.symbol_types[sym] = struct_type
+
+		case ^Interface_Decl:
+			iface_type := new(Type)
+			iface_type.kind = .Interface
+			iface_type.name = d.name
+			iface_type.interface_methods = make(map[string]^Type)
+			ctx.symbol_types[ctx.res.decl_symbols[decl]] = iface_type
+		}
+	}
+
+	// ПРОХОД 2: заполняем структуры, интерфейсы и сигнатуры функций.
+	for decl in prog.decls {
+		#partial switch d in decl {
+		case ^Struct_Decl:
+			sym := ctx.res.decl_symbols[decl]
+			struct_type := ctx.symbol_types[sym]
+			struct_type.fields = make([dynamic]Struct_Field)
 
 			for f in d.fields {
 				field_type := resolve_type_node(ctx, f.type_annotation)
 				append(&struct_type.fields, Struct_Field{name = f.name, type = field_type})
 			}
 
-			sym := ctx.res.decl_symbols[decl]
-			ctx.symbol_types[sym] = struct_type
-
 		case ^Function_Decl:
-			params := make([dynamic]^Type)
-			for _ in d.args do append(&params, TY_ANY)
-			func_type := new_function_type(params, TY_ANY)
 			sym := ctx.res.decl_symbols[decl]
-			ctx.symbol_types[sym] = func_type
+			ctx.symbol_types[sym] = function_type_from_decl(ctx, d)
 
 		case ^Interface_Decl:
-			iface_type := new(Type); iface_type.kind = .Interface; iface_type.name = d.name
+			iface_type := ctx.symbol_types[ctx.res.decl_symbols[decl]]
 			iface_type.interface_methods = make(map[string]^Type)
 			for m in d.methods {
-				params := make([dynamic]^Type)
-				append(&params, TY_ANY) // Первый неявный параметр (это)
-				for _ in m.args do append(&params, TY_ANY)
-				iface_type.interface_methods[m.name] = new_function_type(params, TY_ANY)
+				iface_type.interface_methods[m.name] = interface_method_type_from_signature(ctx, iface_type, m)
 			}
-			ctx.symbol_types[ctx.res.decl_symbols[decl]] = iface_type}
+		}
 	}
 
-	// ПРОХОД 2: Привязка реализаций (методов и контрактов) к структурам
+	// ПРОХОД 3: Привязка реализаций (методов и контрактов) к структурам
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Impl_Decl:
@@ -166,7 +230,15 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			// Регистрируем методы
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
-				ctx.symbol_types[sym] = new_function_type(make([dynamic]^Type), TY_ANY)
+				method_type := function_type_from_decl(ctx, m)
+				if len(method_type.params) == 0 || !types_are_equal(method_type.params[0], struct_type) {
+					fmt.panicf(
+						"Type Error: первый аргумент метода '%s' должен иметь тип '%s'",
+						m.name,
+						struct_type.name,
+					)
+				}
+				ctx.symbol_types[sym] = method_type
 				original_name := m.name[len(d.target_type) + 2:]
 				struct_type.methods[original_name] = sym
 			}
@@ -184,67 +256,38 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				}
 
 				for req_name in iface_type.interface_methods {
-					found := false
-					for m in d.methods {
-						original_name := m.name[len(d.target_type) + 2:]
-						if original_name == req_name {
-							expected_method_type := iface_type.interface_methods[req_name]
-							if len(m.args) != len(expected_method_type.params) {
-								fmt.panicf(
-									"Type Error: метод '%s' структуры '%s' имеет %d аргументов, ожидалось %d",
-									req_name,
-									d.target_type,
-									len(m.args) - 1,
-									len(expected_method_type.params) - 1,
-								)
-							}
-							found = true
-							break
-						}
-					}
+					method_sym, found := struct_type.methods[req_name]
 					if !found do fmt.panicf("Type Error: структура '%s' не реализует метод '%s'", d.target_type, req_name)
+
+					expected_method_type := iface_type.interface_methods[req_name]
+					actual_method_type := ctx.symbol_types[method_sym]
+					if !interface_method_types_match(expected_method_type, actual_method_type) {
+						fmt.panicf(
+							"Type Error: метод '%s' структуры '%s' не совпадает с контрактом интерфейса '%s'",
+							req_name,
+							d.target_type,
+							d.interface_name,
+						)
+					}
 				}
 				append(&struct_type.implemented_interfaces, iface_type)
 			}
 		}
 	}
 
-	// ПРОХОД 3: Глубокая проверка тел всех функций и методов
+	// ПРОХОД 4: Глубокая проверка тел всех функций и методов
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Function_Decl:
-			if args_syms, ok := ctx.res.func_args[d]; ok {
-				for sym in args_syms do ctx.symbol_types[sym] = TY_ANY
-			}
-			check_function_body(ctx, d.body, TY_ANY)
+			func_type := ctx.symbol_types[ctx.res.decl_symbols[decl]]
+			bind_function_args(ctx, d, func_type)
+			check_function_body(ctx, d.body, func_type.return_type)
 		case ^Impl_Decl:
-			target_sym := ctx.res.global_scope.symbols[d.target_type]
-			struct_type := ctx.symbol_types[target_sym]
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
-
-				// ИСПРАВЛЕНИЕ: Используем реальное количество аргументов из парсера
-				params := make([dynamic]^Type)
-				// m.args уже содержит 'это' (первым элементом)
-				for i in 0 ..< len(m.args) {
-					if i == 0 {
-						append(&params, struct_type)
-					} else { 	// 'это' имеет тип структуры
-						append(&params, TY_ANY) // остальные аргументы}
-					}
-				}
-
-				ctx.symbol_types[sym] = new_function_type(params, TY_ANY)
-
-				original_name := m.name[len(d.target_type) + 2:]
-				struct_type.methods[original_name] = sym
-
-				if args_syms, ok := ctx.res.func_args[m]; ok {
-					for arg_sym, i in args_syms {
-						ctx.symbol_types[arg_sym] = i == 0 ? struct_type : TY_ANY
-					}
-				}
-				check_function_body(ctx, m.body, TY_ANY)
+				func_type := ctx.symbol_types[sym]
+				bind_function_args(ctx, m, func_type)
+				check_function_body(ctx, m.body, func_type.return_type)
 			}
 		}
 	}
@@ -258,6 +301,7 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 		if n.name == "Число" do return TY_NUM
 		if n.name == "Булево" do return TY_BOOL
 		if n.name == "Строка" do return TY_STRING
+		if n.name == "Пусто" do return TY_VOID
 		if sym := lookup_symbol(ctx.res.global_scope, n.name); sym != nil {
 			if typ, ok := ctx.symbol_types[sym]; ok do return typ
 		}
@@ -294,8 +338,8 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 }
 
 types_are_equal :: proc(a: ^Type, b: ^Type) -> bool {
-	if a == b || a.kind == .Any || b.kind == .Any do return true
 	if a == nil || b == nil do return false
+	if a == b do return true
 
 	if b.kind == .Interface && a.kind == .Struct {
 		for iface in a.implemented_interfaces {
@@ -328,6 +372,9 @@ types_are_equal :: proc(a: ^Type, b: ^Type) -> bool {
 	case .Map:
 		return types_are_equal(a.key_type, b.key_type) &&
 		       types_are_equal(a.value_type, b.value_type)
+
+	case .Struct, .Interface:
+		return false
 	}
 	return true
 }
@@ -377,14 +424,54 @@ infer_block_type :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 }
 
 check_func_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) {
-	expected_return := TY_VOID
-	check_function_body(ctx, d.body, expected_return)
+	func_type := ctx.symbol_types[ctx.res.decl_symbols[d]]
+	check_function_body(ctx, d.body, func_type.return_type)
 }
 
 check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return: ^Type) {
 	for stmt in body {
 		check_stmt(ctx, stmt, expected_return)
 	}
+
+	body_type := infer_block_type(ctx, body)
+	explicit_return_type := infer_function_body(ctx, body)
+
+	if expected_return == TY_VOID {
+		if body_type != TY_VOID {
+			fmt.panicf(
+				"Type Error: функция объявлена как 'Пусто', но последнее выражение имеет тип '%s'",
+				body_type.name,
+			)
+		}
+		return
+	}
+
+	if body_type != TY_VOID {
+		if !types_are_equal(body_type, expected_return) {
+			fmt.panicf(
+				"Type Error: функция должна возвращать '%s', но последнее выражение имеет тип '%s'",
+				expected_return.name,
+				body_type.name,
+			)
+		}
+		return
+	}
+
+	if explicit_return_type != nil && explicit_return_type != TY_VOID {
+		if !types_are_equal(explicit_return_type, expected_return) {
+			fmt.panicf(
+				"Type Error: функция должна возвращать '%s', но return имеет тип '%s'",
+				expected_return.name,
+				explicit_return_type.name,
+			)
+		}
+		return
+	}
+
+	fmt.panicf(
+		"Type Error: функция должна возвращать '%s', но тело не возвращает значение",
+		expected_return.name,
+	)
 }
 
 infer_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
@@ -434,10 +521,16 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 		sym := ctx.res.stmt_symbols[stmt]
 		if s.type_annotation != nil {
 			expected_type := resolve_type_node(ctx, s.type_annotation)
+			if expected_type == TY_VOID {
+				fmt.panicf("Type Error: переменная '%s' не может иметь тип 'Пусто'", s.name)
+			}
 			check_expr(ctx, s.value, expected_type)
 			ctx.symbol_types[sym] = expected_type
 		} else {
 			t := infer_expr(ctx, s.value)
+			if t == TY_VOID {
+				fmt.panicf("Type Error: переменная '%s' не может иметь тип 'Пусто'", s.name)
+			}
 			ctx.symbol_types[sym] = t
 		}
 
@@ -505,12 +598,15 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		t = TY_STRING
 
 	case ^Lambda_Expr:
-		params := make([dynamic]^Type)
-		for _ in e.args do append(&params, TY_ANY)
+		params := resolve_param_types(ctx, e.args)
 		if args_syms, ok := ctx.res.lambda_args[expr]; ok {
-			for sym in args_syms do ctx.symbol_types[sym] = TY_ANY
+			if len(args_syms) != len(params) {
+				fmt.panicf("Type Error: лямбда имеет рассинхронизированные аргументы")
+			}
+			for sym, i in args_syms do ctx.symbol_types[sym] = params[i]
 		}
-		ret_type := infer_block_type(ctx, e.body)
+		ret_type := resolve_type_node(ctx, e.return_type)
+		check_function_body(ctx, e.body, ret_type)
 		t = new_function_type(params, ret_type)
 
 	case ^Ident_Expr:
@@ -539,7 +635,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 					left_t.name,
 				)
 			}
-			t = right_t
+			t = TY_VOID
 		case:
 			fmt.panicf("Type Error: неподдерживаемый оператор %v", e.op)
 		}
@@ -580,7 +676,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 						)
 					}
 					ctx.collection_calls[expr] = prop_expr.property
-					t = obj_type.element_type.kind == .Any ? default_type : obj_type.element_type
+					t = obj_type.element_type
 					ctx.node_types[expr] = t
 					return t
 				case "есть":
@@ -628,7 +724,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 						)
 					}
 					ctx.collection_calls[expr] = prop_expr.property
-					t = obj_type.value_type.kind == .Any ? default_type : obj_type.value_type
+					t = obj_type.value_type
 					ctx.node_types[expr] = t
 					return t
 				case "удалить":
@@ -727,12 +823,13 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		t = new_tuple_type(elements_types)
 
 	case ^Array_Expr:
-		element_type := TY_ANY
+		if len(e.elements) == 0 {
+			fmt.panicf("Type Error: для пустого массива нужна аннотация ожидаемого типа")
+		}
+		element_type := infer_expr(ctx, e.elements[0])
 		for el, i in e.elements {
 			current_type := infer_expr(ctx, el)
-			if i == 0 {
-				element_type = current_type
-			} else if !types_are_equal(current_type, element_type) {
+			if i > 0 && !types_are_equal(current_type, element_type) {
 				fmt.panicf(
 					"Type Error: элементы массива имеют разные типы: '%s' и '%s'",
 					element_type.name,
@@ -743,18 +840,18 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		t = new_array_type(element_type)
 
 	case ^Map_Expr:
-		key_type := TY_ANY
-		value_type := TY_ANY
+		if len(e.entries) == 0 {
+			fmt.panicf("Type Error: для пустого соответствия нужна аннотация ожидаемого типа")
+		}
+		key_type := infer_expr(ctx, e.entries[0].key)
+		value_type := infer_expr(ctx, e.entries[0].value)
 		for entry, i in e.entries {
 			current_key_type := infer_expr(ctx, entry.key)
 			current_value_type := infer_expr(ctx, entry.value)
 			if !is_valid_map_key_type(current_key_type) {
 				fmt.panicf("Type Error: тип '%s' нельзя использовать как ключ соответствия", current_key_type.name)
 			}
-			if i == 0 {
-				key_type = current_key_type
-				value_type = current_value_type
-			} else {
+			if i > 0 {
 				if !types_are_equal(current_key_type, key_type) {
 					fmt.panicf(
 						"Type Error: ключи соответствия имеют разные типы: '%s' и '%s'",

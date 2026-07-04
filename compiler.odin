@@ -42,6 +42,7 @@ Compiled_Function :: struct {
 	instructions: [dynamic]u8,
 	constants:    [dynamic]Value,
 	frame_size:   int,
+	returns_value: bool,
 }
 
 Local :: struct {
@@ -163,6 +164,8 @@ compile_program :: proc(
 		case ^Function_Decl:
 			fn := new(Compiled_Function)
 			fn.name = d.name
+			func_type := tc.symbol_types[res.decl_symbols[decl]]
+			fn.returns_value = func_type.return_type != TY_VOID
 			// Инициализируем массивы функции
 			fn.instructions = make([dynamic]u8)
 			fn.constants = make([dynamic]Value)
@@ -170,6 +173,8 @@ compile_program :: proc(
 		case ^Impl_Decl:
 			for m in d.methods {
 				fn := new(Compiled_Function); fn.name = m.name
+				func_type := tc.symbol_types[res.decl_symbols[m]]
+				fn.returns_value = func_type.return_type != TY_VOID
 				fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
 				registry[m.name] = fn
 			}
@@ -286,6 +291,8 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 	case ^Lambda_Expr:
 		fn := new(Compiled_Function)
 		fn.name = fmt.tprintf("lambda_%d", len(ctx.registry^))
+		lambda_type := ctx.tc.node_types[expr]
+		fn.returns_value = lambda_type.return_type != TY_VOID
 		fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
 		ctx.registry^[fn.name] = fn
 
@@ -340,8 +347,6 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				}
 				if slot != -1 {
 					emit_opcode(ctx, .Set_Local)
-					emit_byte(ctx, u8(slot))
-					emit_opcode(ctx, .Get_Local)
 					emit_byte(ctx, u8(slot))
 				}
 			} else if prop, ok_2 := e.left.(^Property_Expr); ok_2 {

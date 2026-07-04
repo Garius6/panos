@@ -110,8 +110,8 @@ resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program) {
 				push_scope(ctx)
 				args_syms := make([dynamic]^Symbol)
 				for arg in m.args {
-					sym := new(Symbol); sym.name = arg
-					ctx.current_scope.symbols[arg] = sym
+					sym := new(Symbol); sym.name = arg.name
+					ctx.current_scope.symbols[arg.name] = sym
 					append(&args_syms, sym)
 				}
 				ctx.func_args[m] = args_syms
@@ -125,8 +125,8 @@ resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program) {
 			args_syms := make([dynamic]^Symbol)
 			for arg in d.args {
 				sym := new(Symbol)
-				sym.name = arg
-				ctx.current_scope.symbols[arg] = sym
+				sym.name = arg.name
+				ctx.current_scope.symbols[arg.name] = sym
 				append(&args_syms, sym)
 			}
 			ctx.func_args[decl] = args_syms
@@ -224,8 +224,8 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		push_scope(ctx)
 		args_syms := make([dynamic]^Symbol)
 		for arg in e.args {
-			sym := new(Symbol); sym.name = arg
-			ctx.current_scope.symbols[arg] = sym
+			sym := new(Symbol); sym.name = arg.name
+			ctx.current_scope.symbols[arg.name] = sym
 			append(&args_syms, sym)
 		}
 		ctx.lambda_args[expr] = args_syms

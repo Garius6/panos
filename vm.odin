@@ -105,7 +105,26 @@ execute :: proc(vm: ^VM) {
 
 			// 4. Складываем и снова упаковываем в union
 			append(&vm.stack, Value(a + b))
-		case .Subtract, .Multiply, .Divide:
+		case .Subtract:
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
+			append(&vm.stack, l - r) // <-- ДОБАВЛЕНО
+
+		case .Multiply:
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
+			append(&vm.stack, l * r) // <-- ДОБАВЛЕНО
+		case .Divide:
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
+			append(&vm.stack, l / r) // <-- ДОБАВЛЕНО
+
+		case .Less:
+			// <-- ДОБАВЛЕНО
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
+			append(&vm.stack, l < r) // <-- ДОБАВЛЕНО
+
+		case .Greater:
+			// <-- ДОБАВЛЕНО
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
+			append(&vm.stack, l > r)
 		case .Call:
 			frame.ip += 1
 			arg_count := int(instructions[frame.ip])
@@ -200,6 +219,130 @@ execute :: proc(vm: ^VM) {
 			// Безусловный прыжок (например, в конец if после выполнения then)
 			// Если offset отрицательный (в случае While), int() сохранит знак.
 			frame.ip += int(i16(offset))
+		case .Build_Aggregate:
+			frame.ip += 1
+			count := int(instructions[frame.ip])
+
+			agg := new(Aggregate_Value)
+			agg.elements = make([dynamic]Value, count)
+
+			// ВАЖНО: Снимаем значения со стека в ОБРАТНОМ порядке!
+			// Если было Игрок(10, 20), то 20 лежит на самом верху стека (индекс 1).
+			for i := count - 1; i >= 0; i -= 1 {
+				agg.elements[i] = pop(&vm.stack)
+			}
+
+			// Кладем готовую структуру на стек
+			append(&vm.stack, Value(agg))
+
+		case .Get_Property:
+			frame.ip += 1
+			idx := int(instructions[frame.ip])
+
+			val := pop(&vm.stack)
+			agg, ok := val.(^Aggregate_Value)
+
+			if !ok {
+				fmt.panicf(
+					"Runtime Error: попытка прочитать поле у примитивного типа",
+				)
+			}
+
+			// Достаем нужное поле по индексу и кладем на вершину стека
+			append(&vm.stack, agg.elements[idx])
+
+		case .Set_Property:
+			frame.ip += 1
+			idx := int(instructions[frame.ip])
+
+			value := pop(&vm.stack)
+			target := pop(&vm.stack)
+
+			if agg, ok_agg := target.(^Aggregate_Value); ok_agg {
+				agg.elements[idx] = value
+			} else if iface, ok_iface := target.(^Interface_Value); ok_iface {
+				iface.data.elements[idx] = value
+			} else {
+				fmt.panicf(
+					"Runtime Error: попытка записать поле у примитивного типа",
+				)
+			}
+
+			append(&vm.stack, value)
+
+		case .Cast_Interface:
+			frame.ip += 1
+			struct_name_index := instructions[frame.ip]
+			struct_name := frame.function.constants[struct_name_index].(string)
+
+			val := pop(&vm.stack)
+			agg, ok := val.(^Aggregate_Value)
+			if !ok {
+				fmt.panicf(
+					"Runtime Error: в интерфейс можно привести только структуру",
+				)
+			}
+
+			iface := new(Interface_Value)
+			iface.data = agg
+			iface.methods = make(map[string]^Compiled_Function)
+
+			prefix := fmt.tprintf("%s::", struct_name)
+			for name, fn in vm.compiled_functions {
+				if len(name) > len(prefix) && name[:len(prefix)] == prefix {
+					iface.methods[name[len(prefix):]] = fn
+				}
+			}
+
+			append(&vm.stack, Value(iface))
+
+		case .Invoke_Interface:
+			frame.ip += 1
+			method_name_index := instructions[frame.ip]
+			frame.ip += 1
+			arg_count := int(instructions[frame.ip])
+
+			method_name := frame.function.constants[method_name_index].(string)
+			callee_index := len(vm.stack) - 1 - arg_count
+			iface_val := vm.stack[callee_index]
+
+			iface, ok := iface_val.(^Interface_Value)
+			if !ok {
+				fmt.panicf(
+					"Runtime Error: попытка вызвать интерфейсный метод у не-интерфейса",
+				)
+			}
+
+			func_ptr, found := iface.methods[method_name]
+			if !found {
+				fmt.panicf(
+					"Runtime Error: метод '%s' не найден в vtable интерфейса",
+					method_name,
+				)
+			}
+
+			vm.stack[callee_index] = Value(func_ptr)
+			append(&vm.stack, Value(f64(0)))
+			for i := len(vm.stack) - 1; i > callee_index + 1; i -= 1 {
+				vm.stack[i] = vm.stack[i - 1]
+			}
+			vm.stack[callee_index + 1] = Value(iface.data)
+
+			total_arg_count := arg_count + 1
+			new_frame := CallFrame {
+				function      = func_ptr,
+				ip            = 0,
+				frame_pointer = callee_index + 1,
+			}
+
+			locals_to_allocate := func_ptr.frame_size - total_arg_count
+			for _ in 0 ..< locals_to_allocate {
+				append(&vm.stack, Value(f64(0)))
+			}
+
+			vm.frames[len(vm.frames) - 1].ip = frame.ip + 1
+			append(&vm.frames, new_frame)
+			continue
 		}
 
 		// Двигаем IP текущего фрейма вперед

@@ -1,0 +1,92 @@
+package main
+
+import "core:testing"
+
+// Вспомогательная функция, которая прогоняет весь пайплайн и возвращает результат
+run_code :: proc(source: string) -> (Value, bool) {
+	// 1. Лексика и Парсинг
+	tokens := tokenize(source) // Ваша функция лексера
+	stream := make_stream(tokens)
+	parser := Parser {
+		stream = &stream,
+	}
+	prog := parse_program(&parser)
+
+	// 2. Резолв и Типизация
+	res_ctx := new_resolver_ctx()
+	resolve_program(&res_ctx, prog)
+
+	type_ctx := new_type_ctx(&res_ctx)
+	typecheck_program(&type_ctx, prog)
+
+	// 3. Компиляция
+	registry := compile_program(&res_ctx, &type_ctx, &prog)
+
+	// 4. Выполнение (VM)
+	vm := new_vm(registry)
+	execute(vm)
+
+	// Возвращаем результат (то, что осталось на вершине стека)
+	if len(vm.stack) > 0 {
+		return vm.stack[len(vm.stack) - 1], true
+	}
+	return 0.0, false
+}
+
+@(test)
+test_math_and_logic :: proc(t: ^testing.T) {
+	TestCase :: struct {
+		name:     string,
+		source:   string,
+		expected: Value,
+	}
+
+	tests := []TestCase {
+		{
+			"Простая математика",
+			"функ старт()  10 + 20 конец",
+			f64(30.0),
+		},
+		{"Унарный минус", "функ старт()  -5 конец", f64(-5.0)},
+		{"Логика", "функ старт() истина конец", true},
+		{
+			"Сложный if",
+			`
+			функ старт()
+				пер х = если истина тогда 10 иначе 20 конец
+				х + 5
+		    конец
+		`,
+			f64(15.0),
+		},
+		{
+			"Вызов функции",
+			`
+			функ удвоить(х)  х * 2 конец // когда добавите парсинг аргументов
+			функ старт()  удвоить(10) конец
+		`,
+			f64(20.0),
+		},
+	}
+
+	for tc in tests {
+		result, ok := run_code(tc.source)
+		testing.expectf(
+			t,
+			ok,
+			"[%s] ПРОВАЛ: Стек пуст, нет результата",
+			tc.name,
+		)
+
+		if !ok do continue
+
+		testing.expectf(
+			t,
+			result == tc.expected,
+			"[%s] ПРОВАЛ: Ожидалось %v, получено %v",
+			tc.name,
+			tc.expected,
+			result,
+		)
+	}
+}

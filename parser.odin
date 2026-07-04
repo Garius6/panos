@@ -17,27 +17,59 @@ Function_Decl :: struct {
 	body: [dynamic]Stmt,
 }
 
+Method_Signature :: struct {
+	name: string,
+	args: [dynamic]string,
+}
+
+Interface_Decl :: struct {
+	name:    string,
+	methods: [dynamic]Method_Signature,
+}
+
+Field_Decl :: struct {
+	name:            string,
+	type_annotation: Type_Node,
+}
+
+Struct_Decl :: struct {
+	name:   string,
+	fields: [dynamic]Field_Decl,
+}
+
+Impl_Decl :: struct {
+	interface_name: string,
+	target_type:    string,
+	methods:        [dynamic]^Function_Decl,
+}
+
 Decls :: union {
 	^Function_Decl,
+	^Struct_Decl,
+	^Impl_Decl,
+	^Interface_Decl,
 }
 
 Program :: struct {
 	decls: [dynamic]Decls,
 }
 
+// НОВОЕ: Универсальный тип для дженериков (Массив(Число), Соответствие(Число, Строка))
+Type_Generic :: struct {
+	name:   string,
+	params: [dynamic]Type_Node,
+}
+
 Type_Node :: union {
 	^Type_Ident,
 	^Type_Tuple,
 	^Type_Function,
+	^Type_Generic, // Заменяет Type_Array и Type_Map
 }
 
 Type_Function :: struct {
 	params:      [dynamic]Type_Node,
-	return_type: Type_Node, // Может быть nil, если возвращается Void (ничего)
-}
-
-Tuple_Expr :: struct {
-	elements: [dynamic]Expr,
+	return_type: Type_Node,
 }
 
 Type_Ident :: struct {
@@ -85,15 +117,24 @@ Boolean_Expr :: struct {
 	value: bool,
 }
 
+String_Expr :: struct {
+	value: string,
+}
+
 Binary_Expr :: struct {
 	left:  Expr,
-	op:    TokenKind,
+	op:    TokenKind, // Теперь может быть .Assign (=)
 	right: Expr,
 }
 
 Call_Expr :: struct {
 	args:   [dynamic]Expr,
 	callee: Expr,
+}
+
+Property_Expr :: struct {
+	object:   Expr,
+	property: string,
 }
 
 If_Expr :: struct {
@@ -107,9 +148,19 @@ While_Expr :: struct {
 	body:      [dynamic]Stmt,
 }
 
+Tuple_Expr :: struct {
+	elements: [dynamic]Expr,
+}
+
+Lambda_Expr :: struct {
+	args: [dynamic]string,
+	body: [dynamic]Stmt,
+}
+
 Expr :: union {
 	^Number_Expr,
 	^Boolean_Expr,
+	^String_Expr,
 	^Binary_Expr,
 	^Unary_Expr,
 	^Ident_Expr,
@@ -117,9 +168,12 @@ Expr :: union {
 	^While_Expr,
 	^If_Expr,
 	^Tuple_Expr,
+	^Property_Expr,
+	^Lambda_Expr,
 }
 
-// Функция для печати всей программы
+// --- ПЕЧАТЬ AST ---
+
 print_program :: proc(prog: Program) {
 	fmt.println("Program")
 	for decl in prog.decls {
@@ -135,10 +189,24 @@ print_decl :: proc(decl: Decls) {
 			is_last := i == len(d.body) - 1
 			print_stmt(stmt, "", is_last)
 		}
+	case ^Struct_Decl:
+		fmt.printf("Struct (%s)\n", d.name)
+		for field, i in d.fields {
+			is_last := i == len(d.fields) - 1
+			print_field(field, "", is_last)
+		}
+	case ^Impl_Decl:
+		fmt.printf("Impl (%s)\n", d.target_type)
+	case ^Interface_Decl:
+		fmt.printf("Interface (%s)\n", d.name)
 	}
 }
 
-// Функция для печати инструкций (Statements)
+print_field :: proc(field: Field_Decl, prefix: string = "", is_last: bool = true) {
+	marker := is_last ? "└── " : "├── "
+	fmt.printf("%s%sField(%s)\n", prefix, marker, field.name)
+}
+
 print_stmt :: proc(stmt: Stmt, prefix: string = "", is_last: bool = true) {
 	if stmt == nil do return
 
@@ -148,7 +216,6 @@ print_stmt :: proc(stmt: Stmt, prefix: string = "", is_last: bool = true) {
 	switch s in stmt {
 	case ^Let_Stmt:
 		fmt.printf("%s%sLet(%s)\n", prefix, marker, s.name)
-		// У Let_Stmt всегда есть значение (value), оно последнее
 		print_ast(s.value, next_prefix, true)
 
 	case ^Return_Stmt:
@@ -167,21 +234,19 @@ print_ast :: proc(expr: Expr, prefix: string = "", is_last: bool = true) {
 	if expr == nil do return
 
 	marker := is_last ? "└── " : "├── "
-
 	next_prefix_base := is_last ? "    " : "│   "
 	next_prefix := fmt.tprintf("%s%s", prefix, next_prefix_base)
 
 	switch e in expr {
 	case ^Number_Expr:
 		fmt.printf("%s%sNumber(%v)\n", prefix, marker, e.value)
-
 	case ^Boolean_Expr:
 		fmt.printf("%s%sBoolean(%v)\n", prefix, marker, e.value)
-
+	case ^String_Expr:
+		fmt.printf("%s%sString(\"%s\")\n", prefix, marker, e.value)
 	case ^Unary_Expr:
 		fmt.printf("%s%sUnary(%v)\n", prefix, marker, e.op)
 		print_ast(e.right, next_prefix, true)
-
 	case ^Binary_Expr:
 		fmt.printf("%s%sBinary(%v)\n", prefix, marker, e.op)
 		print_ast(e.left, next_prefix, false)
@@ -191,34 +256,41 @@ print_ast :: proc(expr: Expr, prefix: string = "", is_last: bool = true) {
 	case ^Call_Expr:
 		fmt.printf("%s%sCall()\n", prefix, marker)
 		print_ast(e.callee, next_prefix, false)
-		for arg in e.args {
-			print_ast(arg, next_prefix, false)
+		for arg, i in e.args {
+			print_ast(arg, next_prefix, i == len(e.args) - 1)
 		}
 	case ^While_Expr:
 		fmt.printf("%s%sWhile()\n", prefix, marker)
-		print_ast(e.condition)
-		for stmt in e.body {
-			print_stmt(stmt)
+		print_ast(e.condition, next_prefix, false)
+		for stmt, i in e.body {
+			print_stmt(stmt, next_prefix, i == len(e.body) - 1)
 		}
-
 	case ^If_Expr:
 		fmt.printf("%s%sIf()\n", prefix, marker)
 		print_ast(e.condition, next_prefix, false)
-
 		for stmt in e.then_branch {
-			print_stmt(stmt)
+			print_stmt(stmt, next_prefix, false)
 		}
-
-		for stmt in e.else_branch {
-			print_stmt(stmt)
+		for stmt, i in e.else_branch {
+			print_stmt(stmt, next_prefix, i == len(e.else_branch) - 1)
 		}
 	case ^Tuple_Expr:
 		fmt.printf("%s%sTuple()\n", prefix, marker)
 		for el, i in e.elements {
 			print_ast(el, next_prefix, i == len(e.elements) - 1)
 		}
+	case ^Property_Expr:
+		fmt.printf("%s%sProperty(%s)\n", prefix, marker, e.property)
+		print_ast(e.object, next_prefix, true)
+	case ^Lambda_Expr:
+		fmt.printf("%s%sLambda()\n", prefix, marker)
+		for stmt, i in e.body {
+			print_stmt(stmt, next_prefix, i == len(e.body) - 1)
+		}
 	}
 }
+
+// --- ПАРСИНГ ВЕРХНЕГО УРОВНЯ ---
 
 parse_program :: proc(p: ^Parser) -> Program {
 	prog := Program {
@@ -226,93 +298,209 @@ parse_program :: proc(p: ^Parser) -> Program {
 	}
 
 	for peek_token(p.stream).kind != .EOF {
-		if peek_token(p.stream).kind != .Function {
-			fmt.panicf("Ожидалось объявление функции")
-		}
-		decl := parse_function(p)
-		if decl != nil {
+		tok_kind := peek_token(p.stream).kind
+		if tok_kind == .Function {
+			decl := parse_function(p)
 			append(&prog.decls, decl)
+		} else if tok_kind == .TypeDecl {
+			if p.stream.tokens[p.stream.current_idx + 3].kind == .Struct {
+				decl := parse_struct_decl(p)
+				append(&prog.decls, decl)
+			} else {
+				decl := parse_interface_decl(p)
+				append(&prog.decls, decl)
+			}
+		} else if tok_kind == .Impl {
+			decl := parse_impl_decl(p)
+			append(&prog.decls, decl)
+		} else {
+			fmt.panicf(
+				"Ожидалось объявление функции или типа, получено: %v",
+				tok_kind,
+			)
 		}
 	}
 	return prog
 }
 
+parse_interface_decl :: proc(p: ^Parser) -> ^Interface_Decl {
+	expect(p, .TypeDecl)
+	decl := new(Interface_Decl)
+	decl.methods = make([dynamic]Method_Signature)
+
+	name_tok := next_token(p.stream)
+	decl.name = name_tok.data
+
+	expect(p, .Assign)
+	expect(p, .Interface)
+
+	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
+		expect(p, .Function)
+		method_name := next_token(p.stream)
+		signature := Method_Signature {
+			name = method_name.data,
+			args = make([dynamic]string),
+		}
+
+		expect(p, .LParen)
+		if peek_token(p.stream).kind == .Ident {
+			append(&signature.args, next_token(p.stream).data)
+			for peek_token(p.stream).kind == .Comma {
+				next_token(p.stream)
+				arg_tok := next_token(p.stream)
+				if arg_tok.kind != .Ident do fmt.panicf("Ожидалось имя аргумента")
+				append(&signature.args, arg_tok.data)
+			}
+		}
+		expect(p, .RParen)
+		append(&decl.methods, signature)
+		consume_semicolon_or_newline(p)
+	}
+
+	expect(p, .End)
+	return decl
+}
+
+parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
+	expect(p, .Impl)
+
+	decl := new(Impl_Decl)
+	decl.methods = make([dynamic]^Function_Decl)
+
+	first_ident := next_token(p.stream)
+	if first_ident.kind != .Ident do error("Ожидалось имя типа или интерфейса")
+
+	if peek_token(p.stream).kind == .For {
+		expect(p, .For)
+
+		target_tok := next_token(p.stream)
+		if target_tok.kind != .Ident do error("Ожидалось имя целевой структуры")
+
+		decl.interface_name = first_ident.data
+		decl.target_type = target_tok.data
+	} else {
+		decl.target_type = first_ident.data
+	}
+
+	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
+		if peek_token(p.stream).kind != .Function {
+			error(
+				"Внутри блока реализации могут быть только функции",
+			)
+		}
+
+		method := parse_function(p)
+		if len(method.args) == 0 || method.args[0] != "это" {
+			fmt.panicf(
+				"Синтаксическая ошибка: первый аргумент метода '%s' структуры '%s' должен называться 'это'",
+				method.name,
+				decl.target_type,
+			)
+		}
+
+		method.name = fmt.tprintf("%s::%s", decl.target_type, method.name)
+		append(&decl.methods, method)
+	}
+
+	expect(p, .End)
+	return decl
+}
+
 parse_function :: proc(p: ^Parser) -> ^Function_Decl {
 	expect(p, .Function)
-
 	function := new(Function_Decl)
 	function.args = make([dynamic]string)
 	function.body = make([dynamic]Stmt)
 
 	tok := next_token(p.stream)
-	if tok.kind != .Ident {
-		fmt.panicf("Ожидалось имя функции")
-	}
-
+	if tok.kind != .Ident do fmt.panicf("Ожидалось имя функции")
 	function.name = tok.data
 
 	expect(p, .LParen)
-
-	if tok = peek_token(p.stream); tok.kind == .Ident {
-		for tok = next_token(p.stream); tok.kind == .Ident; {
-			append(&function.args, tok.data)
+	if peek_token(p.stream).kind == .Ident {
+		append(&function.args, next_token(p.stream).data)
+		for peek_token(p.stream).kind == .Comma {
+			next_token(p.stream) // Съедаем запятую
+			tok_arg := next_token(p.stream)
+			if tok_arg.kind != .Ident do fmt.panicf("Ожидалось имя аргумента")
+			append(&function.args, tok_arg.data)
 		}
 	}
-
 	expect(p, .RParen)
 
-	for peek_token(p.stream).kind != .End {
+	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
 		append(&function.body, parse_stmt(p))
 	}
-
 	expect(p, .End)
 
 	return function
 }
 
-parse_stmt :: proc(p: ^Parser) -> Stmt {
-	tok := peek_token(p.stream)
-	if tok == nil do return nil
+parse_struct_decl :: proc(p: ^Parser) -> ^Struct_Decl {
+	expect(p, .TypeDecl)
 
-	#partial switch tok.kind {
-	case .Return:
-		return parse_return_stmt(p)
-	case .Let:
-		return parse_let_stmt(p)
-	case:
-		// Если это не инструкция языка, значит это выражение.
-		// Например: a = 5; или foo();
-		return parse_expr_stmt(p)
+	decl := new(Struct_Decl)
+	decl.fields = make([dynamic]Field_Decl)
+
+	name_tok := next_token(p.stream)
+	if name_tok.kind != .Ident do error("Ожидалось имя типа")
+	decl.name = name_tok.data
+
+	expect(p, .Assign)
+	expect(p, .Struct)
+
+	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
+		field := Field_Decl{}
+
+		field_tok := next_token(p.stream)
+		if field_tok.kind != .Ident do error("Ожидалось имя поля структуры")
+		field.name = field_tok.data
+
+		expect(p, .Colon)
+
+		field.type_annotation = parse_type(p)
+		append(&decl.fields, field)
+
+		consume_semicolon_or_newline(p)
 	}
+
+	expect(p, .End)
+	return decl
 }
 
-parse_return_stmt :: proc(p: ^Parser) -> Stmt {
-	next_token(p.stream) // Поглощаем токен 'return'
-
-	stmt := new(Return_Stmt)
-
-	// Если после return сразу идет точка с запятой, выражение пустое
-	tok := peek_token(p.stream)
-	if tok.kind == .Semicolon || tok.kind == .End || tok.kind == .EOF {
-		stmt.value = nil
-	} else {
-		stmt.value = parse_expr(p, 0)
-	}
-
-	consume_semicolon_or_newline(p)
-	return stmt
-}
+// --- ПАРСИНГ ТИПОВ И ИНСТРУКЦИЙ ---
 
 parse_type :: proc(p: ^Parser) -> Type_Node {
 	tok := next_token(p.stream)
 
 	if tok.kind == .Ident {
+		// НОВОЕ: Универсальный парсинг дженерик-типов: Массив(Число), Соответствие(Число, Строка)
+		if peek_token(p.stream).kind == .LParen {
+			next_token(p.stream) // съедаем (
+			t := new(Type_Generic)
+			t.name = tok.data
+			t.params = make([dynamic]Type_Node)
+
+			if peek_token(p.stream).kind != .RParen {
+				for {
+					append(&t.params, parse_type(p))
+					if peek_token(p.stream).kind == .Comma {
+						next_token(p.stream)
+					} else {
+						break
+					}
+				}
+			}
+			expect(p, .RParen)
+			return t
+		}
+
+		// Иначе это обычный тип-идентификатор (Число, Строка)
 		t := new(Type_Ident)
 		t.name = tok.data
 		return t
 	}
 
-	// Тупл типов, например (Число, Строка)
 	if tok.kind == .LParen {
 		t := new(Type_Tuple)
 		t.elements = make([dynamic]Type_Node)
@@ -321,7 +509,7 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 			for {
 				append(&t.elements, parse_type(p))
 				if peek_token(p.stream).kind == .Comma {
-					next_token(p.stream) // съедаем запятую
+					next_token(p.stream)
 				} else {
 					break
 				}
@@ -335,28 +523,50 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 	return nil
 }
 
-parse_let_stmt :: proc(p: ^Parser) -> Stmt {
-	next_token(p.stream) // Поглощаем 'let'
+parse_stmt :: proc(p: ^Parser) -> Stmt {
+	tok := peek_token(p.stream)
+	if tok == nil do return nil
 
+	#partial switch tok.kind {
+	case .Return:
+		return parse_return_stmt(p)
+	case .Let:
+		return parse_let_stmt(p)
+	case:
+		return parse_expr_stmt(p)
+	}
+}
+
+parse_return_stmt :: proc(p: ^Parser) -> Stmt {
+	next_token(p.stream)
+	stmt := new(Return_Stmt)
+
+	tok := peek_token(p.stream)
+	if tok.kind == .Semicolon || tok.kind == .End || tok.kind == .EOF {
+		stmt.value = nil
+	} else {
+		stmt.value = parse_expr(p, 0)
+	}
+
+	consume_semicolon_or_newline(p)
+	return stmt
+}
+
+parse_let_stmt :: proc(p: ^Parser) -> Stmt {
+	next_token(p.stream)
 	stmt := new(Let_Stmt)
 
 	ident_tok := next_token(p.stream)
-	if ident_tok.kind != .Ident {
-		fmt.panicf(
-			"Синтаксическая ошибка: после 'пер' ожидается идентификатор",
-		)
-	}
+	if ident_tok.kind != .Ident do fmt.panicf("Синтаксическая ошибка: после 'пер' ожидается идентификатор")
 	stmt.name = ident_tok.data
 
 	if peek_token(p.stream).kind == .Colon {
-		next_token(p.stream) // Съедаем двоеточие
+		next_token(p.stream)
 		stmt.type_annotation = parse_type(p)
 	}
 
-	expect(p, .Assign) // Ожидаем '='
-
+	expect(p, .Assign)
 	stmt.value = parse_expr(p, 0)
-
 	consume_semicolon_or_newline(p)
 	return stmt
 }
@@ -364,19 +574,16 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 parse_expr_stmt :: proc(p: ^Parser) -> Stmt {
 	stmt := new(Expr_Stmt)
 	stmt.expr = parse_expr(p, 0)
-
 	consume_semicolon_or_newline(p)
-
 	return stmt
 }
 
+// --- ПАРСИНГ ВЫРАЖЕНИЙ (PRATT PARSER) ---
+
 parse_if_expr :: proc(p: ^Parser) -> Expr {
 	node := new(If_Expr)
-
-	// 1. Условие
 	node.condition = parse_expr(p, 0)
 
-	// 2. Блок 'тогда'
 	expect(p, .Then)
 	node.then_branch = make([dynamic]Stmt)
 	for {
@@ -385,10 +592,9 @@ parse_if_expr :: proc(p: ^Parser) -> Expr {
 		append(&node.then_branch, parse_stmt(p))
 	}
 
-	// 3. Блок 'иначе' (опционально)
 	node.else_branch = make([dynamic]Stmt)
 	if peek_token(p.stream).kind == .Else {
-		next_token(p.stream) // Съедаем 'иначе'
+		next_token(p.stream)
 		for {
 			kind := peek_token(p.stream).kind
 			if kind == .End || kind == .EOF do break
@@ -396,18 +602,14 @@ parse_if_expr :: proc(p: ^Parser) -> Expr {
 		}
 	}
 
-	// 4. Ожидаем 'конец'
 	expect(p, .End)
 	return node
 }
 
 parse_while_expr :: proc(p: ^Parser) -> Expr {
 	node := new(While_Expr)
-
-	// 1. Условие
 	node.condition = parse_expr(p, 0)
 
-	// 2. Блок 'цикл'
 	expect(p, .Loop)
 	node.body = make([dynamic]Stmt)
 	for {
@@ -437,27 +639,38 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 		if !is_infix || lbp < min_bp do break
 
 		next_token(p.stream)
+
 		if op.kind == .LParen {
-			// Вызов функции! `left` (то, что было до скобки) становится нашим callee
+			// Вызов функции (в том числе массив() и соответствие()!)
 			call := new(Call_Expr)
 			call.callee = left
 			call.args = make([dynamic]Expr)
 
-			// Парсим аргументы до закрывающей скобки
 			if peek_token(p.stream).kind != .RParen {
 				for {
 					append(&call.args, parse_expr(p, 0))
 					if peek_token(p.stream).kind == .Comma {
-						next_token(p.stream) // Съедаем запятую
+						next_token(p.stream)
 					} else {
 						break
 					}
 				}
 			}
-			expect(p, .RParen) // Съедаем ')'
-			left = call // Возвращаем собранный Call_Expr дальше по цепочке
+			expect(p, .RParen)
+			left = call
+
+		} else if op.kind == .Dot {
+			prop_tok := next_token(p.stream)
+			if prop_tok.kind != .Ident && prop_tok.kind != .Number {
+				error("Ожидалось имя поля или индекс после '.'")
+			}
+			prop := new(Property_Expr)
+			prop.object = left
+			prop.property = prop_tok.data
+			left = prop
+
 		} else {
-			// Обычный бинарный оператор (+, -, *, /)
+			// Обычный бинарный оператор (включая `=`)
 			right := parse_expr(p, rbp)
 			left = new_bin_op(op.kind, left, right)
 		}
@@ -473,31 +686,55 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 	case .Boolean:
 		return new_boolean_lit(tok)
 
+	case .String:
+		s := new(String_Expr)
+		s.value = tok.data
+		return s
+
 	case .Ident:
 		return new_ident(tok)
 
+	case .Function:
+		// Лямбда-функции: функ(х) х + 1 конец
+		lam := new(Lambda_Expr)
+		lam.args = make([dynamic]string)
+		lam.body = make([dynamic]Stmt)
+
+		expect(p, .LParen)
+		if peek_token(p.stream).kind == .Ident {
+			tok_arg := next_token(p.stream)
+			append(&lam.args, tok_arg.data)
+			for peek_token(p.stream).kind == .Comma {
+				next_token(p.stream)
+				t_arg := next_token(p.stream)
+				append(&lam.args, t_arg.data)
+			}
+		}
+		expect(p, .RParen)
+
+		for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
+			append(&lam.body, parse_stmt(p))
+		}
+		expect(p, .End)
+		return lam
+
 	case .LParen:
-		// 1. Обработка пустого тупла `()`
 		if peek_token(p.stream).kind == .RParen {
-			next_token(p.stream) // Съедаем ')'
+			next_token(p.stream)
 			t := new(Tuple_Expr)
 			t.elements = make([dynamic]Expr)
 			return t
 		}
 
-		// 2. Парсим первое выражение
 		e := parse_expr(p, 0)
 
-		// 3. Если дальше запятая, то это тупл `(a, b)`
 		if peek_token(p.stream).kind == .Comma {
 			t := new(Tuple_Expr)
 			t.elements = make([dynamic]Expr)
 			append(&t.elements, e)
 
 			for peek_token(p.stream).kind == .Comma {
-				next_token(p.stream) // Съедаем запятую
-
-				// Поддержка запятой в конце: `(1,)`
+				next_token(p.stream)
 				if peek_token(p.stream).kind == .RParen {
 					break
 				}
@@ -507,7 +744,6 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 			return t
 		}
 
-		// 4. Запятой нет — это обычная группировка `(a + b)`
 		expect(p, .RParen)
 		return e
 
@@ -517,17 +753,14 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 		return new_unary(tok, rhs)
 
 	case .If:
-		// Токен 'если' мы уже "съели", парсим остальное
 		return parse_if_expr(p)
 
 	case .While:
-		// Токен 'пока' мы уже "съели"
 		return parse_while_expr(p)
 
 	case:
 		error("unexpected token %s in nud position", tok.data)
 	}
-
 	return nil
 }
 
@@ -541,15 +774,23 @@ prefix_bp :: proc(token: ^Token) -> int {
 
 infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 	#partial switch tok.kind {
+	case .Dot:
+		return 90, 91, true
 	case .Star, .Slash:
 		return 60, 61, true
 	case .Plus, .Minus:
 		return 50, 51, true
+	case .Less, .Greater:
+		return 40, 41, true
+	case .Assign:
+		return 10, 9, true
 	case .LParen:
 		return 80, 0, true
 	}
 	return 0, 0, false
 }
+
+// --- УТИЛИТЫ ---
 
 error :: proc(format: string, args: ..any, loc := #caller_location) {
 	fmt.panicf(format, args, loc = loc)
@@ -557,54 +798,30 @@ error :: proc(format: string, args: ..any, loc := #caller_location) {
 
 expect :: proc(p: ^Parser, expected_kind: TokenKind, loc := #caller_location) {
 	tok := next_token(p.stream)
-
-	if tok == nil {
-		fmt.panicf(
-			"Синтаксическая ошибка: ожидалось %v, но обнаружен EOF",
-			expected_kind,
-			loc = loc,
-		)
-	}
-
-	if tok.kind != expected_kind {
-		fmt.panicf(
-			"Синтаксическая ошибка: ожидалось %v, обнаружен %v",
-			expected_kind,
-			tok.kind,
-			loc = loc,
-		)
-	}
+	if tok == nil do fmt.panicf("Синтаксическая ошибка: ожидалось %v, но обнаружен EOF", expected_kind, loc = loc)
+	if tok.kind != expected_kind do fmt.panicf("Синтаксическая ошибка: ожидалось %v, обнаружен %v", expected_kind, tok.kind, loc = loc)
 }
 
 consume_semicolon_or_newline :: proc(p: ^Parser) {
 	tok := peek_token(p.stream)
 	if tok.kind == .Semicolon {
-		next_token(p.stream) // Поглощаем явную ';'
+		next_token(p.stream)
 	} else if tok.kind == .EOF || tok.kind == .RParen {
-		// Здесь можно не поглощать, если мы достигли границы блока
 		return
-	} else {
-		// Если это не ';', но валидный конец выражения — просто игнорируем
-		// Либо можно логировать, что мы вставили "виртуальную" точку
 	}
 }
 
 new_int_lit :: proc(data: ^Token) -> Expr {
 	lit := new(Number_Expr)
 	value, ok := strconv.parse_f64(data.data)
-	if !ok {
-		error("Неверный числовой литерал")
-	}
-
+	if !ok do error("Неверный числовой литерал")
 	lit.value = value
 	return lit
 }
 
 new_boolean_lit :: proc(data: ^Token) -> Expr {
 	lit := new(Boolean_Expr)
-	value := data.data == "истина"
-
-	lit.value = value
+	lit.value = data.data == "истина"
 	return lit
 }
 

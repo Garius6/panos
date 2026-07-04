@@ -21,6 +21,8 @@ Resolver_Ctx :: struct {
 	decl_symbols:  map[Decls]^Symbol,
 	stmt_symbols:  map[Stmt]^Symbol,
 	node_symbols:  map[Expr]^Symbol,
+	func_args:     map[Decls][dynamic]^Symbol,
+	lambda_args:   map[Expr][dynamic]^Symbol,
 }
 
 push_scope :: proc(resolver: ^Resolver_Ctx) {
@@ -64,7 +66,8 @@ lookup_symbol :: proc(s: ^Scope, name: string) -> ^Symbol {
 
 resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program) {
 	for decl in prog.decls {
-		#partial switch d in decl {
+		switch d in decl {
+
 		case ^Function_Decl:
 			sym := new(Symbol)
 			sym.name = d.name
@@ -76,22 +79,66 @@ resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program) {
 
 			ctx.global_scope.symbols[sym.name] = sym
 			ctx.decl_symbols[decl] = sym
+		case ^Struct_Decl:
+			sym := new(Symbol)
+			sym.name = d.name
+
+			if sym.name in ctx.global_scope.symbols {
+				fmt.panicf("Resolve Error: Символ '%s' уже объявлен", sym.name)
+			}
+			ctx.global_scope.symbols[sym.name] = sym
+			ctx.decl_symbols[decl] = sym
+		case ^Interface_Decl:
+			sym := new(Symbol); sym.name = d.name
+			ctx.global_scope.symbols[sym.name] = sym
+			ctx.decl_symbols[decl] = sym
+		case ^Impl_Decl:
+			// Методы структур тоже становятся глобальными символами (формат 'Игрок::атаковать')
+			for m in d.methods {
+				sym := new(Symbol); sym.name = m.name
+				ctx.global_scope.symbols[sym.name] = sym
+				ctx.decl_symbols[m] = sym
+			}
 		}
+
 	}
 
 	for decl in prog.decls {
 		#partial switch d in decl {
+		case ^Impl_Decl:
+			for m in d.methods {
+				push_scope(ctx)
+				args_syms := make([dynamic]^Symbol)
+				for arg in m.args {
+					sym := new(Symbol); sym.name = arg
+					ctx.current_scope.symbols[arg] = sym
+					append(&args_syms, sym)
+				}
+				ctx.func_args[m] = args_syms
+				for stmt in m.body do resolve_stmt(ctx, stmt)
+				pop_scope(ctx)
+			}
+
 		case ^Function_Decl:
 			push_scope(ctx)
 
-			// В будущем здесь вы добавите параметры в Scope:
-			// for p in d.args { ... ctx.current_scope.symbols[p] = sym ... }
+			args_syms := make([dynamic]^Symbol)
+			for arg in d.args {
+				sym := new(Symbol)
+				sym.name = arg
+				ctx.current_scope.symbols[arg] = sym
+				append(&args_syms, sym)
+			}
+			ctx.func_args[decl] = args_syms
 
 			for stmt in d.body {
 				resolve_stmt(ctx, stmt)
 			}
 
 			pop_scope(ctx)
+		case ^Struct_Decl:
+		// Внутри структуры (пока) нет выражений или локальных переменных,
+		// поэтому обходить её тело в Резолвере не нужно.
 		}
 	}
 }
@@ -143,6 +190,7 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 
 	case ^Number_Expr:
 	case ^Boolean_Expr:
+	case ^String_Expr:
 	case ^Call_Expr:
 		resolve_expr(ctx, e.callee)
 
@@ -170,6 +218,19 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		for el in e.elements {
 			resolve_expr(ctx, el)
 		}
+	case ^Property_Expr:
+		resolve_expr(ctx, e.object)
+	case ^Lambda_Expr:
+		push_scope(ctx)
+		args_syms := make([dynamic]^Symbol)
+		for arg in e.args {
+			sym := new(Symbol); sym.name = arg
+			ctx.current_scope.symbols[arg] = sym
+			append(&args_syms, sym)
+		}
+		ctx.lambda_args[expr] = args_syms
+		for stmt in e.body do resolve_stmt(ctx, stmt)
+		pop_scope(ctx)
 	}
 }
 
@@ -181,7 +242,26 @@ print_resolver_ctx :: proc(ctx: ^Resolver_Ctx) {
 	)
 	if len(ctx.decl_symbols) == 0 do fmt.println("  (пусто)")
 	for decl, sym in ctx.decl_symbols {
-		#partial switch d in decl {
+		switch d in decl {
+		case ^Impl_Decl:
+			fmt.printf(
+				"  [STRUCT] '%s' -> создало Символ по адресу %p\n",
+				fmt.tprintf("%s:%s", d.target_type, d.interface_name),
+				sym,
+			)
+
+		case ^Struct_Decl:
+			fmt.printf(
+				"  [STRUCT] '%s' -> создало Символ по адресу %p\n",
+				d.name,
+				sym,
+			)
+		case ^Interface_Decl:
+			fmt.printf(
+				"  [INTERFACE] '%s' -> создало Символ по адресу %p\n",
+				d.name,
+				sym,
+			)
 		case ^Function_Decl:
 			// %p выведет уникальный адрес объекта Symbol (например, 0x14000123450)
 			fmt.printf(

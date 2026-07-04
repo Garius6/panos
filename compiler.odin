@@ -3,10 +3,23 @@ package main
 import "core:fmt"
 import "core:strings"
 
+Aggregate_Value :: struct {
+	elements: [dynamic]Value, // В реальном продакшене лучше использовать фиксированный срез (slice)
+}
+
+Interface_Value :: struct {
+	data:    ^Aggregate_Value,
+	// VTable: связывает имя метода из контракта с реальной скомпилированной функцией
+	methods: map[string]^Compiled_Function,
+}
+
 Value :: union {
 	f64,
 	bool,
+	string,
 	^Compiled_Function,
+	^Aggregate_Value,
+	^Interface_Value,
 }
 
 Compiled_Function :: struct {
@@ -24,6 +37,7 @@ Local :: struct {
 Compiler :: struct {
 	registry:         ^map[string]^Compiled_Function, // Указатель на глобальный реестр
 	current_function: ^Compiled_Function,
+	tc:               ^Type_Ctx,
 	res:              ^Resolver_Ctx,
 	locals:           [dynamic]Local,
 	scope_depth:      int,
@@ -45,6 +59,8 @@ Opcode :: enum u8 {
 	Subtract,
 	Multiply,
 	Divide,
+	Less,
+	Greater,
 	Get_Local, // Операнд: 1 байт (индекс слота во фрейме)
 	Set_Local, // Операнд: 1 байт (индекс слота во фрейме)
 	Jump_If_False, // Операнд: 2 байта (смещение прыжка)
@@ -52,6 +68,11 @@ Opcode :: enum u8 {
 	Pop, // Удалить вершину стека
 	Return, // Возврат из функции
 	Call,
+	Build_Aggregate, // Операнд: 1 байт (количество элементов)
+	Set_Property,
+	Get_Property, // Операнд: 1 байт (индекс поля)
+	Cast_Interface,
+	Invoke_Interface,
 }
 
 // Записать 1 байт в массив инструкций
@@ -64,17 +85,25 @@ emit_opcode :: proc(c: ^Compiler, op: Opcode) {
 	emit_byte(c, u8(op))
 }
 
-// Сохранить константу и сгенерировать инструкцию для ее загрузки
-emit_constant :: proc(c: ^Compiler, value: Value) {
+// Возвращает индекс константы в пуле (без генерации опкода .Constant)
+make_constant :: proc(c: ^Compiler, value: Value) -> u8 {
+	// Здесь Odin точно знает, что value имеет строгий тип Value, и append не сломается
 	append(&c.current_function.constants, value)
 	idx := len(c.current_function.constants) - 1
 
 	if idx > 255 {
-		fmt.panicf("Too many constants in one function!") // Для простоты используем 1 байт
+		fmt.panicf(
+			"Compiler Error: слишком много констант в одной функции!",
+		)
 	}
+	return u8(idx)
+}
 
+// Сохранить константу и сгенерировать опкод для ее загрузки на стек
+emit_constant :: proc(c: ^Compiler, value: Value) {
+	idx := make_constant(c, value)
 	emit_opcode(c, .Constant)
-	emit_byte(c, u8(idx))
+	emit_byte(c, idx)
 }
 
 // Генерирует опкод прыжка и 2 пустых байта для адреса.
@@ -100,7 +129,11 @@ patch_jump :: proc(c: ^Compiler, offset: int) {
 	c.current_function.instructions[offset + 1] = u8(jump_length & 0xff) // Младший байт
 }
 
-compile_program :: proc(res: ^Resolver_Ctx, program: ^Program) -> map[string]^Compiled_Function {
+compile_program :: proc(
+	res: ^Resolver_Ctx,
+	tc: ^Type_Ctx,
+	program: ^Program,
+) -> map[string]^Compiled_Function {
 	registry := make(map[string]^Compiled_Function)
 
 	// ПРОХОД 1: Выделяем память под функции (Hoisting)
@@ -114,6 +147,13 @@ compile_program :: proc(res: ^Resolver_Ctx, program: ^Program) -> map[string]^Co
 			fn.instructions = make([dynamic]u8)
 			fn.constants = make([dynamic]Value)
 			registry[d.name] = fn
+		case ^Impl_Decl:
+			for m in d.methods {
+				fn := new(Compiled_Function); fn.name = m.name
+				fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
+				registry[m.name] = fn
+			}
+
 		}
 	}
 
@@ -121,23 +161,37 @@ compile_program :: proc(res: ^Resolver_Ctx, program: ^Program) -> map[string]^Co
 	for decl in program.decls {
 		#partial switch d in decl {
 		case ^Function_Decl:
-			// СОЗДАЕМ ЧИСТЫЙ КОНТЕКСТ ДЛЯ ЭТОЙ ФУНКЦИИ!
-			// Массив locals пуст, scope_depth = 0. Никаких утечек переменных.
 			ctx := Compiler {
 				registry         = &registry,
 				current_function = registry[d.name],
+				tc               = tc,
 				res              = res,
 				locals           = make([dynamic]Local),
 				scope_depth      = 0,
 			}
 
-			// Компилируем тело
-			for stmt in d.body {
-				compile_statement(&ctx, stmt)
+			if args_syms, ok := ctx.res.func_args[decl]; ok {
+				for sym in args_syms do append(&ctx.locals, Local{symbol = sym, depth = 0})
 			}
-
-			// Защита: если программист забыл написать return, компилятор добавит его сам
+			ctx.current_function.frame_size = len(ctx.locals)
+			compile_block(&ctx, d.body, true)
 			emit_opcode(&ctx, .Return)
+		case ^Impl_Decl:
+			for m in d.methods {
+				ctx := Compiler {
+					registry         = &registry,
+					current_function = registry[m.name],
+					tc               = tc,
+					res              = res,
+					locals           = make([dynamic]Local),
+				}
+				if args_syms, ok := ctx.res.func_args[m]; ok {
+					for sym in args_syms do append(&ctx.locals, Local{symbol = sym, depth = 0})
+				}
+				ctx.current_function.frame_size = len(ctx.locals)
+				compile_block(&ctx, m.body, true)
+				emit_opcode(&ctx, .Return)
+			}
 		}
 	}
 
@@ -146,6 +200,10 @@ compile_program :: proc(res: ^Resolver_Ctx, program: ^Program) -> map[string]^Co
 
 compile_decl :: proc(c: ^Compiler, decl: Decls) {
 	switch d in decl {
+	case ^Impl_Decl:
+	case ^Struct_Decl:
+	case ^Interface_Decl:
+
 	case ^Function_Decl:
 		function := new(Compiled_Function)
 		function.name = d.name
@@ -182,7 +240,9 @@ compile_statement :: proc(ctx: ^Compiler, statement: Stmt) {
 
 	case ^Expr_Stmt:
 		compile_expr(ctx, stmt.expr)
-		emit_opcode(ctx, .Pop)
+		if expr_type, ok := ctx.tc.node_types[stmt.expr]; !ok || expr_type != TY_VOID {
+			emit_opcode(ctx, .Pop)
+		}
 	}
 }
 
@@ -201,6 +261,29 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			emit_opcode(ctx, .Multiply)
 		}
 
+	case ^String_Expr:
+		emit_constant(ctx, e.value)
+	case ^Lambda_Expr:
+		fn := new(Compiled_Function)
+		fn.name = fmt.tprintf("lambda_%d", len(ctx.registry^))
+		fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
+		ctx.registry^[fn.name] = fn
+
+		l_ctx := Compiler {
+			registry         = ctx.registry,
+			current_function = fn,
+			tc               = ctx.tc,
+			res              = ctx.res,
+			locals           = make([dynamic]Local),
+		}
+		if args_syms, ok := ctx.res.lambda_args[expr]; ok {
+			for sym in args_syms do append(&l_ctx.locals, Local{symbol = sym, depth = 0})
+		}
+		l_ctx.current_function.frame_size = len(l_ctx.locals)
+		compile_block(&l_ctx, e.body, true)
+		emit_opcode(&l_ctx, .Return)
+
+		emit_constant(ctx, Value(fn))
 	case ^Ident_Expr:
 		sym := ctx.res.node_symbols[expr]
 
@@ -227,51 +310,94 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 
 	case ^Binary_Expr:
-		compile_expr(ctx, e.left)
-		compile_expr(ctx, e.right)
-
-		#partial switch e.op {
-		case .Plus:
-			emit_opcode(ctx, .Add)
-		}
-
-	case ^Call_Expr:
-		// 1. Кладем функцию на стек (выполнится код из Ident_Expr выше)
-		compile_expr(ctx, e.callee)
-
-		// 2. Кладем аргументы (если они есть)
-		// for arg in e.args do compile_expr(ctx, arg)
-
-		// 3. Вызываем!
-		emit_opcode(ctx, .Call)
-		emit_byte(ctx, 0) // Количество аргументов (пока 0)
-
-	case ^If_Expr:
-		// 1. Вычисляем условие (на стеке окажется bool)
-		compile_expr(ctx, e.condition)
-
-		// 2. Прыгаем в ветку 'иначе', если условие ЛОЖНО
-		else_jump := emit_jump(ctx, .Jump_If_False)
-
-		// 3. Компилируем ветку 'тогда'
-		for stmt in e.then_branch {
-			compile_statement(ctx, stmt)
-		}
-
-		// 4. После выполнения 'тогда' мы должны ПЕРЕПРЫГНУТЬ ветку 'иначе'!
-		end_jump := emit_jump(ctx, .Jump)
-
-		// 5. Теперь мы знаем адрес начала 'иначе'. Зашиваем его в первый прыжок!
-		patch_jump(ctx, else_jump)
-
-		// 6. Компилируем ветку 'иначе' (если она есть)
-		if len(e.else_branch) > 0 {
-			for stmt in e.else_branch {
-				compile_statement(ctx, stmt)
+		if e.op == .Assign {
+			if ident, ok := e.left.(^Ident_Expr); ok {
+				compile_expr(ctx, e.right)
+				sym := ctx.res.node_symbols[ident]
+				slot := -1
+				#reverse for loc, i in ctx.locals {
+					if loc.symbol == sym { slot = i; break }
+				}
+				if slot != -1 {
+					emit_opcode(ctx, .Set_Local)
+					emit_byte(ctx, u8(slot))
+					emit_opcode(ctx, .Get_Local)
+					emit_byte(ctx, u8(slot))
+				}
+			} else if prop, ok_2 := e.left.(^Property_Expr); ok_2 {
+				compile_expr(ctx, prop.object)
+				compile_expr(ctx, e.right)
+				idx := ctx.tc.property_indices[prop]
+				emit_opcode(ctx, .Set_Property); emit_byte(ctx, u8(idx))
+			}
+		} else {
+			compile_expr(ctx, e.left); compile_expr(ctx, e.right)
+			#partial switch e.op {
+			case .Plus:
+				emit_opcode(ctx, .Add)
+			case .Minus:
+				emit_opcode(ctx, .Subtract)
+			case .Star:
+				emit_opcode(ctx, .Multiply)
+			case .Slash:
+				emit_opcode(ctx, .Divide)
+			case .Less:
+				emit_opcode(ctx, .Less)
+			case .Greater:
+				emit_opcode(ctx, .Greater)
 			}
 		}
 
-		// 7. Зашиваем адрес конца всего 'if' во второй прыжок
+	case ^Property_Expr:
+		compile_expr(ctx, e.object) // На стеке окажется структура
+
+		idx := ctx.tc.property_indices[expr] // Берем индекс поля от Тайп-чекера
+
+		emit_opcode(ctx, .Get_Property)
+		emit_byte(ctx, u8(idx))
+	case ^Call_Expr:
+		if method_name, is_iface_call := ctx.tc.interface_calls[expr]; is_iface_call {
+			prop_expr := e.callee.(^Property_Expr)
+			compile_expr(ctx, prop_expr.object)
+			for arg in e.args do compile_expr(ctx, arg)
+
+			emit_opcode(ctx, .Invoke_Interface)
+			emit_byte(ctx, make_constant(ctx, Value(method_name)))
+			emit_byte(ctx, u8(len(e.args)))
+
+		} else if method_sym, is_method := ctx.tc.method_calls[expr]; is_method {
+			if fn_ptr, ok := ctx.registry^[method_sym.name]; ok {
+				emit_constant(ctx, Value(fn_ptr))
+			} else {
+				fmt.panicf("Compiler Error: метод не найден")
+			}
+			prop_expr := e.callee.(^Property_Expr)
+			compile_expr(ctx, prop_expr.object)
+			for arg in e.args do compile_expr(ctx, arg)
+
+			emit_opcode(ctx, .Call)
+			emit_byte(ctx, u8(len(e.args) + 1))
+
+		} else if ctx.tc.is_constructor[expr] {
+			for arg in e.args do compile_expr(ctx, arg)
+			emit_opcode(ctx, .Build_Aggregate)
+			emit_byte(ctx, u8(len(e.args)))
+		} else {
+			compile_expr(ctx, e.callee)
+			for arg in e.args do compile_expr(ctx, arg)
+			emit_opcode(ctx, .Call)
+			emit_byte(ctx, u8(len(e.args)))
+		}
+
+	case ^If_Expr:
+		compile_expr(ctx, e.condition)
+		else_jump := emit_jump(ctx, .Jump_If_False)
+		is_val := ctx.tc.node_types[expr] != TY_VOID
+		compile_block(ctx, e.then_branch, is_val)
+		end_jump := emit_jump(ctx, .Jump)
+		patch_jump(ctx, else_jump)
+		if len(e.else_branch) > 0 do compile_block(ctx, e.else_branch, is_val)
+		else if is_val do emit_constant(ctx, f64(0))
 		patch_jump(ctx, end_jump)
 
 	case ^While_Expr:
@@ -303,7 +429,43 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		// 6. Зашиваем адрес выхода из цикла
 		patch_jump(ctx, exit_jump)
 	case ^Tuple_Expr:
-		fmt.panicf("Компиляция туплов еще не реализована в VM!")
+		for el in e.elements {
+			compile_expr(ctx, el)
+		}
+
+		// 2. Говорим виртуальной машине собрать значения со стека в единый массив
+		emit_opcode(ctx, .Build_Aggregate)
+
+		if len(e.elements) > 255 {
+			fmt.panicf(
+				"Compiler Error: тупл не может содержать больше 255 элементов",
+			)
+		}
+		emit_byte(ctx, u8(len(e.elements)))
+	}
+
+	if struct_type, needs_cast := ctx.tc.interface_casts[expr]; needs_cast {
+		emit_opcode(ctx, .Cast_Interface)
+		// То же самое для имени структуры
+		emit_byte(ctx, make_constant(ctx, Value(struct_type.name)))
+	}
+}
+
+compile_block :: proc(ctx: ^Compiler, body: [dynamic]Stmt, is_expr: bool) {
+	if len(body) == 0 { if is_expr do emit_constant(ctx, f64(0)); return }
+	for i in 0 ..< len(body) {
+		stmt := body[i]
+		is_last := i == len(body) - 1
+		if is_last && is_expr {
+			if expr_stmt, ok := stmt.(^Expr_Stmt); ok {
+				compile_expr(ctx, expr_stmt.expr)
+			} else {
+				compile_statement(ctx, stmt)
+				emit_constant(ctx, f64(0))
+			}
+		} else {
+			compile_statement(ctx, stmt)
+		}
 	}
 }
 
@@ -324,6 +486,19 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 		for idx := 0; idx < len(instructions); idx += 1 {
 			current_opcode := Opcode(instructions[idx])
 			switch current_opcode {
+			case .Set_Property:
+				idx += 1
+				command := fmt.tprintf("%sSET_PROPERTY: %d\n", prefix, instructions[idx])
+				strings.write_string(&builder, command)
+
+			case .Greater:
+				command := fmt.tprintf("%sGREATER\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Less:
+				command := fmt.tprintf("%sLESS\n", prefix)
+				strings.write_string(&builder, command)
+
 			case .Constant:
 				idx += 1
 				command := fmt.tprintf("%sCONSTANT: %d\n", prefix, instructions[idx])
@@ -376,6 +551,23 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 			case .Call:
 				idx += 1
 				command := fmt.tprintf("%sCALL\n", prefix)
+				strings.write_string(&builder, command)
+			case .Build_Aggregate:
+				idx += 1
+				command := fmt.tprintf("%sBUILD_AGGREGATE\n", prefix)
+				strings.write_string(&builder, command)
+			case .Get_Property:
+				idx += 1
+				command := fmt.tprintf("%sGET_PROPERTY\n", prefix)
+				strings.write_string(&builder, command)
+			case .Cast_Interface:
+				idx += 1
+				command := fmt.tprintf("%sCAST_INTERFACE\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Invoke_Interface:
+				idx += 2
+				command := fmt.tprintf("%sINVOKE_INTERFACE\n", prefix)
 				strings.write_string(&builder, command)
 
 			}

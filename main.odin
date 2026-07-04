@@ -89,7 +89,7 @@ run_file :: proc(filename: string) {
 
 	fmt.println("COMPILATION")
 	fmt.printf("--------------------------\n")
-	registry := compile_program(&resolver_ctx, &program)
+	registry := compile_program(&resolver_ctx, &type_ctx, &program)
 	print_assebler(registry)
 	fmt.printf("--------------------------\n\n")
 

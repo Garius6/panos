@@ -245,6 +245,65 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		// 3. Вызываем!
 		emit_opcode(ctx, .Call)
 		emit_byte(ctx, 0) // Количество аргументов (пока 0)
+
+	case ^If_Expr:
+		// 1. Вычисляем условие (на стеке окажется bool)
+		compile_expr(ctx, e.condition)
+
+		// 2. Прыгаем в ветку 'иначе', если условие ЛОЖНО
+		else_jump := emit_jump(ctx, .Jump_If_False)
+
+		// 3. Компилируем ветку 'тогда'
+		for stmt in e.then_branch {
+			compile_statement(ctx, stmt)
+		}
+
+		// 4. После выполнения 'тогда' мы должны ПЕРЕПРЫГНУТЬ ветку 'иначе'!
+		end_jump := emit_jump(ctx, .Jump)
+
+		// 5. Теперь мы знаем адрес начала 'иначе'. Зашиваем его в первый прыжок!
+		patch_jump(ctx, else_jump)
+
+		// 6. Компилируем ветку 'иначе' (если она есть)
+		if len(e.else_branch) > 0 {
+			for stmt in e.else_branch {
+				compile_statement(ctx, stmt)
+			}
+		}
+
+		// 7. Зашиваем адрес конца всего 'if' во второй прыжок
+		patch_jump(ctx, end_jump)
+
+	case ^While_Expr:
+		// 1. Запоминаем адрес начала цикла, чтобы возвращаться сюда
+		loop_start := len(ctx.current_function.instructions)
+
+		// 2. Условие
+		compile_expr(ctx, e.condition)
+
+		// 3. Если условие ложно, выпрыгиваем из цикла
+		exit_jump := emit_jump(ctx, .Jump_If_False)
+
+		// 4. Тело цикла
+		for stmt in e.body {
+			compile_statement(ctx, stmt)
+		}
+
+		// 5. Прыгаем обратно в начало (эмулируем Jump_Back)
+		// У нас нет отдельного опкода для прыжка назад, но мы можем использовать патч:
+		loop_jump := emit_jump(ctx, .Jump)
+
+		// Хак для прыжка назад: считаем смещение вручную как отрицательное число
+		// Либо, для простоты, сделайте опкод .Loop, который прыгает назад.
+		// Пока оставим прямой патч (вычисляет вперед, но нам нужно назад):
+		jump_length := loop_start - len(ctx.current_function.instructions)
+		ctx.current_function.instructions[loop_jump] = u8((jump_length >> 8) & 0xff)
+		ctx.current_function.instructions[loop_jump + 1] = u8(jump_length & 0xff)
+
+		// 6. Зашиваем адрес выхода из цикла
+		patch_jump(ctx, exit_jump)
+	case ^Tuple_Expr:
+		fmt.panicf("Компиляция туплов еще не реализована в VM!")
 	}
 }
 

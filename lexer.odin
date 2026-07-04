@@ -89,6 +89,10 @@ tokenize :: proc(input: string) -> [dynamic]Token {
 			if l.nest_level > 0 do l.nest_level -= 1
 			append(&tokens, Token{kind = .Comma, data = ","})
 			l.pos += width
+		case ch == ':':
+			if l.nest_level > 0 do l.nest_level -= 1
+			append(&tokens, Token{kind = .Colon, data = ":"})
+			l.pos += width
 
 		case:
 			fmt.panicf(
@@ -111,5 +115,11 @@ keywords :: proc() -> map[string]TokenKind {
 	keywords["ложь"] = .Boolean
 	keywords["функ"] = .Function
 	keywords["конец"] = .End
+	keywords["пока"] = .While
+	keywords["цикл"] = .Loop
+	keywords["если"] = .If
+	keywords["тогда"] = .Then
+	keywords["иначе"] = .Else
+
 	return keywords
 }

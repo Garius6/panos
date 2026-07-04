@@ -169,6 +169,37 @@ execute :: proc(vm: ^VM) {
 			// Если мы вышли из функции 'старт', программа сама завершится
 			continue
 
+		case .Jump_If_False:
+			// Читаем 2 байта смещения
+			frame.ip += 1
+			high := u16(instructions[frame.ip])
+			frame.ip += 1
+			low := u16(instructions[frame.ip])
+
+			offset := (high << 8) | low
+
+			// Снимаем условие со стека
+			condition_val := pop(&vm.stack)
+
+			// Мы не делаем ok-проверку, потому что Type Checker
+			// УЖЕ гарантировал, что на стеке лежит строго bool!
+			condition := condition_val.(bool)
+
+			if !condition {
+				frame.ip += int(offset) // Прыгаем вперед!
+			}
+
+		case .Jump:
+			frame.ip += 1
+			high := u16(instructions[frame.ip])
+			frame.ip += 1
+			low := u16(instructions[frame.ip])
+
+			offset := (high << 8) | low
+
+			// Безусловный прыжок (например, в конец if после выполнения then)
+			// Если offset отрицательный (в случае While), int() сохранит знак.
+			frame.ip += int(i16(offset))
 		}
 
 		// Двигаем IP текущего фрейма вперед

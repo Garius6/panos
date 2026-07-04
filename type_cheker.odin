@@ -2,6 +2,7 @@
 package main
 
 import "core:fmt"
+import "core:strings"
 
 // --- ТИПЫ ДАННЫХ ---
 
@@ -9,7 +10,8 @@ Type_Kind :: enum {
 	Number,
 	Bool,
 	Void,
-	Function, // Тип для функций и лямбд
+	Function,
+	Tuple,
 }
 
 Type :: struct {
@@ -18,6 +20,8 @@ Type :: struct {
 	// Поля ниже используются только если kind == .Function
 	params:      [dynamic]^Type,
 	return_type: ^Type,
+	// Для туплов:
+	elements:    [dynamic]^Type,
 }
 
 // Интернированные базовые типы (одиночки, чтобы можно было сравнивать по указателю)
@@ -82,6 +86,81 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 }
 
 // --- ПРОВЕРКА ФУНКЦИЙ ---
+
+resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
+	if node == nil do return TY_VOID
+
+	switch n in node {
+	case ^Type_Ident:
+		if n.name == "Число" do return TY_NUM
+		if n.name == "Булево" do return TY_BOOL
+		fmt.panicf("Type Error: неизвестный тип '%s'", n.name)
+
+	case ^Type_Tuple:
+		elements := make([dynamic]^Type)
+		for el_node in n.elements {
+			append(&elements, resolve_type_node(ctx, el_node))
+		}
+		return new_tuple_type(elements)
+
+	case ^Type_Function:
+		params := make([dynamic]^Type)
+		for p_node in n.params {
+			append(&params, resolve_type_node(ctx, p_node))
+		}
+		return_type := resolve_type_node(ctx, n.return_type)
+		return new_function_type(params, return_type)
+	}
+
+	return TY_VOID
+}
+
+// Функция для глубокого сравнения типов (Структурная типизация)
+types_are_equal :: proc(a: ^Type, b: ^Type) -> bool {
+	if a == b do return true // Быстрая проверка указателей
+	if a == nil || b == nil do return false
+	if a.kind != b.kind do return false
+
+	#partial switch a.kind {
+	case .Tuple:
+		if len(a.elements) != len(b.elements) do return false
+		// Рекурсивно проверяем каждый элемент тупла
+		for i in 0 ..< len(a.elements) {
+			if !types_are_equal(a.elements[i], b.elements[i]) do return false
+		}
+		return true
+
+	case .Function:
+		if len(a.params) != len(b.params) do return false
+		if !types_are_equal(a.return_type, b.return_type) do return false
+		for i in 0 ..< len(a.params) {
+			if !types_are_equal(a.params[i], b.params[i]) do return false
+		}
+		return true
+	}
+
+	return true // Для базовых типов достаточно проверки kind
+}
+
+// Помощник для со��дания типа тупла в памяти
+new_tuple_type :: proc(elements: [dynamic]^Type) -> ^Type {
+	t := new(Type)
+	t.kind = .Tuple
+	t.elements = elements
+
+	// Красиво склеиваем имя для сообщений об ошибках, например "(Number, Bool)"
+	builder: strings.Builder
+	strings.builder_init(&builder)
+	strings.write_string(&builder, "(")
+	for el, i in elements {
+		strings.write_string(&builder, el.name)
+		if i < len(elements) - 1 do strings.write_string(&builder, ", ")
+	}
+	strings.write_string(&builder, ")")
+	t.name = strings.to_string(builder)
+
+	return t
+}
 
 check_func_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) {
 	// В реальном коде вы возьмете заявленный тип из AST (например, -> Number)
@@ -149,9 +228,18 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 		return TY_VOID
 
 	case ^Let_Stmt:
-		t := infer_expr(ctx, s.value)
 		sym := ctx.res.stmt_symbols[stmt]
-		ctx.symbol_types[sym] = t
+
+		if s.type_annotation != nil {
+			// Если программист явно указал тип, мы РЕЗОЛВИМ его и ЧЕКАЕМ (сверху-вниз)
+			expected_type := resolve_type_node(ctx, s.type_annotation)
+			check_expr(ctx, s.value, expected_type) // Магия! Здесь сработает types_are_equal
+			ctx.symbol_types[sym] = expected_type
+		} else {
+			// Если типа нет, выводим его из значения (снизу-вверх)
+			t := infer_expr(ctx, s.value)
+			ctx.symbol_types[sym] = t
+		}
 
 	case ^Expr_Stmt:
 		infer_expr(ctx, s.expr)
@@ -170,7 +258,7 @@ check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type) {
 
 	// В более сложных языках здесь будет функция unification (сравнение сигнатур),
 	// но для базовых типов достаточно проверки указателей.
-	if actual != expected {
+	if !types_are_equal(actual, expected) {
 		fmt.panicf(
 			"Type Error: ожидался '%s', получен '%s'",
 			expected.name,
@@ -247,6 +335,29 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 		t = callee_type.return_type
 
+	case ^If_Expr:
+		// 1. Условие строго проверяем на Bool
+		check_expr(ctx, e.condition, TY_BOOL)
+
+		// 2. В EOP тип всего `if` зависит от того, что возвращают ветки.
+		// Для простоты: если это блок с веткой "иначе", тип берется из них.
+		// (Предполагается, что у вас есть функция вывода типа блока)
+
+		/* then_type := infer_block(ctx, e.then_branch)
+		if len(e.else_branch) > 0 {
+			check_block(ctx, e.else_branch, then_type) // Ветки должны совпадать!
+			t = then_type
+		} else {
+			t = TY_VOID // if без else ничего не возвращает
+		}
+		*/
+
+		t = TY_VOID // Временно ставим Void, пока вы не реализуете infer_block
+
+	case ^While_Expr:
+		check_expr(ctx, e.condition, TY_BOOL)
+		// Цикл пока ничего не возвращает (хотя в продвинутом EOP мож��т собирать массив)
+		t = TY_VOID
 	// case ^Lambda_Expr:
 	// 	// Выводим тип возвращаемого значения из тела лямбды
 	// 	actual_return := infer_function_body(ctx, e.body)
@@ -255,7 +366,13 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	// 	params := make([dynamic]^Type)
 	//
 	// 	t = new_function_type(params, actual_return)
-	}
+	case ^Tuple_Expr:
+		elements_types := make([dynamic]^Type)
+		for el in e.elements {
+			// Выводим тип каждого выражения внутри тупла
+			append(&elements_types, infer_expr(ctx, el))
+		}
+		t = new_tuple_type(elements_types)}
 
 	ctx.node_types[expr] = t
 	return t

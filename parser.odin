@@ -25,6 +25,29 @@ Program :: struct {
 	decls: [dynamic]Decls,
 }
 
+Type_Node :: union {
+	^Type_Ident,
+	^Type_Tuple,
+	^Type_Function,
+}
+
+Type_Function :: struct {
+	params:      [dynamic]Type_Node,
+	return_type: Type_Node, // Может быть nil, если возвращается Void (ничего)
+}
+
+Tuple_Expr :: struct {
+	elements: [dynamic]Expr,
+}
+
+Type_Ident :: struct {
+	name: string,
+}
+
+Type_Tuple :: struct {
+	elements: [dynamic]Type_Node,
+}
+
 Stmt :: union {
 	^Return_Stmt,
 	^Let_Stmt,
@@ -36,8 +59,9 @@ Return_Stmt :: struct {
 }
 
 Let_Stmt :: struct {
-	name:  string,
-	value: Expr,
+	name:            string,
+	value:           Expr,
+	type_annotation: Type_Node,
 }
 
 Expr_Stmt :: struct {
@@ -72,6 +96,17 @@ Call_Expr :: struct {
 	callee: Expr,
 }
 
+If_Expr :: struct {
+	condition:   Expr,
+	then_branch: [dynamic]Stmt,
+	else_branch: [dynamic]Stmt,
+}
+
+While_Expr :: struct {
+	condition: Expr,
+	body:      [dynamic]Stmt,
+}
+
 Expr :: union {
 	^Number_Expr,
 	^Boolean_Expr,
@@ -79,6 +114,9 @@ Expr :: union {
 	^Unary_Expr,
 	^Ident_Expr,
 	^Call_Expr,
+	^While_Expr,
+	^If_Expr,
+	^Tuple_Expr,
 }
 
 // Функция для печати всей программы
@@ -155,6 +193,29 @@ print_ast :: proc(expr: Expr, prefix: string = "", is_last: bool = true) {
 		print_ast(e.callee, next_prefix, false)
 		for arg in e.args {
 			print_ast(arg, next_prefix, false)
+		}
+	case ^While_Expr:
+		fmt.printf("%s%sWhile()\n", prefix, marker)
+		print_ast(e.condition)
+		for stmt in e.body {
+			print_stmt(stmt)
+		}
+
+	case ^If_Expr:
+		fmt.printf("%s%sIf()\n", prefix, marker)
+		print_ast(e.condition, next_prefix, false)
+
+		for stmt in e.then_branch {
+			print_stmt(stmt)
+		}
+
+		for stmt in e.else_branch {
+			print_stmt(stmt)
+		}
+	case ^Tuple_Expr:
+		fmt.printf("%s%sTuple()\n", prefix, marker)
+		for el, i in e.elements {
+			print_ast(el, next_prefix, i == len(e.elements) - 1)
 		}
 	}
 }
@@ -242,6 +303,38 @@ parse_return_stmt :: proc(p: ^Parser) -> Stmt {
 	return stmt
 }
 
+parse_type :: proc(p: ^Parser) -> Type_Node {
+	tok := next_token(p.stream)
+
+	if tok.kind == .Ident {
+		t := new(Type_Ident)
+		t.name = tok.data
+		return t
+	}
+
+	// Тупл типов, например (Число, Строка)
+	if tok.kind == .LParen {
+		t := new(Type_Tuple)
+		t.elements = make([dynamic]Type_Node)
+
+		if peek_token(p.stream).kind != .RParen {
+			for {
+				append(&t.elements, parse_type(p))
+				if peek_token(p.stream).kind == .Comma {
+					next_token(p.stream) // съедаем запятую
+				} else {
+					break
+				}
+			}
+		}
+		expect(p, .RParen)
+		return t
+	}
+
+	error("Ожидалось имя типа или тупл")
+	return nil
+}
+
 parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 	next_token(p.stream) // Поглощаем 'let'
 
@@ -254,6 +347,11 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 		)
 	}
 	stmt.name = ident_tok.data
+
+	if peek_token(p.stream).kind == .Colon {
+		next_token(p.stream) // Съедаем двоеточие
+		stmt.type_annotation = parse_type(p)
+	}
 
 	expect(p, .Assign) // Ожидаем '='
 
@@ -270,6 +368,56 @@ parse_expr_stmt :: proc(p: ^Parser) -> Stmt {
 	consume_semicolon_or_newline(p)
 
 	return stmt
+}
+
+parse_if_expr :: proc(p: ^Parser) -> Expr {
+	node := new(If_Expr)
+
+	// 1. Условие
+	node.condition = parse_expr(p, 0)
+
+	// 2. Блок 'тогда'
+	expect(p, .Then)
+	node.then_branch = make([dynamic]Stmt)
+	for {
+		kind := peek_token(p.stream).kind
+		if kind == .Else || kind == .End || kind == .EOF do break
+		append(&node.then_branch, parse_stmt(p))
+	}
+
+	// 3. Блок 'иначе' (опционально)
+	node.else_branch = make([dynamic]Stmt)
+	if peek_token(p.stream).kind == .Else {
+		next_token(p.stream) // Съедаем 'иначе'
+		for {
+			kind := peek_token(p.stream).kind
+			if kind == .End || kind == .EOF do break
+			append(&node.else_branch, parse_stmt(p))
+		}
+	}
+
+	// 4. Ожидаем 'конец'
+	expect(p, .End)
+	return node
+}
+
+parse_while_expr :: proc(p: ^Parser) -> Expr {
+	node := new(While_Expr)
+
+	// 1. Условие
+	node.condition = parse_expr(p, 0)
+
+	// 2. Блок 'цикл'
+	expect(p, .Loop)
+	node.body = make([dynamic]Stmt)
+	for {
+		kind := peek_token(p.stream).kind
+		if kind == .End || kind == .EOF do break
+		append(&node.body, parse_stmt(p))
+	}
+
+	expect(p, .End)
+	return node
 }
 
 parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
@@ -321,18 +469,61 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 	#partial switch tok.kind {
 	case .Number:
 		return new_int_lit(tok)
+
 	case .Boolean:
 		return new_boolean_lit(tok)
+
 	case .Ident:
 		return new_ident(tok)
+
 	case .LParen:
+		// 1. Обработка пустого тупла `()`
+		if peek_token(p.stream).kind == .RParen {
+			next_token(p.stream) // Съедаем ')'
+			t := new(Tuple_Expr)
+			t.elements = make([dynamic]Expr)
+			return t
+		}
+
+		// 2. Парсим первое выражение
 		e := parse_expr(p, 0)
+
+		// 3. Если дальше запятая, то это тупл `(a, b)`
+		if peek_token(p.stream).kind == .Comma {
+			t := new(Tuple_Expr)
+			t.elements = make([dynamic]Expr)
+			append(&t.elements, e)
+
+			for peek_token(p.stream).kind == .Comma {
+				next_token(p.stream) // Съедаем запятую
+
+				// Поддержка запятой в конце: `(1,)`
+				if peek_token(p.stream).kind == .RParen {
+					break
+				}
+				append(&t.elements, parse_expr(p, 0))
+			}
+			expect(p, .RParen)
+			return t
+		}
+
+		// 4. Запятой нет — это обычная группировка `(a + b)`
 		expect(p, .RParen)
 		return e
+
 	case .Minus:
 		rbp := prefix_bp(tok)
 		rhs := parse_expr(p, rbp)
 		return new_unary(tok, rhs)
+
+	case .If:
+		// Токен 'если' мы уже "съели", парсим остальное
+		return parse_if_expr(p)
+
+	case .While:
+		// Токен 'пока' мы уже "съели"
+		return parse_while_expr(p)
+
 	case:
 		error("unexpected token %s in nud position", tok.data)
 	}
@@ -364,13 +555,14 @@ error :: proc(format: string, args: ..any, loc := #caller_location) {
 	fmt.panicf(format, args, loc = loc)
 }
 
-expect :: proc(p: ^Parser, expected_kind: TokenKind) {
+expect :: proc(p: ^Parser, expected_kind: TokenKind, loc := #caller_location) {
 	tok := next_token(p.stream)
 
 	if tok == nil {
 		fmt.panicf(
 			"Синтаксическая ошибка: ожидалось %v, но обнаружен EOF",
 			expected_kind,
+			loc = loc,
 		)
 	}
 
@@ -379,6 +571,7 @@ expect :: proc(p: ^Parser, expected_kind: TokenKind) {
 			"Синтаксическая ошибка: ожидалось %v, обнаружен %v",
 			expected_kind,
 			tok.kind,
+			loc = loc,
 		)
 	}
 }

@@ -149,6 +149,27 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		for arg in e.args {
 			resolve_expr(ctx, arg)
 		}
+	case ^If_Expr:
+		resolve_expr(ctx, e.condition)
+
+		for stmt in e.then_branch {
+			resolve_stmt(ctx, stmt)
+		}
+
+		for stmt in e.else_branch {
+			resolve_stmt(ctx, stmt)
+		}
+
+	case ^While_Expr:
+		resolve_expr(ctx, e.condition)
+
+		for stmt in e.body {
+			resolve_stmt(ctx, stmt)
+		}
+	case ^Tuple_Expr:
+		for el in e.elements {
+			resolve_expr(ctx, el)
+		}
 	}
 }
 

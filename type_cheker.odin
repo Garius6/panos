@@ -62,6 +62,27 @@ new_function_type :: proc(params: [dynamic]^Type, return_type: ^Type) -> ^Type {
 	return t
 }
 
+new_array_type :: proc(element_type: ^Type) -> ^Type {
+	t := new(Type)
+	t.kind = .Array
+	t.element_type = element_type
+	t.name = fmt.tprintf("Массив(%s)", element_type.name)
+	return t
+}
+
+new_map_type :: proc(key_type: ^Type, value_type: ^Type) -> ^Type {
+	t := new(Type)
+	t.kind = .Map
+	t.key_type = key_type
+	t.value_type = value_type
+	t.name = fmt.tprintf("Соответствие(%s, %s)", key_type.name, value_type.name)
+	return t
+}
+
+is_valid_map_key_type :: proc(t: ^Type) -> bool {
+	return t.kind == .Number || t.kind == .Bool || t.kind == .String || t.kind == .Any
+}
+
 // --- КОНТЕКСТ ---
 
 Type_Ctx :: struct {
@@ -73,6 +94,7 @@ Type_Ctx :: struct {
 	method_calls:     map[Expr]^Symbol,
 	interface_casts:  map[Expr]^Type,
 	interface_calls:  map[Expr]string,
+	collection_calls: map[Expr]string,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -85,6 +107,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		method_calls = make(map[Expr]^Symbol),
 		interface_casts = make(map[Expr]^Type),
 		interface_calls = make(map[Expr]string),
+		collection_calls = make(map[Expr]string),
 	}
 }
 
@@ -256,17 +279,15 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 		return new_function_type(params, return_type)
 	case ^Type_Generic:
 		if n.name == "Массив" {
-			t := new(Type); t.kind = .Array; t.element_type = resolve_type_node(ctx, n.params[0])
-			t.name = fmt.tprintf("Массив(%s)", t.element_type.name); return t
+			if len(n.params) != 1 do fmt.panicf("Type Error: Массив ожидает 1 параметр типа")
+			return new_array_type(resolve_type_node(ctx, n.params[0]))
 		} else if n.name == "Соответствие" {
-			t := new(
-				Type,
-			); t.kind = .Map; t.key_type = resolve_type_node(ctx, n.params[0]); t.value_type = resolve_type_node(ctx, n.params[1])
-			t.name = fmt.tprintf(
-				"Соответствие(%s, %s)",
-				t.key_type.name,
-				t.value_type.name,
-			); return t
+			if len(n.params) != 2 do fmt.panicf("Type Error: Соответствие ожидает 2 параметра типа")
+			key_type := resolve_type_node(ctx, n.params[0])
+			if !is_valid_map_key_type(key_type) {
+				fmt.panicf("Type Error: тип '%s' нельзя использовать как ключ соответствия", key_type.name)
+			}
+			return new_map_type(key_type, resolve_type_node(ctx, n.params[1]))
 		}
 	}
 	return TY_VOID
@@ -300,6 +321,13 @@ types_are_equal :: proc(a: ^Type, b: ^Type) -> bool {
 			if !types_are_equal(a.params[i], b.params[i]) do return false
 		}
 		return true
+
+	case .Array:
+		return types_are_equal(a.element_type, b.element_type)
+
+	case .Map:
+		return types_are_equal(a.key_type, b.key_type) &&
+		       types_are_equal(a.value_type, b.value_type)
 	}
 	return true
 }
@@ -423,6 +451,27 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 
 check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type, loc := #caller_location) {
 	if expr == nil do return
+
+	#partial switch e in expr {
+	case ^Array_Expr:
+		if expected.kind == .Array {
+			for el in e.elements {
+				check_expr(ctx, el, expected.element_type)
+			}
+			ctx.node_types[expr] = expected
+			return
+		}
+	case ^Map_Expr:
+		if expected.kind == .Map {
+			for entry in e.entries {
+				check_expr(ctx, entry.key, expected.key_type)
+				check_expr(ctx, entry.value, expected.value_type)
+			}
+			ctx.node_types[expr] = expected
+			return
+		}
+	}
+
 	actual := infer_expr(ctx, expr)
 
 	if expected.kind == .Interface && actual.kind == .Struct {
@@ -504,7 +553,96 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		case ^Property_Expr:
 			obj_type := infer_expr(ctx, prop_expr.object)
 
-			if obj_type.kind == .Struct {
+			if obj_type.kind == .Array {
+				switch prop_expr.property {
+				case "длина":
+					if len(e.args) != 0 do fmt.panicf("Type Error: массив.длина() не принимает аргументы")
+					ctx.collection_calls[expr] = prop_expr.property
+					t = TY_NUM
+					ctx.node_types[expr] = t
+					return t
+				case "добавить":
+					if len(e.args) != 1 do fmt.panicf("Type Error: массив.добавить() ожидает 1 аргумент")
+					check_expr(ctx, e.args[0], obj_type.element_type)
+					ctx.collection_calls[expr] = prop_expr.property
+					t = TY_VOID
+					ctx.node_types[expr] = t
+					return t
+				case "получить":
+					if len(e.args) != 2 do fmt.panicf("Type Error: массив.получить() ожидает индекс и значение по умолчанию")
+					check_expr(ctx, e.args[0], TY_NUM)
+					default_type := infer_expr(ctx, e.args[1])
+					if !types_are_equal(default_type, obj_type.element_type) {
+						fmt.panicf(
+							"Type Error: значение по умолчанию имеет тип '%s', ожидался '%s'",
+							default_type.name,
+							obj_type.element_type.name,
+						)
+					}
+					ctx.collection_calls[expr] = prop_expr.property
+					t = obj_type.element_type.kind == .Any ? default_type : obj_type.element_type
+					ctx.node_types[expr] = t
+					return t
+				case "есть":
+					if len(e.args) != 1 do fmt.panicf("Type Error: массив.есть() ожидает индекс")
+					check_expr(ctx, e.args[0], TY_NUM)
+					ctx.collection_calls[expr] = prop_expr.property
+					t = TY_BOOL
+					ctx.node_types[expr] = t
+					return t
+				case "содержит":
+					if len(e.args) != 1 do fmt.panicf("Type Error: массив.содержит() ожидает значение")
+					check_expr(ctx, e.args[0], obj_type.element_type)
+					ctx.collection_calls[expr] = prop_expr.property
+					t = TY_BOOL
+					ctx.node_types[expr] = t
+					return t
+				case:
+					fmt.panicf("Type Error: у массива нет метода '%s'", prop_expr.property)
+				}
+
+			} else if obj_type.kind == .Map {
+				switch prop_expr.property {
+				case "длина":
+					if len(e.args) != 0 do fmt.panicf("Type Error: соответствие.длина() не принимает аргументы")
+					ctx.collection_calls[expr] = prop_expr.property
+					t = TY_NUM
+					ctx.node_types[expr] = t
+					return t
+				case "есть":
+					if len(e.args) != 1 do fmt.panicf("Type Error: соответствие.есть() ожидает ключ")
+					check_expr(ctx, e.args[0], obj_type.key_type)
+					ctx.collection_calls[expr] = prop_expr.property
+					t = TY_BOOL
+					ctx.node_types[expr] = t
+					return t
+				case "получить":
+					if len(e.args) != 2 do fmt.panicf("Type Error: соответствие.получить() ожидает ключ и значение по умолчанию")
+					check_expr(ctx, e.args[0], obj_type.key_type)
+					default_type := infer_expr(ctx, e.args[1])
+					if !types_are_equal(default_type, obj_type.value_type) {
+						fmt.panicf(
+							"Type Error: значение по умолчанию имеет тип '%s', ожидался '%s'",
+							default_type.name,
+							obj_type.value_type.name,
+						)
+					}
+					ctx.collection_calls[expr] = prop_expr.property
+					t = obj_type.value_type.kind == .Any ? default_type : obj_type.value_type
+					ctx.node_types[expr] = t
+					return t
+				case "удалить":
+					if len(e.args) != 1 do fmt.panicf("Type Error: соответствие.удалить() ожидает ключ")
+					check_expr(ctx, e.args[0], obj_type.key_type)
+					ctx.collection_calls[expr] = prop_expr.property
+					t = TY_BOOL
+					ctx.node_types[expr] = t
+					return t
+				case:
+					fmt.panicf("Type Error: у соответствия нет метода '%s'", prop_expr.property)
+				}
+
+			} else if obj_type.kind == .Struct {
 				if method_sym, is_method := obj_type.methods[prop_expr.property]; is_method {
 					method_type := ctx.symbol_types[method_sym]
 					if len(e.args) != len(method_type.params) - 1 do fmt.panicf("У метода %s ожидалось %d аргументов", method_sym.name, len(method_type.params) - 1)
@@ -588,6 +726,68 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		}
 		t = new_tuple_type(elements_types)
 
+	case ^Array_Expr:
+		element_type := TY_ANY
+		for el, i in e.elements {
+			current_type := infer_expr(ctx, el)
+			if i == 0 {
+				element_type = current_type
+			} else if !types_are_equal(current_type, element_type) {
+				fmt.panicf(
+					"Type Error: элементы массива имеют разные типы: '%s' и '%s'",
+					element_type.name,
+					current_type.name,
+				)
+			}
+		}
+		t = new_array_type(element_type)
+
+	case ^Map_Expr:
+		key_type := TY_ANY
+		value_type := TY_ANY
+		for entry, i in e.entries {
+			current_key_type := infer_expr(ctx, entry.key)
+			current_value_type := infer_expr(ctx, entry.value)
+			if !is_valid_map_key_type(current_key_type) {
+				fmt.panicf("Type Error: тип '%s' нельзя использовать как ключ соответствия", current_key_type.name)
+			}
+			if i == 0 {
+				key_type = current_key_type
+				value_type = current_value_type
+			} else {
+				if !types_are_equal(current_key_type, key_type) {
+					fmt.panicf(
+						"Type Error: ключи соответствия имеют разные типы: '%s' и '%s'",
+						key_type.name,
+						current_key_type.name,
+					)
+				}
+				if !types_are_equal(current_value_type, value_type) {
+					fmt.panicf(
+						"Type Error: значения соответствия имеют разные типы: '%s' и '%s'",
+						value_type.name,
+						current_value_type.name,
+					)
+				}
+			}
+		}
+		t = new_map_type(key_type, value_type)
+
+	case ^Index_Expr:
+		obj_type := infer_expr(ctx, e.object)
+		if obj_type.kind == .Array {
+			check_expr(ctx, e.index, TY_NUM)
+			t = obj_type.element_type
+		} else if obj_type.kind == .Map {
+			check_expr(ctx, e.index, obj_type.key_type)
+			t = obj_type.value_type
+		} else {
+			fmt.panicf(
+				"Type Error: индексирование поддерживают только массивы и соответствия, получен '%s'",
+				obj_type.name,
+			)
+		}
+
 	case ^Property_Expr:
 		obj_type := infer_expr(ctx, e.object)
 		if obj_type.kind == .Struct {
@@ -608,6 +808,9 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 			if idx < 0 || idx >= len(obj_type.elements) do fmt.panicf("Type Error: индекс %d выходит за границы", idx)
 			t = obj_type.elements[idx]
 			ctx.property_indices[expr] = idx
+
+		} else if obj_type.kind == .Array || obj_type.kind == .Map {
+			fmt.panicf("Type Error: метод коллекции '%s' нужно вызвать через ()", e.property)
 
 		} else {
 			fmt.panicf(

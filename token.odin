@@ -13,6 +13,8 @@ TokenKind :: enum {
 	Assign,
 	LParen,
 	RParen,
+	LBracket,
+	RBracket,
 	Less,
 	Greater,
 	Ident,

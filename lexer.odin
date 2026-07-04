@@ -178,6 +178,16 @@ next_token_lex :: proc(l: ^Lexer) -> Token {
 			kind = .RParen,
 			data = ")",
 		}; advance(l)
+	case '[':
+		tok = Token {
+			kind = .LBracket,
+			data = "[",
+		}; advance(l)
+	case ']':
+		tok = Token {
+			kind = .RBracket,
+			data = "]",
+		}; advance(l)
 	case ',':
 		tok = Token {
 			kind = .Comma,

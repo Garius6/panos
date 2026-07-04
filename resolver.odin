@@ -231,6 +231,18 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		ctx.lambda_args[expr] = args_syms
 		for stmt in e.body do resolve_stmt(ctx, stmt)
 		pop_scope(ctx)
+	case ^Array_Expr:
+		for el in e.elements {
+			resolve_expr(ctx, el)
+		}
+	case ^Map_Expr:
+		for entry in e.entries {
+			resolve_expr(ctx, entry.key)
+			resolve_expr(ctx, entry.value)
+		}
+	case ^Index_Expr:
+		resolve_expr(ctx, e.object)
+		resolve_expr(ctx, e.index)
 	}
 }
 

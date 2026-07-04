@@ -41,6 +41,113 @@ new_vm :: proc(compiled_functions: map[string]^Compiled_Function) -> ^VM {
 	return vm
 }
 
+value_equals :: proc(a: Value, b: Value) -> bool {
+	#partial switch va in a {
+	case f64:
+		if vb, ok := b.(f64); ok do return va == vb
+	case bool:
+		if vb, ok := b.(bool); ok do return va == vb
+	case string:
+		if vb, ok := b.(string); ok do return va == vb
+	}
+	return false
+}
+
+number_to_index :: proc(value: Value) -> int {
+	number, ok := value.(f64)
+	if !ok {
+		fmt.panicf("Runtime Error: индекс массива должен быть числом")
+	}
+
+	idx := int(number)
+	if number < 0 || f64(idx) != number {
+		fmt.panicf("Runtime Error: индекс массива должен быть неотрицательным целым числом")
+	}
+	return idx
+}
+
+map_find_index :: proc(m: ^Map_Value, key: Value) -> int {
+	for entry, i in m.entries {
+		if value_equals(entry.key, key) do return i
+	}
+	return -1
+}
+
+map_remove_at :: proc(m: ^Map_Value, idx: int) {
+	for i := idx; i < len(m.entries) - 1; i += 1 {
+		m.entries[i] = m.entries[i + 1]
+	}
+	resize(&m.entries, len(m.entries) - 1)
+}
+
+expect_arg_count :: proc(method_name: string, actual: int, expected: int) {
+	if actual != expected {
+		fmt.panicf(
+			"Runtime Error: метод '%s' ожидал %d аргументов, получено %d",
+			method_name,
+			expected,
+			actual,
+		)
+	}
+}
+
+invoke_collection_method :: proc(
+	receiver: Value,
+	method_name: string,
+	args: []Value,
+) -> (Value, bool) {
+	if arr, ok_arr := receiver.(^Array_Value); ok_arr {
+		switch method_name {
+		case "длина":
+			expect_arg_count(method_name, len(args), 0)
+			return Value(f64(len(arr.elements))), true
+		case "добавить":
+			expect_arg_count(method_name, len(args), 1)
+			append(&arr.elements, args[0])
+			return Value(f64(0)), false
+		case "получить":
+			expect_arg_count(method_name, len(args), 2)
+			idx := number_to_index(args[0])
+			if idx >= len(arr.elements) do return args[1], true
+			return arr.elements[idx], true
+		case "есть":
+			expect_arg_count(method_name, len(args), 1)
+			idx := number_to_index(args[0])
+			return Value(idx < len(arr.elements)), true
+		case "содержит":
+			expect_arg_count(method_name, len(args), 1)
+			for el in arr.elements {
+				if value_equals(el, args[0]) do return Value(true), true
+			}
+			return Value(false), true
+		}
+	}
+
+	if m, ok_map := receiver.(^Map_Value); ok_map {
+		switch method_name {
+		case "длина":
+			expect_arg_count(method_name, len(args), 0)
+			return Value(f64(len(m.entries))), true
+		case "есть":
+			expect_arg_count(method_name, len(args), 1)
+			return Value(map_find_index(m, args[0]) != -1), true
+		case "получить":
+			expect_arg_count(method_name, len(args), 2)
+			idx := map_find_index(m, args[0])
+			if idx == -1 do return args[1], true
+			return m.entries[idx].value, true
+		case "удалить":
+			expect_arg_count(method_name, len(args), 1)
+			idx := map_find_index(m, args[0])
+			if idx == -1 do return Value(false), true
+			map_remove_at(m, idx)
+			return Value(true), true
+		}
+	}
+
+	fmt.panicf("Runtime Error: метод '%s' не найден у коллекции", method_name)
+}
+
 execute :: proc(vm: ^VM) {
 
 	for len(vm.frames) > 0 {
@@ -235,6 +342,34 @@ execute :: proc(vm: ^VM) {
 			// Кладем готовую структуру на стек
 			append(&vm.stack, Value(agg))
 
+		case .Build_Array:
+			frame.ip += 1
+			count := int(instructions[frame.ip])
+
+			arr := new(Array_Value)
+			arr.elements = make([dynamic]Value, count)
+
+			for i := count - 1; i >= 0; i -= 1 {
+				arr.elements[i] = pop(&vm.stack)
+			}
+
+			append(&vm.stack, Value(arr))
+
+		case .Build_Map:
+			frame.ip += 1
+			count := int(instructions[frame.ip])
+
+			m := new(Map_Value)
+			m.entries = make([dynamic]Map_Entry_Value, count)
+
+			for i := count - 1; i >= 0; i -= 1 {
+				value := pop(&vm.stack)
+				key := pop(&vm.stack)
+				m.entries[i] = Map_Entry_Value{key = key, value = value}
+			}
+
+			append(&vm.stack, Value(m))
+
 		case .Get_Property:
 			frame.ip += 1
 			idx := int(instructions[frame.ip])
@@ -266,6 +401,50 @@ execute :: proc(vm: ^VM) {
 				fmt.panicf(
 					"Runtime Error: попытка записать поле у примитивного типа",
 				)
+			}
+
+			append(&vm.stack, value)
+
+		case .Get_Index:
+			index := pop(&vm.stack)
+			receiver := pop(&vm.stack)
+
+			if arr, ok_arr := receiver.(^Array_Value); ok_arr {
+				idx := number_to_index(index)
+				if idx >= len(arr.elements) {
+					fmt.panicf("Runtime Error: индекс %d выходит за границы массива", idx)
+				}
+				append(&vm.stack, arr.elements[idx])
+			} else if m, ok_map := receiver.(^Map_Value); ok_map {
+				idx := map_find_index(m, index)
+				if idx == -1 {
+					fmt.panicf("Runtime Error: ключ не найден в соответствии")
+				}
+				append(&vm.stack, m.entries[idx].value)
+			} else {
+				fmt.panicf("Runtime Error: индексирование поддерживают только массивы и соответствия")
+			}
+
+		case .Set_Index:
+			value := pop(&vm.stack)
+			index := pop(&vm.stack)
+			receiver := pop(&vm.stack)
+
+			if arr, ok_arr := receiver.(^Array_Value); ok_arr {
+				idx := number_to_index(index)
+				if idx >= len(arr.elements) {
+					fmt.panicf("Runtime Error: индекс %d выходит за границы массива", idx)
+				}
+				arr.elements[idx] = value
+			} else if m, ok_map := receiver.(^Map_Value); ok_map {
+				idx := map_find_index(m, index)
+				if idx == -1 {
+					append(&m.entries, Map_Entry_Value{key = index, value = value})
+				} else {
+					m.entries[idx].value = value
+				}
+			} else {
+				fmt.panicf("Runtime Error: индексная запись поддерживает только массивы и соответствия")
 			}
 
 			append(&vm.stack, value)
@@ -343,6 +522,23 @@ execute :: proc(vm: ^VM) {
 			vm.frames[len(vm.frames) - 1].ip = frame.ip + 1
 			append(&vm.frames, new_frame)
 			continue
+
+		case .Invoke_Collection:
+			frame.ip += 1
+			method_name_index := instructions[frame.ip]
+			frame.ip += 1
+			arg_count := int(instructions[frame.ip])
+
+			method_name := frame.function.constants[method_name_index].(string)
+			receiver_index := len(vm.stack) - 1 - arg_count
+			receiver := vm.stack[receiver_index]
+			args := vm.stack[receiver_index + 1:]
+
+			result, has_result := invoke_collection_method(receiver, method_name, args)
+			resize(&vm.stack, receiver_index)
+			if has_result {
+				append(&vm.stack, result)
+			}
 		}
 
 		// Двигаем IP текущего фрейма вперед

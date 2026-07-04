@@ -7,6 +7,19 @@ Aggregate_Value :: struct {
 	elements: [dynamic]Value, // В реальном продакшене лучше использовать фиксированный срез (slice)
 }
 
+Array_Value :: struct {
+	elements: [dynamic]Value,
+}
+
+Map_Entry_Value :: struct {
+	key:   Value,
+	value: Value,
+}
+
+Map_Value :: struct {
+	entries: [dynamic]Map_Entry_Value,
+}
+
 Interface_Value :: struct {
 	data:    ^Aggregate_Value,
 	// VTable: связывает имя метода из контракта с реальной скомпилированной функцией
@@ -19,6 +32,8 @@ Value :: union {
 	string,
 	^Compiled_Function,
 	^Aggregate_Value,
+	^Array_Value,
+	^Map_Value,
 	^Interface_Value,
 }
 
@@ -73,6 +88,11 @@ Opcode :: enum u8 {
 	Get_Property, // Операнд: 1 байт (индекс поля)
 	Cast_Interface,
 	Invoke_Interface,
+	Build_Array,
+	Build_Map,
+	Get_Index,
+	Set_Index,
+	Invoke_Collection,
 }
 
 // Записать 1 байт в массив инструкций
@@ -329,6 +349,11 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				compile_expr(ctx, e.right)
 				idx := ctx.tc.property_indices[prop]
 				emit_opcode(ctx, .Set_Property); emit_byte(ctx, u8(idx))
+			} else if index_expr, ok_3 := e.left.(^Index_Expr); ok_3 {
+				compile_expr(ctx, index_expr.object)
+				compile_expr(ctx, index_expr.index)
+				compile_expr(ctx, e.right)
+				emit_opcode(ctx, .Set_Index)
 			}
 		} else {
 			compile_expr(ctx, e.left); compile_expr(ctx, e.right)
@@ -355,14 +380,27 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 
 		emit_opcode(ctx, .Get_Property)
 		emit_byte(ctx, u8(idx))
+	case ^Index_Expr:
+		compile_expr(ctx, e.object)
+		compile_expr(ctx, e.index)
+		emit_opcode(ctx, .Get_Index)
 	case ^Call_Expr:
-		if method_name, is_iface_call := ctx.tc.interface_calls[expr]; is_iface_call {
+		if collection_method_name, is_collection_call := ctx.tc.collection_calls[expr]; is_collection_call {
+			prop_expr := e.callee.(^Property_Expr)
+			compile_expr(ctx, prop_expr.object)
+			for arg in e.args do compile_expr(ctx, arg)
+
+			emit_opcode(ctx, .Invoke_Collection)
+			emit_byte(ctx, make_constant(ctx, Value(collection_method_name)))
+			emit_byte(ctx, u8(len(e.args)))
+
+		} else if iface_method_name, is_iface_call := ctx.tc.interface_calls[expr]; is_iface_call {
 			prop_expr := e.callee.(^Property_Expr)
 			compile_expr(ctx, prop_expr.object)
 			for arg in e.args do compile_expr(ctx, arg)
 
 			emit_opcode(ctx, .Invoke_Interface)
-			emit_byte(ctx, make_constant(ctx, Value(method_name)))
+			emit_byte(ctx, make_constant(ctx, Value(iface_method_name)))
 			emit_byte(ctx, u8(len(e.args)))
 
 		} else if method_sym, is_method := ctx.tc.method_calls[expr]; is_method {
@@ -442,6 +480,29 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			)
 		}
 		emit_byte(ctx, u8(len(e.elements)))
+	case ^Array_Expr:
+		for el in e.elements {
+			compile_expr(ctx, el)
+		}
+		if len(e.elements) > 255 {
+			fmt.panicf(
+				"Compiler Error: массив не может содержать больше 255 элементов",
+			)
+		}
+		emit_opcode(ctx, .Build_Array)
+		emit_byte(ctx, u8(len(e.elements)))
+	case ^Map_Expr:
+		for entry in e.entries {
+			compile_expr(ctx, entry.key)
+			compile_expr(ctx, entry.value)
+		}
+		if len(e.entries) > 255 {
+			fmt.panicf(
+				"Compiler Error: соответствие не может содержать больше 255 элементов",
+			)
+		}
+		emit_opcode(ctx, .Build_Map)
+		emit_byte(ctx, u8(len(e.entries)))
 	}
 
 	if struct_type, needs_cast := ctx.tc.interface_casts[expr]; needs_cast {
@@ -568,6 +629,29 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 			case .Invoke_Interface:
 				idx += 2
 				command := fmt.tprintf("%sINVOKE_INTERFACE\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Build_Array:
+				idx += 1
+				command := fmt.tprintf("%sBUILD_ARRAY\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Build_Map:
+				idx += 1
+				command := fmt.tprintf("%sBUILD_MAP\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Get_Index:
+				command := fmt.tprintf("%sGET_INDEX\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Set_Index:
+				command := fmt.tprintf("%sSET_INDEX\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Invoke_Collection:
+				idx += 2
+				command := fmt.tprintf("%sINVOKE_COLLECTION\n", prefix)
 				strings.write_string(&builder, command)
 
 			}

@@ -157,6 +157,24 @@ Lambda_Expr :: struct {
 	body: [dynamic]Stmt,
 }
 
+Array_Expr :: struct {
+	elements: [dynamic]Expr,
+}
+
+Map_Entry_Expr :: struct {
+	key:   Expr,
+	value: Expr,
+}
+
+Map_Expr :: struct {
+	entries: [dynamic]Map_Entry_Expr,
+}
+
+Index_Expr :: struct {
+	object: Expr,
+	index:  Expr,
+}
+
 Expr :: union {
 	^Number_Expr,
 	^Boolean_Expr,
@@ -170,6 +188,9 @@ Expr :: union {
 	^Tuple_Expr,
 	^Property_Expr,
 	^Lambda_Expr,
+	^Array_Expr,
+	^Map_Expr,
+	^Index_Expr,
 }
 
 // --- ПЕЧАТЬ AST ---
@@ -287,6 +308,28 @@ print_ast :: proc(expr: Expr, prefix: string = "", is_last: bool = true) {
 		for stmt, i in e.body {
 			print_stmt(stmt, next_prefix, i == len(e.body) - 1)
 		}
+	case ^Array_Expr:
+		fmt.printf("%s%sArray()\n", prefix, marker)
+		for el, i in e.elements {
+			print_ast(el, next_prefix, i == len(e.elements) - 1)
+		}
+	case ^Map_Expr:
+		fmt.printf("%s%sMap()\n", prefix, marker)
+		for entry, i in e.entries {
+			entry_marker := i == len(e.entries) - 1 ? "└── " : "├── "
+			entry_prefix := fmt.tprintf(
+				"%s%s",
+				next_prefix,
+				i == len(e.entries) - 1 ? "    " : "│   ",
+			)
+			fmt.printf("%s%sEntry\n", next_prefix, entry_marker)
+			print_ast(entry.key, entry_prefix, false)
+			print_ast(entry.value, entry_prefix, true)
+		}
+	case ^Index_Expr:
+		fmt.printf("%s%sIndex()\n", prefix, marker)
+		print_ast(e.object, next_prefix, false)
+		print_ast(e.index, next_prefix, true)
 	}
 }
 
@@ -622,6 +665,55 @@ parse_while_expr :: proc(p: ^Parser) -> Expr {
 	return node
 }
 
+parse_array_literal_after_lparen :: proc(p: ^Parser) -> Expr {
+	node := new(Array_Expr)
+	node.elements = make([dynamic]Expr)
+
+	if peek_token(p.stream).kind != .RParen {
+		for {
+			append(&node.elements, parse_expr(p, 0))
+			if peek_token(p.stream).kind == .Comma {
+				next_token(p.stream)
+				if peek_token(p.stream).kind == .RParen {
+					break
+				}
+			} else {
+				break
+			}
+		}
+	}
+
+	expect(p, .RParen)
+	return node
+}
+
+parse_map_literal_after_lparen :: proc(p: ^Parser) -> Expr {
+	node := new(Map_Expr)
+	node.entries = make([dynamic]Map_Entry_Expr)
+
+	if peek_token(p.stream).kind != .RParen {
+		for {
+			entry := Map_Entry_Expr{}
+			entry.key = parse_expr(p, 11)
+			expect(p, .Assign)
+			entry.value = parse_expr(p, 0)
+			append(&node.entries, entry)
+
+			if peek_token(p.stream).kind == .Comma {
+				next_token(p.stream)
+				if peek_token(p.stream).kind == .RParen {
+					break
+				}
+			} else {
+				break
+			}
+		}
+	}
+
+	expect(p, .RParen)
+	return node
+}
+
 parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 	tok := next_token(p.stream)
 	if tok == nil {
@@ -641,6 +733,17 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 		next_token(p.stream)
 
 		if op.kind == .LParen {
+			if ident, ok := left.(^Ident_Expr); ok {
+				if ident.name == "массив" {
+					left = parse_array_literal_after_lparen(p)
+					continue
+				}
+				if ident.name == "соответствие" {
+					left = parse_map_literal_after_lparen(p)
+					continue
+				}
+			}
+
 			// Вызов функции (в том числе массив() и соответствие()!)
 			call := new(Call_Expr)
 			call.callee = left
@@ -668,6 +771,13 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 			prop.object = left
 			prop.property = prop_tok.data
 			left = prop
+
+		} else if op.kind == .LBracket {
+			index := new(Index_Expr)
+			index.object = left
+			index.index = parse_expr(p, 0)
+			expect(p, .RBracket)
+			left = index
 
 		} else {
 			// Обычный бинарный оператор (включая `=`)
@@ -785,6 +895,8 @@ infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 	case .Assign:
 		return 10, 9, true
 	case .LParen:
+		return 80, 0, true
+	case .LBracket:
 		return 80, 0, true
 	}
 	return 0, 0, false

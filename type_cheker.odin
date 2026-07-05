@@ -1110,6 +1110,11 @@ standard_method_type :: proc(
 			check_expr(ctx, args[0], TY_STRING)
 			ctx.collection_calls[call] = method_name
 			return prune_type(receiver_type.element_type), true
+		case "результат_или":
+			if len(args) != 1 do fmt.panicf("Type Error: Опция.результат_или() ожидает ошибку")
+			error_type := infer_expr(ctx, args[0])
+			ctx.collection_calls[call] = method_name
+			return new_result_type(prune_type(receiver_type.element_type), prune_type(error_type)), true
 		}
 
 	case .Result:
@@ -1140,6 +1145,10 @@ standard_method_type :: proc(
 			check_expr(ctx, args[0], TY_STRING)
 			ctx.collection_calls[call] = method_name
 			return prune_type(receiver_type.ok_type), true
+		case "опция":
+			if len(args) != 0 do fmt.panicf("Type Error: Результат.опция() не принимает аргументы")
+			ctx.collection_calls[call] = method_name
+			return new_option_type(prune_type(receiver_type.ok_type)), true
 		}
 	}
 

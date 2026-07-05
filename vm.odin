@@ -220,6 +220,10 @@ invoke_collection_method :: proc(
 				fmt.panicf("Runtime Panic: %s", message)
 			}
 			return opt.value, true
+		case "результат_или":
+			expect_arg_count(method_name, len(args), 1)
+			if opt.has_value do return make_ok_result(opt.value), true
+			return make_error_result(args[0]), true
 		}
 	}
 
@@ -265,6 +269,16 @@ invoke_collection_method :: proc(
 				fmt.panicf("Runtime Panic: %s", message)
 			}
 			return res.value, true
+		case "опция":
+			expect_arg_count(method_name, len(args), 0)
+			opt := new(Option_Value)
+			opt.has_value = res.is_ok
+			if res.is_ok {
+				opt.value = res.value
+			} else {
+				opt.value = f64(0)
+			}
+			return Value(opt), true
 		}
 	}
 

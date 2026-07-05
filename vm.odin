@@ -603,15 +603,22 @@ execute :: proc(vm: ^VM) {
 
 		case .Try_Unwrap:
 			value := pop(&vm.stack)
-			res, ok := value.(^Result_Value)
-			if !ok {
-				fmt.panicf("Runtime Error: оператор '?' ожидал Результат")
-			}
-			if res.is_ok {
-				append(&vm.stack, res.value)
+			if opt, ok_opt := value.(^Option_Value); ok_opt {
+				if opt.has_value {
+					append(&vm.stack, opt.value)
+				} else {
+					return_from_current_frame(vm, value)
+					continue
+				}
+			} else if res, ok_res := value.(^Result_Value); ok_res {
+				if res.is_ok {
+					append(&vm.stack, res.value)
+				} else {
+					return_from_current_frame(vm, value)
+					continue
+				}
 			} else {
-				return_from_current_frame(vm, value)
-				continue
+				fmt.panicf("Runtime Error: оператор '?' ожидал Опцию или Результат")
 			}
 
 		case .Jump_If_False:

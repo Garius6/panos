@@ -1579,27 +1579,35 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 	case ^Try_Expr:
 		value_type := prune_type(infer_expr(ctx, e.value))
-		if value_type.kind != .Result {
+		if value_type.kind == .Option {
+			return_type := prune_type(ctx.current_return)
+			if return_type == nil || return_type.kind != .Option {
+				fmt.panicf(
+					"Type Error: оператор '?' для Опции можно использовать только в функции, возвращающей Опцию",
+				)
+			}
+			t = prune_type(value_type.element_type)
+		} else if value_type.kind == .Result {
+			return_type := prune_type(ctx.current_return)
+			if return_type == nil || return_type.kind != .Result {
+				fmt.panicf(
+					"Type Error: оператор '?' можно использовать только в функции, возвращающей Результат",
+				)
+			}
+			if !unify_types(value_type.error_type, return_type.error_type) {
+				fmt.panicf(
+					"Type Error: оператор '?' возвращает ошибку типа '%s', но функция ожидает '%s'",
+					prune_type(value_type.error_type).name,
+					prune_type(return_type.error_type).name,
+				)
+			}
+			t = prune_type(value_type.ok_type)
+		} else {
 			fmt.panicf(
-				"Type Error: оператор '?' ожидает Результат, получен '%s'",
+				"Type Error: оператор '?' ожидает Опцию или Результат, получен '%s'",
 				value_type.name,
 			)
 		}
-
-		return_type := prune_type(ctx.current_return)
-		if return_type == nil || return_type.kind != .Result {
-			fmt.panicf(
-				"Type Error: оператор '?' можно использовать только в функции, возвращающей Результат",
-			)
-		}
-		if !unify_types(value_type.error_type, return_type.error_type) {
-			fmt.panicf(
-				"Type Error: оператор '?' возвращает ошибку типа '%s', но функция ожидает '%s'",
-				prune_type(value_type.error_type).name,
-				prune_type(return_type.error_type).name,
-			)
-		}
-		t = prune_type(value_type.ok_type)
 
 	case ^Property_Expr:
 		if sym, ok := ctx.res.node_symbols[expr]; ok {

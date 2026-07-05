@@ -2,6 +2,7 @@
 package main
 
 import "core:fmt"
+import "core:os"
 
 Symbol_Kind :: enum {
 	Variable,
@@ -141,6 +142,42 @@ resolve_import_path :: proc(import_spec: string, importer_dir: string) -> string
 	return normalize_path(spec)
 }
 
+is_bare_import_spec :: proc(import_spec: string) -> bool {
+	if is_absolute_path(import_spec) {
+		return false
+	}
+
+	for ch in import_spec {
+		if ch == '/' {
+			return false
+		}
+	}
+	return true
+}
+
+resolve_existing_import_path :: proc(import_spec: string, importer_dir: string) -> (string, bool) {
+	local_path := resolve_import_path(import_spec, importer_dir)
+	if os.exists(local_path) {
+		return local_path, true
+	}
+
+	if is_bare_import_spec(import_spec) {
+		if env_dir, found := os.lookup_env("PANOS_STDLIB", context.allocator); found {
+			stdlib_path := resolve_import_path(import_spec, env_dir)
+			if os.exists(stdlib_path) {
+				return stdlib_path, true
+			}
+		}
+
+		stdlib_path := resolve_import_path(import_spec, "std")
+		if os.exists(stdlib_path) {
+			return stdlib_path, true
+		}
+	}
+
+	return local_path, false
+}
+
 new_symbol :: proc(
 	name: string,
 	kind: Symbol_Kind,
@@ -237,12 +274,9 @@ lookup_symbol :: proc(s: ^Scope, name: string) -> ^Symbol {
 register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls) {
 	switch d in decl {
 	case ^Import_Decl:
-		import_path := d.path
-		if !is_builtin_module_name(d.path) {
-			import_path = resolve_import_path(d.path, module.dir)
-		}
+		import_path, exists := resolve_existing_import_path(d.path, module.dir)
 		imported_module, ok := ctx.module_graph.modules[import_path]
-		if !ok && is_builtin_module_name(d.path) {
+		if !ok && !exists && is_builtin_module_name(d.path) {
 			imported_module = ensure_builtin_module(ctx.module_graph, d.path)
 			ok = imported_module != nil
 		}

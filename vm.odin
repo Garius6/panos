@@ -454,22 +454,25 @@ execute :: proc(vm: ^VM) {
 			val_b := pop(&vm.stack)
 			val_a := pop(&vm.stack)
 
-			// 2. Распаковываем (извлекаем f64)
-			// В Odin это делается через паттерн-матчинг (switch)
-			a, ok_a := val_a.(f64)
-			b, ok_b := val_b.(f64)
-
-			// 3. Проверка типов перед операцией
-			if !ok_a || !ok_b {
-				fmt.panicf(
-					"Runtime Error: нельзя сложить не-числа (было %v и %v)",
-					val_a,
-					val_b,
-				)
+			if a, ok_a := val_a.(f64); ok_a {
+				if b, ok_b := val_b.(f64); ok_b {
+					append(&vm.stack, Value(a + b))
+					break
+				}
 			}
 
-			// 4. Складываем и снова упаковываем в union
-			append(&vm.stack, Value(a + b))
+			if a, ok_a := val_a.(string); ok_a {
+				if b, ok_b := val_b.(string); ok_b {
+					append(&vm.stack, Value(fmt.tprintf("%s%s", a, b)))
+					break
+				}
+			}
+
+			fmt.panicf(
+				"Runtime Error: оператор '+' ожидает два числа или две строки (было %v и %v)",
+				val_a,
+				val_b,
+			)
 		case .Subtract:
 			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
 			append(&vm.stack, l - r) // <-- ДОБАВЛЕНО

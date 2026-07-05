@@ -96,6 +96,16 @@ test_math_and_logic :: proc(t: ^testing.T) {
 			f64(20.0),
 		},
 		{
+			"Конкатенация строк",
+			`
+			функ старт() -> Строка
+				пер имя = "pan"
+				имя + "os" + "!"
+			конец
+		`,
+			"panos!",
+		},
+		{
 			"Массивы: индекс, запись и методы",
 			`
 			функ старт() -> Число
@@ -348,5 +358,20 @@ test_modules :: proc(t: ^testing.T) {
 		result == f64(42.0),
 		"Модули: ожидалось 42, получено %v",
 		result,
+	)
+
+	stdlib_result, stdlib_ok := run_module_file("stdlib_fixture_main.ps")
+	testing.expectf(
+		t,
+		stdlib_ok,
+		"Файловая stdlib: стек пуст, нет результата",
+	)
+	if !stdlib_ok do return
+
+	testing.expectf(
+		t,
+		stdlib_result == f64(42.0),
+		"Файловая stdlib: ожидалось 42, получено %v",
+		stdlib_result,
 	)
 }

@@ -1148,7 +1148,34 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 	case ^Binary_Expr:
 		#partial switch e.op {
-		case .Plus, .Minus, .Star, .Slash:
+		case .Plus:
+			left_t := prune_type(infer_expr(ctx, e.left))
+			right_t := prune_type(infer_expr(ctx, e.right))
+
+			if left_t.kind == .InferVar && right_t == TY_STRING {
+				unify_types(left_t, TY_STRING)
+			} else if right_t.kind == .InferVar && left_t == TY_STRING {
+				unify_types(right_t, TY_STRING)
+			} else if left_t.kind == .InferVar && right_t == TY_NUM {
+				unify_types(left_t, TY_NUM)
+			} else if right_t.kind == .InferVar && left_t == TY_NUM {
+				unify_types(right_t, TY_NUM)
+			}
+
+			left_t = prune_type(left_t)
+			right_t = prune_type(right_t)
+			if left_t == TY_STRING && right_t == TY_STRING {
+				t = TY_STRING
+			} else if left_t == TY_NUM && right_t == TY_NUM {
+				t = TY_NUM
+			} else {
+				fmt.panicf(
+					"Type Error: оператор '+' ожидает два числа или две строки, получено '%s' и '%s'",
+					left_t.name,
+					right_t.name,
+				)
+			}
+		case .Minus, .Star, .Slash:
 			check_expr(ctx, e.left, TY_NUM)
 			check_expr(ctx, e.right, TY_NUM)
 			t = TY_NUM

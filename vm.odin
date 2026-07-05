@@ -289,6 +289,16 @@ invoke_collection_method :: proc(
 				opt.value = f64(0)
 			}
 			return Value(opt), true
+		case "ошибка_опция":
+			expect_arg_count(method_name, len(args), 0)
+			opt := new(Option_Value)
+			opt.has_value = !res.is_ok
+			if res.is_ok {
+				opt.value = f64(0)
+			} else {
+				opt.value = res.error
+			}
+			return Value(opt), true
 		case "заменить_значение":
 			expect_arg_count(method_name, len(args), 1)
 			if res.is_ok do return make_ok_result(args[0]), true

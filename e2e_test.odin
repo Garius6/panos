@@ -58,6 +58,49 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 }
 
 @(test)
+test_explicit_panic :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Runtime Panic: критичный сбой")
+	run_code(`
+		функ старт() -> Число
+			паника("критичный сбой")
+		конец
+	`)
+}
+
+@(test)
+test_option_expect_panics_on_empty :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Runtime Panic: нет значения")
+	run_code(`
+		функ старт() -> Число
+			пер о: Опция(Число) = Нет()
+			о.ожидать("нет значения")
+		конец
+	`)
+}
+
+@(test)
+test_result_expect_panics_on_error :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Runtime Panic: не удалось: нет файла")
+	run_code(`
+		функ старт() -> Число
+			пер р: Результат(Число, Ошибка) = Неудача(Ошибка("фс", "нет файла"))
+			р.ожидать("не удалось")
+		конец
+	`)
+}
+
+@(test)
+test_strict_index_panics_out_of_bounds :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Runtime Error: индекс 1 выходит за границы массива")
+	run_code(`
+		функ старт() -> Число
+			пер числа = массив(10)
+			числа[1]
+		конец
+	`)
+}
+
+@(test)
 test_math_and_logic :: proc(t: ^testing.T) {
 	TestCase :: struct {
 		name:     string,

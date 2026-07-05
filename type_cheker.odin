@@ -10,6 +10,7 @@ Type_Kind :: enum {
 	Number,
 	Bool,
 	Void,
+	Never,
 	String,
 	Function,
 	Tuple,
@@ -57,6 +58,7 @@ Struct_Field :: struct {
 TY_NUM := &Type{kind = .Number, name = "Число"}
 TY_BOOL := &Type{kind = .Bool, name = "Булево"}
 TY_VOID := &Type{kind = .Void, name = "Пусто"}
+TY_NEVER := &Type{kind = .Never, name = "Никогда"}
 TY_STRING := &Type{kind = .String, name = "Строка"}
 TY_ERROR := &Type{kind = .Error, name = "Ошибка"}
 
@@ -218,6 +220,7 @@ unify_types :: proc(a: ^Type, b: ^Type) -> bool {
 	right := prune_type(b)
 	if left == nil || right == nil do return false
 	if left == right do return true
+	if left.kind == .Never || right.kind == .Never do return true
 
 	if left.kind == .InferVar do return bind_infer_var(left, right)
 	if right.kind == .InferVar do return bind_infer_var(right, left)
@@ -1066,7 +1069,7 @@ builtin_constructor_type :: proc(
 	case "паника":
 		if len(args) != 1 do fmt.panicf("Type Error: паника() ожидает сообщение")
 		check_expr(ctx, args[0], TY_STRING)
-		return TY_VOID, true
+		return TY_NEVER, true
 	}
 
 	return nil, false
@@ -1481,7 +1484,11 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 					prune_type(else_type).name,
 				)
 			}
-			t = prune_type(then_type)
+			if prune_type(then_type) == TY_NEVER {
+				t = prune_type(else_type)
+			} else {
+				t = prune_type(then_type)
+			}
 		}
 
 	case ^While_Expr:

@@ -165,7 +165,7 @@ compile_program :: proc(
 			fn := new(Compiled_Function)
 			fn.name = d.name
 			func_type := tc.symbol_types[res.decl_symbols[decl]]
-			fn.returns_value = func_type.return_type != TY_VOID
+			fn.returns_value = prune_type(func_type.return_type) != TY_VOID
 			// Инициализируем массивы функции
 			fn.instructions = make([dynamic]u8)
 			fn.constants = make([dynamic]Value)
@@ -174,7 +174,7 @@ compile_program :: proc(
 			for m in d.methods {
 				fn := new(Compiled_Function); fn.name = m.name
 				func_type := tc.symbol_types[res.decl_symbols[m]]
-				fn.returns_value = func_type.return_type != TY_VOID
+				fn.returns_value = prune_type(func_type.return_type) != TY_VOID
 				fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
 				registry[m.name] = fn
 			}
@@ -292,7 +292,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		fn := new(Compiled_Function)
 		fn.name = fmt.tprintf("lambda_%d", len(ctx.registry^))
 		lambda_type := ctx.tc.node_types[expr]
-		fn.returns_value = lambda_type.return_type != TY_VOID
+		fn.returns_value = prune_type(lambda_type.return_type) != TY_VOID
 		fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
 		ctx.registry^[fn.name] = fn
 

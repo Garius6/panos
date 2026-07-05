@@ -391,7 +391,7 @@ parse_interface_decl :: proc(p: ^Parser) -> ^Interface_Decl {
 		signature := Method_Signature {
 			name = method_name.data,
 		}
-		signature.args = parse_param_list(p)
+		signature.args = parse_param_list(p, true)
 		signature.return_type = parse_required_return_type(p, "метода интерфейса")
 		append(&decl.methods, signature)
 		consume_semicolon_or_newline(p)
@@ -455,7 +455,7 @@ parse_function :: proc(p: ^Parser) -> ^Function_Decl {
 	if tok.kind != .Ident do fmt.panicf("Ожидалось имя функции")
 	function.name = tok.data
 
-	function.args = parse_param_list(p)
+	function.args = parse_param_list(p, true)
 	function.return_type = parse_required_return_type(p, "функции")
 
 	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
@@ -466,7 +466,7 @@ parse_function :: proc(p: ^Parser) -> ^Function_Decl {
 	return function
 }
 
-parse_param_list :: proc(p: ^Parser) -> [dynamic]Param_Decl {
+parse_param_list :: proc(p: ^Parser, require_types: bool) -> [dynamic]Param_Decl {
 	params := make([dynamic]Param_Decl)
 	expect(p, .LParen)
 
@@ -475,10 +475,18 @@ parse_param_list :: proc(p: ^Parser) -> [dynamic]Param_Decl {
 			param_tok := next_token(p.stream)
 			if param_tok.kind != .Ident do fmt.panicf("Ожидалось имя аргумента")
 
-			expect(p, .Colon)
 			param := Param_Decl {
-				name            = param_tok.data,
-				type_annotation = parse_type(p),
+				name = param_tok.data,
+			}
+
+			if peek_token(p.stream).kind == .Colon {
+				next_token(p.stream)
+				param.type_annotation = parse_type(p)
+			} else if require_types {
+				fmt.panicf(
+					"Синтаксическая ошибка: после аргумента '%s' ожидается ': Тип'",
+					param.name,
+				)
 			}
 			append(&params, param)
 
@@ -501,6 +509,12 @@ parse_required_return_type :: proc(p: ^Parser, owner: string) -> Type_Node {
 	if peek_token(p.stream).kind != .Arrow {
 		fmt.panicf("Синтаксическая ошибка: после объявления %s ожидается '-> Тип'", owner)
 	}
+	next_token(p.stream)
+	return parse_type(p)
+}
+
+parse_optional_return_type :: proc(p: ^Parser) -> Type_Node {
+	if peek_token(p.stream).kind != .Arrow do return nil
 	next_token(p.stream)
 	return parse_type(p)
 }
@@ -855,12 +869,12 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 		return new_ident(tok)
 
 	case .Function:
-		// Лямбда-функции: функ(х: Число) -> Число х + 1 конец
+		// Лямбда-функции: функ(х) х + 1 конец
 		lam := new(Lambda_Expr)
 		lam.body = make([dynamic]Stmt)
 
-		lam.args = parse_param_list(p)
-		lam.return_type = parse_required_return_type(p, "лямбды")
+		lam.args = parse_param_list(p, false)
+		lam.return_type = parse_optional_return_type(p)
 
 		for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
 			append(&lam.body, parse_stmt(p))

@@ -20,6 +20,22 @@ Map_Value :: struct {
 	entries: [dynamic]Map_Entry_Value,
 }
 
+Error_Value :: struct {
+	code:    string,
+	message: string,
+}
+
+Option_Value :: struct {
+	has_value: bool,
+	value:     Value,
+}
+
+Result_Value :: struct {
+	is_ok: bool,
+	value: Value,
+	error: Value,
+}
+
 Interface_Value :: struct {
 	data:    ^Aggregate_Value,
 	// VTable: связывает имя метода из контракта с реальной скомпилированной функцией
@@ -34,6 +50,9 @@ Value :: union {
 	^Aggregate_Value,
 	^Array_Value,
 	^Map_Value,
+	^Error_Value,
+	^Option_Value,
+	^Result_Value,
 	^Interface_Value,
 }
 
@@ -100,6 +119,7 @@ Opcode :: enum u8 {
 	Get_Index,
 	Set_Index,
 	Invoke_Collection,
+	Call_Builtin,
 }
 
 // Записать 1 байт в массив инструкций
@@ -339,6 +359,12 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				sym.name,
 			)
 		}
+		if sym.kind == .Builtin {
+			fmt.panicf(
+				"Compiler Error: встроенный конструктор '%s' нужно вызвать через ()",
+				sym.name,
+			)
+		}
 
 		slot_index := -1
 		#reverse for loc, i in ctx.locals {
@@ -455,7 +481,23 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		compile_expr(ctx, e.index)
 		emit_opcode(ctx, .Get_Index)
 	case ^Call_Expr:
-		if collection_method_name, is_collection_call := ctx.tc.collection_calls[expr];
+		if ident, ok := e.callee.(^Ident_Expr); ok {
+			if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Builtin {
+				for arg in e.args do compile_expr(ctx, arg)
+				emit_opcode(ctx, .Call_Builtin)
+				emit_byte(ctx, make_constant(ctx, Value(ident.name)))
+				emit_byte(ctx, u8(len(e.args)))
+				return
+			}
+		}
+
+		if builtin_name, is_builtin_call := ctx.tc.builtin_calls[expr]; is_builtin_call {
+			for arg in e.args do compile_expr(ctx, arg)
+			emit_opcode(ctx, .Call_Builtin)
+			emit_byte(ctx, make_constant(ctx, Value(builtin_name)))
+			emit_byte(ctx, u8(len(e.args)))
+
+		} else if collection_method_name, is_collection_call := ctx.tc.collection_calls[expr];
 		   is_collection_call {
 			prop_expr := e.callee.(^Property_Expr)
 			compile_expr(ctx, prop_expr.object)
@@ -723,6 +765,11 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 			case .Invoke_Collection:
 				idx += 2
 				command := fmt.tprintf("%sINVOKE_COLLECTION\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Call_Builtin:
+				idx += 2
+				command := fmt.tprintf("%sCALL_BUILTIN\n", prefix)
 				strings.write_string(&builder, command)
 
 			}

@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:os"
 
 Main_Function_Name :: "старт"
 
@@ -61,7 +62,9 @@ number_to_index :: proc(value: Value) -> int {
 
 	idx := int(number)
 	if number < 0 || f64(idx) != number {
-		fmt.panicf("Runtime Error: индекс массива должен быть неотрицательным целым числом")
+		fmt.panicf(
+			"Runtime Error: индекс массива должен быть неотрицательным целым числом",
+		)
 	}
 	return idx
 }
@@ -91,11 +94,102 @@ expect_arg_count :: proc(method_name: string, actual: int, expected: int) {
 	}
 }
 
+expect_string_arg :: proc(function_name: string, value: Value) -> string {
+	text, ok := value.(string)
+	if !ok {
+		fmt.panicf(
+			"Runtime Error: %s ожидает строковый аргумент",
+			function_name,
+		)
+	}
+	return text
+}
+
+make_error_value :: proc(code: string, message: string) -> Value {
+	err := new(Error_Value)
+	err.code = code
+	err.message = message
+	return Value(err)
+}
+
+make_ok_result :: proc(value: Value) -> Value {
+	res := new(Result_Value)
+	res.is_ok = true
+	res.value = value
+	res.error = f64(0)
+	return Value(res)
+}
+
+make_error_result :: proc(err: Value) -> Value {
+	res := new(Result_Value)
+	res.is_ok = false
+	res.value = f64(0)
+	res.error = err
+	return Value(res)
+}
+
 invoke_collection_method :: proc(
 	receiver: Value,
 	method_name: string,
 	args: []Value,
-) -> (Value, bool) {
+) -> (
+	Value,
+	bool,
+) {
+	if opt, ok_opt := receiver.(^Option_Value); ok_opt {
+		switch method_name {
+		case "есть":
+			expect_arg_count(method_name, len(args), 0)
+			return Value(opt.has_value), true
+		case "пусто":
+			expect_arg_count(method_name, len(args), 0)
+			return Value(!opt.has_value), true
+		case "значение":
+			expect_arg_count(method_name, len(args), 0)
+			if !opt.has_value {
+				fmt.panicf(
+					"Runtime Error: попытка получить значение из пустой Опции",
+				)
+			}
+			return opt.value, true
+		case "получить":
+			expect_arg_count(method_name, len(args), 1)
+			if opt.has_value do return opt.value, true
+			return args[0], true
+		}
+	}
+
+	if res, ok_res := receiver.(^Result_Value); ok_res {
+		switch method_name {
+		case "успех":
+			expect_arg_count(method_name, len(args), 0)
+			return Value(res.is_ok), true
+		case "ошибка":
+			expect_arg_count(method_name, len(args), 0)
+			return Value(!res.is_ok), true
+		case "значение":
+			expect_arg_count(method_name, len(args), 0)
+			if !res.is_ok {
+				fmt.panicf(
+					"Runtime Error: попытка получить значение из ошибочного Результата",
+				)
+			}
+			return res.value, true
+		case "причина":
+			expect_arg_count(method_name, len(args), 0)
+			if res.is_ok {
+				fmt.panicf(
+					"Runtime Error: попытка получить причину из успешного Результата",
+				)
+			}
+			return res.error, true
+		case "получить":
+			expect_arg_count(method_name, len(args), 1)
+			if res.is_ok do return res.value, true
+			return args[0], true
+		}
+	}
+
 	if arr, ok_arr := receiver.(^Array_Value); ok_arr {
 		switch method_name {
 		case "длина":
@@ -145,7 +239,81 @@ invoke_collection_method :: proc(
 		}
 	}
 
-	fmt.panicf("Runtime Error: метод '%s' не найден у коллекции", method_name)
+	fmt.panicf(
+		"Runtime Error: метод '%s' не найден у коллекции",
+		method_name,
+	)
+}
+
+call_builtin :: proc(name: string, args: []Value) -> Value {
+	switch name {
+	case "Ошибка":
+		expect_arg_count(name, len(args), 2)
+		code, ok_code := args[0].(string)
+		message, ok_message := args[1].(string)
+		if !ok_code || !ok_message {
+			fmt.panicf("Runtime Error: Ошибка() ожидает две строки")
+		}
+		err := new(Error_Value)
+		err.code = code
+		err.message = message
+		return Value(err)
+
+	case "Есть":
+		expect_arg_count(name, len(args), 1)
+		opt := new(Option_Value)
+		opt.has_value = true
+		opt.value = args[0]
+		return Value(opt)
+
+	case "Нет":
+		expect_arg_count(name, len(args), 0)
+		opt := new(Option_Value)
+		opt.has_value = false
+		opt.value = f64(0)
+		return Value(opt)
+
+	case "Успех":
+		expect_arg_count(name, len(args), 1)
+		res := new(Result_Value)
+		res.is_ok = true
+		res.value = args[0]
+		res.error = f64(0)
+		return Value(res)
+
+	case "Неудача":
+		expect_arg_count(name, len(args), 1)
+		return make_error_result(args[0])
+
+	case "фс::есть":
+		expect_arg_count(name, len(args), 1)
+		path := expect_string_arg(name, args[0])
+		return Value(os.exists(path))
+
+	case "фс::прочитать":
+		expect_arg_count(name, len(args), 1)
+		path := expect_string_arg(name, args[0])
+		data, err := os.read_entire_file(path, context.allocator)
+		if err != nil {
+			return make_error_result(make_error_value("фс", fmt.tprintf("%v", err)))
+		}
+		return make_ok_result(Value(string(data)))
+
+	case "фс::записать":
+		expect_arg_count(name, len(args), 2)
+		path := expect_string_arg(name, args[0])
+		content := expect_string_arg(name, args[1])
+		err := os.write_entire_file(path, content)
+		if err != nil {
+			return make_error_result(make_error_value("фс", fmt.tprintf("%v", err)))
+		}
+		return make_ok_result(Value(f64(len(content))))
+	}
+
+	fmt.panicf(
+		"Runtime Error: неизвестный встроенный конструктор '%s'",
+		name,
+	)
 }
 
 execute :: proc(vm: ^VM) {
@@ -268,6 +436,19 @@ execute :: proc(vm: ^VM) {
 			append(&vm.frames, new_frame)
 			continue // ВАЖНО: Начинаем новый цикл, пропуская frame.ip += 1 в конце
 
+		case .Call_Builtin:
+			frame.ip += 1
+			name_index := instructions[frame.ip]
+			frame.ip += 1
+			arg_count := int(instructions[frame.ip])
+
+			name := frame.function.constants[name_index].(string)
+			args_start := len(vm.stack) - arg_count
+			args := vm.stack[args_start:]
+			result := call_builtin(name, args)
+			resize(&vm.stack, args_start)
+			append(&vm.stack, result)
+
 		case .Return:
 			result: Value = f64(0) // Значение по умолчанию (если функция ничего не вернула)
 
@@ -369,7 +550,10 @@ execute :: proc(vm: ^VM) {
 			for i := count - 1; i >= 0; i -= 1 {
 				value := pop(&vm.stack)
 				key := pop(&vm.stack)
-				m.entries[i] = Map_Entry_Value{key = key, value = value}
+				m.entries[i] = Map_Entry_Value {
+					key   = key,
+					value = value,
+				}
 			}
 
 			append(&vm.stack, Value(m))
@@ -379,16 +563,25 @@ execute :: proc(vm: ^VM) {
 			idx := int(instructions[frame.ip])
 
 			val := pop(&vm.stack)
-			agg, ok := val.(^Aggregate_Value)
-
-			if !ok {
+			if agg, ok_agg := val.(^Aggregate_Value); ok_agg {
+				append(&vm.stack, agg.elements[idx])
+			} else if err, ok_err := val.(^Error_Value); ok_err {
+				switch idx {
+				case 0:
+					append(&vm.stack, Value(err.code))
+				case 1:
+					append(&vm.stack, Value(err.message))
+				case:
+					fmt.panicf(
+						"Runtime Error: у Ошибка нет поля с индексом %d",
+						idx,
+					)
+				}
+			} else {
 				fmt.panicf(
 					"Runtime Error: попытка прочитать поле у примитивного типа",
 				)
 			}
-
-			// Достаем нужное поле по индексу и кладем на вершину стека
-			append(&vm.stack, agg.elements[idx])
 
 		case .Set_Property:
 			frame.ip += 1
@@ -401,6 +594,24 @@ execute :: proc(vm: ^VM) {
 				agg.elements[idx] = value
 			} else if iface, ok_iface := target.(^Interface_Value); ok_iface {
 				iface.data.elements[idx] = value
+			} else if err, ok_err := target.(^Error_Value); ok_err {
+				text, ok_text := value.(string)
+				if !ok_text {
+					fmt.panicf(
+						"Runtime Error: поля Ошибка принимают только строки",
+					)
+				}
+				switch idx {
+				case 0:
+					err.code = text
+				case 1:
+					err.message = text
+				case:
+					fmt.panicf(
+						"Runtime Error: у Ошибка нет поля с индексом %d",
+						idx,
+					)
+				}
 			} else {
 				fmt.panicf(
 					"Runtime Error: попытка записать поле у примитивного типа",
@@ -414,17 +625,24 @@ execute :: proc(vm: ^VM) {
 			if arr, ok_arr := receiver.(^Array_Value); ok_arr {
 				idx := number_to_index(index)
 				if idx >= len(arr.elements) {
-					fmt.panicf("Runtime Error: индекс %d выходит за границы массива", idx)
+					fmt.panicf(
+						"Runtime Error: индекс %d выходит за границы массива",
+						idx,
+					)
 				}
 				append(&vm.stack, arr.elements[idx])
 			} else if m, ok_map := receiver.(^Map_Value); ok_map {
 				idx := map_find_index(m, index)
 				if idx == -1 {
-					fmt.panicf("Runtime Error: ключ не найден в соответствии")
+					fmt.panicf(
+						"Runtime Error: ключ не найден в соответствии",
+					)
 				}
 				append(&vm.stack, m.entries[idx].value)
 			} else {
-				fmt.panicf("Runtime Error: индексирование поддерживают только массивы и соответствия")
+				fmt.panicf(
+					"Runtime Error: индексирование поддерживают только массивы и соответствия",
+				)
 			}
 
 		case .Set_Index:
@@ -435,7 +653,10 @@ execute :: proc(vm: ^VM) {
 			if arr, ok_arr := receiver.(^Array_Value); ok_arr {
 				idx := number_to_index(index)
 				if idx >= len(arr.elements) {
-					fmt.panicf("Runtime Error: индекс %d выходит за границы массива", idx)
+					fmt.panicf(
+						"Runtime Error: индекс %d выходит за границы массива",
+						idx,
+					)
 				}
 				arr.elements[idx] = value
 			} else if m, ok_map := receiver.(^Map_Value); ok_map {
@@ -446,7 +667,9 @@ execute :: proc(vm: ^VM) {
 					m.entries[idx].value = value
 				}
 			} else {
-				fmt.panicf("Runtime Error: индексная запись поддерживает только массивы и соответствия")
+				fmt.panicf(
+					"Runtime Error: индексная запись поддерживает только массивы и соответствия",
+				)
 			}
 
 		case .Cast_Interface:

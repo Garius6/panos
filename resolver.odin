@@ -8,6 +8,7 @@ Symbol_Kind :: enum {
 	Function,
 	Type,
 	Module,
+	Builtin,
 }
 
 // Семантическая сущность: локальная переменная, функция, тип или модуль-алиас.
@@ -189,6 +190,14 @@ pop_scope :: proc(resolver: ^Resolver_Ctx) {
 	}
 }
 
+install_standard_symbols :: proc(ctx: ^Resolver_Ctx) {
+	names := [?]string{"Ошибка", "Есть", "Нет", "Успех", "Неудача"}
+	for name in names {
+		sym := new_symbol(name, .Builtin, nil)
+		ctx.current_scope.symbols[name] = sym
+	}
+}
+
 new_resolver_ctx :: proc() -> Resolver_Ctx {
 	ctx := Resolver_Ctx {
 		symbol_types = make(map[^Symbol]^Type),
@@ -199,6 +208,7 @@ new_resolver_ctx :: proc() -> Resolver_Ctx {
 
 	push_scope(&ctx)
 	ctx.global_scope = ctx.current_scope
+	install_standard_symbols(&ctx)
 
 	return ctx
 }
@@ -227,8 +237,15 @@ lookup_symbol :: proc(s: ^Scope, name: string) -> ^Symbol {
 register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls) {
 	switch d in decl {
 	case ^Import_Decl:
-		import_path := resolve_import_path(d.path, module.dir)
+		import_path := d.path
+		if !is_builtin_module_name(d.path) {
+			import_path = resolve_import_path(d.path, module.dir)
+		}
 		imported_module, ok := ctx.module_graph.modules[import_path]
+		if !ok && is_builtin_module_name(d.path) {
+			imported_module = ensure_builtin_module(ctx.module_graph, d.path)
+			ok = imported_module != nil
+		}
 		if !ok {
 			fmt.panicf("Resolve Error: модуль '%s' не найден", d.path)
 		}

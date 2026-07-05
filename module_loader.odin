@@ -63,6 +63,10 @@ load_module_recursive :: proc(graph: ^Module_Graph, file_path: string, is_entry:
 
 	for decl in module.ast.decls {
 		if import_decl, ok := decl.(^Import_Decl); ok {
+			if is_builtin_module_name(import_decl.path) {
+				ensure_builtin_module(graph, import_decl.path)
+				continue
+			}
 			import_path := resolve_import_path(import_decl.path, module.dir)
 			load_module_recursive(graph, import_path, false)
 		}

@@ -1149,6 +1149,11 @@ standard_method_type :: proc(
 			if len(args) != 0 do fmt.panicf("Type Error: Результат.опция() не принимает аргументы")
 			ctx.collection_calls[call] = method_name
 			return new_option_type(prune_type(receiver_type.ok_type)), true
+		case "заменить_ошибку":
+			if len(args) != 1 do fmt.panicf("Type Error: Результат.заменить_ошибку() ожидает новую ошибку")
+			error_type := infer_expr(ctx, args[0])
+			ctx.collection_calls[call] = method_name
+			return new_result_type(prune_type(receiver_type.ok_type), prune_type(error_type)), true
 		}
 	}
 

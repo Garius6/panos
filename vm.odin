@@ -279,6 +279,10 @@ invoke_collection_method :: proc(
 				opt.value = f64(0)
 			}
 			return Value(opt), true
+		case "заменить_значение":
+			expect_arg_count(method_name, len(args), 1)
+			if res.is_ok do return make_ok_result(args[0]), true
+			return make_error_result(res.error), true
 		case "заменить_ошибку":
 			expect_arg_count(method_name, len(args), 1)
 			if res.is_ok do return make_ok_result(res.value), true

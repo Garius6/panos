@@ -3,7 +3,7 @@ package main
 import "core:testing"
 
 // Вспомогательная функция, которая прогоняет весь пайплайн и возвращает результат
-run_code :: proc(source: string) -> (Value, bool) {
+run_code_with_args :: proc(source: string, program_args: []string = nil) -> (Value, bool) {
 	// 1. Лексика и Парсинг
 	tokens := tokenize(source) // Ваша функция лексера
 	stream := make_stream(tokens)
@@ -23,7 +23,7 @@ run_code :: proc(source: string) -> (Value, bool) {
 	registry := compile_program(&res_ctx, &type_ctx, &prog)
 
 	// 4. Выполнение (VM)
-	vm := new_vm(registry)
+	vm := new_vm(registry, program_args)
 	execute(vm)
 
 	// Возвращаем результат (то, что осталось на вершине стека)
@@ -31,6 +31,10 @@ run_code :: proc(source: string) -> (Value, bool) {
 		return vm.stack[len(vm.stack) - 1], true
 	}
 	return 0.0, false
+}
+
+run_code :: proc(source: string) -> (Value, bool) {
+	return run_code_with_args(source)
 }
 
 run_module_file :: proc(filename: string) -> (Value, bool) {
@@ -263,6 +267,59 @@ test_math_and_logic :: proc(t: ^testing.T) {
 			tc.name,
 			tc.expected,
 			result,
+		)
+	}
+
+	args_result, args_ok := run_code_with_args(
+		`
+		импорт ос
+
+		функ старт() -> Строка
+			пер аргументы = ос.аргументы()
+			аргументы[1]
+		конец
+	`,
+		[]string{"альфа", "бета"},
+	)
+	testing.expectf(
+		t,
+		args_ok,
+		"[Стандартная библиотека: аргументы] стек пуст",
+	)
+	if args_ok {
+		testing.expectf(
+			t,
+			args_result == "бета",
+			"[Стандартная библиотека: аргументы] ожидалось бета, получено %v",
+			args_result,
+		)
+	}
+
+	env_result, env_ok := run_code(
+		`
+		импорт ос
+
+		функ старт() -> Строка
+			пер запись = ос.установить_окружение("PANOS_E2E_ENV", "значение")
+			если запись.успех() тогда
+				ос.окружение("PANOS_E2E_ENV").получить("нет")
+			иначе
+				запись.причина().сообщение
+			конец
+		конец
+	`,
+	)
+	testing.expectf(
+		t,
+		env_ok,
+		"[Стандартная библиотека: окружение] стек пуст",
+	)
+	if env_ok {
+		testing.expectf(
+			t,
+			env_result == "значение",
+			"[Стандартная библиотека: окружение] ожидалось значение, получено %v",
+			env_result,
 		)
 	}
 }

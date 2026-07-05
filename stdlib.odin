@@ -3,7 +3,7 @@ package main
 import "core:fmt"
 
 is_builtin_module_name :: proc(name: string) -> bool {
-	return name == "фс"
+	return name == "фс" || name == "ос"
 }
 
 add_builtin_export :: proc(graph: ^Module_Graph, module: ^Module, name: string, typ: ^Type) {
@@ -33,6 +33,14 @@ builtin_export_type :: proc(full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_STRING, new_result_type(TY_STRING, TY_ERROR))
 	case "фс::записать":
 		return builtin_function_type_2(TY_STRING, TY_STRING, new_result_type(TY_NUM, TY_ERROR))
+	case "ос::аргументы":
+		return new_function_type(make([dynamic]^Type), new_array_type(TY_STRING))
+	case "ос::окружение":
+		return builtin_function_type_1(TY_STRING, new_option_type(TY_STRING))
+	case "ос::установить_окружение":
+		return builtin_function_type_2(TY_STRING, TY_STRING, new_result_type(TY_NUM, TY_ERROR))
+	case "ос::удалить_окружение":
+		return builtin_function_type_1(TY_STRING, TY_BOOL)
 	}
 	return nil
 }
@@ -67,6 +75,31 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"записать",
 			builtin_function_type_2(TY_STRING, TY_STRING, new_result_type(TY_NUM, TY_ERROR)),
+		)
+	} else if name == "ос" {
+		add_builtin_export(
+			graph,
+			module,
+			"аргументы",
+			builtin_export_type("ос::аргументы"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"окружение",
+			builtin_export_type("ос::окружение"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"установить_окружение",
+			builtin_export_type("ос::установить_окружение"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"удалить_окружение",
+			builtin_export_type("ос::удалить_окружение"),
 		)
 	}
 

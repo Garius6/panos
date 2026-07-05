@@ -26,12 +26,12 @@ main :: proc() {
 	args_len := len(args)
 	if args_len == 1 {
 		repl()
-	} else if args_len == 2 {
-		run_file(args[1])
+	} else if args_len >= 2 {
+		run_file(args[1], args[2:])
 	}
 }
 
-run_file :: proc(filename: string) {
+run_file :: proc(filename: string, program_args: []string = nil) {
 	graph := load_module_graph(filename)
 	entry_path := resolve_import_path(filename, "")
 	entry_module := graph.modules[entry_path]
@@ -70,7 +70,7 @@ run_file :: proc(filename: string) {
 
 	fmt.println("EXECUTION")
 	fmt.printf("--------------------------\n")
-	vm := new_vm(global_registry)
+	vm := new_vm(global_registry, program_args)
 	execute(vm)
 	print_vm(vm)
 	fmt.printf("--------------------------\n\n")

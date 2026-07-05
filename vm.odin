@@ -15,11 +15,16 @@ VM :: struct {
 	frames:             [dynamic]CallFrame,
 	compiled_functions: map[string]^Compiled_Function,
 	stack:              [dynamic]Value,
+	program_args:       []string,
 }
 
-new_vm :: proc(compiled_functions: map[string]^Compiled_Function) -> ^VM {
+new_vm :: proc(
+	compiled_functions: map[string]^Compiled_Function,
+	program_args: []string = nil,
+) -> ^VM {
 	vm := new(VM)
 	vm.frames = make([dynamic]CallFrame)
+	vm.program_args = program_args
 
 	// Берем переданный словарь напрямую
 	vm.compiled_functions = compiled_functions
@@ -245,7 +250,7 @@ invoke_collection_method :: proc(
 	)
 }
 
-call_builtin :: proc(name: string, args: []Value) -> Value {
+call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> Value {
 	switch name {
 	case "Ошибка":
 		expect_arg_count(name, len(args), 2)
@@ -308,6 +313,43 @@ call_builtin :: proc(name: string, args: []Value) -> Value {
 			return make_error_result(make_error_value("фс", fmt.tprintf("%v", err)))
 		}
 		return make_ok_result(Value(f64(len(content))))
+
+	case "ос::аргументы":
+		expect_arg_count(name, len(args), 0)
+		arr := new(Array_Value)
+		arr.elements = make([dynamic]Value)
+		for arg in vm.program_args {
+			append(&arr.elements, Value(arg))
+		}
+		return Value(arr)
+
+	case "ос::окружение":
+		expect_arg_count(name, len(args), 1)
+		key := expect_string_arg(name, args[0])
+		value, found := os.lookup_env(key, context.allocator)
+		opt := new(Option_Value)
+		opt.has_value = found
+		if found {
+			opt.value = Value(value)
+		} else {
+			opt.value = Value("")
+		}
+		return Value(opt)
+
+	case "ос::установить_окружение":
+		expect_arg_count(name, len(args), 2)
+		key := expect_string_arg(name, args[0])
+		value := expect_string_arg(name, args[1])
+		err := os.set_env(key, value)
+		if err != nil {
+			return make_error_result(make_error_value("ос", fmt.tprintf("%v", err)))
+		}
+		return make_ok_result(Value(f64(0)))
+
+	case "ос::удалить_окружение":
+		expect_arg_count(name, len(args), 1)
+		key := expect_string_arg(name, args[0])
+		return Value(os.unset_env(key))
 	}
 
 	fmt.panicf(
@@ -445,7 +487,7 @@ execute :: proc(vm: ^VM) {
 			name := frame.function.constants[name_index].(string)
 			args_start := len(vm.stack) - arg_count
 			args := vm.stack[args_start:]
-			result := call_builtin(name, args)
+			result := call_builtin(vm, name, args)
 			resize(&vm.stack, args_start)
 			append(&vm.stack, result)
 

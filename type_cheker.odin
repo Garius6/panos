@@ -1105,6 +1105,11 @@ standard_method_type :: proc(
 			check_expr(ctx, args[0], receiver_type.element_type)
 			ctx.collection_calls[call] = method_name
 			return prune_type(receiver_type.element_type), true
+		case "ожидать":
+			if len(args) != 1 do fmt.panicf("Type Error: Опция.ожидать() ожидает сообщение")
+			check_expr(ctx, args[0], TY_STRING)
+			ctx.collection_calls[call] = method_name
+			return prune_type(receiver_type.element_type), true
 		}
 
 	case .Result:
@@ -1128,6 +1133,11 @@ standard_method_type :: proc(
 		case "получить":
 			if len(args) != 1 do fmt.panicf("Type Error: Результат.получить() ожидает значение по умолчанию")
 			check_expr(ctx, args[0], receiver_type.ok_type)
+			ctx.collection_calls[call] = method_name
+			return prune_type(receiver_type.ok_type), true
+		case "ожидать":
+			if len(args) != 1 do fmt.panicf("Type Error: Результат.ожидать() ожидает сообщение")
+			check_expr(ctx, args[0], TY_STRING)
 			ctx.collection_calls[call] = method_name
 			return prune_type(receiver_type.ok_type), true
 		}

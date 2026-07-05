@@ -213,6 +213,13 @@ invoke_collection_method :: proc(
 			expect_arg_count(method_name, len(args), 1)
 			if opt.has_value do return opt.value, true
 			return args[0], true
+		case "ожидать":
+			expect_arg_count(method_name, len(args), 1)
+			message := expect_string_arg(method_name, args[0])
+			if !opt.has_value {
+				fmt.panicf("Runtime Panic: %s", message)
+			}
+			return opt.value, true
 		}
 	}
 
@@ -244,6 +251,20 @@ invoke_collection_method :: proc(
 			expect_arg_count(method_name, len(args), 1)
 			if res.is_ok do return res.value, true
 			return args[0], true
+		case "ожидать":
+			expect_arg_count(method_name, len(args), 1)
+			message := expect_string_arg(method_name, args[0])
+			if !res.is_ok {
+				if err, ok_err := res.error.(^Error_Value); ok_err {
+					fmt.panicf(
+						"Runtime Panic: %s: %s",
+						message,
+						err.message,
+					)
+				}
+				fmt.panicf("Runtime Panic: %s", message)
+			}
+			return res.value, true
 		}
 	}
 

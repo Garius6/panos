@@ -32,70 +32,45 @@ main :: proc() {
 }
 
 run_file :: proc(filename: string) {
-	if !os.exists(filename) {
-		fmt.eprintf("Файл %s не существует\n", filename)
-		return
-	}
-
-	f, file_open_error := os.open(filename, {.Read})
-	if file_open_error != nil {
+	graph := load_module_graph(filename)
+	entry_path := resolve_import_path(filename, "")
+	entry_module := graph.modules[entry_path]
+	if entry_module == nil {
 		fmt.eprintf(
-			"Не удалось открыть файл по причине: %v\n",
-			file_open_error,
+			"Не удалось загрузить входной модуль %s\n",
+			filename,
 		)
 		return
 	}
-
-	data, file_reading_error := os.read_entire_file(f, context.allocator)
-	if file_reading_error != nil {
-		fmt.eprintf(
-			"Не удалось прочесть файл по причине: %v\n",
-			file_open_error,
-		)
-		return
-	}
-
-	tokens := tokenize(string(data))
-	stream := make_stream(tokens)
-	defer destroy_stream(&stream)
-
-	fmt.println("TOKENS")
-	fmt.printf("--------------------------\n")
-	for tok := next_token(&stream); tok != nil; tok = next_token(&stream) {
-		fmt.println(token_to_string(tok^))
-	}
-	stream.current_idx = 0
-	fmt.printf("--------------------------\n\n")
 
 	fmt.println("AST")
 	fmt.printf("--------------------------\n")
-	parser := Parser {
-		stream = &stream,
+	print_program(entry_module.ast)
+	fmt.printf("--------------------------\n\n")
+
+	global_registry := make(map[string]^Compiled_Function)
+
+	for module in graph.order {
+		resolver_ctx := resolve_module(&graph, module)
+		print_resolver_ctx(&resolver_ctx)
+
+		fmt.println("TYPE CHECK")
+		fmt.printf("--------------------------\n")
+		type_ctx := new_type_ctx(&resolver_ctx)
+		typecheck_program(&type_ctx, module.ast)
+		print_type_ctx(&type_ctx)
+		fmt.printf("--------------------------\n\n")
+
+		fmt.println("COMPILATION")
+		fmt.printf("--------------------------\n")
+		module_registry := compile_program(&resolver_ctx, &type_ctx, &module.ast, &global_registry)
+		print_assebler(module_registry)
+		fmt.printf("--------------------------\n\n")
 	}
-	program := parse_program(&parser)
-	print_program(program)
-	fmt.printf("--------------------------\n\n")
-
-	resolver_ctx := new_resolver_ctx()
-	resolve_program(&resolver_ctx, program)
-	print_resolver_ctx(&resolver_ctx)
-
-	fmt.println("TYPE CHECK")
-	fmt.printf("--------------------------\n")
-	type_ctx := new_type_ctx(&resolver_ctx)
-	typecheck_program(&type_ctx, program)
-	print_type_ctx(&type_ctx)
-	fmt.printf("--------------------------\n\n")
-
-	fmt.println("COMPILATION")
-	fmt.printf("--------------------------\n")
-	registry := compile_program(&resolver_ctx, &type_ctx, &program)
-	print_assebler(registry)
-	fmt.printf("--------------------------\n\n")
 
 	fmt.println("EXECUTION")
 	fmt.printf("--------------------------\n")
-	vm := new_vm(registry)
+	vm := new_vm(global_registry)
 	execute(vm)
 	print_vm(vm)
 	fmt.printf("--------------------------\n\n")

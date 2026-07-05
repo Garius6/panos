@@ -38,16 +38,22 @@ Value :: union {
 }
 
 Compiled_Function :: struct {
-	name:         string,
-	instructions: [dynamic]u8,
-	constants:    [dynamic]Value,
-	frame_size:   int,
+	name:          string,
+	instructions:  [dynamic]u8,
+	constants:     [dynamic]Value,
+	frame_size:    int,
 	returns_value: bool,
 }
 
 Local :: struct {
 	symbol: ^Symbol, // Берем из Resolver_Ctx
 	depth:  int,
+}
+
+symbol_registry_key :: proc(sym: ^Symbol) -> string {
+	if sym == nil do return ""
+	if len(sym.full_name) > 0 do return sym.full_name
+	return sym.name
 }
 
 Compiler :: struct {
@@ -154,29 +160,36 @@ compile_program :: proc(
 	res: ^Resolver_Ctx,
 	tc: ^Type_Ctx,
 	program: ^Program,
+	registry: ^map[string]^Compiled_Function = nil,
 ) -> map[string]^Compiled_Function {
-	registry := make(map[string]^Compiled_Function)
+	registry_ptr := registry
+	if registry_ptr == nil {
+		local_registry := make(map[string]^Compiled_Function)
+		registry_ptr = &local_registry
+	}
 
 	// ПРОХОД 1: Выделяем память под функции (Hoisting)
 	// Это позволит функции 'старт' вызывать функцию 'а', даже если 'а' объявлена ниже.
 	for decl in program.decls {
 		#partial switch d in decl {
+		case ^Import_Decl:
+		// Импорты не порождают исполняемый код.
 		case ^Function_Decl:
 			fn := new(Compiled_Function)
-			fn.name = d.name
+			fn.name = symbol_registry_key(res.decl_symbols[decl])
 			func_type := tc.symbol_types[res.decl_symbols[decl]]
 			fn.returns_value = prune_type(func_type.return_type) != TY_VOID
 			// Инициализируем массивы функции
 			fn.instructions = make([dynamic]u8)
 			fn.constants = make([dynamic]Value)
-			registry[d.name] = fn
+			registry_ptr^[fn.name] = fn
 		case ^Impl_Decl:
 			for m in d.methods {
-				fn := new(Compiled_Function); fn.name = m.name
+				fn := new(Compiled_Function); fn.name = symbol_registry_key(res.decl_symbols[m])
 				func_type := tc.symbol_types[res.decl_symbols[m]]
 				fn.returns_value = prune_type(func_type.return_type) != TY_VOID
 				fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
-				registry[m.name] = fn
+				registry_ptr^[fn.name] = fn
 			}
 
 		}
@@ -187,8 +200,8 @@ compile_program :: proc(
 		#partial switch d in decl {
 		case ^Function_Decl:
 			ctx := Compiler {
-				registry         = &registry,
-				current_function = registry[d.name],
+				registry         = registry_ptr,
+				current_function = registry_ptr^[symbol_registry_key(res.decl_symbols[decl])],
 				tc               = tc,
 				res              = res,
 				locals           = make([dynamic]Local),
@@ -204,8 +217,8 @@ compile_program :: proc(
 		case ^Impl_Decl:
 			for m in d.methods {
 				ctx := Compiler {
-					registry         = &registry,
-					current_function = registry[m.name],
+					registry         = registry_ptr,
+					current_function = registry_ptr^[symbol_registry_key(res.decl_symbols[m])],
 					tc               = tc,
 					res              = res,
 					locals           = make([dynamic]Local),
@@ -220,11 +233,12 @@ compile_program :: proc(
 		}
 	}
 
-	return registry // Возвращаем только готовые функции!}
+	return registry_ptr^ // Возвращаем только готовые функции!}
 }
 
 compile_decl :: proc(c: ^Compiler, decl: Decls) {
 	switch d in decl {
+	case ^Import_Decl:
 	case ^Impl_Decl:
 	case ^Struct_Decl:
 	case ^Interface_Decl:
@@ -239,7 +253,7 @@ compile_decl :: proc(c: ^Compiler, decl: Decls) {
 			compile_statement(c, stmt)
 		}
 
-		c.registry[function.name] = function
+		c.registry^[function.name] = function
 	}
 }
 
@@ -290,7 +304,13 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		emit_constant(ctx, e.value)
 	case ^Lambda_Expr:
 		fn := new(Compiled_Function)
-		fn.name = fmt.tprintf("lambda_%d", len(ctx.registry^))
+		module_prefix := ""
+		if ctx.res.current_module != nil do module_prefix = ctx.res.current_module.path
+		if len(module_prefix) > 0 {
+			fn.name = fmt.tprintf("%s::lambda_%d", module_prefix, len(ctx.registry^))
+		} else {
+			fn.name = fmt.tprintf("lambda_%d", len(ctx.registry^))
+		}
 		lambda_type := ctx.tc.node_types[expr]
 		fn.returns_value = prune_type(lambda_type.return_type) != TY_VOID
 		fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
@@ -313,6 +333,12 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		emit_constant(ctx, Value(fn))
 	case ^Ident_Expr:
 		sym := ctx.res.node_symbols[expr]
+		if sym.kind == .Module {
+			fmt.panicf(
+				"Compiler Error: модуль '%s' нельзя использовать как значение",
+				sym.name,
+			)
+		}
 
 		slot_index := -1
 		#reverse for loc, i in ctx.locals {
@@ -328,7 +354,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			emit_byte(ctx, u8(slot_index))
 		} else {
 			// 2. Если не локальная, ищем в глобальном реестре функций!
-			if fn_ptr, ok := ctx.registry^[sym.name]; ok {
+			if fn_ptr, ok := ctx.registry^[symbol_registry_key(sym)]; ok {
 				// Кладем саму функцию на стек как константу!
 				emit_constant(ctx, Value(fn_ptr))
 			} else {
@@ -379,6 +405,45 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 
 	case ^Property_Expr:
+		if sym, ok := ctx.res.node_symbols[expr]; ok {
+			if fn_ptr, found := ctx.registry^[symbol_registry_key(sym)]; found {
+				emit_constant(ctx, Value(fn_ptr))
+				return
+			}
+			fmt.panicf(
+				"Compiler Error: символ '%s' нельзя использовать как значение",
+				sym.full_name,
+			)
+		}
+		if obj_ident, ok := e.object.(^Ident_Expr); ok {
+			if obj_sym := ctx.res.node_symbols[e.object];
+			   obj_sym != nil && obj_sym.kind == .Module {
+				imported_module := obj_sym.module
+				if imported_module == nil {
+					fmt.panicf(
+						"Compiler Error: модуль '%s' не загружен",
+						obj_ident.name,
+					)
+				}
+				if export_sym, found := imported_module.exports[e.property]; found {
+					if fn_ptr, found_fn := ctx.registry^[symbol_registry_key(export_sym)];
+					   found_fn {
+						emit_constant(ctx, Value(fn_ptr))
+						return
+					}
+					fmt.panicf(
+						"Compiler Error: экспорт '%s.%s' нельзя использовать как значение",
+						obj_ident.name,
+						e.property,
+					)
+				}
+				fmt.panicf(
+					"Compiler Error: модуль '%s' не экспортирует '%s'",
+					obj_ident.name,
+					e.property,
+				)
+			}
+		}
 		compile_expr(ctx, e.object) // На стеке окажется структура
 
 		idx := ctx.tc.property_indices[expr] // Берем индекс поля от Тайп-чекера
@@ -390,7 +455,8 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		compile_expr(ctx, e.index)
 		emit_opcode(ctx, .Get_Index)
 	case ^Call_Expr:
-		if collection_method_name, is_collection_call := ctx.tc.collection_calls[expr]; is_collection_call {
+		if collection_method_name, is_collection_call := ctx.tc.collection_calls[expr];
+		   is_collection_call {
 			prop_expr := e.callee.(^Property_Expr)
 			compile_expr(ctx, prop_expr.object)
 			for arg in e.args do compile_expr(ctx, arg)
@@ -409,7 +475,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			emit_byte(ctx, u8(len(e.args)))
 
 		} else if method_sym, is_method := ctx.tc.method_calls[expr]; is_method {
-			if fn_ptr, ok := ctx.registry^[method_sym.name]; ok {
+			if fn_ptr, ok := ctx.registry^[symbol_registry_key(method_sym)]; ok {
 				emit_constant(ctx, Value(fn_ptr))
 			} else {
 				fmt.panicf("Compiler Error: метод не найден")

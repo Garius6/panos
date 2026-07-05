@@ -106,7 +106,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 	return Type_Ctx {
 		res = res,
 		node_types = make(map[Expr]^Type),
-		symbol_types = make(map[^Symbol]^Type),
+		symbol_types = res.symbol_types,
 		is_constructor = make(map[Expr]bool),
 		property_indices = make(map[Expr]int),
 		method_calls = make(map[Expr]^Symbol),
@@ -602,6 +602,12 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 		if n.name == "Строка" do return TY_STRING
 		if n.name == "Пусто" do return TY_VOID
 		if sym := lookup_symbol(ctx.res.global_scope, n.name); sym != nil {
+			if sym.kind == .Module {
+				fmt.panicf(
+					"Type Error: модуль '%s' нельзя использовать как тип",
+					n.name,
+				)
+			}
 			if typ, ok := ctx.symbol_types[sym]; ok do return typ
 		}
 		fmt.panicf("Type Error: неизвестный тип '%s'", n.name)
@@ -620,6 +626,30 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 		}
 		return_type := resolve_type_node(ctx, n.return_type)
 		return new_function_type(params, return_type)
+	case ^Type_Qualified:
+		module_sym := lookup_symbol(ctx.res.global_scope, n.module_name)
+		if module_sym == nil || module_sym.kind != .Module {
+			fmt.panicf("Type Error: неизвестный модуль '%s'", n.module_name)
+		}
+		imported_module := module_sym.module
+		if imported_module == nil {
+			fmt.panicf("Type Error: модуль '%s' не загружен", n.module_name)
+		}
+		if export_sym, found := imported_module.exports[n.name]; found {
+			if typ, found_type := ctx.symbol_types[export_sym]; found_type {
+				return typ
+			}
+			fmt.panicf(
+				"Type Error: тип '%s.%s' еще не доступен",
+				n.module_name,
+				n.name,
+			)
+		}
+		fmt.panicf(
+			"Type Error: модуль '%s' не экспортирует '%s'",
+			n.module_name,
+			n.name,
+		)
 	case ^Type_Generic:
 		if n.name == "Массив" {
 			if len(n.params) != 1 do fmt.panicf("Type Error: Массив ожидает 1 параметр типа")
@@ -936,6 +966,12 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 	case ^Ident_Expr:
 		sym := ctx.res.node_symbols[expr]
+		if sym.kind == .Module {
+			fmt.panicf(
+				"Type Error: модуль '%s' нельзя использовать как значение",
+				sym.name,
+			)
+		}
 		var_type, ok := ctx.symbol_types[sym]
 		if !ok do fmt.panicf("Type Error: символ '%s' используется до инициализации", sym.name)
 		t = prune_type(var_type)
@@ -973,6 +1009,74 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	case ^Call_Expr:
 		#partial switch prop_expr in e.callee {
 		case ^Property_Expr:
+			if obj_ident, ok := prop_expr.object.(^Ident_Expr); ok {
+				if obj_sym := ctx.res.node_symbols[prop_expr.object];
+				   obj_sym != nil && obj_sym.kind == .Module {
+					imported_module := obj_sym.module
+					if imported_module == nil {
+						fmt.panicf(
+							"Type Error: модуль '%s' не загружен",
+							obj_ident.name,
+						)
+					}
+					export_sym, found := imported_module.exports[prop_expr.property]
+					if !found {
+						fmt.panicf(
+							"Type Error: модуль '%s' не экспортирует '%s'",
+							obj_ident.name,
+							prop_expr.property,
+						)
+					}
+
+					export_type, found_type := ctx.symbol_types[export_sym]
+					if !found_type || export_type == nil {
+						if fn_decl, has_fn_decl := export_sym.decl.(^Function_Decl); has_fn_decl {
+							export_type = function_type_from_decl(ctx, fn_decl)
+						} else {
+							fmt.panicf(
+								"Type Error: символ '%s.%s' еще не типизирован",
+								obj_ident.name,
+								prop_expr.property,
+							)
+						}
+					}
+					export_type = prune_type(export_type)
+					#partial switch export_type.kind {
+					case .Function:
+						if len(e.args) != len(export_type.params) {
+							fmt.panicf(
+								"Type Error: неверное количество аргументов",
+							)
+						}
+						for arg, i in e.args do check_expr(ctx, arg, export_type.params[i])
+						t = prune_type(export_type.return_type)
+						ctx.node_types[expr] = t
+						return t
+
+					case .Struct:
+						if len(e.args) != len(export_type.fields) {
+							fmt.panicf(
+								"Type Error: структура '%s' имеет %d полей",
+								export_type.name,
+								len(export_type.fields),
+							)
+						}
+						for arg, i in e.args do check_expr(ctx, arg, export_type.fields[i].type)
+						ctx.is_constructor[expr] = true
+						t = export_type
+						ctx.node_types[expr] = t
+						return t
+
+					case:
+						fmt.panicf(
+							"Type Error: символ '%s.%s' нельзя вызвать",
+							obj_ident.name,
+							prop_expr.property,
+						)
+					}
+				}
+			}
+
 			obj_type := prune_type(infer_expr(ctx, prop_expr.object))
 
 			if obj_type.kind == .Array {
@@ -1211,6 +1315,45 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		}
 
 	case ^Property_Expr:
+		if sym, ok := ctx.res.node_symbols[expr]; ok {
+			t = prune_type(ctx.symbol_types[sym])
+			ctx.node_types[expr] = t
+			return t
+		}
+		if obj_ident, ok := e.object.(^Ident_Expr); ok {
+			if obj_sym := ctx.res.node_symbols[e.object];
+			   obj_sym != nil && obj_sym.kind == .Module {
+				imported_module := obj_sym.module
+				if imported_module == nil {
+					fmt.panicf(
+						"Type Error: модуль '%s' не загружен",
+						obj_ident.name,
+					)
+				}
+				if export_sym, found := imported_module.exports[e.property]; found {
+					if typ, found_type := ctx.symbol_types[export_sym]; found_type && typ != nil {
+						t = prune_type(typ)
+						ctx.node_types[expr] = t
+						return t
+					}
+					if fn_decl, has_fn_decl := export_sym.decl.(^Function_Decl); has_fn_decl {
+						t = function_type_from_decl(ctx, fn_decl)
+						ctx.node_types[expr] = t
+						return t
+					}
+					fmt.panicf(
+						"Type Error: тип '%s.%s' еще не доступен",
+						obj_ident.name,
+						e.property,
+					)
+				}
+				fmt.panicf(
+					"Type Error: модуль '%s' не экспортирует '%s'",
+					obj_ident.name,
+					e.property,
+				)
+			}
+		}
 		obj_type := prune_type(infer_expr(ctx, e.object))
 		if obj_type.kind == .Struct {
 			field_idx := -1

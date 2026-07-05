@@ -33,6 +33,26 @@ run_code :: proc(source: string) -> (Value, bool) {
 	return 0.0, false
 }
 
+run_module_file :: proc(filename: string) -> (Value, bool) {
+	graph := load_module_graph(filename)
+	registry := make(map[string]^Compiled_Function)
+
+	for module in graph.order {
+		res_ctx := resolve_module(&graph, module)
+		type_ctx := new_type_ctx(&res_ctx)
+		typecheck_program(&type_ctx, module.ast)
+		compile_program(&res_ctx, &type_ctx, &module.ast, &registry)
+	}
+
+	vm := new_vm(registry)
+	execute(vm)
+
+	if len(vm.stack) > 0 {
+		return vm.stack[len(vm.stack) - 1], true
+	}
+	return 0.0, false
+}
+
 @(test)
 test_math_and_logic :: proc(t: ^testing.T) {
 	TestCase :: struct {
@@ -47,7 +67,11 @@ test_math_and_logic :: proc(t: ^testing.T) {
 			"функ старт() -> Число  10 + 20 конец",
 			f64(30.0),
 		},
-		{"Унарный минус", "функ старт() -> Число  -5 конец", f64(-5.0)},
+		{
+			"Унарный минус",
+			"функ старт() -> Число  -5 конец",
+			f64(-5.0),
+		},
 		{"Логика", "функ старт() -> Булево истина конец", true},
 		{
 			"Сложный if",
@@ -180,4 +204,18 @@ test_math_and_logic :: proc(t: ^testing.T) {
 			result,
 		)
 	}
+}
+
+@(test)
+test_modules :: proc(t: ^testing.T) {
+	result, ok := run_module_file("module_fixture_main.ps")
+	testing.expectf(t, ok, "Модули: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(
+		t,
+		result == f64(42.0),
+		"Модули: ожидалось 42, получено %v",
+		result,
+	)
 }

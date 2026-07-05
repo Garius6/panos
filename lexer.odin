@@ -118,6 +118,12 @@ lookup_ident :: proc(ident: string) -> TokenKind {
 		return .Interface
 	case "для":
 		return .For
+	case "импорт":
+		return .Import
+	case "экспорт":
+		return .Export
+	case "как":
+		return .As
 	}
 	return .Ident
 }

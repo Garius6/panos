@@ -16,6 +16,7 @@ Function_Decl :: struct {
 	args:        [dynamic]Param_Decl,
 	return_type: Type_Node,
 	body:        [dynamic]Stmt,
+	is_exported: bool,
 }
 
 Param_Decl :: struct {
@@ -30,8 +31,9 @@ Method_Signature :: struct {
 }
 
 Interface_Decl :: struct {
-	name:    string,
-	methods: [dynamic]Method_Signature,
+	name:        string,
+	methods:     [dynamic]Method_Signature,
+	is_exported: bool,
 }
 
 Field_Decl :: struct {
@@ -40,8 +42,14 @@ Field_Decl :: struct {
 }
 
 Struct_Decl :: struct {
-	name:   string,
-	fields: [dynamic]Field_Decl,
+	name:        string,
+	fields:      [dynamic]Field_Decl,
+	is_exported: bool,
+}
+
+Import_Decl :: struct {
+	path:  string,
+	alias: string,
 }
 
 Impl_Decl :: struct {
@@ -51,6 +59,7 @@ Impl_Decl :: struct {
 }
 
 Decls :: union {
+	^Import_Decl,
 	^Function_Decl,
 	^Struct_Decl,
 	^Impl_Decl,
@@ -67,10 +76,16 @@ Type_Generic :: struct {
 	params: [dynamic]Type_Node,
 }
 
+Type_Qualified :: struct {
+	module_name: string,
+	name:        string,
+}
+
 Type_Node :: union {
 	^Type_Ident,
 	^Type_Tuple,
 	^Type_Function,
+	^Type_Qualified,
 	^Type_Generic, // Заменяет Type_Array и Type_Map
 }
 
@@ -212,14 +227,20 @@ print_program :: proc(prog: Program) {
 
 print_decl :: proc(decl: Decls) {
 	switch d in decl {
+	case ^Import_Decl:
+		if d.alias != "" {
+			fmt.printf("Import (%s as %s)\n", d.path, d.alias)
+		} else {
+			fmt.printf("Import (%s)\n", d.path)
+		}
 	case ^Function_Decl:
-		fmt.printf("Function (%s)\n", d.name)
+		fmt.printf("%sFunction (%s)\n", d.is_exported ? "Export " : "", d.name)
 		for stmt, i in d.body {
 			is_last := i == len(d.body) - 1
 			print_stmt(stmt, "", is_last)
 		}
 	case ^Struct_Decl:
-		fmt.printf("Struct (%s)\n", d.name)
+		fmt.printf("%sStruct (%s)\n", d.is_exported ? "Export " : "", d.name)
 		for field, i in d.fields {
 			is_last := i == len(d.fields) - 1
 			print_field(field, "", is_last)
@@ -227,7 +248,7 @@ print_decl :: proc(decl: Decls) {
 	case ^Impl_Decl:
 		fmt.printf("Impl (%s)\n", d.target_type)
 	case ^Interface_Decl:
-		fmt.printf("Interface (%s)\n", d.name)
+		fmt.printf("%sInterface (%s)\n", d.is_exported ? "Export " : "", d.name)
 	}
 }
 
@@ -349,24 +370,43 @@ parse_program :: proc(p: ^Parser) -> Program {
 	}
 
 	for peek_token(p.stream).kind != .EOF {
+		is_exported := false
+		if peek_token(p.stream).kind == .Export {
+			next_token(p.stream)
+			is_exported = true
+		}
+
 		tok_kind := peek_token(p.stream).kind
-		if tok_kind == .Function {
-			decl := parse_function(p)
+		if tok_kind == .Import {
+			if is_exported {
+				fmt.panicf(
+					"Синтаксическая ошибка: нельзя экспортировать импорт",
+				)
+			}
+			decl := parse_import_decl(p)
+			append(&prog.decls, decl)
+		} else if tok_kind == .Function {
+			decl := parse_function(p, is_exported)
 			append(&prog.decls, decl)
 		} else if tok_kind == .TypeDecl {
 			if p.stream.tokens[p.stream.current_idx + 3].kind == .Struct {
-				decl := parse_struct_decl(p)
+				decl := parse_struct_decl(p, is_exported)
 				append(&prog.decls, decl)
 			} else {
-				decl := parse_interface_decl(p)
+				decl := parse_interface_decl(p, is_exported)
 				append(&prog.decls, decl)
 			}
 		} else if tok_kind == .Impl {
+			if is_exported {
+				fmt.panicf(
+					"Синтаксическая ошибка: реализация не может быть экспортирована",
+				)
+			}
 			decl := parse_impl_decl(p)
 			append(&prog.decls, decl)
 		} else {
 			fmt.panicf(
-				"Ожидалось объявление функции или типа, получено: %v",
+				"Ожидалось объявление, импорт или экспорт, получено: %v",
 				tok_kind,
 			)
 		}
@@ -374,10 +414,38 @@ parse_program :: proc(p: ^Parser) -> Program {
 	return prog
 }
 
-parse_interface_decl :: proc(p: ^Parser) -> ^Interface_Decl {
+parse_import_decl :: proc(p: ^Parser) -> ^Import_Decl {
+	expect(p, .Import)
+	decl := new(Import_Decl)
+
+	path_tok := next_token(p.stream)
+	if path_tok.kind != .Ident && path_tok.kind != .String {
+		fmt.panicf(
+			"Синтаксическая ошибка: после 'импорт' ожидается имя модуля или строка пути",
+		)
+	}
+	decl.path = path_tok.data
+
+	if peek_token(p.stream).kind == .As {
+		next_token(p.stream)
+		alias_tok := next_token(p.stream)
+		if alias_tok.kind != .Ident {
+			fmt.panicf(
+				"Синтаксическая ошибка: после 'как' ожидается имя псевдонима",
+			)
+		}
+		decl.alias = alias_tok.data
+	}
+
+	consume_semicolon_or_newline(p)
+	return decl
+}
+
+parse_interface_decl :: proc(p: ^Parser, is_exported: bool) -> ^Interface_Decl {
 	expect(p, .TypeDecl)
 	decl := new(Interface_Decl)
 	decl.methods = make([dynamic]Method_Signature)
+	decl.is_exported = is_exported
 
 	name_tok := next_token(p.stream)
 	decl.name = name_tok.data
@@ -429,7 +497,7 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 			)
 		}
 
-		method := parse_function(p)
+		method := parse_function(p, false)
 		if len(method.args) == 0 || method.args[0].name != "это" {
 			fmt.panicf(
 				"Синтаксическая ошибка: первый аргумент метода '%s' структуры '%s' должен называться 'это'",
@@ -446,10 +514,11 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 	return decl
 }
 
-parse_function :: proc(p: ^Parser) -> ^Function_Decl {
+parse_function :: proc(p: ^Parser, is_exported: bool) -> ^Function_Decl {
 	expect(p, .Function)
 	function := new(Function_Decl)
 	function.body = make([dynamic]Stmt)
+	function.is_exported = is_exported
 
 	tok := next_token(p.stream)
 	if tok.kind != .Ident do fmt.panicf("Ожидалось имя функции")
@@ -507,7 +576,10 @@ parse_param_list :: proc(p: ^Parser, require_types: bool) -> [dynamic]Param_Decl
 
 parse_required_return_type :: proc(p: ^Parser, owner: string) -> Type_Node {
 	if peek_token(p.stream).kind != .Arrow {
-		fmt.panicf("Синтаксическая ошибка: после объявления %s ожидается '-> Тип'", owner)
+		fmt.panicf(
+			"Синтаксическая ошибка: после объявления %s ожидается '-> Тип'",
+			owner,
+		)
 	}
 	next_token(p.stream)
 	return parse_type(p)
@@ -519,11 +591,12 @@ parse_optional_return_type :: proc(p: ^Parser) -> Type_Node {
 	return parse_type(p)
 }
 
-parse_struct_decl :: proc(p: ^Parser) -> ^Struct_Decl {
+parse_struct_decl :: proc(p: ^Parser, is_exported: bool) -> ^Struct_Decl {
 	expect(p, .TypeDecl)
 
 	decl := new(Struct_Decl)
 	decl.fields = make([dynamic]Field_Decl)
+	decl.is_exported = is_exported
 
 	name_tok := next_token(p.stream)
 	if name_tok.kind != .Ident do error("Ожидалось имя типа")
@@ -581,6 +654,20 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 	}
 
 	if tok.kind == .Ident {
+		if peek_token(p.stream).kind == .Dot {
+			next_token(p.stream)
+			member_tok := next_token(p.stream)
+			if member_tok.kind != .Ident {
+				fmt.panicf(
+					"Синтаксическая ошибка: после '.' ожидается имя типа",
+				)
+			}
+			t := new(Type_Qualified)
+			t.module_name = tok.data
+			t.name = member_tok.data
+			return t
+		}
+
 		// НОВОЕ: Универсальный парсинг дженерик-типов: Массив(Число), Соответствие(Число, Строка)
 		if peek_token(p.stream).kind == .LParen {
 			next_token(p.stream) // съедаем (

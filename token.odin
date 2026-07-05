@@ -41,6 +41,7 @@ TokenKind :: enum {
 	As,
 	Semicolon,
 	Comma,
+	Question,
 	EOF,
 }
 

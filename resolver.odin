@@ -242,6 +242,7 @@ install_standard_symbols :: proc(ctx: ^Resolver_Ctx) {
 		"Успех",
 		"Неудача",
 		"длина",
+		"паника",
 	}
 	for name in names {
 		sym := new_symbol(name, .Builtin, nil)
@@ -547,6 +548,8 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 	case ^Index_Expr:
 		resolve_expr(ctx, e.object)
 		resolve_expr(ctx, e.index)
+	case ^Try_Expr:
+		resolve_expr(ctx, e.value)
 	}
 }
 

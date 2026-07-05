@@ -217,6 +217,11 @@ next_token_lex :: proc(l: ^Lexer) -> Token {
 			kind = .Comma,
 			data = ",",
 		}; advance(l)
+	case '?':
+		tok = Token {
+			kind = .Question,
+			data = "?",
+		}; advance(l)
 	case '.':
 		tok = Token {
 			kind = .Dot,

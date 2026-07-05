@@ -198,6 +198,10 @@ Index_Expr :: struct {
 	index:  Expr,
 }
 
+Try_Expr :: struct {
+	value: Expr,
+}
+
 Expr :: union {
 	^Number_Expr,
 	^Boolean_Expr,
@@ -214,6 +218,7 @@ Expr :: union {
 	^Array_Expr,
 	^Map_Expr,
 	^Index_Expr,
+	^Try_Expr,
 }
 
 // --- ПЕЧАТЬ AST ---
@@ -359,6 +364,9 @@ print_ast :: proc(expr: Expr, prefix: string = "", is_last: bool = true) {
 		fmt.printf("%s%sIndex()\n", prefix, marker)
 		print_ast(e.object, next_prefix, false)
 		print_ast(e.index, next_prefix, true)
+	case ^Try_Expr:
+		fmt.printf("%s%sTry(?)\n", prefix, marker)
+		print_ast(e.value, next_prefix, true)
 	}
 }
 
@@ -930,6 +938,11 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 			expect(p, .RBracket)
 			left = index
 
+		} else if op.kind == .Question {
+			try_expr := new(Try_Expr)
+			try_expr.value = left
+			left = try_expr
+
 		} else {
 			// Обычный бинарный оператор (включая `=`)
 			right := parse_expr(p, rbp)
@@ -1041,6 +1054,8 @@ infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 		return 80, 0, true
 	case .LBracket:
 		return 80, 0, true
+	case .Question:
+		return 90, 91, true
 	}
 	return 0, 0, false
 }

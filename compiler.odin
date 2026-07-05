@@ -121,6 +121,7 @@ Opcode :: enum u8 {
 	Set_Index,
 	Invoke_Collection,
 	Call_Builtin,
+	Try_Unwrap,
 }
 
 // Записать 1 байт в массив инструкций
@@ -484,6 +485,9 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		compile_expr(ctx, e.object)
 		compile_expr(ctx, e.index)
 		emit_opcode(ctx, .Get_Index)
+	case ^Try_Expr:
+		compile_expr(ctx, e.value)
+		emit_opcode(ctx, .Try_Unwrap)
 	case ^Call_Expr:
 		if ident, ok := e.callee.(^Ident_Expr); ok {
 			if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Builtin {
@@ -778,6 +782,10 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 			case .Call_Builtin:
 				idx += 2
 				command := fmt.tprintf("%sCALL_BUILTIN\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Try_Unwrap:
+				command := fmt.tprintf("%sTRY_UNWRAP\n", prefix)
 				strings.write_string(&builder, command)
 
 			}

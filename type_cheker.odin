@@ -122,6 +122,7 @@ Type_Ctx :: struct {
 	interface_calls:  map[Expr]string,
 	collection_calls: map[Expr]string,
 	builtin_calls:    map[Expr]string,
+	current_return:   ^Type,
 	next_infer_id:    int,
 }
 
@@ -837,6 +838,9 @@ check_func_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) {
 // блока и явные `return` с ожидаемым возвращаемым типом.
 check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return: ^Type) {
 	expected_return_type := prune_type(expected_return)
+	prev_return := ctx.current_return
+	ctx.current_return = expected_return_type
+
 	for stmt in body {
 		check_stmt(ctx, stmt, expected_return_type)
 	}
@@ -851,6 +855,7 @@ check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return
 				prune_type(body_type).name,
 			)
 		}
+		ctx.current_return = prev_return
 		return
 	}
 
@@ -862,6 +867,7 @@ check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return
 				prune_type(body_type).name,
 			)
 		}
+		ctx.current_return = prev_return
 		return
 	}
 
@@ -873,9 +879,11 @@ check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return
 				prune_type(explicit_return_type).name,
 			)
 		}
+		ctx.current_return = prev_return
 		return
 	}
 
+	ctx.current_return = prev_return
 	fmt.panicf(
 		"Type Error: функция должна возвращать '%s', но тело не возвращает значение",
 		prune_type(expected_return_type).name,
@@ -1054,6 +1062,11 @@ builtin_constructor_type :: proc(
 			"Type Error: длина() ожидает строку, массив или соответствие, получен '%s'",
 			arg_type.name,
 		)
+
+	case "паника":
+		if len(args) != 1 do fmt.panicf("Type Error: паника() ожидает сообщение")
+		check_expr(ctx, args[0], TY_STRING)
+		return TY_VOID, true
 	}
 
 	return nil, false
@@ -1556,6 +1569,30 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 				obj_type.name,
 			)
 		}
+
+	case ^Try_Expr:
+		value_type := prune_type(infer_expr(ctx, e.value))
+		if value_type.kind != .Result {
+			fmt.panicf(
+				"Type Error: оператор '?' ожидает Результат, получен '%s'",
+				value_type.name,
+			)
+		}
+
+		return_type := prune_type(ctx.current_return)
+		if return_type == nil || return_type.kind != .Result {
+			fmt.panicf(
+				"Type Error: оператор '?' можно использовать только в функции, возвращающей Результат",
+			)
+		}
+		if !unify_types(value_type.error_type, return_type.error_type) {
+			fmt.panicf(
+				"Type Error: оператор '?' возвращает ошибку типа '%s', но функция ожидает '%s'",
+				prune_type(value_type.error_type).name,
+				prune_type(return_type.error_type).name,
+			)
+		}
+		t = prune_type(value_type.ok_type)
 
 	case ^Property_Expr:
 		if sym, ok := ctx.res.node_symbols[expr]; ok {

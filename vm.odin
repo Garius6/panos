@@ -47,6 +47,18 @@ new_vm :: proc(
 	return vm
 }
 
+return_from_current_frame :: proc(vm: ^VM, result: Value) {
+	frame := &vm.frames[len(vm.frames) - 1]
+	callee_index := frame.frame_pointer - 1
+	resize_to := callee_index
+	if resize_to < 0 do resize_to = 0
+	resize(&vm.stack, resize_to)
+	if frame.function.returns_value {
+		append(&vm.stack, result)
+	}
+	pop(&vm.frames)
+}
+
 value_equals :: proc(a: Value, b: Value) -> bool {
 	#partial switch va in a {
 	case f64:
@@ -345,6 +357,11 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 			"Runtime Error: длина() ожидает строку, массив или соответствие",
 		)
 
+	case "паника":
+		expect_arg_count(name, len(args), 1)
+		message := expect_string_arg(name, args[0])
+		fmt.panicf("Runtime Panic: %s", message)
+
 	case "фс::есть":
 		expect_arg_count(name, len(args), 1)
 		path := expect_string_arg(name, args[0])
@@ -581,25 +598,21 @@ execute :: proc(vm: ^VM) {
 				result = pop(&vm.stack)
 			}
 
-			// Очищаем весь кадр (локальные переменные, аргументы и саму вызванную функцию)
-			// Функция-callee лежит прямо перед frame_pointer
-			callee_index := frame.frame_pointer - 1
-
-			// В Odin функция resize мгновенно отсекает хвост массива (очищает стек)
-			resize_to := callee_index
-			if resize_to < 0 do resize_to = 0
-			resize(&vm.stack, resize_to)
-
-			// Кладем результат только для функций с непустым возвращаемым типом.
-			if frame.function.returns_value {
-				append(&vm.stack, result)
-			}
-
-			// Удаляем текущий фрейм
-			pop(&vm.frames)
-
-			// Если мы вышли из функции 'старт', программа сама завершится
+			return_from_current_frame(vm, result)
 			continue
+
+		case .Try_Unwrap:
+			value := pop(&vm.stack)
+			res, ok := value.(^Result_Value)
+			if !ok {
+				fmt.panicf("Runtime Error: оператор '?' ожидал Результат")
+			}
+			if res.is_ok {
+				append(&vm.stack, res.value)
+			} else {
+				return_from_current_frame(vm, value)
+				continue
+			}
 
 		case .Jump_If_False:
 			// Читаем 2 байта смещения

@@ -283,6 +283,13 @@ invoke_collection_method :: proc(
 				fmt.panicf("Runtime Panic: %s", message)
 			}
 			return res.value, true
+		case "ожидать_ошибку":
+			expect_arg_count(method_name, len(args), 1)
+			message := expect_string_arg(method_name, args[0])
+			if res.is_ok {
+				fmt.panicf("Runtime Panic: %s", message)
+			}
+			return res.error, true
 		case "опция":
 			expect_arg_count(method_name, len(args), 0)
 			opt := new(Option_Value)

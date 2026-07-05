@@ -90,6 +90,17 @@ test_result_expect_panics_on_error :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_result_expect_error_panics_on_success :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Runtime Panic: ожидалась ошибка")
+	run_code(`
+		функ старт() -> Ошибка
+			пер р: Результат(Число, Ошибка) = Успех(42)
+			р.ожидать_ошибку("ожидалась ошибка")
+		конец
+	`)
+}
+
+@(test)
 test_strict_index_panics_out_of_bounds :: proc(t: ^testing.T) {
 	testing.expect_assert(t, "Runtime Error: индекс 1 выходит за границы массива")
 	run_code(`
@@ -331,6 +342,16 @@ test_math_and_logic :: proc(t: ^testing.T) {
 			конец
 		`,
 			f64(42.0),
+		},
+		{
+			"Результат: ожидать ошибку возвращает причину",
+			`
+			функ старт() -> Строка
+				пер р: Результат(Число, Ошибка) = Неудача(Ошибка("фс", "нет файла"))
+				р.ожидать_ошибку("должна быть ошибка").сообщение
+			конец
+		`,
+			"нет файла",
 		},
 		{
 			"Результат: успех в опцию",

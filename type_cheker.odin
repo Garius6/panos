@@ -17,6 +17,7 @@ Type_Kind :: enum {
 	Interface,
 	Array,
 	Map,
+	InferVar,
 }
 
 Type :: struct {
@@ -38,6 +39,8 @@ Type :: struct {
 	element_type:           ^Type,
 	key_type:               ^Type,
 	value_type:             ^Type,
+	infer_id:               int,
+	binding:                ^Type,
 }
 
 Struct_Field :: struct {
@@ -51,6 +54,8 @@ TY_BOOL := &Type{kind = .Bool, name = "Булево"}
 TY_VOID := &Type{kind = .Void, name = "Пусто"}
 TY_STRING := &Type{kind = .String, name = "Строка"}
 
+// Построение составных типов держим в одном месте, чтобы имена и ссылки
+// формировались одинаково во всех ветках type checker'а.
 new_function_type :: proc(params: [dynamic]^Type, return_type: ^Type) -> ^Type {
 	t := new(Type)
 	t.kind = .Function
@@ -78,7 +83,8 @@ new_map_type :: proc(key_type: ^Type, value_type: ^Type) -> ^Type {
 }
 
 is_valid_map_key_type :: proc(t: ^Type) -> bool {
-	return t.kind == .Number || t.kind == .Bool || t.kind == .String
+	typ := prune_type(t)
+	return typ.kind == .Number || typ.kind == .Bool || typ.kind == .String
 }
 
 // --- КОНТЕКСТ ---
@@ -93,6 +99,7 @@ Type_Ctx :: struct {
 	interface_casts:  map[Expr]^Type,
 	interface_calls:  map[Expr]string,
 	collection_calls: map[Expr]string,
+	next_infer_id:    int,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -109,14 +116,218 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 	}
 }
 
+// InferVar - внутренний временный тип. Он не равен Any: позже должен
+// связаться с конкретным типом или дать ошибку.
+new_infer_var :: proc(ctx: ^Type_Ctx) -> ^Type {
+	t := new(Type)
+	t.kind = .InferVar
+	t.infer_id = ctx.next_infer_id
+	t.name = fmt.tprintf("?%d", t.infer_id)
+	ctx.next_infer_id += 1
+	return t
+}
+
+// `prune_type` снимает все промежуточные связывания и возвращает фактический тип.
+prune_type :: proc(t: ^Type) -> ^Type {
+	if t == nil do return nil
+	if t.kind == .InferVar && t.binding != nil {
+		t.binding = prune_type(t.binding)
+		return t.binding
+	}
+	return t
+}
+
+// Нужна для защиты от циклических связываний вида `?T = (... ?T ...)`.
+type_contains_infer_var :: proc(t: ^Type, needle: ^Type) -> bool {
+	typ := prune_type(t)
+	if typ == nil do return false
+	if typ == needle do return true
+
+	#partial switch typ.kind {
+	case .Function:
+		for param in typ.params {
+			if type_contains_infer_var(param, needle) do return true
+		}
+		return type_contains_infer_var(typ.return_type, needle)
+
+	case .Tuple:
+		for el in typ.elements {
+			if type_contains_infer_var(el, needle) do return true
+		}
+
+	case .Array:
+		return type_contains_infer_var(typ.element_type, needle)
+
+	case .Map:
+		return(
+			type_contains_infer_var(typ.key_type, needle) ||
+			type_contains_infer_var(typ.value_type, needle) \
+		)
+	}
+
+	return false
+}
+
+// Связывает переменную типа с найденным кандидатом, если это не создает цикл.
+bind_infer_var :: proc(var_type: ^Type, target: ^Type) -> bool {
+	target_type := prune_type(target)
+	if target_type == nil do return false
+	if target_type == var_type do return true
+	if type_contains_infer_var(target_type, var_type) do return false
+	var_type.binding = target_type
+	return true
+}
+
+// Унификация либо подтверждает совместимость типов, либо фиксирует InferVar.
+// Это главный механизм вывода типов в лямбдах, аргументах и присваиваниях.
+unify_types :: proc(a: ^Type, b: ^Type) -> bool {
+	left := prune_type(a)
+	right := prune_type(b)
+	if left == nil || right == nil do return false
+	if left == right do return true
+
+	if left.kind == .InferVar do return bind_infer_var(left, right)
+	if right.kind == .InferVar do return bind_infer_var(right, left)
+
+	if right.kind == .Interface && left.kind == .Struct {
+		for iface in left.implemented_interfaces {
+			if iface == right do return true
+		}
+		return false
+	}
+
+	if left.kind != right.kind do return false
+
+	#partial switch left.kind {
+	case .Tuple:
+		if len(left.elements) != len(right.elements) do return false
+		for i in 0 ..< len(left.elements) {
+			if !unify_types(left.elements[i], right.elements[i]) do return false
+		}
+		return true
+
+	case .Function:
+		if len(left.params) != len(right.params) do return false
+		for i in 0 ..< len(left.params) {
+			if !unify_types(left.params[i], right.params[i]) do return false
+		}
+		return unify_types(left.return_type, right.return_type)
+
+	case .Array:
+		return unify_types(left.element_type, right.element_type)
+
+	case .Map:
+		return(
+			unify_types(left.key_type, right.key_type) &&
+			unify_types(left.value_type, right.value_type) \
+		)
+
+	case .Struct, .Interface:
+		return false
+	}
+	return true
+}
+
+// После вывода типа проверяем, что в нем не осталось неизвестных частей.
+has_unresolved_infer_vars :: proc(t: ^Type) -> bool {
+	typ := prune_type(t)
+	if typ == nil do return false
+
+	#partial switch typ.kind {
+	case .InferVar:
+		return true
+
+	case .Function:
+		for param in typ.params {
+			if has_unresolved_infer_vars(param) do return true
+		}
+		return has_unresolved_infer_vars(typ.return_type)
+
+	case .Tuple:
+		for el in typ.elements {
+			if has_unresolved_infer_vars(el) do return true
+		}
+
+	case .Array:
+		return has_unresolved_infer_vars(typ.element_type)
+
+	case .Map:
+		return has_unresolved_infer_vars(typ.key_type) || has_unresolved_infer_vars(typ.value_type)
+	}
+
+	return false
+}
+
+// Помогает ловить случаи, когда infer дошел не до конца, но код уже
+// пытается использовать результат как окончательный тип.
+ensure_type_resolved :: proc(t: ^Type, where_text: string) {
+	if has_unresolved_infer_vars(t) {
+		fmt.panicf("Type Error: не удалось вывести тип %s", where_text)
+	}
+}
+
+// Для top-level функций типы параметров по-прежнему должны быть явными.
+// Это упрощает раннюю регистрацию символов и не смешивает вывод с резолюцией имен.
 resolve_param_types :: proc(ctx: ^Type_Ctx, args: [dynamic]Param_Decl) -> [dynamic]^Type {
 	params := make([dynamic]^Type)
 	for arg in args {
+		if arg.type_annotation == nil {
+			fmt.panicf(
+				"Type Error: у аргумента '%s' нет явной аннотации типа",
+				arg.name,
+			)
+		}
 		append(&params, resolve_type_node(ctx, arg.type_annotation))
 	}
 	return params
 }
 
+// Для лямбд параметры можно либо взять из ожидаемого типа, либо вывести
+// как отдельные InferVar и потом связать их через тело.
+infer_lambda_param_types :: proc(
+	ctx: ^Type_Ctx,
+	args: [dynamic]Param_Decl,
+	expected: ^Type = nil,
+) -> [dynamic]^Type {
+	params := make([dynamic]^Type)
+	expected_type := prune_type(expected)
+	if expected_type != nil && expected_type.kind != .Function {
+		fmt.panicf(
+			"Type Error: лямбду можно проверить только с типом функции",
+		)
+	}
+	if expected_type != nil && len(args) != len(expected_type.params) {
+		fmt.panicf(
+			"Type Error: лямбда имеет %d аргументов, ожидалось %d",
+			len(args),
+			len(expected_type.params),
+		)
+	}
+
+	for arg, i in args {
+		if arg.type_annotation != nil {
+			arg_type := resolve_type_node(ctx, arg.type_annotation)
+			if expected_type != nil && !unify_types(arg_type, expected_type.params[i]) {
+				fmt.panicf(
+					"Type Error: аргумент лямбды '%s' имеет тип '%s', ожидался '%s'",
+					arg.name,
+					prune_type(arg_type).name,
+					prune_type(expected_type.params[i]).name,
+				)
+			}
+			append(&params, arg_type)
+		} else if expected_type != nil {
+			append(&params, expected_type.params[i])
+		} else {
+			append(&params, new_infer_var(ctx))
+		}
+	}
+
+	return params
+}
+
+// Сигнатура обычной функции берется только из явной декларации.
+// Для top-level items inference здесь не используется.
 function_type_from_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) -> ^Type {
 	params := resolve_param_types(ctx, d.args)
 	return_type := resolve_type_node(ctx, d.return_type)
@@ -136,6 +347,7 @@ interface_method_type_from_signature :: proc(
 	return new_function_type(params, resolve_type_node(ctx, m.return_type))
 }
 
+// Привязывает параметры обычной функции к уже вычисленной сигнатуре.
 bind_function_args :: proc(ctx: ^Type_Ctx, d: ^Function_Decl, func_type: ^Type) {
 	if args_syms, ok := ctx.res.func_args[d]; ok {
 		if len(args_syms) != len(func_type.params) {
@@ -148,6 +360,83 @@ bind_function_args :: proc(ctx: ^Type_Ctx, d: ^Function_Decl, func_type: ^Type) 
 			ctx.symbol_types[arg_sym] = func_type.params[i]
 		}
 	}
+}
+
+// То же самое для лямбды: символы аргументов должны получить типы
+// тех же позиций, которые были выведены или протолкнуты сверху вниз.
+bind_lambda_args :: proc(ctx: ^Type_Ctx, expr: Expr, params: [dynamic]^Type) {
+	if args_syms, ok := ctx.res.lambda_args[expr]; ok {
+		if len(args_syms) != len(params) {
+			fmt.panicf(
+				"Type Error: лямбда имеет рассинхронизированные аргументы",
+			)
+		}
+		for sym, i in args_syms do ctx.symbol_types[sym] = params[i]
+	}
+}
+
+// Пытается вывести тип блока callable-выражения: сначала как значение блока,
+// а если значения нет, то через явные `return`.
+infer_callable_body_type :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
+	body_type := infer_block_type(ctx, body)
+	if body_type != TY_VOID do return body_type
+	return infer_function_body(ctx, body)
+}
+
+// Лямба проверяется bidirectional-стилем:
+// если ожидаемый тип известен, он проталкивается вниз; иначе тип выводится из тела.
+check_lambda_expr :: proc(
+	ctx: ^Type_Ctx,
+	expr: Expr,
+	lambda: ^Lambda_Expr,
+	expected: ^Type = nil,
+) -> ^Type {
+	expected_type := prune_type(expected)
+	params := infer_lambda_param_types(ctx, lambda.args, expected_type)
+	bind_lambda_args(ctx, expr, params)
+
+	return_type: ^Type
+	if lambda.return_type != nil {
+		return_type = resolve_type_node(ctx, lambda.return_type)
+		if expected_type != nil && !unify_types(return_type, expected_type.return_type) {
+			fmt.panicf(
+				"Type Error: лямбда возвращает '%s', ожидался '%s'",
+				prune_type(return_type).name,
+				prune_type(expected_type.return_type).name,
+			)
+		}
+	} else if expected_type != nil {
+		return_type = expected_type.return_type
+	} else {
+		return_type = new_infer_var(ctx)
+	}
+
+	function_type := new_function_type(params, return_type)
+	ctx.node_types[expr] = function_type
+
+	if expected_type != nil && !unify_types(function_type, expected_type) {
+		fmt.panicf(
+			"Type Error: лямбда имеет тип '%s', ожидался '%s'",
+			function_type.name,
+			expected_type.name,
+		)
+	}
+
+	if lambda.return_type != nil || expected_type != nil {
+		check_function_body(ctx, lambda.body, return_type)
+	} else {
+		body_type := infer_callable_body_type(ctx, lambda.body)
+		if !unify_types(body_type, return_type) {
+			fmt.panicf(
+				"Type Error: тело лямбды имеет тип '%s', ожидался '%s'",
+				prune_type(body_type).name,
+				prune_type(return_type).name,
+			)
+		}
+	}
+
+	ensure_type_resolved(function_type, "лямбды")
+	return function_type
 }
 
 interface_method_types_match :: proc(expected: ^Type, actual: ^Type) -> bool {
@@ -164,6 +453,9 @@ interface_method_types_match :: proc(expected: ^Type, actual: ^Type) -> bool {
 
 // --- ГЛАВНЫЙ ЦИКЛ ---
 
+// Основной проход type checker'а идет в несколько стадий:
+// сначала регистрируем номинальные типы, потом сигнатуры, затем реализации,
+// и только после этого проверяем тела.
 typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 	// ПРОХОД 1: создаем номинальные типы до разбора полей и сигнатур.
 	for decl in prog.decls {
@@ -209,7 +501,11 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			iface_type := ctx.symbol_types[ctx.res.decl_symbols[decl]]
 			iface_type.interface_methods = make(map[string]^Type)
 			for m in d.methods {
-				iface_type.interface_methods[m.name] = interface_method_type_from_signature(ctx, iface_type, m)
+				iface_type.interface_methods[m.name] = interface_method_type_from_signature(
+					ctx,
+					iface_type,
+					m,
+				)
 			}
 		}
 	}
@@ -231,7 +527,8 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
 				method_type := function_type_from_decl(ctx, m)
-				if len(method_type.params) == 0 || !types_are_equal(method_type.params[0], struct_type) {
+				if len(method_type.params) == 0 ||
+				   !types_are_equal(method_type.params[0], struct_type) {
 					fmt.panicf(
 						"Type Error: первый аргумент метода '%s' должен иметь тип '%s'",
 						m.name,
@@ -293,6 +590,8 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 	}
 }
 
+// Преобразует синтаксический узел типа в внутреннее представление.
+// Здесь же проверяются ограничения на generic-конструкторы.
 resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 	if node == nil do return TY_VOID
 
@@ -329,7 +628,10 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 			if len(n.params) != 2 do fmt.panicf("Type Error: Соответствие ожидает 2 параметра типа")
 			key_type := resolve_type_node(ctx, n.params[0])
 			if !is_valid_map_key_type(key_type) {
-				fmt.panicf("Type Error: тип '%s' нельзя использовать как ключ соответствия", key_type.name)
+				fmt.panicf(
+					"Type Error: тип '%s' нельзя использовать как ключ соответствия",
+					key_type.name,
+				)
 			}
 			return new_map_type(key_type, resolve_type_node(ctx, n.params[1]))
 		}
@@ -337,41 +639,47 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 	return TY_VOID
 }
 
+// Строгое сравнение типов без вывода и без побочных связываний.
 types_are_equal :: proc(a: ^Type, b: ^Type) -> bool {
-	if a == nil || b == nil do return false
-	if a == b do return true
+	left := prune_type(a)
+	right := prune_type(b)
+	if left == nil || right == nil do return false
+	if left == right do return true
+	if left.kind == .InferVar || right.kind == .InferVar do return false
 
-	if b.kind == .Interface && a.kind == .Struct {
-		for iface in a.implemented_interfaces {
-			if iface == b do return true
+	if right.kind == .Interface && left.kind == .Struct {
+		for iface in left.implemented_interfaces {
+			if iface == right do return true
 		}
 		return false
 	}
 
-	if a.kind != b.kind do return false
+	if left.kind != right.kind do return false
 
-	#partial switch a.kind {
+	#partial switch left.kind {
 	case .Tuple:
-		if len(a.elements) != len(b.elements) do return false
-		for i in 0 ..< len(a.elements) {
-			if !types_are_equal(a.elements[i], b.elements[i]) do return false
+		if len(left.elements) != len(right.elements) do return false
+		for i in 0 ..< len(left.elements) {
+			if !types_are_equal(left.elements[i], right.elements[i]) do return false
 		}
 		return true
 
 	case .Function:
-		if len(a.params) != len(b.params) do return false
-		if !types_are_equal(a.return_type, b.return_type) do return false
-		for i in 0 ..< len(a.params) {
-			if !types_are_equal(a.params[i], b.params[i]) do return false
+		if len(left.params) != len(right.params) do return false
+		if !types_are_equal(left.return_type, right.return_type) do return false
+		for i in 0 ..< len(left.params) {
+			if !types_are_equal(left.params[i], right.params[i]) do return false
 		}
 		return true
 
 	case .Array:
-		return types_are_equal(a.element_type, b.element_type)
+		return types_are_equal(left.element_type, right.element_type)
 
 	case .Map:
-		return types_are_equal(a.key_type, b.key_type) &&
-		       types_are_equal(a.value_type, b.value_type)
+		return(
+			types_are_equal(left.key_type, right.key_type) &&
+			types_are_equal(left.value_type, right.value_type) \
+		)
 
 	case .Struct, .Interface:
 		return false
@@ -379,6 +687,7 @@ types_are_equal :: proc(a: ^Type, b: ^Type) -> bool {
 	return true
 }
 
+// Имя тупла строим из имён элементов, чтобы типы было удобно читать в ошибках.
 new_tuple_type :: proc(elements: [dynamic]^Type) -> ^Type {
 	t := new(Type)
 	t.kind = .Tuple
@@ -398,8 +707,7 @@ new_tuple_type :: proc(elements: [dynamic]^Type) -> ^Type {
 
 // --- ПРОВЕРКА БЛОКОВ (Expression-Oriented Programming) ---
 
-// Помощник для вывода типа блока кода (для If и других EOP конструкций)
-// Блок возвращает тип своего ПОСЛЕДНЕГО выражения.
+// В expression-oriented блоках типом блока считается тип последнего выражения.
 infer_block_type :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 	if len(body) == 0 do return TY_VOID
 
@@ -423,46 +731,50 @@ infer_block_type :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 	return TY_VOID
 }
 
+// Проверка обычной функции против уже известной сигнатуры.
 check_func_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) {
 	func_type := ctx.symbol_types[ctx.res.decl_symbols[d]]
 	check_function_body(ctx, d.body, func_type.return_type)
 }
 
+// Сначала проверяем инструкции сверху вниз, затем сверяем фактический тип
+// блока и явные `return` с ожидаемым возвращаемым типом.
 check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return: ^Type) {
+	expected_return_type := prune_type(expected_return)
 	for stmt in body {
-		check_stmt(ctx, stmt, expected_return)
+		check_stmt(ctx, stmt, expected_return_type)
 	}
 
-	body_type := infer_block_type(ctx, body)
-	explicit_return_type := infer_function_body(ctx, body)
+	body_type := prune_type(infer_block_type(ctx, body))
+	explicit_return_type := prune_type(infer_function_body(ctx, body))
 
-	if expected_return == TY_VOID {
-		if body_type != TY_VOID {
+	if expected_return_type == TY_VOID {
+		if body_type != TY_VOID && !unify_types(body_type, TY_VOID) {
 			fmt.panicf(
 				"Type Error: функция объявлена как 'Пусто', но последнее выражение имеет тип '%s'",
-				body_type.name,
+				prune_type(body_type).name,
 			)
 		}
 		return
 	}
 
 	if body_type != TY_VOID {
-		if !types_are_equal(body_type, expected_return) {
+		if !unify_types(body_type, expected_return_type) {
 			fmt.panicf(
 				"Type Error: функция должна возвращать '%s', но последнее выражение имеет тип '%s'",
-				expected_return.name,
-				body_type.name,
+				prune_type(expected_return_type).name,
+				prune_type(body_type).name,
 			)
 		}
 		return
 	}
 
 	if explicit_return_type != nil && explicit_return_type != TY_VOID {
-		if !types_are_equal(explicit_return_type, expected_return) {
+		if !unify_types(explicit_return_type, expected_return_type) {
 			fmt.panicf(
 				"Type Error: функция должна возвращать '%s', но return имеет тип '%s'",
-				expected_return.name,
-				explicit_return_type.name,
+				prune_type(expected_return_type).name,
+				prune_type(explicit_return_type).name,
 			)
 		}
 		return
@@ -470,10 +782,11 @@ check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return
 
 	fmt.panicf(
 		"Type Error: функция должна возвращать '%s', но тело не возвращает значение",
-		expected_return.name,
+		prune_type(expected_return_type).name,
 	)
 }
 
+// Ищет первый явный `return` в теле callable-выражения.
 infer_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 	actual_return := TY_VOID
 	for stmt in body {
@@ -488,6 +801,7 @@ infer_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 
 // --- ПРОВЕРКА ИНСТРУКЦИЙ (STATEMENTS) ---
 
+// Statement-level проверка знает ожидаемый тип возврата окружения.
 check_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, expected_return: ^Type) {
 	if stmt == nil do return
 
@@ -507,6 +821,7 @@ check_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, expected_return: ^Type) {
 	}
 }
 
+// Вывод типа инструкции, если она сама производит значение.
 infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 	if stmt == nil do return nil
 
@@ -522,15 +837,23 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 		if s.type_annotation != nil {
 			expected_type := resolve_type_node(ctx, s.type_annotation)
 			if expected_type == TY_VOID {
-				fmt.panicf("Type Error: переменная '%s' не может иметь тип 'Пусто'", s.name)
+				fmt.panicf(
+					"Type Error: переменная '%s' не может иметь тип 'Пусто'",
+					s.name,
+				)
 			}
 			check_expr(ctx, s.value, expected_type)
 			ctx.symbol_types[sym] = expected_type
 		} else {
 			t := infer_expr(ctx, s.value)
+			t = prune_type(t)
 			if t == TY_VOID {
-				fmt.panicf("Type Error: переменная '%s' не может иметь тип 'Пусто'", s.name)
+				fmt.panicf(
+					"Type Error: переменная '%s' не может иметь тип 'Пусто'",
+					s.name,
+				)
 			}
+			ensure_type_resolved(t, fmt.tprintf("переменной '%s'", s.name))
 			ctx.symbol_types[sym] = t
 		}
 
@@ -542,48 +865,59 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 
 // --- ПРОВЕРКА ВЫРАЖЕНИЙ (EXPRESSIONS) ---
 
+// Проверяет выражение в контексте ожидаемого типа.
+// Для лямбд, коллекций и вызовов это позволяет протолкнуть типы вниз.
 check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type, loc := #caller_location) {
 	if expr == nil do return
+	expected_type := prune_type(expected)
 
 	#partial switch e in expr {
+	case ^Lambda_Expr:
+		if expected_type.kind == .Function {
+			check_lambda_expr(ctx, expr, e, expected_type)
+			return
+		}
+
 	case ^Array_Expr:
-		if expected.kind == .Array {
+		if expected_type.kind == .Array {
 			for el in e.elements {
-				check_expr(ctx, el, expected.element_type)
+				check_expr(ctx, el, expected_type.element_type)
 			}
-			ctx.node_types[expr] = expected
+			ctx.node_types[expr] = expected_type
 			return
 		}
 	case ^Map_Expr:
-		if expected.kind == .Map {
+		if expected_type.kind == .Map {
 			for entry in e.entries {
-				check_expr(ctx, entry.key, expected.key_type)
-				check_expr(ctx, entry.value, expected.value_type)
+				check_expr(ctx, entry.key, expected_type.key_type)
+				check_expr(ctx, entry.value, expected_type.value_type)
 			}
-			ctx.node_types[expr] = expected
+			ctx.node_types[expr] = expected_type
 			return
 		}
 	}
 
 	actual := infer_expr(ctx, expr)
+	actual = prune_type(actual)
 
-	if expected.kind == .Interface && actual.kind == .Struct {
-		if types_are_equal(actual, expected) {
+	if expected_type.kind == .Interface && actual.kind == .Struct {
+		if unify_types(actual, expected_type) {
 			ctx.interface_casts[expr] = actual
 			return
 		}
 	}
 
-	if !types_are_equal(actual, expected) {
+	if !unify_types(actual, expected_type) {
 		fmt.panicf(
 			"Type Error: ожидался '%s', получен '%s'",
-			expected.name,
-			actual.name,
+			prune_type(expected_type).name,
+			prune_type(actual).name,
 			loc = loc,
 		)
 	}
 }
 
+// Выводит тип выражения без внешнего ожидания.
 infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	if expr == nil do return nil
 	if t, ok := ctx.node_types[expr]; ok do return t
@@ -598,22 +932,13 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		t = TY_STRING
 
 	case ^Lambda_Expr:
-		params := resolve_param_types(ctx, e.args)
-		if args_syms, ok := ctx.res.lambda_args[expr]; ok {
-			if len(args_syms) != len(params) {
-				fmt.panicf("Type Error: лямбда имеет рассинхронизированные аргументы")
-			}
-			for sym, i in args_syms do ctx.symbol_types[sym] = params[i]
-		}
-		ret_type := resolve_type_node(ctx, e.return_type)
-		check_function_body(ctx, e.body, ret_type)
-		t = new_function_type(params, ret_type)
+		t = check_lambda_expr(ctx, expr, e)
 
 	case ^Ident_Expr:
 		sym := ctx.res.node_symbols[expr]
 		var_type, ok := ctx.symbol_types[sym]
 		if !ok do fmt.panicf("Type Error: символ '%s' используется до инициализации", sym.name)
-		t = var_type
+		t = prune_type(var_type)
 
 	case ^Binary_Expr:
 		#partial switch e.op {
@@ -627,12 +952,13 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 			t = TY_BOOL
 		case .Assign:
 			left_t := infer_expr(ctx, e.left)
+			check_expr(ctx, e.right, left_t)
 			right_t := infer_expr(ctx, e.right)
-			if !types_are_equal(left_t, right_t) {
+			if !unify_types(right_t, left_t) {
 				fmt.panicf(
 					"Type Error: попытка присвоить значение типа '%s' в место типа '%s'",
-					right_t.name,
-					left_t.name,
+					prune_type(right_t).name,
+					prune_type(left_t).name,
 				)
 			}
 			t = TY_VOID
@@ -647,7 +973,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	case ^Call_Expr:
 		#partial switch prop_expr in e.callee {
 		case ^Property_Expr:
-			obj_type := infer_expr(ctx, prop_expr.object)
+			obj_type := prune_type(infer_expr(ctx, prop_expr.object))
 
 			if obj_type.kind == .Array {
 				switch prop_expr.property {
@@ -667,14 +993,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 				case "получить":
 					if len(e.args) != 2 do fmt.panicf("Type Error: массив.получить() ожидает индекс и значение по умолчанию")
 					check_expr(ctx, e.args[0], TY_NUM)
-					default_type := infer_expr(ctx, e.args[1])
-					if !types_are_equal(default_type, obj_type.element_type) {
-						fmt.panicf(
-							"Type Error: значение по умолчанию имеет тип '%s', ожидался '%s'",
-							default_type.name,
-							obj_type.element_type.name,
-						)
-					}
+					check_expr(ctx, e.args[1], obj_type.element_type)
 					ctx.collection_calls[expr] = prop_expr.property
 					t = obj_type.element_type
 					ctx.node_types[expr] = t
@@ -694,7 +1013,10 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 					ctx.node_types[expr] = t
 					return t
 				case:
-					fmt.panicf("Type Error: у массива нет метода '%s'", prop_expr.property)
+					fmt.panicf(
+						"Type Error: у массива нет метода '%s'",
+						prop_expr.property,
+					)
 				}
 
 			} else if obj_type.kind == .Map {
@@ -715,14 +1037,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 				case "получить":
 					if len(e.args) != 2 do fmt.panicf("Type Error: соответствие.получить() ожидает ключ и значение по умолчанию")
 					check_expr(ctx, e.args[0], obj_type.key_type)
-					default_type := infer_expr(ctx, e.args[1])
-					if !types_are_equal(default_type, obj_type.value_type) {
-						fmt.panicf(
-							"Type Error: значение по умолчанию имеет тип '%s', ожидался '%s'",
-							default_type.name,
-							obj_type.value_type.name,
-						)
-					}
+					check_expr(ctx, e.args[1], obj_type.value_type)
 					ctx.collection_calls[expr] = prop_expr.property
 					t = obj_type.value_type
 					ctx.node_types[expr] = t
@@ -735,7 +1050,10 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 					ctx.node_types[expr] = t
 					return t
 				case:
-					fmt.panicf("Type Error: у соответствия нет метода '%s'", prop_expr.property)
+					fmt.panicf(
+						"Type Error: у соответствия нет метода '%s'",
+						prop_expr.property,
+					)
 				}
 
 			} else if obj_type.kind == .Struct {
@@ -746,7 +1064,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 					for arg, i in e.args do check_expr(ctx, arg, method_type.params[i + 1])
 
 					ctx.method_calls[expr] = method_sym
-					t = method_type.return_type
+					t = prune_type(method_type.return_type)
 					ctx.node_types[expr] = t
 					return t
 				}
@@ -756,7 +1074,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 					for arg, i in e.args do check_expr(ctx, arg, method_type.params[i + 1])
 
 					ctx.interface_calls[expr] = prop_expr.property
-					t = method_type.return_type
+					t = prune_type(method_type.return_type)
 					ctx.node_types[expr] = t
 					return t
 				} else {
@@ -769,7 +1087,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 			}
 		}
 
-		callee_type := infer_expr(ctx, e.callee)
+		callee_type := prune_type(infer_expr(ctx, e.callee))
 		if callee_type.kind == .Struct {
 			if len(e.args) != len(callee_type.fields) do fmt.panicf("Type Error: структура '%s' имеет %d полей", callee_type.name, len(callee_type.fields))
 			for arg, i in e.args do check_expr(ctx, arg, callee_type.fields[i].type)
@@ -779,7 +1097,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		} else if callee_type.kind == .Function {
 			if len(e.args) != len(callee_type.params) do fmt.panicf("Type Error: неверное количество аргументов")
 			for arg, i in e.args do check_expr(ctx, arg, callee_type.params[i])
-			t = callee_type.return_type
+			t = prune_type(callee_type.return_type)
 
 		} else {
 			fmt.panicf(
@@ -799,14 +1117,14 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 			then_type := infer_block_type(ctx, e.then_branch)
 			else_type := infer_block_type(ctx, e.else_branch)
 
-			if !types_are_equal(then_type, else_type) {
+			if !unify_types(then_type, else_type) {
 				fmt.panicf(
 					"Type Error: ветки 'если' возвращают разные типы. 'тогда' -> '%s', 'иначе' -> '%s'",
-					then_type.name,
-					else_type.name,
+					prune_type(then_type).name,
+					prune_type(else_type).name,
 				)
 			}
-			t = then_type
+			t = prune_type(then_type)
 		}
 
 	case ^While_Expr:
@@ -824,24 +1142,28 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 	case ^Array_Expr:
 		if len(e.elements) == 0 {
-			fmt.panicf("Type Error: для пустого массива нужна аннотация ожидаемого типа")
+			fmt.panicf(
+				"Type Error: для пустого массива нужна аннотация ожидаемого типа",
+			)
 		}
 		element_type := infer_expr(ctx, e.elements[0])
 		for el, i in e.elements {
 			current_type := infer_expr(ctx, el)
-			if i > 0 && !types_are_equal(current_type, element_type) {
+			if i > 0 && !unify_types(current_type, element_type) {
 				fmt.panicf(
 					"Type Error: элементы массива имеют разные типы: '%s' и '%s'",
-					element_type.name,
-					current_type.name,
+					prune_type(element_type).name,
+					prune_type(current_type).name,
 				)
 			}
 		}
-		t = new_array_type(element_type)
+		t = new_array_type(prune_type(element_type))
 
 	case ^Map_Expr:
 		if len(e.entries) == 0 {
-			fmt.panicf("Type Error: для пустого соответствия нужна аннотация ожидаемого типа")
+			fmt.panicf(
+				"Type Error: для пустого соответствия нужна аннотация ожидаемого типа",
+			)
 		}
 		key_type := infer_expr(ctx, e.entries[0].key)
 		value_type := infer_expr(ctx, e.entries[0].value)
@@ -849,35 +1171,38 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 			current_key_type := infer_expr(ctx, entry.key)
 			current_value_type := infer_expr(ctx, entry.value)
 			if !is_valid_map_key_type(current_key_type) {
-				fmt.panicf("Type Error: тип '%s' нельзя использовать как ключ соответствия", current_key_type.name)
+				fmt.panicf(
+					"Type Error: тип '%s' нельзя использовать как ключ соответствия",
+					current_key_type.name,
+				)
 			}
 			if i > 0 {
-				if !types_are_equal(current_key_type, key_type) {
+				if !unify_types(current_key_type, key_type) {
 					fmt.panicf(
 						"Type Error: ключи соответствия имеют разные типы: '%s' и '%s'",
-						key_type.name,
-						current_key_type.name,
+						prune_type(key_type).name,
+						prune_type(current_key_type).name,
 					)
 				}
-				if !types_are_equal(current_value_type, value_type) {
+				if !unify_types(current_value_type, value_type) {
 					fmt.panicf(
 						"Type Error: значения соответствия имеют разные типы: '%s' и '%s'",
-						value_type.name,
-						current_value_type.name,
+						prune_type(value_type).name,
+						prune_type(current_value_type).name,
 					)
 				}
 			}
 		}
-		t = new_map_type(key_type, value_type)
+		t = new_map_type(prune_type(key_type), prune_type(value_type))
 
 	case ^Index_Expr:
-		obj_type := infer_expr(ctx, e.object)
+		obj_type := prune_type(infer_expr(ctx, e.object))
 		if obj_type.kind == .Array {
 			check_expr(ctx, e.index, TY_NUM)
-			t = obj_type.element_type
+			t = prune_type(obj_type.element_type)
 		} else if obj_type.kind == .Map {
 			check_expr(ctx, e.index, obj_type.key_type)
-			t = obj_type.value_type
+			t = prune_type(obj_type.value_type)
 		} else {
 			fmt.panicf(
 				"Type Error: индексирование поддерживают только массивы и соответствия, получен '%s'",
@@ -886,7 +1211,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		}
 
 	case ^Property_Expr:
-		obj_type := infer_expr(ctx, e.object)
+		obj_type := prune_type(infer_expr(ctx, e.object))
 		if obj_type.kind == .Struct {
 			field_idx := -1
 			for f, i in obj_type.fields {
@@ -907,7 +1232,10 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 			ctx.property_indices[expr] = idx
 
 		} else if obj_type.kind == .Array || obj_type.kind == .Map {
-			fmt.panicf("Type Error: метод коллекции '%s' нужно вызвать через ()", e.property)
+			fmt.panicf(
+				"Type Error: метод коллекции '%s' нужно вызвать через ()",
+				e.property,
+			)
 
 		} else {
 			fmt.panicf(
@@ -921,8 +1249,9 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	return t
 }
 
+// Отладочная печать уже вычисленных типов символов.
 print_type_ctx :: proc(ctx: ^Type_Ctx) {
 	for symbol, type in ctx.symbol_types {
-		fmt.printf("Символ '%s' имеет тип %s\n", symbol.name, type.name)
+		fmt.printf("Символ '%s' имеет тип %s\n", symbol.name, prune_type(type).name)
 	}
 }

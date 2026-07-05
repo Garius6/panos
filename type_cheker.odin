@@ -1115,6 +1115,11 @@ standard_method_type :: proc(
 			error_type := infer_expr(ctx, args[0])
 			ctx.collection_calls[call] = method_name
 			return new_result_type(prune_type(receiver_type.element_type), prune_type(error_type)), true
+		case "заменить_значение":
+			if len(args) != 1 do fmt.panicf("Type Error: Опция.заменить_значение() ожидает новое значение")
+			element_type := infer_expr(ctx, args[0])
+			ctx.collection_calls[call] = method_name
+			return new_option_type(prune_type(element_type)), true
 		}
 
 	case .Result:

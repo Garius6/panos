@@ -224,6 +224,16 @@ invoke_collection_method :: proc(
 			expect_arg_count(method_name, len(args), 1)
 			if opt.has_value do return make_ok_result(opt.value), true
 			return make_error_result(args[0]), true
+		case "заменить_значение":
+			expect_arg_count(method_name, len(args), 1)
+			replaced := new(Option_Value)
+			replaced.has_value = opt.has_value
+			if opt.has_value {
+				replaced.value = args[0]
+			} else {
+				replaced.value = f64(0)
+			}
+			return Value(replaced), true
 		}
 	}
 

@@ -1105,6 +1105,21 @@ standard_method_type :: proc(
 			check_expr(ctx, args[0], receiver_type.element_type)
 			ctx.collection_calls[call] = method_name
 			return prune_type(receiver_type.element_type), true
+		case "или":
+			if len(args) != 1 do fmt.panicf("Type Error: Опция.или() ожидает запасную Опцию")
+			fallback_type := prune_type(infer_expr(ctx, args[0]))
+			if fallback_type.kind != .Option {
+				fmt.panicf("Type Error: Опция.или() ожидает Опцию, получен '%s'", fallback_type.name)
+			}
+			if !unify_types(receiver_type.element_type, fallback_type.element_type) {
+				fmt.panicf(
+					"Type Error: Опция.или() ожидает Опцию(%s), получен '%s'",
+					prune_type(receiver_type.element_type).name,
+					fallback_type.name,
+				)
+			}
+			ctx.collection_calls[call] = method_name
+			return new_option_type(prune_type(receiver_type.element_type)), true
 		case "ожидать":
 			if len(args) != 1 do fmt.panicf("Type Error: Опция.ожидать() ожидает сообщение")
 			check_expr(ctx, args[0], TY_STRING)
@@ -1150,6 +1165,21 @@ standard_method_type :: proc(
 			check_expr(ctx, args[0], receiver_type.error_type)
 			ctx.collection_calls[call] = method_name
 			return prune_type(receiver_type.error_type), true
+		case "или":
+			if len(args) != 1 do fmt.panicf("Type Error: Результат.или() ожидает запасной Результат")
+			fallback_type := prune_type(infer_expr(ctx, args[0]))
+			if fallback_type.kind != .Result {
+				fmt.panicf("Type Error: Результат.или() ожидает Результат, получен '%s'", fallback_type.name)
+			}
+			if !unify_types(receiver_type.ok_type, fallback_type.ok_type) {
+				fmt.panicf(
+					"Type Error: Результат.или() ожидает Результат(%s, ...), получен '%s'",
+					prune_type(receiver_type.ok_type).name,
+					fallback_type.name,
+				)
+			}
+			ctx.collection_calls[call] = method_name
+			return new_result_type(prune_type(receiver_type.ok_type), prune_type(fallback_type.error_type)), true
 		case "ожидать":
 			if len(args) != 1 do fmt.panicf("Type Error: Результат.ожидать() ожидает сообщение")
 			check_expr(ctx, args[0], TY_STRING)

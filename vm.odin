@@ -213,6 +213,10 @@ invoke_collection_method :: proc(
 			expect_arg_count(method_name, len(args), 1)
 			if opt.has_value do return opt.value, true
 			return args[0], true
+		case "или":
+			expect_arg_count(method_name, len(args), 1)
+			if opt.has_value do return Value(opt), true
+			return args[0], true
 		case "ожидать":
 			expect_arg_count(method_name, len(args), 1)
 			message := expect_string_arg(method_name, args[0])
@@ -269,6 +273,10 @@ invoke_collection_method :: proc(
 			expect_arg_count(method_name, len(args), 1)
 			if res.is_ok do return args[0], true
 			return res.error, true
+		case "или":
+			expect_arg_count(method_name, len(args), 1)
+			if res.is_ok do return make_ok_result(res.value), true
+			return args[0], true
 		case "ожидать":
 			expect_arg_count(method_name, len(args), 1)
 			message := expect_string_arg(method_name, args[0])

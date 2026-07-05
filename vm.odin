@@ -133,6 +133,38 @@ make_error_result :: proc(err: Value) -> Value {
 	return Value(res)
 }
 
+read_stdin_line :: proc() -> Value {
+	line := make([dynamic]byte)
+	buffer: [256]byte
+
+	for {
+		n, err := os.read(os.stdin, buffer[:])
+		if n > 0 {
+			for b in buffer[:n] {
+				if b == '\n' {
+					return make_ok_result(Value(string(line[:])))
+				}
+				if b != '\r' {
+					append(&line, b)
+				}
+			}
+		}
+
+		if err != nil {
+			if len(line) > 0 {
+				return make_ok_result(Value(string(line[:])))
+			}
+			return make_error_result(
+				make_error_value("ввод_вывод", fmt.tprintf("%v", err)),
+			)
+		}
+
+		if n == 0 {
+			return make_ok_result(Value(string(line[:])))
+		}
+	}
+}
+
 invoke_collection_method :: proc(
 	receiver: Value,
 	method_name: string,
@@ -250,7 +282,7 @@ invoke_collection_method :: proc(
 	)
 }
 
-call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> Value {
+call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	switch name {
 	case "Ошибка":
 		expect_arg_count(name, len(args), 2)
@@ -262,21 +294,21 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> Value {
 		err := new(Error_Value)
 		err.code = code
 		err.message = message
-		return Value(err)
+		return Value(err), true
 
 	case "Есть":
 		expect_arg_count(name, len(args), 1)
 		opt := new(Option_Value)
 		opt.has_value = true
 		opt.value = args[0]
-		return Value(opt)
+		return Value(opt), true
 
 	case "Нет":
 		expect_arg_count(name, len(args), 0)
 		opt := new(Option_Value)
 		opt.has_value = false
 		opt.value = f64(0)
-		return Value(opt)
+		return Value(opt), true
 
 	case "Успех":
 		expect_arg_count(name, len(args), 1)
@@ -284,25 +316,25 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> Value {
 		res.is_ok = true
 		res.value = args[0]
 		res.error = f64(0)
-		return Value(res)
+		return Value(res), true
 
 	case "Неудача":
 		expect_arg_count(name, len(args), 1)
-		return make_error_result(args[0])
+		return make_error_result(args[0]), true
 
 	case "фс::есть":
 		expect_arg_count(name, len(args), 1)
 		path := expect_string_arg(name, args[0])
-		return Value(os.exists(path))
+		return Value(os.exists(path)), true
 
 	case "фс::прочитать":
 		expect_arg_count(name, len(args), 1)
 		path := expect_string_arg(name, args[0])
 		data, err := os.read_entire_file(path, context.allocator)
 		if err != nil {
-			return make_error_result(make_error_value("фс", fmt.tprintf("%v", err)))
+			return make_error_result(make_error_value("фс", fmt.tprintf("%v", err))), true
 		}
-		return make_ok_result(Value(string(data)))
+		return make_ok_result(Value(string(data))), true
 
 	case "фс::записать":
 		expect_arg_count(name, len(args), 2)
@@ -310,9 +342,9 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> Value {
 		content := expect_string_arg(name, args[1])
 		err := os.write_entire_file(path, content)
 		if err != nil {
-			return make_error_result(make_error_value("фс", fmt.tprintf("%v", err)))
+			return make_error_result(make_error_value("фс", fmt.tprintf("%v", err))), true
 		}
-		return make_ok_result(Value(f64(len(content))))
+		return make_ok_result(Value(f64(len(content)))), true
 
 	case "ос::аргументы":
 		expect_arg_count(name, len(args), 0)
@@ -321,7 +353,7 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> Value {
 		for arg in vm.program_args {
 			append(&arr.elements, Value(arg))
 		}
-		return Value(arr)
+		return Value(arr), true
 
 	case "ос::окружение":
 		expect_arg_count(name, len(args), 1)
@@ -334,7 +366,7 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> Value {
 		} else {
 			opt.value = Value("")
 		}
-		return Value(opt)
+		return Value(opt), true
 
 	case "ос::установить_окружение":
 		expect_arg_count(name, len(args), 2)
@@ -342,14 +374,30 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> Value {
 		value := expect_string_arg(name, args[1])
 		err := os.set_env(key, value)
 		if err != nil {
-			return make_error_result(make_error_value("ос", fmt.tprintf("%v", err)))
+			return make_error_result(make_error_value("ос", fmt.tprintf("%v", err))), true
 		}
-		return make_ok_result(Value(f64(0)))
+		return make_ok_result(Value(f64(0))), true
 
 	case "ос::удалить_окружение":
 		expect_arg_count(name, len(args), 1)
 		key := expect_string_arg(name, args[0])
-		return Value(os.unset_env(key))
+		return Value(os.unset_env(key)), true
+
+	case "ввод_вывод::печать":
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		fmt.print(text)
+		return Value(f64(0)), false
+
+	case "ввод_вывод::строка":
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		fmt.println(text)
+		return Value(f64(0)), false
+
+	case "ввод_вывод::прочитать_строку":
+		expect_arg_count(name, len(args), 0)
+		return read_stdin_line(), true
 	}
 
 	fmt.panicf(
@@ -487,9 +535,11 @@ execute :: proc(vm: ^VM) {
 			name := frame.function.constants[name_index].(string)
 			args_start := len(vm.stack) - arg_count
 			args := vm.stack[args_start:]
-			result := call_builtin(vm, name, args)
+			result, has_result := call_builtin(vm, name, args)
 			resize(&vm.stack, args_start)
-			append(&vm.stack, result)
+			if has_result {
+				append(&vm.stack, result)
+			}
 
 		case .Return:
 			result: Value = f64(0) // Значение по умолчанию (если функция ничего не вернула)

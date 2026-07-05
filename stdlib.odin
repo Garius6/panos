@@ -3,7 +3,7 @@ package main
 import "core:fmt"
 
 is_builtin_module_name :: proc(name: string) -> bool {
-	return name == "фс" || name == "ос"
+	return name == "фс" || name == "ос" || name == "ввод_вывод"
 }
 
 add_builtin_export :: proc(graph: ^Module_Graph, module: ^Module, name: string, typ: ^Type) {
@@ -41,6 +41,12 @@ builtin_export_type :: proc(full_name: string) -> ^Type {
 		return builtin_function_type_2(TY_STRING, TY_STRING, new_result_type(TY_NUM, TY_ERROR))
 	case "ос::удалить_окружение":
 		return builtin_function_type_1(TY_STRING, TY_BOOL)
+	case "ввод_вывод::печать":
+		return builtin_function_type_1(TY_STRING, TY_VOID)
+	case "ввод_вывод::строка":
+		return builtin_function_type_1(TY_STRING, TY_VOID)
+	case "ввод_вывод::прочитать_строку":
+		return new_function_type(make([dynamic]^Type), new_result_type(TY_STRING, TY_ERROR))
 	}
 	return nil
 }
@@ -100,6 +106,25 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"удалить_окружение",
 			builtin_export_type("ос::удалить_окружение"),
+		)
+	} else if name == "ввод_вывод" {
+		add_builtin_export(
+			graph,
+			module,
+			"печать",
+			builtin_export_type("ввод_вывод::печать"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"строка",
+			builtin_export_type("ввод_вывод::строка"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"прочитать_строку",
+			builtin_export_type("ввод_вывод::прочитать_строку"),
 		)
 	}
 

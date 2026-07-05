@@ -115,7 +115,6 @@ is_valid_map_key_type :: proc(t: ^Type) -> bool {
 Type_Ctx :: struct {
 	res:              ^Resolver_Ctx,
 	node_types:       map[Expr]^Type,
-	symbol_types:     map[^Symbol]^Type,
 	is_constructor:   map[Expr]bool,
 	property_indices: map[Expr]int,
 	method_calls:     map[Expr]^Symbol,
@@ -130,7 +129,6 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 	return Type_Ctx {
 		res = res,
 		node_types = make(map[Expr]^Type),
-		symbol_types = res.symbol_types,
 		is_constructor = make(map[Expr]bool),
 		property_indices = make(map[Expr]int),
 		method_calls = make(map[Expr]^Symbol),
@@ -406,7 +404,7 @@ bind_function_args :: proc(ctx: ^Type_Ctx, d: ^Function_Decl, func_type: ^Type) 
 			)
 		}
 		for arg_sym, i in args_syms {
-			ctx.symbol_types[arg_sym] = func_type.params[i]
+			ctx.res.symbol_types[arg_sym] = func_type.params[i]
 		}
 	}
 }
@@ -420,7 +418,7 @@ bind_lambda_args :: proc(ctx: ^Type_Ctx, expr: Expr, params: [dynamic]^Type) {
 				"Type Error: лямбда имеет рассинхронизированные аргументы",
 			)
 		}
-		for sym, i in args_syms do ctx.symbol_types[sym] = params[i]
+		for sym, i in args_syms do ctx.res.symbol_types[sym] = params[i]
 	}
 }
 
@@ -518,14 +516,14 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			struct_type.implemented_interfaces = make([dynamic]^Type)
 
 			sym := ctx.res.decl_symbols[decl]
-			ctx.symbol_types[sym] = struct_type
+			ctx.res.symbol_types[sym] = struct_type
 
 		case ^Interface_Decl:
 			iface_type := new(Type)
 			iface_type.kind = .Interface
 			iface_type.name = d.name
 			iface_type.interface_methods = make(map[string]^Type)
-			ctx.symbol_types[ctx.res.decl_symbols[decl]] = iface_type
+			ctx.res.symbol_types[ctx.res.decl_symbols[decl]] = iface_type
 		}
 	}
 
@@ -534,7 +532,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 		#partial switch d in decl {
 		case ^Struct_Decl:
 			sym := ctx.res.decl_symbols[decl]
-			struct_type := ctx.symbol_types[sym]
+			struct_type := ctx.res.symbol_types[sym]
 			struct_type.fields = make([dynamic]Struct_Field)
 
 			for f in d.fields {
@@ -544,10 +542,10 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 
 		case ^Function_Decl:
 			sym := ctx.res.decl_symbols[decl]
-			ctx.symbol_types[sym] = function_type_from_decl(ctx, d)
+			ctx.res.symbol_types[sym] = function_type_from_decl(ctx, d)
 
 		case ^Interface_Decl:
-			iface_type := ctx.symbol_types[ctx.res.decl_symbols[decl]]
+			iface_type := ctx.res.symbol_types[ctx.res.decl_symbols[decl]]
 			iface_type.interface_methods = make(map[string]^Type)
 			for m in d.methods {
 				iface_type.interface_methods[m.name] = interface_method_type_from_signature(
@@ -564,7 +562,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 		#partial switch d in decl {
 		case ^Impl_Decl:
 			target_sym := ctx.res.global_scope.symbols[d.target_type]
-			struct_type := ctx.symbol_types[target_sym]
+			struct_type := ctx.res.symbol_types[target_sym]
 			if struct_type == nil || struct_type.kind != .Struct {
 				fmt.panicf(
 					"Type Error: неизвестная структура '%s'",
@@ -584,7 +582,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 						struct_type.name,
 					)
 				}
-				ctx.symbol_types[sym] = method_type
+				ctx.res.symbol_types[sym] = method_type
 				original_name := m.name[len(d.target_type) + 2:]
 				struct_type.methods[original_name] = sym
 			}
@@ -592,7 +590,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			// Строгая проверка интерфейсного контракта
 			if d.interface_name != "" {
 				iface_sym := ctx.res.global_scope.symbols[d.interface_name]
-				iface_type := ctx.symbol_types[iface_sym]
+				iface_type := ctx.res.symbol_types[iface_sym]
 
 				if iface_type == nil || iface_type.kind != .Interface {
 					fmt.panicf(
@@ -606,7 +604,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 					if !found do fmt.panicf("Type Error: структура '%s' не реализует метод '%s'", d.target_type, req_name)
 
 					expected_method_type := iface_type.interface_methods[req_name]
-					actual_method_type := ctx.symbol_types[method_sym]
+					actual_method_type := ctx.res.symbol_types[method_sym]
 					if !interface_method_types_match(expected_method_type, actual_method_type) {
 						fmt.panicf(
 							"Type Error: метод '%s' структуры '%s' не совпадает с контрактом интерфейса '%s'",
@@ -625,13 +623,13 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Function_Decl:
-			func_type := ctx.symbol_types[ctx.res.decl_symbols[decl]]
+			func_type := ctx.res.symbol_types[ctx.res.decl_symbols[decl]]
 			bind_function_args(ctx, d, func_type)
 			check_function_body(ctx, d.body, func_type.return_type)
 		case ^Impl_Decl:
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
-				func_type := ctx.symbol_types[sym]
+				func_type := ctx.res.symbol_types[sym]
 				bind_function_args(ctx, m, func_type)
 				check_function_body(ctx, m.body, func_type.return_type)
 			}
@@ -658,7 +656,7 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 					n.name,
 				)
 			}
-			if typ, ok := ctx.symbol_types[sym]; ok do return typ
+			if typ, ok := ctx.res.symbol_types[sym]; ok do return typ
 		}
 		fmt.panicf("Type Error: неизвестный тип '%s'", n.name)
 
@@ -686,7 +684,7 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 			fmt.panicf("Type Error: модуль '%s' не загружен", n.module_name)
 		}
 		if export_sym, found := imported_module.exports[n.name]; found {
-			if typ, found_type := ctx.symbol_types[export_sym]; found_type {
+			if typ, found_type := ctx.res.symbol_types[export_sym]; found_type {
 				return typ
 			}
 			fmt.panicf(
@@ -831,7 +829,7 @@ infer_block_type :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 
 // Проверка обычной функции против уже известной сигнатуры.
 check_func_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) {
-	func_type := ctx.symbol_types[ctx.res.decl_symbols[d]]
+	func_type := ctx.res.symbol_types[ctx.res.decl_symbols[d]]
 	check_function_body(ctx, d.body, func_type.return_type)
 }
 
@@ -941,7 +939,7 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 				)
 			}
 			check_expr(ctx, s.value, expected_type)
-			ctx.symbol_types[sym] = expected_type
+			ctx.res.symbol_types[sym] = expected_type
 		} else {
 			t := infer_expr(ctx, s.value)
 			t = prune_type(t)
@@ -952,7 +950,7 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 				)
 			}
 			ensure_type_resolved(t, fmt.tprintf("переменной '%s'", s.name))
-			ctx.symbol_types[sym] = t
+			ctx.res.symbol_types[sym] = t
 		}
 
 	case ^Expr_Stmt:
@@ -1045,6 +1043,17 @@ builtin_constructor_type :: proc(
 	case "Неудача":
 		if len(args) != 1 do fmt.panicf("Type Error: Неудача() ожидает ошибку")
 		return new_result_type(new_infer_var(ctx), infer_expr(ctx, args[0])), true
+
+	case "длина":
+		if len(args) != 1 do fmt.panicf("Type Error: длина() ожидает один аргумент")
+		arg_type := prune_type(infer_expr(ctx, args[0]))
+		if arg_type.kind == .String || arg_type.kind == .Array || arg_type.kind == .Map {
+			return TY_NUM, true
+		}
+		fmt.panicf(
+			"Type Error: длина() ожидает строку, массив или соответствие, получен '%s'",
+			arg_type.name,
+		)
 	}
 
 	return nil, false
@@ -1142,7 +1151,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 				sym.name,
 			)
 		}
-		var_type, ok := ctx.symbol_types[sym]
+		var_type, ok := ctx.res.symbol_types[sym]
 		if !ok do fmt.panicf("Type Error: символ '%s' используется до инициализации", sym.name)
 		t = prune_type(var_type)
 
@@ -1179,10 +1188,11 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 			check_expr(ctx, e.left, TY_NUM)
 			check_expr(ctx, e.right, TY_NUM)
 			t = TY_NUM
-		case .Less, .Greater:
+		case .Less, .Greater, .Equal:
 			check_expr(ctx, e.left, TY_NUM)
 			check_expr(ctx, e.right, TY_NUM)
 			t = TY_BOOL
+
 		case .Assign:
 			left_t := infer_expr(ctx, e.left)
 			check_expr(ctx, e.right, left_t)
@@ -1236,12 +1246,12 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 						)
 					}
 
-					export_type, found_type := ctx.symbol_types[export_sym]
+					export_type, found_type := ctx.res.symbol_types[export_sym]
 					if !found_type || export_type == nil {
 						if export_sym.kind == .Builtin {
 							export_type = builtin_export_type(export_sym.full_name)
 							if export_type != nil {
-								ctx.symbol_types[export_sym] = export_type
+								ctx.res.symbol_types[export_sym] = export_type
 							}
 						} else if fn_decl, has_fn_decl := export_sym.decl.(^Function_Decl);
 						   has_fn_decl {
@@ -1392,7 +1402,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 			} else if obj_type.kind == .Struct {
 				if method_sym, is_method := obj_type.methods[prop_expr.property]; is_method {
-					method_type := ctx.symbol_types[method_sym]
+					method_type := ctx.res.symbol_types[method_sym]
 					if len(e.args) != len(method_type.params) - 1 do fmt.panicf("У метода %s ожидалось %d аргументов", method_sym.name, len(method_type.params) - 1)
 					check_expr(ctx, prop_expr.object, method_type.params[0])
 					for arg, i in e.args do check_expr(ctx, arg, method_type.params[i + 1])
@@ -1537,6 +1547,9 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		} else if obj_type.kind == .Map {
 			check_expr(ctx, e.index, obj_type.key_type)
 			t = prune_type(obj_type.value_type)
+		} else if obj_type.kind == .String {
+			check_expr(ctx, e.index, TY_NUM)
+			t = TY_STRING
 		} else {
 			fmt.panicf(
 				"Type Error: индексирование поддерживают только массивы и соответствия, получен '%s'",
@@ -1546,7 +1559,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 	case ^Property_Expr:
 		if sym, ok := ctx.res.node_symbols[expr]; ok {
-			t = prune_type(ctx.symbol_types[sym])
+			t = prune_type(ctx.res.symbol_types[sym])
 			ctx.node_types[expr] = t
 			return t
 		}
@@ -1561,7 +1574,8 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 					)
 				}
 				if export_sym, found := imported_module.exports[e.property]; found {
-					if typ, found_type := ctx.symbol_types[export_sym]; found_type && typ != nil {
+					if typ, found_type := ctx.res.symbol_types[export_sym];
+					   found_type && typ != nil {
 						t = prune_type(typ)
 						ctx.node_types[expr] = t
 						return t
@@ -1569,7 +1583,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 					if export_sym.kind == .Builtin {
 						t = builtin_export_type(export_sym.full_name)
 						if t != nil {
-							ctx.symbol_types[export_sym] = t
+							ctx.res.symbol_types[export_sym] = t
 							ctx.node_types[expr] = t
 							return t
 						}
@@ -1650,7 +1664,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 // Отладочная печать уже вычисленных типов символов.
 print_type_ctx :: proc(ctx: ^Type_Ctx) {
-	for symbol, type in ctx.symbol_types {
+	for symbol, type in ctx.res.symbol_types {
 		fmt.printf("Символ '%s' имеет тип %s\n", symbol.name, prune_type(type).name)
 	}
 }

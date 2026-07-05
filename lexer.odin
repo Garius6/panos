@@ -150,10 +150,19 @@ next_token_lex :: proc(l: ^Lexer) -> Token {
 			data = ">",
 		}; advance(l)
 	case '=':
-		tok = Token {
-			kind = .Assign,
-			data = "=",
-		}; advance(l)
+		if peek_char(l) == '=' {
+			advance(l)
+			advance(l)
+			tok = Token {
+				kind = .Equal,
+				data = "==",
+			}
+		} else {
+			tok = Token {
+				kind = .Assign,
+				data = "=",
+			}; advance(l)
+		}
 	case '+':
 		tok = Token {
 			kind = .Plus,

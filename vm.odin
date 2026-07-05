@@ -165,6 +165,14 @@ read_stdin_line :: proc() -> Value {
 	}
 }
 
+string_length :: proc(text: string) -> int {
+	count := 0
+	for _ in text {
+		count += 1
+	}
+	return count
+}
+
 invoke_collection_method :: proc(
 	receiver: Value,
 	method_name: string,
@@ -321,6 +329,21 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	case "Неудача":
 		expect_arg_count(name, len(args), 1)
 		return make_error_result(args[0]), true
+
+	case "длина":
+		expect_arg_count(name, len(args), 1)
+		if text, ok := args[0].(string); ok {
+			return Value(f64(string_length(text))), true
+		}
+		if arr, ok := args[0].(^Array_Value); ok {
+			return Value(f64(len(arr.elements))), true
+		}
+		if m, ok := args[0].(^Map_Value); ok {
+			return Value(f64(len(m.entries))), true
+		}
+		fmt.panicf(
+			"Runtime Error: длина() ожидает строку, массив или соответствие",
+		)
 
 	case "фс::есть":
 		expect_arg_count(name, len(args), 1)
@@ -485,14 +508,17 @@ execute :: proc(vm: ^VM) {
 			append(&vm.stack, l / r) // <-- ДОБАВЛЕНО
 
 		case .Less:
-			// <-- ДОБАВЛЕНО
 			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
-			append(&vm.stack, l < r) // <-- ДОБАВЛЕНО
+			append(&vm.stack, l < r)
 
 		case .Greater:
-			// <-- ДОБАВЛЕНО
-			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
 			append(&vm.stack, l > r)
+
+		case .Equal:
+			r := pop(&vm.stack); l := pop(&vm.stack)
+			append(&vm.stack, l == r)
+
 		case .Call:
 			frame.ip += 1
 			arg_count := int(instructions[frame.ip])
@@ -734,6 +760,18 @@ execute :: proc(vm: ^VM) {
 					)
 				}
 				append(&vm.stack, m.entries[idx].value)
+			} else if m, ok_string := receiver.(string); ok_string {
+				idx := number_to_index(index)
+
+				if char_str, ok := get_character_at(m, idx); ok {
+					new_string := Value(char_str)
+					append(&vm.stack, new_string)
+				} else {
+					fmt.panicf(
+						"Runtime Error: индекс %d выходит за границы массива",
+						idx,
+					)
+				}
 			} else {
 				fmt.panicf(
 					"Runtime Error: индексирование поддерживают только массивы и соответствия",

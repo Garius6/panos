@@ -1,5 +1,6 @@
 package main
 
+import "back"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -10,9 +11,11 @@ main :: proc() {
 	arena: mem.Dynamic_Arena
 	mem.dynamic_arena_init(&arena, alignment = 64)
 	defer mem.dynamic_arena_destroy(&arena)
+	back.register_segfault_handler()
 
+	// Перенаправляем стандартный обработчик паник в библиотеку
+	context.assertion_failure_proc = back.assertion_failure_proc
 	context.allocator = mem.dynamic_arena_allocator(&arena)
-
 	when ODIN_DEBUG {
 		tracker: mem.Tracking_Allocator
 		mem.tracking_allocator_init(&tracker, context.allocator, default_allocator)
@@ -66,6 +69,8 @@ run_file :: proc(filename: string, program_args: []string = nil) {
 		module_registry := compile_program(&resolver_ctx, &type_ctx, &module.ast, &global_registry)
 		print_assebler(module_registry)
 		fmt.printf("--------------------------\n\n")
+
+		graph.symbol_types = resolver_ctx.symbol_types
 	}
 
 	fmt.println("EXECUTION")

@@ -1033,6 +1033,8 @@ infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 		return 50, 51, true
 	case .Less, .Greater:
 		return 40, 41, true
+	case .Equal:
+		return 30, 31, true
 	case .Assign:
 		return 10, 9, true
 	case .LParen:

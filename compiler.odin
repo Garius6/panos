@@ -102,6 +102,7 @@ Opcode :: enum u8 {
 	Divide,
 	Less,
 	Greater,
+	Equal,
 	Get_Local, // Операнд: 1 байт (индекс слота во фрейме)
 	Set_Local, // Операнд: 1 байт (индекс слота во фрейме)
 	Jump_If_False, // Операнд: 2 байта (смещение прыжка)
@@ -197,7 +198,7 @@ compile_program :: proc(
 		case ^Function_Decl:
 			fn := new(Compiled_Function)
 			fn.name = symbol_registry_key(res.decl_symbols[decl])
-			func_type := tc.symbol_types[res.decl_symbols[decl]]
+			func_type := tc.res.symbol_types[res.decl_symbols[decl]]
 			fn.returns_value = prune_type(func_type.return_type) != TY_VOID
 			// Инициализируем массивы функции
 			fn.instructions = make([dynamic]u8)
@@ -206,7 +207,7 @@ compile_program :: proc(
 		case ^Impl_Decl:
 			for m in d.methods {
 				fn := new(Compiled_Function); fn.name = symbol_registry_key(res.decl_symbols[m])
-				func_type := tc.symbol_types[res.decl_symbols[m]]
+				func_type := tc.res.symbol_types[res.decl_symbols[m]]
 				fn.returns_value = prune_type(func_type.return_type) != TY_VOID
 				fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
 				registry_ptr^[fn.name] = fn
@@ -427,6 +428,9 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_opcode(ctx, .Less)
 			case .Greater:
 				emit_opcode(ctx, .Greater)
+			case .Equal:
+				emit_opcode(ctx, .Equal)
+
 			}
 		}
 
@@ -670,6 +674,10 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 				strings.write_string(&builder, command)
 
 			case .Less:
+				command := fmt.tprintf("%sLESS\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Equal:
 				command := fmt.tprintf("%sLESS\n", prefix)
 				strings.write_string(&builder, command)
 

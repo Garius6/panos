@@ -769,13 +769,49 @@ register_binder_slot :: proc(ctx: ^Compiler, sym: ^Symbol) -> int {
 	return slot
 }
 
+compile_pattern :: proc(
+	ctx: ^Compiler,
+	pi: ^Pattern_Info,
+	value_slot: int,
+	fail_jumps: ^[dynamic]int,
+) {
+	switch pi.kind {
+	case .Wildcard:
+	// без условия — совпадает всегда
+	case .Binder:
+		binder_slot := register_binder_slot(ctx, pi.binder_sym)
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(value_slot))
+		emit_opcode(ctx, .Set_Local)
+		emit_byte(ctx, u8(binder_slot))
+	case .Constructor:
+		tag_const := make_constant(ctx, Value(f64(pi.tag_index)))
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(value_slot))
+		emit_opcode(ctx, .Match_Tag)
+		emit_byte(ctx, tag_const)
+		append(fail_jumps, emit_jump(ctx, .Jump_If_False))
+		for &sub, field_idx in pi.sub_patterns {
+			if sub.kind == .Wildcard do continue
+			// Извлекаем поле в temp slot, потом рекурсивно сравниваем.
+			field_slot := allocate_temp_slot(ctx, "__match_field")
+			emit_opcode(ctx, .Get_Local)
+			emit_byte(ctx, u8(value_slot))
+			emit_opcode(ctx, .Get_Variant_Field)
+			emit_byte(ctx, u8(field_idx))
+			emit_opcode(ctx, .Set_Local)
+			emit_byte(ctx, u8(field_slot))
+			compile_pattern(ctx, &sub, field_slot, fail_jumps)
+		}
+	}
+}
+
 compile_match_expr :: proc(ctx: ^Compiler, m: ^Match_Expr) {
 	arm_infos, has_infos := ctx.tc.match_arm_infos[m]
 	if !has_infos {
 		fmt.panicf("Compiler Error: match_arm_infos отсутствует для выбора")
 	}
 	is_val := ctx.tc.node_types[m] != TY_VOID
-	// Компилируем subject, сохраняем в temp slot.
 	compile_expr(ctx, m.subject)
 	subject_slot := allocate_temp_slot(ctx, "__match_subject")
 	emit_opcode(ctx, .Set_Local)
@@ -785,48 +821,16 @@ compile_match_expr :: proc(ctx: ^Compiler, m: ^Match_Expr) {
 
 	for arm, arm_idx in m.arms {
 		info := arm_infos[arm_idx]
-		next_arm_jump := -1
-
-		switch info.kind {
-		case .Wildcard:
-		// без условия — падаем сразу в тело
-		case .Binder:
-			// Присваиваем subject биндеру.
-			binder_slot := register_binder_slot(ctx, info.binder_sym)
-			emit_opcode(ctx, .Get_Local)
-			emit_byte(ctx, u8(subject_slot))
-			emit_opcode(ctx, .Set_Local)
-			emit_byte(ctx, u8(binder_slot))
-		case .Constructor:
-			// Match_Tag против константы-тега, потом Jump_If_False.
-			tag_const := make_constant(ctx, Value(f64(info.tag_index)))
-			emit_opcode(ctx, .Get_Local)
-			emit_byte(ctx, u8(subject_slot))
-			emit_opcode(ctx, .Match_Tag)
-			emit_byte(ctx, tag_const)
-			next_arm_jump = emit_jump(ctx, .Jump_If_False)
-			// Извлекаем поля-биндеры (если есть).
-			for binder_sym, field_idx in info.field_binders {
-				if binder_sym == nil do continue
-				binder_slot := register_binder_slot(ctx, binder_sym)
-				emit_opcode(ctx, .Get_Local)
-				emit_byte(ctx, u8(subject_slot))
-				emit_opcode(ctx, .Get_Variant_Field)
-				emit_byte(ctx, u8(field_idx))
-				emit_opcode(ctx, .Set_Local)
-				emit_byte(ctx, u8(binder_slot))
-			}
-		}
+		fail_jumps := make([dynamic]int, context.temp_allocator)
+		pi := info.pattern
+		compile_pattern(ctx, &pi, subject_slot, &fail_jumps)
 
 		compile_block(ctx, arm.body, is_val)
 		append(&end_jumps, emit_jump(ctx, .Jump))
 
-		if next_arm_jump >= 0 {
-			patch_jump(ctx, next_arm_jump)
-		}
+		for fj in fail_jumps do patch_jump(ctx, fj)
 	}
 
-	// Если ни одна ветка не совпала — Match_Fail с subject на стеке.
 	emit_opcode(ctx, .Get_Local)
 	emit_byte(ctx, u8(subject_slot))
 	emit_opcode(ctx, .Match_Fail)

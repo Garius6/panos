@@ -135,13 +135,110 @@ Match_Arm_Kind :: enum {
 	Constructor,
 }
 
+Pattern_Info :: struct {
+	kind:         Match_Arm_Kind,
+	tag_index:   int,
+	binder_sym:   ^Symbol,
+	// Для конструктора: рекурсивные под-шаблоны, по одному на поле варианта.
+	sub_patterns: [dynamic]Pattern_Info,
+}
+
 Match_Arm_Info :: struct {
-	kind:          Match_Arm_Kind,
-	tag_index:     int,
-	binder_sym:    ^Symbol,
-	// Для конструктора: символ-биндер для каждого поля варианта (или nil,
-	// если соответствующий шаблон-аргумент — заглушка `_`).
-	field_binders: [dynamic]^Symbol,
+	pattern: Pattern_Info,
+}
+
+classify_pattern :: proc(
+	ctx: ^Type_Ctx,
+	pattern: Pattern,
+	expected_type: ^Type,
+) -> Pattern_Info {
+	info := Pattern_Info {
+		tag_index = -1,
+	}
+	switch pat in pattern {
+	case ^Pattern_Wildcard:
+		info.kind = .Wildcard
+	case ^Pattern_Literal:
+		fmt.panicf("Type Error: литеральные шаблоны в выборе пока не поддерживаются")
+	case ^Pattern_Ident:
+		expected := prune_type(expected_type)
+		if expected.kind == .Enum || expected.kind == .Option || expected.kind == .Result {
+			enum_view := expected
+			if expected.kind == .Option do enum_view = synth_option_enum(expected)
+			else if expected.kind == .Result do enum_view = synth_result_enum(expected)
+			tag := -1
+			for v, i in enum_view.variants {
+				if v.name == pat.name {
+					tag = i
+					break
+				}
+			}
+			if tag >= 0 {
+				if len(enum_view.variants[tag].fields) != 0 {
+					fmt.panicf(
+						"Type Error: вариант '%s.%s' в шаблоне без скобок, но у него есть поля",
+						enum_view.name,
+						pat.name,
+					)
+				}
+				info.kind = .Constructor
+				info.tag_index = tag
+				info.sub_patterns = make([dynamic]Pattern_Info)
+				return info
+			}
+		}
+		binder_sym := ctx.res.pattern_binders[pat]
+		if binder_sym == nil {
+			fmt.panicf("Type Error: не разрешён шаблон '%s'", pat.name)
+		}
+		info.kind = .Binder
+		info.binder_sym = binder_sym
+		ctx.res.symbol_types[binder_sym] = expected_type
+	case ^Pattern_Constructor:
+		expected := prune_type(expected_type)
+		if expected.kind != .Enum && expected.kind != .Option && expected.kind != .Result {
+			fmt.panicf(
+				"Type Error: шаблон-конструктор '%s' ожидает значение перечисления, получено '%s'",
+				pat.name,
+				expected.name,
+			)
+		}
+		enum_view := expected
+		if expected.kind == .Option do enum_view = synth_option_enum(expected)
+		else if expected.kind == .Result do enum_view = synth_result_enum(expected)
+		tag := -1
+		for v, i in enum_view.variants {
+			if v.name == pat.name {
+				tag = i
+				break
+			}
+		}
+		if tag < 0 {
+			fmt.panicf(
+				"Type Error: вариант '%s' не найден в '%s'",
+				pat.name,
+				enum_view.name,
+			)
+		}
+		expected_fields := enum_view.variants[tag].fields
+		if len(pat.args) != len(expected_fields) {
+			fmt.panicf(
+				"Type Error: у варианта '%s.%s' ожидалось %d аргументов в шаблоне, получено %d",
+				enum_view.name,
+				pat.name,
+				len(expected_fields),
+				len(pat.args),
+			)
+		}
+		info.kind = .Constructor
+		info.tag_index = tag
+		info.sub_patterns = make([dynamic]Pattern_Info)
+		for arg_pat, i in pat.args {
+			sub := classify_pattern(ctx, arg_pat, expected_fields[i])
+			append(&info.sub_patterns, sub)
+		}
+	}
+	return info
 }
 
 // Собираем виртуальный `.Enum` тип для встроенной `Опция(T)`, чтобы `выбор`
@@ -183,13 +280,14 @@ check_match_coverage :: proc(subject_type: ^Type, arm_infos: [dynamic]Match_Arm_
 	catch_all := false
 
 	for info, arm_idx in arm_infos {
+		pi := info.pattern
 		if catch_all {
 			fmt.panicf(
 				"Type Error: ветка выбора #%d недостижима — все случаи покрыты выше",
 				arm_idx + 1,
 			)
 		}
-		switch info.kind {
+		switch pi.kind {
 		case .Wildcard:
 			catch_all = true
 			if arm_idx != len(arm_infos) - 1 {
@@ -205,20 +303,31 @@ check_match_coverage :: proc(subject_type: ^Type, arm_infos: [dynamic]Match_Arm_
 				)
 			}
 		case .Constructor:
-			if info.tag_index < 0 || info.tag_index >= total {
+			if pi.tag_index < 0 || pi.tag_index >= total {
 				fmt.panicf(
 					"Type Error: внутренняя ошибка — тег варианта вне диапазона",
 				)
 			}
-			if covered[info.tag_index] {
+			// Constructor-с-нетривиальными-подшаблонами (nested constructors or
+			// non-wildcard binders) НЕ покрывает вариант целиком — семантика
+			// exhaustiveness требует полного покрытия. Помечаем как covered
+			// только если все подшаблоны — Wildcard или Binder.
+			fully_covers := true
+			for sub in pi.sub_patterns {
+				if sub.kind == .Constructor {
+					fully_covers = false
+					break
+				}
+			}
+			if fully_covers && covered[pi.tag_index] {
 				fmt.panicf(
 					"Type Error: вариант '%s.%s' покрыт повторно в ветке #%d",
 					subject_type.name,
-					subject_type.variants[info.tag_index].name,
+					subject_type.variants[pi.tag_index].name,
 					arm_idx + 1,
 				)
 			}
-			covered[info.tag_index] = true
+			if fully_covers do covered[pi.tag_index] = true
 		}
 	}
 
@@ -2027,103 +2136,9 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		arm_infos := make([dynamic]Match_Arm_Info)
 		result_t: ^Type
 		for arm in e.arms {
+			pi := classify_pattern(ctx, arm.pattern, subject_type_actual)
 			info := Match_Arm_Info {
-				tag_index = -1,
-			}
-			switch pat in arm.pattern {
-			case ^Pattern_Wildcard:
-				info.kind = .Wildcard
-			case ^Pattern_Literal:
-				fmt.panicf(
-					"Type Error: литеральные шаблоны в выборе пока не поддерживаются",
-				)
-			case ^Pattern_Ident:
-				// Сначала проверяем, не является ли имя вариантом
-				// subject_type — это покрывает и пользовательские ADT
-				// (Enum_Variant symbol), и встроенные Опция/Результат
-				// (prelude Builtin).
-				tag := -1
-				for v, i in subject_type.variants {
-					if v.name == pat.name {
-						tag = i
-						break
-					}
-				}
-				if tag >= 0 {
-					if len(subject_type.variants[tag].fields) != 0 {
-						fmt.panicf(
-							"Type Error: вариант '%s.%s' в шаблоне без скобок, но у него есть поля",
-							subject_type.name,
-							pat.name,
-						)
-					}
-					info.kind = .Constructor
-					info.tag_index = tag
-					info.field_binders = make([dynamic]^Symbol)
-				} else {
-					binder_sym := ctx.res.pattern_binders[pat]
-					if binder_sym == nil {
-						fmt.panicf(
-							"Type Error: не разрешён шаблон '%s'",
-							pat.name,
-						)
-					}
-					info.kind = .Binder
-					info.binder_sym = binder_sym
-					ctx.res.symbol_types[binder_sym] = subject_type_actual
-				}
-			case ^Pattern_Constructor:
-				tag := -1
-				for v, i in subject_type.variants {
-					if v.name == pat.name {
-						tag = i
-						break
-					}
-				}
-				if tag < 0 {
-					fmt.panicf(
-						"Type Error: вариант '%s' не найден в '%s'",
-						pat.name,
-						subject_type.name,
-					)
-				}
-				expected_fields := subject_type.variants[tag].fields
-				if len(pat.args) != len(expected_fields) {
-					fmt.panicf(
-						"Type Error: у варианта '%s.%s' ожидалось %d аргументов в шаблоне, получено %d",
-						subject_type.name,
-						pat.name,
-						len(expected_fields),
-						len(pat.args),
-					)
-				}
-				info.kind = .Constructor
-				info.tag_index = tag
-				info.field_binders = make([dynamic]^Symbol)
-				for arg_pat, i in pat.args {
-					switch inner in arg_pat {
-					case ^Pattern_Wildcard:
-						append(&info.field_binders, cast(^Symbol)nil)
-					case ^Pattern_Literal:
-						fmt.panicf(
-							"Type Error: литеральные шаблоны не поддерживаются",
-						)
-					case ^Pattern_Ident:
-						binder_sym := ctx.res.pattern_binders[inner]
-						if binder_sym == nil ||
-						   binder_sym.kind == .Enum_Variant {
-							fmt.panicf(
-								"Type Error: во вложенных шаблонах пока поддерживается только биндер или '_'",
-							)
-						}
-						ctx.res.symbol_types[binder_sym] = expected_fields[i]
-						append(&info.field_binders, binder_sym)
-					case ^Pattern_Constructor:
-						fmt.panicf(
-							"Type Error: вложенные конструкторы в шаблоне пока не поддерживаются",
-						)
-					}
-				}
+				pattern = pi,
 			}
 			append(&arm_infos, info)
 

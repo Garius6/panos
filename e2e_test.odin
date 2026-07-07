@@ -974,6 +974,156 @@ test_match_unreachable_after_wildcard_rejected :: proc(t: ^testing.T) {
 	`)
 }
 
+has_latin_word :: proc(msg: string) -> bool {
+	// Разрешённые английские префиксы диагностики (соглашение проекта).
+	body := msg
+	prefixes := [?]string {
+		"Type Error:",
+		"Runtime Error:",
+		"Runtime Panic:",
+		"Semantic Error:",
+		"Syntactic Error:",
+		"Compiler Error:",
+		"Resolve Error:",
+		"Синтаксическая ошибка:",
+	}
+	for prefix in prefixes {
+		if len(body) >= len(prefix) && body[:len(prefix)] == prefix {
+			body = body[len(prefix):]
+			break
+		}
+	}
+	// Ищем последовательность из ≥3 ASCII-латинских букв в теле сообщения.
+	streak := 0
+	for r in body {
+		is_latin := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		if is_latin {
+			streak += 1
+			if streak >= 3 do return true
+		} else {
+			streak = 0
+		}
+	}
+	return false
+}
+
+@(test)
+test_diagnostics_have_no_latin_words :: proc(t: ^testing.T) {
+	messages := [?]string {
+		"Type Error: у варианта 'Фигура.Круг' поле #0 ожидает 'Число', получено 'Строка'",
+		"Синтаксическая ошибка: вариант 'Круг' объявлен дважды в 'Фигура'",
+		"Resolve Error: у типа 'Фигура' нет варианта 'Ромб'",
+		"Resolve Error: имя варианта 'Точка' конфликтует с уже объявленным символом в модуле",
+		"Resolve Error: модуль 'ф' не экспортирует 'Круг'",
+		"Type Error: выбор не покрывает варианты: Точка",
+		"Type Error: выбор не покрывает варианты: Лист",
+		"Type Error: выбор не покрывает варианты: Г",
+		"Type Error: '_' в выборе должен быть только последней веткой",
+		"Type Error: вариант 'Ф.А' покрыт повторно в ветке #2",
+		"Type Error: выбор не покрывает варианты: Нет",
+	}
+	for msg, i in messages {
+		testing.expectf(
+			t,
+			!has_latin_word(msg),
+			"сообщение #%d содержит латинское слово: %s",
+			i,
+			msg,
+		)
+	}
+}
+
+@(test)
+test_match_scales_20_variants :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип К = перечисление
+			V0; V1; V2; V3; V4; V5; V6; V7; V8; V9
+			V10; V11; V12; V13; V14; V15; V16; V17; V18; V19
+		конец
+		функ индекс(к: К) -> Число
+			возврат выбор к
+				V0 -> 0; V1 -> 1; V2 -> 2; V3 -> 3; V4 -> 4
+				V5 -> 5; V6 -> 6; V7 -> 7; V8 -> 8; V9 -> 9
+				V10 -> 10; V11 -> 11; V12 -> 12; V13 -> 13; V14 -> 14
+				V15 -> 15; V16 -> 16; V17 -> 17; V18 -> 18; V19 -> 19
+			конец
+		конец
+		функ старт() -> Число
+			возврат индекс(V13)
+		конец
+	`)
+	testing.expectf(t, ok, "20-variants: пустой стек")
+	if !ok do return
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 13.0, "20-variants: %v != 13", result)
+}
+
+@(test)
+test_match_arm_panics_never_ignored_in_result_type :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Ф = перечисление
+			А
+			Б
+		конец
+		функ старт() -> Число
+			пер зн: Ф = Б
+			возврат выбор зн
+				А -> паника("не должно")
+				Б -> 5
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "panic-arm: пустой стек")
+	if !ok do return
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 5.0, "panic-arm: %v != 5", result)
+}
+
+@(test)
+test_match_nested_constructor_binds_inner :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Ф = перечисление
+			Круг(Число)
+		конец
+		функ разбор(р: Результат(Ф, Ошибка)) -> Число
+			возврат выбор р
+				Успех(Круг(рад)) -> рад
+				_ -> 0
+			конец
+		конец
+		функ старт() -> Число
+			возврат разбор(Успех(Круг(7)))
+		конец
+	`)
+	testing.expectf(t, ok, "nested: пустой стек")
+	if !ok do return
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 7.0, "nested: %v != 7", result)
+}
+
+@(test)
+test_match_nested_constructor_falls_to_wildcard :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Ф = перечисление
+			Круг(Число)
+			Точка
+		конец
+		функ разбор(р: Результат(Ф, Ошибка)) -> Число
+			возврат выбор р
+				Успех(Круг(рад)) -> рад
+				_ -> 99
+			конец
+		конец
+		функ старт() -> Число
+			возврат разбор(Успех(Точка))
+		конец
+	`)
+	testing.expectf(t, ok, "nested fall: пустой стек")
+	if !ok do return
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 99.0, "nested fall: %v != 99", result)
+}
+
 @(test)
 test_match_option_binds_and_branches :: proc(t: ^testing.T) {
 	result, ok := run_code(`

@@ -10,16 +10,19 @@ Symbol_Kind :: enum {
 	Type,
 	Module,
 	Builtin,
+	Enum_Variant,
 }
 
 // Семантическая сущность: локальная переменная, функция, тип или модуль-алиас.
 Symbol :: struct {
-	name:        string,
-	full_name:   string,
-	kind:        Symbol_Kind,
-	module:      ^Module,
-	is_exported: bool,
-	decl:        Decls,
+	name:              string,
+	full_name:         string,
+	kind:              Symbol_Kind,
+	module:            ^Module,
+	is_exported:       bool,
+	decl:              Decls,
+	owner_type:        ^Symbol,
+	is_pattern_binder: bool,
 }
 
 Module :: struct {
@@ -207,18 +210,19 @@ new_symbol :: proc(
 }
 
 Resolver_Ctx :: struct {
-	current_scope:  ^Scope,
-	global_scope:   ^Scope,
-	current_module: ^Module,
-	module_graph:   ^Module_Graph,
-	symbol_types:   map[^Symbol]^Type,
+	current_scope:   ^Scope,
+	global_scope:    ^Scope,
+	current_module:  ^Module,
+	module_graph:    ^Module_Graph,
+	symbol_types:    map[^Symbol]^Type,
+	pattern_binders: map[^Pattern_Ident]^Symbol,
 
 	// Side Tables
-	decl_symbols:   map[Decls]^Symbol,
-	stmt_symbols:   map[Stmt]^Symbol,
-	node_symbols:   map[Expr]^Symbol,
-	func_args:      map[Decls][dynamic]^Symbol,
-	lambda_args:    map[Expr][dynamic]^Symbol,
+	decl_symbols:    map[Decls]^Symbol,
+	stmt_symbols:    map[Stmt]^Symbol,
+	node_symbols:    map[Expr]^Symbol,
+	func_args:       map[Decls][dynamic]^Symbol,
+	lambda_args:     map[Expr][dynamic]^Symbol,
 }
 
 push_scope :: proc(resolver: ^Resolver_Ctx) {
@@ -252,10 +256,11 @@ install_standard_symbols :: proc(ctx: ^Resolver_Ctx) {
 
 new_resolver_ctx :: proc() -> Resolver_Ctx {
 	ctx := Resolver_Ctx {
-		symbol_types = make(map[^Symbol]^Type),
-		stmt_symbols = make(map[Stmt]^Symbol),
-		decl_symbols = make(map[Decls]^Symbol),
-		node_symbols = make(map[Expr]^Symbol),
+		symbol_types    = make(map[^Symbol]^Type),
+		stmt_symbols    = make(map[Stmt]^Symbol),
+		decl_symbols    = make(map[Decls]^Symbol),
+		node_symbols    = make(map[Expr]^Symbol),
+		pattern_binders = make(map[^Pattern_Ident]^Symbol),
 	}
 
 	push_scope(&ctx)
@@ -287,7 +292,7 @@ lookup_symbol :: proc(s: ^Scope, name: string) -> ^Symbol {
 }
 
 register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls) {
-	switch d in decl {
+	#partial switch d in decl {
 	case ^Import_Decl:
 		import_path, exists := resolve_existing_import_path(d.path, module.dir)
 		imported_module, ok := ctx.module_graph.modules[import_path]
@@ -352,6 +357,32 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 			}
 			module.scope.symbols[sym.name] = sym
 			ctx.decl_symbols[m] = sym
+		}
+
+	case ^Enum_Decl:
+		type_sym := new_symbol(d.name, .Type, module, d.is_exported, decl)
+		if type_sym.name in module.scope.symbols {
+			fmt.panicf("Resolve Error: символ '%s' уже объявлен", type_sym.name)
+		}
+		module.scope.symbols[type_sym.name] = type_sym
+		ctx.decl_symbols[decl] = type_sym
+		if d.is_exported {
+			module.exports[type_sym.name] = type_sym
+		}
+
+		for variant in d.variants {
+			if _, exists := module.scope.symbols[variant.name]; exists {
+				fmt.panicf(
+					"Resolve Error: имя варианта '%s' конфликтует с уже объявленным символом в модуле",
+					variant.name,
+				)
+			}
+			variant_sym := new_symbol(variant.name, .Enum_Variant, module, d.is_exported, decl)
+			variant_sym.owner_type = type_sym
+			module.scope.symbols[variant.name] = variant_sym
+			if d.is_exported {
+				module.exports[variant.name] = variant_sym
+			}
 		}
 	}
 }
@@ -429,6 +460,40 @@ resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program) {
 	ctx^ = resolved
 }
 
+resolve_pattern :: proc(ctx: ^Resolver_Ctx, pattern: Pattern) {
+	switch p in pattern {
+	case ^Pattern_Wildcard:
+	// ничего не привязывает
+	case ^Pattern_Literal:
+		fmt.panicf(
+			"Semantic Error: литеральные шаблоны в выборе пока не поддерживаются",
+		)
+	case ^Pattern_Ident:
+		if p.name == "_" {
+			// Формально не должно случиться — parse_pattern уже
+			// превращает "_" в Pattern_Wildcard.
+			return
+		}
+		if sym := lookup_symbol(ctx.current_scope, p.name); sym != nil &&
+		   sym.kind == .Enum_Variant {
+			// Zero-field constructor pattern; захватывать нечего.
+			ctx.pattern_binders[p] = sym
+		} else {
+			// Обычный биндер.
+			binder := new_symbol(p.name, .Variable, ctx.current_module)
+			binder.is_pattern_binder = true
+			ctx.current_scope.symbols[p.name] = binder
+			ctx.pattern_binders[p] = binder
+		}
+	case ^Pattern_Constructor:
+		// Резолвим квалификатор при необходимости и рекурсивно шаблоны
+		// аргументов. Само имя варианта разрешит type checker.
+		for arg in p.args {
+			resolve_pattern(ctx, arg)
+		}
+	}
+}
+
 resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 	if stmt == nil do return
 
@@ -450,6 +515,9 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 
 	case ^Expr_Stmt:
 		resolve_expr(ctx, s.expr)
+
+	case ^Continue_Stmt:
+	case ^Break_Stmt:
 	}
 }
 
@@ -504,14 +572,19 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		}
 	case ^Property_Expr:
 		resolve_expr(ctx, e.object)
+		obj_sym: ^Symbol
 		if obj_ident, ok := e.object.(^Ident_Expr); ok {
-			if obj_sym := lookup_symbol(ctx.current_scope, obj_ident.name);
-			   obj_sym != nil && obj_sym.kind == .Module {
+			obj_sym = lookup_symbol(ctx.current_scope, obj_ident.name)
+		} else {
+			obj_sym = ctx.node_symbols[e.object]
+		}
+		if obj_sym != nil {
+			if obj_sym.kind == .Module {
 				imported_module := obj_sym.module
 				if imported_module == nil {
 					fmt.panicf(
 						"Resolve Error: модуль '%s' не найден",
-						obj_ident.name,
+						obj_sym.name,
 					)
 				}
 				if export_sym, found := imported_module.exports[e.property]; found {
@@ -520,9 +593,33 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 				}
 				fmt.panicf(
 					"Resolve Error: модуль '%s' не экспортирует '%s'",
-					obj_ident.name,
+					obj_sym.name,
 					e.property,
 				)
+			}
+			if obj_sym.kind == .Type {
+				if _, is_enum := obj_sym.decl.(^Enum_Decl); is_enum {
+					owner_module := obj_sym.module
+					if owner_module == nil ||
+					   owner_module.scope == nil {
+						fmt.panicf(
+							"Resolve Error: модуль-владелец типа '%s' недоступен",
+							obj_sym.name,
+						)
+					}
+					variant_sym, found := owner_module.scope.symbols[e.property]
+					if !found ||
+					   variant_sym.kind != .Enum_Variant ||
+					   variant_sym.owner_type != obj_sym {
+						fmt.panicf(
+							"Resolve Error: у типа '%s' нет варианта '%s'",
+							obj_sym.name,
+							e.property,
+						)
+					}
+					ctx.node_symbols[expr] = variant_sym
+					return
+				}
 			}
 		}
 	case ^Lambda_Expr:
@@ -550,6 +647,15 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		resolve_expr(ctx, e.index)
 	case ^Try_Expr:
 		resolve_expr(ctx, e.value)
+
+	case ^Match_Expr:
+		resolve_expr(ctx, e.subject)
+		for arm in e.arms {
+			push_scope(ctx)
+			resolve_pattern(ctx, arm.pattern)
+			for stmt in arm.body do resolve_stmt(ctx, stmt)
+			pop_scope(ctx)
+		}
 	}
 }
 
@@ -561,7 +667,7 @@ print_resolver_ctx :: proc(ctx: ^Resolver_Ctx) {
 	)
 	if len(ctx.decl_symbols) == 0 do fmt.println("  (пусто)")
 	for decl, sym in ctx.decl_symbols {
-		switch d in decl {
+		#partial switch d in decl {
 		case ^Import_Decl:
 			fmt.printf(
 				"  [IMPORT] '%s'%s\n",

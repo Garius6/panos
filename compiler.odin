@@ -42,6 +42,16 @@ Interface_Value :: struct {
 	methods: map[string]^Compiled_Function,
 }
 
+// Значение варианта пользовательского ADT (либо построенного через prelude
+// Option/Result — см. plan/research). Хранит имя типа-владельца (для
+// диагностики и печати), числовой индекс варианта (порядок объявления) и
+// поля варианта.
+Variant_Value :: struct {
+	type_name: string,
+	tag_index: int,
+	fields:    [dynamic]Value,
+}
+
 Value :: union {
 	f64,
 	bool,
@@ -54,6 +64,7 @@ Value :: union {
 	^Option_Value,
 	^Result_Value,
 	^Interface_Value,
+	^Variant_Value,
 }
 
 Compiled_Function :: struct {
@@ -69,6 +80,11 @@ Local :: struct {
 	depth:  int,
 }
 
+Loop_Context :: struct {
+	continue_target: int,
+	break_jumps:     [dynamic]int,
+}
+
 symbol_registry_key :: proc(sym: ^Symbol) -> string {
 	if sym == nil do return ""
 	if len(sym.full_name) > 0 do return sym.full_name
@@ -81,6 +97,7 @@ Compiler :: struct {
 	tc:               ^Type_Ctx,
 	res:              ^Resolver_Ctx,
 	locals:           [dynamic]Local,
+	loops:            [dynamic]Loop_Context,
 	scope_depth:      int,
 }
 
@@ -89,6 +106,7 @@ new_compiler :: proc(res: ^Resolver_Ctx, name: string) -> Compiler {
 	c := Compiler {
 		res         = res,
 		locals      = make([dynamic]Local),
+		loops       = make([dynamic]Loop_Context),
 		scope_depth = 0,
 	}
 	return c
@@ -103,6 +121,7 @@ Opcode :: enum u8 {
 	Less,
 	Greater,
 	Equal,
+	Negate,
 	Get_Local, // Операнд: 1 байт (индекс слота во фрейме)
 	Set_Local, // Операнд: 1 байт (индекс слота во фрейме)
 	Jump_If_False, // Операнд: 2 байта (смещение прыжка)
@@ -122,6 +141,10 @@ Opcode :: enum u8 {
 	Invoke_Collection,
 	Call_Builtin,
 	Try_Unwrap,
+	Match_Tag, // Операнд: 1 байт (индекс константы с int-тегом). Читает вершину без снятия, кладёт bool.
+	Get_Variant_Field, // Операнд: 1 байт (индекс поля). Снимает variant, кладёт значение поля.
+	Match_Fail, // Без операнда. Runtime-трап при недостижимом промахе `выбор`.
+	Build_Variant, // Операнды: 3 байта (type_name_const, tag, arity). Снимает arity полей, кладёт ^Variant_Value.
 }
 
 // Записать 1 байт в массив инструкций
@@ -176,6 +199,15 @@ patch_jump :: proc(c: ^Compiler, offset: int) {
 
 	c.current_function.instructions[offset] = u8((jump_length >> 8) & 0xff) // Старший байт
 	c.current_function.instructions[offset + 1] = u8(jump_length & 0xff) // Младший байт
+}
+
+patch_signed_jump_to :: proc(c: ^Compiler, offset: int, target: int) {
+	jump_length := target - (offset + 2)
+	if jump_length < -32768 || jump_length > 32767 {
+		fmt.panicf("Too much code to jump over!")
+	}
+	c.current_function.instructions[offset] = u8((jump_length >> 8) & 0xff)
+	c.current_function.instructions[offset + 1] = u8(jump_length & 0xff)
 }
 
 compile_program :: proc(
@@ -259,11 +291,15 @@ compile_program :: proc(
 }
 
 compile_decl :: proc(c: ^Compiler, decl: Decls) {
-	switch d in decl {
+	#partial switch d in decl {
 	case ^Import_Decl:
 	case ^Impl_Decl:
 	case ^Struct_Decl:
 	case ^Interface_Decl:
+	case ^Enum_Decl:
+	// Компиляция уже произошла в type checker'е: тип и варианты
+	// зарегистрированы. Байткод для конструкторов эмитится в местах
+	// вызова (T016/T017), не здесь.
 
 	case ^Function_Decl:
 		function := new(Compiled_Function)
@@ -304,6 +340,21 @@ compile_statement :: proc(ctx: ^Compiler, statement: Stmt) {
 		if expr_type, ok := ctx.tc.node_types[stmt.expr]; !ok || expr_type != TY_VOID {
 			emit_opcode(ctx, .Pop)
 		}
+
+	case ^Continue_Stmt:
+		if len(ctx.loops) == 0 {
+			fmt.panicf("Compiler Error: 'продолжить' вне цикла")
+		}
+		loop := ctx.loops[len(ctx.loops) - 1]
+		continue_jump := emit_jump(ctx, .Jump)
+		patch_signed_jump_to(ctx, continue_jump, loop.continue_target)
+
+	case ^Break_Stmt:
+		if len(ctx.loops) == 0 {
+			fmt.panicf("Compiler Error: 'прервать' вне цикла")
+		}
+		break_jump := emit_jump(ctx, .Jump)
+		append(&ctx.loops[len(ctx.loops) - 1].break_jumps, break_jump)
 	}
 }
 
@@ -360,6 +411,14 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				"Compiler Error: модуль '%s' нельзя использовать как значение",
 				sym.name,
 			)
+		}
+		if info, is_variant := ctx.tc.variant_idents[expr]; is_variant {
+			name_const := make_constant(ctx, Value(info.owner_type.name))
+			emit_opcode(ctx, .Build_Variant)
+			emit_byte(ctx, name_const)
+			emit_byte(ctx, u8(info.tag_index))
+			emit_byte(ctx, 0)
+			return
 		}
 		if sym.kind == .Builtin {
 			fmt.panicf(
@@ -431,12 +490,57 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_opcode(ctx, .Greater)
 			case .Equal:
 				emit_opcode(ctx, .Equal)
+			case .NotEqual:
+				emit_opcode(ctx, .Equal)
+				emit_opcode(ctx, .Negate)
+			case .Negate:
+				emit_opcode(ctx, .Negate)
+			case .And:
+				compile_expr(ctx, e.left)
 
+				false_jump := emit_jump(ctx, .Jump_If_False)
+
+				compile_expr(ctx, e.right)
+				end_jump := emit_jump(ctx, .Jump)
+
+				patch_jump(ctx, false_jump)
+				emit_constant(ctx, Value(false))
+				patch_jump(ctx, end_jump)
+
+			case .Or:
+				compile_expr(ctx, e.left)
+
+				jump_eval_right := emit_jump(ctx, .Jump_If_False)
+
+				emit_constant(ctx, Value(true))
+
+				jump_end := emit_jump(ctx, .Jump)
+
+				patch_jump(ctx, jump_eval_right)
+				compile_expr(ctx, e.right)
+
+				patch_jump(ctx, jump_end)
 			}
 		}
 
 	case ^Property_Expr:
+		if info, is_variant := ctx.tc.variant_idents[expr]; is_variant {
+			name_const := make_constant(ctx, Value(info.owner_type.name))
+			emit_opcode(ctx, .Build_Variant)
+			emit_byte(ctx, name_const)
+			emit_byte(ctx, u8(info.tag_index))
+			emit_byte(ctx, 0)
+			return
+		}
 		if sym, ok := ctx.res.node_symbols[expr]; ok {
+			if sym.kind == .Enum_Variant {
+				owner_name := sym.owner_type == nil ? "" : sym.owner_type.name
+				fmt.panicf(
+					"Compiler Error: вариант '%s.%s' используется как значение — вызовите со скобками",
+					owner_name,
+					sym.name,
+				)
+			}
 			if fn_ptr, found := ctx.registry^[symbol_registry_key(sym)]; found {
 				emit_constant(ctx, Value(fn_ptr))
 				return
@@ -489,6 +593,15 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		compile_expr(ctx, e.value)
 		emit_opcode(ctx, .Try_Unwrap)
 	case ^Call_Expr:
+		if info, is_variant := ctx.tc.variant_calls[expr]; is_variant {
+			for arg in e.args do compile_expr(ctx, arg)
+			name_const := make_constant(ctx, Value(info.owner_type.name))
+			emit_opcode(ctx, .Build_Variant)
+			emit_byte(ctx, name_const)
+			emit_byte(ctx, u8(info.tag_index))
+			emit_byte(ctx, u8(len(e.args)))
+			return
+		}
 		if ident, ok := e.callee.(^Ident_Expr); ok {
 			if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Builtin {
 				for arg in e.args do compile_expr(ctx, arg)
@@ -548,6 +661,9 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			emit_byte(ctx, u8(len(e.args)))
 		}
 
+	case ^Match_Expr:
+		compile_match_expr(ctx, e)
+
 	case ^If_Expr:
 		compile_expr(ctx, e.condition)
 		else_jump := emit_jump(ctx, .Jump_If_False)
@@ -562,6 +678,11 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 	case ^While_Expr:
 		// 1. Запоминаем адрес начала цикла, чтобы возвращаться сюда
 		loop_start := len(ctx.current_function.instructions)
+		loop_ctx := Loop_Context {
+			continue_target = loop_start,
+			break_jumps     = make([dynamic]int),
+		}
+		append(&ctx.loops, loop_ctx)
 
 		// 2. Условие
 		compile_expr(ctx, e.condition)
@@ -575,18 +696,16 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 
 		// 5. Прыгаем обратно в начало (эмулируем Jump_Back)
-		// У нас нет отдельного опкода для прыжка назад, но мы можем использовать патч:
 		loop_jump := emit_jump(ctx, .Jump)
-
-		// Хак для прыжка назад: считаем смещение вручную как отрицательное число
-		// Либо, для простоты, сделайте опкод .Loop, который прыгает назад.
-		// Пока оставим прямой патч (вычисляет вперед, но нам нужно назад):
-		jump_length := loop_start - len(ctx.current_function.instructions)
-		ctx.current_function.instructions[loop_jump] = u8((jump_length >> 8) & 0xff)
-		ctx.current_function.instructions[loop_jump + 1] = u8(jump_length & 0xff)
+		patch_signed_jump_to(ctx, loop_jump, loop_start)
 
 		// 6. Зашиваем адрес выхода из цикла
 		patch_jump(ctx, exit_jump)
+		finished_loop := ctx.loops[len(ctx.loops) - 1]
+		for break_jump in finished_loop.break_jumps {
+			patch_jump(ctx, break_jump)
+		}
+		pop(&ctx.loops)
 	case ^Tuple_Expr:
 		for el in e.elements {
 			compile_expr(ctx, el)
@@ -633,6 +752,88 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 	}
 }
 
+allocate_temp_slot :: proc(ctx: ^Compiler, name: string) -> int {
+	sym := new(Symbol)
+	sym.name = name
+	sym.kind = .Variable
+	append(&ctx.locals, Local{symbol = sym, depth = ctx.scope_depth})
+	slot := len(ctx.locals) - 1
+	ctx.current_function.frame_size = max(ctx.current_function.frame_size, len(ctx.locals))
+	return slot
+}
+
+register_binder_slot :: proc(ctx: ^Compiler, sym: ^Symbol) -> int {
+	append(&ctx.locals, Local{symbol = sym, depth = ctx.scope_depth})
+	slot := len(ctx.locals) - 1
+	ctx.current_function.frame_size = max(ctx.current_function.frame_size, len(ctx.locals))
+	return slot
+}
+
+compile_match_expr :: proc(ctx: ^Compiler, m: ^Match_Expr) {
+	arm_infos, has_infos := ctx.tc.match_arm_infos[m]
+	if !has_infos {
+		fmt.panicf("Compiler Error: match_arm_infos отсутствует для выбора")
+	}
+	is_val := ctx.tc.node_types[m] != TY_VOID
+	// Компилируем subject, сохраняем в temp slot.
+	compile_expr(ctx, m.subject)
+	subject_slot := allocate_temp_slot(ctx, "__match_subject")
+	emit_opcode(ctx, .Set_Local)
+	emit_byte(ctx, u8(subject_slot))
+
+	end_jumps := make([dynamic]int, context.temp_allocator)
+
+	for arm, arm_idx in m.arms {
+		info := arm_infos[arm_idx]
+		next_arm_jump := -1
+
+		switch info.kind {
+		case .Wildcard:
+		// без условия — падаем сразу в тело
+		case .Binder:
+			// Присваиваем subject биндеру.
+			binder_slot := register_binder_slot(ctx, info.binder_sym)
+			emit_opcode(ctx, .Get_Local)
+			emit_byte(ctx, u8(subject_slot))
+			emit_opcode(ctx, .Set_Local)
+			emit_byte(ctx, u8(binder_slot))
+		case .Constructor:
+			// Match_Tag против константы-тега, потом Jump_If_False.
+			tag_const := make_constant(ctx, Value(f64(info.tag_index)))
+			emit_opcode(ctx, .Get_Local)
+			emit_byte(ctx, u8(subject_slot))
+			emit_opcode(ctx, .Match_Tag)
+			emit_byte(ctx, tag_const)
+			next_arm_jump = emit_jump(ctx, .Jump_If_False)
+			// Извлекаем поля-биндеры (если есть).
+			for binder_sym, field_idx in info.field_binders {
+				if binder_sym == nil do continue
+				binder_slot := register_binder_slot(ctx, binder_sym)
+				emit_opcode(ctx, .Get_Local)
+				emit_byte(ctx, u8(subject_slot))
+				emit_opcode(ctx, .Get_Variant_Field)
+				emit_byte(ctx, u8(field_idx))
+				emit_opcode(ctx, .Set_Local)
+				emit_byte(ctx, u8(binder_slot))
+			}
+		}
+
+		compile_block(ctx, arm.body, is_val)
+		append(&end_jumps, emit_jump(ctx, .Jump))
+
+		if next_arm_jump >= 0 {
+			patch_jump(ctx, next_arm_jump)
+		}
+	}
+
+	// Если ни одна ветка не совпала — Match_Fail с subject на стеке.
+	emit_opcode(ctx, .Get_Local)
+	emit_byte(ctx, u8(subject_slot))
+	emit_opcode(ctx, .Match_Fail)
+
+	for j in end_jumps do patch_jump(ctx, j)
+}
+
 compile_block :: proc(ctx: ^Compiler, body: [dynamic]Stmt, is_expr: bool) {
 	if len(body) == 0 { if is_expr do emit_constant(ctx, f64(0)); return }
 	for i in 0 ..< len(body) {
@@ -667,7 +868,7 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 		instructions := f.instructions
 		for idx := 0; idx < len(instructions); idx += 1 {
 			current_opcode := Opcode(instructions[idx])
-			switch current_opcode {
+			#partial switch current_opcode {
 			case .Set_Property:
 				idx += 1
 				command := fmt.tprintf("%sSET_PROPERTY: %d\n", prefix, instructions[idx])
@@ -682,7 +883,11 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 				strings.write_string(&builder, command)
 
 			case .Equal:
-				command := fmt.tprintf("%sLESS\n", prefix)
+				command := fmt.tprintf("%sEQUAL\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Negate:
+				command := fmt.tprintf("%sNEGATE\n", prefix)
 				strings.write_string(&builder, command)
 
 			case .Constant:

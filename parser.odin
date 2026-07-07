@@ -52,6 +52,17 @@ Import_Decl :: struct {
 	alias: string,
 }
 
+Variant_Decl :: struct {
+	name:  string,
+	types: [dynamic]Type_Node,
+}
+
+Enum_Decl :: struct {
+	name:        string,
+	variants:    [dynamic]Variant_Decl,
+	is_exported: bool,
+}
+
 Impl_Decl :: struct {
 	interface_name: string,
 	target_type:    string,
@@ -64,13 +75,13 @@ Decls :: union {
 	^Struct_Decl,
 	^Impl_Decl,
 	^Interface_Decl,
+	^Enum_Decl,
 }
 
 Program :: struct {
 	decls: [dynamic]Decls,
 }
 
-// НОВОЕ: Универсальный тип для дженериков (Массив(Число), Соответствие(Число, Строка))
 Type_Generic :: struct {
 	name:   string,
 	params: [dynamic]Type_Node,
@@ -106,6 +117,8 @@ Stmt :: union {
 	^Return_Stmt,
 	^Let_Stmt,
 	^Expr_Stmt,
+	^Continue_Stmt,
+	^Break_Stmt,
 }
 
 Return_Stmt :: struct {
@@ -120,6 +133,40 @@ Let_Stmt :: struct {
 
 Expr_Stmt :: struct {
 	expr: Expr,
+}
+
+Continue_Stmt :: struct {}
+
+Break_Stmt :: struct {}
+
+Pattern_Wildcard :: struct {}
+Pattern_Literal :: struct {
+	value: Expr,
+}
+Pattern_Ident :: struct {
+	name: string,
+}
+Pattern_Constructor :: struct {
+	module_name: string,
+	name:        string,
+	args:        [dynamic]Pattern,
+}
+
+Pattern :: union {
+	^Pattern_Wildcard,
+	^Pattern_Literal,
+	^Pattern_Ident,
+	^Pattern_Constructor,
+}
+
+Match_Arm :: struct {
+	pattern: Pattern,
+	body:    [dynamic]Stmt,
+}
+
+Match_Expr :: struct {
+	subject: Expr,
+	arms:    [dynamic]Match_Arm,
 }
 
 Ident_Expr :: struct {
@@ -219,6 +266,7 @@ Expr :: union {
 	^Map_Expr,
 	^Index_Expr,
 	^Try_Expr,
+	^Match_Expr,
 }
 
 // --- ПЕЧАТЬ AST ---
@@ -231,7 +279,7 @@ print_program :: proc(prog: Program) {
 }
 
 print_decl :: proc(decl: Decls) {
-	switch d in decl {
+	#partial switch d in decl {
 	case ^Import_Decl:
 		if d.alias != "" {
 			fmt.printf("Import (%s as %s)\n", d.path, d.alias)
@@ -282,6 +330,12 @@ print_stmt :: proc(stmt: Stmt, prefix: string = "", is_last: bool = true) {
 	case ^Expr_Stmt:
 		fmt.printf("%s%sExpr_Stmt\n", prefix, marker)
 		print_ast(s.expr, next_prefix, true)
+
+	case ^Continue_Stmt:
+		fmt.printf("%s%sContinue\n", prefix, marker)
+
+	case ^Break_Stmt:
+		fmt.printf("%s%sBreak\n", prefix, marker)
 	}
 }
 
@@ -292,7 +346,7 @@ print_ast :: proc(expr: Expr, prefix: string = "", is_last: bool = true) {
 	next_prefix_base := is_last ? "    " : "│   "
 	next_prefix := fmt.tprintf("%s%s", prefix, next_prefix_base)
 
-	switch e in expr {
+	#partial switch e in expr {
 	case ^Number_Expr:
 		fmt.printf("%s%sNumber(%v)\n", prefix, marker, e.value)
 	case ^Boolean_Expr:
@@ -397,12 +451,21 @@ parse_program :: proc(p: ^Parser) -> Program {
 			decl := parse_function(p, is_exported)
 			append(&prog.decls, decl)
 		} else if tok_kind == .TypeDecl {
-			if p.stream.tokens[p.stream.current_idx + 3].kind == .Struct {
+			third_kind := p.stream.tokens[p.stream.current_idx + 3].kind
+			if third_kind == .Struct {
 				decl := parse_struct_decl(p, is_exported)
 				append(&prog.decls, decl)
-			} else {
+			} else if third_kind == .Enum {
+				decl := parse_enum_decl(p, is_exported)
+				append(&prog.decls, decl)
+			} else if third_kind == .Interface {
 				decl := parse_interface_decl(p, is_exported)
 				append(&prog.decls, decl)
+			} else {
+				fmt.panicf(
+					"Синтаксическая ошибка: после 'тип X =' ожидалось 'структура', 'интерфейс' или 'перечисление', получено: %v",
+					third_kind,
+				)
 			}
 		} else if tok_kind == .Impl {
 			if is_exported {
@@ -446,6 +509,87 @@ parse_import_decl :: proc(p: ^Parser) -> ^Import_Decl {
 	}
 
 	consume_semicolon_or_newline(p)
+	return decl
+}
+
+parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
+	expect(p, .TypeDecl)
+
+	name_tok := next_token(p.stream)
+	if name_tok.kind != .Ident {
+		fmt.panicf(
+			"Синтаксическая ошибка: после 'тип' ожидалось имя перечисления, получено: %v",
+			name_tok.kind,
+		)
+	}
+
+	decl := new(Enum_Decl)
+	decl.name = name_tok.data
+	decl.is_exported = is_exported
+	decl.variants = make([dynamic]Variant_Decl)
+
+	expect(p, .Assign)
+	expect(p, .Enum)
+
+	seen := make(map[string]bool)
+	defer delete(seen)
+
+	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
+		variant_tok := next_token(p.stream)
+		if variant_tok.kind != .Ident {
+			fmt.panicf(
+				"Синтаксическая ошибка: в перечислении '%s' ожидалось имя варианта, получено: %v",
+				decl.name,
+				variant_tok.kind,
+			)
+		}
+		if seen[variant_tok.data] {
+			fmt.panicf(
+				"Синтаксическая ошибка: вариант '%s' объявлен дважды в '%s'",
+				variant_tok.data,
+				decl.name,
+			)
+		}
+		seen[variant_tok.data] = true
+
+		variant := Variant_Decl {
+			name  = variant_tok.data,
+			types = make([dynamic]Type_Node),
+		}
+
+		if peek_token(p.stream).kind == .LParen {
+			next_token(p.stream) // (
+			if peek_token(p.stream).kind == .RParen {
+				fmt.panicf(
+					"Синтаксическая ошибка: у варианта '%s.%s' должны быть либо параметры в скобках, либо скобки должны отсутствовать",
+					decl.name,
+					variant_tok.data,
+				)
+			}
+			for {
+				append(&variant.types, parse_type(p))
+				if peek_token(p.stream).kind == .Comma {
+					next_token(p.stream)
+					continue
+				}
+				break
+			}
+			expect(p, .RParen)
+		}
+
+		append(&decl.variants, variant)
+		consume_semicolon_or_newline(p)
+	}
+
+	expect(p, .End)
+
+	if len(decl.variants) == 0 {
+		fmt.panicf(
+			"Синтаксическая ошибка: перечисление '%s' должно объявлять хотя бы один вариант",
+			decl.name,
+		)
+	}
+
 	return decl
 }
 
@@ -734,9 +878,27 @@ parse_stmt :: proc(p: ^Parser) -> Stmt {
 		return parse_return_stmt(p)
 	case .Let:
 		return parse_let_stmt(p)
+	case .Continue:
+		return parse_continue_stmt(p)
+	case .Break:
+		return parse_break_stmt(p)
 	case:
 		return parse_expr_stmt(p)
 	}
+}
+
+parse_continue_stmt :: proc(p: ^Parser) -> Stmt {
+	next_token(p.stream)
+	stmt := new(Continue_Stmt)
+	consume_semicolon_or_newline(p)
+	return stmt
+}
+
+parse_break_stmt :: proc(p: ^Parser) -> Stmt {
+	next_token(p.stream)
+	stmt := new(Break_Stmt)
+	consume_semicolon_or_newline(p)
+	return stmt
 }
 
 parse_return_stmt :: proc(p: ^Parser) -> Stmt {
@@ -1016,11 +1178,19 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 		rhs := parse_expr(p, rbp)
 		return new_unary(tok, rhs)
 
+	case .Negate:
+		rbp := prefix_bp(tok)
+		rhs := parse_expr(p, rbp)
+		return new_unary(tok, rhs)
+
 	case .If:
 		return parse_if_expr(p)
 
 	case .While:
 		return parse_while_expr(p)
+
+	case .Match:
+		return parse_match_expr(p)
 
 	case:
 		error("unexpected token %s in nud position", tok.data)
@@ -1028,9 +1198,127 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 	return nil
 }
 
+parse_pattern :: proc(p: ^Parser) -> Pattern {
+	tok := next_token(p.stream)
+	if tok.kind == .Ident {
+		if tok.data == "_" {
+			return new(Pattern_Wildcard)
+		}
+		module_name := ""
+		type_name := ""
+		name := tok.data
+		// Optional qualification: Ident.Ident (Type.Variant) or
+		// Ident.Ident.Ident (module.Type.Variant).
+		for peek_token(p.stream).kind == .Dot {
+			next_token(p.stream)
+			next_tok := next_token(p.stream)
+			if next_tok.kind != .Ident {
+				fmt.panicf(
+					"Синтаксическая ошибка: после '.' в шаблоне ожидался идентификатор",
+				)
+			}
+			if module_name == "" {
+				module_name = name
+				name = next_tok.data
+			} else {
+				type_name = name
+				name = next_tok.data
+			}
+		}
+		// If only one dot was used, we don't know yet whether it was
+		// Type.Variant or module.Variant — resolver decides. Store as
+		// (module_name=first, name=second, type_name=""). For two dots,
+		// (module_name=first, type_name=second, name=third).
+		if type_name != "" {
+			// Encode module.Type.Variant into Pattern_Constructor by
+			// prefixing module_name with the type qualifier separator "|".
+			// Simpler: store type as "module_name". We track second-level
+			// via type_name concatenated. For now flatten to module.
+			module_name = fmt.aprintf("%s.%s", module_name, type_name)
+		}
+		if peek_token(p.stream).kind == .LParen {
+			next_token(p.stream)
+			pat := new(Pattern_Constructor)
+			pat.module_name = module_name
+			pat.name = name
+			pat.args = make([dynamic]Pattern)
+			if peek_token(p.stream).kind == .RParen {
+				fmt.panicf(
+					"Синтаксическая ошибка: у шаблона-конструктора '%s' пустые скобки",
+					name,
+				)
+			}
+			for {
+				append(&pat.args, parse_pattern(p))
+				if peek_token(p.stream).kind == .Comma {
+					next_token(p.stream)
+					continue
+				}
+				break
+			}
+			expect(p, .RParen)
+			return pat
+		}
+		if module_name != "" {
+			pat := new(Pattern_Constructor)
+			pat.module_name = module_name
+			pat.name = name
+			pat.args = make([dynamic]Pattern)
+			return pat
+		}
+		pat := new(Pattern_Ident)
+		pat.name = name
+		return pat
+	}
+	fmt.panicf(
+		"Синтаксическая ошибка: такой шаблон в выборе пока не поддерживается: %v",
+		tok.kind,
+	)
+}
+
+parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
+	m := new(Match_Expr)
+	m.arms = make([dynamic]Match_Arm)
+	m.subject = parse_expr(p, 0)
+
+	consume_semicolon_or_newline(p)
+
+	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
+		arm := Match_Arm {
+			body = make([dynamic]Stmt),
+		}
+		arm.pattern = parse_pattern(p)
+		expect(p, .Arrow)
+		// Тело ветки: один или несколько statement до разделителя ветки.
+		// Разделителем считается перевод строки или `;`; следующая ветка
+		// начинается со следующего Pattern (Ident/`_`).
+		for {
+			append(&arm.body, parse_stmt(p))
+			if peek_token(p.stream).kind == .Semicolon {
+				next_token(p.stream)
+			}
+			nxt := peek_token(p.stream).kind
+			if nxt == .End || nxt == .EOF do break
+			// Если следующий токен — идентификатор ИЛИ `_` (Ident), это
+			// начало следующей ветки. Наивно: если после текущего stmt
+			// стоит Ident в позиции начала выражения, считаем это новой
+			// веткой. Для простоты сейчас поддерживаем ветки в одну
+			// строку — далее берём следующую ветку сразу.
+			break
+		}
+		append(&m.arms, arm)
+	}
+	expect(p, .End)
+
+	if len(m.arms) == 0 {
+		fmt.panicf("Синтаксическая ошибка: выбор должен содержать хотя бы одну ветку")
+	}
+	return m
+}
+
 prefix_bp :: proc(token: ^Token) -> int {
 	#partial switch token.kind {
-	case .Minus:
+	case .Minus, .Negate:
 		return 100
 	}
 	return 0
@@ -1046,8 +1334,12 @@ infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 		return 50, 51, true
 	case .Less, .Greater:
 		return 40, 41, true
-	case .Equal:
+	case .Equal, .NotEqual:
 		return 30, 31, true
+	case .And:
+		return 28, 29, true
+	case .Or:
+		return 26, 27, true
 	case .Assign:
 		return 10, 9, true
 	case .LParen:

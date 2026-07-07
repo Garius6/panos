@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:strings"
 import "core:unicode"
 import "core:unicode/utf8"
 
@@ -69,13 +70,39 @@ read_number :: proc(l: ^Lexer) -> string {
 
 read_string :: proc(l: ^Lexer) -> string {
 	advance(l) // Съедаем открывающую кавычку
-	start := l.pos - l.width
+
+	builder: strings.Builder
+	strings.builder_init(&builder)
 
 	for l.ch != '"' && l.ch != 0 {
+		if l.ch == '\\' {
+			advance(l)
+			switch l.ch {
+			case 'n':
+				strings.write_byte(&builder, '\n')
+			case 't':
+				strings.write_byte(&builder, '\t')
+			case 'r':
+				strings.write_byte(&builder, '\r')
+			case '"':
+				strings.write_byte(&builder, '"')
+			case '\\':
+				strings.write_byte(&builder, '\\')
+			case 0:
+				fmt.panicf(
+					"Лексическая ошибка: незакрытая строка",
+				)
+			case:
+				fmt.panicf(
+					"Лексическая ошибка: неизвестная escape-последовательность '\\%v'",
+					l.ch,
+				)
+			}
+		} else {
+			strings.write_rune(&builder, l.ch)
+		}
 		advance(l)
 	}
-
-	str := l.input[start:l.pos - l.width]
 
 	if l.ch == '"' {
 		advance(l) // Съедаем закрывающую кавычку
@@ -83,7 +110,7 @@ read_string :: proc(l: ^Lexer) -> string {
 		fmt.panicf("Лексическая ошибка: незакрытая строка")
 	}
 
-	return str
+	return strings.to_string(builder)
 }
 
 lookup_ident :: proc(ident: string) -> TokenKind {
@@ -102,12 +129,22 @@ lookup_ident :: proc(ident: string) -> TokenKind {
 		return .While
 	case "цикл":
 		return .Loop
+	case "продолжить":
+		return .Continue
+	case "прервать":
+		return .Break
 	case "если":
 		return .If
 	case "тогда":
 		return .Then
 	case "иначе":
 		return .Else
+	case "не":
+		return .Negate
+	case "и":
+		return .And
+	case "или":
+		return .Or
 	case "тип":
 		return .TypeDecl
 	case "структура":
@@ -122,6 +159,10 @@ lookup_ident :: proc(ident: string) -> TokenKind {
 		return .Import
 	case "экспорт":
 		return .Export
+	case "перечисление":
+		return .Enum
+	case "выбор":
+		return .Match
 	case "как":
 		return .As
 	}
@@ -140,10 +181,20 @@ next_token_lex :: proc(l: ^Lexer) -> Token {
 
 	switch l.ch {
 	case '<':
-		tok = Token {
-			kind = .Less,
-			data = "<",
-		}; advance(l)
+		if peek_char(l) == '>' {
+			advance(l)
+			advance(l)
+			tok = Token {
+				kind = .NotEqual,
+				data = "<>",
+			}
+		} else {
+			tok = Token {
+				kind = .Less,
+				data = "<",
+			}
+			advance(l)
+		}
 	case '>':
 		tok = Token {
 			kind = .Greater,

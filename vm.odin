@@ -59,6 +59,38 @@ return_from_current_frame :: proc(vm: ^VM, result: Value) {
 	pop(&vm.frames)
 }
 
+variant_tag :: proc(v: Value) -> (int, bool) {
+	if variant, ok := v.(^Variant_Value); ok {
+		return variant.tag_index, true
+	}
+	if opt, ok := v.(^Option_Value); ok {
+		if opt.has_value do return 1, true
+		return 0, true
+	}
+	if res, ok := v.(^Result_Value); ok {
+		if res.is_ok do return 0, true
+		return 1, true
+	}
+	return 0, false
+}
+
+variant_field :: proc(v: Value, i: int) -> (Value, bool) {
+	if variant, ok := v.(^Variant_Value); ok {
+		if i < 0 || i >= len(variant.fields) do return Value{}, false
+		return variant.fields[i], true
+	}
+	if opt, ok := v.(^Option_Value); ok {
+		if opt.has_value && i == 0 do return opt.value, true
+		return Value{}, false
+	}
+	if res, ok := v.(^Result_Value); ok {
+		if i != 0 do return Value{}, false
+		if res.is_ok do return res.value, true
+		return res.error, true
+	}
+	return Value{}, false
+}
+
 value_equals :: proc(a: Value, b: Value) -> bool {
 	#partial switch va in a {
 	case f64:
@@ -282,11 +314,7 @@ invoke_collection_method :: proc(
 			message := expect_string_arg(method_name, args[0])
 			if !res.is_ok {
 				if err, ok_err := res.error.(^Error_Value); ok_err {
-					fmt.panicf(
-						"Runtime Panic: %s: %s",
-						message,
-						err.message,
-					)
+					fmt.panicf("Runtime Panic: %s: %s", message, err.message)
 				}
 				fmt.panicf("Runtime Panic: %s", message)
 			}
@@ -614,9 +642,14 @@ execute :: proc(vm: ^VM) {
 			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
 			append(&vm.stack, l > r)
 
+		case .Negate:
+			e := pop(&vm.stack).(bool)
+			append(&vm.stack, !e)
+
 		case .Equal:
-			r := pop(&vm.stack); l := pop(&vm.stack)
-			append(&vm.stack, l == r)
+			r := pop(&vm.stack)
+			l := pop(&vm.stack)
+			append(&vm.stack, value_equals(l, r))
 
 		case .Call:
 			frame.ip += 1
@@ -700,7 +733,9 @@ execute :: proc(vm: ^VM) {
 					continue
 				}
 			} else {
-				fmt.panicf("Runtime Error: оператор '?' ожидал Опцию или Результат")
+				fmt.panicf(
+					"Runtime Error: оператор '?' ожидал Опцию или Результат",
+				)
 			}
 
 		case .Jump_If_False:
@@ -749,6 +784,63 @@ execute :: proc(vm: ^VM) {
 
 			// Кладем готовую структуру на стек
 			append(&vm.stack, Value(agg))
+
+		case .Build_Variant:
+			frame.ip += 1
+			name_index := int(instructions[frame.ip])
+			frame.ip += 1
+			tag := int(instructions[frame.ip])
+			frame.ip += 1
+			arity := int(instructions[frame.ip])
+
+			type_name := frame.function.constants[name_index].(string)
+
+			variant := new(Variant_Value)
+			variant.type_name = type_name
+			variant.tag_index = tag
+			variant.fields = make([dynamic]Value, arity)
+			for i := arity - 1; i >= 0; i -= 1 {
+				variant.fields[i] = pop(&vm.stack)
+			}
+			append(&vm.stack, Value(variant))
+
+		case .Match_Tag:
+			frame.ip += 1
+			tag_const_idx := int(instructions[frame.ip])
+			expected_tag := int(frame.function.constants[tag_const_idx].(f64))
+			subject := vm.stack[len(vm.stack) - 1]
+			actual_tag, ok := variant_tag(subject)
+			if !ok {
+				fmt.panicf(
+					"Runtime Error: выбор ожидал значение перечисления, но получил %v",
+					subject,
+				)
+			}
+			append(&vm.stack, Value(actual_tag == expected_tag))
+
+		case .Get_Variant_Field:
+			frame.ip += 1
+			field_idx := int(instructions[frame.ip])
+			subject := pop(&vm.stack)
+			field_val, ok := variant_field(subject, field_idx)
+			if !ok {
+				fmt.panicf(
+					"Runtime Error: попытка прочитать поле #%d у неподходящего варианта",
+					field_idx,
+				)
+			}
+			append(&vm.stack, field_val)
+
+		case .Match_Fail:
+			subject := vm.stack[len(vm.stack) - 1]
+			variant_name := "?"
+			if v, is_variant := subject.(^Variant_Value); is_variant {
+				variant_name = v.type_name
+			}
+			fmt.panicf(
+				"Runtime Error: значение варианта '%s' не покрыто ни одной веткой выбора",
+				variant_name,
+			)
 
 		case .Build_Array:
 			frame.ip += 1

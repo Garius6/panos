@@ -22,6 +22,12 @@ Type_Kind :: enum {
 	Option,
 	Result,
 	InferVar,
+	Enum,
+}
+
+Type_Variant :: struct {
+	name:   string,
+	fields: [dynamic]^Type,
 }
 
 Type :: struct {
@@ -47,6 +53,10 @@ Type :: struct {
 	error_type:             ^Type,
 	infer_id:               int,
 	binding:                ^Type,
+	// Для kind == .Enum (пользовательский ADT) — упорядоченный список
+	// вариантов. Также заполняется для kind == .Option / .Result при
+	// построении prelude, чтобы `выбор` разбирал их единым путём.
+	variants:               [dynamic]Type_Variant,
 }
 
 Struct_Field :: struct {
@@ -114,6 +124,26 @@ is_valid_map_key_type :: proc(t: ^Type) -> bool {
 
 // --- КОНТЕКСТ ---
 
+Variant_Call_Info :: struct {
+	owner_type: ^Type,
+	tag_index:  int,
+}
+
+Match_Arm_Kind :: enum {
+	Wildcard,
+	Binder,
+	Constructor,
+}
+
+Match_Arm_Info :: struct {
+	kind:          Match_Arm_Kind,
+	tag_index:     int,
+	binder_sym:    ^Symbol,
+	// Для конструктора: символ-биндер для каждого поля варианта (или nil,
+	// если соответствующий шаблон-аргумент — заглушка `_`).
+	field_binders: [dynamic]^Symbol,
+}
+
 Type_Ctx :: struct {
 	res:              ^Resolver_Ctx,
 	node_types:       map[Expr]^Type,
@@ -124,7 +154,11 @@ Type_Ctx :: struct {
 	interface_calls:  map[Expr]string,
 	collection_calls: map[Expr]string,
 	builtin_calls:    map[Expr]string,
+	variant_calls:    map[Expr]Variant_Call_Info,
+	variant_idents:   map[Expr]Variant_Call_Info,
+	match_arm_infos:  map[^Match_Expr][dynamic]Match_Arm_Info,
 	current_return:   ^Type,
+	loop_depth:       int,
 	next_infer_id:    int,
 }
 
@@ -139,6 +173,9 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		interface_calls = make(map[Expr]string),
 		collection_calls = make(map[Expr]string),
 		builtin_calls = make(map[Expr]string),
+		variant_calls = make(map[Expr]Variant_Call_Info),
+		variant_idents = make(map[Expr]Variant_Call_Info),
+		match_arm_infos = make(map[^Match_Expr][dynamic]Match_Arm_Info),
 	}
 }
 
@@ -528,6 +565,13 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			iface_type.name = d.name
 			iface_type.interface_methods = make(map[string]^Type)
 			ctx.res.symbol_types[ctx.res.decl_symbols[decl]] = iface_type
+
+		case ^Enum_Decl:
+			enum_type := new(Type)
+			enum_type.kind = .Enum
+			enum_type.name = d.name
+			enum_type.variants = make([dynamic]Type_Variant)
+			ctx.res.symbol_types[ctx.res.decl_symbols[decl]] = enum_type
 		}
 	}
 
@@ -557,6 +601,16 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 					iface_type,
 					m,
 				)
+			}
+
+		case ^Enum_Decl:
+			enum_type := ctx.res.symbol_types[ctx.res.decl_symbols[decl]]
+			for variant in d.variants {
+				fields := make([dynamic]^Type)
+				for tn in variant.types {
+					append(&fields, resolve_type_node(ctx, tn))
+				}
+				append(&enum_type.variants, Type_Variant{name = variant.name, fields = fields})
 			}
 		}
 	}
@@ -923,7 +977,7 @@ check_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, expected_return: ^Type) {
 			)
 		}
 
-	case ^Let_Stmt, ^Expr_Stmt:
+	case ^Let_Stmt, ^Expr_Stmt, ^Continue_Stmt, ^Break_Stmt:
 		infer_stmt(ctx, stmt)
 	}
 }
@@ -966,6 +1020,20 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 
 	case ^Expr_Stmt:
 		infer_expr(ctx, s.expr)
+
+	case ^Continue_Stmt:
+		if ctx.loop_depth == 0 {
+			fmt.panicf(
+				"Type Error: 'продолжить' можно использовать только внутри цикла",
+			)
+		}
+
+	case ^Break_Stmt:
+		if ctx.loop_depth == 0 {
+			fmt.panicf(
+				"Type Error: 'прервать' можно использовать только внутри цикла",
+			)
+		}
 	}
 	return nil
 }
@@ -1109,7 +1177,10 @@ standard_method_type :: proc(
 			if len(args) != 1 do fmt.panicf("Type Error: Опция.запас() ожидает запасную Опцию")
 			fallback_type := prune_type(infer_expr(ctx, args[0]))
 			if fallback_type.kind != .Option {
-				fmt.panicf("Type Error: Опция.запас() ожидает Опцию, получен '%s'", fallback_type.name)
+				fmt.panicf(
+					"Type Error: Опция.запас() ожидает Опцию, получен '%s'",
+					fallback_type.name,
+				)
 			}
 			if !unify_types(receiver_type.element_type, fallback_type.element_type) {
 				fmt.panicf(
@@ -1129,7 +1200,8 @@ standard_method_type :: proc(
 			if len(args) != 1 do fmt.panicf("Type Error: Опция.результат_или() ожидает ошибку")
 			error_type := infer_expr(ctx, args[0])
 			ctx.collection_calls[call] = method_name
-			return new_result_type(prune_type(receiver_type.element_type), prune_type(error_type)), true
+			return new_result_type(prune_type(receiver_type.element_type), prune_type(error_type)),
+				true
 		case "заменить_значение":
 			if len(args) != 1 do fmt.panicf("Type Error: Опция.заменить_значение() ожидает новое значение")
 			element_type := infer_expr(ctx, args[0])
@@ -1169,7 +1241,10 @@ standard_method_type :: proc(
 			if len(args) != 1 do fmt.panicf("Type Error: Результат.запас() ожидает запасной Результат")
 			fallback_type := prune_type(infer_expr(ctx, args[0]))
 			if fallback_type.kind != .Result {
-				fmt.panicf("Type Error: Результат.запас() ожидает Результат, получен '%s'", fallback_type.name)
+				fmt.panicf(
+					"Type Error: Результат.запас() ожидает Результат, получен '%s'",
+					fallback_type.name,
+				)
 			}
 			if !unify_types(receiver_type.ok_type, fallback_type.ok_type) {
 				fmt.panicf(
@@ -1179,7 +1254,11 @@ standard_method_type :: proc(
 				)
 			}
 			ctx.collection_calls[call] = method_name
-			return new_result_type(prune_type(receiver_type.ok_type), prune_type(fallback_type.error_type)), true
+			return new_result_type(
+					prune_type(receiver_type.ok_type),
+					prune_type(fallback_type.error_type),
+				),
+				true
 		case "ожидать":
 			if len(args) != 1 do fmt.panicf("Type Error: Результат.ожидать() ожидает сообщение")
 			check_expr(ctx, args[0], TY_STRING)
@@ -1239,6 +1318,51 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 				sym.name,
 			)
 		}
+		if sym.kind == .Enum_Variant {
+			owner := sym.owner_type
+			if owner == nil {
+				fmt.panicf(
+					"Type Error: у варианта '%s' нет типа-владельца",
+					sym.name,
+				)
+			}
+			owner_type := ctx.res.symbol_types[owner]
+			if owner_type == nil {
+				fmt.panicf(
+					"Type Error: тип-владелец '%s' варианта '%s' ещё не построен",
+					owner.name,
+					sym.name,
+				)
+			}
+			tag := -1
+			for v, i in owner_type.variants {
+				if v.name == sym.name {
+					tag = i
+					break
+				}
+			}
+			if tag < 0 {
+				fmt.panicf(
+					"Type Error: вариант '%s' не найден в '%s'",
+					sym.name,
+					owner_type.name,
+				)
+			}
+			if len(owner_type.variants[tag].fields) != 0 {
+				fmt.panicf(
+					"Type Error: вариант '%s.%s' должен быть вызван со скобками — у него есть поля",
+					owner_type.name,
+					sym.name,
+				)
+			}
+			ctx.variant_idents[expr] = Variant_Call_Info {
+				owner_type = owner_type,
+				tag_index  = tag,
+			}
+			t = owner_type
+			ctx.node_types[expr] = t
+			return t
+		}
 		if sym.kind == .Builtin {
 			fmt.panicf(
 				"Type Error: встроенный конструктор '%s' нужно вызвать через ()",
@@ -1282,9 +1406,27 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 			check_expr(ctx, e.left, TY_NUM)
 			check_expr(ctx, e.right, TY_NUM)
 			t = TY_NUM
-		case .Less, .Greater, .Equal:
+
+		case .Less, .Greater:
 			check_expr(ctx, e.left, TY_NUM)
 			check_expr(ctx, e.right, TY_NUM)
+			t = TY_BOOL
+
+		case .And, .Or:
+			check_expr(ctx, e.left, TY_BOOL)
+			check_expr(ctx, e.right, TY_BOOL)
+			t = TY_BOOL
+
+		case .Equal, .NotEqual:
+			left_t := infer_expr(ctx, e.left)
+			right_t := infer_expr(ctx, e.right)
+			if !unify_types(left_t, right_t) {
+				fmt.panicf(
+					"Type Error: оператор '==' ожидает совместимые типы, получено '%s' и '%s'",
+					prune_type(left_t).name,
+					prune_type(right_t).name,
+				)
+			}
 			t = TY_BOOL
 
 		case .Assign:
@@ -1304,10 +1446,128 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		}
 
 	case ^Unary_Expr:
-		check_expr(ctx, e.right, TY_NUM)
-		t = TY_NUM
+		#partial switch e.op {
+		case .Minus:
+			check_expr(ctx, e.right, TY_NUM)
+			t = TY_NUM
+		case .Negate:
+			check_expr(ctx, e.right, TY_BOOL)
+			t = TY_BOOL
+		}
 
 	case ^Call_Expr:
+		callee_sym := ctx.res.node_symbols[e.callee]
+		if callee_sym != nil && callee_sym.kind == .Enum_Variant {
+			sym := callee_sym
+			owner := sym.owner_type
+			owner_type := ctx.res.symbol_types[owner]
+			if owner_type == nil {
+				fmt.panicf(
+					"Type Error: тип-владелец варианта '%s' ещё не построен",
+					sym.name,
+				)
+			}
+			tag := -1
+			for v, i in owner_type.variants {
+				if v.name == sym.name {
+					tag = i
+					break
+				}
+			}
+			if tag < 0 {
+				fmt.panicf(
+					"Type Error: вариант '%s' не найден в '%s'",
+					sym.name,
+					owner_type.name,
+				)
+			}
+			expected := owner_type.variants[tag].fields
+			if len(e.args) != len(expected) {
+				fmt.panicf(
+					"Type Error: у варианта '%s.%s' ожидалось %d аргументов, получено %d",
+					owner_type.name,
+					sym.name,
+					len(expected),
+					len(e.args),
+				)
+			}
+			for arg, i in e.args {
+				actual := prune_type(infer_expr(ctx, arg))
+				if !unify_types(actual, expected[i]) {
+					fmt.panicf(
+						"Type Error: у варианта '%s.%s' поле #%d ожидает '%s', получено '%s'",
+						owner_type.name,
+						sym.name,
+						i,
+						prune_type(expected[i]).name,
+						prune_type(actual).name,
+					)
+				}
+			}
+			ctx.variant_calls[expr] = Variant_Call_Info {
+				owner_type = owner_type,
+				tag_index  = tag,
+			}
+			t = owner_type
+			ctx.node_types[expr] = t
+			return t
+		}
+		if _, ok := e.callee.(^Ident_Expr); ok {
+			if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Enum_Variant {
+				owner := sym.owner_type
+				owner_type := ctx.res.symbol_types[owner]
+				if owner_type == nil {
+					fmt.panicf(
+						"Type Error: тип-владелец варианта '%s' ещё не построен",
+						sym.name,
+					)
+				}
+				tag := -1
+				for v, i in owner_type.variants {
+					if v.name == sym.name {
+						tag = i
+						break
+					}
+				}
+				if tag < 0 {
+					fmt.panicf(
+						"Type Error: вариант '%s' не найден в '%s'",
+						sym.name,
+						owner_type.name,
+					)
+				}
+				expected := owner_type.variants[tag].fields
+				if len(e.args) != len(expected) {
+					fmt.panicf(
+						"Type Error: у варианта '%s.%s' ожидалось %d аргументов, получено %d",
+						owner_type.name,
+						sym.name,
+						len(expected),
+						len(e.args),
+					)
+				}
+				for arg, i in e.args {
+					actual := prune_type(infer_expr(ctx, arg))
+					if !unify_types(actual, expected[i]) {
+						fmt.panicf(
+							"Type Error: у варианта '%s.%s' поле #%d ожидает '%s', получено '%s'",
+							owner_type.name,
+							sym.name,
+							i,
+							prune_type(expected[i]).name,
+							prune_type(actual).name,
+						)
+					}
+				}
+				ctx.variant_calls[expr] = Variant_Call_Info {
+					owner_type = owner_type,
+					tag_index  = tag,
+				}
+				t = owner_type
+				ctx.node_types[expr] = t
+				return t
+			}
+		}
 		if ident, ok := e.callee.(^Ident_Expr); ok {
 			if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Builtin {
 				if builtin_type, handled := builtin_constructor_type(ctx, ident.name, e.args);
@@ -1571,8 +1831,10 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 	case ^While_Expr:
 		check_expr(ctx, e.condition, TY_BOOL)
+		ctx.loop_depth += 1
 		// Обязательно проверяем внутренности цикла (чтобы типизировать локальные переменные внутри)
 		infer_block_type(ctx, e.body)
+		ctx.loop_depth -= 1
 		t = TY_VOID
 
 	case ^Tuple_Expr:
@@ -1655,6 +1917,153 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 			)
 		}
 
+	case ^Match_Expr:
+		subject_type := prune_type(infer_expr(ctx, e.subject))
+		if subject_type.kind != .Enum {
+			fmt.panicf(
+				"Type Error: выбор ожидает значение перечисления, получено '%s'",
+				subject_type.name,
+			)
+		}
+		arm_infos := make([dynamic]Match_Arm_Info)
+		result_t: ^Type
+		for arm in e.arms {
+			info := Match_Arm_Info {
+				tag_index = -1,
+			}
+			switch pat in arm.pattern {
+			case ^Pattern_Wildcard:
+				info.kind = .Wildcard
+			case ^Pattern_Literal:
+				fmt.panicf(
+					"Type Error: литеральные шаблоны в выборе пока не поддерживаются",
+				)
+			case ^Pattern_Ident:
+				binder_sym := ctx.res.pattern_binders[pat]
+				if binder_sym == nil {
+					fmt.panicf(
+						"Type Error: не разрешён шаблон '%s'",
+						pat.name,
+					)
+				}
+				if binder_sym.kind == .Enum_Variant {
+					// Zero-field constructor referenced by short name.
+					tag := -1
+					for v, i in subject_type.variants {
+						if v.name == pat.name {
+							tag = i
+							break
+						}
+					}
+					if tag < 0 {
+						fmt.panicf(
+							"Type Error: вариант '%s' не найден в '%s'",
+							pat.name,
+							subject_type.name,
+						)
+					}
+					if len(subject_type.variants[tag].fields) != 0 {
+						fmt.panicf(
+							"Type Error: вариант '%s.%s' в шаблоне без скобок, но у него есть поля",
+							subject_type.name,
+							pat.name,
+						)
+					}
+					info.kind = .Constructor
+					info.tag_index = tag
+					info.field_binders = make([dynamic]^Symbol)
+				} else {
+					info.kind = .Binder
+					info.binder_sym = binder_sym
+					ctx.res.symbol_types[binder_sym] = subject_type
+				}
+			case ^Pattern_Constructor:
+				tag := -1
+				for v, i in subject_type.variants {
+					if v.name == pat.name {
+						tag = i
+						break
+					}
+				}
+				if tag < 0 {
+					fmt.panicf(
+						"Type Error: вариант '%s' не найден в '%s'",
+						pat.name,
+						subject_type.name,
+					)
+				}
+				expected_fields := subject_type.variants[tag].fields
+				if len(pat.args) != len(expected_fields) {
+					fmt.panicf(
+						"Type Error: у варианта '%s.%s' ожидалось %d аргументов в шаблоне, получено %d",
+						subject_type.name,
+						pat.name,
+						len(expected_fields),
+						len(pat.args),
+					)
+				}
+				info.kind = .Constructor
+				info.tag_index = tag
+				info.field_binders = make([dynamic]^Symbol)
+				for arg_pat, i in pat.args {
+					switch inner in arg_pat {
+					case ^Pattern_Wildcard:
+						append(&info.field_binders, cast(^Symbol)nil)
+					case ^Pattern_Literal:
+						fmt.panicf(
+							"Type Error: литеральные шаблоны не поддерживаются",
+						)
+					case ^Pattern_Ident:
+						binder_sym := ctx.res.pattern_binders[inner]
+						if binder_sym == nil ||
+						   binder_sym.kind == .Enum_Variant {
+							fmt.panicf(
+								"Type Error: во вложенных шаблонах пока поддерживается только биндер или '_'",
+							)
+						}
+						ctx.res.symbol_types[binder_sym] = expected_fields[i]
+						append(&info.field_binders, binder_sym)
+					case ^Pattern_Constructor:
+						fmt.panicf(
+							"Type Error: вложенные конструкторы в шаблоне пока не поддерживаются",
+						)
+					}
+				}
+			}
+			append(&arm_infos, info)
+
+			// Тело ветки
+			body_t: ^Type
+			for stmt, i in arm.body {
+				is_last := i == len(arm.body) - 1
+				if is_last {
+					if expr_stmt, ok := stmt.(^Expr_Stmt); ok {
+						body_t = prune_type(infer_expr(ctx, expr_stmt.expr))
+					} else {
+						check_stmt(ctx, stmt, ctx.current_return)
+						body_t = TY_VOID
+					}
+				} else {
+					check_stmt(ctx, stmt, ctx.current_return)
+				}
+			}
+			if body_t == nil do body_t = TY_VOID
+			if body_t.kind != .Never {
+				if result_t == nil {
+					result_t = body_t
+				} else if !unify_types(body_t, result_t) {
+					fmt.panicf(
+						"Type Error: ветки выбора возвращают разные типы: '%s' vs '%s'",
+						prune_type(result_t).name,
+						prune_type(body_t).name,
+					)
+				}
+			}
+		}
+		if result_t == nil do result_t = TY_NEVER
+		ctx.match_arm_infos[e] = arm_infos
+		t = prune_type(result_t)
+
 	case ^Try_Expr:
 		value_type := prune_type(infer_expr(ctx, e.value))
 		if value_type.kind == .Option {
@@ -1689,6 +2098,45 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 	case ^Property_Expr:
 		if sym, ok := ctx.res.node_symbols[expr]; ok {
+			if sym.kind == .Enum_Variant {
+				owner := sym.owner_type
+				owner_type := ctx.res.symbol_types[owner]
+				if owner_type == nil {
+					fmt.panicf(
+						"Type Error: тип-владелец '%s' варианта '%s' ещё не построен",
+						owner.name,
+						sym.name,
+					)
+				}
+				tag := -1
+				for v, i in owner_type.variants {
+					if v.name == sym.name {
+						tag = i
+						break
+					}
+				}
+				if tag < 0 {
+					fmt.panicf(
+						"Type Error: вариант '%s' не найден в '%s'",
+						sym.name,
+						owner_type.name,
+					)
+				}
+				if len(owner_type.variants[tag].fields) != 0 {
+					fmt.panicf(
+						"Type Error: вариант '%s.%s' должен быть вызван со скобками — у него есть поля",
+						owner_type.name,
+						sym.name,
+					)
+				}
+				ctx.variant_idents[expr] = Variant_Call_Info {
+					owner_type = owner_type,
+					tag_index  = tag,
+				}
+				t = owner_type
+				ctx.node_types[expr] = t
+				return t
+			}
 			t = prune_type(ctx.res.symbol_types[sym])
 			ctx.node_types[expr] = t
 			return t

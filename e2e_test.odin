@@ -46,6 +46,7 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 		type_ctx := new_type_ctx(&res_ctx)
 		typecheck_program(&type_ctx, module.ast)
 		compile_program(&res_ctx, &type_ctx, &module.ast, &registry)
+		graph.symbol_types = res_ctx.symbol_types
 	}
 
 	vm := new_vm(registry)
@@ -112,6 +113,28 @@ test_strict_index_panics_out_of_bounds :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_continue_outside_loop_is_type_error :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Type Error: 'продолжить' можно использовать только внутри цикла")
+	run_code(`
+		функ старт() -> Число
+			продолжить
+			1
+		конец
+	`)
+}
+
+@(test)
+test_break_outside_loop_is_type_error :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Type Error: 'прервать' можно использовать только внутри цикла")
+	run_code(`
+		функ старт() -> Число
+			прервать
+			1
+		конец
+	`)
+}
+
+@(test)
 test_math_and_logic :: proc(t: ^testing.T) {
 	TestCase :: struct {
 		name:     string,
@@ -160,6 +183,15 @@ test_math_and_logic :: proc(t: ^testing.T) {
 			"panos!",
 		},
 		{
+			"Строки: escape-последовательности",
+			`
+			функ старт() -> Строка
+				"a\n\tb\rc\"d\\e"
+			конец
+		`,
+			"a\n\tb\rc\"d\\e",
+		},
+		{
 			"Длина строк и коллекций",
 			`
 			функ старт() -> Число
@@ -192,6 +224,42 @@ test_math_and_logic :: proc(t: ^testing.T) {
 			конец
 		`,
 			true,
+		},
+		{
+			"Цикл: продолжить",
+			`
+			функ старт() -> Число
+				пер i = 0
+				пер сумма = 0
+				пока i < 5 цикл
+					i = i + 1
+					если i == 3 тогда
+						продолжить
+					конец
+					сумма = сумма + i
+				конец
+				сумма
+			конец
+		`,
+			f64(12.0),
+		},
+		{
+			"Цикл: прервать",
+			`
+			функ старт() -> Число
+				пер i = 0
+				пер сумма = 0
+				пока i < 10 цикл
+					i = i + 1
+					если i > 3 тогда
+						прервать
+					конец
+					сумма = сумма + i
+				конец
+				сумма
+			конец
+		`,
+			f64(6.0),
 		},
 		{
 			"Соответствие: литерал, индекс и методы",
@@ -724,4 +792,350 @@ test_modules :: proc(t: ^testing.T) {
 		"Файловая stdlib: ожидалось 42, получено %v",
 		stdlib_result,
 	)
+}
+
+@(test)
+test_adt_cross_module_qualified_use :: proc(t: ^testing.T) {
+	result, ok := run_module_file("adt_fixture_main.ps")
+	testing.expectf(t, ok, "cross-module: пустой стек")
+	if !ok do return
+	v, is_variant := result.(^Variant_Value)
+	testing.expectf(t, is_variant, "cross-module: ожидался ^Variant_Value")
+	if !is_variant do return
+	testing.expectf(
+		t,
+		v.type_name == "Фигура" && v.tag_index == 1 && len(v.fields) == 1,
+		"cross-module: форма не совпадает",
+	)
+	f0, is_num := v.fields[0].(f64)
+	testing.expectf(t, is_num && f0 == 9.0, "cross-module: поле != 9")
+}
+
+@(test)
+test_adt_cross_module_short_form :: proc(t: ^testing.T) {
+	result, ok := run_module_file("adt_fixture_short.ps")
+	testing.expectf(t, ok, "cross-module short: пустой стек")
+	if !ok do return
+	v, is_variant := result.(^Variant_Value)
+	testing.expectf(t, is_variant, "cross-module short: ожидался ^Variant_Value")
+	if !is_variant do return
+	f0, _ := v.fields[0].(f64)
+	testing.expectf(
+		t,
+		v.tag_index == 1 && f0 == 11.0,
+		"cross-module short: неверная форма",
+	)
+}
+
+@(test)
+test_adt_non_exported_use_rejected :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Resolve Error: модуль 'ф' не экспортирует 'Круг'")
+	run_module_file("adt_fixture_private_use.ps")
+}
+
+@(test)
+test_match_returns_per_variant_value :: proc(t: ^testing.T) {
+	sources := [?]string {
+		`тип Ф = перечисление
+			Точка
+			Круг(Число)
+			Прямоугольник(Число, Число)
+		конец
+		функ площадь(ф: Ф) -> Число
+			возврат выбор ф
+				Точка -> 0
+				Круг(р) -> р * р * 314 / 100
+				Прямоугольник(ш, в) -> ш * в
+			конец
+		конец
+		функ старт() -> Число
+			возврат площадь(Точка)
+		конец`,
+		`тип Ф = перечисление
+			Точка
+			Круг(Число)
+			Прямоугольник(Число, Число)
+		конец
+		функ площадь(ф: Ф) -> Число
+			возврат выбор ф
+				Точка -> 0
+				Круг(р) -> р * р * 314 / 100
+				Прямоугольник(ш, в) -> ш * в
+			конец
+		конец
+		функ старт() -> Число
+			возврат площадь(Прямоугольник(4, 5))
+		конец`,
+	}
+	expected := [?]f64{0, 20}
+	for src, i in sources {
+		result, ok := run_code(src)
+		testing.expectf(t, ok, "match #%d: пустой стек", i)
+		if !ok do continue
+		f, is_num := result.(f64)
+		testing.expectf(t, is_num && f == expected[i], "match #%d: %v != %v", i, result, expected[i])
+	}
+}
+
+@(test)
+test_match_wildcard_arm_executes :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Ф = перечисление
+			А
+			Б(Число)
+		конец
+		функ старт() -> Число
+			пер зн: Ф = Б(7)
+			возврат выбор зн
+				А -> 0
+				_ -> 42
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "wildcard: пустой стек")
+	if !ok do return
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 42.0, "wildcard: %v != 42", result)
+}
+
+@(test)
+test_match_binder_pattern :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Ф = перечисление
+			А
+			Б(Число)
+		конец
+		функ старт() -> Число
+			пер зн: Ф = Б(7)
+			возврат выбор зн
+				любой -> 5
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "binder: пустой стек")
+	if !ok do return
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 5.0, "binder: %v != 5", result)
+}
+
+@(test)
+test_adt_declare_and_construct_zero_field :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Фигура = перечисление
+		    Точка
+		    Круг(Число)
+		    Прямоугольник(Число, Число)
+		конец
+
+		функ старт() -> Фигура
+		    возврат Точка
+		конец
+	`)
+	testing.expectf(t, ok, "US1 zero-field: пустой стек")
+	if !ok do return
+	v, is_variant := result.(^Variant_Value)
+	testing.expectf(t, is_variant, "US1 zero-field: ожидался ^Variant_Value, получено %v", result)
+	if !is_variant do return
+	testing.expectf(
+		t,
+		v.type_name == "Фигура",
+		"US1 zero-field: type_name '%s' != 'Фигура'",
+		v.type_name,
+	)
+	testing.expectf(t, v.tag_index == 0, "US1 zero-field: tag_index %d != 0", v.tag_index)
+	testing.expectf(t, len(v.fields) == 0, "US1 zero-field: fields не пустые (%d)", len(v.fields))
+}
+
+@(test)
+test_adt_declare_and_construct_single_field :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Фигура = перечисление
+		    Точка
+		    Круг(Число)
+		    Прямоугольник(Число, Число)
+		конец
+
+		функ старт() -> Фигура
+		    возврат Круг(3)
+		конец
+	`)
+	testing.expectf(t, ok, "US1 single-field: пустой стек")
+	if !ok do return
+	v, is_variant := result.(^Variant_Value)
+	testing.expectf(
+		t,
+		is_variant,
+		"US1 single-field: ожидался ^Variant_Value, получено %v",
+		result,
+	)
+	if !is_variant do return
+	testing.expectf(t, v.tag_index == 1, "US1 single-field: tag_index %d != 1", v.tag_index)
+	testing.expectf(
+		t,
+		len(v.fields) == 1,
+		"US1 single-field: ожидалось 1 поле, получено %d",
+		len(v.fields),
+	)
+	f, is_num := v.fields[0].(f64)
+	testing.expectf(t, is_num && f == 3.0, "US1 single-field: поле != 3 (%v)", v.fields[0])
+}
+
+@(test)
+test_adt_declare_and_construct_multi_field :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Фигура = перечисление
+		    Точка
+		    Круг(Число)
+		    Прямоугольник(Число, Число)
+		конец
+
+		функ старт() -> Фигура
+		    возврат Прямоугольник(4, 5)
+		конец
+	`)
+	testing.expectf(t, ok, "US1 multi-field: пустой стек")
+	if !ok do return
+	v, is_variant := result.(^Variant_Value)
+	testing.expectf(t, is_variant, "US1 multi-field: ожидался ^Variant_Value")
+	if !is_variant do return
+	testing.expectf(t, v.tag_index == 2, "US1 multi-field: tag_index %d != 2", v.tag_index)
+	testing.expectf(
+		t,
+		len(v.fields) == 2,
+		"US1 multi-field: ожидалось 2 поля, получено %d",
+		len(v.fields),
+	)
+	f0, ok0 := v.fields[0].(f64)
+	f1, ok1 := v.fields[1].(f64)
+	testing.expectf(
+		t,
+		ok0 && ok1 && f0 == 4.0 && f1 == 5.0,
+		"US1 multi-field: поля != (4, 5) (%v, %v)",
+		v.fields[0],
+		v.fields[1],
+	)
+}
+
+@(test)
+test_adt_arg_type_mismatch_rejected :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Type Error: у варианта 'Фигура.Круг' поле #0 ожидает 'Число', получено 'Строка'",
+	)
+	run_code(`
+		тип Фигура = перечисление
+		    Круг(Число)
+		конец
+
+		функ старт() -> Фигура
+		    возврат Круг("три")
+		конец
+	`)
+}
+
+@(test)
+test_adt_qualified_variant_call :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Фигура = перечисление
+		    Точка
+		    Круг(Число)
+		конец
+
+		функ старт() -> Фигура
+		    возврат Фигура.Круг(7)
+		конец
+	`)
+	testing.expectf(t, ok, "US1 qualified: пустой стек")
+	if !ok do return
+	v, is_variant := result.(^Variant_Value)
+	testing.expectf(t, is_variant, "US1 qualified: ожидался ^Variant_Value")
+	if !is_variant do return
+	testing.expectf(
+		t,
+		v.type_name == "Фигура" && v.tag_index == 1 && len(v.fields) == 1,
+		"US1 qualified: неверная форма (%v, tag=%d, len=%d)",
+		v.type_name,
+		v.tag_index,
+		len(v.fields),
+	)
+}
+
+@(test)
+test_adt_qualified_zero_field_variant :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Фигура = перечисление
+		    Точка
+		    Круг(Число)
+		конец
+
+		функ старт() -> Фигура
+		    возврат Фигура.Точка
+		конец
+	`)
+	testing.expectf(t, ok, "US1 qualified zero: пустой стек")
+	if !ok do return
+	v, is_variant := result.(^Variant_Value)
+	testing.expectf(t, is_variant, "US1 qualified zero: ожидался ^Variant_Value")
+	if !is_variant do return
+	testing.expectf(
+		t,
+		v.type_name == "Фигура" && v.tag_index == 0 && len(v.fields) == 0,
+		"US1 qualified zero: неверная форма",
+	)
+}
+
+@(test)
+test_adt_unknown_qualified_variant_rejected :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Resolve Error: у типа 'Фигура' нет варианта 'Ромб'")
+	run_code(`
+		тип Фигура = перечисление
+		    Точка
+		    Круг(Число)
+		конец
+
+		функ старт() -> Фигура
+		    возврат Фигура.Ромб
+		конец
+	`)
+}
+
+@(test)
+test_adt_variant_collides_with_struct_rejected :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Resolve Error: имя варианта 'Точка' конфликтует с уже объявленным символом в модуле",
+	)
+	run_code(`
+		тип Точка = структура
+		    x: Число
+		    y: Число
+		конец
+
+		тип Фигура = перечисление
+		    Точка
+		    Круг(Число)
+		конец
+
+		функ старт() -> Число
+		    возврат 0
+		конец
+	`)
+}
+
+@(test)
+test_adt_duplicate_variant_rejected :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Синтаксическая ошибка: вариант 'Круг' объявлен дважды в 'Фигура'",
+	)
+	run_code(`
+		тип Фигура = перечисление
+		    Круг(Число)
+		    Круг(Число, Число)
+		конец
+
+		функ старт() -> Фигура
+		    возврат Круг(1)
+		конец
+	`)
 }

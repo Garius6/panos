@@ -144,6 +144,99 @@ Match_Arm_Info :: struct {
 	field_binders: [dynamic]^Symbol,
 }
 
+// Собираем виртуальный `.Enum` тип для встроенной `Опция(T)`, чтобы `выбор`
+// разбирал её единообразно (Q5, R5). Порядок вариантов зафиксирован:
+// 0 = Нет, 1 = Есть(T).
+synth_option_enum :: proc(option_type: ^Type) -> ^Type {
+	t := new(Type)
+	t.kind = .Enum
+	t.name = option_type.name
+	t.variants = make([dynamic]Type_Variant)
+	append(&t.variants, Type_Variant{name = "Нет", fields = make([dynamic]^Type)})
+	есть_fields := make([dynamic]^Type)
+	append(&есть_fields, option_type.element_type)
+	append(&t.variants, Type_Variant{name = "Есть", fields = есть_fields})
+	return t
+}
+
+// То же для `Результат(T, E)`: 0 = Успех(T), 1 = Неудача(E).
+synth_result_enum :: proc(result_type: ^Type) -> ^Type {
+	t := new(Type)
+	t.kind = .Enum
+	t.name = result_type.name
+	t.variants = make([dynamic]Type_Variant)
+	успех_fields := make([dynamic]^Type)
+	append(&успех_fields, result_type.ok_type)
+	append(&t.variants, Type_Variant{name = "Успех", fields = успех_fields})
+	неудача_fields := make([dynamic]^Type)
+	append(&неудача_fields, result_type.error_type)
+	append(&t.variants, Type_Variant{name = "Неудача", fields = неудача_fields})
+	return t
+}
+
+// Чистая процедура: получает тип-subject и arm_infos, проверяет
+// исчерпываемость, недостижимость, позицию `_`. Ошибка — panic по
+// правилам contracts/diagnostics.md.
+check_match_coverage :: proc(subject_type: ^Type, arm_infos: [dynamic]Match_Arm_Info) {
+	total := len(subject_type.variants)
+	covered := make([dynamic]bool, total, context.temp_allocator)
+	catch_all := false
+
+	for info, arm_idx in arm_infos {
+		if catch_all {
+			fmt.panicf(
+				"Type Error: ветка выбора #%d недостижима — все случаи покрыты выше",
+				arm_idx + 1,
+			)
+		}
+		switch info.kind {
+		case .Wildcard:
+			catch_all = true
+			if arm_idx != len(arm_infos) - 1 {
+				fmt.panicf(
+					"Type Error: '_' в выборе должен быть только последней веткой",
+				)
+			}
+		case .Binder:
+			catch_all = true
+			if arm_idx != len(arm_infos) - 1 {
+				fmt.panicf(
+					"Type Error: биндер-ветка выбора должна быть только последней — она покрывает все случаи",
+				)
+			}
+		case .Constructor:
+			if info.tag_index < 0 || info.tag_index >= total {
+				fmt.panicf(
+					"Type Error: внутренняя ошибка — тег варианта вне диапазона",
+				)
+			}
+			if covered[info.tag_index] {
+				fmt.panicf(
+					"Type Error: вариант '%s.%s' покрыт повторно в ветке #%d",
+					subject_type.name,
+					subject_type.variants[info.tag_index].name,
+					arm_idx + 1,
+				)
+			}
+			covered[info.tag_index] = true
+		}
+	}
+
+	if catch_all do return
+
+	missing := make([dynamic]string, context.temp_allocator)
+	for was_covered, i in covered {
+		if !was_covered do append(&missing, subject_type.variants[i].name)
+	}
+	if len(missing) > 0 {
+		joined := strings.join(missing[:], ", ", context.temp_allocator)
+		fmt.panicf(
+			"Type Error: выбор не покрывает варианты: %s",
+			joined,
+		)
+	}
+}
+
 Type_Ctx :: struct {
 	res:              ^Resolver_Ctx,
 	node_types:       map[Expr]^Type,
@@ -1918,11 +2011,17 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		}
 
 	case ^Match_Expr:
-		subject_type := prune_type(infer_expr(ctx, e.subject))
+		subject_type_actual := prune_type(infer_expr(ctx, e.subject))
+		subject_type := subject_type_actual
+		if subject_type.kind == .Option {
+			subject_type = synth_option_enum(subject_type_actual)
+		} else if subject_type.kind == .Result {
+			subject_type = synth_result_enum(subject_type_actual)
+		}
 		if subject_type.kind != .Enum {
 			fmt.panicf(
-				"Type Error: выбор ожидает значение перечисления, получено '%s'",
-				subject_type.name,
+				"Type Error: выбор ожидает значение перечисления, Опции или Результата, получено '%s'",
+				subject_type_actual.name,
 			)
 		}
 		arm_infos := make([dynamic]Match_Arm_Info)
@@ -1939,29 +2038,18 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 					"Type Error: литеральные шаблоны в выборе пока не поддерживаются",
 				)
 			case ^Pattern_Ident:
-				binder_sym := ctx.res.pattern_binders[pat]
-				if binder_sym == nil {
-					fmt.panicf(
-						"Type Error: не разрешён шаблон '%s'",
-						pat.name,
-					)
+				// Сначала проверяем, не является ли имя вариантом
+				// subject_type — это покрывает и пользовательские ADT
+				// (Enum_Variant symbol), и встроенные Опция/Результат
+				// (prelude Builtin).
+				tag := -1
+				for v, i in subject_type.variants {
+					if v.name == pat.name {
+						tag = i
+						break
+					}
 				}
-				if binder_sym.kind == .Enum_Variant {
-					// Zero-field constructor referenced by short name.
-					tag := -1
-					for v, i in subject_type.variants {
-						if v.name == pat.name {
-							tag = i
-							break
-						}
-					}
-					if tag < 0 {
-						fmt.panicf(
-							"Type Error: вариант '%s' не найден в '%s'",
-							pat.name,
-							subject_type.name,
-						)
-					}
+				if tag >= 0 {
 					if len(subject_type.variants[tag].fields) != 0 {
 						fmt.panicf(
 							"Type Error: вариант '%s.%s' в шаблоне без скобок, но у него есть поля",
@@ -1973,9 +2061,16 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 					info.tag_index = tag
 					info.field_binders = make([dynamic]^Symbol)
 				} else {
+					binder_sym := ctx.res.pattern_binders[pat]
+					if binder_sym == nil {
+						fmt.panicf(
+							"Type Error: не разрешён шаблон '%s'",
+							pat.name,
+						)
+					}
 					info.kind = .Binder
 					info.binder_sym = binder_sym
-					ctx.res.symbol_types[binder_sym] = subject_type
+					ctx.res.symbol_types[binder_sym] = subject_type_actual
 				}
 			case ^Pattern_Constructor:
 				tag := -1
@@ -2062,6 +2157,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		}
 		if result_t == nil do result_t = TY_NEVER
 		ctx.match_arm_infos[e] = arm_infos
+		check_match_coverage(subject_type, arm_infos)
 		t = prune_type(result_t)
 
 	case ^Try_Expr:

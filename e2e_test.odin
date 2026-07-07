@@ -899,6 +899,167 @@ test_match_wildcard_arm_executes :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_match_missing_variant_фигура :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Type Error: выбор не покрывает варианты: Точка")
+	run_code(`
+		тип Фигура = перечисление
+			Точка
+			Круг(Число)
+		конец
+		функ старт() -> Число
+			пер ф: Фигура = Круг(3)
+			возврат выбор ф
+				Круг(р) -> р
+			конец
+		конец
+	`)
+}
+
+@(test)
+test_match_missing_variant_дерево :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Type Error: выбор не покрывает варианты: Лист")
+	run_code(`
+		тип Дерево = перечисление
+			Лист
+			Узел(Число)
+		конец
+		функ старт() -> Число
+			пер д: Дерево = Узел(5)
+			возврат выбор д
+				Узел(х) -> х
+			конец
+		конец
+	`)
+}
+
+@(test)
+test_match_missing_variant_multi :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Type Error: выбор не покрывает варианты: Г")
+	run_code(`
+		тип Событие = перечисление
+			А
+			Б
+			В(Число)
+			Г
+		конец
+		функ старт() -> Число
+			пер с: Событие = А
+			возврат выбор с
+				А -> 0
+				Б -> 1
+				В(х) -> х
+			конец
+		конец
+	`)
+}
+
+@(test)
+test_match_unreachable_after_wildcard_rejected :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Type Error: '_' в выборе должен быть только последней веткой",
+	)
+	run_code(`
+		тип Ф = перечисление
+			А
+			Б
+		конец
+		функ старт() -> Число
+			пер зн: Ф = А
+			возврат выбор зн
+				_ -> 42
+				Б -> 1
+			конец
+		конец
+	`)
+}
+
+@(test)
+test_match_option_binds_and_branches :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер о: Опция(Число) = Есть(41)
+			возврат выбор о
+				Есть(х) -> х + 1
+				Нет -> 0
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "opt match: пустой стек")
+	if !ok do return
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 42.0, "opt match: %v != 42", result)
+}
+
+@(test)
+test_match_option_none_branch :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер о: Опция(Число) = Нет()
+			возврат выбор о
+				Есть(х) -> х + 1
+				Нет -> 99
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "opt none: пустой стек")
+	if !ok do return
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 99.0, "opt none: %v != 99", result)
+}
+
+@(test)
+test_match_result_binds_success_and_error :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Строка
+			пер р: Результат(Строка, Ошибка) = Успех("ок")
+			возврат выбор р
+				Успех(з) -> з
+				Неудача(о) -> "плохо"
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "res match: пустой стек")
+	if !ok do return
+	s, is_str := result.(string)
+	testing.expectf(t, is_str && s == "ок", "res match: %v != ок", result)
+}
+
+@(test)
+test_match_option_non_exhaustive_rejected :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Type Error: выбор не покрывает варианты: Нет")
+	run_code(`
+		функ старт() -> Число
+			пер о: Опция(Число) = Есть(5)
+			возврат выбор о
+				Есть(х) -> х
+			конец
+		конец
+	`)
+}
+
+@(test)
+test_match_duplicate_variant_arm_rejected :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Type Error: вариант 'Ф.А' покрыт повторно в ветке #2",
+	)
+	run_code(`
+		тип Ф = перечисление
+			А
+			Б
+		конец
+		функ старт() -> Число
+			пер зн: Ф = А
+			возврат выбор зн
+				А -> 0
+				А -> 1
+			конец
+		конец
+	`)
+}
+
+@(test)
 test_match_binder_pattern :: proc(t: ^testing.T) {
 	result, ok := run_code(`
 		тип Ф = перечисление

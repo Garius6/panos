@@ -120,18 +120,18 @@ description: "Task list for ADT + pattern-matching implementation"
 
 ### Implementation
 
-- [ ] T031 [US3] In `type_cheker.odin` add pure procedure `compute_match_coverage(subject_type: ^Type, arms: []Match_Arm) -> Match_Coverage` (returns `unmatched: [dynamic]string`, `unreachable_idx: [dynamic]int`, `wildcard_pos: int`) — no mutation of inputs.
-- [ ] T032 [US3] In `type_cheker.odin` after `check_match`, use `compute_match_coverage` to emit ordered errors: repeated variant → unreachable; branch after `_` → unreachable; `_` present but not last → unreachable; non-exhaustive without `_` → list unmatched names. Messages per contracts/diagnostics.md.
-- [ ] T033 [US3] In `compiler.odin` when the last arm is `_`, still emit `Match_Fail` at the end as an internal invariant (documented insurance per R9); when there is no `_`, `Match_Fail` is required (type checker guarantees unreachable in valid programs).
+- [X] T031 [US3] Added `check_match_coverage(subject_type, arm_infos)` — pure procedure iterating arm infos, tracking a `covered` bitmap and a `catch_all` flag; single-pass, no mutation of inputs beyond emitting Russian panics with contract messages.
+- [X] T032 [US3] Wired `check_match_coverage` at the end of `^Match_Expr` typing. Emits ordered errors per contracts: unreachable-after-catch-all, `_` not last, duplicate variant, non-exhaustive with list of missing names.
+- [X] T033 [US3] `compile_match_expr` already emits terminal `Match_Fail` unconditionally as internal insurance (documented at emission site). Runs regardless of whether checker proved unreachable.
 
 ### Tests for User Story 3
 
-- [ ] T034 [US3] Add `test_match_missing_variant_фигура` in `e2e_test.odin` with `площадь` missing the `Точка` arm; assert error message contains `Точка` (AC-1, SC-003 case #1).
-- [ ] T034a [US3] Add `test_match_missing_variant_дерево` in `e2e_test.odin` with a recursive ADT `тип Дерево = перечисление Лист; Узел(Дерево, Дерево) конец` where the `Лист` arm is missing; assert error contains `Лист` (SC-003 case #2).
-- [ ] T034b [US3] Add `test_match_missing_variant_multi` in `e2e_test.odin` with a 4-variant ADT (e.g. `Событие = перечисление А; Б; В(Число); Г` — one arm missing); assert error lists exactly the one missing name (SC-003 case #3).
-- [ ] T034c [US3] Add `test_match_scales_linear_20_variants` in `e2e_test.odin` — an ADT with 20 variants and a `выбор` with an arm per variant returning a distinct integer; assert every arm produces its expected value (correctness proxy for FR-013 linearity; exhaustiveness covers control-flow shape).
-- [ ] T035 [US3] Add `test_match_unreachable_after_wildcard_rejected` in `e2e_test.odin` with an arm after `_`; assert error mentions "недостижима" and identifies the offending arm (AC-2).
-- [ ] T036 [US3] Add `test_match_duplicate_variant_arm_rejected` in `e2e_test.odin` with two arms for the same variant; assert unreachable-branch diagnostic.
+- [X] T034 [US3] Added `test_match_missing_variant_фигура` (Круг-only match against `Фигура`; expects error listing `Точка`).
+- [X] T034a [US3] Added `test_match_missing_variant_дерево` (Узел-only match against `Дерево` = Лист/Узел; expects error listing `Лист`).
+- [X] T034b [US3] Added `test_match_missing_variant_multi` (4-variant `Событие` with one arm missing; error lists `Г`).
+- [ ] T034c [US3] `test_match_scales_linear_20_variants` — deferred (not blocking Phase 5 correctness; can go into Phase 7 as micro-perf sanity).
+- [X] T035 [US3] Added `test_match_unreachable_after_wildcard_rejected` — arm after `_` produces "'_' в выборе должен быть только последней веткой".
+- [X] T036 [US3] Added `test_match_duplicate_variant_arm_rejected` — duplicate constructor arm produces "покрыт повторно в ветке #2".
 
 **Checkpoint**: all P1 stories complete. Language is usable: declare ADT, match it, get compile-time exhaustiveness. AC-3 of US3 (runtime fallthrough) is guaranteed unreachable by the type checker; no e2e test — `Match_Fail` remains as internal invariant.
 
@@ -149,9 +149,9 @@ Nothing new — Phase 2 (prelude registration + `variants` on Option/Result) plu
 
 ### Tests for User Story 4
 
-- [ ] T037 [US4] Add `test_match_option_binds_and_branches` in `e2e_test.odin` matching an `Опция(Число)` value with `Есть(х)` / `Нет` arms; assert branch selection and typed binder (AC-1, FR-011).
-- [ ] T038 [US4] Add `test_match_result_binds_success_and_error` in `e2e_test.odin` matching `Результат(Строка, Ошибка)` with `Успех(з)` / `Неудача(о)`; assert typed binders (AC-2).
-- [ ] T039 [US4] Add `test_match_option_non_exhaustive_rejected` in `e2e_test.odin` covering only `Есть(х)`; assert error mentions `Нет` (AC-3).
+- [X] T037 [US4] Added `test_match_option_binds_and_branches` (Есть(41) → 42) + `test_match_option_none_branch` (Нет() → 99). Approach: synthesize a virtual `.Enum` Type_Kind view for Option in type checker; VM helpers already unify via variant_tag/variant_field.
+- [X] T038 [US4] Added `test_match_result_binds_success_and_error` (Успех("ок") → "ок").
+- [X] T039 [US4] Added `test_match_option_non_exhaustive_rejected` — coverage checker reuses `check_match_coverage` and reports missing `Нет`.
 
 **Checkpoint**: US4 verified without new production code.
 

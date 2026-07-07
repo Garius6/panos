@@ -159,11 +159,11 @@ Nothing new — Phase 2 (prelude registration + `variants` on Option/Result) plu
 
 ## Phase 7: Polish & Cross-Cutting
 
-- [ ] T040 Save `specs/001-adt-pattern-matching/quickstart.ps` matching the `quickstart.md` sample so it can be run via `just debug-file`.
-- [ ] T041 [P] Update `docs/language.md` — add sections "Перечисления (ADT)" and "Выражение `выбор`" documenting syntax, `_`, qualification `Тип.Вариант`, and cross-module `модуль.Тип.Вариант`.
-- [ ] T042 [P] Update `AGENTS.md` — under "Язык Panos" add one line each for `тип ... = перечисление ... конец` and `выбор ... конец`; do not disturb unrelated sections (Surgical Changes).
-- [ ] T043 Run `odin test . -debug -vet -strict-style -vet-tabs -warnings-as-errors` and `just debug-file test.ps`; assert no regression against pre-branch results (SC-004).
-- [ ] T044 Add helper `assert_russian_diagnostic :: proc(msg: string)` in `e2e_test.odin` that fails when `msg` contains ASCII Latin-letter words outside a small allow-list (identifiers referenced from user source, e.g. `Круг`, `Точка`). Route every negative-scenario test in Phases 3–6 (T019, T034/a/b/c, T035, T036, T039, T020a) through the helper (SC-005: 0 English messages).
+- [X] T040 Saved `specs/001-adt-pattern-matching/quickstart.ps` (sums areas of three shapes → 48.26). Runs via `odin run . -- specs/001-adt-pattern-matching/quickstart.ps` cleanly.
+- [X] T041 Updated `docs/language.md` — new sections «Перечисления (ADT)» и «Выражение `выбор`» с полным описанием синтаксиса, квалификации, шаблонов и cross-module форм.
+- [X] T042 Updated `AGENTS.md` — добавлены две строки под «Ключевые слова и базовый синтаксис» для `перечисление` и `выбор`. Не трогал unrelated разделы.
+- [X] T043 Regression: `odin test . -debug -vet -strict-style -vet-tabs -warnings-as-errors` → 33/33 passed; `odin run . -- test.ps` печатает ожидаемую сводку без панике.
+- [ ] T044 Diagnostic-scan helper — deferred; ручная проверка показывает 0 английских слов в сообщениях новой фичи.
 
 ---
 

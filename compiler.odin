@@ -412,7 +412,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				sym.name,
 			)
 		}
-		if info, is_variant := ctx.tc.variant_idents[expr]; is_variant {
+		if info, is_variant := ctx.tc.variant_ctors[expr]; is_variant {
 			name_const := make_constant(ctx, Value(info.owner_type.name))
 			emit_opcode(ctx, .Build_Variant)
 			emit_byte(ctx, name_const)
@@ -524,7 +524,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 
 	case ^Property_Expr:
-		if info, is_variant := ctx.tc.variant_idents[expr]; is_variant {
+		if info, is_variant := ctx.tc.variant_ctors[expr]; is_variant {
 			name_const := make_constant(ctx, Value(info.owner_type.name))
 			emit_opcode(ctx, .Build_Variant)
 			emit_byte(ctx, name_const)
@@ -593,7 +593,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		compile_expr(ctx, e.value)
 		emit_opcode(ctx, .Try_Unwrap)
 	case ^Call_Expr:
-		if info, is_variant := ctx.tc.variant_calls[expr]; is_variant {
+		if info, is_variant := ctx.tc.variant_ctors[expr]; is_variant {
 			for arg in e.args do compile_expr(ctx, arg)
 			name_const := make_constant(ctx, Value(info.owner_type.name))
 			emit_opcode(ctx, .Build_Variant)
@@ -820,9 +820,8 @@ compile_match_expr :: proc(ctx: ^Compiler, m: ^Match_Expr) {
 	end_jumps := make([dynamic]int, context.temp_allocator)
 
 	for arm, arm_idx in m.arms {
-		info := arm_infos[arm_idx]
+		pi := arm_infos[arm_idx]
 		fail_jumps := make([dynamic]int, context.temp_allocator)
-		pi := info.pattern
 		compile_pattern(ctx, &pi, subject_slot, &fail_jumps)
 
 		compile_block(ctx, arm.body, is_val)

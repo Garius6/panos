@@ -57,6 +57,16 @@ Type :: struct {
 	// вариантов. Также заполняется для kind == .Option / .Result при
 	// построении prelude, чтобы `выбор` разбирал их единым путём.
 	variants:               [dynamic]Type_Variant,
+	// Индекс имени варианта в `variants` — заполняется вместе с variants,
+	// избавляет от O(V) линейного поиска в 3+ местах.
+	variant_index:          map[string]int,
+}
+
+// Ищет позицию варианта по имени в enum-типе (обычном или synth-view
+// Опции/Результата). Единая точка вместо линейного поиска по variants.
+variant_index :: proc(enum_type: ^Type, name: string) -> (int, bool) {
+	idx, ok := enum_type.variant_index[name]
+	return idx, ok
 }
 
 Struct_Field :: struct {
@@ -71,6 +81,32 @@ TY_VOID := &Type{kind = .Void, name = "Пусто"}
 TY_NEVER := &Type{kind = .Never, name = "Никогда"}
 TY_STRING := &Type{kind = .String, name = "Строка"}
 TY_ERROR := &Type{kind = .Error, name = "Ошибка"}
+
+// Имя базового типа в аннотации → интернированный Type. `Никогда` был
+// пропущен здесь исторически — `функ f() -> Никогда` падал с "неизвестный
+// тип", хотя TY_NEVER существовал. Fixed-size array вместо map — global
+// map-литералы в Odin по умолчанию запрещены (dynamic-type literal), а
+// для 6 записей линейный поиск не хуже hash-lookup'а.
+Base_Type_Entry :: struct {
+	name: string,
+	typ:  ^Type,
+}
+
+BASE_TYPES := [?]Base_Type_Entry {
+	{"Число", TY_NUM},
+	{"Булево", TY_BOOL},
+	{"Строка", TY_STRING},
+	{"Пусто", TY_VOID},
+	{"Ошибка", TY_ERROR},
+	{"Никогда", TY_NEVER},
+}
+
+lookup_base_type :: proc(name: string) -> (^Type, bool) {
+	for entry in BASE_TYPES {
+		if entry.name == name do return entry.typ, true
+	}
+	return nil, false
+}
 
 // Построение составных типов держим в одном месте, чтобы имена и ссылки
 // формировались одинаково во всех ветках type checker'а.
@@ -137,21 +173,13 @@ Match_Arm_Kind :: enum {
 
 Pattern_Info :: struct {
 	kind:         Match_Arm_Kind,
-	tag_index:   int,
+	tag_index:    int,
 	binder_sym:   ^Symbol,
 	// Для конструктора: рекурсивные под-шаблоны, по одному на поле варианта.
 	sub_patterns: [dynamic]Pattern_Info,
 }
 
-Match_Arm_Info :: struct {
-	pattern: Pattern_Info,
-}
-
-classify_pattern :: proc(
-	ctx: ^Type_Ctx,
-	pattern: Pattern,
-	expected_type: ^Type,
-) -> Pattern_Info {
+classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type) -> Pattern_Info {
 	info := Pattern_Info {
 		tag_index = -1,
 	}
@@ -159,21 +187,16 @@ classify_pattern :: proc(
 	case ^Pattern_Wildcard:
 		info.kind = .Wildcard
 	case ^Pattern_Literal:
-		fmt.panicf("Type Error: литеральные шаблоны в выборе пока не поддерживаются")
+		fmt.panicf(
+			"Type Error: литеральные шаблоны в выборе пока не поддерживаются",
+		)
 	case ^Pattern_Ident:
 		expected := prune_type(expected_type)
 		if expected.kind == .Enum || expected.kind == .Option || expected.kind == .Result {
 			enum_view := expected
-			if expected.kind == .Option do enum_view = synth_option_enum(expected)
-			else if expected.kind == .Result do enum_view = synth_result_enum(expected)
-			tag := -1
-			for v, i in enum_view.variants {
-				if v.name == pat.name {
-					tag = i
-					break
-				}
-			}
-			if tag >= 0 {
+			if expected.kind == .Option || expected.kind == .Result do enum_view = synth_enum_view(ctx, expected)
+			tag, found := variant_index(enum_view, pat.name)
+			if found {
 				if len(enum_view.variants[tag].fields) != 0 {
 					fmt.panicf(
 						"Type Error: вариант '%s.%s' в шаблоне без скобок, но у него есть поля",
@@ -204,16 +227,9 @@ classify_pattern :: proc(
 			)
 		}
 		enum_view := expected
-		if expected.kind == .Option do enum_view = synth_option_enum(expected)
-		else if expected.kind == .Result do enum_view = synth_result_enum(expected)
-		tag := -1
-		for v, i in enum_view.variants {
-			if v.name == pat.name {
-				tag = i
-				break
-			}
-		}
-		if tag < 0 {
+		if expected.kind == .Option || expected.kind == .Result do enum_view = synth_enum_view(ctx, expected)
+		tag, found := variant_index(enum_view, pat.name)
+		if !found {
 			fmt.panicf(
 				"Type Error: вариант '%s' не найден в '%s'",
 				pat.name,
@@ -249,10 +265,13 @@ synth_option_enum :: proc(option_type: ^Type) -> ^Type {
 	t.kind = .Enum
 	t.name = option_type.name
 	t.variants = make([dynamic]Type_Variant)
+	t.variant_index = make(map[string]int)
 	append(&t.variants, Type_Variant{name = "Нет", fields = make([dynamic]^Type)})
+	t.variant_index["Нет"] = 0
 	есть_fields := make([dynamic]^Type)
 	append(&есть_fields, option_type.element_type)
 	append(&t.variants, Type_Variant{name = "Есть", fields = есть_fields})
+	t.variant_index["Есть"] = 1
 	return t
 }
 
@@ -262,25 +281,27 @@ synth_result_enum :: proc(result_type: ^Type) -> ^Type {
 	t.kind = .Enum
 	t.name = result_type.name
 	t.variants = make([dynamic]Type_Variant)
+	t.variant_index = make(map[string]int)
 	успех_fields := make([dynamic]^Type)
 	append(&успех_fields, result_type.ok_type)
 	append(&t.variants, Type_Variant{name = "Успех", fields = успех_fields})
+	t.variant_index["Успех"] = 0
 	неудача_fields := make([dynamic]^Type)
 	append(&неудача_fields, result_type.error_type)
 	append(&t.variants, Type_Variant{name = "Неудача", fields = неудача_fields})
+	t.variant_index["Неудача"] = 1
 	return t
 }
 
 // Чистая процедура: получает тип-subject и arm_infos, проверяет
 // исчерпываемость, недостижимость, позицию `_`. Ошибка — panic по
 // правилам contracts/diagnostics.md.
-check_match_coverage :: proc(subject_type: ^Type, arm_infos: [dynamic]Match_Arm_Info) {
+check_match_coverage :: proc(subject_type: ^Type, arm_infos: [dynamic]Pattern_Info) {
 	total := len(subject_type.variants)
 	covered := make([dynamic]bool, total, context.temp_allocator)
 	catch_all := false
 
-	for info, arm_idx in arm_infos {
-		pi := info.pattern
+	for pi, arm_idx in arm_infos {
 		if catch_all {
 			fmt.panicf(
 				"Type Error: ветка выбора #%d недостижима — все случаи покрыты выше",
@@ -339,10 +360,7 @@ check_match_coverage :: proc(subject_type: ^Type, arm_infos: [dynamic]Match_Arm_
 	}
 	if len(missing) > 0 {
 		joined := strings.join(missing[:], ", ", context.temp_allocator)
-		fmt.panicf(
-			"Type Error: выбор не покрывает варианты: %s",
-			joined,
-		)
+		fmt.panicf("Type Error: выбор не покрывает варианты: %s", joined)
 	}
 }
 
@@ -356,9 +374,13 @@ Type_Ctx :: struct {
 	interface_calls:  map[Expr]string,
 	collection_calls: map[Expr]string,
 	builtin_calls:    map[Expr]string,
-	variant_calls:    map[Expr]Variant_Call_Info,
-	variant_idents:   map[Expr]Variant_Call_Info,
-	match_arm_infos:  map[^Match_Expr][dynamic]Match_Arm_Info,
+	variant_ctors:    map[Expr]Variant_Call_Info,
+	match_arm_infos:  map[^Match_Expr][dynamic]Pattern_Info,
+	// Кэш synth-view Enum-типов для Опции/Результата: base type (Option/
+	// Result) → построенный virtual-Enum. Без кэша каждый match над одной
+	// Опцией/Результатом создаёт новый Type-объект (утечка + сломанный
+	// identity-check).
+	synth_enum_cache: map[^Type]^Type,
 	current_return:   ^Type,
 	loop_depth:       int,
 	next_infer_id:    int,
@@ -375,10 +397,27 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		interface_calls = make(map[Expr]string),
 		collection_calls = make(map[Expr]string),
 		builtin_calls = make(map[Expr]string),
-		variant_calls = make(map[Expr]Variant_Call_Info),
-		variant_idents = make(map[Expr]Variant_Call_Info),
-		match_arm_infos = make(map[^Match_Expr][dynamic]Match_Arm_Info),
+		variant_ctors = make(map[Expr]Variant_Call_Info),
+		match_arm_infos = make(map[^Match_Expr][dynamic]Pattern_Info),
+		synth_enum_cache = make(map[^Type]^Type),
 	}
+}
+
+// Кэширующая обёртка над synth_option_enum/synth_result_enum: один base
+// type даёт один synth-Enum на весь прогон type checker'а.
+synth_enum_view :: proc(ctx: ^Type_Ctx, base: ^Type) -> ^Type {
+	if cached, ok := ctx.synth_enum_cache[base]; ok do return cached
+	result: ^Type
+	#partial switch base.kind {
+	case .Option:
+		result = synth_option_enum(base)
+	case .Result:
+		result = synth_result_enum(base)
+	case:
+		fmt.panicf("Type Error: internal — synth_enum_view для не-Option/Result типа '%s'", base.name)
+	}
+	ctx.synth_enum_cache[base] = result
+	return result
 }
 
 // InferVar - внутренний временный тип. Он не равен Any: позже должен
@@ -773,6 +812,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			enum_type.kind = .Enum
 			enum_type.name = d.name
 			enum_type.variants = make([dynamic]Type_Variant)
+			enum_type.variant_index = make(map[string]int)
 			ctx.res.symbol_types[ctx.res.decl_symbols[decl]] = enum_type
 		}
 	}
@@ -812,7 +852,9 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				for tn in variant.types {
 					append(&fields, resolve_type_node(ctx, tn))
 				}
+				tag := len(enum_type.variants)
 				append(&enum_type.variants, Type_Variant{name = variant.name, fields = fields})
+				enum_type.variant_index[variant.name] = tag
 			}
 		}
 	}
@@ -904,11 +946,7 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 
 	switch n in node {
 	case ^Type_Ident:
-		if n.name == "Число" do return TY_NUM
-		if n.name == "Булево" do return TY_BOOL
-		if n.name == "Строка" do return TY_STRING
-		if n.name == "Пусто" do return TY_VOID
-		if n.name == "Ошибка" do return TY_ERROR
+		if base_type, ok := lookup_base_type(n.name); ok do return base_type
 		if sym := lookup_symbol(ctx.res.global_scope, n.name); sym != nil {
 			if sym.kind == .Module {
 				fmt.panicf(
@@ -1274,8 +1312,7 @@ check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type, loc := #caller_l
 		}
 	}
 
-	actual := infer_expr(ctx, expr)
-	actual = prune_type(actual)
+	actual := prune_type(infer_expr(ctx, expr))
 
 	if expected_type.kind == .Interface && actual.kind == .Struct {
 		if unify_types(actual, expected_type) {
@@ -1495,6 +1532,84 @@ standard_method_type :: proc(
 	return nil, false
 }
 
+// Единая точка построения значения Enum_Variant — покрывает как
+// bare-идентификатор без скобок (`Нет`), так и вызов со скобками
+// (`Круг(3)`). `is_call == false` требует нулевой arity, `is_call ==
+// true` проверяет arity аргументов и унифицирует поля. Оба пути пишут в
+// `ctx.variant_ctors`.
+resolve_variant_ctor :: proc(
+	ctx: ^Type_Ctx,
+	expr: Expr,
+	sym: ^Symbol,
+	args: []Expr,
+	is_call: bool,
+) -> ^Type {
+	owner := sym.owner_type
+	if owner == nil {
+		fmt.panicf("Type Error: у варианта '%s' нет типа-владельца", sym.name)
+	}
+	owner_type := ctx.res.symbol_types[owner]
+	if owner_type == nil {
+		fmt.panicf(
+			"Type Error: тип-владелец '%s' варианта '%s' ещё не построен",
+			owner.name,
+			sym.name,
+		)
+	}
+	tag, found := variant_index(owner_type, sym.name)
+	if !found {
+		fmt.panicf(
+			"Type Error: вариант '%s' не найден в '%s'",
+			sym.name,
+			owner_type.name,
+		)
+	}
+
+	if !is_call {
+		if len(owner_type.variants[tag].fields) != 0 {
+			fmt.panicf(
+				"Type Error: вариант '%s.%s' должен быть вызван со скобками — у него есть поля",
+				owner_type.name,
+				sym.name,
+			)
+		}
+		ctx.variant_ctors[expr] = Variant_Call_Info {
+			owner_type = owner_type,
+			tag_index  = tag,
+		}
+		return owner_type
+	}
+
+	expected := owner_type.variants[tag].fields
+	if len(args) != len(expected) {
+		fmt.panicf(
+			"Type Error: у варианта '%s.%s' ожидалось %d аргументов, получено %d",
+			owner_type.name,
+			sym.name,
+			len(expected),
+			len(args),
+		)
+	}
+	for arg, i in args {
+		actual := prune_type(infer_expr(ctx, arg))
+		if !unify_types(actual, expected[i]) {
+			fmt.panicf(
+				"Type Error: у варианта '%s.%s' поле #%d ожидает '%s', получено '%s'",
+				owner_type.name,
+				sym.name,
+				i,
+				prune_type(expected[i]).name,
+				prune_type(actual).name,
+			)
+		}
+	}
+	ctx.variant_ctors[expr] = Variant_Call_Info {
+		owner_type = owner_type,
+		tag_index  = tag,
+	}
+	return owner_type
+}
+
 // Выводит тип выражения без внешнего ожидания.
 infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	if expr == nil do return nil
@@ -1521,47 +1636,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 			)
 		}
 		if sym.kind == .Enum_Variant {
-			owner := sym.owner_type
-			if owner == nil {
-				fmt.panicf(
-					"Type Error: у варианта '%s' нет типа-владельца",
-					sym.name,
-				)
-			}
-			owner_type := ctx.res.symbol_types[owner]
-			if owner_type == nil {
-				fmt.panicf(
-					"Type Error: тип-владелец '%s' варианта '%s' ещё не построен",
-					owner.name,
-					sym.name,
-				)
-			}
-			tag := -1
-			for v, i in owner_type.variants {
-				if v.name == sym.name {
-					tag = i
-					break
-				}
-			}
-			if tag < 0 {
-				fmt.panicf(
-					"Type Error: вариант '%s' не найден в '%s'",
-					sym.name,
-					owner_type.name,
-				)
-			}
-			if len(owner_type.variants[tag].fields) != 0 {
-				fmt.panicf(
-					"Type Error: вариант '%s.%s' должен быть вызван со скобками — у него есть поля",
-					owner_type.name,
-					sym.name,
-				)
-			}
-			ctx.variant_idents[expr] = Variant_Call_Info {
-				owner_type = owner_type,
-				tag_index  = tag,
-			}
-			t = owner_type
+			t = resolve_variant_ctor(ctx, expr, sym, nil, false)
 			ctx.node_types[expr] = t
 			return t
 		}
@@ -1660,115 +1735,9 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	case ^Call_Expr:
 		callee_sym := ctx.res.node_symbols[e.callee]
 		if callee_sym != nil && callee_sym.kind == .Enum_Variant {
-			sym := callee_sym
-			owner := sym.owner_type
-			owner_type := ctx.res.symbol_types[owner]
-			if owner_type == nil {
-				fmt.panicf(
-					"Type Error: тип-владелец варианта '%s' ещё не построен",
-					sym.name,
-				)
-			}
-			tag := -1
-			for v, i in owner_type.variants {
-				if v.name == sym.name {
-					tag = i
-					break
-				}
-			}
-			if tag < 0 {
-				fmt.panicf(
-					"Type Error: вариант '%s' не найден в '%s'",
-					sym.name,
-					owner_type.name,
-				)
-			}
-			expected := owner_type.variants[tag].fields
-			if len(e.args) != len(expected) {
-				fmt.panicf(
-					"Type Error: у варианта '%s.%s' ожидалось %d аргументов, получено %d",
-					owner_type.name,
-					sym.name,
-					len(expected),
-					len(e.args),
-				)
-			}
-			for arg, i in e.args {
-				actual := prune_type(infer_expr(ctx, arg))
-				if !unify_types(actual, expected[i]) {
-					fmt.panicf(
-						"Type Error: у варианта '%s.%s' поле #%d ожидает '%s', получено '%s'",
-						owner_type.name,
-						sym.name,
-						i,
-						prune_type(expected[i]).name,
-						prune_type(actual).name,
-					)
-				}
-			}
-			ctx.variant_calls[expr] = Variant_Call_Info {
-				owner_type = owner_type,
-				tag_index  = tag,
-			}
-			t = owner_type
+			t = resolve_variant_ctor(ctx, expr, callee_sym, e.args[:], true)
 			ctx.node_types[expr] = t
 			return t
-		}
-		if _, ok := e.callee.(^Ident_Expr); ok {
-			if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Enum_Variant {
-				owner := sym.owner_type
-				owner_type := ctx.res.symbol_types[owner]
-				if owner_type == nil {
-					fmt.panicf(
-						"Type Error: тип-владелец варианта '%s' ещё не построен",
-						sym.name,
-					)
-				}
-				tag := -1
-				for v, i in owner_type.variants {
-					if v.name == sym.name {
-						tag = i
-						break
-					}
-				}
-				if tag < 0 {
-					fmt.panicf(
-						"Type Error: вариант '%s' не найден в '%s'",
-						sym.name,
-						owner_type.name,
-					)
-				}
-				expected := owner_type.variants[tag].fields
-				if len(e.args) != len(expected) {
-					fmt.panicf(
-						"Type Error: у варианта '%s.%s' ожидалось %d аргументов, получено %d",
-						owner_type.name,
-						sym.name,
-						len(expected),
-						len(e.args),
-					)
-				}
-				for arg, i in e.args {
-					actual := prune_type(infer_expr(ctx, arg))
-					if !unify_types(actual, expected[i]) {
-						fmt.panicf(
-							"Type Error: у варианта '%s.%s' поле #%d ожидает '%s', получено '%s'",
-							owner_type.name,
-							sym.name,
-							i,
-							prune_type(expected[i]).name,
-							prune_type(actual).name,
-						)
-					}
-				}
-				ctx.variant_calls[expr] = Variant_Call_Info {
-					owner_type = owner_type,
-					tag_index  = tag,
-				}
-				t = owner_type
-				ctx.node_types[expr] = t
-				return t
-			}
 		}
 		if ident, ok := e.callee.(^Ident_Expr); ok {
 			if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Builtin {
@@ -2122,10 +2091,8 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	case ^Match_Expr:
 		subject_type_actual := prune_type(infer_expr(ctx, e.subject))
 		subject_type := subject_type_actual
-		if subject_type.kind == .Option {
-			subject_type = synth_option_enum(subject_type_actual)
-		} else if subject_type.kind == .Result {
-			subject_type = synth_result_enum(subject_type_actual)
+		if subject_type.kind == .Option || subject_type.kind == .Result {
+			subject_type = synth_enum_view(ctx, subject_type_actual)
 		}
 		if subject_type.kind != .Enum {
 			fmt.panicf(
@@ -2133,14 +2100,11 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 				subject_type_actual.name,
 			)
 		}
-		arm_infos := make([dynamic]Match_Arm_Info)
+		arm_infos := make([dynamic]Pattern_Info)
 		result_t: ^Type
 		for arm in e.arms {
 			pi := classify_pattern(ctx, arm.pattern, subject_type_actual)
-			info := Match_Arm_Info {
-				pattern = pi,
-			}
-			append(&arm_infos, info)
+			append(&arm_infos, pi)
 
 			// Тело ветки
 			body_t: ^Type
@@ -2210,41 +2174,7 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	case ^Property_Expr:
 		if sym, ok := ctx.res.node_symbols[expr]; ok {
 			if sym.kind == .Enum_Variant {
-				owner := sym.owner_type
-				owner_type := ctx.res.symbol_types[owner]
-				if owner_type == nil {
-					fmt.panicf(
-						"Type Error: тип-владелец '%s' варианта '%s' ещё не построен",
-						owner.name,
-						sym.name,
-					)
-				}
-				tag := -1
-				for v, i in owner_type.variants {
-					if v.name == sym.name {
-						tag = i
-						break
-					}
-				}
-				if tag < 0 {
-					fmt.panicf(
-						"Type Error: вариант '%s' не найден в '%s'",
-						sym.name,
-						owner_type.name,
-					)
-				}
-				if len(owner_type.variants[tag].fields) != 0 {
-					fmt.panicf(
-						"Type Error: вариант '%s.%s' должен быть вызван со скобками — у него есть поля",
-						owner_type.name,
-						sym.name,
-					)
-				}
-				ctx.variant_idents[expr] = Variant_Call_Info {
-					owner_type = owner_type,
-					tag_index  = tag,
-				}
-				t = owner_type
+				t = resolve_variant_ctor(ctx, expr, sym, nil, false)
 				ctx.node_types[expr] = t
 				return t
 			}

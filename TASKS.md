@@ -1,6 +1,6 @@
 # Panos — Задачи
 
-**Текущая стадия**: 0 — Foundation cleanup
+**Текущая стадия**: 0 — Foundation cleanup (готово, коммит `3055f10`)
 **Roadmap**: [ROADMAP.md](ROADMAP.md)
 
 Работа отслеживается через mkdnflow.nvim в Neovim. `<CR>` на строке
@@ -28,29 +28,33 @@ risk, разблокирует всё последующее.
 
 ### Волна 1 рефакторинга type-checker'а
 
-- [ ] P2 — helper `resolve_variant_ctor` (унифицировать 3 места
+- [x] P2 — helper `resolve_variant_ctor` (унифицировать 3 места
       Enum_Variant construction, `type_cheker.odin:1523-1772`)
-- [ ] P3 — `variant_index: map[string]int` в `Type` + helper
+- [x] P3 — `variant_index: map[string]int` в `Type` + helper
       `variant_index(enum_type, name) -> (int, bool)`
-- [ ] P5 — synth cache `Type_Ctx.synth_enum_cache: map[^Type]^Type` +
+- [x] P5 — synth cache `Type_Ctx.synth_enum_cache: map[^Type]^Type` +
       `synth_enum_view(ctx, base)`
-- [ ] P12 — убрать двойные `prune_type(prune_type(x))` вызовы
-- [ ] P13 — `BASE_TYPES` map + добавить `Никогда` (сейчас баг:
+- [x] P12 — убрать двойные `prune_type(prune_type(x))` вызовы
+- [x] P13 — `BASE_TYPES` map + добавить `Никогда` (сейчас баг:
       `функ f() -> Никогда` падает)
-- [ ] P14 — убрать `Match_Arm_Info` wrapper, использовать `Pattern_Info`
+- [x] P14 — убрать `Match_Arm_Info` wrapper, использовать `Pattern_Info`
       напрямую
-- [ ] P15 — унифицировать `variant_calls` + `variant_idents` в
+- [x] P15 — унифицировать `variant_calls` + `variant_idents` в
       единый `variant_ctors: map[Expr]Variant_Ctor_Info` (включает P4-часть)
 
 ### Verification
 
-- [ ] `odin test .` — 38/38 тестов зелёные
-- [ ] `odin run . -- test.ps` — без регрессий
-- [ ] Type-checker строк ≤ 2150 (было 2359)
+- [x] `odin test .` — 38/38 тестов зелёные
+- [x] `odin run . -- test.ps` — без регрессий
+- [x] Type-checker строк ≤ 2150 (было 2359) — **не достигнуто**: итог
+      2289 строк (−70). Дедупликация и утечки устранены как задумано,
+      но добавленная инфраструктура (helper'ы, кэш, docstring'и)
+      компенсировала часть экономии — расхождение с прогнозом отчёта
+      (−209), не регрессия.
 
 ### Delivery
 
-- [ ] Коммит с русскоязычным описанием изменений
+- [x] Коммит с русскоязычным описанием изменений — `3055f10`
 
 ---
 

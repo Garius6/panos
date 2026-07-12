@@ -58,13 +58,25 @@ symbol_at :: proc(store: ^Symbol_Store, id: Symbol_Id) -> Symbol {
 }
 
 Module :: struct {
-	path:    string,
-	dir:     string,
-	ast:     Program,
-	scope:   ^Scope,
-	exports: map[Interned]Symbol_Id,
-	file_id: u16,
-	source:  string,
+	path:     string,
+	dir:      string,
+	ast:      Program,
+	scope:    ^Scope,
+	exports:  map[Interned]Symbol_Id,
+	file_id:  u16,
+	source:   string,
+	// Варианты перечислений НЕ живут в scope.symbols (см. register_top_level_decl
+	// Enum_Decl) — иначе два разных `тип X = перечисление` с одноимённым
+	// вариантом (напр. оба "Точка") конфликтовали бы как "уже объявлено",
+	// хотя логически не пересекаются. Ключ первого уровня — Symbol_Id
+	// типа-владельца, чтобы Тип1.Вариант и Тип2.Вариант с одинаковым
+	// именем не перетирали друг друга в одной плоской map. Доступ к
+	// варианту теперь ТОЛЬКО квалифицированный (Тип.Вариант) — bare
+	// `Вариант(...)` как конструктор-выражение больше не резолвится
+	// (см. Property_Expr в resolve_expr). Шаблоны в `выбор` (Pattern_Ident/
+	// Pattern_Constructor) это не затрагивает — они резолвят имя варианта
+	// по expected_type в type_cheker.odin, никогда не ходили через scope.
+	variants: map[Symbol_Id]map[Interned]Symbol_Id,
 }
 
 Module_Graph :: struct {
@@ -481,15 +493,6 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 
 		for variant in d.variants {
 			variant_name_id := intern(variant.name)
-			if variant_name_id in module.scope.symbols {
-				report_resolve(
-					ctx,
-					variant.span,
-					"Resolve Error: имя варианта '%s' конфликтует с уже объявленным символом в модуле",
-					variant.name,
-				)
-				continue
-			}
 			variant_sym := new_symbol(
 				ctx.symbol_store,
 				variant.name,
@@ -500,7 +503,19 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 				variant.span,
 				owner_type = type_sym,
 			)
-			module.scope.symbols[variant_name_id] = variant_sym
+			// Дубликат ИМЕНИ ВНУТРИ одного и того же перечисления ловит
+			// парсер ("вариант 'X' объявлен дважды в 'Y'") — сюда попадают
+			// уже различные (enum, variant_name) пары, коллизий между
+			// РАЗНЫМИ типами больше не бывает по конструкции map'ы.
+			if module.variants == nil {
+				module.variants = make(map[Symbol_Id]map[Interned]Symbol_Id)
+			}
+			inner_variants, has_inner := module.variants[type_sym]
+			if !has_inner {
+				inner_variants = make(map[Interned]Symbol_Id)
+			}
+			inner_variants[variant_name_id] = variant_sym
+			module.variants[type_sym] = inner_variants
 			if d.is_exported {
 				module.exports[variant_name_id] = variant_sym
 			}
@@ -745,8 +760,7 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 			if obj.kind == .Type {
 				if _, is_enum := obj.decl.(^Enum_Decl); is_enum {
 					owner_module := obj.module
-					if owner_module == nil ||
-					   owner_module.scope == nil {
+					if owner_module == nil {
 						report_resolve(
 							ctx,
 							e.span,
@@ -755,11 +769,12 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 						)
 						return
 					}
-					variant_id, found := owner_module.scope.symbols[intern(e.property)]
-					variant := symbol_at(ctx.symbol_store, variant_id)
-					if !found ||
-					   variant.kind != .Enum_Variant ||
-					   variant.owner_type != obj_sym {
+					// Ключ первого уровня — Symbol_Id САМОГО типа (obj_sym) —
+					// см. Module.variants. found==false покрывает и "модуль
+					// ещё не зарегистрировал вариантов для этого типа"
+					// (nil map, safe read), и "такого варианта нет".
+					variant_id, found := owner_module.variants[obj_sym][intern(e.property)]
+					if !found {
 						report_resolve(
 							ctx,
 							e.span,

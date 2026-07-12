@@ -68,15 +68,19 @@ Module :: struct {
 }
 
 Module_Graph :: struct {
-	modules:      map[string]^Module,
-	order:        [dynamic]^Module,
-	loading:      map[string]bool,
-	symbol_types: map[Symbol_Id]^Type,
-	symbol_store: ^Symbol_Store,
+	modules:          map[string]^Module,
+	order:            [dynamic]^Module,
+	loading:          map[string]bool,
+	symbol_types:     map[Symbol_Id]^Type,
+	symbol_store:     ^Symbol_Store,
 	// file_id → путь/исходник, нужно чтобы превратить Span в line:col при
 	// печати diagnostic'а (Span хранит только file_id, не путь).
-	file_paths:   map[u16]string,
-	file_sources: map[u16]string,
+	file_paths:       map[u16]string,
+	file_sources:     map[u16]string,
+	// Parser.diagnostics каждого загруженного модуля — Parser живёт только
+	// внутри load_module_recursive, поэтому собираем сюда, иначе они
+	// терялись бы вместе с локальным Parser'ом.
+	parse_diagnostics: [dynamic]Diagnostic,
 }
 
 Scope :: struct {
@@ -93,6 +97,7 @@ new_module_graph :: proc() -> Module_Graph {
 		symbol_store = new_symbol_store(),
 		file_paths = make(map[u16]string),
 		file_sources = make(map[u16]string),
+		parse_diagnostics = make([dynamic]Diagnostic),
 	}
 }
 
@@ -275,6 +280,9 @@ Resolver_Ctx :: struct {
 	symbol_store:    ^Symbol_Store,
 	symbol_types:    map[Symbol_Id]^Type,
 	pattern_binders: map[^Pattern_Ident]Symbol_Id,
+	// Diagnostic/Severity из type_cheker.odin — тот же package, тот же
+	// accumulate-not-panic паттерн, что и в парсере/тайпчекере.
+	diagnostics:     [dynamic]Diagnostic,
 
 	// Side Tables
 	decl_symbols:    map[Decls]Symbol_Id,
@@ -282,6 +290,14 @@ Resolver_Ctx :: struct {
 	node_symbols:    map[Expr]Symbol_Id,
 	func_args:       map[Decls][dynamic]Symbol_Id,
 	lambda_args:     map[Expr][dynamic]Symbol_Id,
+}
+
+report_resolve :: proc(ctx: ^Resolver_Ctx, span: Span, format: string, args: ..any) {
+	msg := fmt.aprintf(format, ..args)
+	for d in ctx.diagnostics {
+		if d.span == span && d.message == msg do return
+	}
+	append(&ctx.diagnostics, Diagnostic{severity = .Error, span = span, message = msg})
 }
 
 push_scope :: proc(resolver: ^Resolver_Ctx) {
@@ -321,6 +337,7 @@ new_resolver_ctx :: proc() -> Resolver_Ctx {
 		decl_symbols    = make(map[Decls]Symbol_Id),
 		node_symbols    = make(map[Expr]Symbol_Id),
 		pattern_binders = make(map[^Pattern_Ident]Symbol_Id),
+		diagnostics     = make([dynamic]Diagnostic),
 	}
 
 	push_scope(&ctx)
@@ -346,6 +363,7 @@ new_module_resolver_ctx :: proc(graph: ^Module_Graph, module: ^Module) -> Resolv
 		decl_symbols    = make(map[Decls]Symbol_Id),
 		node_symbols    = make(map[Expr]Symbol_Id),
 		pattern_binders = make(map[^Pattern_Ident]Symbol_Id),
+		diagnostics     = make([dynamic]Diagnostic),
 	}
 	push_scope(&ctx)
 	ctx.global_scope = ctx.current_scope
@@ -378,7 +396,8 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 			ok = imported_module != nil
 		}
 		if !ok {
-			fmt.panicf("Resolve Error: модуль '%s' не найден", d.path)
+			report_resolve(ctx, d.span, "Resolve Error: модуль '%s' не найден", d.path)
+			return
 		}
 
 		alias := d.alias
@@ -387,7 +406,8 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 		}
 		alias_id := intern(alias)
 		if alias_id in module.scope.symbols {
-			fmt.panicf("Resolve Error: символ '%s' уже объявлен", alias)
+			report_resolve(ctx, d.span, "Resolve Error: символ '%s' уже объявлен", alias)
+			return
 		}
 
 		sym := new_symbol(ctx.symbol_store, alias, .Module, module, span = d.span, module_override = imported_module)
@@ -396,69 +416,77 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 	case ^Function_Decl:
 		sym := new_symbol(ctx.symbol_store, d.name, .Function, module, d.is_exported, decl, d.span)
 		name_id := intern(d.name)
-		if name_id in module.scope.symbols {
-			fmt.panicf("Resolve Error: символ '%s' уже объявлен", d.name)
-		}
-		module.scope.symbols[name_id] = sym
 		ctx.decl_symbols[decl] = sym
-		if d.is_exported {
-			module.exports[name_id] = sym
+		if name_id in module.scope.symbols {
+			report_resolve(ctx, d.span, "Resolve Error: символ '%s' уже объявлен", d.name)
+		} else {
+			module.scope.symbols[name_id] = sym
+			if d.is_exported {
+				module.exports[name_id] = sym
+			}
 		}
 
 	case ^Struct_Decl:
 		sym := new_symbol(ctx.symbol_store, d.name, .Type, module, d.is_exported, decl, d.span)
 		name_id := intern(d.name)
-		if name_id in module.scope.symbols {
-			fmt.panicf("Resolve Error: символ '%s' уже объявлен", d.name)
-		}
-		module.scope.symbols[name_id] = sym
 		ctx.decl_symbols[decl] = sym
-		if d.is_exported {
-			module.exports[name_id] = sym
+		if name_id in module.scope.symbols {
+			report_resolve(ctx, d.span, "Resolve Error: символ '%s' уже объявлен", d.name)
+		} else {
+			module.scope.symbols[name_id] = sym
+			if d.is_exported {
+				module.exports[name_id] = sym
+			}
 		}
 
 	case ^Interface_Decl:
 		sym := new_symbol(ctx.symbol_store, d.name, .Type, module, d.is_exported, decl, d.span)
 		name_id := intern(d.name)
-		if name_id in module.scope.symbols {
-			fmt.panicf("Resolve Error: символ '%s' уже объявлен", d.name)
-		}
-		module.scope.symbols[name_id] = sym
 		ctx.decl_symbols[decl] = sym
-		if d.is_exported {
-			module.exports[name_id] = sym
+		if name_id in module.scope.symbols {
+			report_resolve(ctx, d.span, "Resolve Error: символ '%s' уже объявлен", d.name)
+		} else {
+			module.scope.symbols[name_id] = sym
+			if d.is_exported {
+				module.exports[name_id] = sym
+			}
 		}
 
 	case ^Impl_Decl:
 		for m in d.methods {
 			sym := new_symbol(ctx.symbol_store, m.name, .Function, module, false, m, m.span)
 			name_id := intern(m.name)
-			if name_id in module.scope.symbols {
-				fmt.panicf("Resolve Error: символ '%s' уже объявлен", m.name)
-			}
-			module.scope.symbols[name_id] = sym
 			ctx.decl_symbols[m] = sym
+			if name_id in module.scope.symbols {
+				report_resolve(ctx, m.span, "Resolve Error: символ '%s' уже объявлен", m.name)
+			} else {
+				module.scope.symbols[name_id] = sym
+			}
 		}
 
 	case ^Enum_Decl:
 		type_name_id := intern(d.name)
 		type_sym := new_symbol(ctx.symbol_store, d.name, .Type, module, d.is_exported, decl, d.span)
-		if type_name_id in module.scope.symbols {
-			fmt.panicf("Resolve Error: символ '%s' уже объявлен", d.name)
-		}
-		module.scope.symbols[type_name_id] = type_sym
 		ctx.decl_symbols[decl] = type_sym
-		if d.is_exported {
-			module.exports[type_name_id] = type_sym
+		if type_name_id in module.scope.symbols {
+			report_resolve(ctx, d.span, "Resolve Error: символ '%s' уже объявлен", d.name)
+		} else {
+			module.scope.symbols[type_name_id] = type_sym
+			if d.is_exported {
+				module.exports[type_name_id] = type_sym
+			}
 		}
 
 		for variant in d.variants {
 			variant_name_id := intern(variant.name)
 			if variant_name_id in module.scope.symbols {
-				fmt.panicf(
+				report_resolve(
+					ctx,
+					variant.span,
 					"Resolve Error: имя варианта '%s' конфликтует с уже объявленным символом в модуле",
 					variant.name,
 				)
+				continue
 			}
 			variant_sym := new_symbol(
 				ctx.symbol_store,
@@ -556,9 +584,7 @@ resolve_pattern :: proc(ctx: ^Resolver_Ctx, pattern: Pattern) {
 	case ^Pattern_Wildcard:
 	// ничего не привязывает
 	case ^Pattern_Literal:
-		fmt.panicf(
-			"Semantic Error: литеральные шаблоны в выборе пока не поддерживаются",
-		)
+		report_resolve(ctx, p.span, "Semantic Error: литеральные шаблоны в выборе пока не поддерживаются")
 	case ^Pattern_Ident:
 		if p.name == "_" {
 			// Формально не должно случиться — parse_pattern уже
@@ -588,6 +614,8 @@ resolve_pattern :: proc(ctx: ^Resolver_Ctx, pattern: Pattern) {
 		for arg in p.args {
 			resolve_pattern(ctx, arg)
 		}
+	case ^Error_Pattern:
+	// Уже отрапортовано парсером — нечего резолвить.
 	}
 }
 
@@ -601,7 +629,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 		sym := new_symbol(ctx.symbol_store, s.name, .Variable, ctx.current_module, span = s.span)
 		name_id := intern(s.name)
 		if name_id in ctx.current_scope.symbols {
-			fmt.panicf("Имя %s уже объявлено", s.name)
+			report_resolve(ctx, s.span, "Имя %s уже объявлено", s.name)
 		}
 		ctx.current_scope.symbols[name_id] = sym
 
@@ -616,6 +644,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 
 	case ^Continue_Stmt:
 	case ^Break_Stmt:
+	case ^Error_Stmt:
 	}
 }
 
@@ -626,9 +655,11 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 	case ^Ident_Expr:
 		sym := lookup_symbol(ctx.current_scope, e.name)
 		if sym == INVALID_SYMBOL {
-			fmt.panicf("Resolve Error: undefined variable '%s'", resolve_interned(e.name))
+			report_resolve(ctx, e.span, "Resolve Error: undefined variable '%s'", resolve_interned(e.name))
 		}
-		// Кэшируем использование в Side Table
+		// Кэшируем использование в Side Table (INVALID_SYMBOL если undefined —
+		// typechecker трактует это как poison, не каскадирует вторичный
+		// diagnostic, см. infer_ident_expr).
 		ctx.node_symbols[expr] = sym
 
 	case ^Binary_Expr:
@@ -681,41 +712,48 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 			if obj.kind == .Module {
 				imported_module := obj.module
 				if imported_module == nil {
-					fmt.panicf(
-						"Resolve Error: модуль '%s' не найден",
-						resolve_interned(obj.name),
-					)
+					report_resolve(ctx, e.span, "Resolve Error: модуль '%s' не найден", resolve_interned(obj.name))
+					return
 				}
 				if export_sym, found := imported_module.exports[intern(e.property)]; found {
 					ctx.node_symbols[expr] = export_sym
 					return
 				}
-				fmt.panicf(
+				report_resolve(
+					ctx,
+					e.span,
 					"Resolve Error: модуль '%s' не экспортирует '%s'",
 					resolve_interned(obj.name),
 					e.property,
 				)
+				return
 			}
 			if obj.kind == .Type {
 				if _, is_enum := obj.decl.(^Enum_Decl); is_enum {
 					owner_module := obj.module
 					if owner_module == nil ||
 					   owner_module.scope == nil {
-						fmt.panicf(
+						report_resolve(
+							ctx,
+							e.span,
 							"Resolve Error: модуль-владелец типа '%s' недоступен",
 							resolve_interned(obj.name),
 						)
+						return
 					}
 					variant_id, found := owner_module.scope.symbols[intern(e.property)]
 					variant := symbol_at(ctx.symbol_store, variant_id)
 					if !found ||
 					   variant.kind != .Enum_Variant ||
 					   variant.owner_type != obj_sym {
-						fmt.panicf(
+						report_resolve(
+							ctx,
+							e.span,
 							"Resolve Error: у типа '%s' нет варианта '%s'",
 							resolve_interned(obj.name),
 							e.property,
 						)
+						return
 					}
 					ctx.node_symbols[expr] = variant_id
 					return
@@ -756,6 +794,9 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 			for stmt in arm.body do resolve_stmt(ctx, stmt)
 			pop_scope(ctx)
 		}
+	case ^Error_Expr:
+	// Уже отрапортовано парсером — нечего резолвить, node_symbols не
+	// заполняется (typecheck сработает через INVALID_SYMBOL).
 	}
 }
 

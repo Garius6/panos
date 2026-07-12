@@ -358,6 +358,11 @@ compile_statement :: proc(ctx: ^Compiler, statement: Stmt) {
 		}
 		break_jump := emit_jump(ctx, .Jump)
 		append(&ctx.loops[len(ctx.loops) - 1].break_jumps, break_jump)
+
+	case ^Error_Stmt:
+		// Компилятор запускается только после typecheck_program с нулём
+		// diagnostics (main.odin) — Error_Stmt сюда дойти не должен.
+		fmt.panicf("Compiler Error: внутренняя ошибка — Error_Stmt дошёл до компиляции")
 	}
 }
 
@@ -751,6 +756,11 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 		emit_opcode(ctx, .Build_Map)
 		emit_byte(ctx, u8(len(e.entries)))
+
+	case ^Error_Expr:
+		// Компилятор запускается только после typecheck_program с нулём
+		// diagnostics (main.odin) — Error_Expr сюда дойти не должен.
+		fmt.panicf("Compiler Error: внутренняя ошибка — Error_Expr дошёл до компиляции")
 	}
 
 	if struct_type, needs_cast := ctx.tc.interface_casts[expr]; needs_cast {

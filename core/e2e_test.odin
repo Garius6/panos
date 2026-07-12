@@ -2,18 +2,20 @@ package core
 
 import "core:testing"
 
-// typecheck_program больше не panic'ует на первой ошибке — копит в
-// ctx.diagnostics (см. report() в type_cheker.odin). run_file в main.odin
-// печатает их все и выходит до компиляции; здесь — тот же гейт, но вместо
-// печати panic'уем с текстом ПЕРВОГО diagnostic'а. Это сохраняет поведение
-// старых `testing.expect_assert(t, "Type Error: ...")` тестов без
-// переписывания: они по-прежнему ловят ровно один panic с тем же
-// сообщением, что было бы у fmt.panicf раньше. Тесты, которые хотят
-// проверить накопление НЕСКОЛЬКИХ ошибок разом, используют expect_diagnostic
-// ниже вместо этого моста.
-panic_on_diagnostics :: proc(ctx: ^Type_Ctx) {
-	if len(ctx.diagnostics) > 0 {
-		panic(ctx.diagnostics[0].message)
+// Парсер, резолвер и тайпчекер больше не panic'уют на первой ошибке — все
+// три копят diagnostic'и в собственный []Diagnostic (Parser.diagnostics,
+// Resolver_Ctx.diagnostics, Type_Ctx.diagnostics — общий accumulate-not-panic
+// паттерн, см. report()/report_parse()/report_resolve()). run_file в
+// main.odin печатает их все и выходит до компиляции; здесь — тот же гейт,
+// но вместо печати panic'уем с текстом ПЕРВОГО diagnostic'а (в порядке
+// pipeline: parse → resolve → typecheck, как раньше первый panic случался
+// на самой ранней стадии). Это сохраняет поведение старых
+// `testing.expect_assert(t, "...")` тестов без переписывания. Тесты,
+// которые хотят проверить накопление НЕСКОЛЬКИХ ошибок разом, используют
+// expect_diagnostic ниже вместо этого моста.
+panic_on_diagnostics :: proc(diags: [dynamic]Diagnostic) {
+	if len(diags) > 0 {
+		panic(diags[0].message)
 	}
 }
 
@@ -26,14 +28,16 @@ run_code_with_args :: proc(source: string, program_args: []string = nil) -> (Val
 		stream = &stream,
 	}
 	prog := parse_program(&parser)
+	panic_on_diagnostics(parser.diagnostics)
 
 	// 2. Резолв и Типизация
 	res_ctx := new_resolver_ctx()
 	resolve_program(&res_ctx, prog)
+	panic_on_diagnostics(res_ctx.diagnostics)
 
 	type_ctx := new_type_ctx(&res_ctx)
 	typecheck_program(&type_ctx, prog)
-	panic_on_diagnostics(&type_ctx)
+	panic_on_diagnostics(type_ctx.diagnostics)
 
 	// 3. Компиляция
 	registry := compile_program(&res_ctx, &type_ctx, &prog)
@@ -59,9 +63,10 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 
 	for module in graph.order {
 		res_ctx := resolve_module(&graph, module)
+		panic_on_diagnostics(res_ctx.diagnostics)
 		type_ctx := new_type_ctx(&res_ctx)
 		typecheck_program(&type_ctx, module.ast)
-		panic_on_diagnostics(&type_ctx)
+		panic_on_diagnostics(type_ctx.diagnostics)
 		compile_program(&res_ctx, &type_ctx, &module.ast, &registry)
 		graph.symbol_types = res_ctx.symbol_types
 	}
@@ -76,9 +81,9 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 }
 
 // Прогоняет только парсинг+резолв+типизацию (без компиляции/исполнения) и
-// возвращает накопленные diagnostic'и — для тестов, которые хотят увидеть
-// ВСЕ ошибки разом, а не только первую (в отличие от run_code, который
-// через panic_on_diagnostics останавливается на первой).
+// возвращает накопленные diagnostic'и СО ВСЕХ трёх стадий разом — для
+// тестов, которые хотят увидеть ВСЕ ошибки, а не только первую (в отличие
+// от run_code, который через panic_on_diagnostics останавливается на первой).
 typecheck_only :: proc(source: string) -> [dynamic]Diagnostic {
 	tokens := tokenize(source)
 	stream := make_stream(tokens)
@@ -92,7 +97,12 @@ typecheck_only :: proc(source: string) -> [dynamic]Diagnostic {
 
 	type_ctx := new_type_ctx(&res_ctx)
 	typecheck_program(&type_ctx, prog)
-	return type_ctx.diagnostics
+
+	all := make([dynamic]Diagnostic)
+	for d in parser.diagnostics do append(&all, d)
+	for d in res_ctx.diagnostics do append(&all, d)
+	for d in type_ctx.diagnostics do append(&all, d)
+	return all
 }
 
 // expect_diagnostic проверяет, что среди накопленных ошибок есть хотя бы

@@ -35,8 +35,24 @@ main :: proc() {
 	}
 }
 
+// Печатает diagnostic'и (parser/resolver/typechecker — все три копят в
+// []Diagnostic одинаковой формы) как path:line:col: message и выходит,
+// если список непуст. Общая точка для всех трёх стадий гейта в run_file.
+print_diagnostics_and_exit :: proc(graph: ^core.Module_Graph, diags: [dynamic]core.Diagnostic) {
+	if len(diags) == 0 do return
+	for d in diags {
+		source := graph.file_sources[d.span.file_id]
+		path := graph.file_paths[d.span.file_id]
+		line, col := core.span_line_col(source, d.span.start)
+		fmt.eprintf("%s:%d:%d: %s\n", path, line, col, d.message)
+	}
+	os.exit(1)
+}
+
 run_file :: proc(filename: string, program_args: []string = nil) {
 	graph := core.load_module_graph(filename)
+	print_diagnostics_and_exit(&graph, graph.parse_diagnostics)
+
 	entry_path := core.resolve_import_path(filename, "")
 	entry_module := graph.modules[entry_path]
 	if entry_module == nil {
@@ -56,21 +72,14 @@ run_file :: proc(filename: string, program_args: []string = nil) {
 
 	for module in graph.order {
 		resolver_ctx := core.resolve_module(&graph, module)
+		print_diagnostics_and_exit(&graph, resolver_ctx.diagnostics)
 		core.print_resolver_ctx(&resolver_ctx)
 
 		fmt.println("TYPE CHECK")
 		fmt.printf("--------------------------\n")
 		type_ctx := core.new_type_ctx(&resolver_ctx)
 		core.typecheck_program(&type_ctx, module.ast)
-		if len(type_ctx.diagnostics) > 0 {
-			for d in type_ctx.diagnostics {
-				source := graph.file_sources[d.span.file_id]
-				path := graph.file_paths[d.span.file_id]
-				line, col := core.span_line_col(source, d.span.start)
-				fmt.eprintf("%s:%d:%d: %s\n", path, line, col, d.message)
-			}
-			os.exit(1)
-		}
+		print_diagnostics_and_exit(&graph, type_ctx.diagnostics)
 		core.print_type_ctx(&type_ctx)
 		fmt.printf("--------------------------\n\n")
 

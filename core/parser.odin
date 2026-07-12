@@ -4,8 +4,42 @@ import "core:fmt"
 import "core:strconv"
 
 Parser :: struct {
-	stream:  ^TokenStream,
-	file_id: u16,
+	stream:      ^TokenStream,
+	file_id:     u16,
+	// Diagnostic/Severity определены в type_cheker.odin (тот же package) —
+	// переиспользуем ту же модель accumulate-not-panic, что и там (TY_POISON).
+	diagnostics: [dynamic]Diagnostic,
+}
+
+// Аналог report() из type_cheker.odin: копит diagnostic вместо panic,
+// дедуп по (span, message) — та же логика, что для type-диагностик.
+report_parse :: proc(p: ^Parser, span: Span, format: string, args: ..any) {
+	msg := fmt.aprintf(format, ..args)
+	for d in p.diagnostics {
+		if d.span == span && d.message == msg do return
+	}
+	append(&p.diagnostics, Diagnostic{severity = .Error, span = span, message = msg})
+}
+
+// Токены, с которых безопасно возобновить разбор после неразрешимой
+// ошибки — начало новой top-level декларации или конец файла. Используется
+// только в местах, где ошибка обнаруживается БЕЗ предварительного
+// потребления токена (иначе гарантированный прогресс уже есть и skip не
+// нужен) — см. комментарии на местах вызова.
+is_sync_token :: proc(kind: TokenKind) -> bool {
+	#partial switch kind {
+	case .Function, .TypeDecl, .Impl, .Import, .Export, .End, .EOF:
+		return true
+	}
+	return false
+}
+
+skip_to_sync :: proc(p: ^Parser) {
+	for {
+		tok := peek_token(p.stream)
+		if tok == nil || is_sync_token(tok.kind) do return
+		next_token(p.stream)
+	}
 }
 
 Parser_Error :: enum {
@@ -80,6 +114,15 @@ Impl_Decl :: struct {
 	methods:        [dynamic]^Function_Decl,
 }
 
+// Placeholder-узел ("hole"): парсер не смог разобрать конструкцию на этом
+// месте (например top-level мусор), но должен продолжить разбор остального
+// файла вместо panic. Несёт только span для diagnostic'а; резолвер/тайпчекер
+// трактуют его как уже отрапортованную ошибку (см. TY_POISON) и не
+// каскадируют вторичные диагностики.
+Error_Decl :: struct {
+	span: Span,
+}
+
 Decls :: union {
 	^Import_Decl,
 	^Function_Decl,
@@ -87,6 +130,7 @@ Decls :: union {
 	^Impl_Decl,
 	^Interface_Decl,
 	^Enum_Decl,
+	^Error_Decl,
 }
 
 Program :: struct {
@@ -105,12 +149,17 @@ Type_Qualified :: struct {
 	name:        string,
 }
 
+Error_Type_Node :: struct {
+	span: Span,
+}
+
 Type_Node :: union {
 	^Type_Ident,
 	^Type_Tuple,
 	^Type_Function,
 	^Type_Qualified,
 	^Type_Generic, // Заменяет Type_Array и Type_Map
+	^Error_Type_Node,
 }
 
 Type_Function :: struct {
@@ -129,12 +178,17 @@ Type_Tuple :: struct {
 	elements: [dynamic]Type_Node,
 }
 
+Error_Stmt :: struct {
+	span: Span,
+}
+
 Stmt :: union {
 	^Return_Stmt,
 	^Let_Stmt,
 	^Expr_Stmt,
 	^Continue_Stmt,
 	^Break_Stmt,
+	^Error_Stmt,
 }
 
 Return_Stmt :: struct {
@@ -180,11 +234,16 @@ Pattern_Constructor :: struct {
 	args:        [dynamic]Pattern,
 }
 
+Error_Pattern :: struct {
+	span: Span,
+}
+
 Pattern :: union {
 	^Pattern_Wildcard,
 	^Pattern_Literal,
 	^Pattern_Ident,
 	^Pattern_Constructor,
+	^Error_Pattern,
 }
 
 Match_Arm :: struct {
@@ -296,6 +355,10 @@ Try_Expr :: struct {
 	value: Expr,
 }
 
+Error_Expr :: struct {
+	span: Span,
+}
+
 Expr :: union {
 	^Number_Expr,
 	^Boolean_Expr,
@@ -314,6 +377,7 @@ Expr :: union {
 	^Index_Expr,
 	^Try_Expr,
 	^Match_Expr,
+	^Error_Expr,
 }
 
 // --- ПЕЧАТЬ AST ---
@@ -383,6 +447,9 @@ print_stmt :: proc(stmt: Stmt, prefix: string = "", is_last: bool = true) {
 
 	case ^Break_Stmt:
 		fmt.printf("%s%sBreak\n", prefix, marker)
+
+	case ^Error_Stmt:
+		fmt.printf("%s%s<parse error>\n", prefix, marker)
 	}
 }
 
@@ -488,9 +555,7 @@ parse_program :: proc(p: ^Parser) -> Program {
 		tok_kind := peek_token(p.stream).kind
 		if tok_kind == .Import {
 			if is_exported {
-				fmt.panicf(
-					"Синтаксическая ошибка: нельзя экспортировать импорт",
-				)
+				report_parse(p, peek_token(p.stream).span, "Синтаксическая ошибка: нельзя экспортировать импорт")
 			}
 			decl := parse_import_decl(p)
 			append(&prog.decls, decl)
@@ -498,6 +563,17 @@ parse_program :: proc(p: ^Parser) -> Program {
 			decl := parse_function(p, is_exported)
 			append(&prog.decls, decl)
 		} else if tok_kind == .TypeDecl {
+			// Бывает короче 4 токенов у оборванного файла ("тип X" в самом
+			// конце) — без bounds-check тут был бы index-out-of-range panic.
+			if p.stream.current_idx+3 >= len(p.stream.tokens) {
+				bad_span := peek_token(p.stream).span
+				report_parse(p, bad_span, "Синтаксическая ошибка: неполное объявление типа")
+				skip_to_sync(p)
+				err_decl := new(Error_Decl)
+				err_decl.span = span_from(p, bad_span)
+				append(&prog.decls, err_decl)
+				continue
+			}
 			third_kind := p.stream.tokens[p.stream.current_idx + 3].kind
 			if third_kind == .Struct {
 				decl := parse_struct_decl(p, is_exported)
@@ -509,24 +585,36 @@ parse_program :: proc(p: ^Parser) -> Program {
 				decl := parse_interface_decl(p, is_exported)
 				append(&prog.decls, decl)
 			} else {
-				fmt.panicf(
+				// peek-only (третий токен вперёд не потреблён) — без skip
+				// следующая итерация увидит тот же .TypeDecl и зациклится.
+				bad_span := peek_token(p.stream).span
+				report_parse(
+					p,
+					bad_span,
 					"Синтаксическая ошибка: после 'тип X =' ожидалось 'структура', 'интерфейс' или 'перечисление', получено: %v",
 					third_kind,
 				)
+				next_token(p.stream)
+				skip_to_sync(p)
+				err_decl := new(Error_Decl)
+				err_decl.span = span_from(p, bad_span)
+				append(&prog.decls, err_decl)
 			}
 		} else if tok_kind == .Impl {
 			if is_exported {
-				fmt.panicf(
-					"Синтаксическая ошибка: реализация не может быть экспортирована",
-				)
+				report_parse(p, peek_token(p.stream).span, "Синтаксическая ошибка: реализация не может быть экспортирована")
 			}
 			decl := parse_impl_decl(p)
 			append(&prog.decls, decl)
 		} else {
-			fmt.panicf(
-				"Ожидалось объявление, импорт или экспорт, получено: %v",
-				tok_kind,
-			)
+			// peek-only — без skip зациклится на том же токене.
+			bad_span := peek_token(p.stream).span
+			report_parse(p, bad_span, "Ожидалось объявление, импорт или экспорт, получено: %v", tok_kind)
+			next_token(p.stream)
+			skip_to_sync(p)
+			err_decl := new(Error_Decl)
+			err_decl.span = span_from(p, bad_span)
+			append(&prog.decls, err_decl)
 		}
 	}
 	return prog
@@ -539,9 +627,7 @@ parse_import_decl :: proc(p: ^Parser) -> ^Import_Decl {
 
 	path_tok := next_token(p.stream)
 	if path_tok.kind != .Ident && path_tok.kind != .String {
-		fmt.panicf(
-			"Синтаксическая ошибка: после 'импорт' ожидается имя модуля или строка пути",
-		)
+		report_parse(p, path_tok.span, "Синтаксическая ошибка: после 'импорт' ожидается имя модуля или строка пути")
 	}
 	decl.path = path_tok.data
 
@@ -549,9 +635,7 @@ parse_import_decl :: proc(p: ^Parser) -> ^Import_Decl {
 		next_token(p.stream)
 		alias_tok := next_token(p.stream)
 		if alias_tok.kind != .Ident {
-			fmt.panicf(
-				"Синтаксическая ошибка: после 'как' ожидается имя псевдонима",
-			)
+			report_parse(p, alias_tok.span, "Синтаксическая ошибка: после 'как' ожидается имя псевдонима")
 		}
 		decl.alias = alias_tok.data
 	}
@@ -567,7 +651,9 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
 
 	name_tok := next_token(p.stream)
 	if name_tok.kind != .Ident {
-		fmt.panicf(
+		report_parse(
+			p,
+			name_tok.span,
 			"Синтаксическая ошибка: после 'тип' ожидалось имя перечисления, получено: %v",
 			name_tok.kind,
 		)
@@ -587,14 +673,18 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
 	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
 		variant_tok := next_token(p.stream)
 		if variant_tok.kind != .Ident {
-			fmt.panicf(
+			report_parse(
+				p,
+				variant_tok.span,
 				"Синтаксическая ошибка: в перечислении '%s' ожидалось имя варианта, получено: %v",
 				decl.name,
 				variant_tok.kind,
 			)
 		}
 		if seen[variant_tok.data] {
-			fmt.panicf(
+			report_parse(
+				p,
+				variant_tok.span,
 				"Синтаксическая ошибка: вариант '%s' объявлен дважды в '%s'",
 				variant_tok.data,
 				decl.name,
@@ -610,7 +700,9 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
 		if peek_token(p.stream).kind == .LParen {
 			next_token(p.stream) // (
 			if peek_token(p.stream).kind == .RParen {
-				fmt.panicf(
+				report_parse(
+					p,
+					peek_token(p.stream).span,
 					"Синтаксическая ошибка: у варианта '%s.%s' должны быть либо параметры в скобках, либо скобки должны отсутствовать",
 					decl.name,
 					variant_tok.data,
@@ -635,7 +727,9 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
 	expect(p, .End)
 
 	if len(decl.variants) == 0 {
-		fmt.panicf(
+		report_parse(
+			p,
+			span_from(p, start),
 			"Синтаксическая ошибка: перечисление '%s' должно объявлять хотя бы один вариант",
 			decl.name,
 		)
@@ -685,13 +779,13 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 	decl.methods = make([dynamic]^Function_Decl)
 
 	first_ident := next_token(p.stream)
-	if first_ident.kind != .Ident do error("Ожидалось имя типа или интерфейса")
+	if first_ident.kind != .Ident do error(p, "Ожидалось имя типа или интерфейса")
 
 	if peek_token(p.stream).kind == .For {
 		expect(p, .For)
 
 		target_tok := next_token(p.stream)
-		if target_tok.kind != .Ident do error("Ожидалось имя целевой структуры")
+		if target_tok.kind != .Ident do error(p, "Ожидалось имя целевой структуры")
 
 		decl.interface_name = first_ident.data
 		decl.target_type = target_tok.data
@@ -701,14 +795,19 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 
 	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
 		if peek_token(p.stream).kind != .Function {
-			error(
-				"Внутри блока реализации могут быть только функции",
-			)
+			// peek-only: без явного skip следующая итерация увидит тот же
+			// токен и зациклится — гарантируем прогресс сами.
+			bad := peek_token(p.stream)
+			report_parse(p, bad.span, "Внутри блока реализации могут быть только функции")
+			skip_to_sync(p)
+			continue
 		}
 
 		method := parse_function(p, false)
 		if len(method.args) == 0 || method.args[0].name != "это" {
-			fmt.panicf(
+			report_parse(
+				p,
+				method.span,
 				"Синтаксическая ошибка: первый аргумент метода '%s' структуры '%s' должен называться 'это'",
 				method.name,
 				decl.target_type,
@@ -732,7 +831,7 @@ parse_function :: proc(p: ^Parser, is_exported: bool) -> ^Function_Decl {
 	function.is_exported = is_exported
 
 	tok := next_token(p.stream)
-	if tok.kind != .Ident do fmt.panicf("Ожидалось имя функции")
+	if tok.kind != .Ident do report_parse(p, tok.span, "Синтаксическая ошибка: ожидалось имя функции, получено: %v", tok.kind)
 	function.name = tok.data
 
 	function.args = parse_param_list(p, true)
@@ -754,7 +853,7 @@ parse_param_list :: proc(p: ^Parser, require_types: bool) -> [dynamic]Param_Decl
 	if peek_token(p.stream).kind != .RParen {
 		for {
 			param_tok := next_token(p.stream)
-			if param_tok.kind != .Ident do fmt.panicf("Ожидалось имя аргумента")
+			if param_tok.kind != .Ident do report_parse(p, param_tok.span, "Синтаксическая ошибка: ожидалось имя аргумента, получено: %v", param_tok.kind)
 
 			param := Param_Decl {
 				name = param_tok.data,
@@ -764,7 +863,9 @@ parse_param_list :: proc(p: ^Parser, require_types: bool) -> [dynamic]Param_Decl
 				next_token(p.stream)
 				param.type_annotation = parse_type(p)
 			} else if require_types {
-				fmt.panicf(
+				report_parse(
+					p,
+					param_tok.span,
 					"Синтаксическая ошибка: после аргумента '%s' ожидается ': Тип'",
 					param.name,
 				)
@@ -789,12 +890,15 @@ parse_param_list :: proc(p: ^Parser, require_types: bool) -> [dynamic]Param_Decl
 
 parse_required_return_type :: proc(p: ^Parser, owner: string) -> Type_Node {
 	if peek_token(p.stream).kind != .Arrow {
-		fmt.panicf(
+		report_parse(
+			p,
+			peek_token(p.stream).span,
 			"Синтаксическая ошибка: после объявления %s ожидается '-> Тип'",
 			owner,
 		)
+	} else {
+		next_token(p.stream)
 	}
-	next_token(p.stream)
 	return parse_type(p)
 }
 
@@ -813,7 +917,7 @@ parse_struct_decl :: proc(p: ^Parser, is_exported: bool) -> ^Struct_Decl {
 	decl.is_exported = is_exported
 
 	name_tok := next_token(p.stream)
-	if name_tok.kind != .Ident do error("Ожидалось имя типа")
+	if name_tok.kind != .Ident do error(p, "Ожидалось имя типа")
 	decl.name = name_tok.data
 
 	expect(p, .Assign)
@@ -823,7 +927,7 @@ parse_struct_decl :: proc(p: ^Parser, is_exported: bool) -> ^Struct_Decl {
 		field := Field_Decl{}
 
 		field_tok := next_token(p.stream)
-		if field_tok.kind != .Ident do error("Ожидалось имя поля структуры")
+		if field_tok.kind != .Ident do error(p, "Ожидалось имя поля структуры")
 		field.name = field_tok.data
 
 		expect(p, .Colon)
@@ -876,9 +980,7 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 			next_token(p.stream)
 			member_tok := next_token(p.stream)
 			if member_tok.kind != .Ident {
-				fmt.panicf(
-					"Синтаксическая ошибка: после '.' ожидается имя типа",
-				)
+				report_parse(p, member_tok.span, "Синтаксическая ошибка: после '.' ожидается имя типа")
 			}
 			t := new(Type_Qualified)
 			t.module_name = tok.data
@@ -935,8 +1037,10 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 		return t
 	}
 
-	error("Ожидалось имя типа или тупл")
-	return nil
+	report_parse(p, start, "Ожидалось имя типа или тупл, получено: %v", tok.kind)
+	err := new(Error_Type_Node)
+	err.span = start
+	return err
 }
 
 parse_stmt :: proc(p: ^Parser) -> Stmt {
@@ -998,7 +1102,7 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 	stmt := new(Let_Stmt)
 
 	ident_tok := next_token(p.stream)
-	if ident_tok.kind != .Ident do fmt.panicf("Синтаксическая ошибка: после 'пер' ожидается идентификатор")
+	if ident_tok.kind != .Ident do report_parse(p, ident_tok.span, "Синтаксическая ошибка: после 'пер' ожидается идентификатор")
 	stmt.name = ident_tok.data
 
 	if peek_token(p.stream).kind == .Colon {
@@ -1128,8 +1232,10 @@ parse_map_literal_after_lparen :: proc(p: ^Parser, start: Span) -> Expr {
 parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 	tok := next_token(p.stream)
 	if tok == nil {
-		error("Unexpected end of file")
-		return nil
+		report_parse(p, last_token_span(p.stream), "Синтаксическая ошибка: неожиданный конец файла в выражении")
+		err := new(Error_Expr)
+		err.span = last_token_span(p.stream)
+		return err
 	}
 
 	left := nud(p, tok)
@@ -1181,7 +1287,7 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 		} else if op.kind == .Dot {
 			prop_tok := next_token(p.stream)
 			if prop_tok.kind != .Ident && prop_tok.kind != .Number {
-				error("Ожидалось имя поля или индекс после '.'")
+				report_parse(p, prop_tok.span, "Ожидалось имя поля или индекс после '.', получено: %v", prop_tok.kind)
 			}
 			prop := new(Property_Expr)
 			prop.object = left
@@ -1215,7 +1321,7 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 	#partial switch tok.kind {
 	case .Number:
-		return new_int_lit(tok)
+		return new_int_lit(p, tok)
 
 	case .Boolean:
 		return new_boolean_lit(tok)
@@ -1297,7 +1403,10 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 		return parse_match_expr(p)
 
 	case:
-		error("unexpected token %s in nud position", tok.data)
+		report_parse(p, tok.span, "Синтаксическая ошибка: неожиданный токен '%s' (%v) в начале выражения", tok.data, tok.kind)
+		err := new(Error_Expr)
+		err.span = tok.span
+		return err
 	}
 	return nil
 }
@@ -1320,9 +1429,7 @@ parse_pattern :: proc(p: ^Parser) -> Pattern {
 			next_token(p.stream)
 			next_tok := next_token(p.stream)
 			if next_tok.kind != .Ident {
-				fmt.panicf(
-					"Синтаксическая ошибка: после '.' в шаблоне ожидался идентификатор",
-				)
+				report_parse(p, next_tok.span, "Синтаксическая ошибка: после '.' в шаблоне ожидался идентификатор")
 			}
 			if module_name == "" {
 				module_name = name
@@ -1350,7 +1457,9 @@ parse_pattern :: proc(p: ^Parser) -> Pattern {
 			pat.name = name
 			pat.args = make([dynamic]Pattern)
 			if peek_token(p.stream).kind == .RParen {
-				fmt.panicf(
+				report_parse(
+					p,
+					peek_token(p.stream).span,
 					"Синтаксическая ошибка: у шаблона-конструктора '%s' пустые скобки",
 					name,
 				)
@@ -1380,10 +1489,15 @@ parse_pattern :: proc(p: ^Parser) -> Pattern {
 		pat.span = span_from(p, start)
 		return pat
 	}
-	fmt.panicf(
+	report_parse(
+		p,
+		tok.span,
 		"Синтаксическая ошибка: такой шаблон в выборе пока не поддерживается: %v",
 		tok.kind,
 	)
+	err := new(Error_Pattern)
+	err.span = tok.span
+	return err
 }
 
 parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
@@ -1424,7 +1538,7 @@ parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
 	expect(p, .End)
 
 	if len(m.arms) == 0 {
-		fmt.panicf("Синтаксическая ошибка: выбор должен содержать хотя бы одну ветку")
+		report_parse(p, span_from(p, start), "Синтаксическая ошибка: выбор должен содержать хотя бы одну ветку")
 	}
 	m.span = span_from(p, start)
 	return m
@@ -1468,8 +1582,8 @@ infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 
 // --- УТИЛИТЫ ---
 
-error :: proc(format: string, args: ..any, loc := #caller_location) {
-	fmt.panicf(format, args, loc = loc)
+error :: proc(p: ^Parser, format: string, args: ..any) {
+	report_parse(p, last_token_span(p.stream), format, ..args)
 }
 
 // Собирает span конструкции: start — позиция первого токена (обычно
@@ -1520,14 +1634,21 @@ expr_span :: proc(e: Expr) -> Span {
 		return v.span
 	case ^Match_Expr:
 		return v.span
+	case ^Error_Expr:
+		return v.span
 	}
 	return Span{}
 }
 
-expect :: proc(p: ^Parser, expected_kind: TokenKind, loc := #caller_location) {
+expect :: proc(p: ^Parser, expected_kind: TokenKind) {
 	tok := next_token(p.stream)
-	if tok == nil do fmt.panicf("Синтаксическая ошибка: ожидалось %v, но обнаружен EOF", expected_kind, loc = loc)
-	if tok.kind != expected_kind do fmt.panicf("Синтаксическая ошибка: ожидалось %v, обнаружен %v", expected_kind, tok.kind, loc = loc)
+	if tok == nil {
+		report_parse(p, last_token_span(p.stream), "Синтаксическая ошибка: ожидалось %v, но обнаружен EOF", expected_kind)
+		return
+	}
+	if tok.kind != expected_kind {
+		report_parse(p, tok.span, "Синтаксическая ошибка: ожидалось %v, обнаружен %v", expected_kind, tok.kind)
+	}
 }
 
 consume_semicolon_or_newline :: proc(p: ^Parser) {
@@ -1539,10 +1660,12 @@ consume_semicolon_or_newline :: proc(p: ^Parser) {
 	}
 }
 
-new_int_lit :: proc(data: ^Token) -> Expr {
+new_int_lit :: proc(p: ^Parser, data: ^Token) -> Expr {
 	lit := new(Number_Expr)
 	value, ok := strconv.parse_f64(data.data)
-	if !ok do error("Неверный числовой литерал")
+	if !ok {
+		report_parse(p, data.span, "Синтаксическая ошибка: неверный числовой литерал '%s'", data.data)
+	}
 	lit.value = value
 	lit.span = data.span
 	return lit

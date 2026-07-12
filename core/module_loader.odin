@@ -64,6 +64,7 @@ load_module_recursive :: proc(graph: ^Module_Graph, file_path: string, is_entry:
 		file_id = module.file_id,
 	}
 	module.ast = parse_program(&parser)
+	for d in parser.diagnostics do append(&graph.parse_diagnostics, d)
 
 	graph.modules[module_key] = module
 

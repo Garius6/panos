@@ -12,15 +12,18 @@ import "core:strings"
 // изменение — старые Type_Ctx/Resolver_Ctx от предыдущей версии документа
 // просто перестают быть достижимы и никуда не используются повторно.
 LSP_Document :: struct {
-	uri:     string,
-	source:  string,
-	file_id: u16,
-	prog:    core.Program,
-	res_ctx: core.Resolver_Ctx,
-	tc_ctx:  core.Type_Ctx,
+	uri:              string,
+	source:           string,
+	file_id:          u16,
+	prog:             core.Program,
+	res_ctx:          core.Resolver_Ctx,
+	tc_ctx:           core.Type_Ctx,
+	// Parser — локальная переменная внутри update_document, поэтому её
+	// diagnostics сохраняем сюда отдельно (иначе терялись бы вместе с ней).
+	parse_diagnostics: [dynamic]core.Diagnostic,
 	// Symbol_Id -> все места использования (для find-references/rename).
 	// Не включает span объявления — тот берётся напрямую из symbol_at(...).span.
-	usages:  map[core.Symbol_Id][dynamic]core.Span,
+	usages:           map[core.Symbol_Id][dynamic]core.Span,
 }
 
 LSP_Server :: struct {
@@ -28,14 +31,6 @@ LSP_Server :: struct {
 	next_file_id: u16,
 }
 
-// ВАЖНО (известное ограничение MVP): parse_program/resolve_program по-прежнему
-// используют fmt.panicf на синтаксических/resolve-ошибках (только
-// type_cheker.odin мигрирован на diagnostic accumulation в Стадии 2).
-// Значит синтаксическая ошибка в редактируемом файле уронит весь LSP-процесс.
-// vscode-languageclient по умолчанию перезапускает упавший сервер, так что
-// это не фатально для MVP, но требует отдельной доработки (аналогичная
-// миграция panicf→report для parser.odin/resolver.odin), если понадобится
-// не терять diagnostics/hover-состояние при каждой опечатке.
 run_lsp_server :: proc() {
 	server: LSP_Server
 	server.documents = make(map[string]^LSP_Document)
@@ -140,6 +135,7 @@ update_document :: proc(server: ^LSP_Server, uri: string, text: string) {
 		file_id = doc.file_id,
 	}
 	doc.prog = core.parse_program(&parser)
+	doc.parse_diagnostics = parser.diagnostics
 
 	doc.res_ctx = core.new_resolver_ctx()
 	core.resolve_program(&doc.res_ctx, doc.prog)
@@ -169,19 +165,25 @@ build_usages :: proc(doc: ^LSP_Document) {
 }
 
 publish_diagnostics :: proc(doc: ^LSP_Document) {
-	diags := make([dynamic]json.Value, 0, len(doc.tc_ctx.diagnostics))
-	for d in doc.tc_ctx.diagnostics {
-		append(
-			&diags,
-			json.Value(
-				json.Object {
-					"range" = lsp_range_json(doc.source, d.span.start, d.span.end),
-					"severity" = json.Integer(1), // Error
-					"message" = json.String(d.message),
-				},
-			),
-		)
+	total := len(doc.parse_diagnostics) + len(doc.res_ctx.diagnostics) + len(doc.tc_ctx.diagnostics)
+	diags := make([dynamic]json.Value, 0, total)
+	append_diags :: proc(diags: ^[dynamic]json.Value, source: string, list: [dynamic]core.Diagnostic) {
+		for d in list {
+			append(
+				diags,
+				json.Value(
+					json.Object {
+						"range" = lsp_range_json(source, d.span.start, d.span.end),
+						"severity" = json.Integer(1), // Error
+						"message" = json.String(d.message),
+					},
+				),
+			)
+		}
 	}
+	append_diags(&diags, doc.source, doc.parse_diagnostics)
+	append_diags(&diags, doc.source, doc.res_ctx.diagnostics)
+	append_diags(&diags, doc.source, doc.tc_ctx.diagnostics)
 
 	send_notification(
 		"textDocument/publishDiagnostics",

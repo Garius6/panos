@@ -71,6 +71,8 @@ decl_span :: proc(d: core.Decls) -> core.Span {
 		return v.span
 	case ^core.Enum_Decl:
 		return v.span
+	case ^core.Error_Decl:
+		return v.span
 	}
 	return core.Span{}
 }
@@ -265,5 +267,6 @@ collect_pattern_binders :: proc(res: ^core.Resolver_Ctx, pattern: core.Pattern, 
 		if sym, ok := res.pattern_binders[p]; ok do append(out, sym)
 	case ^core.Pattern_Constructor:
 		for arg in p.args do collect_pattern_binders(res, arg, out)
+	case ^core.Error_Pattern:
 	}
 }

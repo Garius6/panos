@@ -213,6 +213,11 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 		tag_index = -1,
 	}
 	switch pat in pattern {
+	case ^Error_Pattern:
+		// Уже отрапортовано парсером — трактуем как wildcard, чтобы не
+		// каскадировать вторичные диагностики (exhaustiveness и т.п.).
+		info.span = pat.span
+		info.kind = .Wildcard
 	case ^Pattern_Wildcard:
 		info.span = pat.span
 		info.kind = .Wildcard
@@ -1164,6 +1169,9 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 				resolve_type_node(ctx, n.params[1]),
 			)
 		}
+	case ^Error_Type_Node:
+		// Уже отрапортовано парсером — не дублируем diagnostic.
+		return TY_POISON
 	}
 	return TY_VOID
 }
@@ -1374,7 +1382,7 @@ check_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, expected_return: ^Type) {
 			)
 		}
 
-	case ^Let_Stmt, ^Expr_Stmt, ^Continue_Stmt, ^Break_Stmt:
+	case ^Let_Stmt, ^Expr_Stmt, ^Continue_Stmt, ^Break_Stmt, ^Error_Stmt:
 		infer_stmt(ctx, stmt)
 	}
 }
@@ -1439,6 +1447,9 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 				"Type Error: 'прервать' можно использовать только внутри цикла",
 			)
 		}
+
+	case ^Error_Stmt:
+	// Уже отрапортовано парсером — нечего проверять.
 	}
 	return nil
 }
@@ -1927,6 +1938,10 @@ resolve_variant_ctor :: proc(
 
 infer_ident_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Ident_Expr) -> ^Type {
 	sym_id := ctx.res.node_symbols[expr]
+	if sym_id == INVALID_SYMBOL {
+		// Резолвер уже отрапортовал (undefined variable) — не каскадируем.
+		return TY_POISON
+	}
 	sym := symbol_at(ctx.res.symbol_store, sym_id)
 	if sym.kind == .Module {
 		return report(
@@ -2720,6 +2735,9 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 		t = infer_try_expr(ctx, expr, e)
 	case ^Property_Expr:
 		t = infer_property_expr(ctx, expr, e)
+	case ^Error_Expr:
+		// Уже отрапортовано парсером — не дублируем diagnostic.
+		t = TY_POISON
 	}
 
 	ctx.node_types[expr] = t

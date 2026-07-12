@@ -175,3 +175,95 @@ find_expr_in_program :: proc(prog: core.Program, file_id: u16, offset: u32) -> c
 	}
 	return nil
 }
+
+// Для completion: находит объемлющую top-level декларацию (функцию/impl)
+// по byte offset — без спуска внутрь тела, в отличие от find_expr_in_program.
+find_enclosing_decl :: proc(prog: core.Program, file_id: u16, offset: u32) -> core.Decls {
+	for decl in prog.decls {
+		if span_contains(decl_span(decl), file_id, offset) do return decl
+	}
+	return nil
+}
+
+// --- ЛОКАЛЬНЫЕ СИМВОЛЫ ДЛЯ COMPLETION ---
+// Собирает все Let_Stmt-переменные и pattern-биндеры внутри тела функции
+// (без учёта позиции курсора — MVP слегка over-suggest'ит: предлагает
+// локали из непройденных веток if/match, но не даёт ложных отрицаний).
+
+collect_local_symbols :: proc(res: ^core.Resolver_Ctx, body: [dynamic]core.Stmt, out: ^[dynamic]core.Symbol_Id) {
+	for stmt in body {
+		collect_local_symbols_stmt(res, stmt, out)
+	}
+}
+
+collect_local_symbols_stmt :: proc(res: ^core.Resolver_Ctx, stmt: core.Stmt, out: ^[dynamic]core.Symbol_Id) {
+	if stmt == nil do return
+	#partial switch s in stmt {
+	case ^core.Let_Stmt:
+		if sym, ok := res.stmt_symbols[stmt]; ok do append(out, sym)
+		collect_local_symbols_expr(res, s.value, out)
+	case ^core.Return_Stmt:
+		collect_local_symbols_expr(res, s.value, out)
+	case ^core.Expr_Stmt:
+		collect_local_symbols_expr(res, s.expr, out)
+	}
+}
+
+collect_local_symbols_expr :: proc(res: ^core.Resolver_Ctx, expr: core.Expr, out: ^[dynamic]core.Symbol_Id) {
+	if expr == nil do return
+	#partial switch e in expr {
+	case ^core.Binary_Expr:
+		collect_local_symbols_expr(res, e.left, out)
+		collect_local_symbols_expr(res, e.right, out)
+	case ^core.Unary_Expr:
+		collect_local_symbols_expr(res, e.right, out)
+	case ^core.Call_Expr:
+		collect_local_symbols_expr(res, e.callee, out)
+		for arg in e.args do collect_local_symbols_expr(res, arg, out)
+	case ^core.If_Expr:
+		collect_local_symbols_expr(res, e.condition, out)
+		for s in e.then_branch do collect_local_symbols_stmt(res, s, out)
+		for s in e.else_branch do collect_local_symbols_stmt(res, s, out)
+	case ^core.While_Expr:
+		collect_local_symbols_expr(res, e.condition, out)
+		for s in e.body do collect_local_symbols_stmt(res, s, out)
+	case ^core.Tuple_Expr:
+		for el in e.elements do collect_local_symbols_expr(res, el, out)
+	case ^core.Property_Expr:
+		collect_local_symbols_expr(res, e.object, out)
+	case ^core.Lambda_Expr:
+		if args, ok := res.lambda_args[expr]; ok {
+			for a in args do append(out, a)
+		}
+		for s in e.body do collect_local_symbols_stmt(res, s, out)
+	case ^core.Array_Expr:
+		for el in e.elements do collect_local_symbols_expr(res, el, out)
+	case ^core.Map_Expr:
+		for entry in e.entries {
+			collect_local_symbols_expr(res, entry.key, out)
+			collect_local_symbols_expr(res, entry.value, out)
+		}
+	case ^core.Index_Expr:
+		collect_local_symbols_expr(res, e.object, out)
+		collect_local_symbols_expr(res, e.index, out)
+	case ^core.Try_Expr:
+		collect_local_symbols_expr(res, e.value, out)
+	case ^core.Match_Expr:
+		collect_local_symbols_expr(res, e.subject, out)
+		for arm in e.arms {
+			collect_pattern_binders(res, arm.pattern, out)
+			for s in arm.body do collect_local_symbols_stmt(res, s, out)
+		}
+	}
+}
+
+collect_pattern_binders :: proc(res: ^core.Resolver_Ctx, pattern: core.Pattern, out: ^[dynamic]core.Symbol_Id) {
+	switch p in pattern {
+	case ^core.Pattern_Wildcard:
+	case ^core.Pattern_Literal:
+	case ^core.Pattern_Ident:
+		if sym, ok := res.pattern_binders[p]; ok do append(out, sym)
+	case ^core.Pattern_Constructor:
+		for arg in p.args do collect_pattern_binders(res, arg, out)
+	}
+}

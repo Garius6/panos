@@ -1,7 +1,9 @@
 # Panos — Задачи
 
-**Текущая стадия**: готовы 0, 2, 3, 6 (вне очереди). Следующие разблокированные:
-1 (GC), 4 (FFI-A), 5 (DOD Волна 2 + LSP расширение, требует 3 ✓), 7 (Generics, требует 6 ✓).
+**Текущая стадия**: готовы 0, 2, 3, 6 (вне очереди), 5 частично (Symbol_Id +
+LSP completions/references/rename; Type_Id отложен). Следующие
+разблокированные: 1 (GC), 4 (FFI-A), 7 (Generics, требует 6 ✓). Type_Id/SoA
+(остаток Стадии 5) — отдельная перформансная задача без явного триггера.
 **Roadmap**: [ROADMAP.md](ROADMAP.md)
 
 Работа отслеживается через mkdnflow.nvim в Neovim. `<CR>` на строке
@@ -196,19 +198,43 @@ Prerequisite: нет. Независимо.
 
 ---
 
-## Стадия 5 — DOD Волна 2 + LSP расширение
+## Стадия 5 — DOD Волна 2 + LSP расширение (частично)
 
 Refs: [ROADMAP §Стадия 5](ROADMAP.md#стадия-5--dod-волна-2--lsp-расширение-2-3-недели).
 
 Prerequisite: Стадия 3.
 
-- [ ] `Symbol_Id :: distinct u32` + `Symbol_Store` SoA
-- [ ] Migration `^Symbol` → `Symbol_Id`
-- [ ] `Type_Id :: distinct u32` + `Type_Store` SoA
-- [ ] Migration `^Type` → `Type_Id`
-- [ ] LSP: `textDocument/completion`
-- [ ] LSP: `textDocument/references` через cross-reference table
-- [ ] LSP: `textDocument/rename` через WorkspaceEdit
+- [x] `Symbol_Id :: distinct u32` + `Symbol_Store` — реализовано как
+      `[dynamic]Symbol` (AoS) + индекс, а не колоночный SoA из ROADMAP
+      (columns: names/kinds/scope_ids/...). Даёт стабильные ID и дешёвые
+      Symbol_Id→usage таблицы (главная цель LSP-фич ниже) без риска
+      переписывать unification-семантику; полный SoA отложен вместе с
+      Type_Id (см. ниже) как чисто перформансная доработка
+- [x] Migration `^Symbol` → `Symbol_Id` в resolver/type_cheker/compiler/lsp
+      (INVALID_SYMBOL sentinel = Symbol_Id(0), симметрично Interned(0))
+- [ ] `Type_Id :: distinct u32` + `Type_Store` SoA — **отложено**. `Type` —
+      рекурсивная структура с pointer-identity семантикой (unify через `==`,
+      mutable `binding` для InferVar union-find, глобальные синглтоны
+      TY_NUM/TY_POISON), используется в 150+ местах 2700-строчного
+      type_cheker.odin. Перевод на ID-store — не переименование, а
+      переписывание модели вывода типов. Не блокер для LSP-фич ниже
+      (completions/references/rename нужен только Symbol_Id)
+- [ ] Migration `^Type` → `Type_Id` — отложено вместе с предыдущим пунктом
+- [x] LSP: `textDocument/completion` — глобальные символы модуля + параметры
+      и локали объемлющей функции/метода (`lsp/lsp_position.odin:
+      collect_local_symbols`). MVP: без точной блочной видимости по
+      позиции курсора (over-suggest — предлагает локали из непройденных
+      веток if/match, но не даёт ложных отрицаний)
+- [x] LSP: `textDocument/references` через `Symbol_Id -> [dynamic]Span`
+      (`lsp/lsp_server.odin: build_usages`, один проход по node_symbols
+      при каждом реparse'е документа)
+- [x] LSP: `textDocument/rename` через WorkspaceEdit — та же usage-таблица,
+      что и references. Как и go-to-definition: single-file, без графа
+      импортов (межфайловый rename не входит в MVP)
+
+Verification: `odin test ./core` 38/38, `test.ps` без регрессий, both
+binaries (`panos`, `panos-lsp`) билдятся чисто, JSON-RPC round-trip
+проверен Python-клиентом на completion/references/rename.
 
 ---
 

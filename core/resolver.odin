@@ -21,11 +21,40 @@ Symbol :: struct {
 	module:            ^Module,
 	is_exported:       bool,
 	decl:              Decls,
-	owner_type:        ^Symbol,
+	owner_type:        Symbol_Id,
 	is_pattern_binder: bool,
 	// Span объявления — для LSP go-to-definition. Zero-value у builtin'ов
 	// (нет исходника, куда прыгать).
 	span:              Span,
+}
+
+// Стабильный хэндл на Symbol вместо ^Symbol — индекс в Symbol_Store. Даёт
+// дешёвые cross-reference таблицы (Symbol_Id -> [dynamic]Usage_Site для LSP
+// find-references/rename), не завязанные на адрес объекта в памяти.
+Symbol_Id :: distinct u32
+
+// Индекс 0 зарезервирован под sentinel (как Interned(0) под ""): нет символа.
+INVALID_SYMBOL :: Symbol_Id(0)
+
+Symbol_Store :: struct {
+	symbols: [dynamic]Symbol,
+}
+
+// ^Symbol_Store всегда живёт в куче (см. new_symbol_store) — это позволяет
+// свободно копировать содержащие его структуры (Resolver_Ctx, Module_Graph)
+// по значению, не боясь расхождения backing-массива.
+new_symbol_store :: proc() -> ^Symbol_Store {
+	store := new(Symbol_Store)
+	store.symbols = make([dynamic]Symbol)
+	append(&store.symbols, Symbol{}) // индекс 0 = INVALID_SYMBOL sentinel
+	return store
+}
+
+// Возвращает копию Symbol по значению — Symbol не хранит крупных встроенных
+// массивов, копия дешева и безопасна (не зависит от того, реаллоцировался ли
+// backing-массив store между созданием символа и чтением).
+symbol_at :: proc(store: ^Symbol_Store, id: Symbol_Id) -> Symbol {
+	return store.symbols[id]
 }
 
 Module :: struct {
@@ -33,7 +62,7 @@ Module :: struct {
 	dir:     string,
 	ast:     Program,
 	scope:   ^Scope,
-	exports: map[Interned]^Symbol,
+	exports: map[Interned]Symbol_Id,
 	file_id: u16,
 	source:  string,
 }
@@ -42,7 +71,8 @@ Module_Graph :: struct {
 	modules:      map[string]^Module,
 	order:        [dynamic]^Module,
 	loading:      map[string]bool,
-	symbol_types: map[^Symbol]^Type,
+	symbol_types: map[Symbol_Id]^Type,
+	symbol_store: ^Symbol_Store,
 	// file_id → путь/исходник, нужно чтобы превратить Span в line:col при
 	// печати diagnostic'а (Span хранит только file_id, не путь).
 	file_paths:   map[u16]string,
@@ -51,7 +81,7 @@ Module_Graph :: struct {
 
 Scope :: struct {
 	parent:  ^Scope,
-	symbols: map[Interned]^Symbol,
+	symbols: map[Interned]Symbol_Id,
 }
 
 new_module_graph :: proc() -> Module_Graph {
@@ -59,7 +89,8 @@ new_module_graph :: proc() -> Module_Graph {
 		modules = make(map[string]^Module),
 		order = make([dynamic]^Module),
 		loading = make(map[string]bool),
-		symbol_types = make(map[^Symbol]^Type),
+		symbol_types = make(map[Symbol_Id]^Type),
+		symbol_store = new_symbol_store(),
 		file_paths = make(map[u16]string),
 		file_sources = make(map[u16]string),
 	}
@@ -200,26 +231,40 @@ resolve_existing_import_path :: proc(import_spec: string, importer_dir: string) 
 }
 
 new_symbol :: proc(
+	store: ^Symbol_Store,
 	name: string,
 	kind: Symbol_Kind,
 	module: ^Module,
 	exported: bool = false,
 	decl: Decls = nil,
 	span: Span = {},
-) -> ^Symbol {
-	sym := new(Symbol)
-	sym.name = intern(name)
-	sym.kind = kind
-	sym.module = module
-	sym.is_exported = exported
-	sym.decl = decl
-	sym.span = span
+	owner_type: Symbol_Id = INVALID_SYMBOL,
+	is_pattern_binder: bool = false,
+	// Для kind == .Module: символ должен указывать на импортированный модуль,
+	// а не на модуль-импортёр (тот нужен только для вычисления full_name).
+	module_override: ^Module = nil,
+) -> Symbol_Id {
+	sym := Symbol {
+		name              = intern(name),
+		kind              = kind,
+		module            = module,
+		is_exported       = exported,
+		decl              = decl,
+		span              = span,
+		owner_type        = owner_type,
+		is_pattern_binder = is_pattern_binder,
+	}
 	if module != nil && len(module.path) > 0 {
 		sym.full_name = intern(fmt.tprintf("%s::%s", module.path, name))
 	} else {
 		sym.full_name = sym.name
 	}
-	return sym
+	if module_override != nil {
+		sym.module = module_override
+	}
+	id := Symbol_Id(len(store.symbols))
+	append(&store.symbols, sym)
+	return id
 }
 
 Resolver_Ctx :: struct {
@@ -227,21 +272,22 @@ Resolver_Ctx :: struct {
 	global_scope:    ^Scope,
 	current_module:  ^Module,
 	module_graph:    ^Module_Graph,
-	symbol_types:    map[^Symbol]^Type,
-	pattern_binders: map[^Pattern_Ident]^Symbol,
+	symbol_store:    ^Symbol_Store,
+	symbol_types:    map[Symbol_Id]^Type,
+	pattern_binders: map[^Pattern_Ident]Symbol_Id,
 
 	// Side Tables
-	decl_symbols:    map[Decls]^Symbol,
-	stmt_symbols:    map[Stmt]^Symbol,
-	node_symbols:    map[Expr]^Symbol,
-	func_args:       map[Decls][dynamic]^Symbol,
-	lambda_args:     map[Expr][dynamic]^Symbol,
+	decl_symbols:    map[Decls]Symbol_Id,
+	stmt_symbols:    map[Stmt]Symbol_Id,
+	node_symbols:    map[Expr]Symbol_Id,
+	func_args:       map[Decls][dynamic]Symbol_Id,
+	lambda_args:     map[Expr][dynamic]Symbol_Id,
 }
 
 push_scope :: proc(resolver: ^Resolver_Ctx) {
 	new_scope := new(Scope)
 	new_scope.parent = resolver.current_scope
-	new_scope.symbols = make(map[Interned]^Symbol)
+	new_scope.symbols = make(map[Interned]Symbol_Id)
 	resolver.current_scope = new_scope
 }
 
@@ -262,18 +308,19 @@ install_standard_symbols :: proc(ctx: ^Resolver_Ctx) {
 		"паника",
 	}
 	for name in names {
-		sym := new_symbol(name, .Builtin, nil)
-		ctx.current_scope.symbols[sym.name] = sym
+		sym := new_symbol(ctx.symbol_store, name, .Builtin, nil)
+		ctx.current_scope.symbols[intern(name)] = sym
 	}
 }
 
 new_resolver_ctx :: proc() -> Resolver_Ctx {
 	ctx := Resolver_Ctx {
-		symbol_types    = make(map[^Symbol]^Type),
-		stmt_symbols    = make(map[Stmt]^Symbol),
-		decl_symbols    = make(map[Decls]^Symbol),
-		node_symbols    = make(map[Expr]^Symbol),
-		pattern_binders = make(map[^Pattern_Ident]^Symbol),
+		symbol_store    = new_symbol_store(),
+		symbol_types    = make(map[Symbol_Id]^Type),
+		stmt_symbols    = make(map[Stmt]Symbol_Id),
+		decl_symbols    = make(map[Decls]Symbol_Id),
+		node_symbols    = make(map[Expr]Symbol_Id),
+		pattern_binders = make(map[^Pattern_Ident]Symbol_Id),
 	}
 
 	push_scope(&ctx)
@@ -284,14 +331,31 @@ new_resolver_ctx :: proc() -> Resolver_Ctx {
 }
 
 new_module_resolver_ctx :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
-	ctx := new_resolver_ctx()
+	// Не через new_resolver_ctx(): она ставит собственный свежий
+	// symbol_store и сразу устанавливает в него builtin'ы — если потом
+	// подменить symbol_store на graph.symbol_store, Symbol_Id builtin'ов
+	// (уже записанные в scope) будут указывать в чужой, отброшенный store
+	// (id's коллизия — напр. "Есть" получало тот же #2, что и первая
+	// пользовательская переменная модуля). Строим ctx сразу на
+	// graph.symbol_store, чтобы install_standard_symbols писала builtin'ы
+	// в тот же store, что будет использоваться дальше.
+	ctx := Resolver_Ctx {
+		symbol_store    = graph.symbol_store,
+		symbol_types    = graph.symbol_types,
+		stmt_symbols    = make(map[Stmt]Symbol_Id),
+		decl_symbols    = make(map[Decls]Symbol_Id),
+		node_symbols    = make(map[Expr]Symbol_Id),
+		pattern_binders = make(map[^Pattern_Ident]Symbol_Id),
+	}
+	push_scope(&ctx)
+	ctx.global_scope = ctx.current_scope
+	install_standard_symbols(&ctx)
 	ctx.module_graph = graph
 	ctx.current_module = module
-	ctx.symbol_types = graph.symbol_types
 	return ctx
 }
 
-lookup_symbol :: proc(s: ^Scope, name: Interned) -> ^Symbol {
+lookup_symbol :: proc(s: ^Scope, name: Interned) -> Symbol_Id {
 	sym, found := s.symbols[name]
 	if found {
 		return sym
@@ -301,7 +365,7 @@ lookup_symbol :: proc(s: ^Scope, name: Interned) -> ^Symbol {
 		return lookup_symbol(s.parent, name)
 	}
 
-	return nil
+	return INVALID_SYMBOL
 }
 
 register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls) {
@@ -321,80 +385,94 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 		if alias == "" {
 			alias = module_base_name(import_path)
 		}
-		if intern(alias) in module.scope.symbols {
+		alias_id := intern(alias)
+		if alias_id in module.scope.symbols {
 			fmt.panicf("Resolve Error: символ '%s' уже объявлен", alias)
 		}
 
-		sym := new_symbol(alias, .Module, module, span = d.span)
-		sym.module = imported_module
-		module.scope.symbols[sym.name] = sym
+		sym := new_symbol(ctx.symbol_store, alias, .Module, module, span = d.span, module_override = imported_module)
+		module.scope.symbols[alias_id] = sym
 
 	case ^Function_Decl:
-		sym := new_symbol(d.name, .Function, module, d.is_exported, decl, d.span)
-		if sym.name in module.scope.symbols {
-			fmt.panicf("Resolve Error: символ '%s' уже объявлен", resolve_interned(sym.name))
+		sym := new_symbol(ctx.symbol_store, d.name, .Function, module, d.is_exported, decl, d.span)
+		name_id := intern(d.name)
+		if name_id in module.scope.symbols {
+			fmt.panicf("Resolve Error: символ '%s' уже объявлен", d.name)
 		}
-		module.scope.symbols[sym.name] = sym
+		module.scope.symbols[name_id] = sym
 		ctx.decl_symbols[decl] = sym
 		if d.is_exported {
-			module.exports[sym.name] = sym
+			module.exports[name_id] = sym
 		}
 
 	case ^Struct_Decl:
-		sym := new_symbol(d.name, .Type, module, d.is_exported, decl, d.span)
-		if sym.name in module.scope.symbols {
-			fmt.panicf("Resolve Error: символ '%s' уже объявлен", resolve_interned(sym.name))
+		sym := new_symbol(ctx.symbol_store, d.name, .Type, module, d.is_exported, decl, d.span)
+		name_id := intern(d.name)
+		if name_id in module.scope.symbols {
+			fmt.panicf("Resolve Error: символ '%s' уже объявлен", d.name)
 		}
-		module.scope.symbols[sym.name] = sym
+		module.scope.symbols[name_id] = sym
 		ctx.decl_symbols[decl] = sym
 		if d.is_exported {
-			module.exports[sym.name] = sym
+			module.exports[name_id] = sym
 		}
 
 	case ^Interface_Decl:
-		sym := new_symbol(d.name, .Type, module, d.is_exported, decl, d.span)
-		if sym.name in module.scope.symbols {
-			fmt.panicf("Resolve Error: символ '%s' уже объявлен", resolve_interned(sym.name))
+		sym := new_symbol(ctx.symbol_store, d.name, .Type, module, d.is_exported, decl, d.span)
+		name_id := intern(d.name)
+		if name_id in module.scope.symbols {
+			fmt.panicf("Resolve Error: символ '%s' уже объявлен", d.name)
 		}
-		module.scope.symbols[sym.name] = sym
+		module.scope.symbols[name_id] = sym
 		ctx.decl_symbols[decl] = sym
 		if d.is_exported {
-			module.exports[sym.name] = sym
+			module.exports[name_id] = sym
 		}
 
 	case ^Impl_Decl:
 		for m in d.methods {
-			sym := new_symbol(m.name, .Function, module, false, m, m.span)
-			if sym.name in module.scope.symbols {
-				fmt.panicf("Resolve Error: символ '%s' уже объявлен", resolve_interned(sym.name))
+			sym := new_symbol(ctx.symbol_store, m.name, .Function, module, false, m, m.span)
+			name_id := intern(m.name)
+			if name_id in module.scope.symbols {
+				fmt.panicf("Resolve Error: символ '%s' уже объявлен", m.name)
 			}
-			module.scope.symbols[sym.name] = sym
+			module.scope.symbols[name_id] = sym
 			ctx.decl_symbols[m] = sym
 		}
 
 	case ^Enum_Decl:
-		type_sym := new_symbol(d.name, .Type, module, d.is_exported, decl, d.span)
-		if type_sym.name in module.scope.symbols {
-			fmt.panicf("Resolve Error: символ '%s' уже объявлен", resolve_interned(type_sym.name))
+		type_name_id := intern(d.name)
+		type_sym := new_symbol(ctx.symbol_store, d.name, .Type, module, d.is_exported, decl, d.span)
+		if type_name_id in module.scope.symbols {
+			fmt.panicf("Resolve Error: символ '%s' уже объявлен", d.name)
 		}
-		module.scope.symbols[type_sym.name] = type_sym
+		module.scope.symbols[type_name_id] = type_sym
 		ctx.decl_symbols[decl] = type_sym
 		if d.is_exported {
-			module.exports[type_sym.name] = type_sym
+			module.exports[type_name_id] = type_sym
 		}
 
 		for variant in d.variants {
-			if intern(variant.name) in module.scope.symbols {
+			variant_name_id := intern(variant.name)
+			if variant_name_id in module.scope.symbols {
 				fmt.panicf(
 					"Resolve Error: имя варианта '%s' конфликтует с уже объявленным символом в модуле",
 					variant.name,
 				)
 			}
-			variant_sym := new_symbol(variant.name, .Enum_Variant, module, d.is_exported, decl, variant.span)
-			variant_sym.owner_type = type_sym
-			module.scope.symbols[variant_sym.name] = variant_sym
+			variant_sym := new_symbol(
+				ctx.symbol_store,
+				variant.name,
+				.Enum_Variant,
+				module,
+				d.is_exported,
+				decl,
+				variant.span,
+				owner_type = type_sym,
+			)
+			module.scope.symbols[variant_name_id] = variant_sym
 			if d.is_exported {
-				module.exports[variant_sym.name] = variant_sym
+				module.exports[variant_name_id] = variant_sym
 			}
 		}
 	}
@@ -404,7 +482,7 @@ resolve_module :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
 	ctx := new_module_resolver_ctx(graph, module)
 	module.scope = ctx.global_scope
 	if module.exports == nil {
-		module.exports = make(map[Interned]^Symbol)
+		module.exports = make(map[Interned]Symbol_Id)
 	}
 
 	for decl in module.ast.decls {
@@ -418,10 +496,10 @@ resolve_module :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
 		case ^Impl_Decl:
 			for m in d.methods {
 				push_scope(&ctx)
-				args_syms := make([dynamic]^Symbol)
+				args_syms := make([dynamic]Symbol_Id)
 				for arg in m.args {
-					sym := new_symbol(arg.name, .Variable, module, span = arg.span)
-					ctx.current_scope.symbols[sym.name] = sym
+					sym := new_symbol(ctx.symbol_store, arg.name, .Variable, module, span = arg.span)
+					ctx.current_scope.symbols[intern(arg.name)] = sym
 					append(&args_syms, sym)
 				}
 				ctx.func_args[m] = args_syms
@@ -432,10 +510,10 @@ resolve_module :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
 		case ^Function_Decl:
 			push_scope(&ctx)
 
-			args_syms := make([dynamic]^Symbol)
+			args_syms := make([dynamic]Symbol_Id)
 			for arg in d.args {
-				sym := new_symbol(arg.name, .Variable, module, span = arg.span)
-				ctx.current_scope.symbols[sym.name] = sym
+				sym := new_symbol(ctx.symbol_store, arg.name, .Variable, module, span = arg.span)
+				ctx.current_scope.symbols[intern(arg.name)] = sym
 				append(&args_syms, sym)
 			}
 			ctx.func_args[decl] = args_syms
@@ -459,7 +537,7 @@ resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program) {
 		dir     = "",
 		ast     = prog,
 		scope   = nil,
-		exports = make(map[Interned]^Symbol),
+		exports = make(map[Interned]Symbol_Id),
 	}
 	if ctx.global_scope == nil {
 		push_scope(ctx)
@@ -487,15 +565,21 @@ resolve_pattern :: proc(ctx: ^Resolver_Ctx, pattern: Pattern) {
 			// превращает "_" в Pattern_Wildcard.
 			return
 		}
-		if sym := lookup_symbol(ctx.current_scope, intern(p.name)); sym != nil &&
-		   sym.kind == .Enum_Variant {
+		sym := lookup_symbol(ctx.current_scope, intern(p.name))
+		if sym != INVALID_SYMBOL && symbol_at(ctx.symbol_store, sym).kind == .Enum_Variant {
 			// Zero-field constructor pattern; захватывать нечего.
 			ctx.pattern_binders[p] = sym
 		} else {
 			// Обычный биндер.
-			binder := new_symbol(p.name, .Variable, ctx.current_module, span = p.span)
-			binder.is_pattern_binder = true
-			ctx.current_scope.symbols[binder.name] = binder
+			binder := new_symbol(
+				ctx.symbol_store,
+				p.name,
+				.Variable,
+				ctx.current_module,
+				span = p.span,
+				is_pattern_binder = true,
+			)
+			ctx.current_scope.symbols[intern(p.name)] = binder
 			ctx.pattern_binders[p] = binder
 		}
 	case ^Pattern_Constructor:
@@ -514,11 +598,12 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 	case ^Let_Stmt:
 		resolve_expr(ctx, s.value)
 
-		sym := new_symbol(s.name, .Variable, ctx.current_module, span = s.span)
-		if intern(s.name) in ctx.current_scope.symbols {
+		sym := new_symbol(ctx.symbol_store, s.name, .Variable, ctx.current_module, span = s.span)
+		name_id := intern(s.name)
+		if name_id in ctx.current_scope.symbols {
 			fmt.panicf("Имя %s уже объявлено", s.name)
 		}
-		ctx.current_scope.symbols[sym.name] = sym
+		ctx.current_scope.symbols[name_id] = sym
 
 		// 4. Кэшируем создание в Side Table
 		ctx.stmt_symbols[stmt] = sym
@@ -540,7 +625,7 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 	switch e in expr {
 	case ^Ident_Expr:
 		sym := lookup_symbol(ctx.current_scope, e.name)
-		if sym == nil {
+		if sym == INVALID_SYMBOL {
 			fmt.panicf("Resolve Error: undefined variable '%s'", resolve_interned(e.name))
 		}
 		// Кэшируем использование в Side Table
@@ -585,19 +670,20 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		}
 	case ^Property_Expr:
 		resolve_expr(ctx, e.object)
-		obj_sym: ^Symbol
+		obj_sym: Symbol_Id
 		if obj_ident, ok := e.object.(^Ident_Expr); ok {
 			obj_sym = lookup_symbol(ctx.current_scope, obj_ident.name)
 		} else {
 			obj_sym = ctx.node_symbols[e.object]
 		}
-		if obj_sym != nil {
-			if obj_sym.kind == .Module {
-				imported_module := obj_sym.module
+		if obj_sym != INVALID_SYMBOL {
+			obj := symbol_at(ctx.symbol_store, obj_sym)
+			if obj.kind == .Module {
+				imported_module := obj.module
 				if imported_module == nil {
 					fmt.panicf(
 						"Resolve Error: модуль '%s' не найден",
-						resolve_interned(obj_sym.name),
+						resolve_interned(obj.name),
 					)
 				}
 				if export_sym, found := imported_module.exports[intern(e.property)]; found {
@@ -606,41 +692,42 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 				}
 				fmt.panicf(
 					"Resolve Error: модуль '%s' не экспортирует '%s'",
-					resolve_interned(obj_sym.name),
+					resolve_interned(obj.name),
 					e.property,
 				)
 			}
-			if obj_sym.kind == .Type {
-				if _, is_enum := obj_sym.decl.(^Enum_Decl); is_enum {
-					owner_module := obj_sym.module
+			if obj.kind == .Type {
+				if _, is_enum := obj.decl.(^Enum_Decl); is_enum {
+					owner_module := obj.module
 					if owner_module == nil ||
 					   owner_module.scope == nil {
 						fmt.panicf(
 							"Resolve Error: модуль-владелец типа '%s' недоступен",
-							resolve_interned(obj_sym.name),
+							resolve_interned(obj.name),
 						)
 					}
-					variant_sym, found := owner_module.scope.symbols[intern(e.property)]
+					variant_id, found := owner_module.scope.symbols[intern(e.property)]
+					variant := symbol_at(ctx.symbol_store, variant_id)
 					if !found ||
-					   variant_sym.kind != .Enum_Variant ||
-					   variant_sym.owner_type != obj_sym {
+					   variant.kind != .Enum_Variant ||
+					   variant.owner_type != obj_sym {
 						fmt.panicf(
 							"Resolve Error: у типа '%s' нет варианта '%s'",
-							resolve_interned(obj_sym.name),
+							resolve_interned(obj.name),
 							e.property,
 						)
 					}
-					ctx.node_symbols[expr] = variant_sym
+					ctx.node_symbols[expr] = variant_id
 					return
 				}
 			}
 		}
 	case ^Lambda_Expr:
 		push_scope(ctx)
-		args_syms := make([dynamic]^Symbol)
+		args_syms := make([dynamic]Symbol_Id)
 		for arg in e.args {
-			sym := new_symbol(arg.name, .Variable, ctx.current_module, span = arg.span)
-			ctx.current_scope.symbols[sym.name] = sym
+			sym := new_symbol(ctx.symbol_store, arg.name, .Variable, ctx.current_module, span = arg.span)
+			ctx.current_scope.symbols[intern(arg.name)] = sym
 			append(&args_syms, sym)
 		}
 		ctx.lambda_args[expr] = args_syms
@@ -679,7 +766,8 @@ print_resolver_ctx :: proc(ctx: ^Resolver_Ctx) {
 		"\n[1] ДЕКЛАРАЦИИ (decl_symbols) - Места создания глобальных символов:",
 	)
 	if len(ctx.decl_symbols) == 0 do fmt.println("  (пусто)")
-	for decl, sym in ctx.decl_symbols {
+	for decl, sym_id in ctx.decl_symbols {
+		sym := symbol_at(ctx.symbol_store, sym_id)
 		#partial switch d in decl {
 		case ^Import_Decl:
 			fmt.printf(
@@ -689,19 +777,18 @@ print_resolver_ctx :: proc(ctx: ^Resolver_Ctx) {
 			)
 		case ^Impl_Decl:
 			fmt.printf(
-				"  [STRUCT] '%s' -> %s (%p)\n",
+				"  [STRUCT] '%s' -> %s (#%d)\n",
 				fmt.tprintf("%s:%s", d.target_type, d.interface_name),
 				resolve_interned(sym.full_name),
-				sym,
+				sym_id,
 			)
 
 		case ^Struct_Decl:
-			fmt.printf("  [STRUCT] '%s' -> %s (%p)\n", d.name, resolve_interned(sym.full_name), sym)
+			fmt.printf("  [STRUCT] '%s' -> %s (#%d)\n", d.name, resolve_interned(sym.full_name), sym_id)
 		case ^Interface_Decl:
-			fmt.printf("  [INTERFACE] '%s' -> %s (%p)\n", d.name, resolve_interned(sym.full_name), sym)
+			fmt.printf("  [INTERFACE] '%s' -> %s (#%d)\n", d.name, resolve_interned(sym.full_name), sym_id)
 		case ^Function_Decl:
-			// %p выведет уникальный адрес объекта Symbol (например, 0x14000123450)
-			fmt.printf("  [FUNC] '%s' -> %s (%p)\n", d.name, resolve_interned(sym.full_name), sym)
+			fmt.printf("  [FUNC] '%s' -> %s (#%d)\n", d.name, resolve_interned(sym.full_name), sym_id)
 		}
 	}
 
@@ -709,10 +796,11 @@ print_resolver_ctx :: proc(ctx: ^Resolver_Ctx) {
 		"\n[2] ЛОКАЛЬНЫЕ ПЕРЕМЕННЫЕ (stmt_symbols) - Места создания локальных символов:",
 	)
 	if len(ctx.stmt_symbols) == 0 do fmt.println("  (пусто)")
-	for stmt, sym in ctx.stmt_symbols {
+	for stmt, sym_id in ctx.stmt_symbols {
+		sym := symbol_at(ctx.symbol_store, sym_id)
 		#partial switch s in stmt {
 		case ^Let_Stmt:
-			fmt.printf("  [LET]  '%s' -> %s (%p)\n", s.name, resolve_interned(sym.full_name), sym)
+			fmt.printf("  [LET]  '%s' -> %s (#%d)\n", s.name, resolve_interned(sym.full_name), sym_id)
 		}
 	}
 
@@ -720,14 +808,15 @@ print_resolver_ctx :: proc(ctx: ^Resolver_Ctx) {
 		"\n[3] ИСПОЛЬЗОВАНИЯ (node_symbols) - Куда ссылаются узлы AST:",
 	)
 	if len(ctx.node_symbols) == 0 do fmt.println("  (пусто)")
-	for expr, sym in ctx.node_symbols {
+	for expr, sym_id in ctx.node_symbols {
+		sym := symbol_at(ctx.symbol_store, sym_id)
 		#partial switch e in expr {
 		case ^Ident_Expr:
 			fmt.printf(
-				"  [EXPR] Идентификатор '%s' -> %s (%p)\n",
+				"  [EXPR] Идентификатор '%s' -> %s (#%d)\n",
 				resolve_interned(e.name),
 				resolve_interned(sym.full_name),
-				sym,
+				sym_id,
 			)
 		}
 	}

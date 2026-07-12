@@ -47,7 +47,7 @@ load_module_recursive :: proc(graph: ^Module_Graph, file_path: string, is_entry:
 	} else {
 		module.path = module_key
 	}
-	module.exports = make(map[Interned]^Symbol)
+	module.exports = make(map[Interned]Symbol_Id)
 	module.file_id = u16(len(graph.modules))
 
 	source := read_file_text(module_key)

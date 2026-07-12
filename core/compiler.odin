@@ -76,7 +76,7 @@ Compiled_Function :: struct {
 }
 
 Local :: struct {
-	symbol: ^Symbol, // Берем из Resolver_Ctx
+	symbol: Symbol_Id, // Берем из Resolver_Ctx
 	depth:  int,
 }
 
@@ -85,8 +85,9 @@ Loop_Context :: struct {
 	break_jumps:     [dynamic]int,
 }
 
-symbol_registry_key :: proc(sym: ^Symbol) -> string {
-	if sym == nil do return ""
+symbol_registry_key :: proc(store: ^Symbol_Store, id: Symbol_Id) -> string {
+	if id == INVALID_SYMBOL do return ""
+	sym := symbol_at(store, id)
 	// Interned(0) зарезервирован под "" — так же, как раньше `len(...) > 0`
 	// отличал заданный full_name от незаполненного.
 	if sym.full_name != Interned(0) do return resolve_interned(sym.full_name)
@@ -232,7 +233,7 @@ compile_program :: proc(
 		// Импорты не порождают исполняемый код.
 		case ^Function_Decl:
 			fn := new(Compiled_Function)
-			fn.name = symbol_registry_key(res.decl_symbols[decl])
+			fn.name = symbol_registry_key(res.symbol_store, res.decl_symbols[decl])
 			func_type := tc.res.symbol_types[res.decl_symbols[decl]]
 			fn.returns_value = prune_type(func_type.return_type) != TY_VOID
 			// Инициализируем массивы функции
@@ -241,7 +242,7 @@ compile_program :: proc(
 			registry_ptr^[fn.name] = fn
 		case ^Impl_Decl:
 			for m in d.methods {
-				fn := new(Compiled_Function); fn.name = symbol_registry_key(res.decl_symbols[m])
+				fn := new(Compiled_Function); fn.name = symbol_registry_key(res.symbol_store, res.decl_symbols[m])
 				func_type := tc.res.symbol_types[res.decl_symbols[m]]
 				fn.returns_value = prune_type(func_type.return_type) != TY_VOID
 				fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
@@ -257,7 +258,7 @@ compile_program :: proc(
 		case ^Function_Decl:
 			ctx := Compiler {
 				registry         = registry_ptr,
-				current_function = registry_ptr^[symbol_registry_key(res.decl_symbols[decl])],
+				current_function = registry_ptr^[symbol_registry_key(res.symbol_store, res.decl_symbols[decl])],
 				tc               = tc,
 				res              = res,
 				locals           = make([dynamic]Local),
@@ -274,7 +275,7 @@ compile_program :: proc(
 			for m in d.methods {
 				ctx := Compiler {
 					registry         = registry_ptr,
-					current_function = registry_ptr^[symbol_registry_key(res.decl_symbols[m])],
+					current_function = registry_ptr^[symbol_registry_key(res.symbol_store, res.decl_symbols[m])],
 					tc               = tc,
 					res              = res,
 					locals           = make([dynamic]Local),
@@ -407,7 +408,8 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 
 		emit_constant(ctx, Value(fn))
 	case ^Ident_Expr:
-		sym := ctx.res.node_symbols[expr]
+		sym_id := ctx.res.node_symbols[expr]
+		sym := symbol_at(ctx.res.symbol_store, sym_id)
 		if sym.kind == .Module {
 			fmt.panicf(
 				"Compiler Error: модуль '%s' нельзя использовать как значение",
@@ -431,7 +433,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 
 		slot_index := -1
 		#reverse for loc, i in ctx.locals {
-			if loc.symbol == sym {
+			if loc.symbol == sym_id {
 				slot_index = i
 				break
 			}
@@ -443,7 +445,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			emit_byte(ctx, u8(slot_index))
 		} else {
 			// 2. Если не локальная, ищем в глобальном реестре функций!
-			if fn_ptr, ok := ctx.registry^[symbol_registry_key(sym)]; ok {
+			if fn_ptr, ok := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, sym_id)]; ok {
 				// Кладем саму функцию на стек как константу!
 				emit_constant(ctx, Value(fn_ptr))
 			} else {
@@ -455,10 +457,10 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		if e.op == .Assign {
 			if ident, ok := e.left.(^Ident_Expr); ok {
 				compile_expr(ctx, e.right)
-				sym := ctx.res.node_symbols[ident]
+				sym_id := ctx.res.node_symbols[ident]
 				slot := -1
 				#reverse for loc, i in ctx.locals {
-					if loc.symbol == sym { slot = i; break }
+					if loc.symbol == sym_id { slot = i; break }
 				}
 				if slot != -1 {
 					emit_opcode(ctx, .Set_Local)
@@ -534,16 +536,17 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			emit_byte(ctx, 0)
 			return
 		}
-		if sym, ok := ctx.res.node_symbols[expr]; ok {
+		if sym_id, ok := ctx.res.node_symbols[expr]; ok {
+			sym := symbol_at(ctx.res.symbol_store, sym_id)
 			if sym.kind == .Enum_Variant {
-				owner_name := sym.owner_type == nil ? "" : resolve_interned(sym.owner_type.name)
+				owner_name := sym.owner_type == INVALID_SYMBOL ? "" : resolve_interned(symbol_at(ctx.res.symbol_store, sym.owner_type).name)
 				fmt.panicf(
 					"Compiler Error: вариант '%s.%s' используется как значение — вызовите со скобками",
 					owner_name,
 					resolve_interned(sym.name),
 				)
 			}
-			if fn_ptr, found := ctx.registry^[symbol_registry_key(sym)]; found {
+			if fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, sym_id)]; found {
 				emit_constant(ctx, Value(fn_ptr))
 				return
 			}
@@ -553,9 +556,9 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			)
 		}
 		if obj_ident, ok := e.object.(^Ident_Expr); ok {
-			if obj_sym := ctx.res.node_symbols[e.object];
-			   obj_sym != nil && obj_sym.kind == .Module {
-				imported_module := obj_sym.module
+			if obj_sym_id := ctx.res.node_symbols[e.object];
+			   obj_sym_id != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, obj_sym_id).kind == .Module {
+				imported_module := symbol_at(ctx.res.symbol_store, obj_sym_id).module
 				if imported_module == nil {
 					fmt.panicf(
 						"Compiler Error: модуль '%s' не загружен",
@@ -563,7 +566,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 					)
 				}
 				if export_sym, found := imported_module.exports[intern(e.property)]; found {
-					if fn_ptr, found_fn := ctx.registry^[symbol_registry_key(export_sym)];
+					if fn_ptr, found_fn := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, export_sym)];
 					   found_fn {
 						emit_constant(ctx, Value(fn_ptr))
 						return
@@ -632,7 +635,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				return
 
 			case .Method_Struct:
-				if fn_ptr, found := ctx.registry^[symbol_registry_key(info.symbol_ref)]; found {
+				if fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, info.symbol_ref)]; found {
 					emit_constant(ctx, Value(fn_ptr))
 				} else {
 					fmt.panicf("Compiler Error: метод не найден")
@@ -652,7 +655,8 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			}
 		}
 		if ident, ok := e.callee.(^Ident_Expr); ok {
-			if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Builtin {
+			if sym_id := ctx.res.node_symbols[e.callee];
+			   sym_id != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, sym_id).kind == .Builtin {
 				for arg in e.args do compile_expr(ctx, arg)
 				emit_opcode(ctx, .Call_Builtin)
 				emit_byte(ctx, make_constant(ctx, Value(resolve_interned(ident.name))))
@@ -757,16 +761,14 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 }
 
 allocate_temp_slot :: proc(ctx: ^Compiler, name: string) -> int {
-	sym := new(Symbol)
-	sym.name = intern(name)
-	sym.kind = .Variable
+	sym := new_symbol(ctx.res.symbol_store, name, .Variable, nil)
 	append(&ctx.locals, Local{symbol = sym, depth = ctx.scope_depth})
 	slot := len(ctx.locals) - 1
 	ctx.current_function.frame_size = max(ctx.current_function.frame_size, len(ctx.locals))
 	return slot
 }
 
-register_binder_slot :: proc(ctx: ^Compiler, sym: ^Symbol) -> int {
+register_binder_slot :: proc(ctx: ^Compiler, sym: Symbol_Id) -> int {
 	append(&ctx.locals, Local{symbol = sym, depth = ctx.scope_depth})
 	slot := len(ctx.locals) - 1
 	ctx.current_function.frame_size = max(ctx.current_function.frame_size, len(ctx.locals))

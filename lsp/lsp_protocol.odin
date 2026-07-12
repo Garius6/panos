@@ -28,6 +28,12 @@ json_int :: proc(v: json.Value, key: string) -> int {
 	return 0
 }
 
+json_bool :: proc(v: json.Value, key: string) -> bool {
+	val := json_get(v, key)
+	if b, ok := val.(json.Boolean); ok do return bool(b)
+	return false
+}
+
 // Собирает LSP Position {line, character} как json.Value.
 lsp_position_json :: proc(line: int, character: int) -> json.Value {
 	return json.Object {

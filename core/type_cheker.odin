@@ -45,7 +45,7 @@ Type :: struct {
 	// Для структур
 	fields:                 [dynamic]Struct_Field,
 	// Для методов/интерфейсов
-	methods:                map[string]^Symbol,
+	methods:                map[string]Symbol_Id,
 	// Для структур: список интерфейсов, которые они реализовали
 	implemented_interfaces: [dynamic]^Type,
 	// Для интерфейсов: какие методы они требуют
@@ -188,7 +188,7 @@ Call_Kind :: enum {
 // значит запись просто не создаётся) остаётся default-веткой.
 Call_Info :: struct {
 	kind:       Call_Kind,
-	symbol_ref: ^Symbol,           // Method_Struct
+	symbol_ref: Symbol_Id,         // Method_Struct
 	text_name:  string,            // Builtin, Method_Interface, Method_Collection
 	variant:    Variant_Call_Info, // Constructor_Variant
 }
@@ -202,7 +202,7 @@ Match_Arm_Kind :: enum {
 Pattern_Info :: struct {
 	kind:         Match_Arm_Kind,
 	tag_index:    int,
-	binder_sym:   ^Symbol,
+	binder_sym:   Symbol_Id,
 	// Для конструктора: рекурсивные под-шаблоны, по одному на поле варианта.
 	sub_patterns: [dynamic]Pattern_Info,
 	span:         Span,
@@ -244,7 +244,7 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 			}
 		}
 		binder_sym := ctx.res.pattern_binders[pat]
-		if binder_sym == nil {
+		if binder_sym == INVALID_SYMBOL {
 			report(ctx, pat.span, "Type Error: не разрешён шаблон '%s'", pat.name)
 			info.kind = .Wildcard
 			return info
@@ -908,7 +908,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			struct_type.kind = .Struct
 			struct_type.name = d.name
 			struct_type.fields = make([dynamic]Struct_Field)
-			struct_type.methods = make(map[string]^Symbol)
+			struct_type.methods = make(map[string]Symbol_Id)
 			struct_type.implemented_interfaces = make([dynamic]^Type)
 
 			sym := ctx.res.decl_symbols[decl]
@@ -1083,8 +1083,8 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 	switch n in node {
 	case ^Type_Ident:
 		if base_type, ok := lookup_base_type(n.name); ok do return base_type
-		if sym := lookup_symbol(ctx.res.global_scope, intern(n.name)); sym != nil {
-			if sym.kind == .Module {
+		if sym := lookup_symbol(ctx.res.global_scope, intern(n.name)); sym != INVALID_SYMBOL {
+			if symbol_at(ctx.res.symbol_store, sym).kind == .Module {
 				return report(
 					ctx,
 					n.span,
@@ -1112,10 +1112,10 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 		return new_function_type(params, return_type)
 	case ^Type_Qualified:
 		module_sym := lookup_symbol(ctx.res.global_scope, intern(n.module_name))
-		if module_sym == nil || module_sym.kind != .Module {
+		if module_sym == INVALID_SYMBOL || symbol_at(ctx.res.symbol_store, module_sym).kind != .Module {
 			return report(ctx, n.span, "Type Error: неизвестный модуль '%s'", n.module_name)
 		}
-		imported_module := module_sym.module
+		imported_module := symbol_at(ctx.res.symbol_store, module_sym).module
 		if imported_module == nil {
 			return report(ctx, n.span, "Type Error: модуль '%s' не загружен", n.module_name)
 		}
@@ -1848,19 +1848,20 @@ standard_method_type :: proc(
 resolve_variant_ctor :: proc(
 	ctx: ^Type_Ctx,
 	expr: Expr,
-	sym: ^Symbol,
+	sym_id: Symbol_Id,
 	args: []Expr,
 	is_call: bool,
 ) -> ^Type {
+	sym := symbol_at(ctx.res.symbol_store, sym_id)
 	owner := sym.owner_type
-	if owner == nil {
+	if owner == INVALID_SYMBOL {
 		fmt.panicf("Type Error: у варианта '%s' нет типа-владельца", resolve_interned(sym.name))
 	}
 	owner_type := ctx.res.symbol_types[owner]
 	if owner_type == nil {
 		fmt.panicf(
 			"Type Error: тип-владелец '%s' варианта '%s' ещё не построен",
-			resolve_interned(owner.name),
+			resolve_interned(symbol_at(ctx.res.symbol_store, owner).name),
 			resolve_interned(sym.name),
 		)
 	}
@@ -1925,7 +1926,8 @@ resolve_variant_ctor :: proc(
 }
 
 infer_ident_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Ident_Expr) -> ^Type {
-	sym := ctx.res.node_symbols[expr]
+	sym_id := ctx.res.node_symbols[expr]
+	sym := symbol_at(ctx.res.symbol_store, sym_id)
 	if sym.kind == .Module {
 		return report(
 			ctx,
@@ -1935,7 +1937,7 @@ infer_ident_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Ident_Expr) -> ^Type {
 		)
 	}
 	if sym.kind == .Enum_Variant {
-		return resolve_variant_ctor(ctx, expr, sym, nil, false)
+		return resolve_variant_ctor(ctx, expr, sym_id, nil, false)
 	}
 	if sym.kind == .Builtin {
 		return report(
@@ -1945,7 +1947,7 @@ infer_ident_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Ident_Expr) -> ^Type {
 			resolve_interned(sym.name),
 		)
 	}
-	var_type, ok := ctx.res.symbol_types[sym]
+	var_type, ok := ctx.res.symbol_types[sym_id]
 	if !ok do return report(ctx, e.span, "Type Error: символ '%s' используется до инициализации", resolve_interned(sym.name))
 	return prune_type(var_type)
 }
@@ -2051,11 +2053,12 @@ infer_unary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Unary_Expr) -> ^Type {
 
 infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 	callee_sym := ctx.res.node_symbols[e.callee]
-	if callee_sym != nil && callee_sym.kind == .Enum_Variant {
+	if callee_sym != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, callee_sym).kind == .Enum_Variant {
 		return resolve_variant_ctor(ctx, expr, callee_sym, e.args[:], true)
 	}
 	if ident, ok := e.callee.(^Ident_Expr); ok {
-		if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Builtin {
+		if sym := ctx.res.node_symbols[e.callee];
+		   sym != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, sym).kind == .Builtin {
 			if builtin_type, handled := builtin_constructor_type(ctx, expr, resolve_interned(ident.name), e.args);
 			   handled {
 				return builtin_type
@@ -2068,8 +2071,8 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 	case ^Property_Expr:
 		if obj_ident, ok := prop_expr.object.(^Ident_Expr); ok {
 			if obj_sym := ctx.res.node_symbols[prop_expr.object];
-			   obj_sym != nil && obj_sym.kind == .Module {
-				imported_module := obj_sym.module
+			   obj_sym != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, obj_sym).kind == .Module {
+				imported_module := symbol_at(ctx.res.symbol_store, obj_sym).module
 				if imported_module == nil {
 					return report(
 						ctx,
@@ -2078,7 +2081,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 						resolve_interned(obj_ident.name),
 					)
 				}
-				export_sym, found := imported_module.exports[intern(prop_expr.property)]
+				export_sym_id, found := imported_module.exports[intern(prop_expr.property)]
 				if !found {
 					return report(
 						ctx,
@@ -2088,13 +2091,14 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 						prop_expr.property,
 					)
 				}
+				export_sym := symbol_at(ctx.res.symbol_store, export_sym_id)
 
-				export_type, found_type := ctx.res.symbol_types[export_sym]
+				export_type, found_type := ctx.res.symbol_types[export_sym_id]
 				if !found_type || export_type == nil {
 					if export_sym.kind == .Builtin {
 						export_type = builtin_export_type(resolve_interned(export_sym.full_name))
 						if export_type != nil {
-							ctx.res.symbol_types[export_sym] = export_type
+							ctx.res.symbol_types[export_sym_id] = export_type
 						}
 					} else if fn_decl, has_fn_decl := export_sym.decl.(^Function_Decl);
 					   has_fn_decl {
@@ -2242,7 +2246,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 						ctx,
 						e.span,
 						"У метода %s ожидалось %d аргументов",
-						resolve_interned(method_sym.name),
+						resolve_interned(symbol_at(ctx.res.symbol_store, method_sym).name),
 						len(method_type.params) - 1,
 					)
 				}
@@ -2553,16 +2557,16 @@ infer_try_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Try_Expr) -> ^Type {
 }
 
 infer_property_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Property_Expr) -> ^Type {
-	if sym, ok := ctx.res.node_symbols[expr]; ok {
-		if sym.kind == .Enum_Variant {
-			return resolve_variant_ctor(ctx, expr, sym, nil, false)
+	if sym_id, ok := ctx.res.node_symbols[expr]; ok {
+		if symbol_at(ctx.res.symbol_store, sym_id).kind == .Enum_Variant {
+			return resolve_variant_ctor(ctx, expr, sym_id, nil, false)
 		}
-		return prune_type(ctx.res.symbol_types[sym])
+		return prune_type(ctx.res.symbol_types[sym_id])
 	}
 	if obj_ident, ok := e.object.(^Ident_Expr); ok {
 		if obj_sym := ctx.res.node_symbols[e.object];
-		   obj_sym != nil && obj_sym.kind == .Module {
-			imported_module := obj_sym.module
+		   obj_sym != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, obj_sym).kind == .Module {
+			imported_module := symbol_at(ctx.res.symbol_store, obj_sym).module
 			if imported_module == nil {
 				return report(
 					ctx,
@@ -2571,15 +2575,16 @@ infer_property_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Property_Expr) -> ^T
 					resolve_interned(obj_ident.name),
 				)
 			}
-			if export_sym, found := imported_module.exports[intern(e.property)]; found {
-				if typ, found_type := ctx.res.symbol_types[export_sym];
+			if export_sym_id, found := imported_module.exports[intern(e.property)]; found {
+				export_sym := symbol_at(ctx.res.symbol_store, export_sym_id)
+				if typ, found_type := ctx.res.symbol_types[export_sym_id];
 				   found_type && typ != nil {
 					return prune_type(typ)
 				}
 				if export_sym.kind == .Builtin {
 					bt := builtin_export_type(resolve_interned(export_sym.full_name))
 					if bt != nil {
-						ctx.res.symbol_types[export_sym] = bt
+						ctx.res.symbol_types[export_sym_id] = bt
 						return bt
 					}
 				} else if fn_decl, has_fn_decl := export_sym.decl.(^Function_Decl);
@@ -2723,7 +2728,8 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 
 // Отладочная печать уже вычисленных типов символов.
 print_type_ctx :: proc(ctx: ^Type_Ctx) {
-	for symbol, type in ctx.res.symbol_types {
-		fmt.printf("Символ '%s' имеет тип %s\n", symbol.name, prune_type(type).name)
+	for symbol_id, type in ctx.res.symbol_types {
+		symbol := symbol_at(ctx.res.symbol_store, symbol_id)
+		fmt.printf("Символ '%s' имеет тип %s\n", resolve_interned(symbol.name), prune_type(type).name)
 	}
 }

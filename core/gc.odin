@@ -56,6 +56,7 @@ GC_State :: struct {
 	free_variants:   [dynamic]^Variant_Value,
 	free_strings:    [dynamic]^Panos_String,
 	free_files:      [dynamic]^File_Value,
+	free_sockets:    [dynamic]^Socket_Value,
 }
 
 // Не собираем, пока живой хип меньше этого — иначе на маленьких
@@ -78,6 +79,7 @@ new_gc_state :: proc() -> GC_State {
 		free_variants = make([dynamic]^Variant_Value),
 		free_strings = make([dynamic]^Panos_String),
 		free_files = make([dynamic]^File_Value),
+		free_sockets = make([dynamic]^Socket_Value),
 	}
 }
 
@@ -137,6 +139,8 @@ gc_new :: proc(vm: ^VM, $T: typeid) -> ^T {
 		obj = pool_take(&vm.gc.free_strings)
 	} else when T == File_Value {
 		obj = pool_take(&vm.gc.free_files)
+	} else when T == Socket_Value {
+		obj = pool_take(&vm.gc.free_sockets)
 	}
 
 	if obj == nil {
@@ -195,6 +199,8 @@ get_header :: proc(v: Value) -> ^GC_Header {
 		return &val.header
 	case ^File_Value:
 		return &val.header
+	case ^Socket_Value:
+		return &val.header
 	case f64, bool, ^Compiled_Function:
 		return nil
 	}
@@ -214,7 +220,7 @@ mark_value :: proc(v: Value) {
 	h.marked = true
 
 	switch val in v {
-	case f64, bool, ^Compiled_Function, ^Panos_String, ^File_Value:
+	case f64, bool, ^Compiled_Function, ^Panos_String, ^File_Value, ^Socket_Value:
 	// листья — нечего обходить дальше
 	case ^Aggregate_Value:
 		for el in val.elements do mark_value(el)
@@ -283,6 +289,8 @@ value_size :: proc(v: Value) -> int {
 		return size_of(Variant_Value)
 	case ^File_Value:
 		return size_of(File_Value)
+	case ^Socket_Value:
+		return size_of(Socket_Value)
 	}
 	return 0
 }
@@ -338,6 +346,12 @@ pool_release :: proc(vm: ^VM, v: Value) {
 		delete(val.path)
 		val.path = ""
 		append(&vm.gc.free_files, val)
+	case ^Socket_Value:
+		// Тот же finalizer-принцип, что у File_Value — недостижимое, но не
+		// закрытое явно соединение закрывается здесь через close_socket_value
+		// (см. vm.odin), а не течёт до конца процесса.
+		close_socket_value(val)
+		append(&vm.gc.free_sockets, val)
 	}
 }
 

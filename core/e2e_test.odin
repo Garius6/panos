@@ -1787,6 +1787,23 @@ test_file_handle_open_missing_dir_is_error :: proc(t: ^testing.T) {
 	testing.expectf(t, result == Value(true), "file handle open error: ожидалась ошибка открытия, получено %v", result)
 }
 
+// Порт на 127.0.0.1 без слушателя — соединение отклоняется ядром сразу же
+// (localhost, не реальная сеть), без риска зависнуть на таймауте.
+@(test)
+test_socket_connect_refused_is_error :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт сеть
+
+		функ старт() -> Булево
+			пер р = сеть.подключиться("127.0.0.1", 47)
+			р.ошибка()
+		конец
+	`)
+	testing.expectf(t, ok, "socket connect refused: пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(true), "socket connect refused: ожидалась ошибка подключения, получено %v", result)
+}
+
 // ввод_вывод.поток() переиспользует File_Value для стдин — здесь только
 // структурная проверка (конструктор + .закрыть() как no-op), реального
 // чтения не делаем: os.stdin в тестовом процессе не подключён к пайпу и

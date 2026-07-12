@@ -3,6 +3,8 @@ package core
 import "base:runtime"
 import "core:bufio"
 import "core:fmt"
+import "core:io"
+import "core:net"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -272,6 +274,51 @@ close_file_value :: proc(file: ^File_Value) {
 	file.is_open = false
 }
 
+// io.Stream поверх net.recv_tcp — только .Read, чего достаточно для
+// bufio.Reader (io.read зовёт ровно этот mode, см. core:io/io.odin). Даёт
+// Socket_Value переиспользовать read_line_from_reader/read_all_from_reader
+// один в один с File_Value, без отдельного пути чтения для сокетов.
+tcp_recv_stream_proc :: proc(
+	stream_data: rawptr,
+	mode: io.Stream_Mode,
+	p: []byte,
+	offset: i64,
+	whence: io.Seek_From,
+) -> (
+	n: i64,
+	err: io.Error,
+) {
+	#partial switch mode {
+	case .Read:
+		socket := (^net.TCP_Socket)(stream_data)
+		read_n, recv_err := net.recv_tcp(socket^, p)
+		if recv_err != nil {
+			return i64(read_n), .Unknown
+		}
+		if read_n == 0 {
+			// recv_tcp: 0 байт + nil-ошибка == соединение закрыто с той
+			// стороны — это EOF, а не "нечего было прочитать в этот
+			// момент" (в отличие от неблокирующих сокетов, наши блокируют).
+			return 0, .EOF
+		}
+		return i64(read_n), nil
+	}
+	return 0, .Empty
+}
+
+tcp_to_stream :: proc(socket: ^net.TCP_Socket) -> io.Stream {
+	return io.Stream{procedure = tcp_recv_stream_proc, data = socket}
+}
+
+// Симметрично close_file_value — единая точка закрытия для явного
+// .закрыть() и GC-финализатора (см. gc.odin::pool_release).
+close_socket_value :: proc(sock: ^Socket_Value) {
+	if !sock.is_open do return
+	bufio.reader_destroy(&sock.reader)
+	net.close(sock.socket)
+	sock.is_open = false
+}
+
 string_length :: proc(text: string) -> int {
 	count := 0
 	for _ in text {
@@ -512,6 +559,39 @@ invoke_collection_method :: proc(
 		}
 	}
 
+	if sock, ok_sock := receiver.(^Socket_Value); ok_sock {
+		switch method_name {
+		case "получить":
+			expect_arg_count(method_name, len(args), 0)
+			if !sock.is_open {
+				return make_error_result(vm, make_error_value(vm, "сеть", "соединение уже закрыто")), true
+			}
+			content := read_all_from_reader(&sock.reader)
+			return make_ok_result(vm, Value(gc_new_string(vm, content))), true
+		case "получить_строку":
+			expect_arg_count(method_name, len(args), 0)
+			if !sock.is_open {
+				return make_error_result(vm, make_error_value(vm, "сеть", "соединение уже закрыто")), true
+			}
+			return read_line_from_reader(vm, &sock.reader), true
+		case "отправить":
+			expect_arg_count(method_name, len(args), 1)
+			text := expect_string_arg(method_name, args[0])
+			if !sock.is_open {
+				return make_error_result(vm, make_error_value(vm, "сеть", "соединение уже закрыто")), true
+			}
+			n, err := net.send_tcp(sock.socket, transmute([]byte)text)
+			if err != nil {
+				return make_error_result(vm, make_error_value(vm, "сеть", fmt.tprintf("%v", err))), true
+			}
+			return make_ok_result(vm, Value(f64(n))), true
+		case "закрыть":
+			expect_arg_count(method_name, len(args), 0)
+			close_socket_value(sock)
+			return Value(f64(0)), false
+		}
+	}
+
 	fmt.panicf(
 		"Runtime Error: метод '%s' не найден у коллекции",
 		method_name,
@@ -685,6 +765,24 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		file.is_open = true
 		file.is_stdin = true
 		return Value(file), true
+
+	case "сеть::подключиться":
+		expect_arg_count(name, len(args), 2)
+		host := expect_string_arg(name, args[0])
+		port_num, ok_port := args[1].(f64)
+		if !ok_port {
+			fmt.panicf("Runtime Error: сеть.подключиться() ожидает номер порта числом")
+		}
+		socket, dial_err := net.dial_tcp_from_hostname_with_port_override(host, int(port_num))
+		if dial_err != nil {
+			return make_error_result(vm, make_error_value(vm, "сеть", fmt.tprintf("%v", dial_err))), true
+		}
+		conn := gc_new(vm, Socket_Value)
+		conn.socket = socket
+		conn.is_open = true
+		context.allocator = runtime.heap_allocator()
+		bufio.reader_init(&conn.reader, tcp_to_stream(&conn.socket))
+		return make_ok_result(vm, Value(conn)), true
 
 	case "строки::срез":
 		expect_arg_count(name, len(args), 3)

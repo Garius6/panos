@@ -7,7 +7,8 @@ is_builtin_module_name :: proc(name: string) -> bool {
 		name == "фс" ||
 		name == "ос" ||
 		name == "ввод_вывод" ||
-		name == "строки" \
+		name == "строки" ||
+		name == "сеть" \
 	)
 }
 
@@ -74,6 +75,8 @@ builtin_export_type :: proc(full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_STRING, TY_BOOL)
 	case "строки::в_число":
 		return builtin_function_type_1(TY_STRING, new_result_type(TY_NUM, TY_ERROR))
+	case "сеть::подключиться":
+		return builtin_function_type_2(TY_STRING, TY_NUM, new_result_type(TY_CONNECTION, TY_ERROR))
 	}
 	return nil
 }
@@ -176,6 +179,13 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			builtin_export_type("строки::цифра_или_буква"),
 		)
 		add_builtin_export(graph, module, "в_число", builtin_export_type("строки::в_число"))
+	} else if name == "сеть" {
+		add_builtin_export(
+			graph,
+			module,
+			"подключиться",
+			builtin_export_type("сеть::подключиться"),
+		)
 	}
 
 	return module

@@ -2,6 +2,7 @@ package core
 
 import "core:bufio"
 import "core:fmt"
+import "core:net"
 import "core:os"
 import "core:strings"
 
@@ -78,6 +79,17 @@ File_Value :: struct {
 	is_stdin: bool,
 }
 
+// TCP-соединение (сеть.подключиться). reader читает через свой io.Stream
+// поверх net.recv_tcp (см. tcp_to_stream в vm.odin) — тот же
+// read_line_from_reader/read_all_from_reader, что и у File_Value, без
+// дублирования логики чтения.
+Socket_Value :: struct {
+	header:  GC_Header,
+	socket:  net.TCP_Socket,
+	reader:  bufio.Reader,
+	is_open: bool,
+}
+
 Value :: union {
 	f64,
 	bool,
@@ -92,6 +104,7 @@ Value :: union {
 	^Interface_Value,
 	^Variant_Value,
 	^File_Value,
+	^Socket_Value,
 }
 
 Compiled_Function :: struct {

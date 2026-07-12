@@ -3,4 +3,7 @@ lang-design-notes.md
 panos.dSYM/
 .agents/
 .specify/
+/panos
+/panos-lsp
+/panos-lsp.dSYM/
 

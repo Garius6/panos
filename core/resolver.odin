@@ -1,5 +1,5 @@
 // resolver.odin
-package main
+package core
 
 import "core:fmt"
 import "core:os"
@@ -23,6 +23,9 @@ Symbol :: struct {
 	decl:              Decls,
 	owner_type:        ^Symbol,
 	is_pattern_binder: bool,
+	// Span объявления — для LSP go-to-definition. Zero-value у builtin'ов
+	// (нет исходника, куда прыгать).
+	span:              Span,
 }
 
 Module :: struct {
@@ -202,6 +205,7 @@ new_symbol :: proc(
 	module: ^Module,
 	exported: bool = false,
 	decl: Decls = nil,
+	span: Span = {},
 ) -> ^Symbol {
 	sym := new(Symbol)
 	sym.name = intern(name)
@@ -209,6 +213,7 @@ new_symbol :: proc(
 	sym.module = module
 	sym.is_exported = exported
 	sym.decl = decl
+	sym.span = span
 	if module != nil && len(module.path) > 0 {
 		sym.full_name = intern(fmt.tprintf("%s::%s", module.path, name))
 	} else {
@@ -320,12 +325,12 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 			fmt.panicf("Resolve Error: символ '%s' уже объявлен", alias)
 		}
 
-		sym := new_symbol(alias, .Module, module)
+		sym := new_symbol(alias, .Module, module, span = d.span)
 		sym.module = imported_module
 		module.scope.symbols[sym.name] = sym
 
 	case ^Function_Decl:
-		sym := new_symbol(d.name, .Function, module, d.is_exported, decl)
+		sym := new_symbol(d.name, .Function, module, d.is_exported, decl, d.span)
 		if sym.name in module.scope.symbols {
 			fmt.panicf("Resolve Error: символ '%s' уже объявлен", resolve_interned(sym.name))
 		}
@@ -336,7 +341,7 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 		}
 
 	case ^Struct_Decl:
-		sym := new_symbol(d.name, .Type, module, d.is_exported, decl)
+		sym := new_symbol(d.name, .Type, module, d.is_exported, decl, d.span)
 		if sym.name in module.scope.symbols {
 			fmt.panicf("Resolve Error: символ '%s' уже объявлен", resolve_interned(sym.name))
 		}
@@ -347,7 +352,7 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 		}
 
 	case ^Interface_Decl:
-		sym := new_symbol(d.name, .Type, module, d.is_exported, decl)
+		sym := new_symbol(d.name, .Type, module, d.is_exported, decl, d.span)
 		if sym.name in module.scope.symbols {
 			fmt.panicf("Resolve Error: символ '%s' уже объявлен", resolve_interned(sym.name))
 		}
@@ -359,7 +364,7 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 
 	case ^Impl_Decl:
 		for m in d.methods {
-			sym := new_symbol(m.name, .Function, module, false, m)
+			sym := new_symbol(m.name, .Function, module, false, m, m.span)
 			if sym.name in module.scope.symbols {
 				fmt.panicf("Resolve Error: символ '%s' уже объявлен", resolve_interned(sym.name))
 			}
@@ -368,7 +373,7 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 		}
 
 	case ^Enum_Decl:
-		type_sym := new_symbol(d.name, .Type, module, d.is_exported, decl)
+		type_sym := new_symbol(d.name, .Type, module, d.is_exported, decl, d.span)
 		if type_sym.name in module.scope.symbols {
 			fmt.panicf("Resolve Error: символ '%s' уже объявлен", resolve_interned(type_sym.name))
 		}
@@ -385,7 +390,7 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 					variant.name,
 				)
 			}
-			variant_sym := new_symbol(variant.name, .Enum_Variant, module, d.is_exported, decl)
+			variant_sym := new_symbol(variant.name, .Enum_Variant, module, d.is_exported, decl, variant.span)
 			variant_sym.owner_type = type_sym
 			module.scope.symbols[variant_sym.name] = variant_sym
 			if d.is_exported {
@@ -415,7 +420,7 @@ resolve_module :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
 				push_scope(&ctx)
 				args_syms := make([dynamic]^Symbol)
 				for arg in m.args {
-					sym := new_symbol(arg.name, .Variable, module)
+					sym := new_symbol(arg.name, .Variable, module, span = arg.span)
 					ctx.current_scope.symbols[sym.name] = sym
 					append(&args_syms, sym)
 				}
@@ -429,7 +434,7 @@ resolve_module :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
 
 			args_syms := make([dynamic]^Symbol)
 			for arg in d.args {
-				sym := new_symbol(arg.name, .Variable, module)
+				sym := new_symbol(arg.name, .Variable, module, span = arg.span)
 				ctx.current_scope.symbols[sym.name] = sym
 				append(&args_syms, sym)
 			}
@@ -488,7 +493,7 @@ resolve_pattern :: proc(ctx: ^Resolver_Ctx, pattern: Pattern) {
 			ctx.pattern_binders[p] = sym
 		} else {
 			// Обычный биндер.
-			binder := new_symbol(p.name, .Variable, ctx.current_module)
+			binder := new_symbol(p.name, .Variable, ctx.current_module, span = p.span)
 			binder.is_pattern_binder = true
 			ctx.current_scope.symbols[binder.name] = binder
 			ctx.pattern_binders[p] = binder
@@ -509,7 +514,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 	case ^Let_Stmt:
 		resolve_expr(ctx, s.value)
 
-		sym := new_symbol(s.name, .Variable, ctx.current_module)
+		sym := new_symbol(s.name, .Variable, ctx.current_module, span = s.span)
 		if intern(s.name) in ctx.current_scope.symbols {
 			fmt.panicf("Имя %s уже объявлено", s.name)
 		}
@@ -634,7 +639,7 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		push_scope(ctx)
 		args_syms := make([dynamic]^Symbol)
 		for arg in e.args {
-			sym := new_symbol(arg.name, .Variable, ctx.current_module)
+			sym := new_symbol(arg.name, .Variable, ctx.current_module, span = arg.span)
 			ctx.current_scope.symbols[sym.name] = sym
 			append(&args_syms, sym)
 		}

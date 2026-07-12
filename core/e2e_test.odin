@@ -2125,3 +2125,44 @@ test_enum_bare_constructor_rejected :: proc(t: ^testing.T) {
 		конец
 	`)
 }
+
+// Пусто-функция не обязана заканчиваться Пусто-выражением — последний
+// statement трактуется как обычный (значение молча отбрасывается), ровно
+// как любой НЕ последний statement тела функции. Раньше здесь была
+// ошибка "функция объявлена как 'Пусто', но последнее выражение имеет
+// тип...", убрана по запросу пользователя.
+@(test)
+test_void_function_discards_trailing_value :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ побочный_эффект() -> Число
+			42
+		конец
+
+		функ действие() -> Пусто
+			побочный_эффект()
+		конец
+
+		функ старт() -> Число
+			действие()
+			действие()
+			99
+		конец
+	`)
+	testing.expectf(t, ok, "void trailing discard: пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(f64(99)), "void trailing discard: ожидалось 99, получено %v", result)
+}
+
+// Явный `возврат X` внутри Пусто-функции — ДРУГОЙ путь (check_stmt's
+// Return_Stmt, не через infer_block_type) и по-прежнему ошибка: сознательно
+// написанный `возврат 5` при заявленном Пусто — это не "последнее
+// выражение как значение по умолчанию", а явная ошибка автора.
+@(test)
+test_void_function_explicit_return_value_still_rejected :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Type Error: ожидался 'Пусто', получен 'Число'")
+	run_code(`
+		функ старт() -> Пусто
+			возврат 5
+		конец
+	`)
+}

@@ -1337,14 +1337,17 @@ check_function_body :: proc(ctx: ^Type_Ctx, span: Span, body: [dynamic]Stmt, exp
 	explicit_return_type := prune_type(infer_function_body(ctx, body))
 
 	if expected_return_type == TY_VOID {
-		if body_type != TY_VOID && !unify_types(body_type, TY_VOID) {
-			report(
-				ctx,
-				span,
-				"Type Error: функция объявлена как 'Пусто', но последнее выражение имеет тип '%s'",
-				prune_type(body_type).name,
-			)
-		}
+		// Пусто-функция не обязана заканчиваться Пусто-выражением: последний
+		// statement трактуется как обычный (значение отбрасывается), а не
+		// как неявный return — ровно то же самое отбрасывание, что уже
+		// происходит с любым НЕ последним statement'ом тела функции
+		// (compile_statement эмитит Pop для non-void Expr_Stmt). VM это уже
+		// поддерживал сам по себе: .Return снимает "лишнее" значение со
+		// стека, но кладёт его вызывающему только если
+		// frame.function.returns_value — для Пусто-функции результат
+		// молча отбрасывается. Раньше здесь была ошибка, требовавшая явно
+		// избегать non-void последнего выражения в Пусто-функции — убрано
+		// по запросу пользователя.
 		ctx.current_return = prev_return
 		return
 	}

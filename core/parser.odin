@@ -800,10 +800,13 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 
 	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
 		if peek_token(p.stream).kind != .Function {
-			// peek-only: без явного skip следующая итерация увидит тот же
-			// токен и зациклится — гарантируем прогресс сами.
 			bad := peek_token(p.stream)
 			report_parse(p, bad.span, "Внутри блока реализации могут быть только функции")
+			// bad сам может быть sync-токеном (TypeDecl/Impl/Import/Export) —
+			// skip_to_sync тогда не продвинется вообще, а цикл выше не
+			// выйдет (ждёт End/EOF), и парсер зависает навсегда. Поэтому
+			// прогресс гарантируем явно: съедаем bad, потом уже skip_to_sync.
+			next_token(p.stream)
 			skip_to_sync(p)
 			continue
 		}

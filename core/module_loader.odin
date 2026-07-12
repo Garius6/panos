@@ -3,38 +3,59 @@ package core
 import "core:fmt"
 import "core:os"
 
-read_file_text :: proc(path: string) -> string {
+// ok=false — ошибка описана в err_msg (без "Module Loader Error:" префикса,
+// его добавляет вызывающий вместе с уместным span'ом — read_file_text сам
+// не знает, откуда его вызвали, чтобы указать на импорт).
+read_file_text :: proc(path: string) -> (data: string, err_msg: string, ok: bool) {
 	if !os.exists(path) {
-		fmt.panicf("Module Loader Error: файл '%s' не существует", path)
+		return "", fmt.tprintf("файл '%s' не существует", path), false
 	}
 
 	f, err := os.open(path, {.Read})
 	if err != nil {
-		fmt.panicf("Module Loader Error: не удалось открыть '%s': %v", path, err)
+		return "", fmt.tprintf("не удалось открыть '%s': %v", path, err), false
 	}
 
-	data, read_err := os.read_entire_file(f, context.allocator)
+	content, read_err := os.read_entire_file(f, context.allocator)
 	if read_err != nil {
-		fmt.panicf(
-			"Module Loader Error: не удалось прочесть '%s': %v",
-			path,
-			read_err,
-		)
+		return "", fmt.tprintf("не удалось прочесть '%s': %v", path, read_err), false
 	}
 
-	return string(data)
+	return string(content), "", true
 }
 
-load_module_recursive :: proc(graph: ^Module_Graph, file_path: string, is_entry: bool) -> ^Module {
+// Раньше все ошибки здесь были fmt.panicf — единственный оставшийся
+// "panicking" путь пайплайна (см. TASKS.md §Стадия 10 П6, "не live-typing
+// сценарий"). Это предположение оказалось неверным для LSP: файл вне
+// панos-репы без PANOS_STDLIB/std рядом — обычный live-typing сценарий,
+// а panicf здесь роняет весь LSP-процесс, не только диагностику одного
+// документа. Мигрировано на тот же accumulate-not-panic, что и
+// lexer/parser/resolver — module_key просто не попадает в graph.modules,
+// и резолвер уже умеет с этим жить (register_top_level_decl::Import_Decl
+// проверяет `ok` из map-lookup'а, а не полагается, что модуль есть всегда).
+// importer_span — span импортирующего `Import_Decl` (для diagnostic'а),
+// zero-value для входного файла (там винить нечего, см. main.odin's
+// отдельную проверку entry_module == nil).
+load_module_recursive :: proc(
+	graph: ^Module_Graph,
+	file_path: string,
+	is_entry: bool,
+	importer_span: Span = {},
+) -> ^Module {
 	module_key := resolve_import_path(file_path, "")
 	if module, found := graph.modules[module_key]; found {
 		return module
 	}
 	if graph.loading[module_key] {
-		fmt.panicf(
-			"Module Loader Error: обнаружен циклический импорт '%s'",
-			file_path,
+		append(
+			&graph.parse_diagnostics,
+			Diagnostic {
+				severity = .Error,
+				span = importer_span,
+				message = fmt.tprintf("Module Loader Error: обнаружен циклический импорт '%s'", file_path),
+			},
 		)
+		return nil
 	}
 
 	graph.loading[module_key] = true
@@ -57,7 +78,19 @@ load_module_recursive :: proc(graph: ^Module_Graph, file_path: string, is_entry:
 		// редактора вместо read_file_text для этого конкретного модуля.
 		source = override
 	} else {
-		source = read_file_text(module_key)
+		text, err_msg, read_ok := read_file_text(module_key)
+		if !read_ok {
+			append(
+				&graph.parse_diagnostics,
+				Diagnostic {
+					severity = .Error,
+					span = importer_span,
+					message = fmt.tprintf("Module Loader Error: %s", err_msg),
+				},
+			)
+			return nil
+		}
+		source = text
 	}
 	module.source = source
 	graph.file_paths[module.file_id] = module_key
@@ -85,12 +118,17 @@ load_module_recursive :: proc(graph: ^Module_Graph, file_path: string, is_entry:
 				continue
 			}
 			if !exists {
-				fmt.panicf(
-					"Module Loader Error: модуль '%s' не найден",
-					import_decl.path,
+				append(
+					&graph.parse_diagnostics,
+					Diagnostic {
+						severity = .Error,
+						span = import_decl.span,
+						message = fmt.tprintf("Module Loader Error: модуль '%s' не найден", import_decl.path),
+					},
 				)
+				continue
 			}
-			load_module_recursive(graph, import_path, false)
+			load_module_recursive(graph, import_path, false, import_decl.span)
 		}
 	}
 

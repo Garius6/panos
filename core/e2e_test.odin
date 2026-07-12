@@ -2166,3 +2166,26 @@ test_void_function_explicit_return_value_still_rejected :: proc(t: ^testing.T) {
 		конец
 	`)
 }
+
+// Раньше module_loader.odin panicf'ал на "модуль не найден" — единственный
+// оставшийся panicking путь пайплайна (см. TASKS.md §Стадия 10 П6). Роняло
+// не только CLI (терпимо — main.odin гейтит и выходит), но и ВЕСЬ LSP-
+// процесс на одном битом импорте, что обнаружилось на реальном внешнем
+// проекте пользователя. Мигрировано на тот же accumulate-not-panic — граф
+// просто не получает эту вершину, diagnostic копится как обычно.
+@(test)
+test_module_loader_missing_import_does_not_panic :: proc(t: ^testing.T) {
+	graph := load_module_graph("module_fixture_missing_import_main.ps")
+	found := false
+	for d in graph.parse_diagnostics {
+		if d.message == "Module Loader Error: модуль 'не_существует_вообще_никогда' не найден" {
+			found = true
+		}
+	}
+	testing.expectf(
+		t,
+		found,
+		"missing import: ожидался diagnostic про отсутствующий модуль, получено %v",
+		graph.parse_diagnostics,
+	)
+}

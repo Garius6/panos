@@ -1,9 +1,10 @@
 # Panos — Задачи
 
-**Текущая стадия**: готовы 0, 2, 3, 6, 10 (вне очереди), 5 частично
+**Текущая стадия**: готовы 0, 1, 2, 3, 6, 10 (вне очереди), 5 частично
 (Symbol_Id + LSP completions/references/rename; Type_Id отложен). Следующие
-разблокированные: 1 (GC), 4 (FFI-A), 7 (Generics, требует 6 ✓). Type_Id/SoA
-(остаток Стадии 5) — отдельная перформансная задача без явного триггера.
+разблокированные: 4 (FFI-A), 7 (Generics, требует 6 ✓), 8 (FFI-B, требует
+1 ✓ — finalizers теперь возможны). Type_Id/SoA (остаток Стадии 5) —
+отдельная перформансная задача без явного триггера.
 **Roadmap**: [ROADMAP.md](ROADMAP.md)
 
 Работа отслеживается через mkdnflow.nvim в Neovim. `<CR>` на строке
@@ -61,7 +62,7 @@ risk, разблокирует всё последующее.
 
 ---
 
-## Стадия 1 — Runtime memory model (GC)
+## Стадия 1 — Runtime memory model (GC) ✅
 
 Refs: [ROADMAP §Стадия 1](ROADMAP.md#стадия-1--runtime-memory-model-gc-2-недели).
 
@@ -70,47 +71,113 @@ long-running scenarios.
 
 ### Prerequisites
 
-- [ ] `^Panos_String` обёртка для runtime-строк
-      (`{ bytes: []u8, len: int }`)
-- [ ] Migration runtime-strings (concat, substring, string builder)
+- [x] `^Panos_String` обёртка для runtime-строк — `{header: GC_Header,
+      data: string}` (не `{bytes, len}` — переиспользует Odin `string` как
+      backing, проще). Compile-time литералы идут через отдельный
+      `perm_string()` (не регистрируется в GC — живут весь процесс)
+- [x] Migration runtime-strings — конкатенация (`.Add`), `фс::прочитать`,
+      `stdin`, срез строки по индексу, все builtin'ы
 
 ### Core GC
 
-- [ ] `GC_State` + `mem.Allocator` interface (`gc_allocator :: proc(state)`)
-- [ ] `GC_Header` layout: `{kind, mark, size, next}`, placed before payload
-- [ ] `gc_new[T]` helpers через compile-time `when` для kind resolution
-- [ ] Value walker для 11 вариантов Value union (force полный switch)
-- [ ] Root walker: `vm.stack`, `vm.frames`, `vm.compiled_functions`
-- [ ] Mark phase (recursive from roots)
-- [ ] Sweep phase (walk all_objects list)
-- [ ] Adaptive threshold (следующий GC при 2x live memory)
+- [x] `GC_State` — не через `mem.Allocator` interface, как в исходном
+      плане, а как явное поле `VM.gc: GC_State` с процедурами
+      `gc_new(vm, $T)` — проще, не требует imitация Odin allocator vtable
+      для 9 разных типов
+- [x] `GC_Header` — упрощён до `{marked: bool}` (без `kind`/`size`/`next`
+      intrusive-list полей): `all_objects: [dynamic]Value` — плоский
+      список, Odin union уже несёт kind-информацию, intrusive linked list
+      не нужен
+- [x] `gc_new(vm, $T: typeid)` — параметрическая процедура с `when
+      T == X` для диспетчеризации в free-list (см. ниже)
+- [x] Value walker (`mark_value`) — exhaustive switch по всем 11
+      вариантам (12-й будет compile error, не тихий пропуск)
+- [x] Root walker (`mark_roots`) — `vm.stack` (покрывает и temporaries, и
+      локали — `frame_pointer` индексирует в тот же стек), `protect_stack`
+      (см. ниже), `vm.compiled_functions[*].constants`
+- [x] Mark phase — рекурсивный, с cycle-guard через `marked`-флаг
+      (циклические структуры не зацикливают mark; отдельного теста на
+      cycle collection нет, но защита от бесконечной рекурсии — часть
+      самого mark_value, не опциональна)
+- [x] Sweep phase
+- [x] Adaptive threshold (2x live bytes после каждого sweep) — грубое
+      приближение: `.elements`/`.entries`/`.fields` содержимое в
+      bytes_allocated не считается, только заголовки структур + байты
+      строк (симметрично на alloc/free — иначе threshold дрейфовал бы)
+
+### Архитектурное дополнение — object pooling (не было в исходном плане)
+
+Первая версия (mark-sweep поверх голого `new()`/`free()`) прошла все
+функциональные тесты, но **не прошла собственный checkpoint**: peak RSS
+на CLI-прогоне линейно рос с числом итераций (164MB → 968MB на 1M → 6M
+итераций), несмотря на то, что внутренний учёт GC (bytes_allocated,
+live_objects) был идеально стабилен цикл к циклу. Причина — разрыв между
+"logically freed" и "OS-visible память переиспользована": `free()`
+возвращает блок в malloc, но под sustained churn ОС/malloc не гарантируют
+быстрый reuse тех же страниц.
+
+Исправлено free-list per типу (`GC_State.free_aggregates`,
+`free_arrays`, ... `free_strings`) — `sweep()` не зовёt `free()` на
+недостижимом объекте, а кладёт в пул (`pool_release`); `gc_new` сначала
+пробует `pool_take` из пула. Для `.elements`/`.entries`/`.fields`
+call-сайты в vm.odin (`Build_Aggregate`/`Array`/`Map`/`Variant`) переведены
+с `= make([dynamic]Value, n)` на `resize(&obj.field, n)`, иначе
+переиспользование backing-буфера теряло смысл. Результат: peak RSS стал
+плоским — **7.65MB одинаково на 1M/3M/6M итераций** массивов. Для
+string-heavy нагрузки (конкатенация в цикле) пока пул только заголовка
+`Panos_String`, не самого byte-буфера переменной длины — рост памяти
+есть, но не катастрофический (43MB → 158MB на 500k → 2M итераций);
+полноценный size-class аллокатор для строк — задел на будущее, не сделан
+(см. "Известные ограничения" ниже).
 
 ### Integration
 
-- [ ] Split allocator lifecycle в `main.odin`: arena для compile-phase,
-      GC для runtime
-- [ ] Migration `new(X)` → `gc_new(X)` в vm.odin (~30 мест)
-- [ ] Migration `make([dynamic]Value)` — явный allocator из GC context
+- [x] Split allocator lifecycle — arena (`main.odin`) для parse/compile,
+      `runtime.heap_allocator()` явно пином для всех GC'd аллокаций внутри
+      gc.odin (тот же паттерн, что уже использован для `INTERNER` в
+      interner.odin — Dynamic_Arena не поддерживает free() отдельных
+      аллокаций)
+- [x] Migration `new(X)` → `gc_new(vm, X)` в vm.odin — 17 сайтов
+      (Aggregate/Array/Map/Error/Option/Result/Interface/Variant_Value)
+- [x] `gc_protect`/`gc_unprotect` — обнаружен и закрыт реальный
+      "lost roots during construction" баг: `Cast_Interface` снимал `agg`
+      со стека, потом аллоцировал `Interface_Value` — в этом окне `agg`
+      не был ни на стеке, ни встроен никуда; аналогично для
+      `make_ok_result`/`make_error_result`/builtin'ов, конструирующих
+      несколько GC-объектов подряд до финального push на стек
 
 ### Instrumentation
 
-- [ ] `gc_stats(state)` — статистика (allocated, freed, collections)
-- [ ] `force_gc(state)` — для тестов
-- [ ] Verbose mode (env var / flag) — логи каждой коллекции
+- [x] `gc_stats(vm)` — live_objects, bytes_allocated, collections_run,
+      freed_last_run
+- [x] `force_gc(vm)` — для тестов
+- [ ] Verbose mode (env var/flag с логом каждой коллекции) — не сделан,
+      не запрашивался; временная версия использовалась для отладки RSS-бага
+      выше и была удалена
 
 ### Tests
 
-- [ ] Программа с миллионом allocation'ов в цикле — память не растёт
-- [ ] Циклические ссылки собираются (interface → self)
-- [ ] Closure captured variables не освобождаются пока closure жив
-- [ ] Все существующие 38 тестов проходят
-- [ ] Memory-tracker не показывает runtime-leaks (только compile-time
-      arena, которая освобождается deferred)
+- [x] Программа с миллионом allocation'ов в цикле — память не растёт
+      (`test_gc_reclaims_garbage_in_loop`, `test_gc_keeps_reachable_data_alive`
+      в e2e_test.odin, плюс ручная проверка `/usr/bin/time -l` на 1M/3M/6M
+      итераций через CLI — см. выше)
+- [ ] Циклические ссылки собираются (interface → self) — отдельного теста
+      нет; mark_value защищён от бесконечной рекурсии по циклам
+      (cycle-guard через marked-флаг), но explicit-cycle collection тест
+      не написан
+- [ ] Closure captured variables — N/A: у Panos пока нет захвата внешних
+      переменных в лямбдах (`Lambda_Expr` компилируется как независимый
+      `Compiled_Function` без upvalue-списка) — нечего тестировать
+- [x] Все существующие тесты проходят (38 исходных + 2 новых GC-теста = 40/40)
+- [x] Memory-tracker (`odin test ./core`) не показывает новых
+      runtime-leaks относительно до-GC состояния
 
 ### Delivery
 
-- [ ] Отдельные коммиты per major step (allocator interface, walker,
-      migration, tests)
+- [ ] Отдельные коммиты per major step — сделано одним коммитом (весь
+      объём — Panos_String + GC core + object pooling — тесно связан,
+      разбивка на sub-PR потребовала бы временных промежуточных состояний
+      с непроходящими тестами)
 
 ---
 

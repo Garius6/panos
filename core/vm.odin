@@ -16,6 +16,7 @@ VM :: struct {
 	compiled_functions: map[string]^Compiled_Function,
 	stack:              [dynamic]Value,
 	program_args:       []string,
+	gc:                 GC_State,
 }
 
 new_vm :: proc(
@@ -25,6 +26,7 @@ new_vm :: proc(
 	vm := new(VM)
 	vm.frames = make([dynamic]CallFrame)
 	vm.program_args = program_args
+	vm.gc = new_gc_state()
 
 	// Берем переданный словарь напрямую
 	vm.compiled_functions = compiled_functions
@@ -97,8 +99,8 @@ value_equals :: proc(a: Value, b: Value) -> bool {
 		if vb, ok := b.(f64); ok do return va == vb
 	case bool:
 		if vb, ok := b.(bool); ok do return va == vb
-	case string:
-		if vb, ok := b.(string); ok do return va == vb
+	case ^Panos_String:
+		if vb, ok := b.(^Panos_String); ok do return va.data == vb.data
 	}
 	return false
 }
@@ -144,40 +146,50 @@ expect_arg_count :: proc(method_name: string, actual: int, expected: int) {
 }
 
 expect_string_arg :: proc(function_name: string, value: Value) -> string {
-	text, ok := value.(string)
+	text, ok := value.(^Panos_String)
 	if !ok {
 		fmt.panicf(
 			"Runtime Error: %s ожидает строковый аргумент",
 			function_name,
 		)
 	}
-	return text
+	return text.data
 }
 
-make_error_value :: proc(code: string, message: string) -> Value {
-	err := new(Error_Value)
-	err.code = code
-	err.message = message
+// code/message — компилируемые внутрь VM строки (например "ввод_вывод"),
+// а не значения, снятые со стека, поэтому gc_new_string безопасен здесь без
+// gc_protect: между gc_new(Error_Value) и присвоением полей других
+// gc_new-вызовов, зависящих от уже-непротектнутых локалей, нет.
+make_error_value :: proc(vm: ^VM, code: string, message: string) -> Value {
+	err := gc_new(vm, Error_Value)
+	gc_protect(vm, Value(err))
+	err.code = gc_new_string(vm, code)
+	err.message = gc_new_string(vm, message)
+	gc_unprotect(vm, 1)
 	return Value(err)
 }
 
-make_ok_result :: proc(value: Value) -> Value {
-	res := new(Result_Value)
+make_ok_result :: proc(vm: ^VM, value: Value) -> Value {
+	gc_protect(vm, value)
+	res := gc_new(vm, Result_Value)
 	res.is_ok = true
 	res.value = value
 	res.error = f64(0)
+	gc_unprotect(vm, 1)
 	return Value(res)
 }
 
-make_error_result :: proc(err: Value) -> Value {
-	res := new(Result_Value)
+make_error_result :: proc(vm: ^VM, err: Value) -> Value {
+	gc_protect(vm, err)
+	res := gc_new(vm, Result_Value)
 	res.is_ok = false
 	res.value = f64(0)
 	res.error = err
+	gc_unprotect(vm, 1)
 	return Value(res)
 }
 
-read_stdin_line :: proc() -> Value {
+read_stdin_line :: proc(vm: ^VM) -> Value {
 	line := make([dynamic]byte)
 	buffer: [256]byte
 
@@ -186,7 +198,7 @@ read_stdin_line :: proc() -> Value {
 		if n > 0 {
 			for b in buffer[:n] {
 				if b == '\n' {
-					return make_ok_result(Value(string(line[:])))
+					return make_ok_result(vm, Value(gc_new_string(vm, string(line[:]))))
 				}
 				if b != '\r' {
 					append(&line, b)
@@ -196,15 +208,16 @@ read_stdin_line :: proc() -> Value {
 
 		if err != nil {
 			if len(line) > 0 {
-				return make_ok_result(Value(string(line[:])))
+				return make_ok_result(vm, Value(gc_new_string(vm, string(line[:]))))
 			}
 			return make_error_result(
-				make_error_value("ввод_вывод", fmt.tprintf("%v", err)),
+				vm,
+				make_error_value(vm, "ввод_вывод", fmt.tprintf("%v", err)),
 			)
 		}
 
 		if n == 0 {
-			return make_ok_result(Value(string(line[:])))
+			return make_ok_result(vm, Value(gc_new_string(vm, string(line[:]))))
 		}
 	}
 }
@@ -218,6 +231,7 @@ string_length :: proc(text: string) -> int {
 }
 
 invoke_collection_method :: proc(
+	vm: ^VM,
 	receiver: Value,
 	method_name: string,
 	args: []Value,
@@ -258,11 +272,11 @@ invoke_collection_method :: proc(
 			return opt.value, true
 		case "результат_или":
 			expect_arg_count(method_name, len(args), 1)
-			if opt.has_value do return make_ok_result(opt.value), true
-			return make_error_result(args[0]), true
+			if opt.has_value do return make_ok_result(vm, opt.value), true
+			return make_error_result(vm, args[0]), true
 		case "заменить_значение":
 			expect_arg_count(method_name, len(args), 1)
-			replaced := new(Option_Value)
+			replaced := gc_new(vm, Option_Value)
 			replaced.has_value = opt.has_value
 			if opt.has_value {
 				replaced.value = args[0]
@@ -307,14 +321,14 @@ invoke_collection_method :: proc(
 			return res.error, true
 		case "запас":
 			expect_arg_count(method_name, len(args), 1)
-			if res.is_ok do return make_ok_result(res.value), true
+			if res.is_ok do return make_ok_result(vm, res.value), true
 			return args[0], true
 		case "ожидать":
 			expect_arg_count(method_name, len(args), 1)
 			message := expect_string_arg(method_name, args[0])
 			if !res.is_ok {
 				if err, ok_err := res.error.(^Error_Value); ok_err {
-					fmt.panicf("Runtime Panic: %s: %s", message, err.message)
+					fmt.panicf("Runtime Panic: %s: %s", message, err.message.data)
 				}
 				fmt.panicf("Runtime Panic: %s", message)
 			}
@@ -328,7 +342,7 @@ invoke_collection_method :: proc(
 			return res.error, true
 		case "опция":
 			expect_arg_count(method_name, len(args), 0)
-			opt := new(Option_Value)
+			opt := gc_new(vm, Option_Value)
 			opt.has_value = res.is_ok
 			if res.is_ok {
 				opt.value = res.value
@@ -338,7 +352,7 @@ invoke_collection_method :: proc(
 			return Value(opt), true
 		case "ошибка_опция":
 			expect_arg_count(method_name, len(args), 0)
-			opt := new(Option_Value)
+			opt := gc_new(vm, Option_Value)
 			opt.has_value = !res.is_ok
 			if res.is_ok {
 				opt.value = f64(0)
@@ -348,12 +362,12 @@ invoke_collection_method :: proc(
 			return Value(opt), true
 		case "заменить_значение":
 			expect_arg_count(method_name, len(args), 1)
-			if res.is_ok do return make_ok_result(args[0]), true
-			return make_error_result(res.error), true
+			if res.is_ok do return make_ok_result(vm, args[0]), true
+			return make_error_result(vm, res.error), true
 		case "заменить_ошибку":
 			expect_arg_count(method_name, len(args), 1)
-			if res.is_ok do return make_ok_result(res.value), true
-			return make_error_result(args[0]), true
+			if res.is_ok do return make_ok_result(vm, res.value), true
+			return make_error_result(vm, args[0]), true
 		}
 	}
 
@@ -416,33 +430,35 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	switch name {
 	case "Ошибка":
 		expect_arg_count(name, len(args), 2)
-		code, ok_code := args[0].(string)
-		message, ok_message := args[1].(string)
+		code, ok_code := args[0].(^Panos_String)
+		message, ok_message := args[1].(^Panos_String)
 		if !ok_code || !ok_message {
 			fmt.panicf("Runtime Error: Ошибка() ожидает две строки")
 		}
-		err := new(Error_Value)
+		// code/message уже на vm.stack через args (слайс в живой стек) —
+		// протектить не нужно, они рутятся сами до возврата из этого вызова.
+		err := gc_new(vm, Error_Value)
 		err.code = code
 		err.message = message
 		return Value(err), true
 
 	case "Есть":
 		expect_arg_count(name, len(args), 1)
-		opt := new(Option_Value)
+		opt := gc_new(vm, Option_Value)
 		opt.has_value = true
 		opt.value = args[0]
 		return Value(opt), true
 
 	case "Нет":
 		expect_arg_count(name, len(args), 0)
-		opt := new(Option_Value)
+		opt := gc_new(vm, Option_Value)
 		opt.has_value = false
 		opt.value = f64(0)
 		return Value(opt), true
 
 	case "Успех":
 		expect_arg_count(name, len(args), 1)
-		res := new(Result_Value)
+		res := gc_new(vm, Result_Value)
 		res.is_ok = true
 		res.value = args[0]
 		res.error = f64(0)
@@ -450,12 +466,12 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 
 	case "Неудача":
 		expect_arg_count(name, len(args), 1)
-		return make_error_result(args[0]), true
+		return make_error_result(vm, args[0]), true
 
 	case "длина":
 		expect_arg_count(name, len(args), 1)
-		if text, ok := args[0].(string); ok {
-			return Value(f64(string_length(text))), true
+		if text, ok := args[0].(^Panos_String); ok {
+			return Value(f64(string_length(text.data))), true
 		}
 		if arr, ok := args[0].(^Array_Value); ok {
 			return Value(f64(len(arr.elements))), true
@@ -482,9 +498,9 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		path := expect_string_arg(name, args[0])
 		data, err := os.read_entire_file(path, context.allocator)
 		if err != nil {
-			return make_error_result(make_error_value("фс", fmt.tprintf("%v", err))), true
+			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true
 		}
-		return make_ok_result(Value(string(data))), true
+		return make_ok_result(vm, Value(gc_new_string(vm, string(data)))), true
 
 	case "фс::записать":
 		expect_arg_count(name, len(args), 2)
@@ -492,30 +508,34 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		content := expect_string_arg(name, args[1])
 		err := os.write_entire_file(path, content)
 		if err != nil {
-			return make_error_result(make_error_value("фс", fmt.tprintf("%v", err))), true
+			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true
 		}
-		return make_ok_result(Value(f64(len(content)))), true
+		return make_ok_result(vm, Value(f64(len(content)))), true
 
 	case "ос::аргументы":
 		expect_arg_count(name, len(args), 0)
-		arr := new(Array_Value)
+		arr := gc_new(vm, Array_Value)
+		gc_protect(vm, Value(arr))
 		arr.elements = make([dynamic]Value)
 		for arg in vm.program_args {
-			append(&arr.elements, Value(arg))
+			append(&arr.elements, Value(gc_new_string(vm, arg)))
 		}
+		gc_unprotect(vm, 1)
 		return Value(arr), true
 
 	case "ос::окружение":
 		expect_arg_count(name, len(args), 1)
 		key := expect_string_arg(name, args[0])
 		value, found := os.lookup_env(key, context.allocator)
-		opt := new(Option_Value)
+		opt := gc_new(vm, Option_Value)
+		gc_protect(vm, Value(opt))
 		opt.has_value = found
 		if found {
-			opt.value = Value(value)
+			opt.value = Value(gc_new_string(vm, value))
 		} else {
-			opt.value = Value("")
+			opt.value = Value(gc_new_string(vm, ""))
 		}
+		gc_unprotect(vm, 1)
 		return Value(opt), true
 
 	case "ос::установить_окружение":
@@ -524,9 +544,9 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		value := expect_string_arg(name, args[1])
 		err := os.set_env(key, value)
 		if err != nil {
-			return make_error_result(make_error_value("ос", fmt.tprintf("%v", err))), true
+			return make_error_result(vm, make_error_value(vm, "ос", fmt.tprintf("%v", err))), true
 		}
-		return make_ok_result(Value(f64(0))), true
+		return make_ok_result(vm, Value(f64(0))), true
 
 	case "ос::удалить_окружение":
 		expect_arg_count(name, len(args), 1)
@@ -547,7 +567,7 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 
 	case "ввод_вывод::прочитать_строку":
 		expect_arg_count(name, len(args), 0)
-		return read_stdin_line(), true
+		return read_stdin_line(vm), true
 	}
 
 	fmt.panicf(
@@ -611,9 +631,13 @@ execute :: proc(vm: ^VM) {
 				}
 			}
 
-			if a, ok_a := val_a.(string); ok_a {
-				if b, ok_b := val_b.(string); ok_b {
-					append(&vm.stack, Value(fmt.tprintf("%s%s", a, b)))
+			if a, ok_a := val_a.(^Panos_String); ok_a {
+				if b, ok_b := val_b.(^Panos_String); ok_b {
+					// a/b уже сняты со стека, но fmt.tprintf читает их байты
+					// СРАЗУ (temp_allocator), до вызова gc_new_string — им
+					// не нужно переживать сам вызов, только предоставить
+					// данные для конкатенации.
+					append(&vm.stack, Value(gc_new_string(vm, fmt.tprintf("%s%s", a.data, b.data))))
 					break
 				}
 			}
@@ -693,7 +717,7 @@ execute :: proc(vm: ^VM) {
 			frame.ip += 1
 			arg_count := int(instructions[frame.ip])
 
-			name := frame.function.constants[name_index].(string)
+			name := frame.function.constants[name_index].(^Panos_String).data
 			args_start := len(vm.stack) - arg_count
 			args := vm.stack[args_start:]
 			result, has_result := call_builtin(vm, name, args)
@@ -773,8 +797,8 @@ execute :: proc(vm: ^VM) {
 			frame.ip += 1
 			count := int(instructions[frame.ip])
 
-			agg := new(Aggregate_Value)
-			agg.elements = make([dynamic]Value, count)
+			agg := gc_new(vm, Aggregate_Value)
+			resize(&agg.elements, count)
 
 			// ВАЖНО: Снимаем значения со стека в ОБРАТНОМ порядке!
 			// Если было Игрок(10, 20), то 20 лежит на самом верху стека (индекс 1).
@@ -793,12 +817,12 @@ execute :: proc(vm: ^VM) {
 			frame.ip += 1
 			arity := int(instructions[frame.ip])
 
-			type_name := frame.function.constants[name_index].(string)
+			type_name := frame.function.constants[name_index].(^Panos_String).data
 
-			variant := new(Variant_Value)
+			variant := gc_new(vm, Variant_Value)
 			variant.type_name = type_name
 			variant.tag_index = tag
-			variant.fields = make([dynamic]Value, arity)
+			resize(&variant.fields, arity)
 			for i := arity - 1; i >= 0; i -= 1 {
 				variant.fields[i] = pop(&vm.stack)
 			}
@@ -846,8 +870,8 @@ execute :: proc(vm: ^VM) {
 			frame.ip += 1
 			count := int(instructions[frame.ip])
 
-			arr := new(Array_Value)
-			arr.elements = make([dynamic]Value, count)
+			arr := gc_new(vm, Array_Value)
+			resize(&arr.elements, count)
 
 			for i := count - 1; i >= 0; i -= 1 {
 				arr.elements[i] = pop(&vm.stack)
@@ -859,8 +883,8 @@ execute :: proc(vm: ^VM) {
 			frame.ip += 1
 			count := int(instructions[frame.ip])
 
-			m := new(Map_Value)
-			m.entries = make([dynamic]Map_Entry_Value, count)
+			m := gc_new(vm, Map_Value)
+			resize(&m.entries, count)
 
 			for i := count - 1; i >= 0; i -= 1 {
 				value := pop(&vm.stack)
@@ -910,7 +934,7 @@ execute :: proc(vm: ^VM) {
 			} else if iface, ok_iface := target.(^Interface_Value); ok_iface {
 				iface.data.elements[idx] = value
 			} else if err, ok_err := target.(^Error_Value); ok_err {
-				text, ok_text := value.(string)
+				text, ok_text := value.(^Panos_String)
 				if !ok_text {
 					fmt.panicf(
 						"Runtime Error: поля Ошибка принимают только строки",
@@ -954,11 +978,11 @@ execute :: proc(vm: ^VM) {
 					)
 				}
 				append(&vm.stack, m.entries[idx].value)
-			} else if m, ok_string := receiver.(string); ok_string {
+			} else if m, ok_string := receiver.(^Panos_String); ok_string {
 				idx := number_to_index(index)
 
-				if char_str, ok := get_character_at(m, idx); ok {
-					new_string := Value(char_str)
+				if char_str, ok := get_character_at(m.data, idx); ok {
+					new_string := Value(gc_new_string(vm, char_str))
 					append(&vm.stack, new_string)
 				} else {
 					fmt.panicf(
@@ -1002,7 +1026,7 @@ execute :: proc(vm: ^VM) {
 		case .Cast_Interface:
 			frame.ip += 1
 			struct_name_index := instructions[frame.ip]
-			struct_name := frame.function.constants[struct_name_index].(string)
+			struct_name := frame.function.constants[struct_name_index].(^Panos_String).data
 
 			val := pop(&vm.stack)
 			agg, ok := val.(^Aggregate_Value)
@@ -1011,8 +1035,11 @@ execute :: proc(vm: ^VM) {
 					"Runtime Error: в интерфейс можно привести только структуру",
 				)
 			}
+			// agg только что снят со стека — до gc_new(Interface_Value) он
+			// нигде не закреплён, protect'им явно (см. gc_protect в gc.odin).
+			gc_protect(vm, val)
 
-			iface := new(Interface_Value)
+			iface := gc_new(vm, Interface_Value)
 			iface.data = agg
 			iface.methods = make(map[string]^Compiled_Function)
 
@@ -1023,6 +1050,7 @@ execute :: proc(vm: ^VM) {
 				}
 			}
 
+			gc_unprotect(vm, 1)
 			append(&vm.stack, Value(iface))
 
 		case .Invoke_Interface:
@@ -1031,7 +1059,7 @@ execute :: proc(vm: ^VM) {
 			frame.ip += 1
 			arg_count := int(instructions[frame.ip])
 
-			method_name := frame.function.constants[method_name_index].(string)
+			method_name := frame.function.constants[method_name_index].(^Panos_String).data
 			callee_index := len(vm.stack) - 1 - arg_count
 			iface_val := vm.stack[callee_index]
 
@@ -1079,12 +1107,12 @@ execute :: proc(vm: ^VM) {
 			frame.ip += 1
 			arg_count := int(instructions[frame.ip])
 
-			method_name := frame.function.constants[method_name_index].(string)
+			method_name := frame.function.constants[method_name_index].(^Panos_String).data
 			receiver_index := len(vm.stack) - 1 - arg_count
 			receiver := vm.stack[receiver_index]
 			args := vm.stack[receiver_index + 1:]
 
-			result, has_result := invoke_collection_method(receiver, method_name, args)
+			result, has_result := invoke_collection_method(vm, receiver, method_name, args)
 			resize(&vm.stack, receiver_index)
 			if has_result {
 				append(&vm.stack, result)
@@ -1099,6 +1127,10 @@ execute :: proc(vm: ^VM) {
 
 print_vm :: proc(vm: ^VM) {
 	for s in vm.stack {
-		fmt.println(s)
+		if ps, ok := s.(^Panos_String); ok {
+			fmt.println(ps.data)
+		} else {
+			fmt.println(s)
+		}
 	}
 }

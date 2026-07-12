@@ -3,11 +3,15 @@ package core
 import "core:fmt"
 import "core:strings"
 
+// Все heap-managed варианты Value (кроме f64/bool/^Compiled_Function —
+// см. GC_State в gc.odin) встраивают GC_Header первым полем.
 Aggregate_Value :: struct {
+	header:   GC_Header,
 	elements: [dynamic]Value, // В реальном продакшене лучше использовать фиксированный срез (slice)
 }
 
 Array_Value :: struct {
+	header:   GC_Header,
 	elements: [dynamic]Value,
 }
 
@@ -17,26 +21,34 @@ Map_Entry_Value :: struct {
 }
 
 Map_Value :: struct {
+	header:  GC_Header,
 	entries: [dynamic]Map_Entry_Value,
 }
 
 Error_Value :: struct {
-	code:    string,
-	message: string,
+	header:  GC_Header,
+	// ^Panos_String, а не string — поля читаются/пишутся напрямую как
+	// Panos-значения через Get_Property/Set_Property (см. vm.odin), должны
+	// участвовать в mark/sweep как любой другой Value.string.
+	code:    ^Panos_String,
+	message: ^Panos_String,
 }
 
 Option_Value :: struct {
+	header:    GC_Header,
 	has_value: bool,
 	value:     Value,
 }
 
 Result_Value :: struct {
-	is_ok: bool,
-	value: Value,
-	error: Value,
+	header: GC_Header,
+	is_ok:  bool,
+	value:  Value,
+	error:  Value,
 }
 
 Interface_Value :: struct {
+	header:  GC_Header,
 	data:    ^Aggregate_Value,
 	// VTable: связывает имя метода из контракта с реальной скомпилированной функцией
 	methods: map[string]^Compiled_Function,
@@ -47,6 +59,7 @@ Interface_Value :: struct {
 // диагностики и печати), числовой индекс варианта (порядок объявления) и
 // поля варианта.
 Variant_Value :: struct {
+	header:    GC_Header,
 	type_name: string,
 	tag_index: int,
 	fields:    [dynamic]Value,
@@ -55,7 +68,7 @@ Variant_Value :: struct {
 Value :: union {
 	f64,
 	bool,
-	string,
+	^Panos_String,
 	^Compiled_Function,
 	^Aggregate_Value,
 	^Array_Value,
@@ -382,7 +395,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 
 	case ^String_Expr:
-		emit_constant(ctx, e.value)
+		emit_constant(ctx, Value(perm_string(e.value)))
 	case ^Lambda_Expr:
 		fn := new(Compiled_Function)
 		module_prefix := ""
@@ -422,7 +435,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			)
 		}
 		if info, ok := ctx.tc.call_infos[expr]; ok && info.kind == .Constructor_Variant {
-			name_const := make_constant(ctx, Value(info.variant.owner_type.name))
+			name_const := make_constant(ctx, Value(perm_string(info.variant.owner_type.name)))
 			emit_opcode(ctx, .Build_Variant)
 			emit_byte(ctx, name_const)
 			emit_byte(ctx, u8(info.variant.tag_index))
@@ -534,7 +547,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 
 	case ^Property_Expr:
 		if info, ok := ctx.tc.call_infos[expr]; ok && info.kind == .Constructor_Variant {
-			name_const := make_constant(ctx, Value(info.variant.owner_type.name))
+			name_const := make_constant(ctx, Value(perm_string(info.variant.owner_type.name)))
 			emit_opcode(ctx, .Build_Variant)
 			emit_byte(ctx, name_const)
 			emit_byte(ctx, u8(info.variant.tag_index))
@@ -607,7 +620,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			switch info.kind {
 			case .Constructor_Variant:
 				for arg in e.args do compile_expr(ctx, arg)
-				name_const := make_constant(ctx, Value(info.variant.owner_type.name))
+				name_const := make_constant(ctx, Value(perm_string(info.variant.owner_type.name)))
 				emit_opcode(ctx, .Build_Variant)
 				emit_byte(ctx, name_const)
 				emit_byte(ctx, u8(info.variant.tag_index))
@@ -617,7 +630,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			case .Builtin:
 				for arg in e.args do compile_expr(ctx, arg)
 				emit_opcode(ctx, .Call_Builtin)
-				emit_byte(ctx, make_constant(ctx, Value(info.text_name)))
+				emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
 				emit_byte(ctx, u8(len(e.args)))
 				return
 
@@ -626,7 +639,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				compile_expr(ctx, prop_expr.object)
 				for arg in e.args do compile_expr(ctx, arg)
 				emit_opcode(ctx, .Invoke_Collection)
-				emit_byte(ctx, make_constant(ctx, Value(info.text_name)))
+				emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
 				emit_byte(ctx, u8(len(e.args)))
 				return
 
@@ -635,7 +648,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				compile_expr(ctx, prop_expr.object)
 				for arg in e.args do compile_expr(ctx, arg)
 				emit_opcode(ctx, .Invoke_Interface)
-				emit_byte(ctx, make_constant(ctx, Value(info.text_name)))
+				emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
 				emit_byte(ctx, u8(len(e.args)))
 				return
 
@@ -664,7 +677,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			   sym_id != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, sym_id).kind == .Builtin {
 				for arg in e.args do compile_expr(ctx, arg)
 				emit_opcode(ctx, .Call_Builtin)
-				emit_byte(ctx, make_constant(ctx, Value(resolve_interned(ident.name))))
+				emit_byte(ctx, make_constant(ctx, Value(perm_string(resolve_interned(ident.name)))))
 				emit_byte(ctx, u8(len(e.args)))
 				return
 			}
@@ -766,7 +779,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 	if struct_type, needs_cast := ctx.tc.interface_casts[expr]; needs_cast {
 		emit_opcode(ctx, .Cast_Interface)
 		// То же самое для имени структуры
-		emit_byte(ctx, make_constant(ctx, Value(struct_type.name)))
+		emit_byte(ctx, make_constant(ctx, Value(perm_string(struct_type.name))))
 	}
 }
 

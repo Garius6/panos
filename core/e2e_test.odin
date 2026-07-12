@@ -105,6 +105,15 @@ typecheck_only :: proc(source: string) -> [dynamic]Diagnostic {
 	return all
 }
 
+// Value.string теперь ^Panos_String (см. gc.odin) — прямое `value == "лит"`
+// больше не компилируется (нет неявной конвертации), а `value == Value(...)`
+// сравнивало бы указатели, а не содержимое. Тестам, которые раньше писали
+// `result == "литерал"`, нужен явный, content-based хелпер.
+value_str_eq :: proc(v: Value, expected: string) -> bool {
+	s, ok := v.(^Panos_String)
+	return ok && s.data == expected
+}
+
 // expect_diagnostic проверяет, что среди накопленных ошибок есть хотя бы
 // одна с точным текстом expected — в отличие от testing.expect_assert
 // (которая ловит panic), здесь программа НЕ падает, поэтому можно
@@ -238,7 +247,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				имя + "os" + "!"
 			конец
 		`,
-			"panos!",
+			Value(perm_string("panos!")),
 		},
 		{
 			"Строки: escape-последовательности",
@@ -247,7 +256,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				"a\n\tb\rc\"d\\e"
 			конец
 		`,
-			"a\n\tb\rc\"d\\e",
+			Value(perm_string("a\n\tb\rc\"d\\e")),
 		},
 		{
 			"Длина строк и коллекций",
@@ -405,7 +414,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				если р.ошибка() тогда р.причина().сообщение иначе "" конец
 			конец
 		`,
-			"нет файла",
+			Value(perm_string("нет файла")),
 		},
 		{
 			"Результат: оператор ? разворачивает успех",
@@ -437,7 +446,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				если р.ошибка() тогда р.причина().сообщение иначе "" конец
 			конец
 		`,
-			"нет файла",
+			Value(perm_string("нет файла")),
 		},
 		{
 			"Результат: получить ошибку из успеха возвращает умолчание",
@@ -447,7 +456,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				р.получить_ошибку(Ошибка("нет", "нет ошибки")).сообщение
 			конец
 		`,
-			"нет ошибки",
+			Value(perm_string("нет ошибки")),
 		},
 		{
 			"Результат: получить ошибку из неудачи",
@@ -457,7 +466,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				р.получить_ошибку(Ошибка("нет", "нет ошибки")).сообщение
 			конец
 		`,
-			"нет файла",
+			Value(perm_string("нет файла")),
 		},
 		{
 			"Результат: ожидать возвращает успех",
@@ -477,7 +486,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				р.ожидать_ошибку("должна быть ошибка").сообщение
 			конец
 		`,
-			"нет файла",
+			Value(perm_string("нет файла")),
 		},
 		{
 			"Результат: успех в опцию",
@@ -507,7 +516,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				р.ошибка_опция().получить(Ошибка("нет", "нет ошибки")).сообщение
 			конец
 		`,
-			"нет ошибки",
+			Value(perm_string("нет ошибки")),
 		},
 		{
 			"Результат: ошибка в опцию ошибки",
@@ -517,7 +526,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				р.ошибка_опция().получить(Ошибка("нет", "нет ошибки")).сообщение
 			конец
 		`,
-			"нет файла",
+			Value(perm_string("нет файла")),
 		},
 		{
 			"Результат: заменить ошибку сохраняет успех",
@@ -538,7 +547,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				если новый.ошибка() тогда новый.причина().сообщение иначе "" конец
 			конец
 		`,
-			"новое",
+			Value(perm_string("новое")),
 		},
 		{
 			"Результат: заменить значение меняет успех",
@@ -548,7 +557,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				р.заменить_значение("готово").получить("нет")
 			конец
 		`,
-			"готово",
+			Value(perm_string("готово")),
 		},
 		{
 			"Результат: заменить значение сохраняет ошибку",
@@ -559,7 +568,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				если новый.ошибка() тогда новый.причина().сообщение иначе "" конец
 			конец
 		`,
-			"старое",
+			Value(perm_string("старое")),
 		},
 		{
 			"Результат: запас сохраняет успех",
@@ -659,7 +668,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				о.заменить_значение("готово").получить("нет")
 			конец
 		`,
-			"готово",
+			Value(perm_string("готово")),
 		},
 		{
 			"Опция: заменить значение сохраняет пусто",
@@ -669,7 +678,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				о.заменить_значение("готово").получить("нет")
 			конец
 		`,
-			"нет",
+			Value(perm_string("нет")),
 		},
 		{
 			"Опция: запас сохраняет значение",
@@ -710,7 +719,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				если р.ошибка() тогда р.причина().сообщение иначе "" конец
 			конец
 		`,
-			"пусто",
+			Value(perm_string("пусто")),
 		},
 		{
 			"Стандартная библиотека: файловая система",
@@ -731,7 +740,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 				конец
 			конец
 		`,
-			"panos",
+			Value(perm_string("panos")),
 		},
 		{
 			"Стандартная библиотека: вывод",
@@ -761,7 +770,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 
 		testing.expectf(
 			t,
-			result == tc.expected,
+			value_equals(result, tc.expected),
 			"[%s] ПРОВАЛ: Ожидалось %v, получено %v",
 			tc.name,
 			tc.expected,
@@ -788,7 +797,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 	if args_ok {
 		testing.expectf(
 			t,
-			args_result == "бета",
+			value_str_eq(args_result, "бета"),
 			"[Стандартная библиотека: аргументы] ожидалось бета, получено %v",
 			args_result,
 		)
@@ -816,7 +825,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 	if env_ok {
 		testing.expectf(
 			t,
-			env_result == "значение",
+			value_str_eq(env_result, "значение"),
 			"[Стандартная библиотека: окружение] ожидалось значение, получено %v",
 			env_result,
 		)
@@ -1229,8 +1238,8 @@ test_match_result_binds_success_and_error :: proc(t: ^testing.T) {
 	`)
 	testing.expectf(t, ok, "res match: пустой стек")
 	if !ok do return
-	s, is_str := result.(string)
-	testing.expectf(t, is_str && s == "ок", "res match: %v != ок", result)
+	s, is_str := result.(^Panos_String)
+	testing.expectf(t, is_str && s.data == "ок", "res match: %v != ок", result)
 }
 
 @(test)
@@ -1507,4 +1516,100 @@ test_adt_duplicate_variant_rejected :: proc(t: ^testing.T) {
 		    возврат Круг(1)
 		конец
 	`)
+}
+
+// Собирает VM после полного прогона source, не выполняя его дальше — нужен
+// доступ к vm.gc для force_gc/gc_stats, которого run_code() не даёт
+// (возвращает только Value результата).
+compile_and_run_for_gc :: proc(source: string) -> ^VM {
+	tokens := tokenize(source)
+	stream := make_stream(tokens)
+	parser := Parser {
+		stream = &stream,
+	}
+	prog := parse_program(&parser)
+	panic_on_diagnostics(parser.diagnostics)
+
+	res_ctx := new_resolver_ctx()
+	resolve_program(&res_ctx, prog)
+	panic_on_diagnostics(res_ctx.diagnostics)
+
+	type_ctx := new_type_ctx(&res_ctx)
+	typecheck_program(&type_ctx, prog)
+	panic_on_diagnostics(type_ctx.diagnostics)
+
+	registry := compile_program(&res_ctx, &type_ctx, &prog)
+	vm := new_vm(registry)
+	execute(vm)
+	return vm
+}
+
+// Стадия 1 checkpoint: "программа с миллионом allocation'ов в цикле —
+// память не растёт". `пер мусор` внутри тела цикла компилируется в ОДИН
+// stack-слот (Set_Local с фиксированным индексом — тело цикла компилируется
+// статически один раз, а не по разу на итерацию), так что каждая итерация
+// перезаписывает слот предыдущей — предыдущий Array_Value становится
+// недостижим сразу же. 100k * ~5 живых-на-момент объектов гарантированно
+// пересекает GC_MIN_THRESHOLD не один раз.
+@(test)
+test_gc_reclaims_garbage_in_loop :: proc(t: ^testing.T) {
+	vm := compile_and_run_for_gc(`
+		функ старт() -> Число
+			пер сч = 0
+			пока сч < 100000 цикл
+				пер мусор = массив(1, 2, 3, 4, 5)
+				сч = сч + 1
+			конец
+			возврат сч
+		конец
+	`)
+
+	force_gc(vm)
+	stats := gc_stats(vm)
+	testing.expectf(
+		t,
+		stats.collections_run > 0,
+		"GC stress: ожидался хотя бы 1 запуск коллектора за 100000 итераций, получено 0",
+	)
+	testing.expectf(
+		t,
+		stats.live_objects < 10,
+		"GC stress: ожидалось <10 живых объектов после force_gc (мусор из цикла давно недостижим), получено %d",
+		stats.live_objects,
+	)
+}
+
+// Обратная сторона предыдущего теста: GC не должен освобождать то, что
+// ДЕЙСТВИТЕЛЬНО достижимо, пока рядом с ним крутится цикл, генерирующий
+// мусор — иначе "программа не растёт по памяти" ценой "программа теряет
+// живые данные".
+@(test)
+test_gc_keeps_reachable_data_alive :: proc(t: ^testing.T) {
+	vm := compile_and_run_for_gc(`
+		функ старт() -> Массив(Число)
+			пер живой = массив(1, 2, 3)
+			пер сч = 0
+			пока сч < 50000 цикл
+				пер мусор = массив(9, 9, 9)
+				сч = сч + 1
+			конец
+			возврат живой
+		конец
+	`)
+
+	force_gc(vm)
+	testing.expectf(t, len(vm.stack) > 0, "GC keep-alive: пустой стек")
+	if len(vm.stack) == 0 do return
+
+	result := vm.stack[len(vm.stack) - 1]
+	arr, ok := result.(^Array_Value)
+	testing.expectf(t, ok, "GC keep-alive: результат не массив: %v", result)
+	if !ok do return
+
+	testing.expectf(
+		t,
+		len(arr.elements) == 3 && arr.elements[0] == Value(f64(1)) && arr.elements[2] == Value(f64(3)),
+		"GC keep-alive: ожидался [1,2,3] нетронутым после force_gc, получено %v",
+		arr.elements,
+	)
 }

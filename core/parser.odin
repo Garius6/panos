@@ -9,6 +9,11 @@ Parser :: struct {
 	// Diagnostic/Severity определены в type_cheker.odin (тот же package) —
 	// переиспользуем ту же модель accumulate-not-panic, что и там (TY_POISON).
 	diagnostics: [dynamic]Diagnostic,
+	// Монотонный счётчик для gensym-имён синтетических переменных
+	// для-in-раскрытия (см. parse_for_stmt_into) — __for_1_idx, __for_2_idx,
+	// ... Уникальности в пределах файла достаточно (разные функции и так не
+	// делят scope), сбрасывать между функциями не нужно.
+	for_counter: int,
 }
 
 // Аналог report() из type_cheker.odin: копит diagnostic вместо panic,
@@ -838,7 +843,7 @@ parse_function :: proc(p: ^Parser, is_exported: bool) -> ^Function_Decl {
 	function.return_type = parse_required_return_type(p, "функции")
 
 	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
-		append(&function.body, parse_stmt(p))
+		parse_stmt_into(p, &function.body)
 	}
 	expect(p, .End)
 
@@ -1061,6 +1066,231 @@ parse_stmt :: proc(p: ^Parser) -> Stmt {
 	}
 }
 
+// Единственная причина, по которой это не просто `append(&body,
+// parse_stmt(p))` — для-in: "для x в expr цикл ... конец" раскрывается в
+// НЕСКОЛЬКО statement'ов (инициализация индекса + сам цикл), а parse_stmt
+// возвращает ровно один Stmt. Вместо нового AST-узла "блок из N
+// statement'ов" (который пришлось бы учить понимать resolver/type_cheker/
+// compiler) — правим единственную точку, где тело собирается из
+// statement'ов, во ВСЕХ шести местах (функция/если/иначе/пока/лямбда/
+// ветка выбора). Desugar целиком живёт в parser.odin — резолвер и всё,
+// что ниже, вообще не знают, что для-in существует.
+parse_stmt_into :: proc(p: ^Parser, body: ^[dynamic]Stmt) {
+	if peek_token(p.stream).kind == .For {
+		parse_for_stmt_into(p, body)
+		return
+	}
+	append(body, parse_stmt(p))
+}
+
+// для <шаблон> в <expr> цикл <тело> конец
+// шаблон := ident | '(' ident (',' ident)* ')'
+//
+// Раскрывается на месте в уже существующие узлы (Let_Stmt/While_Expr/
+// If_Expr/Break_Stmt/Index_Expr/Property_Expr) — три statement'а на выходе:
+//
+//   пер __for_N_iter = <expr>
+//   пер __for_N_idx = -1
+//   пока истина цикл
+//       __for_N_idx = __for_N_idx + 1
+//       если __for_N_idx == __for_N_iter.длина() тогда прервать конец
+//       пер <элемент(ы) из шаблона> = __for_N_iter[__for_N_idx]
+//       <тело>
+//   конец
+//
+// Инкремент — ПЕРЕД телом, не после: `продолжить` компилируется как
+// прыжок на начало `пока`-цикла (см. Loop_Context.continue_target в
+// compiler.odin), т.е. на re-check условия. Если бы инкремент стоял
+// ПОСЛЕ пользовательского тела (классическое "тело; idx++"), `продолжить`
+// внутри тела перепрыгивал бы через инкремент — idx никогда не рос,
+// бесконечный цикл. С условием "пока истина" и инкрементом в самом
+// начале тела continue корректно возвращается именно туда.
+//
+// Работает с чем угодно, что поддерживает .длина() + [индекс] (Массив).
+// Соответствие так индексировать нельзя ([] у карты — по ключу, не по
+// позиции) — для карты сначала .записи() (см. Стадия 16), которая как раз
+// возвращает Массив((К,З)), совместимый с шаблоном "для (к, з) в ...".
+//
+// "в" — контекстный keyword: НЕ зарезервированное слово лексера (проверено
+// на практике — test.ps уже использует "в" как имя переменной в шаблоне
+// `Прямоугольник(ш, в)`), сравнивается по тексту токена только в этой
+// одной позиции грамматики.
+parse_for_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt) {
+	start := peek_token(p.stream).span
+	next_token(p.stream) // .For
+
+	names := make([dynamic]string)
+	if peek_token(p.stream).kind == .LParen {
+		next_token(p.stream)
+		for {
+			name_tok := next_token(p.stream)
+			if name_tok.kind != .Ident {
+				report_parse(p, name_tok.span, "Синтаксическая ошибка: в шаблоне 'для (...)' ожидается идентификатор")
+			}
+			append(&names, name_tok.data)
+			if peek_token(p.stream).kind == .Comma {
+				next_token(p.stream)
+			} else {
+				break
+			}
+		}
+		expect(p, .RParen)
+	} else {
+		name_tok := next_token(p.stream)
+		if name_tok.kind != .Ident {
+			report_parse(p, name_tok.span, "Синтаксическая ошибка: после 'для' ожидается идентификатор или '(идент, ...)'")
+		}
+		append(&names, name_tok.data)
+	}
+
+	in_tok := next_token(p.stream)
+	if in_tok.kind != .Ident || in_tok.data != "в" {
+		report_parse(p, in_tok.span, "Синтаксическая ошибка: после списка переменных 'для' ожидается 'в'")
+	}
+
+	iterable := parse_expr(p, 0)
+
+	expect(p, .Loop)
+	user_body := make([dynamic]Stmt)
+	for {
+		kind := peek_token(p.stream).kind
+		if kind == .End || kind == .EOF do break
+		parse_stmt_into(p, &user_body)
+	}
+	expect(p, .End)
+
+	span := span_from(p, start)
+
+	p.for_counter += 1
+	suffix := fmt.tprintf("__for_%d", p.for_counter)
+	iter_name := fmt.tprintf("%s_iter", suffix)
+	idx_name := fmt.tprintf("%s_idx", suffix)
+
+	mk_ident :: proc(name: string, span: Span) -> Expr {
+		e := new(Ident_Expr)
+		e.name = intern(name)
+		e.span = span
+		return e
+	}
+	mk_num :: proc(v: f64, span: Span) -> Expr {
+		e := new(Number_Expr)
+		e.value = v
+		e.span = span
+		return e
+	}
+
+	// пер __for_N_iter = <expr>
+	iter_let := new(Let_Stmt)
+	iter_let.name = iter_name
+	iter_let.value = iterable
+	iter_let.span = span
+	append(out, iter_let)
+
+	// пер __for_N_idx = -1
+	neg_one := new(Unary_Expr)
+	neg_one.op = .Minus
+	neg_one.right = mk_num(1, span)
+	neg_one.span = span
+	idx_let := new(Let_Stmt)
+	idx_let.name = idx_name
+	idx_let.value = neg_one
+	idx_let.span = span
+	append(out, idx_let)
+
+	while_node := new(While_Expr)
+	true_lit := new(Boolean_Expr)
+	true_lit.value = true
+	true_lit.span = span
+	while_node.condition = true_lit
+	while_node.body = make([dynamic]Stmt)
+
+	// __for_N_idx = __for_N_idx + 1
+	incr_add := new(Binary_Expr)
+	incr_add.left = mk_ident(idx_name, span)
+	incr_add.op = .Plus
+	incr_add.right = mk_num(1, span)
+	incr_add.span = span
+	incr_assign := new(Binary_Expr)
+	incr_assign.left = mk_ident(idx_name, span)
+	incr_assign.op = .Assign
+	incr_assign.right = incr_add
+	incr_assign.span = span
+	incr_stmt := new(Expr_Stmt)
+	incr_stmt.expr = incr_assign
+	incr_stmt.span = span
+	append(&while_node.body, incr_stmt)
+
+	// если __for_N_idx == __for_N_iter.длина() тогда прервать конец
+	len_prop := new(Property_Expr)
+	len_prop.object = mk_ident(iter_name, span)
+	len_prop.property = "длина"
+	len_prop.span = span
+	len_call := new(Call_Expr)
+	len_call.callee = len_prop
+	len_call.args = make([dynamic]Expr)
+	len_call.span = span
+	cmp_eq := new(Binary_Expr)
+	cmp_eq.left = mk_ident(idx_name, span)
+	cmp_eq.op = .Equal
+	cmp_eq.right = len_call
+	cmp_eq.span = span
+	break_stmt := new(Break_Stmt)
+	break_stmt.span = span
+	exit_if := new(If_Expr)
+	exit_if.condition = cmp_eq
+	exit_if.then_branch = make([dynamic]Stmt)
+	append(&exit_if.then_branch, break_stmt)
+	exit_if.else_branch = make([dynamic]Stmt)
+	exit_if.span = span
+	exit_if_stmt := new(Expr_Stmt)
+	exit_if_stmt.expr = exit_if
+	exit_if_stmt.span = span
+	append(&while_node.body, exit_if_stmt)
+
+	// пер <элемент(ы)> = __for_N_iter[__for_N_idx]
+	index_expr := new(Index_Expr)
+	index_expr.object = mk_ident(iter_name, span)
+	index_expr.index = mk_ident(idx_name, span)
+	index_expr.span = span
+
+	if len(names) == 1 {
+		elem_let := new(Let_Stmt)
+		elem_let.name = names[0]
+		elem_let.value = index_expr
+		elem_let.span = span
+		append(&while_node.body, elem_let)
+	} else {
+		elem_name := fmt.tprintf("%s_elem", suffix)
+		elem_let := new(Let_Stmt)
+		elem_let.name = elem_name
+		elem_let.value = index_expr
+		elem_let.span = span
+		append(&while_node.body, elem_let)
+
+		for name, i in names {
+			field_prop := new(Property_Expr)
+			field_prop.object = mk_ident(elem_name, span)
+			field_prop.property = fmt.tprintf("%d", i)
+			field_prop.span = span
+			field_let := new(Let_Stmt)
+			field_let.name = name
+			field_let.value = field_prop
+			field_let.span = span
+			append(&while_node.body, field_let)
+		}
+	}
+
+	for stmt in user_body {
+		append(&while_node.body, stmt)
+	}
+
+	while_node.span = span
+	while_stmt := new(Expr_Stmt)
+	while_stmt.expr = while_node
+	while_stmt.span = span
+	append(out, while_stmt)
+}
+
 parse_continue_stmt :: proc(p: ^Parser) -> Stmt {
 	start := peek_token(p.stream).span
 	next_token(p.stream)
@@ -1138,7 +1368,7 @@ parse_if_expr :: proc(p: ^Parser) -> Expr {
 	for {
 		kind := peek_token(p.stream).kind
 		if kind == .Else || kind == .End || kind == .EOF do break
-		append(&node.then_branch, parse_stmt(p))
+		parse_stmt_into(p, &node.then_branch)
 	}
 
 	node.else_branch = make([dynamic]Stmt)
@@ -1147,7 +1377,7 @@ parse_if_expr :: proc(p: ^Parser) -> Expr {
 		for {
 			kind := peek_token(p.stream).kind
 			if kind == .End || kind == .EOF do break
-			append(&node.else_branch, parse_stmt(p))
+			parse_stmt_into(p, &node.else_branch)
 		}
 	}
 
@@ -1166,7 +1396,7 @@ parse_while_expr :: proc(p: ^Parser) -> Expr {
 	for {
 		kind := peek_token(p.stream).kind
 		if kind == .End || kind == .EOF do break
-		append(&node.body, parse_stmt(p))
+		parse_stmt_into(p, &node.body)
 	}
 
 	expect(p, .End)
@@ -1345,7 +1575,7 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 		lam.return_type = parse_optional_return_type(p)
 
 		for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
-			append(&lam.body, parse_stmt(p))
+			parse_stmt_into(p, &lam.body)
 		}
 		expect(p, .End)
 		lam.span = span_from(p, start)
@@ -1519,7 +1749,7 @@ parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
 		// Разделителем считается перевод строки или `;`; следующая ветка
 		// начинается со следующего Pattern (Ident/`_`).
 		for {
-			append(&arm.body, parse_stmt(p))
+			parse_stmt_into(p, &arm.body)
 			if peek_token(p.stream).kind == .Semicolon {
 				next_token(p.stream)
 			}

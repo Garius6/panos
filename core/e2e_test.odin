@@ -1881,3 +1881,193 @@ test_lexer_unknown_escape_recovers_as_literal :: proc(t: ^testing.T) {
 		str_tok.data,
 	)
 }
+
+// для-in — чистый parser-level desugar в Let/While/If/Index (см.
+// parse_stmt_into/parse_for_stmt_into в parser.odin). Резолвер/type_cheker/
+// compiler/vm ничего о нём не знают — эти тесты гоняют desugar сквозь весь
+// пайплайн, а не проверяют parser напрямую.
+@(test)
+test_for_in_sums_array :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер числа = массив(10, 20, 30)
+			пер сумма = 0
+			для х в числа цикл
+				сумма = сумма + х
+			конец
+			сумма
+		конец
+	`)
+	testing.expectf(t, ok, "for-in array: пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(f64(60)), "for-in array: ожидалось 60, получено %v", result)
+}
+
+// Шаблон "(к, з)" — деструктуризация тупла из Соответствие.записи()
+// (Стадия 16). Map[] сама по себе НЕ индексируется позиционно — for-in
+// работает только через .записи().
+@(test)
+test_for_in_destructures_map_entries :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер карта: Соответствие(Строка, Число) = соответствие(
+				"a" = 1,
+				"b" = 2,
+				"c" = 3,
+			)
+			пер сумма = 0
+			для (к, з) в карта.записи() цикл
+				сумма = сумма + з
+			конец
+			сумма
+		конец
+	`)
+	testing.expectf(t, ok, "for-in map entries: пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(f64(6)), "for-in map entries: ожидалось 6, получено %v", result)
+}
+
+// Инкремент индекса стоит ПЕРЕД телом (см. комментарий у
+// parse_for_stmt_into) именно из-за этого случая: 'продолжить' не должен
+// пропускать инкремент, иначе цикл завис бы. 'прервать' проверяется
+// отдельно — оба в одном тесте, чтобы покрыть их взаимодействие.
+@(test)
+test_for_in_continue_and_break :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер числа = массив(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+			пер сумма = 0
+			пер посещено = 0
+			для х в числа цикл
+				посещено = посещено + 1
+				если посещено == 8 тогда
+					прервать
+				конец
+				если х == 3 тогда
+					продолжить
+				конец
+				сумма = сумма + х
+			конец
+			сумма
+		конец
+	`)
+	testing.expectf(t, ok, "for-in continue/break: пустой стек")
+	if !ok do return
+	// 1+2+4+5+6+7 = 25 (3 пропущен через continue, 8-й элемент не
+	// достигнут — break сработал до прибавления к сумме)
+	testing.expectf(t, result == Value(f64(25)), "for-in continue/break: ожидалось 25, получено %v", result)
+}
+
+@(test)
+test_for_in_empty_array_zero_iterations :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер пустой: Массив(Число) = массив()
+			пер счетчик = 0
+			для х в пустой цикл
+				счетчик = счетчик + 1
+			конец
+			счетчик
+		конец
+	`)
+	testing.expectf(t, ok, "for-in empty: пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(f64(0)), "for-in empty: ожидалось 0, получено %v", result)
+}
+
+// Ранний возврат внутри для-in тела — синтетическая пока-обёртка не
+// должна мешать обычному return-flow (нет отдельной scope-изоляции у
+// синтетического While_Expr, ровно как у обычного пока/если — см.
+// resolve_stmt::While_Expr).
+@(test)
+test_for_in_early_return :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер числа = массив(1, 3, 5, 4, 7)
+			для х в числа цикл
+				если х == 4 тогда
+					возврат х
+				конец
+			конец
+			-1
+		конец
+	`)
+	testing.expectf(t, ok, "for-in early return: пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(f64(4)), "for-in early return: ожидалось 4, получено %v", result)
+}
+
+// Два для-in в одной функции с ОДИНАКОВЫМ именем переменной цикла — до
+// scope-фикса (см. resolve_stmt::If_Expr/While_Expr) if/while вообще не
+// изолировали scope, `пер` внутри протекал в объемлющую функцию, и второй
+// `для х` падал с "Имя х уже объявлено" (не про for-in как таковой — та
+// же проблема была у любых двух `пока`/`если` подряд с одноимённым `пер`).
+@(test)
+test_for_in_multiple_loops_no_name_collision :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер а = массив(1, 2)
+			пер б = массив(10, 20)
+			пер сумма = 0
+			для х в а цикл
+				сумма = сумма + х
+			конец
+			для х в б цикл
+				сумма = сумма + х
+			конец
+			сумма
+		конец
+	`)
+	testing.expectf(t, ok, "for-in no collision: пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(f64(33)), "for-in no collision: ожидалось 33, получено %v", result)
+}
+
+@(test)
+test_for_in_nested_loops :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер строки = массив(массив(1, 2), массив(3, 4, 5))
+			пер сумма = 0
+			для строка в строки цикл
+				для х в строка цикл
+					сумма = сумма + х
+				конец
+			конец
+			сумма
+		конец
+	`)
+	testing.expectf(t, ok, "for-in nested: пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(f64(15)), "for-in nested: ожидалось 15, получено %v", result)
+}
+
+// Регрессия на сам scope-фикс, отдельно от for-in: `пер` внутри если/пока
+// объявляет ИМЯ заново в разных, не вложенных, ветках/циклах без
+// конфликта, но мутации ВНЕШНИХ переменных (не redeclare, обычное
+// присваивание) по-прежнему видны после блока — scope изолирует
+// ОБЪЯВЛЕНИЯ, не читает/пишет через границу.
+@(test)
+test_if_while_scope_isolation :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер x = 5
+			если истина тогда
+				x = x + 1
+				пер y = 100
+			конец
+			если истина тогда
+				пер y = 1
+				x = x + y
+			иначе
+				x = 0
+			конец
+			x
+		конец
+	`)
+	testing.expectf(t, ok, "if/while scope isolation: пустой стек")
+	if !ok do return
+	// 5 +1 (первый если, y=100 там не видно снаружи) +1 (второй если,
+	// свой y=1, не конфликтует с y из первого) = 7
+	testing.expectf(t, result == Value(f64(7)), "if/while scope isolation: ожидалось 7, получено %v", result)
+}

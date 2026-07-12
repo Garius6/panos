@@ -683,20 +683,32 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 	case ^If_Expr:
 		resolve_expr(ctx, e.condition)
 
+		// Своя scope на ветку (тот же паттерн, что у Match_Expr/Lambda_Expr
+		// ниже) — без неё `пер x` в then И `пер x` в else двух РАЗНЫХ if
+		// в одной функции конфликтовали бы как "уже объявлено", хотя
+		// логически никогда не видят друг друга. Раньше её не было вообще
+		// (см. TASKS.md — всплыло на для-in с переиспользованным именем
+		// переменной в соседних, не вложенных, циклах).
+		push_scope(ctx)
 		for stmt in e.then_branch {
 			resolve_stmt(ctx, stmt)
 		}
+		pop_scope(ctx)
 
+		push_scope(ctx)
 		for stmt in e.else_branch {
 			resolve_stmt(ctx, stmt)
 		}
+		pop_scope(ctx)
 
 	case ^While_Expr:
 		resolve_expr(ctx, e.condition)
 
+		push_scope(ctx)
 		for stmt in e.body {
 			resolve_stmt(ctx, stmt)
 		}
+		pop_scope(ctx)
 	case ^Tuple_Expr:
 		for el in e.elements {
 			resolve_expr(ctx, el)

@@ -1781,10 +1781,18 @@ parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
 	return m
 }
 
+// 70 — между Call/Index (lbp 80) и Star/Slash (lbp 60/61). Postfix
+// (`.`/`()`/`[]`) обязан биндиться ТУЖЕ префиксного `-`/`не`, иначе
+// `не x.y.z` парсится как `(не x).y.z` вместо `не (x.y.z)` — операнд
+// префикса при парсинге (rbp здесь = min_bp для operand) обрывается на
+// первом же `.`/`(`/`[`, не забирая postfix-цепочку внутрь себя, и она
+// потом навешивается СНАРУЖИ на уже готовый Unary_Expr в вызывающем
+// цикле. Раньше здесь стояло 100 (туже даже Dot/Question=90) — ровно
+// наоборот того, что нужно.
 prefix_bp :: proc(token: ^Token) -> int {
 	#partial switch token.kind {
 	case .Minus, .Negate:
-		return 100
+		return 70
 	}
 	return 0
 }

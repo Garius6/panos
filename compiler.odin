@@ -412,11 +412,11 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				sym.name,
 			)
 		}
-		if info, is_variant := ctx.tc.variant_ctors[expr]; is_variant {
-			name_const := make_constant(ctx, Value(info.owner_type.name))
+		if info, ok := ctx.tc.call_infos[expr]; ok && info.kind == .Constructor_Variant {
+			name_const := make_constant(ctx, Value(info.variant.owner_type.name))
 			emit_opcode(ctx, .Build_Variant)
 			emit_byte(ctx, name_const)
-			emit_byte(ctx, u8(info.tag_index))
+			emit_byte(ctx, u8(info.variant.tag_index))
 			emit_byte(ctx, 0)
 			return
 		}
@@ -524,11 +524,11 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 
 	case ^Property_Expr:
-		if info, is_variant := ctx.tc.variant_ctors[expr]; is_variant {
-			name_const := make_constant(ctx, Value(info.owner_type.name))
+		if info, ok := ctx.tc.call_infos[expr]; ok && info.kind == .Constructor_Variant {
+			name_const := make_constant(ctx, Value(info.variant.owner_type.name))
 			emit_opcode(ctx, .Build_Variant)
 			emit_byte(ctx, name_const)
-			emit_byte(ctx, u8(info.tag_index))
+			emit_byte(ctx, u8(info.variant.tag_index))
 			emit_byte(ctx, 0)
 			return
 		}
@@ -593,14 +593,61 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		compile_expr(ctx, e.value)
 		emit_opcode(ctx, .Try_Unwrap)
 	case ^Call_Expr:
-		if info, is_variant := ctx.tc.variant_ctors[expr]; is_variant {
-			for arg in e.args do compile_expr(ctx, arg)
-			name_const := make_constant(ctx, Value(info.owner_type.name))
-			emit_opcode(ctx, .Build_Variant)
-			emit_byte(ctx, name_const)
-			emit_byte(ctx, u8(info.tag_index))
-			emit_byte(ctx, u8(len(e.args)))
-			return
+		if info, ok := ctx.tc.call_infos[expr]; ok {
+			switch info.kind {
+			case .Constructor_Variant:
+				for arg in e.args do compile_expr(ctx, arg)
+				name_const := make_constant(ctx, Value(info.variant.owner_type.name))
+				emit_opcode(ctx, .Build_Variant)
+				emit_byte(ctx, name_const)
+				emit_byte(ctx, u8(info.variant.tag_index))
+				emit_byte(ctx, u8(len(e.args)))
+				return
+
+			case .Builtin:
+				for arg in e.args do compile_expr(ctx, arg)
+				emit_opcode(ctx, .Call_Builtin)
+				emit_byte(ctx, make_constant(ctx, Value(info.text_name)))
+				emit_byte(ctx, u8(len(e.args)))
+				return
+
+			case .Method_Collection:
+				prop_expr := e.callee.(^Property_Expr)
+				compile_expr(ctx, prop_expr.object)
+				for arg in e.args do compile_expr(ctx, arg)
+				emit_opcode(ctx, .Invoke_Collection)
+				emit_byte(ctx, make_constant(ctx, Value(info.text_name)))
+				emit_byte(ctx, u8(len(e.args)))
+				return
+
+			case .Method_Interface:
+				prop_expr := e.callee.(^Property_Expr)
+				compile_expr(ctx, prop_expr.object)
+				for arg in e.args do compile_expr(ctx, arg)
+				emit_opcode(ctx, .Invoke_Interface)
+				emit_byte(ctx, make_constant(ctx, Value(info.text_name)))
+				emit_byte(ctx, u8(len(e.args)))
+				return
+
+			case .Method_Struct:
+				if fn_ptr, found := ctx.registry^[symbol_registry_key(info.symbol_ref)]; found {
+					emit_constant(ctx, Value(fn_ptr))
+				} else {
+					fmt.panicf("Compiler Error: метод не найден")
+				}
+				prop_expr := e.callee.(^Property_Expr)
+				compile_expr(ctx, prop_expr.object)
+				for arg in e.args do compile_expr(ctx, arg)
+				emit_opcode(ctx, .Call)
+				emit_byte(ctx, u8(len(e.args) + 1))
+				return
+
+			case .Constructor_Struct:
+				for arg in e.args do compile_expr(ctx, arg)
+				emit_opcode(ctx, .Build_Aggregate)
+				emit_byte(ctx, u8(len(e.args)))
+				return
+			}
 		}
 		if ident, ok := e.callee.(^Ident_Expr); ok {
 			if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Builtin {
@@ -611,55 +658,10 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				return
 			}
 		}
-
-		if builtin_name, is_builtin_call := ctx.tc.builtin_calls[expr]; is_builtin_call {
-			for arg in e.args do compile_expr(ctx, arg)
-			emit_opcode(ctx, .Call_Builtin)
-			emit_byte(ctx, make_constant(ctx, Value(builtin_name)))
-			emit_byte(ctx, u8(len(e.args)))
-
-		} else if collection_method_name, is_collection_call := ctx.tc.collection_calls[expr];
-		   is_collection_call {
-			prop_expr := e.callee.(^Property_Expr)
-			compile_expr(ctx, prop_expr.object)
-			for arg in e.args do compile_expr(ctx, arg)
-
-			emit_opcode(ctx, .Invoke_Collection)
-			emit_byte(ctx, make_constant(ctx, Value(collection_method_name)))
-			emit_byte(ctx, u8(len(e.args)))
-
-		} else if iface_method_name, is_iface_call := ctx.tc.interface_calls[expr]; is_iface_call {
-			prop_expr := e.callee.(^Property_Expr)
-			compile_expr(ctx, prop_expr.object)
-			for arg in e.args do compile_expr(ctx, arg)
-
-			emit_opcode(ctx, .Invoke_Interface)
-			emit_byte(ctx, make_constant(ctx, Value(iface_method_name)))
-			emit_byte(ctx, u8(len(e.args)))
-
-		} else if method_sym, is_method := ctx.tc.method_calls[expr]; is_method {
-			if fn_ptr, ok := ctx.registry^[symbol_registry_key(method_sym)]; ok {
-				emit_constant(ctx, Value(fn_ptr))
-			} else {
-				fmt.panicf("Compiler Error: метод не найден")
-			}
-			prop_expr := e.callee.(^Property_Expr)
-			compile_expr(ctx, prop_expr.object)
-			for arg in e.args do compile_expr(ctx, arg)
-
-			emit_opcode(ctx, .Call)
-			emit_byte(ctx, u8(len(e.args) + 1))
-
-		} else if ctx.tc.is_constructor[expr] {
-			for arg in e.args do compile_expr(ctx, arg)
-			emit_opcode(ctx, .Build_Aggregate)
-			emit_byte(ctx, u8(len(e.args)))
-		} else {
-			compile_expr(ctx, e.callee)
-			for arg in e.args do compile_expr(ctx, arg)
-			emit_opcode(ctx, .Call)
-			emit_byte(ctx, u8(len(e.args)))
-		}
+		compile_expr(ctx, e.callee)
+		for arg in e.args do compile_expr(ctx, arg)
+		emit_opcode(ctx, .Call)
+		emit_byte(ctx, u8(len(e.args)))
 
 	case ^Match_Expr:
 		compile_match_expr(ctx, e)

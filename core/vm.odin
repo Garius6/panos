@@ -129,6 +129,15 @@ value_equals :: proc(a: Value, b: Value) -> bool {
 		if vb, ok := b.(bool); ok do return va == vb
 	case ^Panos_String:
 		if vb, ok := b.(^Panos_String); ok do return va.data == vb.data
+	case ^Variant_Value:
+		if vb, ok := b.(^Variant_Value); ok {
+			if va.tag_index != vb.tag_index do return false
+			if len(va.fields) != len(vb.fields) do return false
+			for i in 0 ..< len(va.fields) {
+				if !value_equals(va.fields[i], vb.fields[i]) do return false
+			}
+			return true
+		}
 	}
 	return false
 }

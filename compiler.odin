@@ -87,8 +87,10 @@ Loop_Context :: struct {
 
 symbol_registry_key :: proc(sym: ^Symbol) -> string {
 	if sym == nil do return ""
-	if len(sym.full_name) > 0 do return sym.full_name
-	return sym.name
+	// Interned(0) зарезервирован под "" — так же, как раньше `len(...) > 0`
+	// отличал заданный full_name от незаполненного.
+	if sym.full_name != Interned(0) do return resolve_interned(sym.full_name)
+	return resolve_interned(sym.name)
 }
 
 Compiler :: struct {
@@ -409,7 +411,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		if sym.kind == .Module {
 			fmt.panicf(
 				"Compiler Error: модуль '%s' нельзя использовать как значение",
-				sym.name,
+				resolve_interned(sym.name),
 			)
 		}
 		if info, ok := ctx.tc.call_infos[expr]; ok && info.kind == .Constructor_Variant {
@@ -423,7 +425,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		if sym.kind == .Builtin {
 			fmt.panicf(
 				"Compiler Error: встроенный конструктор '%s' нужно вызвать через ()",
-				sym.name,
+				resolve_interned(sym.name),
 			)
 		}
 
@@ -445,7 +447,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				// Кладем саму функцию на стек как константу!
 				emit_constant(ctx, Value(fn_ptr))
 			} else {
-				fmt.panicf("Compiler Error: символ '%s' не найден", sym.name)
+				fmt.panicf("Compiler Error: символ '%s' не найден", resolve_interned(sym.name))
 			}
 		}
 
@@ -534,11 +536,11 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 		if sym, ok := ctx.res.node_symbols[expr]; ok {
 			if sym.kind == .Enum_Variant {
-				owner_name := sym.owner_type == nil ? "" : sym.owner_type.name
+				owner_name := sym.owner_type == nil ? "" : resolve_interned(sym.owner_type.name)
 				fmt.panicf(
 					"Compiler Error: вариант '%s.%s' используется как значение — вызовите со скобками",
 					owner_name,
-					sym.name,
+					resolve_interned(sym.name),
 				)
 			}
 			if fn_ptr, found := ctx.registry^[symbol_registry_key(sym)]; found {
@@ -547,7 +549,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			}
 			fmt.panicf(
 				"Compiler Error: символ '%s' нельзя использовать как значение",
-				sym.full_name,
+				resolve_interned(sym.full_name),
 			)
 		}
 		if obj_ident, ok := e.object.(^Ident_Expr); ok {
@@ -557,10 +559,10 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				if imported_module == nil {
 					fmt.panicf(
 						"Compiler Error: модуль '%s' не загружен",
-						obj_ident.name,
+						resolve_interned(obj_ident.name),
 					)
 				}
-				if export_sym, found := imported_module.exports[e.property]; found {
+				if export_sym, found := imported_module.exports[intern(e.property)]; found {
 					if fn_ptr, found_fn := ctx.registry^[symbol_registry_key(export_sym)];
 					   found_fn {
 						emit_constant(ctx, Value(fn_ptr))
@@ -568,13 +570,13 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 					}
 					fmt.panicf(
 						"Compiler Error: экспорт '%s.%s' нельзя использовать как значение",
-						obj_ident.name,
+						resolve_interned(obj_ident.name),
 						e.property,
 					)
 				}
 				fmt.panicf(
 					"Compiler Error: модуль '%s' не экспортирует '%s'",
-					obj_ident.name,
+					resolve_interned(obj_ident.name),
 					e.property,
 				)
 			}
@@ -653,7 +655,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Builtin {
 				for arg in e.args do compile_expr(ctx, arg)
 				emit_opcode(ctx, .Call_Builtin)
-				emit_byte(ctx, make_constant(ctx, Value(ident.name)))
+				emit_byte(ctx, make_constant(ctx, Value(resolve_interned(ident.name))))
 				emit_byte(ctx, u8(len(e.args)))
 				return
 			}
@@ -756,7 +758,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 
 allocate_temp_slot :: proc(ctx: ^Compiler, name: string) -> int {
 	sym := new(Symbol)
-	sym.name = name
+	sym.name = intern(name)
 	sym.kind = .Variable
 	append(&ctx.locals, Local{symbol = sym, depth = ctx.scope_depth})
 	slot := len(ctx.locals) - 1

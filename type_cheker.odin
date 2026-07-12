@@ -23,6 +23,10 @@ Type_Kind :: enum {
 	Result,
 	InferVar,
 	Enum,
+	// Заглушка для узла, где уже была зарепорчена ошибка. Unify'ится с чем
+	// угодно (см. unify_types/types_are_equal) — не даёт одной первопричине
+	// расплодиться в десяток производных диагностик по всему выражению.
+	Poison,
 }
 
 Type_Variant :: struct {
@@ -81,6 +85,7 @@ TY_VOID := &Type{kind = .Void, name = "Пусто"}
 TY_NEVER := &Type{kind = .Never, name = "Никогда"}
 TY_STRING := &Type{kind = .String, name = "Строка"}
 TY_ERROR := &Type{kind = .Error, name = "Ошибка"}
+TY_POISON := &Type{kind = .Poison, name = "?ошибка?"}
 
 // Имя базового типа в аннотации → интернированный Type. `Никогда` был
 // пропущен здесь исторически — `функ f() -> Никогда` падал с "неизвестный
@@ -200,6 +205,7 @@ Pattern_Info :: struct {
 	binder_sym:   ^Symbol,
 	// Для конструктора: рекурсивные под-шаблоны, по одному на поле варианта.
 	sub_patterns: [dynamic]Pattern_Info,
+	span:         Span,
 }
 
 classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type) -> Pattern_Info {
@@ -208,12 +214,14 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 	}
 	switch pat in pattern {
 	case ^Pattern_Wildcard:
+		info.span = pat.span
 		info.kind = .Wildcard
 	case ^Pattern_Literal:
-		fmt.panicf(
-			"Type Error: литеральные шаблоны в выборе пока не поддерживаются",
-		)
+		info.span = pat.span
+		report(ctx, pat.span, "Type Error: литеральные шаблоны в выборе пока не поддерживаются")
+		info.kind = .Wildcard
 	case ^Pattern_Ident:
+		info.span = pat.span
 		expected := prune_type(expected_type)
 		if expected.kind == .Enum || expected.kind == .Option || expected.kind == .Result {
 			enum_view := expected
@@ -221,7 +229,9 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 			tag, found := variant_index(enum_view, pat.name)
 			if found {
 				if len(enum_view.variants[tag].fields) != 0 {
-					fmt.panicf(
+					report(
+						ctx,
+						pat.span,
 						"Type Error: вариант '%s.%s' в шаблоне без скобок, но у него есть поля",
 						enum_view.name,
 						pat.name,
@@ -235,39 +245,54 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 		}
 		binder_sym := ctx.res.pattern_binders[pat]
 		if binder_sym == nil {
-			fmt.panicf("Type Error: не разрешён шаблон '%s'", pat.name)
+			report(ctx, pat.span, "Type Error: не разрешён шаблон '%s'", pat.name)
+			info.kind = .Wildcard
+			return info
 		}
 		info.kind = .Binder
 		info.binder_sym = binder_sym
 		ctx.res.symbol_types[binder_sym] = expected_type
 	case ^Pattern_Constructor:
+		info.span = pat.span
 		expected := prune_type(expected_type)
 		if expected.kind != .Enum && expected.kind != .Option && expected.kind != .Result {
-			fmt.panicf(
+			report(
+				ctx,
+				pat.span,
 				"Type Error: шаблон-конструктор '%s' ожидает значение перечисления, получено '%s'",
 				pat.name,
 				expected.name,
 			)
+			info.kind = .Wildcard
+			return info
 		}
 		enum_view := expected
 		if expected.kind == .Option || expected.kind == .Result do enum_view = synth_enum_view(ctx, expected)
 		tag, found := variant_index(enum_view, pat.name)
 		if !found {
-			fmt.panicf(
+			report(
+				ctx,
+				pat.span,
 				"Type Error: вариант '%s' не найден в '%s'",
 				pat.name,
 				enum_view.name,
 			)
+			info.kind = .Wildcard
+			return info
 		}
 		expected_fields := enum_view.variants[tag].fields
 		if len(pat.args) != len(expected_fields) {
-			fmt.panicf(
+			report(
+				ctx,
+				pat.span,
 				"Type Error: у варианта '%s.%s' ожидалось %d аргументов в шаблоне, получено %d",
 				enum_view.name,
 				pat.name,
 				len(expected_fields),
 				len(pat.args),
 			)
+			info.kind = .Wildcard
+			return info
 		}
 		info.kind = .Constructor
 		info.tag_index = tag
@@ -317,37 +342,52 @@ synth_result_enum :: proc(result_type: ^Type) -> ^Type {
 }
 
 // Чистая процедура: получает тип-subject и arm_infos, проверяет
-// исчерпываемость, недостижимость, позицию `_`. Ошибка — panic по
-// правилам contracts/diagnostics.md.
-check_match_coverage :: proc(subject_type: ^Type, arm_infos: [dynamic]Pattern_Info) {
+// исчерпываемость, недостижимость, позицию `_`. Копит ошибки через
+// report() вместо немедленного panic — но продолжает разбор остальных
+// веток, чтобы отчитаться сразу обо всех проблемах match'а.
+check_match_coverage :: proc(
+	ctx: ^Type_Ctx,
+	match_span: Span,
+	subject_type: ^Type,
+	arm_infos: [dynamic]Pattern_Info,
+) {
 	total := len(subject_type.variants)
 	covered := make([dynamic]bool, total, context.temp_allocator)
 	catch_all := false
 
 	for pi, arm_idx in arm_infos {
 		if catch_all {
-			fmt.panicf(
+			report(
+				ctx,
+				pi.span,
 				"Type Error: ветка выбора #%d недостижима — все случаи покрыты выше",
 				arm_idx + 1,
 			)
+			continue
 		}
 		switch pi.kind {
 		case .Wildcard:
 			catch_all = true
 			if arm_idx != len(arm_infos) - 1 {
-				fmt.panicf(
+				report(
+					ctx,
+					pi.span,
 					"Type Error: '_' в выборе должен быть только последней веткой",
 				)
 			}
 		case .Binder:
 			catch_all = true
 			if arm_idx != len(arm_infos) - 1 {
-				fmt.panicf(
+				report(
+					ctx,
+					pi.span,
 					"Type Error: биндер-ветка выбора должна быть только последней — она покрывает все случаи",
 				)
 			}
 		case .Constructor:
 			if pi.tag_index < 0 || pi.tag_index >= total {
+				// Внутренний инвариант (classify_pattern всегда даёт валидный
+				// tag для .Constructor) — не user-facing, остаётся panic.
 				fmt.panicf(
 					"Type Error: внутренняя ошибка — тег варианта вне диапазона",
 				)
@@ -364,7 +404,9 @@ check_match_coverage :: proc(subject_type: ^Type, arm_infos: [dynamic]Pattern_In
 				}
 			}
 			if fully_covers && covered[pi.tag_index] {
-				fmt.panicf(
+				report(
+					ctx,
+					pi.span,
 					"Type Error: вариант '%s.%s' покрыт повторно в ветке #%d",
 					subject_type.name,
 					subject_type.variants[pi.tag_index].name,
@@ -383,8 +425,19 @@ check_match_coverage :: proc(subject_type: ^Type, arm_infos: [dynamic]Pattern_In
 	}
 	if len(missing) > 0 {
 		joined := strings.join(missing[:], ", ", context.temp_allocator)
-		fmt.panicf("Type Error: выбор не покрывает варианты: %s", joined)
+		report(ctx, match_span, "Type Error: выбор не покрывает варианты: %s", joined)
 	}
+}
+
+Severity :: enum {
+	Error,
+	Warning,
+}
+
+Diagnostic :: struct {
+	severity: Severity,
+	span:     Span,
+	message:  string,
 }
 
 Type_Ctx :: struct {
@@ -402,6 +455,7 @@ Type_Ctx :: struct {
 	current_return:   ^Type,
 	loop_depth:       int,
 	next_infer_id:    int,
+	diagnostics:      [dynamic]Diagnostic,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -413,7 +467,28 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		call_infos = make(map[Expr]Call_Info),
 		match_arm_infos = make(map[^Match_Expr][dynamic]Pattern_Info),
 		synth_enum_cache = make(map[^Type]^Type),
+		diagnostics = make([dynamic]Diagnostic),
 	}
+}
+
+// Копит ошибку вместо немедленного panic — так typecheck_program успевает
+// пройти всю программу и показать все ошибки разом, а не только первую.
+// Возвращает TY_POISON: он unify'ится с чем угодно (см. unify_types),
+// поэтому один репорт не плодит цепочку производных ошибок у всех, кто
+// читает результат этого выражения дальше.
+//
+// Дедуп по (span, message): check_function_body проверяет тело функции
+// дважды (infer_block_type + infer_function_body — независимая старая
+// избыточность, не связанная с этой стадией), из-за чего один и тот же
+// узел мог зарепортиться 2-3 раза подряд. Раньше это было незаметно —
+// panic on first срабатывал до второго прохода.
+report :: proc(ctx: ^Type_Ctx, span: Span, format: string, args: ..any) -> ^Type {
+	msg := fmt.aprintf(format, ..args)
+	for d in ctx.diagnostics {
+		if d.span == span && d.message == msg do return TY_POISON
+	}
+	append(&ctx.diagnostics, Diagnostic{severity = .Error, span = span, message = msg})
+	return TY_POISON
 }
 
 // Кэширующая обёртка над synth_option_enum/synth_result_enum: один base
@@ -512,6 +587,7 @@ unify_types :: proc(a: ^Type, b: ^Type) -> bool {
 	if left == nil || right == nil do return false
 	if left == right do return true
 	if left.kind == .Never || right.kind == .Never do return true
+	if left.kind == .Poison || right.kind == .Poison do return true
 
 	if left.kind == .InferVar do return bind_infer_var(left, right)
 	if right.kind == .InferVar do return bind_infer_var(right, left)
@@ -602,9 +678,9 @@ has_unresolved_infer_vars :: proc(t: ^Type) -> bool {
 
 // Помогает ловить случаи, когда infer дошел не до конца, но код уже
 // пытается использовать результат как окончательный тип.
-ensure_type_resolved :: proc(t: ^Type, where_text: string) {
+ensure_type_resolved :: proc(ctx: ^Type_Ctx, span: Span, t: ^Type, where_text: string) {
 	if has_unresolved_infer_vars(t) {
-		fmt.panicf("Type Error: не удалось вывести тип %s", where_text)
+		report(ctx, span, "Type Error: не удалось вывести тип %s", where_text)
 	}
 }
 
@@ -614,10 +690,14 @@ resolve_param_types :: proc(ctx: ^Type_Ctx, args: [dynamic]Param_Decl) -> [dynam
 	params := make([dynamic]^Type)
 	for arg in args {
 		if arg.type_annotation == nil {
-			fmt.panicf(
+			report(
+				ctx,
+				arg.span,
 				"Type Error: у аргумента '%s' нет явной аннотации типа",
 				arg.name,
 			)
+			append(&params, TY_POISON)
+			continue
 		}
 		append(&params, resolve_type_node(ctx, arg.type_annotation))
 	}
@@ -625,32 +705,47 @@ resolve_param_types :: proc(ctx: ^Type_Ctx, args: [dynamic]Param_Decl) -> [dynam
 }
 
 // Для лямбд параметры можно либо взять из ожидаемого типа, либо вывести
-// как отдельные InferVar и потом связать их через тело.
+// как отдельные InferVar и потом связать их через тело. `span` — span
+// самой лямбды, для ошибок без более точного узла (несовпадение arity/kind
+// с ожидаемым типом).
 infer_lambda_param_types :: proc(
 	ctx: ^Type_Ctx,
+	span: Span,
 	args: [dynamic]Param_Decl,
 	expected: ^Type = nil,
 ) -> [dynamic]^Type {
 	params := make([dynamic]^Type)
 	expected_type := prune_type(expected)
 	if expected_type != nil && expected_type.kind != .Function {
-		fmt.panicf(
+		report(
+			ctx,
+			span,
 			"Type Error: лямбду можно проверить только с типом функции",
 		)
+		// Деградируем до "ожидаемого типа нет" — иначе ниже упадём на
+		// expected_type.params при несовпадающем kind.
+		expected_type = nil
 	}
 	if expected_type != nil && len(args) != len(expected_type.params) {
-		fmt.panicf(
+		report(
+			ctx,
+			span,
 			"Type Error: лямбда имеет %d аргументов, ожидалось %d",
 			len(args),
 			len(expected_type.params),
 		)
+		// То же самое: длины разошлись — дальше индексировать
+		// expected_type.params[i] по len(args) небезопасно.
+		expected_type = nil
 	}
 
 	for arg, i in args {
 		if arg.type_annotation != nil {
 			arg_type := resolve_type_node(ctx, arg.type_annotation)
 			if expected_type != nil && !unify_types(arg_type, expected_type.params[i]) {
-				fmt.panicf(
+				report(
+					ctx,
+					arg.span,
 					"Type Error: аргумент лямбды '%s' имеет тип '%s', ожидался '%s'",
 					arg.name,
 					prune_type(arg_type).name,
@@ -734,14 +829,16 @@ check_lambda_expr :: proc(
 	expected: ^Type = nil,
 ) -> ^Type {
 	expected_type := prune_type(expected)
-	params := infer_lambda_param_types(ctx, lambda.args, expected_type)
+	params := infer_lambda_param_types(ctx, lambda.span, lambda.args, expected_type)
 	bind_lambda_args(ctx, expr, params)
 
 	return_type: ^Type
 	if lambda.return_type != nil {
 		return_type = resolve_type_node(ctx, lambda.return_type)
 		if expected_type != nil && !unify_types(return_type, expected_type.return_type) {
-			fmt.panicf(
+			report(
+				ctx,
+				lambda.span,
 				"Type Error: лямбда возвращает '%s', ожидался '%s'",
 				prune_type(return_type).name,
 				prune_type(expected_type.return_type).name,
@@ -757,7 +854,9 @@ check_lambda_expr :: proc(
 	ctx.node_types[expr] = function_type
 
 	if expected_type != nil && !unify_types(function_type, expected_type) {
-		fmt.panicf(
+		report(
+			ctx,
+			lambda.span,
 			"Type Error: лямбда имеет тип '%s', ожидался '%s'",
 			function_type.name,
 			expected_type.name,
@@ -765,11 +864,13 @@ check_lambda_expr :: proc(
 	}
 
 	if lambda.return_type != nil || expected_type != nil {
-		check_function_body(ctx, lambda.body, return_type)
+		check_function_body(ctx, lambda.span, lambda.body, return_type)
 	} else {
 		body_type := infer_callable_body_type(ctx, lambda.body)
 		if !unify_types(body_type, return_type) {
-			fmt.panicf(
+			report(
+				ctx,
+				lambda.span,
 				"Type Error: тело лямбды имеет тип '%s', ожидался '%s'",
 				prune_type(body_type).name,
 				prune_type(return_type).name,
@@ -777,7 +878,7 @@ check_lambda_expr :: proc(
 		}
 	}
 
-	ensure_type_resolved(function_type, "лямбды")
+	ensure_type_resolved(ctx, lambda.span, function_type, "лямбды")
 	return function_type
 }
 
@@ -876,13 +977,19 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Impl_Decl:
-			target_sym := ctx.res.global_scope.symbols[d.target_type]
+			target_sym := ctx.res.global_scope.symbols[intern(d.target_type)]
 			struct_type := ctx.res.symbol_types[target_sym]
 			if struct_type == nil || struct_type.kind != .Struct {
-				fmt.panicf(
+				report(
+					ctx,
+					d.span,
 					"Type Error: неизвестная структура '%s'",
 					d.target_type,
 				)
+				// struct_type == nil ниже разыменовывается (.methods,
+				// .implemented_interfaces) — без структуры реализацию
+				// проверять нечем, пропускаем весь блок.
+				continue
 			}
 
 			// Регистрируем методы
@@ -891,7 +998,9 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				method_type := function_type_from_decl(ctx, m)
 				if len(method_type.params) == 0 ||
 				   !types_are_equal(method_type.params[0], struct_type) {
-					fmt.panicf(
+					report(
+						ctx,
+						m.span,
 						"Type Error: первый аргумент метода '%s' должен иметь тип '%s'",
 						m.name,
 						struct_type.name,
@@ -904,24 +1013,38 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 
 			// Строгая проверка интерфейсного контракта
 			if d.interface_name != "" {
-				iface_sym := ctx.res.global_scope.symbols[d.interface_name]
+				iface_sym := ctx.res.global_scope.symbols[intern(d.interface_name)]
 				iface_type := ctx.res.symbol_types[iface_sym]
 
 				if iface_type == nil || iface_type.kind != .Interface {
-					fmt.panicf(
+					report(
+						ctx,
+						d.span,
 						"Type Error: '%s' не является интерфейсом",
 						d.interface_name,
 					)
+					continue
 				}
 
 				for req_name in iface_type.interface_methods {
 					method_sym, found := struct_type.methods[req_name]
-					if !found do fmt.panicf("Type Error: структура '%s' не реализует метод '%s'", d.target_type, req_name)
+					if !found {
+						report(
+							ctx,
+							d.span,
+							"Type Error: структура '%s' не реализует метод '%s'",
+							d.target_type,
+							req_name,
+						)
+						continue
+					}
 
 					expected_method_type := iface_type.interface_methods[req_name]
 					actual_method_type := ctx.res.symbol_types[method_sym]
 					if !interface_method_types_match(expected_method_type, actual_method_type) {
-						fmt.panicf(
+						report(
+							ctx,
+							d.span,
 							"Type Error: метод '%s' структуры '%s' не совпадает с контрактом интерфейса '%s'",
 							req_name,
 							d.target_type,
@@ -940,13 +1063,13 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 		case ^Function_Decl:
 			func_type := ctx.res.symbol_types[ctx.res.decl_symbols[decl]]
 			bind_function_args(ctx, d, func_type)
-			check_function_body(ctx, d.body, func_type.return_type)
+			check_function_body(ctx, d.span, d.body, func_type.return_type)
 		case ^Impl_Decl:
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
 				func_type := ctx.res.symbol_types[sym]
 				bind_function_args(ctx, m, func_type)
-				check_function_body(ctx, m.body, func_type.return_type)
+				check_function_body(ctx, m.span, m.body, func_type.return_type)
 			}
 		}
 	}
@@ -960,16 +1083,18 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 	switch n in node {
 	case ^Type_Ident:
 		if base_type, ok := lookup_base_type(n.name); ok do return base_type
-		if sym := lookup_symbol(ctx.res.global_scope, n.name); sym != nil {
+		if sym := lookup_symbol(ctx.res.global_scope, intern(n.name)); sym != nil {
 			if sym.kind == .Module {
-				fmt.panicf(
+				return report(
+					ctx,
+					n.span,
 					"Type Error: модуль '%s' нельзя использовать как тип",
 					n.name,
 				)
 			}
 			if typ, ok := ctx.res.symbol_types[sym]; ok do return typ
 		}
-		fmt.panicf("Type Error: неизвестный тип '%s'", n.name)
+		return report(ctx, n.span, "Type Error: неизвестный тип '%s'", n.name)
 
 	case ^Type_Tuple:
 		elements := make([dynamic]^Type)
@@ -986,48 +1111,54 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 		return_type := resolve_type_node(ctx, n.return_type)
 		return new_function_type(params, return_type)
 	case ^Type_Qualified:
-		module_sym := lookup_symbol(ctx.res.global_scope, n.module_name)
+		module_sym := lookup_symbol(ctx.res.global_scope, intern(n.module_name))
 		if module_sym == nil || module_sym.kind != .Module {
-			fmt.panicf("Type Error: неизвестный модуль '%s'", n.module_name)
+			return report(ctx, n.span, "Type Error: неизвестный модуль '%s'", n.module_name)
 		}
 		imported_module := module_sym.module
 		if imported_module == nil {
-			fmt.panicf("Type Error: модуль '%s' не загружен", n.module_name)
+			return report(ctx, n.span, "Type Error: модуль '%s' не загружен", n.module_name)
 		}
-		if export_sym, found := imported_module.exports[n.name]; found {
+		if export_sym, found := imported_module.exports[intern(n.name)]; found {
 			if typ, found_type := ctx.res.symbol_types[export_sym]; found_type {
 				return typ
 			}
-			fmt.panicf(
+			return report(
+				ctx,
+				n.span,
 				"Type Error: тип '%s.%s' еще не доступен",
 				n.module_name,
 				n.name,
 			)
 		}
-		fmt.panicf(
+		return report(
+			ctx,
+			n.span,
 			"Type Error: модуль '%s' не экспортирует '%s'",
 			n.module_name,
 			n.name,
 		)
 	case ^Type_Generic:
 		if n.name == "Массив" {
-			if len(n.params) != 1 do fmt.panicf("Type Error: Массив ожидает 1 параметр типа")
+			if len(n.params) != 1 do return report(ctx, n.span, "Type Error: Массив ожидает 1 параметр типа")
 			return new_array_type(resolve_type_node(ctx, n.params[0]))
 		} else if n.name == "Соответствие" {
-			if len(n.params) != 2 do fmt.panicf("Type Error: Соответствие ожидает 2 параметра типа")
+			if len(n.params) != 2 do return report(ctx, n.span, "Type Error: Соответствие ожидает 2 параметра типа")
 			key_type := resolve_type_node(ctx, n.params[0])
 			if !is_valid_map_key_type(key_type) {
-				fmt.panicf(
+				return report(
+					ctx,
+					n.span,
 					"Type Error: тип '%s' нельзя использовать как ключ соответствия",
 					key_type.name,
 				)
 			}
 			return new_map_type(key_type, resolve_type_node(ctx, n.params[1]))
 		} else if n.name == "Опция" {
-			if len(n.params) != 1 do fmt.panicf("Type Error: Опция ожидает 1 параметр типа")
+			if len(n.params) != 1 do return report(ctx, n.span, "Type Error: Опция ожидает 1 параметр типа")
 			return new_option_type(resolve_type_node(ctx, n.params[0]))
 		} else if n.name == "Результат" {
-			if len(n.params) != 2 do fmt.panicf("Type Error: Результат ожидает 2 параметра типа")
+			if len(n.params) != 2 do return report(ctx, n.span, "Type Error: Результат ожидает 2 параметра типа")
 			return new_result_type(
 				resolve_type_node(ctx, n.params[0]),
 				resolve_type_node(ctx, n.params[1]),
@@ -1043,6 +1174,7 @@ types_are_equal :: proc(a: ^Type, b: ^Type) -> bool {
 	right := prune_type(b)
 	if left == nil || right == nil do return false
 	if left == right do return true
+	if left.kind == .Poison || right.kind == .Poison do return true
 	if left.kind == .InferVar || right.kind == .InferVar do return false
 
 	if right.kind == .Interface && left.kind == .Struct {
@@ -1141,12 +1273,14 @@ infer_block_type :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 // Проверка обычной функции против уже известной сигнатуры.
 check_func_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) {
 	func_type := ctx.res.symbol_types[ctx.res.decl_symbols[d]]
-	check_function_body(ctx, d.body, func_type.return_type)
+	check_function_body(ctx, d.span, d.body, func_type.return_type)
 }
 
 // Сначала проверяем инструкции сверху вниз, затем сверяем фактический тип
-// блока и явные `return` с ожидаемым возвращаемым типом.
-check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return: ^Type) {
+// блока и явные `return` с ожидаемым возвращаемым типом. `span` — span
+// объемлющей функции/лямбды/метода, используется для диагностик, у которых
+// нет более точного узла (напр. "тело не возвращает значение").
+check_function_body :: proc(ctx: ^Type_Ctx, span: Span, body: [dynamic]Stmt, expected_return: ^Type) {
 	expected_return_type := prune_type(expected_return)
 	prev_return := ctx.current_return
 	ctx.current_return = expected_return_type
@@ -1160,7 +1294,9 @@ check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return
 
 	if expected_return_type == TY_VOID {
 		if body_type != TY_VOID && !unify_types(body_type, TY_VOID) {
-			fmt.panicf(
+			report(
+				ctx,
+				span,
 				"Type Error: функция объявлена как 'Пусто', но последнее выражение имеет тип '%s'",
 				prune_type(body_type).name,
 			)
@@ -1171,7 +1307,9 @@ check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return
 
 	if body_type != TY_VOID {
 		if !unify_types(body_type, expected_return_type) {
-			fmt.panicf(
+			report(
+				ctx,
+				span,
 				"Type Error: функция должна возвращать '%s', но последнее выражение имеет тип '%s'",
 				prune_type(expected_return_type).name,
 				prune_type(body_type).name,
@@ -1183,7 +1321,9 @@ check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return
 
 	if explicit_return_type != nil && explicit_return_type != TY_VOID {
 		if !unify_types(explicit_return_type, expected_return_type) {
-			fmt.panicf(
+			report(
+				ctx,
+				span,
 				"Type Error: функция должна возвращать '%s', но return имеет тип '%s'",
 				prune_type(expected_return_type).name,
 				prune_type(explicit_return_type).name,
@@ -1194,7 +1334,9 @@ check_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return
 	}
 
 	ctx.current_return = prev_return
-	fmt.panicf(
+	report(
+		ctx,
+		span,
 		"Type Error: функция должна возвращать '%s', но тело не возвращает значение",
 		prune_type(expected_return_type).name,
 	)
@@ -1224,7 +1366,9 @@ check_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, expected_return: ^Type) {
 		if s.value != nil {
 			check_expr(ctx, s.value, expected_return)
 		} else if expected_return != TY_VOID {
-			fmt.panicf(
+			report(
+				ctx,
+				s.span,
 				"Type Error: ожидался возврат %s, но return пустой",
 				expected_return.name,
 			)
@@ -1251,7 +1395,9 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 		if s.type_annotation != nil {
 			expected_type := resolve_type_node(ctx, s.type_annotation)
 			if expected_type == TY_VOID {
-				fmt.panicf(
+				report(
+					ctx,
+					s.span,
 					"Type Error: переменная '%s' не может иметь тип 'Пусто'",
 					s.name,
 				)
@@ -1262,12 +1408,14 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 			t := infer_expr(ctx, s.value)
 			t = prune_type(t)
 			if t == TY_VOID {
-				fmt.panicf(
+				report(
+					ctx,
+					s.span,
 					"Type Error: переменная '%s' не может иметь тип 'Пусто'",
 					s.name,
 				)
 			}
-			ensure_type_resolved(t, fmt.tprintf("переменной '%s'", s.name))
+			ensure_type_resolved(ctx, s.span, t, fmt.tprintf("переменной '%s'", s.name))
 			ctx.res.symbol_types[sym] = t
 		}
 
@@ -1276,14 +1424,18 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 
 	case ^Continue_Stmt:
 		if ctx.loop_depth == 0 {
-			fmt.panicf(
+			report(
+				ctx,
+				s.span,
 				"Type Error: 'продолжить' можно использовать только внутри цикла",
 			)
 		}
 
 	case ^Break_Stmt:
 		if ctx.loop_depth == 0 {
-			fmt.panicf(
+			report(
+				ctx,
+				s.span,
 				"Type Error: 'прервать' можно использовать только внутри цикла",
 			)
 		}
@@ -1295,7 +1447,7 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 
 // Проверяет выражение в контексте ожидаемого типа.
 // Для лямбд, коллекций и вызовов это позволяет протолкнуть типы вниз.
-check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type, loc := #caller_location) {
+check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type) {
 	if expr == nil do return
 	expected_type := prune_type(expected)
 
@@ -1335,11 +1487,12 @@ check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type, loc := #caller_l
 	}
 
 	if !unify_types(actual, expected_type) {
-		fmt.panicf(
+		report(
+			ctx,
+			expr_span(expr),
 			"Type Error: ожидался '%s', получен '%s'",
 			prune_type(expected_type).name,
 			prune_type(actual).name,
-			loc = loc,
 		)
 	}
 }
@@ -1347,7 +1500,7 @@ check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type, loc := #caller_l
 Builtin_Ctor_Sig :: struct {
 	name:    string,
 	arity:   int,
-	handler: proc(ctx: ^Type_Ctx, args: [dynamic]Expr) -> ^Type,
+	handler: proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type,
 }
 
 // Таблица builtin-конструкторов (Ошибка/Есть/Нет/Успех/Неудача/длина/
@@ -1358,7 +1511,7 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 	{
 		name = "Ошибка",
 		arity = 2,
-		handler = proc(ctx: ^Type_Ctx, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], TY_STRING)
 			check_expr(ctx, args[1], TY_STRING)
 			return TY_ERROR
@@ -1367,40 +1520,43 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 	{
 		name = "Есть",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
 			return new_option_type(infer_expr(ctx, args[0]))
 		},
 	},
 	{
 		name = "Нет",
 		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
 			return new_option_type(new_infer_var(ctx))
 		},
 	},
 	{
 		name = "Успех",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
 			return new_result_type(infer_expr(ctx, args[0]), new_infer_var(ctx))
 		},
 	},
 	{
 		name = "Неудача",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
 			return new_result_type(new_infer_var(ctx), infer_expr(ctx, args[0]))
 		},
 	},
 	{
 		name = "длина",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
 			arg_type := prune_type(infer_expr(ctx, args[0]))
 			if arg_type.kind == .String || arg_type.kind == .Array || arg_type.kind == .Map {
 				return TY_NUM
 			}
-			fmt.panicf(
+			if arg_type.kind == .Poison do return TY_POISON
+			return report(
+				ctx,
+				expr_span(call),
 				"Type Error: длина() ожидает строку, массив или соответствие, получен '%s'",
 				arg_type.name,
 			)
@@ -1409,7 +1565,7 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 	{
 		name = "паника",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], TY_STRING)
 			return TY_NEVER
 		},
@@ -1418,6 +1574,7 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 
 builtin_constructor_type :: proc(
 	ctx: ^Type_Ctx,
+	call: Expr,
 	name: string,
 	args: [dynamic]Expr,
 ) -> (
@@ -1427,14 +1584,16 @@ builtin_constructor_type :: proc(
 	for sig in BUILTIN_CTORS {
 		if sig.name != name do continue
 		if len(args) != sig.arity {
-			fmt.panicf(
+			return report(
+				ctx,
+				expr_span(call),
 				"Type Error: %s() ожидает %d аргументов, получено %d",
 				name,
 				sig.arity,
 				len(args),
-			)
+			), true
 		}
-		return sig.handler(ctx, args), true
+		return sig.handler(ctx, call, args), true
 	}
 	return nil, false
 }
@@ -1442,31 +1601,31 @@ builtin_constructor_type :: proc(
 Method_Sig :: struct {
 	name:    string,
 	arity:   int,
-	handler: proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type,
+	handler: proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type,
 }
 
 OPTION_METHODS := [?]Method_Sig {
 	{
 		name = "есть",
 		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
 	},
 	{
 		name = "пусто",
 		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
 	},
 	{
 		name = "значение",
 		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			return prune_type(receiver_type.element_type)
 		},
 	},
 	{
 		name = "получить",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], receiver_type.element_type)
 			return prune_type(receiver_type.element_type)
 		},
@@ -1474,16 +1633,19 @@ OPTION_METHODS := [?]Method_Sig {
 	{
 		name = "запас",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			fallback_type := prune_type(infer_expr(ctx, args[0]))
 			if fallback_type.kind != .Option {
-				fmt.panicf(
+				report(
+					ctx,
+					expr_span(call),
 					"Type Error: Опция.запас() ожидает Опцию, получен '%s'",
 					fallback_type.name,
 				)
-			}
-			if !unify_types(receiver_type.element_type, fallback_type.element_type) {
-				fmt.panicf(
+			} else if !unify_types(receiver_type.element_type, fallback_type.element_type) {
+				report(
+					ctx,
+					expr_span(call),
 					"Type Error: Опция.запас() ожидает Опцию(%s), получен '%s'",
 					prune_type(receiver_type.element_type).name,
 					fallback_type.name,
@@ -1495,7 +1657,7 @@ OPTION_METHODS := [?]Method_Sig {
 	{
 		name = "ожидать",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], TY_STRING)
 			return prune_type(receiver_type.element_type)
 		},
@@ -1503,7 +1665,7 @@ OPTION_METHODS := [?]Method_Sig {
 	{
 		name = "результат_или",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			error_type := infer_expr(ctx, args[0])
 			return new_result_type(prune_type(receiver_type.element_type), prune_type(error_type))
 		},
@@ -1511,7 +1673,7 @@ OPTION_METHODS := [?]Method_Sig {
 	{
 		name = "заменить_значение",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			element_type := infer_expr(ctx, args[0])
 			return new_option_type(prune_type(element_type))
 		},
@@ -1522,31 +1684,31 @@ RESULT_METHODS := [?]Method_Sig {
 	{
 		name = "успех",
 		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
 	},
 	{
 		name = "ошибка",
 		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
 	},
 	{
 		name = "значение",
 		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			return prune_type(receiver_type.ok_type)
 		},
 	},
 	{
 		name = "причина",
 		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			return prune_type(receiver_type.error_type)
 		},
 	},
 	{
 		name = "получить",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], receiver_type.ok_type)
 			return prune_type(receiver_type.ok_type)
 		},
@@ -1554,7 +1716,7 @@ RESULT_METHODS := [?]Method_Sig {
 	{
 		name = "получить_ошибку",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], receiver_type.error_type)
 			return prune_type(receiver_type.error_type)
 		},
@@ -1562,16 +1724,21 @@ RESULT_METHODS := [?]Method_Sig {
 	{
 		name = "запас",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			fallback_type := prune_type(infer_expr(ctx, args[0]))
 			if fallback_type.kind != .Result {
-				fmt.panicf(
+				report(
+					ctx,
+					expr_span(call),
 					"Type Error: Результат.запас() ожидает Результат, получен '%s'",
 					fallback_type.name,
 				)
+				return new_result_type(prune_type(receiver_type.ok_type), prune_type(receiver_type.error_type))
 			}
 			if !unify_types(receiver_type.ok_type, fallback_type.ok_type) {
-				fmt.panicf(
+				report(
+					ctx,
+					expr_span(call),
 					"Type Error: Результат.запас() ожидает Результат(%s, ...), получен '%s'",
 					prune_type(receiver_type.ok_type).name,
 					fallback_type.name,
@@ -1586,7 +1753,7 @@ RESULT_METHODS := [?]Method_Sig {
 	{
 		name = "ожидать",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], TY_STRING)
 			return prune_type(receiver_type.ok_type)
 		},
@@ -1594,7 +1761,7 @@ RESULT_METHODS := [?]Method_Sig {
 	{
 		name = "ожидать_ошибку",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], TY_STRING)
 			return prune_type(receiver_type.error_type)
 		},
@@ -1602,21 +1769,21 @@ RESULT_METHODS := [?]Method_Sig {
 	{
 		name = "опция",
 		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			return new_option_type(prune_type(receiver_type.ok_type))
 		},
 	},
 	{
 		name = "ошибка_опция",
 		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			return new_option_type(prune_type(receiver_type.error_type))
 		},
 	},
 	{
 		name = "заменить_значение",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			ok_type := infer_expr(ctx, args[0])
 			return new_result_type(prune_type(ok_type), prune_type(receiver_type.error_type))
 		},
@@ -1624,7 +1791,7 @@ RESULT_METHODS := [?]Method_Sig {
 	{
 		name = "заменить_ошибку",
 		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			error_type := infer_expr(ctx, args[0])
 			return new_result_type(prune_type(receiver_type.ok_type), prune_type(error_type))
 		},
@@ -1656,15 +1823,17 @@ standard_method_type :: proc(
 	for sig in method_list {
 		if sig.name != method_name do continue
 		if len(args) != sig.arity {
-			fmt.panicf(
+			return report(
+				ctx,
+				expr_span(call),
 				"Type Error: %s.%s() ожидает %d аргументов, получено %d",
 				receiver_type.name,
 				method_name,
 				sig.arity,
 				len(args),
-			)
+			), true
 		}
-		result := sig.handler(ctx, receiver_type, args)
+		result := sig.handler(ctx, call, receiver_type, args)
 		ctx.call_infos[call] = Call_Info{kind = .Method_Collection, text_name = method_name}
 		return result, true
 	}
@@ -1685,31 +1854,33 @@ resolve_variant_ctor :: proc(
 ) -> ^Type {
 	owner := sym.owner_type
 	if owner == nil {
-		fmt.panicf("Type Error: у варианта '%s' нет типа-владельца", sym.name)
+		fmt.panicf("Type Error: у варианта '%s' нет типа-владельца", resolve_interned(sym.name))
 	}
 	owner_type := ctx.res.symbol_types[owner]
 	if owner_type == nil {
 		fmt.panicf(
 			"Type Error: тип-владелец '%s' варианта '%s' ещё не построен",
-			owner.name,
-			sym.name,
+			resolve_interned(owner.name),
+			resolve_interned(sym.name),
 		)
 	}
-	tag, found := variant_index(owner_type, sym.name)
+	tag, found := variant_index(owner_type, resolve_interned(sym.name))
 	if !found {
 		fmt.panicf(
 			"Type Error: вариант '%s' не найден в '%s'",
-			sym.name,
+			resolve_interned(sym.name),
 			owner_type.name,
 		)
 	}
 
 	if !is_call {
 		if len(owner_type.variants[tag].fields) != 0 {
-			fmt.panicf(
+			return report(
+				ctx,
+				expr_span(expr),
 				"Type Error: вариант '%s.%s' должен быть вызван со скобками — у него есть поля",
 				owner_type.name,
-				sym.name,
+				resolve_interned(sym.name),
 			)
 		}
 		ctx.call_infos[expr] = Call_Info {
@@ -1721,10 +1892,12 @@ resolve_variant_ctor :: proc(
 
 	expected := owner_type.variants[tag].fields
 	if len(args) != len(expected) {
-		fmt.panicf(
+		return report(
+			ctx,
+			expr_span(expr),
 			"Type Error: у варианта '%s.%s' ожидалось %d аргументов, получено %d",
 			owner_type.name,
-			sym.name,
+			resolve_interned(sym.name),
 			len(expected),
 			len(args),
 		)
@@ -1732,10 +1905,12 @@ resolve_variant_ctor :: proc(
 	for arg, i in args {
 		actual := prune_type(infer_expr(ctx, arg))
 		if !unify_types(actual, expected[i]) {
-			fmt.panicf(
+			report(
+				ctx,
+				expr_span(arg),
 				"Type Error: у варианта '%s.%s' поле #%d ожидает '%s', получено '%s'",
 				owner_type.name,
-				sym.name,
+				resolve_interned(sym.name),
 				i,
 				prune_type(expected[i]).name,
 				prune_type(actual).name,
@@ -1752,22 +1927,26 @@ resolve_variant_ctor :: proc(
 infer_ident_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Ident_Expr) -> ^Type {
 	sym := ctx.res.node_symbols[expr]
 	if sym.kind == .Module {
-		fmt.panicf(
+		return report(
+			ctx,
+			e.span,
 			"Type Error: модуль '%s' нельзя использовать как значение",
-			sym.name,
+			resolve_interned(sym.name),
 		)
 	}
 	if sym.kind == .Enum_Variant {
 		return resolve_variant_ctor(ctx, expr, sym, nil, false)
 	}
 	if sym.kind == .Builtin {
-		fmt.panicf(
+		return report(
+			ctx,
+			e.span,
 			"Type Error: встроенный конструктор '%s' нужно вызвать через ()",
-			sym.name,
+			resolve_interned(sym.name),
 		)
 	}
 	var_type, ok := ctx.res.symbol_types[sym]
-	if !ok do fmt.panicf("Type Error: символ '%s' используется до инициализации", sym.name)
+	if !ok do return report(ctx, e.span, "Type Error: символ '%s' используется до инициализации", resolve_interned(sym.name))
 	return prune_type(var_type)
 }
 
@@ -1794,8 +1973,15 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 			t = TY_STRING
 		} else if left_t == TY_NUM && right_t == TY_NUM {
 			t = TY_NUM
+		} else if left_t.kind == .Poison || right_t.kind == .Poison {
+			// Прямое `==` сравнение выше не поймает Poison (не unify_types) —
+			// без явного шорт-каута отчитались бы производной ошибкой поверх
+			// уже отчитанной первопричины.
+			t = TY_POISON
 		} else {
-			fmt.panicf(
+			t = report(
+				ctx,
+				e.span,
 				"Type Error: оператор '+' ожидает два числа или две строки, получено '%s' и '%s'",
 				left_t.name,
 				right_t.name,
@@ -1820,7 +2006,9 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 		left_t := infer_expr(ctx, e.left)
 		right_t := infer_expr(ctx, e.right)
 		if !unify_types(left_t, right_t) {
-			fmt.panicf(
+			report(
+				ctx,
+				e.span,
 				"Type Error: оператор '==' ожидает совместимые типы, получено '%s' и '%s'",
 				prune_type(left_t).name,
 				prune_type(right_t).name,
@@ -1833,7 +2021,9 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 		check_expr(ctx, e.right, left_t)
 		right_t := infer_expr(ctx, e.right)
 		if !unify_types(right_t, left_t) {
-			fmt.panicf(
+			report(
+				ctx,
+				e.span,
 				"Type Error: попытка присвоить значение типа '%s' в место типа '%s'",
 				prune_type(right_t).name,
 				prune_type(left_t).name,
@@ -1841,7 +2031,7 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 		}
 		t = TY_VOID
 	case:
-		fmt.panicf("Type Error: неподдерживаемый оператор %v", e.op)
+		t = report(ctx, e.span, "Type Error: неподдерживаемый оператор %v", e.op)
 	}
 	return t
 }
@@ -1866,7 +2056,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 	}
 	if ident, ok := e.callee.(^Ident_Expr); ok {
 		if sym := ctx.res.node_symbols[e.callee]; sym != nil && sym.kind == .Builtin {
-			if builtin_type, handled := builtin_constructor_type(ctx, ident.name, e.args);
+			if builtin_type, handled := builtin_constructor_type(ctx, expr, resolve_interned(ident.name), e.args);
 			   handled {
 				return builtin_type
 			}
@@ -1881,16 +2071,20 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 			   obj_sym != nil && obj_sym.kind == .Module {
 				imported_module := obj_sym.module
 				if imported_module == nil {
-					fmt.panicf(
+					return report(
+						ctx,
+						e.span,
 						"Type Error: модуль '%s' не загружен",
-						obj_ident.name,
+						resolve_interned(obj_ident.name),
 					)
 				}
-				export_sym, found := imported_module.exports[prop_expr.property]
+				export_sym, found := imported_module.exports[intern(prop_expr.property)]
 				if !found {
-					fmt.panicf(
+					return report(
+						ctx,
+						e.span,
 						"Type Error: модуль '%s' не экспортирует '%s'",
-						obj_ident.name,
+						resolve_interned(obj_ident.name),
 						prop_expr.property,
 					)
 				}
@@ -1898,7 +2092,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				export_type, found_type := ctx.res.symbol_types[export_sym]
 				if !found_type || export_type == nil {
 					if export_sym.kind == .Builtin {
-						export_type = builtin_export_type(export_sym.full_name)
+						export_type = builtin_export_type(resolve_interned(export_sym.full_name))
 						if export_type != nil {
 							ctx.res.symbol_types[export_sym] = export_type
 						}
@@ -1907,9 +2101,11 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 						export_type = function_type_from_decl(ctx, fn_decl)
 					}
 					if export_type == nil {
-						fmt.panicf(
+						return report(
+							ctx,
+							e.span,
 							"Type Error: символ '%s.%s' еще не типизирован",
-							obj_ident.name,
+							resolve_interned(obj_ident.name),
 							prop_expr.property,
 						)
 					}
@@ -1918,7 +2114,9 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				#partial switch export_type.kind {
 				case .Function:
 					if len(e.args) != len(export_type.params) {
-						fmt.panicf(
+						return report(
+							ctx,
+							e.span,
 							"Type Error: неверное количество аргументов",
 						)
 					}
@@ -1926,14 +2124,16 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 					if export_sym.kind == .Builtin {
 						ctx.call_infos[expr] = Call_Info {
 							kind      = .Builtin,
-							text_name = export_sym.full_name,
+							text_name = resolve_interned(export_sym.full_name),
 						}
 					}
 					return prune_type(export_type.return_type)
 
 				case .Struct:
 					if len(e.args) != len(export_type.fields) {
-						fmt.panicf(
+						return report(
+							ctx,
+							e.span,
 							"Type Error: структура '%s' имеет %d полей",
 							export_type.name,
 							len(export_type.fields),
@@ -1944,9 +2144,11 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 					return export_type
 
 				case:
-					fmt.panicf(
+					return report(
+						ctx,
+						e.span,
 						"Type Error: символ '%s.%s' нельзя вызвать",
-						obj_ident.name,
+						resolve_interned(obj_ident.name),
 						prop_expr.property,
 					)
 				}
@@ -1968,32 +2170,34 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 		if obj_type.kind == .Array {
 			switch prop_expr.property {
 			case "длина":
-				if len(e.args) != 0 do fmt.panicf("Type Error: массив.длина() не принимает аргументы")
+				if len(e.args) != 0 do return report(ctx, e.span, "Type Error: массив.длина() не принимает аргументы")
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return TY_NUM
 			case "добавить":
-				if len(e.args) != 1 do fmt.panicf("Type Error: массив.добавить() ожидает 1 аргумент")
+				if len(e.args) != 1 do return report(ctx, e.span, "Type Error: массив.добавить() ожидает 1 аргумент")
 				check_expr(ctx, e.args[0], obj_type.element_type)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return TY_VOID
 			case "получить":
-				if len(e.args) != 2 do fmt.panicf("Type Error: массив.получить() ожидает индекс и значение по умолчанию")
+				if len(e.args) != 2 do return report(ctx, e.span, "Type Error: массив.получить() ожидает индекс и значение по умолчанию")
 				check_expr(ctx, e.args[0], TY_NUM)
 				check_expr(ctx, e.args[1], obj_type.element_type)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return obj_type.element_type
 			case "есть":
-				if len(e.args) != 1 do fmt.panicf("Type Error: массив.есть() ожидает индекс")
+				if len(e.args) != 1 do return report(ctx, e.span, "Type Error: массив.есть() ожидает индекс")
 				check_expr(ctx, e.args[0], TY_NUM)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return TY_BOOL
 			case "содержит":
-				if len(e.args) != 1 do fmt.panicf("Type Error: массив.содержит() ожидает значение")
+				if len(e.args) != 1 do return report(ctx, e.span, "Type Error: массив.содержит() ожидает значение")
 				check_expr(ctx, e.args[0], obj_type.element_type)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return TY_BOOL
 			case:
-				fmt.panicf(
+				return report(
+					ctx,
+					e.span,
 					"Type Error: у массива нет метода '%s'",
 					prop_expr.property,
 				)
@@ -2002,27 +2206,29 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 		} else if obj_type.kind == .Map {
 			switch prop_expr.property {
 			case "длина":
-				if len(e.args) != 0 do fmt.panicf("Type Error: соответствие.длина() не принимает аргументы")
+				if len(e.args) != 0 do return report(ctx, e.span, "Type Error: соответствие.длина() не принимает аргументы")
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return TY_NUM
 			case "есть":
-				if len(e.args) != 1 do fmt.panicf("Type Error: соответствие.есть() ожидает ключ")
+				if len(e.args) != 1 do return report(ctx, e.span, "Type Error: соответствие.есть() ожидает ключ")
 				check_expr(ctx, e.args[0], obj_type.key_type)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return TY_BOOL
 			case "получить":
-				if len(e.args) != 2 do fmt.panicf("Type Error: соответствие.получить() ожидает ключ и значение по умолчанию")
+				if len(e.args) != 2 do return report(ctx, e.span, "Type Error: соответствие.получить() ожидает ключ и значение по умолчанию")
 				check_expr(ctx, e.args[0], obj_type.key_type)
 				check_expr(ctx, e.args[1], obj_type.value_type)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return obj_type.value_type
 			case "удалить":
-				if len(e.args) != 1 do fmt.panicf("Type Error: соответствие.удалить() ожидает ключ")
+				if len(e.args) != 1 do return report(ctx, e.span, "Type Error: соответствие.удалить() ожидает ключ")
 				check_expr(ctx, e.args[0], obj_type.key_type)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return TY_BOOL
 			case:
-				fmt.panicf(
+				return report(
+					ctx,
+					e.span,
 					"Type Error: у соответствия нет метода '%s'",
 					prop_expr.property,
 				)
@@ -2031,7 +2237,15 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 		} else if obj_type.kind == .Struct {
 			if method_sym, is_method := obj_type.methods[prop_expr.property]; is_method {
 				method_type := ctx.res.symbol_types[method_sym]
-				if len(e.args) != len(method_type.params) - 1 do fmt.panicf("У метода %s ожидалось %d аргументов", method_sym.name, len(method_type.params) - 1)
+				if len(e.args) != len(method_type.params) - 1 {
+					return report(
+						ctx,
+						e.span,
+						"У метода %s ожидалось %d аргументов",
+						resolve_interned(method_sym.name),
+						len(method_type.params) - 1,
+					)
+				}
 				check_expr(ctx, prop_expr.object, method_type.params[0])
 				for arg, i in e.args do check_expr(ctx, arg, method_type.params[i + 1])
 
@@ -2040,13 +2254,17 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 			}
 		} else if obj_type.kind == .Interface {
 			if method_type, exists := obj_type.interface_methods[prop_expr.property]; exists {
-				if len(e.args) != len(method_type.params) - 1 do fmt.panicf("Ожидалось %d аргументов", len(method_type.params) - 1)
+				if len(e.args) != len(method_type.params) - 1 {
+					return report(ctx, e.span, "Ожидалось %d аргументов", len(method_type.params) - 1)
+				}
 				for arg, i in e.args do check_expr(ctx, arg, method_type.params[i + 1])
 
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Interface, text_name = prop_expr.property}
 				return prune_type(method_type.return_type)
 			} else {
-				fmt.panicf(
+				return report(
+					ctx,
+					e.span,
 					"Type Error: в интерфейсе '%s' нет метода '%s'",
 					obj_type.name,
 					prop_expr.property,
@@ -2057,18 +2275,32 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 
 	callee_type := prune_type(infer_expr(ctx, e.callee))
 	if callee_type.kind == .Struct {
-		if len(e.args) != len(callee_type.fields) do fmt.panicf("Type Error: структура '%s' имеет %d полей", callee_type.name, len(callee_type.fields))
+		if len(e.args) != len(callee_type.fields) {
+			return report(
+				ctx,
+				e.span,
+				"Type Error: структура '%s' имеет %d полей",
+				callee_type.name,
+				len(callee_type.fields),
+			)
+		}
 		for arg, i in e.args do check_expr(ctx, arg, callee_type.fields[i].type)
 		ctx.call_infos[expr] = Call_Info{kind = .Constructor_Struct}
 		t = callee_type
 
 	} else if callee_type.kind == .Function {
-		if len(e.args) != len(callee_type.params) do fmt.panicf("Type Error: неверное количество аргументов")
+		if len(e.args) != len(callee_type.params) {
+			return report(ctx, e.span, "Type Error: неверное количество аргументов")
+		}
 		for arg, i in e.args do check_expr(ctx, arg, callee_type.params[i])
 		t = prune_type(callee_type.return_type)
 
+	} else if callee_type.kind == .Poison {
+		t = TY_POISON
 	} else {
-		fmt.panicf(
+		return report(
+			ctx,
+			e.span,
 			"Type Error: значение типа '%s' нельзя вызвать",
 			callee_type.name,
 		)
@@ -2089,7 +2321,9 @@ infer_if_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^If_Expr) -> ^Type {
 		else_type := infer_block_type(ctx, e.else_branch)
 
 		if !unify_types(then_type, else_type) {
-			fmt.panicf(
+			report(
+				ctx,
+				e.span,
 				"Type Error: ветки 'если' возвращают разные типы. 'тогда' -> '%s', 'иначе' -> '%s'",
 				prune_type(then_type).name,
 				prune_type(else_type).name,
@@ -2123,7 +2357,9 @@ infer_tuple_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Tuple_Expr) -> ^Type {
 
 infer_array_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Array_Expr) -> ^Type {
 	if len(e.elements) == 0 {
-		fmt.panicf(
+		return report(
+			ctx,
+			e.span,
 			"Type Error: для пустого массива нужна аннотация ожидаемого типа",
 		)
 	}
@@ -2131,7 +2367,9 @@ infer_array_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Array_Expr) -> ^Type {
 	for el, i in e.elements {
 		current_type := infer_expr(ctx, el)
 		if i > 0 && !unify_types(current_type, element_type) {
-			fmt.panicf(
+			report(
+				ctx,
+				expr_span(el),
 				"Type Error: элементы массива имеют разные типы: '%s' и '%s'",
 				prune_type(element_type).name,
 				prune_type(current_type).name,
@@ -2143,7 +2381,9 @@ infer_array_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Array_Expr) -> ^Type {
 
 infer_map_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Map_Expr) -> ^Type {
 	if len(e.entries) == 0 {
-		fmt.panicf(
+		return report(
+			ctx,
+			e.span,
 			"Type Error: для пустого соответствия нужна аннотация ожидаемого типа",
 		)
 	}
@@ -2153,21 +2393,27 @@ infer_map_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Map_Expr) -> ^Type {
 		current_key_type := infer_expr(ctx, entry.key)
 		current_value_type := infer_expr(ctx, entry.value)
 		if !is_valid_map_key_type(current_key_type) {
-			fmt.panicf(
+			report(
+				ctx,
+				expr_span(entry.key),
 				"Type Error: тип '%s' нельзя использовать как ключ соответствия",
 				current_key_type.name,
 			)
 		}
 		if i > 0 {
 			if !unify_types(current_key_type, key_type) {
-				fmt.panicf(
+				report(
+					ctx,
+					expr_span(entry.key),
 					"Type Error: ключи соответствия имеют разные типы: '%s' и '%s'",
 					prune_type(key_type).name,
 					prune_type(current_key_type).name,
 				)
 			}
 			if !unify_types(current_value_type, value_type) {
-				fmt.panicf(
+				report(
+					ctx,
+					expr_span(entry.value),
 					"Type Error: значения соответствия имеют разные типы: '%s' и '%s'",
 					prune_type(value_type).name,
 					prune_type(current_value_type).name,
@@ -2190,8 +2436,12 @@ infer_index_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Index_Expr) -> ^Type {
 	} else if obj_type.kind == .String {
 		check_expr(ctx, e.index, TY_NUM)
 		t = TY_STRING
+	} else if obj_type.kind == .Poison {
+		t = TY_POISON
 	} else {
-		fmt.panicf(
+		t = report(
+			ctx,
+			e.span,
 			"Type Error: индексирование поддерживают только массивы и соответствия, получен '%s'",
 			obj_type.name,
 		)
@@ -2206,7 +2456,12 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 		subject_type = synth_enum_view(ctx, subject_type_actual)
 	}
 	if subject_type.kind != .Enum {
-		fmt.panicf(
+		// Возвращаем сразу — иначе классификация каждой ветки ниже полезет
+		// в classify_pattern с невалидным subject_type и продублирует эту
+		// же ошибку на каждую ветку.
+		return report(
+			ctx,
+			e.span,
 			"Type Error: выбор ожидает значение перечисления, Опции или Результата, получено '%s'",
 			subject_type_actual.name,
 		)
@@ -2237,7 +2492,9 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 			if result_t == nil {
 				result_t = body_t
 			} else if !unify_types(body_t, result_t) {
-				fmt.panicf(
+				report(
+					ctx,
+					arm.span,
 					"Type Error: ветки выбора возвращают разные типы: '%s' vs '%s'",
 					prune_type(result_t).name,
 					prune_type(body_t).name,
@@ -2247,7 +2504,7 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 	}
 	if result_t == nil do result_t = TY_NEVER
 	ctx.match_arm_infos[e] = arm_infos
-	check_match_coverage(subject_type, arm_infos)
+	check_match_coverage(ctx, e.span, subject_type, arm_infos)
 	return prune_type(result_t)
 }
 
@@ -2257,7 +2514,9 @@ infer_try_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Try_Expr) -> ^Type {
 	if value_type.kind == .Option {
 		return_type := prune_type(ctx.current_return)
 		if return_type == nil || return_type.kind != .Option {
-			fmt.panicf(
+			report(
+				ctx,
+				e.span,
 				"Type Error: оператор '?' для Опции можно использовать только в функции, возвращающей Опцию",
 			)
 		}
@@ -2265,20 +2524,27 @@ infer_try_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Try_Expr) -> ^Type {
 	} else if value_type.kind == .Result {
 		return_type := prune_type(ctx.current_return)
 		if return_type == nil || return_type.kind != .Result {
-			fmt.panicf(
+			report(
+				ctx,
+				e.span,
 				"Type Error: оператор '?' можно использовать только в функции, возвращающей Результат",
 			)
-		}
-		if !unify_types(value_type.error_type, return_type.error_type) {
-			fmt.panicf(
+		} else if !unify_types(value_type.error_type, return_type.error_type) {
+			report(
+				ctx,
+				e.span,
 				"Type Error: оператор '?' возвращает ошибку типа '%s', но функция ожидает '%s'",
 				prune_type(value_type.error_type).name,
 				prune_type(return_type.error_type).name,
 			)
 		}
 		t = prune_type(value_type.ok_type)
+	} else if value_type.kind == .Poison {
+		t = TY_POISON
 	} else {
-		fmt.panicf(
+		t = report(
+			ctx,
+			e.span,
 			"Type Error: оператор '?' ожидает Опцию или Результат, получен '%s'",
 			value_type.name,
 		)
@@ -2298,18 +2564,20 @@ infer_property_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Property_Expr) -> ^T
 		   obj_sym != nil && obj_sym.kind == .Module {
 			imported_module := obj_sym.module
 			if imported_module == nil {
-				fmt.panicf(
+				return report(
+					ctx,
+					e.span,
 					"Type Error: модуль '%s' не загружен",
-					obj_ident.name,
+					resolve_interned(obj_ident.name),
 				)
 			}
-			if export_sym, found := imported_module.exports[e.property]; found {
+			if export_sym, found := imported_module.exports[intern(e.property)]; found {
 				if typ, found_type := ctx.res.symbol_types[export_sym];
 				   found_type && typ != nil {
 					return prune_type(typ)
 				}
 				if export_sym.kind == .Builtin {
-					bt := builtin_export_type(export_sym.full_name)
+					bt := builtin_export_type(resolve_interned(export_sym.full_name))
 					if bt != nil {
 						ctx.res.symbol_types[export_sym] = bt
 						return bt
@@ -2318,15 +2586,19 @@ infer_property_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Property_Expr) -> ^T
 				   has_fn_decl {
 					return function_type_from_decl(ctx, fn_decl)
 				}
-				fmt.panicf(
+				return report(
+					ctx,
+					e.span,
 					"Type Error: тип '%s.%s' еще не доступен",
-					obj_ident.name,
+					resolve_interned(obj_ident.name),
 					e.property,
 				)
 			}
-			fmt.panicf(
+			return report(
+				ctx,
+				e.span,
 				"Type Error: модуль '%s' не экспортирует '%s'",
-				obj_ident.name,
+				resolve_interned(obj_ident.name),
 				e.property,
 			)
 		}
@@ -2342,18 +2614,26 @@ infer_property_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Property_Expr) -> ^T
 				break
 			}
 		}
-		if field_idx == -1 do fmt.panicf("Type Error: у структуры '%s' нет поля '%s'", obj_type.name, e.property)
+		if field_idx == -1 {
+			return report(ctx, e.span, "Type Error: у структуры '%s' нет поля '%s'", obj_type.name, e.property)
+		}
 		ctx.property_indices[expr] = field_idx
 
 	} else if obj_type.kind == .Tuple {
 		idx, ok := strconv.parse_int(e.property)
-		if !ok do fmt.panicf("Type Error: неверный индекс тупла '%s'", e.property)
-		if idx < 0 || idx >= len(obj_type.elements) do fmt.panicf("Type Error: индекс %d выходит за границы", idx)
+		if !ok {
+			return report(ctx, e.span, "Type Error: неверный индекс тупла '%s'", e.property)
+		}
+		if idx < 0 || idx >= len(obj_type.elements) {
+			return report(ctx, e.span, "Type Error: индекс %d выходит за границы", idx)
+		}
 		t = obj_type.elements[idx]
 		ctx.property_indices[expr] = idx
 
 	} else if obj_type.kind == .Array || obj_type.kind == .Map {
-		fmt.panicf(
+		return report(
+			ctx,
+			e.span,
 			"Type Error: метод коллекции '%s' нужно вызвать через ()",
 			e.property,
 		)
@@ -2367,17 +2647,24 @@ infer_property_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Property_Expr) -> ^T
 			t = TY_STRING
 			ctx.property_indices[expr] = 1
 		case:
-			fmt.panicf("Type Error: у Ошибка нет поля '%s'", e.property)
+			t = report(ctx, e.span, "Type Error: у Ошибка нет поля '%s'", e.property)
 		}
 
 	} else if obj_type.kind == .Option || obj_type.kind == .Result {
-		fmt.panicf(
+		return report(
+			ctx,
+			e.span,
 			"Type Error: метод '%s' нужно вызвать через ()",
 			e.property,
 		)
 
+	} else if obj_type.kind == .Poison {
+		t = TY_POISON
+
 	} else {
-		fmt.panicf(
+		return report(
+			ctx,
+			e.span,
 			"Type Error: попытка получить поле у не-структуры (тип: %s)",
 			obj_type.name,
 		)

@@ -8,7 +8,7 @@ is_builtin_module_name :: proc(name: string) -> bool {
 
 add_builtin_export :: proc(graph: ^Module_Graph, module: ^Module, name: string, typ: ^Type) {
 	sym := new_symbol(name, .Builtin, module, true)
-	module.exports[name] = sym
+	module.exports[sym.name] = sym
 	graph.symbol_types[sym] = typ
 }
 
@@ -65,7 +65,7 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 	module := new(Module)
 	module.path = name
 	module.dir = ""
-	module.exports = make(map[string]^Symbol)
+	module.exports = make(map[Interned]^Symbol)
 	graph.modules[name] = module
 
 	if name == "фс" {

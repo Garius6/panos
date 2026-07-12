@@ -61,6 +61,15 @@ run_file :: proc(filename: string, program_args: []string = nil) {
 		fmt.printf("--------------------------\n")
 		type_ctx := new_type_ctx(&resolver_ctx)
 		typecheck_program(&type_ctx, module.ast)
+		if len(type_ctx.diagnostics) > 0 {
+			for d in type_ctx.diagnostics {
+				source := graph.file_sources[d.span.file_id]
+				path := graph.file_paths[d.span.file_id]
+				line, col := span_line_col(source, d.span.start)
+				fmt.eprintf("%s:%d:%d: %s\n", path, line, col, d.message)
+			}
+			os.exit(1)
+		}
 		print_type_ctx(&type_ctx)
 		fmt.printf("--------------------------\n\n")
 

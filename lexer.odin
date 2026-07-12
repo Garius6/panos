@@ -170,152 +170,158 @@ lookup_ident :: proc(ident: string) -> TokenKind {
 }
 
 // ВАЖНО: Переименовано в next_token_lex, чтобы не конфликтовать с token.odin!
-next_token_lex :: proc(l: ^Lexer) -> Token {
+// Один return point внизу — там же ставится span. `l.pos - l.width` в
+// любой момент указывает на начало ещё не съеденного `l.ch` (см.
+// read_identifier/read_number — тот же приём), поэтому start берётся до
+// свитча, а end — после того, как соответствующая ветка съела токен целиком.
+next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 	skip_whitespace_and_comments(l)
 
-	if l.ch == 0 {
-		return Token{kind = .EOF, data = "EOF"}
-	}
-
+	start_pos := l.pos - l.width
 	tok: Token
 
-	switch l.ch {
-	case '<':
-		if peek_char(l) == '>' {
-			advance(l)
-			advance(l)
-			tok = Token {
-				kind = .NotEqual,
-				data = "<>",
+	if l.ch == 0 {
+		tok = Token{kind = .EOF, data = "EOF"}
+	} else {
+		switch l.ch {
+		case '<':
+			if peek_char(l) == '>' {
+				advance(l)
+				advance(l)
+				tok = Token {
+					kind = .NotEqual,
+					data = "<>",
+				}
+			} else {
+				tok = Token {
+					kind = .Less,
+					data = "<",
+				}
+				advance(l)
 			}
-		} else {
+		case '>':
 			tok = Token {
-				kind = .Less,
-				data = "<",
-			}
-			advance(l)
-		}
-	case '>':
-		tok = Token {
-			kind = .Greater,
-			data = ">",
-		}; advance(l)
-	case '=':
-		if peek_char(l) == '=' {
-			advance(l)
-			advance(l)
-			tok = Token {
-				kind = .Equal,
-				data = "==",
-			}
-		} else {
-			tok = Token {
-				kind = .Assign,
-				data = "=",
+				kind = .Greater,
+				data = ">",
 			}; advance(l)
-		}
-	case '+':
-		tok = Token {
-			kind = .Plus,
-			data = "+",
-		}; advance(l)
-	case '-':
-		if peek_char(l) == '>' {
-			advance(l)
-			advance(l)
-			tok = Token {
-				kind = .Arrow,
-				data = "->",
+		case '=':
+			if peek_char(l) == '=' {
+				advance(l)
+				advance(l)
+				tok = Token {
+					kind = .Equal,
+					data = "==",
+				}
+			} else {
+				tok = Token {
+					kind = .Assign,
+					data = "=",
+				}; advance(l)
 			}
-		} else {
+		case '+':
 			tok = Token {
-				kind = .Minus,
-				data = "-",
+				kind = .Plus,
+				data = "+",
 			}; advance(l)
-		}
-	case '*':
-		tok = Token {
-			kind = .Star,
-			data = "*",
-		}; advance(l)
-	case '/':
-		tok = Token {
-			kind = .Slash,
-			data = "/",
-		}; advance(l)
-	case '(':
-		tok = Token {
-			kind = .LParen,
-			data = "(",
-		}; advance(l)
-	case ')':
-		tok = Token {
-			kind = .RParen,
-			data = ")",
-		}; advance(l)
-	case '[':
-		tok = Token {
-			kind = .LBracket,
-			data = "[",
-		}; advance(l)
-	case ']':
-		tok = Token {
-			kind = .RBracket,
-			data = "]",
-		}; advance(l)
-	case ',':
-		tok = Token {
-			kind = .Comma,
-			data = ",",
-		}; advance(l)
-	case '?':
-		tok = Token {
-			kind = .Question,
-			data = "?",
-		}; advance(l)
-	case '.':
-		tok = Token {
-			kind = .Dot,
-			data = ".",
-		}; advance(l)
-	case ':':
-		tok = Token {
-			kind = .Colon,
-			data = ":",
-		}; advance(l)
-	case ';':
-		tok = Token {
-			kind = .Semicolon,
-			data = ";",
-		}; advance(l)
-	case '"':
-		str := read_string(l)
-		return Token{kind = .String, data = str}
-	case:
-		if unicode.is_alpha(l.ch) || l.ch == '_' {
-			ident := read_identifier(l)
-			return Token{kind = lookup_ident(ident), data = ident}
-		} else if unicode.is_digit(l.ch) {
-			num := read_number(l)
-			return Token{kind = .Number, data = num}
-		} else {
-			fmt.panicf(
-				"Лексическая ошибка: неожиданный символ '%v'",
-				l.ch,
-			)
+		case '-':
+			if peek_char(l) == '>' {
+				advance(l)
+				advance(l)
+				tok = Token {
+					kind = .Arrow,
+					data = "->",
+				}
+			} else {
+				tok = Token {
+					kind = .Minus,
+					data = "-",
+				}; advance(l)
+			}
+		case '*':
+			tok = Token {
+				kind = .Star,
+				data = "*",
+			}; advance(l)
+		case '/':
+			tok = Token {
+				kind = .Slash,
+				data = "/",
+			}; advance(l)
+		case '(':
+			tok = Token {
+				kind = .LParen,
+				data = "(",
+			}; advance(l)
+		case ')':
+			tok = Token {
+				kind = .RParen,
+				data = ")",
+			}; advance(l)
+		case '[':
+			tok = Token {
+				kind = .LBracket,
+				data = "[",
+			}; advance(l)
+		case ']':
+			tok = Token {
+				kind = .RBracket,
+				data = "]",
+			}; advance(l)
+		case ',':
+			tok = Token {
+				kind = .Comma,
+				data = ",",
+			}; advance(l)
+		case '?':
+			tok = Token {
+				kind = .Question,
+				data = "?",
+			}; advance(l)
+		case '.':
+			tok = Token {
+				kind = .Dot,
+				data = ".",
+			}; advance(l)
+		case ':':
+			tok = Token {
+				kind = .Colon,
+				data = ":",
+			}; advance(l)
+		case ';':
+			tok = Token {
+				kind = .Semicolon,
+				data = ";",
+			}; advance(l)
+		case '"':
+			str := read_string(l)
+			tok = Token{kind = .String, data = str}
+		case:
+			if unicode.is_alpha(l.ch) || l.ch == '_' {
+				ident := read_identifier(l)
+				tok = Token{kind = lookup_ident(ident), data = ident}
+			} else if unicode.is_digit(l.ch) {
+				num := read_number(l)
+				tok = Token{kind = .Number, data = num}
+			} else {
+				fmt.panicf(
+					"Лексическая ошибка: неожиданный символ '%v'",
+					l.ch,
+				)
+			}
 		}
 	}
 
+	end_pos := l.pos - l.width
+	tok.span = Span{file_id = file_id, start = u32(start_pos), end = u32(end_pos)}
 	return tok
 }
 
-// ВАЖНО: Сигнатура не изменена, возвращает [dynamic]Token как раньше.
-tokenize :: proc(input: string) -> [dynamic]Token {
+tokenize :: proc(input: string, file_id: u16 = 0) -> [dynamic]Token {
 	l := new_lexer(input)
 	tokens := make([dynamic]Token)
 
 	for {
-		tok := next_token_lex(&l)
+		tok := next_token_lex(&l, file_id)
 		append(&tokens, tok)
 		if tok.kind == .EOF do break
 	}

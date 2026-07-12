@@ -47,15 +47,21 @@ load_module_recursive :: proc(graph: ^Module_Graph, file_path: string, is_entry:
 	} else {
 		module.path = module_key
 	}
-	module.exports = make(map[string]^Symbol)
+	module.exports = make(map[Interned]^Symbol)
+	module.file_id = u16(len(graph.modules))
 
 	source := read_file_text(module_key)
-	tokens := tokenize(source)
+	module.source = source
+	graph.file_paths[module.file_id] = module_key
+	graph.file_sources[module.file_id] = source
+
+	tokens := tokenize(source, module.file_id)
 	stream := make_stream(tokens)
 	defer destroy_stream(&stream)
 
 	parser := Parser {
-		stream = &stream,
+		stream  = &stream,
+		file_id = module.file_id,
 	}
 	module.ast = parse_program(&parser)
 

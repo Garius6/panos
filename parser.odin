@@ -4,7 +4,8 @@ import "core:fmt"
 import "core:strconv"
 
 Parser :: struct {
-	stream: ^TokenStream,
+	stream:  ^TokenStream,
+	file_id: u16,
 }
 
 Parser_Error :: enum {
@@ -12,6 +13,7 @@ Parser_Error :: enum {
 }
 
 Function_Decl :: struct {
+	span:        Span,
 	name:        string,
 	args:        [dynamic]Param_Decl,
 	return_type: Type_Node,
@@ -20,50 +22,59 @@ Function_Decl :: struct {
 }
 
 Param_Decl :: struct {
+	span:            Span,
 	name:            string,
 	type_annotation: Type_Node,
 }
 
 Method_Signature :: struct {
+	span:        Span,
 	name:        string,
 	args:        [dynamic]Param_Decl,
 	return_type: Type_Node,
 }
 
 Interface_Decl :: struct {
+	span:        Span,
 	name:        string,
 	methods:     [dynamic]Method_Signature,
 	is_exported: bool,
 }
 
 Field_Decl :: struct {
+	span:            Span,
 	name:            string,
 	type_annotation: Type_Node,
 }
 
 Struct_Decl :: struct {
+	span:        Span,
 	name:        string,
 	fields:      [dynamic]Field_Decl,
 	is_exported: bool,
 }
 
 Import_Decl :: struct {
+	span:  Span,
 	path:  string,
 	alias: string,
 }
 
 Variant_Decl :: struct {
+	span:  Span,
 	name:  string,
 	types: [dynamic]Type_Node,
 }
 
 Enum_Decl :: struct {
+	span:        Span,
 	name:        string,
 	variants:    [dynamic]Variant_Decl,
 	is_exported: bool,
 }
 
 Impl_Decl :: struct {
+	span:           Span,
 	interface_name: string,
 	target_type:    string,
 	methods:        [dynamic]^Function_Decl,
@@ -83,11 +94,13 @@ Program :: struct {
 }
 
 Type_Generic :: struct {
+	span:   Span,
 	name:   string,
 	params: [dynamic]Type_Node,
 }
 
 Type_Qualified :: struct {
+	span:        Span,
 	module_name: string,
 	name:        string,
 }
@@ -101,15 +114,18 @@ Type_Node :: union {
 }
 
 Type_Function :: struct {
+	span:        Span,
 	params:      [dynamic]Type_Node,
 	return_type: Type_Node,
 }
 
 Type_Ident :: struct {
+	span: Span,
 	name: string,
 }
 
 Type_Tuple :: struct {
+	span:     Span,
 	elements: [dynamic]Type_Node,
 }
 
@@ -122,31 +138,43 @@ Stmt :: union {
 }
 
 Return_Stmt :: struct {
+	span:  Span,
 	value: Expr,
 }
 
 Let_Stmt :: struct {
+	span:            Span,
 	name:            string,
 	value:           Expr,
 	type_annotation: Type_Node,
 }
 
 Expr_Stmt :: struct {
+	span: Span,
 	expr: Expr,
 }
 
-Continue_Stmt :: struct {}
+Continue_Stmt :: struct {
+	span: Span,
+}
 
-Break_Stmt :: struct {}
+Break_Stmt :: struct {
+	span: Span,
+}
 
-Pattern_Wildcard :: struct {}
+Pattern_Wildcard :: struct {
+	span: Span,
+}
 Pattern_Literal :: struct {
+	span:  Span,
 	value: Expr,
 }
 Pattern_Ident :: struct {
+	span: Span,
 	name: string,
 }
 Pattern_Constructor :: struct {
+	span:        Span,
 	module_name: string,
 	name:        string,
 	args:        [dynamic]Pattern,
@@ -160,92 +188,111 @@ Pattern :: union {
 }
 
 Match_Arm :: struct {
+	span:    Span,
 	pattern: Pattern,
 	body:    [dynamic]Stmt,
 }
 
 Match_Expr :: struct {
+	span:    Span,
 	subject: Expr,
 	arms:    [dynamic]Match_Arm,
 }
 
 Ident_Expr :: struct {
-	name: string,
+	span: Span,
+	name: Interned,
 }
 
 Unary_Expr :: struct {
+	span:  Span,
 	op:    TokenKind,
 	right: Expr,
 }
 
 Number_Expr :: struct {
+	span:  Span,
 	value: f64,
 }
 
 Boolean_Expr :: struct {
+	span:  Span,
 	value: bool,
 }
 
 String_Expr :: struct {
+	span:  Span,
 	value: string,
 }
 
 Binary_Expr :: struct {
+	span:  Span,
 	left:  Expr,
 	op:    TokenKind, // Теперь может быть .Assign (=)
 	right: Expr,
 }
 
 Call_Expr :: struct {
+	span:   Span,
 	args:   [dynamic]Expr,
 	callee: Expr,
 }
 
 Property_Expr :: struct {
+	span:     Span,
 	object:   Expr,
 	property: string,
 }
 
 If_Expr :: struct {
+	span:        Span,
 	condition:   Expr,
 	then_branch: [dynamic]Stmt,
 	else_branch: [dynamic]Stmt,
 }
 
 While_Expr :: struct {
+	span:      Span,
 	condition: Expr,
 	body:      [dynamic]Stmt,
 }
 
 Tuple_Expr :: struct {
+	span:     Span,
 	elements: [dynamic]Expr,
 }
 
 Lambda_Expr :: struct {
+	span:        Span,
 	args:        [dynamic]Param_Decl,
 	return_type: Type_Node,
 	body:        [dynamic]Stmt,
 }
 
 Array_Expr :: struct {
+	span:     Span,
 	elements: [dynamic]Expr,
 }
 
 Map_Entry_Expr :: struct {
+	span:  Span,
 	key:   Expr,
 	value: Expr,
 }
 
 Map_Expr :: struct {
+	span:    Span,
 	entries: [dynamic]Map_Entry_Expr,
 }
 
 Index_Expr :: struct {
+	span:   Span,
 	object: Expr,
 	index:  Expr,
 }
 
 Try_Expr :: struct {
+	span:  Span,
 	value: Expr,
 }
 
@@ -361,7 +408,7 @@ print_ast :: proc(expr: Expr, prefix: string = "", is_last: bool = true) {
 		print_ast(e.left, next_prefix, false)
 		print_ast(e.right, next_prefix, true)
 	case ^Ident_Expr:
-		fmt.printf("%s%sIdent(%v)\n", prefix, marker, e.name)
+		fmt.printf("%s%sIdent(%v)\n", prefix, marker, resolve_interned(e.name))
 	case ^Call_Expr:
 		fmt.printf("%s%sCall()\n", prefix, marker)
 		print_ast(e.callee, next_prefix, false)
@@ -486,6 +533,7 @@ parse_program :: proc(p: ^Parser) -> Program {
 }
 
 parse_import_decl :: proc(p: ^Parser) -> ^Import_Decl {
+	start := peek_token(p.stream).span
 	expect(p, .Import)
 	decl := new(Import_Decl)
 
@@ -509,10 +557,12 @@ parse_import_decl :: proc(p: ^Parser) -> ^Import_Decl {
 	}
 
 	consume_semicolon_or_newline(p)
+	decl.span = span_from(p, start)
 	return decl
 }
 
 parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
+	start := peek_token(p.stream).span
 	expect(p, .TypeDecl)
 
 	name_tok := next_token(p.stream)
@@ -577,6 +627,7 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
 			expect(p, .RParen)
 		}
 
+		variant.span = span_from(p, variant_tok.span)
 		append(&decl.variants, variant)
 		consume_semicolon_or_newline(p)
 	}
@@ -590,10 +641,12 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
 		)
 	}
 
+	decl.span = span_from(p, start)
 	return decl
 }
 
 parse_interface_decl :: proc(p: ^Parser, is_exported: bool) -> ^Interface_Decl {
+	start := peek_token(p.stream).span
 	expect(p, .TypeDecl)
 	decl := new(Interface_Decl)
 	decl.methods = make([dynamic]Method_Signature)
@@ -606,6 +659,7 @@ parse_interface_decl :: proc(p: ^Parser, is_exported: bool) -> ^Interface_Decl {
 	expect(p, .Interface)
 
 	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
+		method_start := peek_token(p.stream).span
 		expect(p, .Function)
 		method_name := next_token(p.stream)
 		signature := Method_Signature {
@@ -613,15 +667,18 @@ parse_interface_decl :: proc(p: ^Parser, is_exported: bool) -> ^Interface_Decl {
 		}
 		signature.args = parse_param_list(p, true)
 		signature.return_type = parse_required_return_type(p, "метода интерфейса")
+		signature.span = span_from(p, method_start)
 		append(&decl.methods, signature)
 		consume_semicolon_or_newline(p)
 	}
 
 	expect(p, .End)
+	decl.span = span_from(p, start)
 	return decl
 }
 
 parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
+	start := peek_token(p.stream).span
 	expect(p, .Impl)
 
 	decl := new(Impl_Decl)
@@ -663,10 +720,12 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 	}
 
 	expect(p, .End)
+	decl.span = span_from(p, start)
 	return decl
 }
 
 parse_function :: proc(p: ^Parser, is_exported: bool) -> ^Function_Decl {
+	start := peek_token(p.stream).span
 	expect(p, .Function)
 	function := new(Function_Decl)
 	function.body = make([dynamic]Stmt)
@@ -684,6 +743,7 @@ parse_function :: proc(p: ^Parser, is_exported: bool) -> ^Function_Decl {
 	}
 	expect(p, .End)
 
+	function.span = span_from(p, start)
 	return function
 }
 
@@ -709,6 +769,7 @@ parse_param_list :: proc(p: ^Parser, require_types: bool) -> [dynamic]Param_Decl
 					param.name,
 				)
 			}
+			param.span = span_from(p, param_tok.span)
 			append(&params, param)
 
 			if peek_token(p.stream).kind == .Comma {
@@ -744,6 +805,7 @@ parse_optional_return_type :: proc(p: ^Parser) -> Type_Node {
 }
 
 parse_struct_decl :: proc(p: ^Parser, is_exported: bool) -> ^Struct_Decl {
+	start := peek_token(p.stream).span
 	expect(p, .TypeDecl)
 
 	decl := new(Struct_Decl)
@@ -767,12 +829,14 @@ parse_struct_decl :: proc(p: ^Parser, is_exported: bool) -> ^Struct_Decl {
 		expect(p, .Colon)
 
 		field.type_annotation = parse_type(p)
+		field.span = span_from(p, field_tok.span)
 		append(&decl.fields, field)
 
 		consume_semicolon_or_newline(p)
 	}
 
 	expect(p, .End)
+	decl.span = span_from(p, start)
 	return decl
 }
 
@@ -780,6 +844,7 @@ parse_struct_decl :: proc(p: ^Parser, is_exported: bool) -> ^Struct_Decl {
 
 parse_type :: proc(p: ^Parser) -> Type_Node {
 	tok := next_token(p.stream)
+	start := tok.span
 
 	if tok.kind == .Function {
 		t := new(Type_Function)
@@ -802,6 +867,7 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 		expect(p, .RParen)
 		expect(p, .Arrow)
 		t.return_type = parse_type(p)
+		t.span = span_from(p, start)
 		return t
 	}
 
@@ -817,6 +883,7 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 			t := new(Type_Qualified)
 			t.module_name = tok.data
 			t.name = member_tok.data
+			t.span = span_from(p, start)
 			return t
 		}
 
@@ -838,12 +905,14 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 				}
 			}
 			expect(p, .RParen)
+			t.span = span_from(p, start)
 			return t
 		}
 
 		// Иначе это обычный тип-идентификатор (Число, Строка)
 		t := new(Type_Ident)
 		t.name = tok.data
+		t.span = span_from(p, start)
 		return t
 	}
 
@@ -862,6 +931,7 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 			}
 		}
 		expect(p, .RParen)
+		t.span = span_from(p, start)
 		return t
 	}
 
@@ -888,20 +958,25 @@ parse_stmt :: proc(p: ^Parser) -> Stmt {
 }
 
 parse_continue_stmt :: proc(p: ^Parser) -> Stmt {
+	start := peek_token(p.stream).span
 	next_token(p.stream)
 	stmt := new(Continue_Stmt)
 	consume_semicolon_or_newline(p)
+	stmt.span = span_from(p, start)
 	return stmt
 }
 
 parse_break_stmt :: proc(p: ^Parser) -> Stmt {
+	start := peek_token(p.stream).span
 	next_token(p.stream)
 	stmt := new(Break_Stmt)
 	consume_semicolon_or_newline(p)
+	stmt.span = span_from(p, start)
 	return stmt
 }
 
 parse_return_stmt :: proc(p: ^Parser) -> Stmt {
+	start := peek_token(p.stream).span
 	next_token(p.stream)
 	stmt := new(Return_Stmt)
 
@@ -913,10 +988,12 @@ parse_return_stmt :: proc(p: ^Parser) -> Stmt {
 	}
 
 	consume_semicolon_or_newline(p)
+	stmt.span = span_from(p, start)
 	return stmt
 }
 
 parse_let_stmt :: proc(p: ^Parser) -> Stmt {
+	start := peek_token(p.stream).span
 	next_token(p.stream)
 	stmt := new(Let_Stmt)
 
@@ -932,19 +1009,23 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 	expect(p, .Assign)
 	stmt.value = parse_expr(p, 0)
 	consume_semicolon_or_newline(p)
+	stmt.span = span_from(p, start)
 	return stmt
 }
 
 parse_expr_stmt :: proc(p: ^Parser) -> Stmt {
+	start := peek_token(p.stream).span
 	stmt := new(Expr_Stmt)
 	stmt.expr = parse_expr(p, 0)
 	consume_semicolon_or_newline(p)
+	stmt.span = span_from(p, start)
 	return stmt
 }
 
 // --- ПАРСИНГ ВЫРАЖЕНИЙ (PRATT PARSER) ---
 
 parse_if_expr :: proc(p: ^Parser) -> Expr {
+	start := last_token_span(p.stream) // .If уже съеден вызывающим nud()
 	node := new(If_Expr)
 	node.condition = parse_expr(p, 0)
 
@@ -967,10 +1048,12 @@ parse_if_expr :: proc(p: ^Parser) -> Expr {
 	}
 
 	expect(p, .End)
+	node.span = span_from(p, start)
 	return node
 }
 
 parse_while_expr :: proc(p: ^Parser) -> Expr {
+	start := last_token_span(p.stream) // .While уже съеден вызывающим nud()
 	node := new(While_Expr)
 	node.condition = parse_expr(p, 0)
 
@@ -983,10 +1066,14 @@ parse_while_expr :: proc(p: ^Parser) -> Expr {
 	}
 
 	expect(p, .End)
+	node.span = span_from(p, start)
 	return node
 }
 
-parse_array_literal_after_lparen :: proc(p: ^Parser) -> Expr {
+// start передаётся вызывающим кодом (parse_expr) — это span идентификатора
+// `массив`/`соответствие`, а не открывающей скобки, чтобы Array_Expr
+// покрывал весь литерал целиком.
+parse_array_literal_after_lparen :: proc(p: ^Parser, start: Span) -> Expr {
 	node := new(Array_Expr)
 	node.elements = make([dynamic]Expr)
 
@@ -1005,19 +1092,22 @@ parse_array_literal_after_lparen :: proc(p: ^Parser) -> Expr {
 	}
 
 	expect(p, .RParen)
+	node.span = span_from(p, start)
 	return node
 }
 
-parse_map_literal_after_lparen :: proc(p: ^Parser) -> Expr {
+parse_map_literal_after_lparen :: proc(p: ^Parser, start: Span) -> Expr {
 	node := new(Map_Expr)
 	node.entries = make([dynamic]Map_Entry_Expr)
 
 	if peek_token(p.stream).kind != .RParen {
 		for {
 			entry := Map_Entry_Expr{}
+			entry_start := peek_token(p.stream).span
 			entry.key = parse_expr(p, 11)
 			expect(p, .Assign)
 			entry.value = parse_expr(p, 0)
+			entry.span = span_from(p, entry_start)
 			append(&node.entries, entry)
 
 			if peek_token(p.stream).kind == .Comma {
@@ -1043,6 +1133,10 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 	}
 
 	left := nud(p, tok)
+	// Начало всей цепочки (левый операнд до всех Call/Property/Index/Try/
+	// Binary обёрток) — используется для end-inclusive span каждой новой
+	// обёртки, чтобы `a.b(c)[d]` целиком покрывался одним span'ом от `a`.
+	start := expr_span(left)
 
 	for {
 		op := peek_token(p.stream)
@@ -1055,12 +1149,12 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 
 		if op.kind == .LParen {
 			if ident, ok := left.(^Ident_Expr); ok {
-				if ident.name == "массив" {
-					left = parse_array_literal_after_lparen(p)
+				if ident.name == intern("массив") {
+					left = parse_array_literal_after_lparen(p, ident.span)
 					continue
 				}
-				if ident.name == "соответствие" {
-					left = parse_map_literal_after_lparen(p)
+				if ident.name == intern("соответствие") {
+					left = parse_map_literal_after_lparen(p, ident.span)
 					continue
 				}
 			}
@@ -1081,6 +1175,7 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 				}
 			}
 			expect(p, .RParen)
+			call.span = span_from(p, start)
 			left = call
 
 		} else if op.kind == .Dot {
@@ -1091,6 +1186,7 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 			prop := new(Property_Expr)
 			prop.object = left
 			prop.property = prop_tok.data
+			prop.span = span_from(p, start)
 			left = prop
 
 		} else if op.kind == .LBracket {
@@ -1098,17 +1194,19 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 			index.object = left
 			index.index = parse_expr(p, 0)
 			expect(p, .RBracket)
+			index.span = span_from(p, start)
 			left = index
 
 		} else if op.kind == .Question {
 			try_expr := new(Try_Expr)
 			try_expr.value = left
+			try_expr.span = span_from(p, start)
 			left = try_expr
 
 		} else {
 			// Обычный бинарный оператор (включая `=`)
 			right := parse_expr(p, rbp)
-			left = new_bin_op(op.kind, left, right)
+			left = new_bin_op(op.kind, left, right, start)
 		}
 	}
 	return left
@@ -1125,6 +1223,7 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 	case .String:
 		s := new(String_Expr)
 		s.value = tok.data
+		s.span = tok.span
 		return s
 
 	case .Ident:
@@ -1132,6 +1231,7 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 
 	case .Function:
 		// Лямбда-функции: функ(х) х + 1 конец
+		start := tok.span
 		lam := new(Lambda_Expr)
 		lam.body = make([dynamic]Stmt)
 
@@ -1142,13 +1242,16 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 			append(&lam.body, parse_stmt(p))
 		}
 		expect(p, .End)
+		lam.span = span_from(p, start)
 		return lam
 
 	case .LParen:
+		start := tok.span
 		if peek_token(p.stream).kind == .RParen {
 			next_token(p.stream)
 			t := new(Tuple_Expr)
 			t.elements = make([dynamic]Expr)
+			t.span = span_from(p, start)
 			return t
 		}
 
@@ -1167,6 +1270,7 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 				append(&t.elements, parse_expr(p, 0))
 			}
 			expect(p, .RParen)
+			t.span = span_from(p, start)
 			return t
 		}
 
@@ -1199,10 +1303,13 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 }
 
 parse_pattern :: proc(p: ^Parser) -> Pattern {
+	start := peek_token(p.stream).span
 	tok := next_token(p.stream)
 	if tok.kind == .Ident {
 		if tok.data == "_" {
-			return new(Pattern_Wildcard)
+			w := new(Pattern_Wildcard)
+			w.span = span_from(p, start)
+			return w
 		}
 		module_name := ""
 		type_name := ""
@@ -1257,6 +1364,7 @@ parse_pattern :: proc(p: ^Parser) -> Pattern {
 				break
 			}
 			expect(p, .RParen)
+			pat.span = span_from(p, start)
 			return pat
 		}
 		if module_name != "" {
@@ -1264,10 +1372,12 @@ parse_pattern :: proc(p: ^Parser) -> Pattern {
 			pat.module_name = module_name
 			pat.name = name
 			pat.args = make([dynamic]Pattern)
+			pat.span = span_from(p, start)
 			return pat
 		}
 		pat := new(Pattern_Ident)
 		pat.name = name
+		pat.span = span_from(p, start)
 		return pat
 	}
 	fmt.panicf(
@@ -1277,6 +1387,7 @@ parse_pattern :: proc(p: ^Parser) -> Pattern {
 }
 
 parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
+	start := last_token_span(p.stream) // .Match уже съеден вызывающим nud()
 	m := new(Match_Expr)
 	m.arms = make([dynamic]Match_Arm)
 	m.subject = parse_expr(p, 0)
@@ -1284,6 +1395,7 @@ parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
 	consume_semicolon_or_newline(p)
 
 	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
+		arm_start := peek_token(p.stream).span
 		arm := Match_Arm {
 			body = make([dynamic]Stmt),
 		}
@@ -1306,6 +1418,7 @@ parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
 			// строку — далее берём следующую ветку сразу.
 			break
 		}
+		arm.span = span_from(p, arm_start)
 		append(&m.arms, arm)
 	}
 	expect(p, .End)
@@ -1313,6 +1426,7 @@ parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
 	if len(m.arms) == 0 {
 		fmt.panicf("Синтаксическая ошибка: выбор должен содержать хотя бы одну ветку")
 	}
+	m.span = span_from(p, start)
 	return m
 }
 
@@ -1358,6 +1472,58 @@ error :: proc(format: string, args: ..any, loc := #caller_location) {
 	fmt.panicf(format, args, loc = loc)
 }
 
+// Собирает span конструкции: start — позиция первого токена (обычно
+// peek_token до начала парсинга), end — позиция последнего уже съеденного
+// токена (last_token_span). Единая точка, чтобы не дублировать
+// file_id-проброс в каждом parse_X.
+span_from :: proc(p: ^Parser, start: Span) -> Span {
+	end := last_token_span(p.stream)
+	return Span{file_id = p.file_id, start = start.start, end = end.end}
+}
+
+// span произвольного Expr — нужен в Pratt-парсере, чтобы взять start
+// левого операнда до того, как он обрастёт обёртками (Binary/Call/...).
+expr_span :: proc(e: Expr) -> Span {
+	if e == nil do return Span{}
+	switch v in e {
+	case ^Number_Expr:
+		return v.span
+	case ^Boolean_Expr:
+		return v.span
+	case ^String_Expr:
+		return v.span
+	case ^Binary_Expr:
+		return v.span
+	case ^Unary_Expr:
+		return v.span
+	case ^Ident_Expr:
+		return v.span
+	case ^Call_Expr:
+		return v.span
+	case ^While_Expr:
+		return v.span
+	case ^If_Expr:
+		return v.span
+	case ^Tuple_Expr:
+		return v.span
+	case ^Property_Expr:
+		return v.span
+	case ^Lambda_Expr:
+		return v.span
+	case ^Array_Expr:
+		return v.span
+	case ^Map_Expr:
+		return v.span
+	case ^Index_Expr:
+		return v.span
+	case ^Try_Expr:
+		return v.span
+	case ^Match_Expr:
+		return v.span
+	}
+	return Span{}
+}
+
 expect :: proc(p: ^Parser, expected_kind: TokenKind, loc := #caller_location) {
 	tok := next_token(p.stream)
 	if tok == nil do fmt.panicf("Синтаксическая ошибка: ожидалось %v, но обнаружен EOF", expected_kind, loc = loc)
@@ -1378,20 +1544,23 @@ new_int_lit :: proc(data: ^Token) -> Expr {
 	value, ok := strconv.parse_f64(data.data)
 	if !ok do error("Неверный числовой литерал")
 	lit.value = value
+	lit.span = data.span
 	return lit
 }
 
 new_boolean_lit :: proc(data: ^Token) -> Expr {
 	lit := new(Boolean_Expr)
 	lit.value = data.data == "истина"
+	lit.span = data.span
 	return lit
 }
 
-new_bin_op :: proc(kind: TokenKind, left: Expr, right: Expr) -> Expr {
+new_bin_op :: proc(kind: TokenKind, left: Expr, right: Expr, start: Span) -> Expr {
 	b := new(Binary_Expr)
 	b.left = left
 	b.op = kind
 	b.right = right
+	b.span = Span{file_id = start.file_id, start = start.start, end = expr_span(right).end}
 	return b
 }
 
@@ -1399,11 +1568,17 @@ new_unary :: proc(token: ^Token, rhs: Expr) -> Expr {
 	lit := new(Unary_Expr)
 	lit.op = token.kind
 	lit.right = rhs
+	lit.span = Span {
+		file_id = token.span.file_id,
+		start   = token.span.start,
+		end     = expr_span(rhs).end,
+	}
 	return lit
 }
 
 new_ident :: proc(tok: ^Token) -> Expr {
 	node := new(Ident_Expr)
-	node.name = tok.data
+	node.name = intern(tok.data)
+	node.span = tok.span
 	return node
 }

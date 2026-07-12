@@ -2,6 +2,21 @@ package main
 
 import "core:testing"
 
+// typecheck_program больше не panic'ует на первой ошибке — копит в
+// ctx.diagnostics (см. report() в type_cheker.odin). run_file в main.odin
+// печатает их все и выходит до компиляции; здесь — тот же гейт, но вместо
+// печати panic'уем с текстом ПЕРВОГО diagnostic'а. Это сохраняет поведение
+// старых `testing.expect_assert(t, "Type Error: ...")` тестов без
+// переписывания: они по-прежнему ловят ровно один panic с тем же
+// сообщением, что было бы у fmt.panicf раньше. Тесты, которые хотят
+// проверить накопление НЕСКОЛЬКИХ ошибок разом, используют expect_diagnostic
+// ниже вместо этого моста.
+panic_on_diagnostics :: proc(ctx: ^Type_Ctx) {
+	if len(ctx.diagnostics) > 0 {
+		panic(ctx.diagnostics[0].message)
+	}
+}
+
 // Вспомогательная функция, которая прогоняет весь пайплайн и возвращает результат
 run_code_with_args :: proc(source: string, program_args: []string = nil) -> (Value, bool) {
 	// 1. Лексика и Парсинг
@@ -18,6 +33,7 @@ run_code_with_args :: proc(source: string, program_args: []string = nil) -> (Val
 
 	type_ctx := new_type_ctx(&res_ctx)
 	typecheck_program(&type_ctx, prog)
+	panic_on_diagnostics(&type_ctx)
 
 	// 3. Компиляция
 	registry := compile_program(&res_ctx, &type_ctx, &prog)
@@ -45,6 +61,7 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 		res_ctx := resolve_module(&graph, module)
 		type_ctx := new_type_ctx(&res_ctx)
 		typecheck_program(&type_ctx, module.ast)
+		panic_on_diagnostics(&type_ctx)
 		compile_program(&res_ctx, &type_ctx, &module.ast, &registry)
 		graph.symbol_types = res_ctx.symbol_types
 	}
@@ -56,6 +73,37 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 		return vm.stack[len(vm.stack) - 1], true
 	}
 	return 0.0, false
+}
+
+// Прогоняет только парсинг+резолв+типизацию (без компиляции/исполнения) и
+// возвращает накопленные diagnostic'и — для тестов, которые хотят увидеть
+// ВСЕ ошибки разом, а не только первую (в отличие от run_code, который
+// через panic_on_diagnostics останавливается на первой).
+typecheck_only :: proc(source: string) -> [dynamic]Diagnostic {
+	tokens := tokenize(source)
+	stream := make_stream(tokens)
+	parser := Parser {
+		stream = &stream,
+	}
+	prog := parse_program(&parser)
+
+	res_ctx := new_resolver_ctx()
+	resolve_program(&res_ctx, prog)
+
+	type_ctx := new_type_ctx(&res_ctx)
+	typecheck_program(&type_ctx, prog)
+	return type_ctx.diagnostics
+}
+
+// expect_diagnostic проверяет, что среди накопленных ошибок есть хотя бы
+// одна с точным текстом expected — в отличие от testing.expect_assert
+// (которая ловит panic), здесь программа НЕ падает, поэтому можно
+// проверить сразу несколько независимых ошибок в одном source.
+expect_diagnostic :: proc(t: ^testing.T, diagnostics: [dynamic]Diagnostic, expected: string, loc := #caller_location) {
+	for d in diagnostics {
+		if d.message == expected do return
+	}
+	testing.expectf(t, false, "diagnostic not found: %q (got %d diagnostics)", expected, len(diagnostics), loc = loc)
 }
 
 @(test)

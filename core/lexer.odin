@@ -6,18 +6,42 @@ import "core:unicode"
 import "core:unicode/utf8"
 
 Lexer :: struct {
-	input: string,
-	pos:   int,
-	ch:    rune,
-	width: int,
+	input:       string,
+	pos:         int,
+	ch:          rune,
+	width:       int,
+	file_id:     u16,
+	// Тот же accumulate-not-panic паттерн, что и Parser.diagnostics/
+	// Resolver_Ctx.diagnostics/Type_Ctx.diagnostics (см. Стадия 10) — раньше
+	// это был единственный оставшийся "panicing" проход пайплайна (Стадия
+	// 10 П6 намеренно его отложила). Ошибочный символ здесь не должен ронять
+	// весь процесс (в т.ч. LSP при live-typing).
+	diagnostics: [dynamic]Diagnostic,
 }
 
-new_lexer :: proc(input: string) -> Lexer {
+new_lexer :: proc(input: string, file_id: u16 = 0) -> Lexer {
 	l := Lexer {
-		input = input,
+		input       = input,
+		file_id     = file_id,
+		diagnostics = make([dynamic]Diagnostic),
 	}
 	advance(&l)
 	return l
+}
+
+// Дедуп по span+message — тот же приём, что report_parse/report_resolve.
+report_lex :: proc(l: ^Lexer, span: Span, format: string, args: ..any) {
+	msg := fmt.aprintf(format, ..args)
+	for d in l.diagnostics {
+		if d.span == span && d.message == msg do return
+	}
+	append(&l.diagnostics, Diagnostic{severity = .Error, span = span, message = msg})
+}
+
+// Span текущего (ещё не съеденного) символа — `l.pos - l.width` указывает
+// на его начало, `l.pos` на его конец (см. комментарий у next_token_lex).
+current_char_span :: proc(l: ^Lexer) -> Span {
+	return Span{file_id = l.file_id, start = u32(l.pos - l.width), end = u32(l.pos)}
 }
 
 advance :: proc(l: ^Lexer) {
@@ -89,14 +113,23 @@ read_string :: proc(l: ^Lexer) -> string {
 			case '\\':
 				strings.write_byte(&builder, '\\')
 			case 0:
-				fmt.panicf(
-					"Лексическая ошибка: незакрытая строка",
-				)
+				// EOF сразу после '\' — строка обрывается прямо тут, дальше
+				// нечего съедать. report_lex + возврат накопленного (best
+				// effort), а не panic: следующий next_token_lex увидит
+				// l.ch == 0 и естественно закроет поток .EOF-токеном.
+				report_lex(l, current_char_span(l), "Лексическая ошибка: незакрытая строка")
 			case:
-				fmt.panicf(
+				// Неизвестный escape — трактуем как литеральный символ
+				// (совпадает с типичным поведением строковых литералов при
+				// восстановлении: не роняем оставшуюся часть строки/файла
+				// из-за одной опечатки в '\%v').
+				report_lex(
+					l,
+					current_char_span(l),
 					"Лексическая ошибка: неизвестная escape-последовательность '\\%v'",
 					l.ch,
 				)
+				strings.write_rune(&builder, l.ch)
 			}
 		} else {
 			strings.write_rune(&builder, l.ch)
@@ -107,7 +140,10 @@ read_string :: proc(l: ^Lexer) -> string {
 	if l.ch == '"' {
 		advance(l) // Съедаем закрывающую кавычку
 	} else {
-		fmt.panicf("Лексическая ошибка: незакрытая строка")
+		// l.ch == 0 — дошли до EOF, не встретив закрывающую кавычку.
+		// Возвращаем накопленное как best-effort строковый токен вместо
+		// падения всего процесса на файле с одной незакрытой кавычкой.
+		report_lex(l, current_char_span(l), "Лексическая ошибка: незакрытая строка")
 	}
 
 	return strings.to_string(builder)
@@ -174,7 +210,14 @@ lookup_ident :: proc(ident: string) -> TokenKind {
 // любой момент указывает на начало ещё не съеденного `l.ch` (см.
 // read_identifier/read_number — тот же приём), поэтому start берётся до
 // свитча, а end — после того, как соответствующая ветка съела токен целиком.
+// Обёрнуто в for — единственный путь восстановления после "неожиданный
+// символ" (см. case: ниже) требует съесть один битый rune и попробовать
+// СЛЕДУЮЩИЙ токен заново, не возвращая для битого символа никакого токена
+// вообще (в отличие от Hole-узлов парсера — на уровне лексера "дыра" это
+// просто "символ исчез из потока", а не placeholder-токен, который потом
+// пришлось бы разбирать парсеру).
 next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
+	for {
 	skip_whitespace_and_comments(l)
 
 	start_pos := l.pos - l.width
@@ -303,10 +346,9 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 				num := read_number(l)
 				tok = Token{kind = .Number, data = num}
 			} else {
-				fmt.panicf(
-					"Лексическая ошибка: неожиданный символ '%v'",
-					l.ch,
-				)
+				report_lex(l, current_char_span(l), "Лексическая ошибка: неожиданный символ '%v'", l.ch)
+				advance(l) // символ съеден без токена — форвард-прогресс
+				continue // пробуем следующий токен заново
 			}
 		}
 	}
@@ -314,10 +356,11 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 	end_pos := l.pos - l.width
 	tok.span = Span{file_id = file_id, start = u32(start_pos), end = u32(end_pos)}
 	return tok
+	}
 }
 
-tokenize :: proc(input: string, file_id: u16 = 0) -> [dynamic]Token {
-	l := new_lexer(input)
+tokenize :: proc(input: string, file_id: u16 = 0) -> ([dynamic]Token, [dynamic]Diagnostic) {
+	l := new_lexer(input, file_id)
 	tokens := make([dynamic]Token)
 
 	for {
@@ -326,5 +369,5 @@ tokenize :: proc(input: string, file_id: u16 = 0) -> [dynamic]Token {
 		if tok.kind == .EOF do break
 	}
 
-	return tokens
+	return tokens, l.diagnostics
 }

@@ -114,9 +114,19 @@ destroy_stream :: proc(s: ^TokenStream) {
 	delete(s.tokens)
 }
 
+// Ни next_token, ни peek_token НИКОГДА не возвращают nil — tokenize()
+// гарантирует хотя бы один .EOF-токен последним элементом s.tokens, и обе
+// функции клэмпят current_idx на нём вместо ухода за границу массива.
+// Раньше "за границей" означало nil, и любой вызывающий код, забывший явно
+// проверить tok == nil (например parse_program: `for peek_token(...).kind
+// != .EOF`), сегфолтил на разыменовании .kind — проявилось на файле,
+// обрывающемся внутри незакрытой строки/блока прямо перед физическим EOF
+// (см. e2e test_lexer_reports_unterminated_string). Теперь "конец потока"
+// — устойчивое состояние: сколько раз ни спроси, снова .EOF, а не обрыв.
 next_token :: proc(s: ^TokenStream) -> ^Token {
-	if s.current_idx >= len(s.tokens) {
-		return nil
+	if s.current_idx >= len(s.tokens) - 1 {
+		s.current_idx = len(s.tokens) - 1
+		return &s.tokens[s.current_idx]
 	}
 	idx := s.current_idx
 	s.current_idx += 1
@@ -125,7 +135,7 @@ next_token :: proc(s: ^TokenStream) -> ^Token {
 
 peek_token :: proc(s: ^TokenStream) -> ^Token {
 	if s.current_idx >= len(s.tokens) {
-		return nil
+		return &s.tokens[len(s.tokens) - 1]
 	}
 	return &s.tokens[s.current_idx]
 }

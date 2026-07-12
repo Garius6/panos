@@ -406,6 +406,8 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		case .Minus:
 			emit_constant(ctx, -1.0)
 			emit_opcode(ctx, .Multiply)
+		case .Negate:
+			emit_opcode(ctx, .Negate)
 		}
 
 	case ^String_Expr:

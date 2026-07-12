@@ -63,7 +63,8 @@ load_module_recursive :: proc(graph: ^Module_Graph, file_path: string, is_entry:
 	graph.file_paths[module.file_id] = module_key
 	graph.file_sources[module.file_id] = source
 
-	tokens := tokenize(source, module.file_id)
+	tokens, lex_diags := tokenize(source, module.file_id)
+	for d in lex_diags do append(&graph.parse_diagnostics, d)
 	stream := make_stream(tokens)
 	defer destroy_stream(&stream)
 

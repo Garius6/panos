@@ -5,6 +5,8 @@ import "core:bufio"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:unicode"
+import "core:unicode/utf8"
 
 Main_Function_Name :: "старт"
 
@@ -275,6 +277,15 @@ string_length :: proc(text: string) -> int {
 		count += 1
 	}
 	return count
+}
+
+// Первая руна строки — строки::это_цифра/это_буква/цифра_или_буква
+// принимают однобуквенную Строку (результат индексации text[i], см.
+// Get_Index) как замену несуществующему в языке типу Символ.
+first_rune :: proc(s: string) -> rune {
+	if len(s) == 0 do return 0
+	r, _ := utf8.decode_rune_in_string(s)
+	return r
 }
 
 invoke_collection_method :: proc(
@@ -673,6 +684,38 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		file.is_open = true
 		file.is_stdin = true
 		return Value(file), true
+
+	case "строки::срез":
+		expect_arg_count(name, len(args), 3)
+		text := expect_string_arg(name, args[0])
+		start := number_to_index(args[1])
+		end := number_to_index(args[2])
+		slice, ok := string_slice_by_rune(text, start, end)
+		if !ok {
+			fmt.panicf(
+				"Runtime Error: срез [%d:%d] выходит за границы строки длиной %d",
+				start,
+				end,
+				string_length(text),
+			)
+		}
+		return Value(gc_new_string(vm, slice)), true
+
+	case "строки::это_цифра":
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		return Value(unicode.is_digit(first_rune(text))), true
+
+	case "строки::это_буква":
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		return Value(unicode.is_alpha(first_rune(text))), true
+
+	case "строки::цифра_или_буква":
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		r := first_rune(text)
+		return Value(unicode.is_digit(r) || unicode.is_alpha(r)), true
 	}
 
 	fmt.panicf(

@@ -22,7 +22,8 @@ panic_on_diagnostics :: proc(diags: [dynamic]Diagnostic) {
 // Вспомогательная функция, которая прогоняет весь пайплайн и возвращает результат
 run_code_with_args :: proc(source: string, program_args: []string = nil) -> (Value, bool) {
 	// 1. Лексика и Парсинг
-	tokens := tokenize(source) // Ваша функция лексера
+	tokens, lex_diags := tokenize(source) // Ваша функция лексера
+	panic_on_diagnostics(lex_diags)
 	stream := make_stream(tokens)
 	parser := Parser {
 		stream = &stream,
@@ -88,7 +89,7 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 // тестов, которые хотят увидеть ВСЕ ошибки, а не только первую (в отличие
 // от run_code, который через panic_on_diagnostics останавливается на первой).
 typecheck_only :: proc(source: string) -> [dynamic]Diagnostic {
-	tokens := tokenize(source)
+	tokens, lex_diags := tokenize(source)
 	stream := make_stream(tokens)
 	parser := Parser {
 		stream = &stream,
@@ -102,6 +103,7 @@ typecheck_only :: proc(source: string) -> [dynamic]Diagnostic {
 	typecheck_program(&type_ctx, prog)
 
 	all := make([dynamic]Diagnostic)
+	for d in lex_diags do append(&all, d)
 	for d in parser.diagnostics do append(&all, d)
 	for d in res_ctx.diagnostics do append(&all, d)
 	for d in type_ctx.diagnostics do append(&all, d)
@@ -758,6 +760,25 @@ test_math_and_logic :: proc(t: ^testing.T) {
 		`,
 			f64(42.0),
 		},
+		{
+			"Стандартная библиотека: строки",
+			`
+			импорт строки
+
+			функ старт() -> Строка
+				пер срез = строки.срез("panos-lang", 0, 5)
+				пер цифра = строки.это_цифра("7")
+				пер буква = строки.это_буква("ф")
+				пер ни_то_ни_то = строки.цифра_или_буква("-")
+				если цифра и буква и не ни_то_ни_то тогда
+					срез
+				иначе
+					"провал"
+				конец
+			конец
+		`,
+			Value(perm_string("panos")),
+		},
 	}
 
 	for tc in tests {
@@ -861,6 +882,23 @@ test_modules :: proc(t: ^testing.T) {
 		stdlib_result == f64(42.0),
 		"Файловая stdlib: ожидалось 42, получено %v",
 		stdlib_result,
+	)
+}
+
+// Импорт по пути с '/' во вложенный каталог (не только соседний файл) —
+// resolve_import_path/normalize_path это уже поддерживали, но regression-
+// покрытия не было. См. также std/кодирование/toml.ps.
+@(test)
+test_nested_module_import :: proc(t: ^testing.T) {
+	result, ok := run_module_file("module_fixture_nested_main.ps")
+	testing.expectf(t, ok, "Вложенный модуль: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(
+		t,
+		result == f64(42.0),
+		"Вложенный модуль: ожидалось 42, получено %v",
+		result,
 	)
 }
 
@@ -1525,7 +1563,8 @@ test_adt_duplicate_variant_rejected :: proc(t: ^testing.T) {
 // доступ к vm.gc для force_gc/gc_stats, которого run_code() не даёт
 // (возвращает только Value результата).
 compile_and_run_for_gc :: proc(source: string) -> ^VM {
-	tokens := tokenize(source)
+	tokens, lex_diags := tokenize(source)
+	panic_on_diagnostics(lex_diags)
 	stream := make_stream(tokens)
 	parser := Parser {
 		stream = &stream,
@@ -1704,4 +1743,48 @@ test_stdin_stream_handle_smoke :: proc(t: ^testing.T) {
 	testing.expectf(t, ok, "stdin stream smoke: пустой стек")
 	if !ok do return
 	testing.expectf(t, result == Value(f64(42)), "stdin stream smoke: ожидалось 42, получено %v", result)
+}
+
+// Лексер больше не panic'ует (см. lexer.odin::report_lex) — последний из
+// panic'ующих проходов пайплайна (Стадия 10 П6 намеренно это отложила).
+// Неожиданный символ молча исчезает из потока токенов (report_lex +
+// advance, БЕЗ токена для него) — парсер о нём вообще не узнаёт, поэтому
+// остаток программы разбирается нормально.
+@(test)
+test_lexer_reports_unexpected_char_and_continues :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			$
+			42
+		конец
+	`)
+	expect_diagnostic(t, diags, "Лексическая ошибка: неожиданный символ '$'")
+}
+
+@(test)
+test_lexer_reports_unterminated_string :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Строка
+			"не закрыта
+	`)
+	expect_diagnostic(t, diags, "Лексическая ошибка: незакрытая строка")
+}
+
+// Неизвестная escape-последовательность восстанавливается как литеральный
+// символ ПОСЛЕ '\' (не сама '\') — строка не обрывается из-за одной
+// опечатки в экранировании.
+@(test)
+test_lexer_unknown_escape_recovers_as_literal :: proc(t: ^testing.T) {
+	tokens, diags := tokenize(`"плохой \q escape"`)
+	expect_diagnostic(t, diags, "Лексическая ошибка: неизвестная escape-последовательность '\\q'")
+	testing.expectf(t, len(tokens) >= 1, "unknown escape recovery: пустой поток токенов")
+	if len(tokens) == 0 do return
+	str_tok := tokens[0]
+	testing.expectf(t, str_tok.kind == .String, "unknown escape recovery: ожидался String токен, получен %v", str_tok.kind)
+	testing.expectf(
+		t,
+		str_tok.data == "плохой q escape",
+		"unknown escape recovery: ожидалось 'плохой q escape', получено %q",
+		str_tok.data,
+	)
 }

@@ -937,6 +937,9 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			enum_type.name = d.name
 			enum_type.variants = make([dynamic]Type_Variant)
 			enum_type.variant_index = make(map[string]int)
+			// Как у Struct — без этого `реализация X` для перечисления X
+			// падала бы на nil-map assignment в ПРОХОДЕ 3.
+			enum_type.methods = make(map[string]Symbol_Id)
 			ctx.res.symbol_types[ctx.res.decl_symbols[decl]] = enum_type
 		}
 	}
@@ -983,22 +986,36 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 		}
 	}
 
-	// ПРОХОД 3: Привязка реализаций (методов и контрактов) к структурам
+	// ПРОХОД 3: Привязка реализаций (методов и контрактов) к структурам и
+	// перечислениям. Интерфейсы перечисления реализовывать не могут —
+	// узкий scope, не design-ограничение языка (interface_method_types_match
+	// и остальной контрактный путь ниже писались и тестировались только
+	// под Struct-получатели).
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Impl_Decl:
 			target_sym := ctx.res.global_scope.symbols[intern(d.target_type)]
-			struct_type := ctx.res.symbol_types[target_sym]
-			if struct_type == nil || struct_type.kind != .Struct {
+			target_type := ctx.res.symbol_types[target_sym]
+			if target_type == nil || (target_type.kind != .Struct && target_type.kind != .Enum) {
 				report(
 					ctx,
 					d.span,
-					"Type Error: неизвестная структура '%s'",
+					"Type Error: неизвестный тип '%s' (реализация возможна только для структуры или перечисления)",
 					d.target_type,
 				)
-				// struct_type == nil ниже разыменовывается (.methods,
-				// .implemented_interfaces) — без структуры реализацию
-				// проверять нечем, пропускаем весь блок.
+				// target_type == nil ниже разыменовывается (.methods,
+				// .implemented_interfaces) — реализацию проверять нечем,
+				// пропускаем весь блок.
+				continue
+			}
+			if target_type.kind == .Enum && d.interface_name != "" {
+				report(
+					ctx,
+					d.span,
+					"Type Error: перечисление '%s' не может реализовывать интерфейс '%s'",
+					d.target_type,
+					d.interface_name,
+				)
 				continue
 			}
 
@@ -1007,21 +1024,22 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				sym := ctx.res.decl_symbols[m]
 				method_type := function_type_from_decl(ctx, m)
 				if len(method_type.params) == 0 ||
-				   !types_are_equal(method_type.params[0], struct_type) {
+				   !types_are_equal(method_type.params[0], target_type) {
 					report(
 						ctx,
 						m.span,
 						"Type Error: первый аргумент метода '%s' должен иметь тип '%s'",
 						m.name,
-						struct_type.name,
+						target_type.name,
 					)
 				}
 				ctx.res.symbol_types[sym] = method_type
 				original_name := m.name[len(d.target_type) + 2:]
-				struct_type.methods[original_name] = sym
+				target_type.methods[original_name] = sym
 			}
 
-			// Строгая проверка интерфейсного контракта
+			// Строгая проверка интерфейсного контракта (только Struct — см.
+			// guard выше)
 			if d.interface_name != "" {
 				iface_sym := ctx.res.global_scope.symbols[intern(d.interface_name)]
 				iface_type := ctx.res.symbol_types[iface_sym]
@@ -1037,7 +1055,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				}
 
 				for req_name in iface_type.interface_methods {
-					method_sym, found := struct_type.methods[req_name]
+					method_sym, found := target_type.methods[req_name]
 					if !found {
 						report(
 							ctx,
@@ -1062,7 +1080,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 						)
 					}
 				}
-				append(&struct_type.implemented_interfaces, iface_type)
+				append(&target_type.implemented_interfaces, iface_type)
 			}
 		}
 	}
@@ -1078,6 +1096,14 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
 				func_type := ctx.res.symbol_types[sym]
+				if func_type == nil {
+					// ПРОХОД 3 пропустил регистрацию этого метода — target
+					// реализации не структура (диагностика уже зарепорчена
+					// там же, см. "неизвестная структура"). Тело метода
+					// проверять нечем — пропускаем, не падаем на
+					// bind_function_args(nil).
+					continue
+				}
 				bind_function_args(ctx, m, func_type)
 				check_function_body(ctx, m.span, m.body, func_type.return_type)
 			}
@@ -2291,6 +2317,28 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 			}
 
 		} else if obj_type.kind == .Struct {
+			if method_sym, is_method := obj_type.methods[prop_expr.property]; is_method {
+				method_type := ctx.res.symbol_types[method_sym]
+				if len(e.args) != len(method_type.params) - 1 {
+					return report(
+						ctx,
+						e.span,
+						"У метода %s ожидалось %d аргументов",
+						resolve_interned(symbol_at(ctx.res.symbol_store, method_sym).name),
+						len(method_type.params) - 1,
+					)
+				}
+				check_expr(ctx, prop_expr.object, method_type.params[0])
+				for arg, i in e.args do check_expr(ctx, arg, method_type.params[i + 1])
+
+				ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
+				return prune_type(method_type.return_type)
+			}
+		} else if obj_type.kind == .Enum {
+			// Тот же путь диспетчеризации, что у Struct (.Method_Struct —
+			// имя историческое, кодогенерация в compiler.odin трактует его
+			// как "обычный вызов функции с receiver'ом первым аргументом",
+			// получателю всё равно, Aggregate_Value это или Variant_Value).
 			if method_sym, is_method := obj_type.methods[prop_expr.property]; is_method {
 				method_type := ctx.res.symbol_types[method_sym]
 				if len(e.args) != len(method_type.params) - 1 {

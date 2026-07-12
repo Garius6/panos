@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:bufio"
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 import "core:unicode"
 import "core:unicode/utf8"
@@ -716,6 +717,18 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		text := expect_string_arg(name, args[0])
 		r := first_rune(text)
 		return Value(unicode.is_digit(r) || unicode.is_alpha(r)), true
+
+	case "строки::в_число":
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		num, ok := strconv.parse_f64(text)
+		if !ok {
+			return make_error_result(
+				vm,
+				make_error_value(vm, "строки", fmt.tprintf("'%s' не является числом", text)),
+			), true
+		}
+		return make_ok_result(vm, Value(num)), true
 	}
 
 	fmt.panicf(

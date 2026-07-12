@@ -81,6 +81,10 @@ Module_Graph :: struct {
 	// внутри load_module_recursive, поэтому собираем сюда, иначе они
 	// терялись бы вместе с локальным Parser'ом.
 	parse_diagnostics: [dynamic]Diagnostic,
+	// LSP: module_key (нормализованный путь) -> текст из редактора, для
+	// модулей, которые сейчас открыты как буферы. Пусто вне LSP — CLI
+	// (main.odin) всегда читает с диска.
+	source_overrides:  map[string]string,
 }
 
 Scope :: struct {
@@ -206,8 +210,6 @@ is_bare_import_spec :: proc(import_spec: string) -> bool {
 }
 
 resolve_existing_import_path :: proc(import_spec: string, importer_dir: string) -> (string, bool) {
-	fmt.printf("Резолвим модуль %s %s\n", import_spec, importer_dir)
-
 	local_path := resolve_import_path(import_spec, importer_dir)
 	if os.exists(local_path) {
 		return local_path, true

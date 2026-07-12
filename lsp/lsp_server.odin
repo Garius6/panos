@@ -5,30 +5,39 @@ import core "../core"
 import "core:encoding/json"
 import "core:strings"
 
-// Каждый открытый в редакторе документ — свой независимый прогон
-// tokenize→parse→resolve→typecheck (single-file resolve_program, БЕЗ
-// графа импортов — как e2e_test.odin::run_code). file_id свой на сервер
-// (не пересекается с CLI-режимом main.odin), инкрементируется на каждое
-// изменение — старые Type_Ctx/Resolver_Ctx от предыдущей версии документа
-// просто перестают быть достижимы и никуда не используются повторно.
+// Каждый открытый в редакторе документ разбирается вместе со своим графом
+// импортов (core.Module_Graph) — не изолированно, как раньше. Открытые
+// документы подставляются в граф как in-memory overrides (см.
+// core.load_module_graph_with_overrides): их текст мог измениться в
+// редакторе и ещё не быть сохранён на диск. Остальные модули графа
+// читаются с диска как обычно. file_id — id ENTRY-модуля внутри ЕГО
+// собственного (каждый раз заново построенного) графа; graph хранится
+// целиком, чтобы go-to-definition мог указать на символ в ДРУГОМ файле
+// (граф даёт file_id -> путь через graph.file_paths).
 LSP_Document :: struct {
-	uri:              string,
-	source:           string,
-	file_id:          u16,
-	prog:             core.Program,
-	res_ctx:          core.Resolver_Ctx,
-	tc_ctx:           core.Type_Ctx,
-	// Parser — локальная переменная внутри update_document, поэтому её
-	// diagnostics сохраняем сюда отдельно (иначе терялись бы вместе с ней).
-	parse_diagnostics: [dynamic]core.Diagnostic,
-	// Symbol_Id -> все места использования (для find-references/rename).
-	// Не включает span объявления — тот берётся напрямую из symbol_at(...).span.
-	usages:           map[core.Symbol_Id][dynamic]core.Span,
+	uri:     string,
+	path:    string, // абсолютный путь на диске, извлечённый из uri
+	source:  string,
+	file_id: u16,
+	graph:   core.Module_Graph,
+	prog:    core.Program,
+	res_ctx: core.Resolver_Ctx,
+	tc_ctx:  core.Type_Ctx,
+	// resolve/typecheck diagnostics СО ВСЕХ модулей графа (не только
+	// entry) — если зависимость (импортированный, но не открытый как
+	// свой документ файл) содержит свою собственную ошибку, она тоже
+	// должна попасть в diagnostics, а не потеряться вместе с её
+	// отброшенным Resolver_Ctx/Type_Ctx.
+	all_diagnostics: [dynamic]core.Diagnostic,
+	// Symbol_Id -> все места использования В ЭТОМ документе (для
+	// find-references/rename). Не включает span объявления — тот
+	// берётся напрямую из symbol_at(...).span. НЕ сканирует другие
+	// открытые документы — см. ограничение в handle_references.
+	usages:  map[core.Symbol_Id][dynamic]core.Span,
 }
 
 LSP_Server :: struct {
-	documents:    map[string]^LSP_Document,
-	next_file_id: u16,
+	documents: map[string]^LSP_Document,
 }
 
 run_lsp_server :: proc() {
@@ -121,38 +130,87 @@ handle_did_close :: proc(server: ^LSP_Server, params: json.Value) {
 	delete_key(&server.documents, uri)
 }
 
-update_document :: proc(server: ^LSP_Server, uri: string, text: string) {
-	doc := new(LSP_Document)
-	doc.uri = uri
-	doc.source = strings.clone(text)
-	doc.file_id = server.next_file_id
-	server.next_file_id += 1
-
-	tokens := core.tokenize(doc.source, doc.file_id)
-	stream := core.make_stream(tokens)
-	parser := core.Parser {
-		stream  = &stream,
-		file_id = doc.file_id,
+// file:///abs/path -> /abs/path. Не декодирует %XX-escape'ы — для
+// локальных путей без пробелов/юникода в самом пути этого достаточно
+// (MVP, как и остальные LSP-хелперы здесь).
+uri_to_path :: proc(uri: string) -> string {
+	prefix :: "file://"
+	if strings.has_prefix(uri, prefix) {
+		return uri[len(prefix):]
 	}
-	doc.prog = core.parse_program(&parser)
-	doc.parse_diagnostics = parser.diagnostics
+	return uri
+}
 
-	doc.res_ctx = core.new_resolver_ctx()
-	core.resolve_program(&doc.res_ctx, doc.prog)
+path_to_uri :: proc(path: string) -> string {
+	return strings.concatenate({"file://", path})
+}
 
-	doc.tc_ctx = core.new_type_ctx(&doc.res_ctx)
-	core.typecheck_program(&doc.tc_ctx, doc.prog)
+update_document :: proc(server: ^LSP_Server, uri: string, text: string) {
+	doc, existed := server.documents[uri]
+	if !existed {
+		doc = new(LSP_Document)
+		doc.uri = uri
+		doc.path = uri_to_path(uri)
+		server.documents[uri] = doc
+	}
+	doc.source = strings.clone(text)
+
+	// Документ, который меняется, может быть чьей-то ЗАВИСИМОСТЬЮ — если
+	// util.ps редактируется (ещё не сохранён), main.ps, который его
+	// импортирует, должен пересчитаться тоже, иначе его diagnostics
+	// останутся устаревшими до следующего редактирования main.ps.
+	// Пересчитываем ВСЕ открытые документы, не только изменившийся —
+	// для типичного числа открытых файлов в LSP-сессии это дёшево и
+	// просто, в отличие от честного dependency-tracking.
+	for _, other_doc in server.documents {
+		revalidate_document(server, other_doc)
+	}
+}
+
+revalidate_document :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
+	// Открытые документы подставляются вместо чтения с диска — включая
+	// сам doc (его .source уже актуален на момент вызова).
+	overrides := make(map[string]string)
+	for _, other_doc in server.documents {
+		key := core.resolve_import_path(other_doc.path, "")
+		overrides[key] = other_doc.source
+	}
+
+	graph := core.load_module_graph_with_overrides(doc.path, overrides)
+	entry_key := core.resolve_import_path(doc.path, "")
+	entry_module := graph.modules[entry_key]
+	if entry_module == nil {
+		// Не должно случиться (entry всегда грузится первым в
+		// load_module_recursive), но на всякий случай не падаем молча.
+		return
+	}
+
+	doc.graph = graph
+	doc.prog = entry_module.ast
+	doc.file_id = entry_module.file_id
+
+	results := core.resolve_and_typecheck_all(&graph)
+	all_diagnostics := make([dynamic]core.Diagnostic)
+	for i in 0 ..< len(results) {
+		r := &results[i]
+		for d in r.res_ctx.diagnostics do append(&all_diagnostics, d)
+		for d in r.tc_ctx.diagnostics do append(&all_diagnostics, d)
+		if r.module == entry_module {
+			doc.res_ctx = r.res_ctx
+			doc.tc_ctx = r.tc_ctx
+		}
+	}
+	doc.all_diagnostics = all_diagnostics
 
 	build_usages(doc)
 
-	server.documents[uri] = doc
-	publish_diagnostics(doc)
+	publish_diagnostics(server, doc)
 }
 
 // Symbol_Id -> [span использования, ...] — единственный проход по
-// node_symbols (Expr -> Symbol_Id), заполненному резолвером. Объявление
-// само по себе не входит (доступно через symbol_at(...).span отдельно) —
-// в node_symbols попадают только Ident/Property-узлы, ссылающиеся НА
+// node_symbols (Expr -> Symbol_Id) ENTRY-модуля. Объявление само по себе
+// не входит (доступно через symbol_at(...).span отдельно) — в
+// node_symbols попадают только Ident/Property-узлы, ссылающиеся НА
 // символ, а не место его создания (Let_Stmt.name — строка, не Expr-узел).
 build_usages :: proc(doc: ^LSP_Document) {
 	doc.usages = make(map[core.Symbol_Id][dynamic]core.Span)
@@ -164,13 +222,42 @@ build_usages :: proc(doc: ^LSP_Document) {
 	}
 }
 
-publish_diagnostics :: proc(doc: ^LSP_Document) {
-	total := len(doc.parse_diagnostics) + len(doc.res_ctx.diagnostics) + len(doc.tc_ctx.diagnostics)
-	diags := make([dynamic]json.Value, 0, total)
-	append_diags :: proc(diags: ^[dynamic]json.Value, source: string, list: [dynamic]core.Diagnostic) {
+// Публикует diagnostics для ВСЕХ модулей графа (не только ENTRY) — если
+// открытый файл импортирует модуль с ошибкой, эта ошибка тоже должна
+// куда-то попасть, а не молча проглатываться. Группирует по file_id,
+// шлёт одно уведомление на файл (даже если тот сейчас не открыт в
+// редакторе — publishDiagnostics это не требует).
+publish_diagnostics :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
+	by_file := make(map[u16][dynamic]core.Diagnostic, allocator = context.temp_allocator)
+
+	collect :: proc(by_file: ^map[u16][dynamic]core.Diagnostic, list: [dynamic]core.Diagnostic) {
 		for d in list {
+			bucket := by_file[d.span.file_id]
+			append(&bucket, d)
+			by_file[d.span.file_id] = bucket
+		}
+	}
+	collect(&by_file, doc.graph.parse_diagnostics)
+	collect(&by_file, doc.all_diagnostics)
+
+	// Файлы графа без единой diagnostic'и тоже должны получить пустой
+	// список — иначе старые diagnostics для файла, который только что
+	// починили, останутся висеть в редакторе.
+	for _, module in doc.graph.modules {
+		if module.file_id not_in by_file {
+			by_file[module.file_id] = nil
+		}
+	}
+
+	for file_id, file_diags in by_file {
+		source := doc.graph.file_sources[file_id]
+		path := doc.graph.file_paths[file_id]
+		file_uri := path_to_uri(path)
+
+		diags := make([dynamic]json.Value, 0, len(file_diags))
+		for d in file_diags {
 			append(
-				diags,
+				&diags,
 				json.Value(
 					json.Object {
 						"range" = lsp_range_json(source, d.span.start, d.span.end),
@@ -180,15 +267,12 @@ publish_diagnostics :: proc(doc: ^LSP_Document) {
 				),
 			)
 		}
-	}
-	append_diags(&diags, doc.source, doc.parse_diagnostics)
-	append_diags(&diags, doc.source, doc.res_ctx.diagnostics)
-	append_diags(&diags, doc.source, doc.tc_ctx.diagnostics)
 
-	send_notification(
-		"textDocument/publishDiagnostics",
-		json.Object{"uri" = json.String(doc.uri), "diagnostics" = json.Array(diags)},
-	)
+		send_notification(
+			"textDocument/publishDiagnostics",
+			json.Object{"uri" = json.String(file_uri), "diagnostics" = json.Array(diags)},
+		)
+	}
 }
 
 handle_hover :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
@@ -235,22 +319,31 @@ handle_definition :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 	}
 
 	sym_id, has_sym := doc.res_ctx.node_symbols[expr]
-	// sym.span.file_id != doc.file_id значит символ объявлен в другом
-	// модуле/файле — межфайловый go-to-def не входит в MVP (нужен полный
-	// граф импортов, а не single-file resolve_program).
 	if !has_sym || sym_id == core.INVALID_SYMBOL {
 		send_response(id, nil)
 		return
 	}
+	// symbol_store общий на весь граф импортов (graph.symbol_store) —
+	// symbol_at корректно резолвит символ, даже если он объявлен в
+	// ДРУГОМ модуле (импортированном), не только в текущем документе.
 	sym := core.symbol_at(doc.res_ctx.symbol_store, sym_id)
-	if sym.span.file_id != doc.file_id {
+	if sym.kind == .Builtin {
+		// Ошибка/Есть/Нет/Успех/Неудача/длина/паника — span нулевой
+		// (install_standard_symbols не задаёт его), некуда прыгать.
 		send_response(id, nil)
 		return
 	}
 
+	target_source := doc.source
+	target_uri := doc.uri
+	if sym.span.file_id != doc.file_id {
+		target_source = doc.graph.file_sources[sym.span.file_id]
+		target_uri = path_to_uri(doc.graph.file_paths[sym.span.file_id])
+	}
+
 	result := json.Object {
-		"uri" = json.String(doc.uri),
-		"range" = lsp_range_json(doc.source, sym.span.start, sym.span.end),
+		"uri" = json.String(target_uri),
+		"range" = lsp_range_json(target_source, sym.span.start, sym.span.end),
 	}
 	send_response(id, result)
 }
@@ -290,9 +383,11 @@ completion_kind :: proc(kind: core.Symbol_Kind) -> int {
 	return 1
 }
 
-// scope-aware enumeration (MVP): глобальные символы модуля + параметры и
-// локальные переменные объемлющей функции/метода (без точной блочной
-// видимости по позиции — см. collect_local_symbols).
+// scope-aware enumeration (MVP): глобальные символы модуля (включая алиасы
+// импортов как Module-kind символы — сами экспорты импортированного
+// модуля не разворачиваются, обращение к ним всегда через `модуль.имя`)
+// + параметры и локальные переменные объемлющей функции/метода (без
+// точной блочной видимости по позиции — см. collect_local_symbols).
 handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	doc, offset, ok := resolve_position(server, params)
 	if !ok {
@@ -352,23 +447,29 @@ handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 	send_response(id, json.Array(items))
 }
 
-// Собирает Location[] по Symbol_Id: объявление (если includeDeclaration и
-// оно в этом же файле) + все usages из doc.usages.
+// Собирает Location[] по Symbol_Id: объявление (в этом или другом файле
+// графа — symbol_store общий) + все usages ИЗ ЭТОГО документа (doc.usages
+// не сканирует другие открытые файлы — см. ограничение в
+// handle_references).
 collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_decl: bool) -> [dynamic]json.Value {
 	locations := make([dynamic]json.Value)
 	if include_decl {
 		decl_span := core.symbol_at(doc.res_ctx.symbol_store, sym_id).span
-		if decl_span.file_id == doc.file_id {
-			append(
-				&locations,
-				json.Value(
-					json.Object {
-						"uri" = json.String(doc.uri),
-						"range" = lsp_range_json(doc.source, decl_span.start, decl_span.end),
-					},
-				),
-			)
+		decl_source := doc.source
+		decl_uri := doc.uri
+		if decl_span.file_id != doc.file_id {
+			decl_source = doc.graph.file_sources[decl_span.file_id]
+			decl_uri = path_to_uri(doc.graph.file_paths[decl_span.file_id])
 		}
+		append(
+			&locations,
+			json.Value(
+				json.Object {
+					"uri" = json.String(decl_uri),
+					"range" = lsp_range_json(decl_source, decl_span.start, decl_span.end),
+				},
+			),
+		)
 	}
 	for sp in doc.usages[sym_id] {
 		append(
@@ -381,9 +482,11 @@ collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_de
 	return locations
 }
 
-// Межфайловый find-references/rename не входит в MVP — как и go-to-def,
-// работает только в пределах открытого документа (single-file
-// resolve_program, без графа импортов).
+// Известное ограничение MVP: find-references/rename сканируют usages
+// ТОЛЬКО в текущем открытом документе, не по всему графу импортов/
+// проекту — символ, объявленный в текущем файле и используемый в другом
+// открытом файле, найдётся не полностью. Определение символа (в т.ч. в
+// другом файле) резолвится корректно через общий symbol_store.
 handle_references :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	doc, offset, ok := resolve_position(server, params)
 	if !ok {
@@ -425,14 +528,21 @@ handle_rename :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	}
 
 	locations := collect_locations(doc, sym_id, true)
-	edits := make([dynamic]json.Value)
+	// changes сгруппирован по uri — declaration может лежать в ДРУГОМ
+	// файле (импортированном модуле), чем usages.
+	changes := make(json.Object)
 	for loc in locations {
 		obj := loc.(json.Object)
-		append(&edits, json.Value(json.Object{"range" = obj["range"], "newText" = json.String(new_name)}))
+		uri := string(obj["uri"].(json.String))
+		edit := json.Value(json.Object{"range" = obj["range"], "newText" = json.String(new_name)})
+		if existing, found := changes[uri]; found {
+			arr := existing.(json.Array)
+			append(&arr, edit)
+			changes[uri] = json.Value(arr)
+		} else {
+			changes[uri] = json.Value(json.Array{edit})
+		}
 	}
-
-	changes := make(json.Object)
-	changes[doc.uri] = json.Array(edits)
 	result := json.Object{"changes" = json.Value(changes)}
 	send_response(id, result)
 }

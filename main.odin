@@ -27,11 +27,20 @@ main :: proc() {
 	}
 
 	args := os.args
-	args_len := len(args)
-	if args_len == 1 {
+	idx := 1
+	verbose := false
+	// -v/--verbose должен стоять ПЕРЕД именем файла: panos -v file.ps arg1
+	// arg2 — всё, что после файла, идёт в сам скрипт как program_args
+	// (ос.аргументы()), флаг интерпретатора туда попасть не должен.
+	if len(args) > idx && (args[idx] == "-v" || args[idx] == "--verbose") {
+		verbose = true
+		idx += 1
+	}
+
+	if len(args) <= idx {
 		repl()
-	} else if args_len >= 2 {
-		run_file(args[1], args[2:])
+	} else {
+		run_file(args[idx], args[idx + 1:], verbose)
 	}
 }
 
@@ -49,9 +58,8 @@ print_diagnostics_and_exit :: proc(graph: ^core.Module_Graph, diags: [dynamic]co
 	os.exit(1)
 }
 
-run_file :: proc(filename: string, program_args: []string = nil) {
+run_file :: proc(filename: string, program_args: []string = nil, verbose: bool = false) {
 	graph := core.load_module_graph(filename)
-	print_diagnostics_and_exit(&graph, graph.parse_diagnostics)
 
 	entry_path := core.resolve_import_path(filename, "")
 	entry_module := graph.modules[entry_path]
@@ -63,41 +71,60 @@ run_file :: proc(filename: string, program_args: []string = nil) {
 		return
 	}
 
-	fmt.println("AST")
-	fmt.printf("--------------------------\n")
-	core.print_program(entry_module.ast)
-	fmt.printf("--------------------------\n\n")
+	if verbose {
+		fmt.println("AST")
+		fmt.printf("--------------------------\n")
+		core.print_program(entry_module.ast)
+		fmt.printf("--------------------------\n\n")
+	}
+
+	results := core.resolve_and_typecheck_all(&graph)
+
+	// Гейт до компиляции: копим diagnostics со ВСЕХ модулей и фаз разом
+	// (не только первую упавшую) — тот же accumulate-not-panic принцип,
+	// что и внутри каждой фазы (см. Стадия 2/10), только теперь ещё и
+	// поперёк графа импортов.
+	all_diags := make([dynamic]core.Diagnostic)
+	for d in graph.parse_diagnostics do append(&all_diags, d)
+	for r in results {
+		for d in r.res_ctx.diagnostics do append(&all_diags, d)
+		for d in r.tc_ctx.diagnostics do append(&all_diags, d)
+	}
+	print_diagnostics_and_exit(&graph, all_diags)
 
 	global_registry := make(map[string]^core.Compiled_Function)
 
-	for module in graph.order {
-		resolver_ctx := core.resolve_module(&graph, module)
-		print_diagnostics_and_exit(&graph, resolver_ctx.diagnostics)
-		core.print_resolver_ctx(&resolver_ctx)
+	for i in 0 ..< len(results) {
+		r := &results[i]
+		module_registry := core.compile_program(&r.res_ctx, &r.tc_ctx, &r.module.ast, &global_registry)
+		if verbose {
+			core.print_resolver_ctx(&r.res_ctx)
 
-		fmt.println("TYPE CHECK")
-		fmt.printf("--------------------------\n")
-		type_ctx := core.new_type_ctx(&resolver_ctx)
-		core.typecheck_program(&type_ctx, module.ast)
-		print_diagnostics_and_exit(&graph, type_ctx.diagnostics)
-		core.print_type_ctx(&type_ctx)
-		fmt.printf("--------------------------\n\n")
+			fmt.println("TYPE CHECK")
+			fmt.printf("--------------------------\n")
+			core.print_type_ctx(&r.tc_ctx)
+			fmt.printf("--------------------------\n\n")
 
-		fmt.println("COMPILATION")
-		fmt.printf("--------------------------\n")
-		module_registry := core.compile_program(&resolver_ctx, &type_ctx, &module.ast, &global_registry)
-		core.print_assebler(module_registry)
-		fmt.printf("--------------------------\n\n")
-
-		graph.symbol_types = resolver_ctx.symbol_types
+			fmt.println("COMPILATION")
+			fmt.printf("--------------------------\n")
+			core.print_assebler(module_registry)
+			fmt.printf("--------------------------\n\n")
+		}
 	}
 
-	fmt.println("EXECUTION")
-	fmt.printf("--------------------------\n")
+	if verbose {
+		fmt.println("EXECUTION")
+		fmt.printf("--------------------------\n")
+	}
 	vm := core.new_vm(global_registry, program_args)
 	core.execute(vm)
+	// Не гейтим за verbose — это фактический результат прогона (значение,
+	// оставшееся на стеке после старт()), а не внутренняя отладочная
+	// информация компилятора.
 	core.print_vm(vm)
-	fmt.printf("--------------------------\n\n")
+	if verbose {
+		fmt.printf("--------------------------\n\n")
+	}
 }
 
 repl :: proc() {

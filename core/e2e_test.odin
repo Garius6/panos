@@ -61,14 +61,17 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 	graph := load_module_graph(filename)
 	registry := make(map[string]^Compiled_Function)
 
-	for module in graph.order {
-		res_ctx := resolve_module(&graph, module)
-		panic_on_diagnostics(res_ctx.diagnostics)
-		type_ctx := new_type_ctx(&res_ctx)
-		typecheck_program(&type_ctx, module.ast)
-		panic_on_diagnostics(type_ctx.diagnostics)
-		compile_program(&res_ctx, &type_ctx, &module.ast, &registry)
-		graph.symbol_types = res_ctx.symbol_types
+	// resolve_and_typecheck_all — общий с main.odin::run_file и
+	// lsp/lsp_server.odin::revalidate_document путь. Раньше этот тест
+	// гонял СВОЙ отдельный цикл, из-за чего регрессия в общем коде
+	// (dangling Type_Ctx.res после копирования Module_Result в массив)
+	// проходила мимо всего test suite — теперь тот же путь, что и CLI.
+	results := resolve_and_typecheck_all(&graph)
+	for i in 0 ..< len(results) {
+		r := &results[i]
+		panic_on_diagnostics(r.res_ctx.diagnostics)
+		panic_on_diagnostics(r.tc_ctx.diagnostics)
+		compile_program(&r.res_ctx, &r.tc_ctx, &r.module.ast, &registry)
 	}
 
 	vm := new_vm(registry)

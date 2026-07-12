@@ -2585,7 +2585,32 @@ infer_index_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Index_Expr) -> ^Type {
 		check_expr(ctx, e.index, TY_NUM)
 		t = prune_type(obj_type.element_type)
 	} else if obj_type.kind == .Map {
-		check_expr(ctx, e.index, obj_type.key_type)
+		// Частый источник этой ошибки — для-in напрямую на Соответствие
+		// (`для x в моя_карта цикл`): для-in раскрывается в позиционное
+		// `[индекс]` (см. parse_for_stmt_into в parser.odin), а
+		// Соответствие индексируется по ключу, не позиционно. Подсказка
+		// нацелена именно на этот случай (индекс — Число, ключ — нет),
+		// остальные несовпадения репортятся как обычно.
+		index_type := prune_type(infer_expr(ctx, e.index))
+		key_type := prune_type(obj_type.key_type)
+		if !unify_types(index_type, key_type) {
+			if index_type.kind == .Number && key_type.kind != .Number {
+				report(
+					ctx,
+					e.span,
+					"Type Error: соответствие индексируется по ключу типа '%s', получено 'Число' — Соответствие не поддерживает позиционный доступ; для перебора элементов используйте .записи() и 'для (ключ, значение) в ...'",
+					key_type.name,
+				)
+			} else {
+				report(
+					ctx,
+					e.span,
+					"Type Error: ожидался '%s', получен '%s'",
+					key_type.name,
+					index_type.name,
+				)
+			}
+		}
 		t = prune_type(obj_type.value_type)
 	} else if obj_type.kind == .String {
 		check_expr(ctx, e.index, TY_NUM)

@@ -33,6 +33,8 @@ builtin_export_type :: proc(full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_STRING, new_result_type(TY_STRING, TY_ERROR))
 	case "фс::записать":
 		return builtin_function_type_2(TY_STRING, TY_STRING, new_result_type(TY_NUM, TY_ERROR))
+	case "фс::открыть":
+		return builtin_function_type_1(TY_STRING, new_result_type(TY_FILE, TY_ERROR))
 	case "ос::аргументы":
 		return new_function_type(make([dynamic]^Type), new_array_type(TY_STRING))
 	case "ос::окружение":
@@ -47,6 +49,8 @@ builtin_export_type :: proc(full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_STRING, TY_VOID)
 	case "ввод_вывод::прочитать_строку":
 		return new_function_type(make([dynamic]^Type), new_result_type(TY_STRING, TY_ERROR))
+	case "ввод_вывод::поток":
+		return new_function_type(make([dynamic]^Type), TY_FILE)
 	}
 	return nil
 }
@@ -81,6 +85,12 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"записать",
 			builtin_function_type_2(TY_STRING, TY_STRING, new_result_type(TY_NUM, TY_ERROR)),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"открыть",
+			builtin_function_type_1(TY_STRING, new_result_type(TY_FILE, TY_ERROR)),
 		)
 	} else if name == "ос" {
 		add_builtin_export(
@@ -125,6 +135,12 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"прочитать_строку",
 			builtin_export_type("ввод_вывод::прочитать_строку"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"поток",
+			builtin_export_type("ввод_вывод::поток"),
 		)
 	}
 

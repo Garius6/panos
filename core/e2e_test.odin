@@ -1616,3 +1616,92 @@ test_gc_keeps_reachable_data_alive :: proc(t: ^testing.T) {
 		arr.elements,
 	)
 }
+
+// Объектный API фс: фс.открыть -> Файл-дескриптор с методами .записать/
+// .прочитать/.прочитать_строку/.закрыть (см. File_Value в compiler.odin,
+// FILE_METHODS в type_cheker.odin).
+@(test)
+test_file_handle_write_then_read_back :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт фс
+
+		функ старт() -> Строка
+			пер путь = "/tmp/panos_file_handle_write.txt"
+			пер ф = фс.открыть(путь).ожидать("не удалось открыть")
+			ф.записать("привет из дескриптора")
+			ф.закрыть()
+			фс.прочитать(путь).ожидать("не удалось прочитать")
+		конец
+	`)
+	testing.expectf(t, ok, "file handle write: пустой стек")
+	if !ok do return
+	testing.expectf(
+		t,
+		value_str_eq(result, "привет из дескриптора"),
+		"file handle write: ожидалось 'привет из дескриптора', получено %v",
+		result,
+	)
+}
+
+// .прочитать_строку() и .прочитать() должны делить один и тот же курсор
+// чтения (общий bufio.Reader) — вторая строка должна прочитаться СО
+// СЛЕДУЮЩЕЙ позиции, а не сначала файла.
+@(test)
+test_file_handle_read_line_then_read_rest :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт фс
+
+		функ старт() -> Строка
+			пер путь = "/tmp/panos_file_handle_read.txt"
+			фс.записать(путь, "первая\nвторая")
+			пер ф = фс.открыть(путь).ожидать("не удалось открыть")
+			пер строка1 = ф.прочитать_строку().ожидать("нет строки")
+			пер остаток = ф.прочитать().ожидать("нет остатка")
+			ф.закрыть()
+			строка1 + "|" + остаток
+		конец
+	`)
+	testing.expectf(t, ok, "file handle read: пустой стек")
+	if !ok do return
+	testing.expectf(
+		t,
+		value_str_eq(result, "первая|вторая"),
+		"file handle read: ожидалось 'первая|вторая', получено %v",
+		result,
+	)
+}
+
+@(test)
+test_file_handle_open_missing_dir_is_error :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт фс
+
+		функ старт() -> Булево
+			пер р = фс.открыть("/tmp/panos_e2e_missing_dir_zzz/file.txt")
+			р.ошибка()
+		конец
+	`)
+	testing.expectf(t, ok, "file handle open error: пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(true), "file handle open error: ожидалась ошибка открытия, получено %v", result)
+}
+
+// ввод_вывод.поток() переиспользует File_Value для стдин — здесь только
+// структурная проверка (конструктор + .закрыть() как no-op), реального
+// чтения не делаем: os.stdin в тестовом процессе не подключён к пайпу и
+// блокирующее чтение повесило бы весь test suite.
+@(test)
+test_stdin_stream_handle_smoke :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт ввод_вывод
+
+		функ старт() -> Число
+			пер поток = ввод_вывод.поток()
+			поток.закрыть()
+			42
+		конец
+	`)
+	testing.expectf(t, ok, "stdin stream smoke: пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(f64(42)), "stdin stream smoke: ожидалось 42, получено %v", result)
+}

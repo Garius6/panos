@@ -1,7 +1,10 @@
 package core
 
+import "base:runtime"
+import "core:bufio"
 import "core:fmt"
 import "core:os"
+import "core:strings"
 
 Main_Function_Name :: "старт"
 
@@ -17,6 +20,26 @@ VM :: struct {
 	stack:              [dynamic]Value,
 	program_args:       []string,
 	gc:                 GC_State,
+	// Единый буферизованный reader над os.stdin — вне зависимости от того,
+	// сколько раз вызван ввод_вывод.поток(), реальный поток ОС читается
+	// ровно одним bufio.Reader'ом (см. get_stdin_reader). Несколько
+	// независимых bufio.Reader поверх одного os.stdin буферизовали бы
+	// каждый свой кусок и теряли байты, уже вычитанные другим.
+	stdin_reader:       bufio.Reader,
+	stdin_reader_ready: bool,
+}
+
+// Ленивая инициализация общего reader'а над os.stdin. Аллокатор буфера
+// закреплён на runtime.heap_allocator(), а не на context.allocator в точке
+// вызова (тот же урок, что и с GC-хипом в gc.odin/interner.odin) — VM живёт
+// весь процесс, буфер не должен зависеть от арены вызывающего кода.
+get_stdin_reader :: proc(vm: ^VM) -> ^bufio.Reader {
+	if !vm.stdin_reader_ready {
+		context.allocator = runtime.heap_allocator()
+		bufio.reader_init(&vm.stdin_reader, os.to_stream(os.stdin))
+		vm.stdin_reader_ready = true
+	}
+	return &vm.stdin_reader
 }
 
 new_vm :: proc(
@@ -189,37 +212,61 @@ make_error_result :: proc(vm: ^VM, err: Value) -> Value {
 	return Value(res)
 }
 
-read_stdin_line :: proc(vm: ^VM) -> Value {
-	line := make([dynamic]byte)
-	buffer: [256]byte
-
-	for {
-		n, err := os.read(os.stdin, buffer[:])
-		if n > 0 {
-			for b in buffer[:n] {
-				if b == '\n' {
-					return make_ok_result(vm, Value(gc_new_string(vm, string(line[:]))))
-				}
-				if b != '\r' {
-					append(&line, b)
-				}
-			}
-		}
-
-		if err != nil {
-			if len(line) > 0 {
-				return make_ok_result(vm, Value(gc_new_string(vm, string(line[:]))))
-			}
-			return make_error_result(
-				vm,
-				make_error_value(vm, "ввод_вывод", fmt.tprintf("%v", err)),
-			)
-		}
-
-		if n == 0 {
-			return make_ok_result(vm, Value(gc_new_string(vm, string(line[:]))))
-		}
+// Общая точка чтения одной строки из ЛЮБОГО bufio.Reader — используется и
+// для ввод_вывод::прочитать_строку (общий vm.stdin_reader), и для
+// File_Value.прочитать_строку у обычных файлов (свой reader на дескриптор),
+// и у Файл-обёртки над стдин (тот же vm.stdin_reader, см. get_stdin_reader).
+// Один и тот же путь чтения+trim для всех трёх случаев — то самое
+// "разделяет общий механизм", о котором просили.
+read_line_from_reader :: proc(vm: ^VM, r: ^bufio.Reader) -> Value {
+	line, err := bufio.reader_read_string(r, '\n', context.temp_allocator)
+	if err != nil && err != .EOF {
+		return make_error_result(vm, make_error_value(vm, "ввод_вывод", fmt.tprintf("%v", err)))
 	}
+	trimmed := strings.trim_right(line, "\r\n")
+	return make_ok_result(vm, Value(gc_new_string(vm, trimmed)))
+}
+
+read_stdin_line :: proc(vm: ^VM) -> Value {
+	return read_line_from_reader(vm, get_stdin_reader(vm))
+}
+
+// Вычитывает reader до EOF в temp-буфер (не трогает уже прочитанное — если
+// перед .прочитать() были вызовы .прочитать_строку(), получаем ОСТАТОК
+// файла, а не его начало заново, ровно как ожидалось бы от одного и того
+// же файлового курсора).
+read_all_from_reader :: proc(r: ^bufio.Reader) -> string {
+	data := make([dynamic]byte, context.temp_allocator)
+	buf: [4096]byte
+	for {
+		n, err := bufio.reader_read(r, buf[:])
+		if n > 0 do append(&data, ..buf[:n])
+		if err != nil do break
+	}
+	return string(data[:])
+}
+
+// Куда читать для конкретного File_Value: у обычного файла — его
+// собственный buffer, у Файл-обёртки над стдин — единый vm.stdin_reader
+// (см. комментарий у поля stdin_reader в VM).
+file_reader :: proc(vm: ^VM, file: ^File_Value) -> ^bufio.Reader {
+	if file.is_stdin do return get_stdin_reader(vm)
+	return &file.reader
+}
+
+// Единая точка закрытия File_Value — вызывается и явным .закрыть() из Panos-
+// кода, и GC-финализатором в pool_release (см. gc.odin), когда хендл стал
+// недостижим, но не был закрыт явно. is_open — гейт идемпотентности: оба
+// пути могут сойтись на одном объекте (сначала явный close, потом sweep),
+// второй вызов обязан быть no-op.
+close_file_value :: proc(file: ^File_Value) {
+	if !file.is_open do return
+	if !file.is_stdin {
+		if file.handle != nil do os.close(file.handle)
+		bufio.reader_destroy(&file.reader)
+	}
+	file.handle = nil
+	file.is_open = false
 }
 
 string_length :: proc(text: string) -> int {
@@ -420,6 +467,39 @@ invoke_collection_method :: proc(
 		}
 	}
 
+	if file, ok_file := receiver.(^File_Value); ok_file {
+		switch method_name {
+		case "прочитать":
+			expect_arg_count(method_name, len(args), 0)
+			if !file.is_open {
+				return make_error_result(vm, make_error_value(vm, "фс", "файл уже закрыт")), true
+			}
+			content := read_all_from_reader(file_reader(vm, file))
+			return make_ok_result(vm, Value(gc_new_string(vm, content))), true
+		case "прочитать_строку":
+			expect_arg_count(method_name, len(args), 0)
+			if !file.is_open {
+				return make_error_result(vm, make_error_value(vm, "фс", "файл уже закрыт")), true
+			}
+			return read_line_from_reader(vm, file_reader(vm, file)), true
+		case "записать":
+			expect_arg_count(method_name, len(args), 1)
+			text := expect_string_arg(method_name, args[0])
+			if !file.is_open || file.is_stdin {
+				return make_error_result(vm, make_error_value(vm, "фс", "файл не открыт для записи")), true
+			}
+			n, err := os.write(file.handle, transmute([]byte)text)
+			if err != nil {
+				return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true
+			}
+			return make_ok_result(vm, Value(f64(n))), true
+		case "закрыть":
+			expect_arg_count(method_name, len(args), 0)
+			close_file_value(file)
+			return Value(f64(0)), false
+		}
+	}
+
 	fmt.panicf(
 		"Runtime Error: метод '%s' не найден у коллекции",
 		method_name,
@@ -512,6 +592,22 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		}
 		return make_ok_result(vm, Value(f64(len(content)))), true
 
+	case "фс::открыть":
+		expect_arg_count(name, len(args), 1)
+		path := expect_string_arg(name, args[0])
+		handle, err := os.open(path, {.Read, .Write, .Create}, os.Permissions_Default_File)
+		if err != nil {
+			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true
+		}
+		file := gc_new(vm, File_Value)
+		file.handle = handle
+		file.is_open = true
+		file.is_stdin = false
+		context.allocator = runtime.heap_allocator()
+		file.path = strings.clone(path)
+		bufio.reader_init(&file.reader, os.to_stream(handle))
+		return make_ok_result(vm, Value(file)), true
+
 	case "ос::аргументы":
 		expect_arg_count(name, len(args), 0)
 		arr := gc_new(vm, Array_Value)
@@ -568,6 +664,15 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	case "ввод_вывод::прочитать_строку":
 		expect_arg_count(name, len(args), 0)
 		return read_stdin_line(vm), true
+
+	case "ввод_вывод::поток":
+		expect_arg_count(name, len(args), 0)
+		file := gc_new(vm, File_Value)
+		file.handle = nil
+		file.path = ""
+		file.is_open = true
+		file.is_stdin = true
+		return Value(file), true
 	}
 
 	fmt.panicf(

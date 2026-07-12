@@ -23,6 +23,9 @@ Type_Kind :: enum {
 	Result,
 	InferVar,
 	Enum,
+	// Дескриптор открытого файла/потока (фс.открыть, ввод_вывод.поток) —
+	// непараметрический тип, методы см. FILE_METHODS.
+	File,
 	// Заглушка для узла, где уже была зарепорчена ошибка. Unify'ится с чем
 	// угодно (см. unify_types/types_are_equal) — не даёт одной первопричине
 	// расплодиться в десяток производных диагностик по всему выражению.
@@ -85,6 +88,7 @@ TY_VOID := &Type{kind = .Void, name = "Пусто"}
 TY_NEVER := &Type{kind = .Never, name = "Никогда"}
 TY_STRING := &Type{kind = .String, name = "Строка"}
 TY_ERROR := &Type{kind = .Error, name = "Ошибка"}
+TY_FILE := &Type{kind = .File, name = "Файл"}
 TY_POISON := &Type{kind = .Poison, name = "?ошибка?"}
 
 // Имя базового типа в аннотации → интернированный Type. `Никогда` был
@@ -104,6 +108,7 @@ BASE_TYPES := [?]Base_Type_Entry {
 	{"Пусто", TY_VOID},
 	{"Ошибка", TY_ERROR},
 	{"Никогда", TY_NEVER},
+	{"Файл", TY_FILE},
 }
 
 lookup_base_type :: proc(name: string) -> (^Type, bool) {
@@ -1809,8 +1814,38 @@ RESULT_METHODS := [?]Method_Sig {
 	},
 }
 
-// Диспетчер методов Опции/Результата: одна карта вместо 21 повторяющегося
-// case'а (arity-check + collection_calls-запись + return). Handler'ы
+FILE_METHODS := [?]Method_Sig {
+	{
+		name = "прочитать",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			return new_result_type(TY_STRING, TY_ERROR)
+		},
+	},
+	{
+		name = "прочитать_строку",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			return new_result_type(TY_STRING, TY_ERROR)
+		},
+	},
+	{
+		name = "записать",
+		arity = 1,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			check_expr(ctx, args[0], TY_STRING)
+			return new_result_type(TY_NUM, TY_ERROR)
+		},
+	},
+	{
+		name = "закрыть",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_VOID},
+	},
+}
+
+// Диспетчер методов Опции/Результата/Файла: одна карта вместо повторяющихся
+// case'ов (arity-check + collection_calls-запись + return). Handler'ы
 // хранят только уникальную логику.
 standard_method_type :: proc(
 	ctx: ^Type_Ctx,
@@ -1828,6 +1863,8 @@ standard_method_type :: proc(
 		method_list = OPTION_METHODS[:]
 	case .Result:
 		method_list = RESULT_METHODS[:]
+	case .File:
+		method_list = FILE_METHODS[:]
 	case:
 		return nil, false
 	}

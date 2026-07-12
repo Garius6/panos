@@ -55,6 +55,7 @@ GC_State :: struct {
 	free_interfaces: [dynamic]^Interface_Value,
 	free_variants:   [dynamic]^Variant_Value,
 	free_strings:    [dynamic]^Panos_String,
+	free_files:      [dynamic]^File_Value,
 }
 
 // Не собираем, пока живой хип меньше этого — иначе на маленьких
@@ -76,6 +77,7 @@ new_gc_state :: proc() -> GC_State {
 		free_interfaces = make([dynamic]^Interface_Value),
 		free_variants = make([dynamic]^Variant_Value),
 		free_strings = make([dynamic]^Panos_String),
+		free_files = make([dynamic]^File_Value),
 	}
 }
 
@@ -133,6 +135,8 @@ gc_new :: proc(vm: ^VM, $T: typeid) -> ^T {
 		obj = pool_take(&vm.gc.free_variants)
 	} else when T == Panos_String {
 		obj = pool_take(&vm.gc.free_strings)
+	} else when T == File_Value {
+		obj = pool_take(&vm.gc.free_files)
 	}
 
 	if obj == nil {
@@ -189,6 +193,8 @@ get_header :: proc(v: Value) -> ^GC_Header {
 		return &val.header
 	case ^Variant_Value:
 		return &val.header
+	case ^File_Value:
+		return &val.header
 	case f64, bool, ^Compiled_Function:
 		return nil
 	}
@@ -208,7 +214,7 @@ mark_value :: proc(v: Value) {
 	h.marked = true
 
 	switch val in v {
-	case f64, bool, ^Compiled_Function, ^Panos_String:
+	case f64, bool, ^Compiled_Function, ^Panos_String, ^File_Value:
 	// листья — нечего обходить дальше
 	case ^Aggregate_Value:
 		for el in val.elements do mark_value(el)
@@ -275,6 +281,8 @@ value_size :: proc(v: Value) -> int {
 		return size_of(Interface_Value)
 	case ^Variant_Value:
 		return size_of(Variant_Value)
+	case ^File_Value:
+		return size_of(File_Value)
 	}
 	return 0
 }
@@ -319,6 +327,17 @@ pool_release :: proc(vm: ^VM, v: Value) {
 	case ^Variant_Value:
 		clear(&val.fields)
 		append(&vm.gc.free_variants, val)
+	case ^File_Value:
+		// Finalizer: файл стал недостижим, но программа не вызвала
+		// .закрыть() явно — закрываем ОС-хендл здесь (через ту же
+		// close_file_value, что и явный .закрыть(), см. vm.odin), иначе он
+		// утекает до конца процесса. GC решает, ЧТО собрать, но не КОГДА —
+		// момент закрытия непредсказуем для программиста, поэтому это
+		// fallback, а не замена явному .закрыть().
+		close_file_value(val)
+		delete(val.path)
+		val.path = ""
+		append(&vm.gc.free_files, val)
 	}
 }
 

@@ -1,6 +1,8 @@
 package core
 
+import "core:bufio"
 import "core:fmt"
+import "core:os"
 import "core:strings"
 
 // Все heap-managed варианты Value (кроме f64/bool/^Compiled_Function —
@@ -65,6 +67,17 @@ Variant_Value :: struct {
 	fields:    [dynamic]Value,
 }
 
+// Дескриптор открытого файла или потока ввода (стдин). is_stdin файлы не
+// владеют ОС-хендлом (нельзя закрыть стдин) — закрытие для них no-op.
+File_Value :: struct {
+	header:   GC_Header,
+	handle:   ^os.File,
+	reader:   bufio.Reader,
+	path:     string,
+	is_open:  bool,
+	is_stdin: bool,
+}
+
 Value :: union {
 	f64,
 	bool,
@@ -78,6 +91,7 @@ Value :: union {
 	^Result_Value,
 	^Interface_Value,
 	^Variant_Value,
+	^File_Value,
 }
 
 Compiled_Function :: struct {

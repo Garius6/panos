@@ -1213,18 +1213,38 @@ parse_for_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt) {
 // Разворачивает числовой диапазон `для сч = <start> по <end> цикл ... конец`
 // (границы включительно с обеих сторон) в:
 //
-//   пер __for_N_val = <start> - 1
-//   пер __for_N_end = <end>
-//   пока истина цикл
-//       __for_N_val = __for_N_val + 1
-//       если __for_N_val > __for_N_end тогда прервать конец
-//       пер <сч> = __for_N_val
-//       <тело>
+//   пока истина цикл                 // ①  внешняя обёртка — только ради
+//       пер <сч> = <start> - 1       //     собственного scope у <сч>/end,
+//       пер __for_N_end = <end>      //     см. ниже; выполняется РОВНО 1 раз
+//       пока истина цикл             // ②  сам диапазон
+//           <сч> = <сч> + 1
+//           если <сч> > __for_N_end тогда прервать конец
+//           <тело>
+//       конец
+//       прервать                     // безусловно — конец обёртки ①
 //   конец
 //
-// Та же схема continue-safety, что и в for-in выше: инкремент — первым в
-// теле, до пользовательского кода, поэтому `продолжить` (прыжок на начало
-// пока-цикла) корректно проходит через инкремент вместо того, чтобы его
+// В отличие от for-in (где элемент на каждой итерации ЗАНОВО привязывается
+// через `пер`, см. parse_for_stmt_into), здесь <сч> — единственная живая
+// переменная-счётчик, без скрытого внутреннего аналога. Если тело меняет
+// <сч> (`сч = сч + 1`), это по-настоящему сдвигает следующую итерацию —
+// как в C-style `for`, а не отбрасывается, как было бы при перепривязке.
+// Осознанный выбор ради шаблона "прочитать значение по сч+1 и пропустить
+// его следующей итерацией" (парсинг флагов командной строки) — без live
+// счётчика пропуск невозможен в принципе, т.к. `для` не даёт доступа к
+// внутреннему индексу итерации.
+//
+// Внешняя обёртка ① нужна, т.к. `пер <сч> = ...` объявлен ПРЯМО в теле
+// (а не перепривязывается внутри цикла, как у for-in) — без своего scope
+// он утёк бы в объемлющий блок, и второй `для сч = ... по ... цикл` в той
+// же функции упал бы с "Имя сч уже объявлено". resolver.odin заводит
+// новый scope на каждый While_Expr.body — тело ①, которое исполняется
+// ровно 1 раз и сразу прерывается, это использует, ничего не пряча от
+// пользователя (тело ② остаётся честным неограниченным циклом).
+//
+// Та же схема continue-safety, что и в for-in: инкремент — первым в теле
+// ②, до пользовательского кода, поэтому `продолжить` (прыжок на начало
+// пока-цикла ②) корректно проходит через инкремент вместо того, чтобы его
 // перепрыгнуть. <end> считаем один раз в отдельную переменную ДО цикла —
 // как for-in один раз сохраняет iterable — а не переоцениваем каждую
 // итерацию.
@@ -1255,30 +1275,27 @@ parse_for_range_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt, start: Span, 
 	span := span_from(p, start)
 
 	p.for_counter += 1
-	suffix := fmt.tprintf("__for_%d", p.for_counter)
-	val_name := fmt.tprintf("%s_val", suffix)
-	end_name := fmt.tprintf("%s_end", suffix)
+	end_name := fmt.tprintf("__for_%d_end", p.for_counter)
 
-	// пер __for_N_val = <start> - 1
-	append(out, mk_let(val_name, mk_bin(.Minus, start_expr, mk_num(1, span), span), span))
-	// пер __for_N_end = <end>
-	append(out, mk_let(end_name, end_expr, span))
-
-	body := make([dynamic]Stmt)
-
-	// __for_N_val = __for_N_val + 1
-	append(&body, mk_incr(val_name, span))
-	// если __for_N_val > __for_N_end тогда прервать конец
-	cmp_gt := mk_bin(.Greater, mk_ident(val_name, span), mk_ident(end_name, span), span)
-	append(&body, mk_if_break(cmp_gt, span))
-	// пер <сч> = __for_N_val
-	append(&body, mk_let(var_name, mk_ident(val_name, span), span))
-
+	inner_body := make([dynamic]Stmt)
+	// <сч> = <сч> + 1
+	append(&inner_body, mk_incr(var_name, span))
+	// если <сч> > __for_N_end тогда прервать конец
+	cmp_gt := mk_bin(.Greater, mk_ident(var_name, span), mk_ident(end_name, span), span)
+	append(&inner_body, mk_if_break(cmp_gt, span))
 	for stmt in user_body {
-		append(&body, stmt)
+		append(&inner_body, stmt)
 	}
 
-	append(out, mk_while(mk_bool(true, span), body, span))
+	outer_body := make([dynamic]Stmt)
+	// пер <сч> = <start> - 1
+	append(&outer_body, mk_let(var_name, mk_bin(.Minus, start_expr, mk_num(1, span), span), span))
+	// пер __for_N_end = <end>
+	append(&outer_body, mk_let(end_name, end_expr, span))
+	append(&outer_body, mk_while(mk_bool(true, span), inner_body, span))
+	append(&outer_body, mk_break(span))
+
+	append(out, mk_while(mk_bool(true, span), outer_body, span))
 }
 
 parse_continue_stmt :: proc(p: ^Parser) -> Stmt {
@@ -1907,6 +1924,13 @@ mk_if_break :: proc(cond: Expr, span: Span) -> Stmt {
 	node.else_branch = make([dynamic]Stmt)
 	node.span = span
 	return mk_expr_stmt(node, span)
+}
+
+// прервать (безусловно)
+mk_break :: proc(span: Span) -> Stmt {
+	s := new(Break_Stmt)
+	s.span = span
+	return s
 }
 
 // пока <cond> цикл <body> конец

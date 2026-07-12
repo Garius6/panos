@@ -1144,6 +1144,13 @@ parse_for_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt) {
 			report_parse(p, name_tok.span, "Синтаксическая ошибка: после 'для' ожидается идентификатор или '(идент, ...)'")
 		}
 		append(&names, name_tok.data)
+
+		// Числовой диапазон: `для сч = 0 по 4 цикл` — одиночный идентификатор,
+		// за которым сразу `=` вместо `в`, отличает эту форму от for-in.
+		if peek_token(p.stream).kind == .Assign {
+			parse_for_range_stmt_into(p, out, start, name_tok.data)
+			return
+		}
 	}
 
 	in_tok := next_token(p.stream)
@@ -1169,129 +1176,109 @@ parse_for_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt) {
 	iter_name := fmt.tprintf("%s_iter", suffix)
 	idx_name := fmt.tprintf("%s_idx", suffix)
 
-	mk_ident :: proc(name: string, span: Span) -> Expr {
-		e := new(Ident_Expr)
-		e.name = intern(name)
-		e.span = span
-		return e
-	}
-	mk_num :: proc(v: f64, span: Span) -> Expr {
-		e := new(Number_Expr)
-		e.value = v
-		e.span = span
-		return e
-	}
-
 	// пер __for_N_iter = <expr>
-	iter_let := new(Let_Stmt)
-	iter_let.name = iter_name
-	iter_let.value = iterable
-	iter_let.span = span
-	append(out, iter_let)
-
+	append(out, mk_let(iter_name, iterable, span))
 	// пер __for_N_idx = -1
-	neg_one := new(Unary_Expr)
-	neg_one.op = .Minus
-	neg_one.right = mk_num(1, span)
-	neg_one.span = span
-	idx_let := new(Let_Stmt)
-	idx_let.name = idx_name
-	idx_let.value = neg_one
-	idx_let.span = span
-	append(out, idx_let)
+	append(out, mk_let(idx_name, mk_unary(.Minus, mk_num(1, span), span), span))
 
-	while_node := new(While_Expr)
-	true_lit := new(Boolean_Expr)
-	true_lit.value = true
-	true_lit.span = span
-	while_node.condition = true_lit
-	while_node.body = make([dynamic]Stmt)
+	body := make([dynamic]Stmt)
 
 	// __for_N_idx = __for_N_idx + 1
-	incr_add := new(Binary_Expr)
-	incr_add.left = mk_ident(idx_name, span)
-	incr_add.op = .Plus
-	incr_add.right = mk_num(1, span)
-	incr_add.span = span
-	incr_assign := new(Binary_Expr)
-	incr_assign.left = mk_ident(idx_name, span)
-	incr_assign.op = .Assign
-	incr_assign.right = incr_add
-	incr_assign.span = span
-	incr_stmt := new(Expr_Stmt)
-	incr_stmt.expr = incr_assign
-	incr_stmt.span = span
-	append(&while_node.body, incr_stmt)
+	append(&body, mk_incr(idx_name, span))
 
 	// если __for_N_idx == __for_N_iter.длина() тогда прервать конец
-	len_prop := new(Property_Expr)
-	len_prop.object = mk_ident(iter_name, span)
-	len_prop.property = "длина"
-	len_prop.span = span
-	len_call := new(Call_Expr)
-	len_call.callee = len_prop
-	len_call.args = make([dynamic]Expr)
-	len_call.span = span
-	cmp_eq := new(Binary_Expr)
-	cmp_eq.left = mk_ident(idx_name, span)
-	cmp_eq.op = .Equal
-	cmp_eq.right = len_call
-	cmp_eq.span = span
-	break_stmt := new(Break_Stmt)
-	break_stmt.span = span
-	exit_if := new(If_Expr)
-	exit_if.condition = cmp_eq
-	exit_if.then_branch = make([dynamic]Stmt)
-	append(&exit_if.then_branch, break_stmt)
-	exit_if.else_branch = make([dynamic]Stmt)
-	exit_if.span = span
-	exit_if_stmt := new(Expr_Stmt)
-	exit_if_stmt.expr = exit_if
-	exit_if_stmt.span = span
-	append(&while_node.body, exit_if_stmt)
+	len_call := mk_call0(mk_prop(mk_ident(iter_name, span), "длина", span), span)
+	append(&body, mk_if_break(mk_bin(.Equal, mk_ident(idx_name, span), len_call, span), span))
 
 	// пер <элемент(ы)> = __for_N_iter[__for_N_idx]
-	index_expr := new(Index_Expr)
-	index_expr.object = mk_ident(iter_name, span)
-	index_expr.index = mk_ident(idx_name, span)
-	index_expr.span = span
-
+	index_expr := mk_index(mk_ident(iter_name, span), mk_ident(idx_name, span), span)
 	if len(names) == 1 {
-		elem_let := new(Let_Stmt)
-		elem_let.name = names[0]
-		elem_let.value = index_expr
-		elem_let.span = span
-		append(&while_node.body, elem_let)
+		append(&body, mk_let(names[0], index_expr, span))
 	} else {
 		elem_name := fmt.tprintf("%s_elem", suffix)
-		elem_let := new(Let_Stmt)
-		elem_let.name = elem_name
-		elem_let.value = index_expr
-		elem_let.span = span
-		append(&while_node.body, elem_let)
-
+		append(&body, mk_let(elem_name, index_expr, span))
 		for name, i in names {
-			field_prop := new(Property_Expr)
-			field_prop.object = mk_ident(elem_name, span)
-			field_prop.property = fmt.tprintf("%d", i)
-			field_prop.span = span
-			field_let := new(Let_Stmt)
-			field_let.name = name
-			field_let.value = field_prop
-			field_let.span = span
-			append(&while_node.body, field_let)
+			field_prop := mk_prop(mk_ident(elem_name, span), fmt.tprintf("%d", i), span)
+			append(&body, mk_let(name, field_prop, span))
 		}
 	}
 
 	for stmt in user_body {
-		append(&while_node.body, stmt)
+		append(&body, stmt)
 	}
 
-	while_node.span = span
-	while_stmt := new(Expr_Stmt)
-	while_stmt.expr = while_node
-	while_stmt.span = span
-	append(out, while_stmt)
+	append(out, mk_while(mk_bool(true, span), body, span))
+}
+
+// Разворачивает числовой диапазон `для сч = <start> по <end> цикл ... конец`
+// (границы включительно с обеих сторон) в:
+//
+//   пер __for_N_val = <start> - 1
+//   пер __for_N_end = <end>
+//   пока истина цикл
+//       __for_N_val = __for_N_val + 1
+//       если __for_N_val > __for_N_end тогда прервать конец
+//       пер <сч> = __for_N_val
+//       <тело>
+//   конец
+//
+// Та же схема continue-safety, что и в for-in выше: инкремент — первым в
+// теле, до пользовательского кода, поэтому `продолжить` (прыжок на начало
+// пока-цикла) корректно проходит через инкремент вместо того, чтобы его
+// перепрыгнуть. <end> считаем один раз в отдельную переменную ДО цикла —
+// как for-in один раз сохраняет iterable — а не переоцениваем каждую
+// итерацию.
+//
+// Вызывается из parse_for_stmt_into сразу после одиночного идентификатора,
+// когда за ним следует `=` вместо `в`; `=` ещё не съеден.
+parse_for_range_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt, start: Span, var_name: string) {
+	next_token(p.stream) // .Assign
+
+	start_expr := parse_expr(p, 0)
+
+	po_tok := next_token(p.stream)
+	if po_tok.kind != .Ident || po_tok.data != "по" {
+		report_parse(p, po_tok.span, "Синтаксическая ошибка: после начала диапазона 'для X = ...' ожидается 'по'")
+	}
+
+	end_expr := parse_expr(p, 0)
+
+	expect(p, .Loop)
+	user_body := make([dynamic]Stmt)
+	for {
+		kind := peek_token(p.stream).kind
+		if kind == .End || kind == .EOF do break
+		parse_stmt_into(p, &user_body)
+	}
+	expect(p, .End)
+
+	span := span_from(p, start)
+
+	p.for_counter += 1
+	suffix := fmt.tprintf("__for_%d", p.for_counter)
+	val_name := fmt.tprintf("%s_val", suffix)
+	end_name := fmt.tprintf("%s_end", suffix)
+
+	// пер __for_N_val = <start> - 1
+	append(out, mk_let(val_name, mk_bin(.Minus, start_expr, mk_num(1, span), span), span))
+	// пер __for_N_end = <end>
+	append(out, mk_let(end_name, end_expr, span))
+
+	body := make([dynamic]Stmt)
+
+	// __for_N_val = __for_N_val + 1
+	append(&body, mk_incr(val_name, span))
+	// если __for_N_val > __for_N_end тогда прервать конец
+	cmp_gt := mk_bin(.Greater, mk_ident(val_name, span), mk_ident(end_name, span), span)
+	append(&body, mk_if_break(cmp_gt, span))
+	// пер <сч> = __for_N_val
+	append(&body, mk_let(var_name, mk_ident(val_name, span), span))
+
+	for stmt in user_body {
+		append(&body, stmt)
+	}
+
+	append(out, mk_while(mk_bool(true, span), body, span))
 }
 
 parse_continue_stmt :: proc(p: ^Parser) -> Stmt {
@@ -1811,6 +1798,124 @@ infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 		return 90, 91, true
 	}
 	return 0, 0, false
+}
+
+// --- AST-BUILDER ХЕЛПЕРЫ ДЛЯ DESUGAR ---
+//
+// `для` (for-in и числовой диапазон) разворачивается на этапе parse в
+// обычные узлы AST (While_Expr/If_Expr/...) — см. parse_for_stmt_into и
+// parse_for_range_stmt_into. Без этих хелперов каждый узел собирался бы
+// вручную (new(X); x.field = ...; на 4-6 строк), и desugar-функции
+// раздувались бы пропорционально числу узлов в развёрнутом виде.
+
+mk_ident :: proc(name: string, span: Span) -> Expr {
+	e := new(Ident_Expr)
+	e.name = intern(name)
+	e.span = span
+	return e
+}
+
+mk_num :: proc(v: f64, span: Span) -> Expr {
+	e := new(Number_Expr)
+	e.value = v
+	e.span = span
+	return e
+}
+
+mk_bool :: proc(v: bool, span: Span) -> Expr {
+	e := new(Boolean_Expr)
+	e.value = v
+	e.span = span
+	return e
+}
+
+mk_unary :: proc(op: TokenKind, operand: Expr, span: Span) -> Expr {
+	e := new(Unary_Expr)
+	e.op = op
+	e.right = operand
+	e.span = span
+	return e
+}
+
+mk_bin :: proc(op: TokenKind, l: Expr, r: Expr, span: Span) -> Expr {
+	e := new(Binary_Expr)
+	e.left = l
+	e.op = op
+	e.right = r
+	e.span = span
+	return e
+}
+
+mk_prop :: proc(obj: Expr, name: string, span: Span) -> Expr {
+	e := new(Property_Expr)
+	e.object = obj
+	e.property = name
+	e.span = span
+	return e
+}
+
+// Только нуль-арные вызовы — единственная форма, нужная desugar'у (.длина()).
+mk_call0 :: proc(callee: Expr, span: Span) -> Expr {
+	e := new(Call_Expr)
+	e.callee = callee
+	e.args = make([dynamic]Expr)
+	e.span = span
+	return e
+}
+
+mk_index :: proc(obj: Expr, idx: Expr, span: Span) -> Expr {
+	e := new(Index_Expr)
+	e.object = obj
+	e.index = idx
+	e.span = span
+	return e
+}
+
+mk_expr_stmt :: proc(e: Expr, span: Span) -> Stmt {
+	s := new(Expr_Stmt)
+	s.expr = e
+	s.span = span
+	return s
+}
+
+mk_let :: proc(name: string, value: Expr, span: Span) -> Stmt {
+	s := new(Let_Stmt)
+	s.name = name
+	s.value = value
+	s.span = span
+	return s
+}
+
+// <name> = <value>
+mk_assign :: proc(name: string, value: Expr, span: Span) -> Stmt {
+	return mk_expr_stmt(mk_bin(.Assign, mk_ident(name, span), value, span), span)
+}
+
+// <name> = <name> + 1
+mk_incr :: proc(name: string, span: Span) -> Stmt {
+	return mk_assign(name, mk_bin(.Plus, mk_ident(name, span), mk_num(1, span), span), span)
+}
+
+// если <cond> тогда прервать конец
+mk_if_break :: proc(cond: Expr, span: Span) -> Stmt {
+	break_stmt := new(Break_Stmt)
+	break_stmt.span = span
+	node := new(If_Expr)
+	node.condition = cond
+	node.then_branch = make([dynamic]Stmt)
+	append(&node.then_branch, break_stmt)
+	node.else_branch = make([dynamic]Stmt)
+	node.span = span
+	return mk_expr_stmt(node, span)
+}
+
+// пока <cond> цикл <body> конец
+mk_while :: proc(cond: Expr, body: [dynamic]Stmt, span: Span) -> Stmt {
+	node := new(While_Expr)
+	node.condition = cond
+	node.body = body
+	node.span = span
+	return mk_expr_stmt(node, span)
 }
 
 // --- УТИЛИТЫ ---

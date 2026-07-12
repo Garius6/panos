@@ -827,6 +827,14 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 			), true
 		}
 		return make_ok_result(vm, Value(num)), true
+
+	case "строки::из_числа":
+		expect_arg_count(name, len(args), 1)
+		num, ok_num := args[0].(f64)
+		if !ok_num {
+			fmt.panicf("Runtime Error: строки.из_числа() ожидает число")
+		}
+		return Value(gc_new_string(vm, fmt.tprintf("%v", num))), true
 	}
 
 	fmt.panicf(

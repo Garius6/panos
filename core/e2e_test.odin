@@ -902,6 +902,20 @@ test_nested_module_import :: proc(t: ^testing.T) {
 	)
 }
 
+// Чистая логика std/сеть/http.ps (разбор URL) без реального сокета —
+// сеть на CI/в тестовом окружении может быть недоступна или дать таймаут,
+// а разобрать_адрес не требует соединения вообще (только строки.срез/
+// строки.в_число). Реальный HTTP GET/POST проверен вручную (см.
+// TASKS.md §Стадия 15) — Python HTTP-сервер на loopback.
+@(test)
+test_http_url_parsing :: proc(t: ^testing.T) {
+	result, ok := run_module_file("http_url_fixture_main.ps")
+	testing.expectf(t, ok, "http url parsing: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(true), "http url parsing: ожидалось true, получено %v", result)
+}
+
 @(test)
 test_adt_cross_module_qualified_use :: proc(t: ^testing.T) {
 	result, ok := run_module_file("adt_fixture_main.ps")

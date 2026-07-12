@@ -79,6 +79,8 @@ builtin_export_type :: proc(full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_NUM, TY_STRING)
 	case "сеть::подключиться":
 		return builtin_function_type_2(TY_STRING, TY_NUM, new_result_type(TY_CONNECTION, TY_ERROR))
+	case "сеть::кодировать_url":
+		return builtin_function_type_1(TY_STRING, TY_STRING)
 	}
 	return nil
 }
@@ -188,6 +190,12 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"подключиться",
 			builtin_export_type("сеть::подключиться"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"кодировать_url",
+			builtin_export_type("сеть::кодировать_url"),
 		)
 	}
 

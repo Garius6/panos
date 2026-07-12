@@ -523,6 +523,25 @@ invoke_collection_method :: proc(
 			if idx == -1 do return Value(false), true
 			map_remove_at(m, idx)
 			return Value(true), true
+		case "записи":
+			// Массив((Ключ, Значение)) — единственный способ пройтись по
+			// произвольному Соответствию без for-in. `m` (receiver) уже
+			// снят с vm.stack к этому моменту (см. Invoke_Collection) —
+			// протектим явно, иначе аллокация ниже может собрать его как
+			// мусор посреди чтения m.entries.
+			expect_arg_count(method_name, len(args), 0)
+			gc_protect(vm, Value(m))
+			arr := gc_new(vm, Array_Value)
+			gc_protect(vm, Value(arr))
+			for entry in m.entries {
+				pair := gc_new(vm, Aggregate_Value)
+				resize(&pair.elements, 2)
+				pair.elements[0] = entry.key
+				pair.elements[1] = entry.value
+				append(&arr.elements, Value(pair))
+			}
+			gc_unprotect(vm, 2)
+			return Value(arr), true
 		}
 	}
 
@@ -783,6 +802,32 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		context.allocator = runtime.heap_allocator()
 		bufio.reader_init(&conn.reader, tcp_to_stream(&conn.socket))
 		return make_ok_result(vm, Value(conn)), true
+
+	case "сеть::кодировать_url":
+		// percent-encoding по байтам, не рунам — RFC 3986 unreserved
+		// (A-Z a-z 0-9 - _ . ~) как есть, всё остальное как %XX (в т.ч.
+		// каждый байт многобайтовой UTF-8 руны отдельно). Нет способа
+		// сделать это в самом Panos — нет доступа к байтам строки.
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		builder: strings.Builder
+		strings.builder_init(&builder, context.temp_allocator)
+		for b in transmute([]byte)text {
+			is_unreserved :=
+				(b >= 'A' && b <= 'Z') ||
+				(b >= 'a' && b <= 'z') ||
+				(b >= '0' && b <= '9') ||
+				b == '-' ||
+				b == '_' ||
+				b == '.' ||
+				b == '~'
+			if is_unreserved {
+				strings.write_byte(&builder, b)
+			} else {
+				fmt.sbprintf(&builder, "%%%02X", b)
+			}
+		}
+		return Value(gc_new_string(vm, strings.to_string(builder))), true
 
 	case "строки::срез":
 		expect_arg_count(name, len(args), 3)

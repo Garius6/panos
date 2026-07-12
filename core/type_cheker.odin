@@ -2344,6 +2344,16 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				check_expr(ctx, e.args[0], obj_type.key_type)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return TY_BOOL
+			case "записи":
+				// В языке нет for-in — единственный способ обойти
+				// произвольное Соответствие: получить Массив((Ключ,
+				// Значение)) и пройтись по нему индексом через `пока`.
+				if len(e.args) != 0 do return report(ctx, e.span, "Type Error: соответствие.записи() не принимает аргументы")
+				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
+				entry_fields := make([dynamic]^Type)
+				append(&entry_fields, obj_type.key_type)
+				append(&entry_fields, obj_type.value_type)
+				return new_array_type(new_tuple_type(entry_fields))
 			case:
 				return report(
 					ctx,

@@ -136,8 +136,50 @@ value_equals :: proc(a: Value, b: Value, visited: ^map[[2]rawptr]bool = nil) -> 
 		if vb, ok := b.(^Variant_Value); ok {
 			if va.tag_index != vb.tag_index do return false
 			if len(va.fields) != len(vb.fields) do return false
+			pair := [2]rawptr{va, vb}
+			if v[pair] do return true
+			v[pair] = true
 			for i in 0 ..< len(va.fields) {
-				if !value_equals(va.fields[i], vb.fields[i]) do return false
+				if !value_equals(va.fields[i], vb.fields[i], v) do return false
+			}
+			return true
+		}
+	case ^Aggregate_Value:
+		if vb, ok := b.(^Aggregate_Value); ok {
+			if len(va.elements) != len(vb.elements) do return false
+			pair := [2]rawptr{va, vb}
+			if v[pair] do return true
+			v[pair] = true
+			for i in 0 ..< len(va.elements) {
+				if !value_equals(va.elements[i], vb.elements[i], v) do return false
+			}
+			return true
+		}
+	case ^Array_Value:
+		if vb, ok := b.(^Array_Value); ok {
+			if len(va.elements) != len(vb.elements) do return false
+			pair := [2]rawptr{va, vb}
+			if v[pair] do return true
+			v[pair] = true
+			for i in 0 ..< len(va.elements) {
+				if !value_equals(va.elements[i], vb.elements[i], v) do return false
+			}
+			return true
+		}
+	case ^Map_Value:
+		if vb, ok := b.(^Map_Value); ok {
+			if len(va.entries) != len(vb.entries) do return false
+			pair := [2]rawptr{va, vb}
+			if v[pair] do return true
+			v[pair] = true
+			// map_find_index сам использует value_equals для ключей — ключи
+			// ограничены Number/Bool/String (is_valid_map_key_type,
+			// type_cheker.odin), цикл через ключ невозможен, visited не
+			// нужен для этого вложенного вызова.
+			for entry in va.entries {
+				idx := map_find_index(vb, entry.key)
+				if idx == -1 do return false
+				if !value_equals(entry.value, vb.entries[idx].value, v) do return false
 			}
 			return true
 		}

@@ -1,11 +1,7 @@
 package core
 
-import "base:runtime"
 import "core:bufio"
 import "core:fmt"
-import "core:io"
-import "core:net"
-import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:unicode"
@@ -34,18 +30,8 @@ VM :: struct {
 	stdin_reader_ready: bool,
 }
 
-// Ленивая инициализация общего reader'а над os.stdin. Аллокатор буфера
-// закреплён на runtime.heap_allocator(), а не на context.allocator в точке
-// вызова (тот же урок, что и с GC-хипом в gc.odin/interner.odin) — VM живёт
-// весь процесс, буфер не должен зависеть от арены вызывающего кода.
-get_stdin_reader :: proc(vm: ^VM) -> ^bufio.Reader {
-	if !vm.stdin_reader_ready {
-		context.allocator = runtime.heap_allocator()
-		bufio.reader_init(&vm.stdin_reader, os.to_stream(os.stdin))
-		vm.stdin_reader_ready = true
-	}
-	return &vm.stdin_reader
-}
+// get_stdin_reader — в vm_io_native.odin/vm_io_wasm.odin (#+build split,
+// см. заметку у File_Value в compiler.odin) — трогает os.stdin.
 
 new_vm :: proc(
 	compiled_functions: map[string]^Compiled_Function,
@@ -121,7 +107,24 @@ variant_field :: proc(v: Value, i: int) -> (Value, bool) {
 	return Value{}, false
 }
 
-value_equals :: proc(a: Value, b: Value) -> bool {
+// visited — cycle-safe (тот же приём, что unify_types в type_cheker.odin:
+// пара указателей once-visited считается равной без рекурсии дальше) —
+// panos поддерживает мутацию полей (Set_Property), значит self-
+// ссылающийся runtime-граф (a.следующий = a) физически возможен, наивная
+// рекурсия зациклилась бы. Раньше здесь не было case для ^Aggregate_Value/
+// ^Array_Value/^Map_Value вовсе — падало в `return false` БЕЗУСЛОВНО, а
+// тайпчекер тем временем разрешает `==`/`<>` для любых unifiable типов
+// (structural check в unify_types) — `стр1 == стр2` для двух одинаковых
+// по полям структур молча всегда была `ложь` (сравнение по ссылке, а не
+// по значению), без единой диагностики.
+value_equals :: proc(a: Value, b: Value, visited: ^map[[2]rawptr]bool = nil) -> bool {
+	v := visited
+	local_v: map[[2]rawptr]bool
+	if v == nil {
+		local_v = make(map[[2]rawptr]bool, context.temp_allocator)
+		v = &local_v
+	}
+
 	#partial switch va in a {
 	case f64:
 		if vb, ok := b.(f64); ok do return va == vb
@@ -241,10 +244,6 @@ read_line_from_reader :: proc(vm: ^VM, r: ^bufio.Reader) -> Value {
 	return make_ok_result(vm, Value(gc_new_string(vm, trimmed)))
 }
 
-read_stdin_line :: proc(vm: ^VM) -> Value {
-	return read_line_from_reader(vm, get_stdin_reader(vm))
-}
-
 // Вычитывает reader до EOF в temp-буфер (не трогает уже прочитанное — если
 // перед .прочитать() были вызовы .прочитать_строку(), получаем ОСТАТОК
 // файла, а не его начало заново, ровно как ожидалось бы от одного и того
@@ -260,73 +259,9 @@ read_all_from_reader :: proc(r: ^bufio.Reader) -> string {
 	return string(data[:])
 }
 
-// Куда читать для конкретного File_Value: у обычного файла — его
-// собственный buffer, у Файл-обёртки над стдин — единый vm.stdin_reader
-// (см. комментарий у поля stdin_reader в VM).
-file_reader :: proc(vm: ^VM, file: ^File_Value) -> ^bufio.Reader {
-	if file.is_stdin do return get_stdin_reader(vm)
-	return &file.reader
-}
-
-// Единая точка закрытия File_Value — вызывается и явным .закрыть() из Panos-
-// кода, и GC-финализатором в pool_release (см. gc.odin), когда хендл стал
-// недостижим, но не был закрыт явно. is_open — гейт идемпотентности: оба
-// пути могут сойтись на одном объекте (сначала явный close, потом sweep),
-// второй вызов обязан быть no-op.
-close_file_value :: proc(file: ^File_Value) {
-	if !file.is_open do return
-	if !file.is_stdin {
-		if file.handle != nil do os.close(file.handle)
-		bufio.reader_destroy(&file.reader)
-	}
-	file.handle = nil
-	file.is_open = false
-}
-
-// io.Stream поверх net.recv_tcp — только .Read, чего достаточно для
-// bufio.Reader (io.read зовёт ровно этот mode, см. core:io/io.odin). Даёт
-// Socket_Value переиспользовать read_line_from_reader/read_all_from_reader
-// один в один с File_Value, без отдельного пути чтения для сокетов.
-tcp_recv_stream_proc :: proc(
-	stream_data: rawptr,
-	mode: io.Stream_Mode,
-	p: []byte,
-	offset: i64,
-	whence: io.Seek_From,
-) -> (
-	n: i64,
-	err: io.Error,
-) {
-	#partial switch mode {
-	case .Read:
-		socket := (^net.TCP_Socket)(stream_data)
-		read_n, recv_err := net.recv_tcp(socket^, p)
-		if recv_err != nil {
-			return i64(read_n), .Unknown
-		}
-		if read_n == 0 {
-			// recv_tcp: 0 байт + nil-ошибка == соединение закрыто с той
-			// стороны — это EOF, а не "нечего было прочитать в этот
-			// момент" (в отличие от неблокирующих сокетов, наши блокируют).
-			return 0, .EOF
-		}
-		return i64(read_n), nil
-	}
-	return 0, .Empty
-}
-
-tcp_to_stream :: proc(socket: ^net.TCP_Socket) -> io.Stream {
-	return io.Stream{procedure = tcp_recv_stream_proc, data = socket}
-}
-
-// Симметрично close_file_value — единая точка закрытия для явного
-// .закрыть() и GC-финализатора (см. gc.odin::pool_release).
-close_socket_value :: proc(sock: ^Socket_Value) {
-	if !sock.is_open do return
-	bufio.reader_destroy(&sock.reader)
-	net.close(sock.socket)
-	sock.is_open = false
-}
+// read_stdin_line/file_reader/close_file_value/tcp_to_stream/
+// close_socket_value — в vm_io_native.odin/vm_io_wasm.odin (#+build
+// split), трогают os.stdin/os.close/net.*.
 
 string_length :: proc(text: string) -> int {
 	count := 0
@@ -554,70 +489,11 @@ invoke_collection_method :: proc(
 		}
 	}
 
-	if file, ok_file := receiver.(^File_Value); ok_file {
-		switch method_name {
-		case "прочитать":
-			expect_arg_count(method_name, len(args), 0)
-			if !file.is_open {
-				return make_error_result(vm, make_error_value(vm, "фс", "файл уже закрыт")), true
-			}
-			content := read_all_from_reader(file_reader(vm, file))
-			return make_ok_result(vm, Value(gc_new_string(vm, content))), true
-		case "прочитать_строку":
-			expect_arg_count(method_name, len(args), 0)
-			if !file.is_open {
-				return make_error_result(vm, make_error_value(vm, "фс", "файл уже закрыт")), true
-			}
-			return read_line_from_reader(vm, file_reader(vm, file)), true
-		case "записать":
-			expect_arg_count(method_name, len(args), 1)
-			text := expect_string_arg(method_name, args[0])
-			if !file.is_open || file.is_stdin {
-				return make_error_result(vm, make_error_value(vm, "фс", "файл не открыт для записи")), true
-			}
-			n, err := os.write(file.handle, transmute([]byte)text)
-			if err != nil {
-				return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true
-			}
-			return make_ok_result(vm, Value(f64(n))), true
-		case "закрыть":
-			expect_arg_count(method_name, len(args), 0)
-			close_file_value(file)
-			return Value(f64(0)), false
-		}
-	}
-
-	if sock, ok_sock := receiver.(^Socket_Value); ok_sock {
-		switch method_name {
-		case "получить":
-			expect_arg_count(method_name, len(args), 0)
-			if !sock.is_open {
-				return make_error_result(vm, make_error_value(vm, "сеть", "соединение уже закрыто")), true
-			}
-			content := read_all_from_reader(&sock.reader)
-			return make_ok_result(vm, Value(gc_new_string(vm, content))), true
-		case "получить_строку":
-			expect_arg_count(method_name, len(args), 0)
-			if !sock.is_open {
-				return make_error_result(vm, make_error_value(vm, "сеть", "соединение уже закрыто")), true
-			}
-			return read_line_from_reader(vm, &sock.reader), true
-		case "отправить":
-			expect_arg_count(method_name, len(args), 1)
-			text := expect_string_arg(method_name, args[0])
-			if !sock.is_open {
-				return make_error_result(vm, make_error_value(vm, "сеть", "соединение уже закрыто")), true
-			}
-			n, err := net.send_tcp(sock.socket, transmute([]byte)text)
-			if err != nil {
-				return make_error_result(vm, make_error_value(vm, "сеть", fmt.tprintf("%v", err))), true
-			}
-			return make_ok_result(vm, Value(f64(n))), true
-		case "закрыть":
-			expect_arg_count(method_name, len(args), 0)
-			close_socket_value(sock)
-			return Value(f64(0)), false
-		}
+	// File_Value/Socket_Value методы (.прочитать/.записать/.закрыть и
+	// сетевые аналоги) — в vm_io_native.odin/vm_io_wasm.odin (#+build
+	// split, трогают os.write/net.send_tcp).
+	if result, ok, handled := invoke_io_method(vm, receiver, method_name, args); handled {
+		return result, ok
 	}
 
 	fmt.panicf(
@@ -627,6 +503,14 @@ invoke_collection_method :: proc(
 }
 
 call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
+	// фс::*/ос::окружение*/ввод_вывод::прочитать_строку/поток/сеть::подключиться
+	// — в vm_io_native.odin/vm_io_wasm.odin (#+build split, трогают
+	// os.exists/os.open/os.lookup_env/net.dial_tcp...). Остальные builtin'ы
+	// (в т.ч. ос::аргументы, ввод_вывод::печать/строка, сеть::кодировать_url
+	// — уже os/net-агностичны) остаются в общем switch ниже без изменений.
+	if result, ok, handled := call_builtin_io(vm, name, args); handled {
+		return result, ok
+	}
 	switch name {
 	case "Ошибка":
 		expect_arg_count(name, len(args), 2)
@@ -688,46 +572,6 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		message := expect_string_arg(name, args[0])
 		fmt.panicf("Runtime Panic: %s", message)
 
-	case "фс::есть":
-		expect_arg_count(name, len(args), 1)
-		path := expect_string_arg(name, args[0])
-		return Value(os.exists(path)), true
-
-	case "фс::прочитать":
-		expect_arg_count(name, len(args), 1)
-		path := expect_string_arg(name, args[0])
-		data, err := os.read_entire_file(path, context.allocator)
-		if err != nil {
-			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true
-		}
-		return make_ok_result(vm, Value(gc_new_string(vm, string(data)))), true
-
-	case "фс::записать":
-		expect_arg_count(name, len(args), 2)
-		path := expect_string_arg(name, args[0])
-		content := expect_string_arg(name, args[1])
-		err := os.write_entire_file(path, content)
-		if err != nil {
-			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true
-		}
-		return make_ok_result(vm, Value(f64(len(content)))), true
-
-	case "фс::открыть":
-		expect_arg_count(name, len(args), 1)
-		path := expect_string_arg(name, args[0])
-		handle, err := os.open(path, {.Read, .Write, .Create}, os.Permissions_Default_File)
-		if err != nil {
-			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true
-		}
-		file := gc_new(vm, File_Value)
-		file.handle = handle
-		file.is_open = true
-		file.is_stdin = false
-		context.allocator = runtime.heap_allocator()
-		file.path = strings.clone(path)
-		bufio.reader_init(&file.reader, os.to_stream(handle))
-		return make_ok_result(vm, Value(file)), true
-
 	case "ос::аргументы":
 		expect_arg_count(name, len(args), 0)
 		arr := gc_new(vm, Array_Value)
@@ -738,36 +582,6 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		}
 		gc_unprotect(vm, 1)
 		return Value(arr), true
-
-	case "ос::окружение":
-		expect_arg_count(name, len(args), 1)
-		key := expect_string_arg(name, args[0])
-		value, found := os.lookup_env(key, context.allocator)
-		opt := gc_new(vm, Option_Value)
-		gc_protect(vm, Value(opt))
-		opt.has_value = found
-		if found {
-			opt.value = Value(gc_new_string(vm, value))
-		} else {
-			opt.value = Value(gc_new_string(vm, ""))
-		}
-		gc_unprotect(vm, 1)
-		return Value(opt), true
-
-	case "ос::установить_окружение":
-		expect_arg_count(name, len(args), 2)
-		key := expect_string_arg(name, args[0])
-		value := expect_string_arg(name, args[1])
-		err := os.set_env(key, value)
-		if err != nil {
-			return make_error_result(vm, make_error_value(vm, "ос", fmt.tprintf("%v", err))), true
-		}
-		return make_ok_result(vm, Value(f64(0))), true
-
-	case "ос::удалить_окружение":
-		expect_arg_count(name, len(args), 1)
-		key := expect_string_arg(name, args[0])
-		return Value(os.unset_env(key)), true
 
 	case "ввод_вывод::печать":
 		expect_arg_count(name, len(args), 1)
@@ -780,37 +594,6 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		text := expect_string_arg(name, args[0])
 		fmt.println(text)
 		return Value(f64(0)), false
-
-	case "ввод_вывод::прочитать_строку":
-		expect_arg_count(name, len(args), 0)
-		return read_stdin_line(vm), true
-
-	case "ввод_вывод::поток":
-		expect_arg_count(name, len(args), 0)
-		file := gc_new(vm, File_Value)
-		file.handle = nil
-		file.path = ""
-		file.is_open = true
-		file.is_stdin = true
-		return Value(file), true
-
-	case "сеть::подключиться":
-		expect_arg_count(name, len(args), 2)
-		host := expect_string_arg(name, args[0])
-		port_num, ok_port := args[1].(f64)
-		if !ok_port {
-			fmt.panicf("Runtime Error: сеть.подключиться() ожидает номер порта числом")
-		}
-		socket, dial_err := net.dial_tcp_from_hostname_with_port_override(host, int(port_num))
-		if dial_err != nil {
-			return make_error_result(vm, make_error_value(vm, "сеть", fmt.tprintf("%v", dial_err))), true
-		}
-		conn := gc_new(vm, Socket_Value)
-		conn.socket = socket
-		conn.is_open = true
-		context.allocator = runtime.heap_allocator()
-		bufio.reader_init(&conn.reader, tcp_to_stream(&conn.socket))
-		return make_ok_result(vm, Value(conn)), true
 
 	case "сеть::кодировать_url":
 		// percent-encoding по байтам, не рунам — RFC 3986 unreserved

@@ -1,9 +1,6 @@
 package core
 
-import "core:bufio"
 import "core:fmt"
-import "core:net"
-import "core:os"
 import "core:strings"
 
 // Все heap-managed варианты Value (кроме f64/bool/^Compiled_Function —
@@ -68,27 +65,12 @@ Variant_Value :: struct {
 	fields:    [dynamic]Value,
 }
 
-// Дескриптор открытого файла или потока ввода (стдин). is_stdin файлы не
-// владеют ОС-хендлом (нельзя закрыть стдин) — закрытие для них no-op.
-File_Value :: struct {
-	header:   GC_Header,
-	handle:   ^os.File,
-	reader:   bufio.Reader,
-	path:     string,
-	is_open:  bool,
-	is_stdin: bool,
-}
-
-// TCP-соединение (сеть.подключиться). reader читает через свой io.Stream
-// поверх net.recv_tcp (см. tcp_to_stream в vm.odin) — тот же
-// read_line_from_reader/read_all_from_reader, что и у File_Value, без
-// дублирования логики чтения.
-Socket_Value :: struct {
-	header:  GC_Header,
-	socket:  net.TCP_Socket,
-	reader:  bufio.Reader,
-	is_open: bool,
-}
+// File_Value/Socket_Value (фс/сеть builtin'ы) — определены в
+// file_value_native.odin/file_value_wasm.odin (#+build split), не здесь.
+// Причина: поля handle/socket типизированы ^os.File/net.TCP_Socket, а
+// сам ИМПОРТ core:os падает compile-time panic'ом под js_wasm32 (браузер
+// не может делать реальный ФС/сокеты) — см. заметку в ROADMAP про WASM-
+// спайк.
 
 Value :: union {
 	f64,

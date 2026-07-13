@@ -41,7 +41,7 @@ INTERNER_MUTEX: sync.Mutex
 intern :: proc(s: string) -> Interned {
 	sync.mutex_lock(&INTERNER_MUTEX)
 	defer sync.mutex_unlock(&INTERNER_MUTEX)
-	context.allocator = runtime.heap_allocator()
+	context.allocator = vm_heap_allocator()
 	if INTERNER.table == nil {
 		INTERNER.table = make(map[string]Interned)
 		INTERNER.names = make([dynamic]string)

@@ -1,3 +1,4 @@
+#+build !js
 package core
 
 import "core:testing"
@@ -19,41 +20,15 @@ panic_on_diagnostics :: proc(diags: [dynamic]Diagnostic) {
 	}
 }
 
-// Вспомогательная функция, которая прогоняет весь пайплайн и возвращает результат
+// Тонкая panic-обёртка поверх run_source_with_args (core/pipeline.odin) —
+// сам пайплайн переехал туда, т.к. нужен и WASM-входу, которому этот файл
+// (тянет core:testing, не собирается под js_wasm32) недоступен. Панику на
+// первом diagnostic'е сохраняем ради ~200 существующих `run_code(...)` по
+// тестам этого файла — не переписываем их все на explicit-diagnostics API.
 run_code_with_args :: proc(source: string, program_args: []string = nil) -> (Value, bool) {
-	// 1. Лексика и Парсинг
-	tokens, lex_diags := tokenize(source) // Ваша функция лексера
-	panic_on_diagnostics(lex_diags)
-	stream := make_stream(tokens)
-	parser := Parser {
-		stream = &stream,
-	}
-	prog := parse_program(&parser)
-	panic_on_diagnostics(parser.diagnostics)
-
-	// 2. Резолв и Типизация
-	res_ctx := new_resolver_ctx()
-	resolve_program(&res_ctx, prog)
-	panic_on_diagnostics(res_ctx.diagnostics)
-
-	type_ctx := new_type_ctx(&res_ctx)
-	typecheck_program(&type_ctx, prog)
-	panic_on_diagnostics(type_ctx.diagnostics)
-
-	// 3. Компиляция
-	registry := make(map[string]^Compiled_Function)
-	ensure_prelude_compiled(&res_ctx, &registry)
-	compile_program(&res_ctx, &type_ctx, &prog, &registry)
-
-	// 4. Выполнение (VM)
-	vm := new_vm(registry, program_args)
-	execute(vm)
-
-	// Возвращаем результат (то, что осталось на вершине стека)
-	if len(vm.stack) > 0 {
-		return vm.stack[len(vm.stack) - 1], true
-	}
-	return 0.0, false
+	result, has_result, diags := run_source_with_args(source, program_args)
+	panic_on_diagnostics(diags)
+	return result, has_result
 }
 
 run_code :: proc(source: string) -> (Value, bool) {

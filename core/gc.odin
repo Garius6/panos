@@ -3,6 +3,22 @@ package core
 import "base:runtime"
 import "core:strings"
 
+// runtime.heap_allocator() — прямая обёртка над malloc/free ОС — не
+// реализован на js/wasm/freestanding (unimplemented() panic при первом
+// же вызове, см. base:runtime/heap_allocator_other.odin в тулчейне Odin;
+// компилируется, но падает в рантайме — выяснено живым тестом WASM-
+// спайка). runtime.default_wasm_allocator() — wasm-native аллокатор
+// (порт emmalloc, растит через wasm memory.grow), корректная замена
+// ИМЕННО для js/wasm target'ов; на остальных платформах поведение не
+// меняется — тот же heap_allocator(), что и раньше.
+vm_heap_allocator :: proc() -> runtime.Allocator {
+	when ODIN_OS == .JS {
+		return runtime.default_wasm_allocator()
+	} else {
+		return runtime.heap_allocator()
+	}
+}
+
 // Простой non-moving mark-and-sweep — сырых указателей на Value-объекты
 // разбросано по всему vm.odin/compiler.odin, moving/copying-коллектор
 // потребовал бы fixup всех этих мест при каждом перемещении. Не инкрементальный
@@ -64,7 +80,7 @@ GC_State :: struct {
 GC_MIN_THRESHOLD :: 1024 * 1024
 
 new_gc_state :: proc() -> GC_State {
-	context.allocator = runtime.heap_allocator()
+	context.allocator = vm_heap_allocator()
 	return GC_State {
 		all_objects = make([dynamic]Value),
 		protect_stack = make([dynamic]Value),
@@ -144,7 +160,7 @@ gc_new :: proc(vm: ^VM, $T: typeid) -> ^T {
 	}
 
 	if obj == nil {
-		context.allocator = runtime.heap_allocator()
+		context.allocator = vm_heap_allocator()
 		obj = new(T)
 	} else {
 		obj.header.marked = false
@@ -158,7 +174,7 @@ gc_new :: proc(vm: ^VM, $T: typeid) -> ^T {
 // столько же, сколько сама функция (весь процесс). Не регистрируется в
 // GC — sweep её не видит.
 perm_string :: proc(s: string) -> ^Panos_String {
-	context.allocator = runtime.heap_allocator()
+	context.allocator = vm_heap_allocator()
 	ps := new(Panos_String)
 	ps.data = strings.clone(s)
 	return ps
@@ -167,7 +183,7 @@ perm_string :: proc(s: string) -> ^Panos_String {
 // runtime-строка — полноценно GC-managed.
 gc_new_string :: proc(vm: ^VM, s: string) -> ^Panos_String {
 	ps := gc_new(vm, Panos_String)
-	context.allocator = runtime.heap_allocator()
+	context.allocator = vm_heap_allocator()
 	delete(ps.data) // на случай переиспользования из free_strings — старые байты чужие
 	ps.data = strings.clone(s)
 	vm.gc.bytes_allocated += len(ps.data)
@@ -301,7 +317,7 @@ value_size :: proc(v: Value) -> int {
 // нового malloc. methods (map) у Interface_Value — редкий, некрупный
 // случай, здесь просто delete()'им (не настолько горячий путь).
 pool_release :: proc(vm: ^VM, v: Value) {
-	context.allocator = runtime.heap_allocator()
+	context.allocator = vm_heap_allocator()
 	switch val in v {
 	case f64, bool, ^Compiled_Function:
 	// не GC-managed

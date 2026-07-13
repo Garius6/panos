@@ -2,7 +2,6 @@
 package core
 
 import "core:fmt"
-import "core:os"
 
 Symbol_Kind :: enum {
 	Variable,
@@ -250,33 +249,11 @@ is_bare_import_spec :: proc(import_spec: string) -> bool {
 	return true
 }
 
-resolve_existing_import_path :: proc(import_spec: string, importer_dir: string) -> (string, bool) {
-	local_path := resolve_import_path(import_spec, importer_dir)
-	if os.exists(local_path) {
-		return local_path, true
-	}
-
-	// if is_bare_import_spec(import_spec) {
-	modules_path := resolve_import_path(import_spec, "модули")
-	if os.exists(modules_path) {
-		return modules_path, true
-	}
-
-	if env_dir, found := os.lookup_env("PANOS_STDLIB", context.allocator); found {
-		stdlib_path := resolve_import_path(import_spec, env_dir)
-		if os.exists(stdlib_path) {
-			return stdlib_path, true
-		}
-	}
-
-	stdlib_path := resolve_import_path(import_spec, "std")
-	if os.exists(stdlib_path) {
-		return stdlib_path, true
-	}
-	// }
-
-	return local_path, false
-}
+// resolve_existing_import_path — в resolver_import_native.odin/
+// resolver_import_wasm.odin (#+build split, трогает os.exists/
+// os.lookup_env — сам импорт core:os падает под js_wasm32). WASM-спайк v1
+// не поддерживает файловый `импорт` — см. read_file_text в
+// module_loader_wasm.odin.
 
 new_symbol :: proc(
 	store: ^Symbol_Store,

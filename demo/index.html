@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>panos — демо в браузере</title>
+<style>
+	body { font-family: monospace; margin: 2em; max-width: 900px; }
+	.cm-editor { border: 1px solid #444; font-size: 14px; }
+	.cm-editor.cm-focused { outline: none; border-color: #888; }
+	#console {
+		background: #111;
+		color: #eee;
+		padding: 1em;
+		min-height: 100px;
+		white-space: pre-wrap;
+		font-size: 14px;
+		border-radius: 4px;
+	}
+	.toolbar { margin: 1em 0; display: flex; align-items: center; gap: 1em; }
+	button { font-size: 16px; padding: 0.5em 1.5em; }
+	.hint { color: #666; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>panos — демо в браузере</h1>
+<p>Без <code>импорт</code> — только чистая логика в одном файле (стандартная библиотека
+в браузере пока не поддержана, см. ROADMAP.md).</p>
+
+<div id="editor"></div>
+<div class="toolbar">
+	<button id="run">Запустить</button>
+	<span class="hint">или Cmd/Ctrl+Enter</span>
+</div>
+<div id="console">— результат появится здесь —</div>
+
+<script src="odin.js"></script>
+<script type="module">
+import {EditorView, basicSetup} from "https://esm.sh/codemirror@6.0.1";
+import {keymap} from "https://esm.sh/@codemirror/view@6";
+import {indentWithTab} from "https://esm.sh/@codemirror/commands@6";
+
+const DEFAULT_SOURCE = `функ старт() -> Число
+	10 + 20
+конец`;
+
+const consoleEl = document.getElementById("console");
+const memInterface = new odin.WasmMemoryInterface();
+
+function runSource(source) {
+	// #console — постоянно растущий лог (odin.js рендерит его из
+	// внутреннего, недоступного снаружи буфера — очистить между запусками
+	// нельзя, см. комментарий у panos_run в wasm/main.odin, который сам
+	// печатает разделитель "── запуск ──" перед каждым прогоном).
+	const cap = memInterface.exports.panos_source_capacity();
+	// Байтовая (не символьная) длина — исходник в UTF-8 внутри WASM-памяти,
+	// кириллица занимает 2 байта на символ. Проверяем ДО storeString —
+	// сама storeString пишет без bounds-check, запись сверх буфера
+	// затёрла бы соседнюю память ДО того, как мы вообще узнали бы о
+	// переполнении.
+	const byteLen = new TextEncoder().encode(source).length;
+	if (byteLen > cap) {
+		consoleEl.style.color = "#f66";
+		consoleEl.textContent = `Ошибка: исходник длиннее буфера демо (${byteLen} > ${cap} байт)`;
+		return;
+	}
+	const ptr = memInterface.exports.panos_source_ptr();
+	const written = memInterface.storeString(ptr, source);
+	memInterface.exports.panos_run(written);
+}
+
+const runCommand = () => {
+	runSource(editor.state.doc.toString());
+	return true;
+};
+
+// "Mod-Enter" одним биндингом ненадёжен — CodeMirror резолвит "Mod" через
+// navigator.platform/userAgentData, а headless Chromium (в т.ч. под
+// Playwright) не всегда репортит платформу так, как ожидает браузер
+// пользователя (живой тест: "Mod-Enter" молча не срабатывал в headless-
+// прогоне на macOS-хосте). Оба варианта явно, вместо одного "Mod-".
+const runKeymap = keymap.of([
+	indentWithTab,
+	{ key: "Mod-Enter", run: runCommand },
+	{ key: "Ctrl-Enter", run: runCommand },
+]);
+
+const editor = new EditorView({
+	doc: DEFAULT_SOURCE,
+	extensions: [basicSetup, runKeymap],
+	parent: document.getElementById("editor"),
+});
+
+odin.runWasm("panos.wasm", consoleEl, {}, memInterface).then(() => {
+	document.getElementById("run").addEventListener("click", () => {
+		runSource(editor.state.doc.toString());
+	});
+});
+</script>
+</body>
+</html>

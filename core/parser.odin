@@ -1893,7 +1893,7 @@ infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 		return 60, 61, true
 	case .Plus, .Minus:
 		return 50, 51, true
-	case .Less, .Greater:
+	case .Less, .Greater, .LessEqual, .GreaterEqual:
 		return 40, 41, true
 	case .Equal, .NotEqual:
 		return 30, 31, true

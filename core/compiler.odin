@@ -559,6 +559,15 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_opcode(ctx, .Less)
 			case .Greater:
 				emit_opcode(ctx, .Greater)
+			case .LessEqual:
+				// a <= b == не (a > b) — тот же приём, что NotEqual ниже
+				// (Equal+Negate): не заводим отдельный VM-опкод под ещё
+				// одно сравнение, компонуем из уже существующих.
+				emit_opcode(ctx, .Greater)
+				emit_opcode(ctx, .Negate)
+			case .GreaterEqual:
+				emit_opcode(ctx, .Less)
+				emit_opcode(ctx, .Negate)
 			case .Equal:
 				emit_opcode(ctx, .Equal)
 			case .NotEqual:

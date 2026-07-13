@@ -17,6 +17,8 @@ TokenKind :: enum {
 	RBracket,
 	Less,
 	Greater,
+	LessEqual,
+	GreaterEqual,
 	Equal,
 	Negate,
 	NotEqual,

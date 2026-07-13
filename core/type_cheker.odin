@@ -2517,7 +2517,7 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 		check_expr(ctx, e.right, TY_NUM)
 		t = TY_NUM
 
-	case .Less, .Greater:
+	case .Less, .Greater, .LessEqual, .GreaterEqual:
 		check_expr(ctx, e.left, TY_NUM)
 		check_expr(ctx, e.right, TY_NUM)
 		t = TY_BOOL

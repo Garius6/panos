@@ -235,6 +235,13 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 					kind = .NotEqual,
 					data = "<>",
 				}
+			} else if peek_char(l) == '=' {
+				advance(l)
+				advance(l)
+				tok = Token {
+					kind = .LessEqual,
+					data = "<=",
+				}
 			} else {
 				tok = Token {
 					kind = .Less,
@@ -243,10 +250,20 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 				advance(l)
 			}
 		case '>':
-			tok = Token {
-				kind = .Greater,
-				data = ">",
-			}; advance(l)
+			if peek_char(l) == '=' {
+				advance(l)
+				advance(l)
+				tok = Token {
+					kind = .GreaterEqual,
+					data = ">=",
+				}
+			} else {
+				tok = Token {
+					kind = .Greater,
+					data = ">",
+				}
+				advance(l)
+			}
 		case '=':
 			if peek_char(l) == '=' {
 				advance(l)

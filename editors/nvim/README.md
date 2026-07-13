@@ -78,5 +78,10 @@ vim.keymap.set("n", "gd", vim.lsp.buf.definition)
 - **`.ps` конфликтует с PostScript.** `ftdetect/panos.lua` переопределяет
   расширение глобально. Если вы реально работаете с `.ps`-PostScript —
   сузьте паттерн под свой проект вместо `extension = { ps = "panos" }`.
-- Нет syntax highlighting (`.ps` файлы подсвечиваются как plain text,
-  если у вас нет отдельного tree-sitter/syntax файла для panos).
+- **Нет tree-sitter грамматики** — `syntax/panos.vim` даёт классическую
+  regex-based подсветку (ключевые слова, типы/конструкторы по заглавной
+  букве, строки с escape-последовательностями, числа, операторы), но не
+  умеет то, что даёт tree-sitter (структурная навигация, инкрементальные
+  правки, textobjects). Список ключевых слов в `syntax/panos.vim`
+  синхронизирован вручную с `core/lexer.odin::lookup_ident` — держать в
+  курсе при добавлении новых слов в язык.

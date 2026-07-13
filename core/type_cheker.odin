@@ -1510,9 +1510,24 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				// (ПРОХОД 2) — это: Коробка (bare Type_Ident) резолвится в
 				// сам шаблонный ^Type, а T/U и т.п. в остальных параметрах
 				// — в те же InferVar через current_type_params.
+				//
+				// Стадия 7 Phase F: метод может добавлять СОБСТВЕННЫЕ
+				// type-параметры сверх владельца (функ результат_или[E]
+				// (это: Опция, ошибка: E) -> Результат(T, E) — E не входит
+				// в [T] Опции). combined — объединение decl_type_params
+				// владельца (если generic) со свежими InferVar на m.type_
+				// params (если непусто); own_scheme включается любым из
+				// двух условий.
 				prev := ctx.current_type_params
-				if is_generic_target {
-					ctx.current_type_params = ctx.decl_type_params[target_sym]
+				own_scheme := is_generic_target || len(m.type_params) > 0
+				combined: map[string]^Type
+				if own_scheme {
+					combined = make(map[string]^Type)
+					if is_generic_target {
+						for k, v in ctx.decl_type_params[target_sym] do combined[k] = v
+					}
+					for name in m.type_params do combined[name] = new_infer_var(ctx)
+					ctx.current_type_params = combined
 				}
 				method_type := function_type_from_decl(ctx, m)
 				ctx.current_type_params = prev
@@ -1531,21 +1546,27 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				original_name := m.name[len(d.target_type) + 2:]
 				target_type.methods[original_name] = sym
 
-				if is_generic_target {
+				if own_scheme {
 					// Метод получает СВОЮ Type_Scheme — иначе первый же
-					// вызов зацементирует T шаблона навсегда (structural
+					// вызов зацементирует T/E шаблона навсегда (structural
 					// fallback в unify_types, Phase D, связал бы шаблонный
 					// InferVar с конкретным типом ПОСТОЯННО, ведь это:
 					// Коробка ссылается на общий на все инстанциации
-					// шаблонный ^Type). generalize уже находит T
+					// шаблонный ^Type). generalize находит T/E
 					// автоматически: это: Коробка резолвится в сам
-					// шаблонный ^Type, collect_free_infer_vars проходит
+					// шаблонный ^Type (T внутри), E — прямая InferVar-
+					// ссылка в параметре; collect_free_infer_vars проходит
 					// внутрь через .Struct/.Enum-case (с cycle-guard,
-					// Phase D) и находит T в .fields/.variants.
+					// Phase D) и находит оба.
 					scheme := generalize(ctx, method_type)
 					if len(scheme.forall) > 0 {
 						ctx.symbol_schemes[sym] = scheme
 					}
+					// Персистируем combined под СОБСТВЕННЫМ Symbol_Id
+					// метода — ПРОХОД 4 должен резолвить T/E в теле в ТЕ
+					// ЖЕ InferVar-узлы, что и сигнатура здесь, иначе тело
+					// получило бы свежие (несвязанные с func_type) узлы.
+					ctx.decl_type_params[sym] = combined
 				}
 			}
 
@@ -1614,13 +1635,11 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				check_function_body(ctx, d.span, d.body, func_type.return_type)
 			}
 		case ^Impl_Decl:
-			// Стадия 7 Phase E: тело generic-метода резолвит T в ТЕ ЖЕ
-			// InferVar владельца, что и сигнатура в ПРОХОД 3 — тот же
-			// паттерн, что уже даёт ПРОХОД 4 top-level generic-функциям
-			// выше.
-			target_sym := ctx.res.global_scope.symbols[intern(d.target_type)]
-			params_map, is_generic_target := ctx.decl_type_params[target_sym]
-
+			// Стадия 7 Phase E/F: тело generic-метода резолвит T/E в ТЕ ЖЕ
+			// InferVar, что и сигнатура в ПРОХОД 3 — ключ по СОБСТВЕННОМУ
+			// Symbol_Id метода (не владельца), т.к. combined там уже
+			// включает и владельца, и собственные type-параметры метода
+			// (Опция.результат_или[E]).
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
 				func_type := ctx.res.symbol_types[sym]
@@ -1633,7 +1652,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 					continue
 				}
 				bind_function_args(ctx, m, func_type)
-				if is_generic_target {
+				if params_map, ok := ctx.decl_type_params[sym]; ok {
 					prev := ctx.current_type_params
 					ctx.current_type_params = params_map
 					check_function_body(ctx, m.span, m.body, func_type.return_type)

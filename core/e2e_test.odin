@@ -207,12 +207,12 @@ test_break_outside_loop_is_type_error :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_generic_method_rejected :: proc(t: ^testing.T) {
-	// Стадия 7 Phase B поддерживает generic только у top-level функций —
-	// generic-методы (реализация X ... функ м[T](...)) отклоняются
-	// парсером с понятной ошибкой вместо того, чтобы T молча падал в
-	// "неизвестный тип" при резолве сигнатуры метода. Это Phase E.
-	diags := typecheck_only(`
+test_method_own_type_param :: proc(t: ^testing.T) {
+	// Стадия 7 Phase F: метод может иметь СОБСТВЕННЫЙ type-параметр,
+	// даже когда владелец НЕ generic (Коробка здесь без [T]) — нужно для
+	// Опция.результат_или[E](ошибка: E), E не входит в [T] Опции. Раньше
+	// (Phase B/E) любой метод с [T] отклонялся парсером безусловно.
+	result, ok := run_code(`
 		тип Коробка = структура
 			значение: Число
 		конец
@@ -223,10 +223,14 @@ test_generic_method_rejected :: proc(t: ^testing.T) {
 			конец
 		конец
 
-		функ старт() -> Пусто
+		функ старт() -> Число
+			пер к = Коробка(1)
+			к.метод(42)
 		конец
 	`)
-	expect_diagnostic(t, diags, "Синтаксическая ошибка: generic-методы пока не поддержаны (Стадия 7 Phase E)")
+	testing.expectf(t, ok, "method own type param: пустой стек")
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 42.0, "method own type param: %v != 42.0", result)
 }
 
 @(test)

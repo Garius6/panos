@@ -842,17 +842,12 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 				decl.target_type,
 			)
 		}
-		if len(method.type_params) > 0 {
-			// Стадия 7 Phase B поддерживает generic только у top-level
-			// функций. Generic-методы (реализация X ... функ м[T](...))
-			// — Phase E; явный отказ здесь понятнее, чем то, что T молча
-			// упал бы в "неизвестный тип" при резолве сигнатуры метода.
-			report_parse(
-				p,
-				method.span,
-				"Синтаксическая ошибка: generic-методы пока не поддержаны (Стадия 7 Phase E)",
-			)
-		}
+		// Стадия 7 Phase F: собственные type-параметры метода (функ м[E]
+		// (это: Тип, x: E) -> ...) теперь поддержаны — нужны Опция.
+		// результат_или[E](ошибка: E), где E не входит в [T] владельца.
+		// Раньше (Phase B/E) здесь был безусловный отказ; type_cheker.odin
+		// объединяет decl_type_params владельца с собственными InferVar
+		// метода в один current_type_params при резолве сигнатуры.
 
 		method.name = fmt.tprintf("%s::%s", decl.target_type, method.name)
 		append(&decl.methods, method)

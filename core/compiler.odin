@@ -414,6 +414,24 @@ compile_statement :: proc(ctx: ^Compiler, statement: Stmt) {
 	}
 }
 
+// Эмитит приведение структуры к интерфейсу, если тайпчекер его пометил
+// (ctx.tc.interface_casts, см. check_expr в type_cheker.odin). Раньше это
+// была ОДНА проверка внизу compile_expr, применявшаяся ко ВСЕМ видам expr
+// единообразно — но `case ^Call_Expr:` внутри содержит СВОИ ранние `return`
+// (Constructor_Struct/Method_Interface/Builtin/...), которые выходят из
+// compile_expr ЦЕЛИКОМ, минуя эту проверку. Живой баг: `показать(Коробка(5))`
+// (конструктор структуры ПРЯМО в позиции аргумента интерфейсного параметра)
+// падал в рантайме на "попытка вызвать интерфейсный метод у не-интерфейса",
+// тогда как `пер к = Коробка(5); показать(к)` работал — Ident_Expr не имеет
+// ранних return'ов и доходил до проверки внизу. Теперь вызывается явно
+// перед КАЖДЫМ таким early-return, плюс один раз в общей развязке внизу.
+maybe_emit_interface_cast :: proc(ctx: ^Compiler, expr: Expr) {
+	if struct_type, needs_cast := ctx.tc.interface_casts[expr]; needs_cast {
+		emit_opcode(ctx, .Cast_Interface)
+		emit_byte(ctx, make_constant(ctx, Value(perm_string(struct_type.name))))
+	}
+}
+
 compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 
 	switch e in expr {
@@ -683,6 +701,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_byte(ctx, name_const)
 				emit_byte(ctx, u8(info.variant.tag_index))
 				emit_byte(ctx, u8(len(e.args)))
+				maybe_emit_interface_cast(ctx, expr)
 				return
 
 			case .Builtin:
@@ -690,6 +709,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_opcode(ctx, .Call_Builtin)
 				emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
 				emit_byte(ctx, u8(len(e.args)))
+				maybe_emit_interface_cast(ctx, expr)
 				return
 
 			case .Method_Collection:
@@ -699,6 +719,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_opcode(ctx, .Invoke_Collection)
 				emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
 				emit_byte(ctx, u8(len(e.args)))
+				maybe_emit_interface_cast(ctx, expr)
 				return
 
 			case .Method_Interface:
@@ -708,6 +729,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_opcode(ctx, .Invoke_Interface)
 				emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
 				emit_byte(ctx, u8(len(e.args)))
+				maybe_emit_interface_cast(ctx, expr)
 				return
 
 			case .Method_Struct:
@@ -721,12 +743,14 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				for arg in e.args do compile_expr(ctx, arg)
 				emit_opcode(ctx, .Call)
 				emit_byte(ctx, u8(len(e.args) + 1))
+				maybe_emit_interface_cast(ctx, expr)
 				return
 
 			case .Constructor_Struct:
 				for arg in e.args do compile_expr(ctx, arg)
 				emit_opcode(ctx, .Build_Aggregate)
 				emit_byte(ctx, u8(len(e.args)))
+				maybe_emit_interface_cast(ctx, expr)
 				return
 			}
 		}
@@ -737,6 +761,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_opcode(ctx, .Call_Builtin)
 				emit_byte(ctx, make_constant(ctx, Value(perm_string(resolve_interned(ident.name)))))
 				emit_byte(ctx, u8(len(e.args)))
+				maybe_emit_interface_cast(ctx, expr)
 				return
 			}
 		}
@@ -834,11 +859,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		fmt.panicf("Compiler Error: внутренняя ошибка — Error_Expr дошёл до компиляции")
 	}
 
-	if struct_type, needs_cast := ctx.tc.interface_casts[expr]; needs_cast {
-		emit_opcode(ctx, .Cast_Interface)
-		// То же самое для имени структуры
-		emit_byte(ctx, make_constant(ctx, Value(perm_string(struct_type.name))))
-	}
+	maybe_emit_interface_cast(ctx, expr)
 }
 
 allocate_temp_slot :: proc(ctx: ^Compiler, name: string) -> int {

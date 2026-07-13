@@ -488,6 +488,11 @@ Type_Ctx :: struct {
 	// же мутируемый указатель, что ПРОХОД 2 продолжает достраивать
 	// append'ом; к моменту реального использования (ПРОХОД 4+) он уже полон.
 	currently_declaring_generic: Symbol_Id,
+	// Стадия 7: очередь constraint'ов для join-точек (если/иначе, выбор-
+	// ветки, элементы массива/соответствия-литералов), см. Constraint/
+	// emit_constraint/solve_constraints выше. Дренируется solve_constraints
+	// в конце каждой join-точки — не переживает её.
+	pending_constraints: [dynamic]Constraint,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -504,6 +509,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		decl_type_param_order = make(map[Symbol_Id][dynamic]^Type),
 		generic_instance_cache = make(map[string]^Type),
 		currently_declaring_generic = INVALID_SYMBOL,
+		pending_constraints = make([dynamic]Constraint),
 	}
 	// Стадия 7 Phase F: см. Resolver_Ctx.prelude_generic_order — прелюдия
 	// типизируется в СВОЁМ отдельном tc_ctx (ensure_prelude), любой другой
@@ -757,7 +763,19 @@ instantiate_type :: proc(ctx: ^Type_Ctx, t: ^Type, subst: ^map[int]^Type, visite
 		// (если эта инстанциация случилась раньше, во время ПРОХОД 2)
 		// всё равно видно через t2.methods — тот же указатель на данные.
 		t2.methods = pruned.methods
-		t2.implemented_interfaces = make([dynamic]^Type)
+		// Стадия 7: снимок, а не пустой массив — раньше здесь стоял
+		// make([dynamic]^Type), из-за чего unify_types'ова interface-
+		// коэрция (см. `for iface in left.implemented_interfaces`) на
+		// ЛЮБОЙ инстанциации generic-структуры всегда видела пустой
+		// список, даже если шаблон честно реализует интерфейс — molча
+		// ломая `x: ИнтерфейсX = generic_значение`. В отличие от .methods
+		// это НЕ живой алиас (dynamic array — value-заголовок, не
+		// reference type, как map) — но и не нужен: реальные инстанциации
+		// (эта функция) вызываются только из ПРОХОД 4, который всегда
+		// идёт строго ПОСЛЕ ПРОХОД 3 — к этому моменту
+		// pruned.implemented_interfaces шаблона уже полностью заполнен и
+		// больше никогда не мутируется, так что плоский снимок корректен.
+		t2.implemented_interfaces = pruned.implemented_interfaces
 		v[pruned] = t2 // регистрируем ДО рекурсии в поля — см. комментарий выше
 		for f in pruned.fields {
 			append(&t2.fields, Struct_Field{name = f.name, type = instantiate_type(ctx, f.type, subst, v)})
@@ -923,6 +941,56 @@ unify_types :: proc(a: ^Type, b: ^Type, visited: ^map[[2]^Type]bool = nil) -> bo
 		return true
 	}
 	return true
+}
+
+// Стадия 7: constraint-based inference (generate → solve), см. ROADMAP
+// §Стадия 7 "Архитектурное решение". Применяется ТОЛЬКО к join-точкам
+// (если/иначе, выбор-ветки, элементы массива/соответствия-литералов) —
+// местам, где N УЖЕ полностью выведенных (bottom-up) типов должны
+// совпасть друг с другом, и решение "что делать дальше" не зависит от
+// диспетчеризации ВНУТРИ самого сравнения. Остальные вызовы unify_types
+// в этом файле остаются eager — тайпчекер там принимает структурные
+// решения (какой метод резолвится на Массив vs Соответствие,
+// exhaustiveness `выбор` по .Enum и т.п.) ПО ХОДУ обхода, что
+// несовместимо с отложенным solve без переписывания на HM-стиль с
+// отложенной диспетчеризацией (недели работы ради нуля текущих
+// функциональных проблем — Phase A-F доказали, что eager-unify
+// достаточно для всего, что уже реализовано, см. заметку Phase A выше).
+Constraint :: struct {
+	a, b:    ^Type,
+	span:    Span,
+	message: string,
+}
+
+// Сообщение форматируется В МОМЕНТ emit (как раньше форматировалось
+// прямо перед немедленным unify_types) — операнды join-точки уже
+// полностью выведены к этому моменту, так что дальнейшее связывание
+// InferVar'ов внутри ТОГО ЖЕ батча не меняет их pruned-имена задним
+// числом.
+emit_constraint :: proc(ctx: ^Type_Ctx, a: ^Type, b: ^Type, span: Span, message: string) {
+	append(&ctx.pending_constraints, Constraint{a = a, b = b, span = span, message = message})
+}
+
+// Батч-солвер: прогоняет накопленные constraint'ы через unify_types.
+// Внутренняя механика unify_types (bind_infer_var, TY_POISON, cycle-safe
+// visited-карты) не меняется — солвер лишь переносит МОМЕНТ вызова с
+// "сразу по ходу обхода" на "после того, как все операнды join-точки уже
+// выведены". bind_infer_var — union-find-подобная мутация, порядок-
+// независимая, так что итоговое состояние типов идентично eager-
+// поведению; разница только в том, что ВСЕ несовпадения join-точки
+// репортятся за один проход, а не по одному по ходу eager-обхода (хотя
+// эффективно так уже было — циклы на join-точках и раньше не прерывались
+// на первой ошибке).
+solve_constraints :: proc(ctx: ^Type_Ctx) -> bool {
+	all_ok := true
+	for c in ctx.pending_constraints {
+		if !unify_types(c.a, c.b) {
+			report(ctx, c.span, "%s", c.message)
+			all_ok = false
+		}
+	}
+	clear(&ctx.pending_constraints)
+	return all_ok
 }
 
 // После вывода типа проверяем, что в нем не осталось неизвестных частей.
@@ -1443,16 +1511,19 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			is_generic_target := false
 			if _, ok := ctx.decl_type_params[target_sym]; ok {
 				is_generic_target = true
-				if d.interface_name != "" {
-					report(
-						ctx,
-						d.span,
-						"Type Error: реализация интерфейса для generic-типа пока не поддерживается: '%s'",
-						d.target_type,
-					)
-					continue
-				}
 			}
+			// Стадия 7: реализация ИНТЕРФЕЙСА на generic-цели теперь
+			// поддержана — интерфейс сам по себе НЕ generic (Interface_Decl
+			// не имеет [T]), поэтому ни один метод контракта не ссылается
+			// на T цели: interface_method_types_match ниже сравнивает
+			// параметры/возврат мимо receiver'а (i от 1), там никогда не
+			// встретится InferVar цели — сравнение работает как для
+			// обычных конкретных типов, без изменений. Раньше здесь стоял
+			// безусловный continue, пропускавший даже РЕГИСТРАЦИЮ методов
+			// (см. ниже) — т.е. `реализация X для GenericТип` не работала
+			// вообще никак. generic-интерфейсы САМИ ПО СЕБЕ (тип с [T] в
+			// заголовке интерфейса) — по-прежнему вне scope, отдельная
+			// фича.
 			if target_type.kind == .Enum && d.interface_name != "" {
 				report(
 					ctx,
@@ -2982,15 +3053,18 @@ infer_if_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^If_Expr) -> ^Type {
 		then_type := infer_block_type(ctx, e.then_branch)
 		else_type := infer_block_type(ctx, e.else_branch)
 
-		if !unify_types(then_type, else_type) {
-			report(
-				ctx,
-				e.span,
+		emit_constraint(
+			ctx,
+			then_type,
+			else_type,
+			e.span,
+			fmt.aprintf(
 				"Type Error: ветки 'если' возвращают разные типы. 'тогда' -> '%s', 'иначе' -> '%s'",
 				prune_type(then_type).name,
 				prune_type(else_type).name,
-			)
-		}
+			),
+		)
+		solve_constraints(ctx)
 		if prune_type(then_type) == TY_NEVER {
 			t = prune_type(else_type)
 		} else {
@@ -3025,19 +3099,25 @@ infer_array_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Array_Expr) -> ^Type {
 			"Type Error: для пустого массива нужна аннотация ожидаемого типа",
 		)
 	}
+	// join-точка (Стадия 7 constraint-based) — все элементы выводятся
+	// сначала, потом сравниваются батчем. Заодно убирает задвоение:
+	// раньше e.elements[0] инферился дважды (тут и на i==0 внутри цикла).
 	element_type := infer_expr(ctx, e.elements[0])
-	for el, i in e.elements {
-		current_type := infer_expr(ctx, el)
-		if i > 0 && !unify_types(current_type, element_type) {
-			report(
-				ctx,
-				expr_span(el),
+	for i in 1 ..< len(e.elements) {
+		current_type := infer_expr(ctx, e.elements[i])
+		emit_constraint(
+			ctx,
+			current_type,
+			element_type,
+			expr_span(e.elements[i]),
+			fmt.aprintf(
 				"Type Error: элементы массива имеют разные типы: '%s' и '%s'",
 				prune_type(element_type).name,
 				prune_type(current_type).name,
-			)
-		}
+			),
+		)
 	}
+	solve_constraints(ctx)
 	return new_array_type(prune_type(element_type))
 }
 
@@ -3049,9 +3129,23 @@ infer_map_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Map_Expr) -> ^Type {
 			"Type Error: для пустого соответствия нужна аннотация ожидаемого типа",
 		)
 	}
+	// join-точка (Стадия 7 constraint-based) — ключи и значения выводятся
+	// сначала, потом сравниваются батчем. is_valid_map_key_type остаётся
+	// eager-проверкой (не "N сиблингов должны совпасть друг с другом", а
+	// "этот конкретный тип годится как ключ вообще" — другой класс
+	// проверки). Заодно убирает задвоение entries[0] (см. infer_array_expr).
 	key_type := infer_expr(ctx, e.entries[0].key)
 	value_type := infer_expr(ctx, e.entries[0].value)
-	for entry, i in e.entries {
+	if !is_valid_map_key_type(key_type) {
+		report(
+			ctx,
+			expr_span(e.entries[0].key),
+			"Type Error: тип '%s' нельзя использовать как ключ соответствия",
+			key_type.name,
+		)
+	}
+	for i in 1 ..< len(e.entries) {
+		entry := e.entries[i]
 		current_key_type := infer_expr(ctx, entry.key)
 		current_value_type := infer_expr(ctx, entry.value)
 		if !is_valid_map_key_type(current_key_type) {
@@ -3062,27 +3156,30 @@ infer_map_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Map_Expr) -> ^Type {
 				current_key_type.name,
 			)
 		}
-		if i > 0 {
-			if !unify_types(current_key_type, key_type) {
-				report(
-					ctx,
-					expr_span(entry.key),
-					"Type Error: ключи соответствия имеют разные типы: '%s' и '%s'",
-					prune_type(key_type).name,
-					prune_type(current_key_type).name,
-				)
-			}
-			if !unify_types(current_value_type, value_type) {
-				report(
-					ctx,
-					expr_span(entry.value),
-					"Type Error: значения соответствия имеют разные типы: '%s' и '%s'",
-					prune_type(value_type).name,
-					prune_type(current_value_type).name,
-				)
-			}
-		}
+		emit_constraint(
+			ctx,
+			current_key_type,
+			key_type,
+			expr_span(entry.key),
+			fmt.aprintf(
+				"Type Error: ключи соответствия имеют разные типы: '%s' и '%s'",
+				prune_type(key_type).name,
+				prune_type(current_key_type).name,
+			),
+		)
+		emit_constraint(
+			ctx,
+			current_value_type,
+			value_type,
+			expr_span(entry.value),
+			fmt.aprintf(
+				"Type Error: значения соответствия имеют разные типы: '%s' и '%s'",
+				prune_type(value_type).name,
+				prune_type(current_value_type).name,
+			),
+		)
 	}
+	solve_constraints(ctx)
 	return new_map_type(prune_type(key_type), prune_type(value_type))
 }
 
@@ -3177,17 +3274,26 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 		if body_t.kind != .Never {
 			if result_t == nil {
 				result_t = body_t
-			} else if !unify_types(body_t, result_t) {
-				report(
+			} else {
+				// join-точка (Стадия 7 constraint-based) — сравнение
+				// откладывается в общий батч ниже, после того как ВСЕ
+				// ветки уже выведены (result_t тут — уже финальный тип
+				// первой не-Never ветки, дальше не меняется).
+				emit_constraint(
 					ctx,
+					body_t,
+					result_t,
 					arm.span,
-					"Type Error: ветки выбора возвращают разные типы: '%s' vs '%s'",
-					prune_type(result_t).name,
-					prune_type(body_t).name,
+					fmt.aprintf(
+						"Type Error: ветки выбора возвращают разные типы: '%s' vs '%s'",
+						prune_type(result_t).name,
+						prune_type(body_t).name,
+					),
 				)
 			}
 		}
 	}
+	solve_constraints(ctx)
 	if result_t == nil do result_t = TY_NEVER
 	ctx.match_arm_infos[e] = arm_infos
 	check_match_coverage(ctx, e.span, subject_type, arm_infos)

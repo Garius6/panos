@@ -382,8 +382,8 @@ LSP-фич Стадии 5 (completions/find-references/rename) не требуе
 
 - **Phase A** ✅ — implicit rank-1 полиморфизм для лямбд (1 день).
 - **Phase B** ✅ — явные generic-функции: `функ имя[T](x: T) -> T` (2 дня).
-- **Phase C** — generic struct/interface: `тип Пара[A, B] = структура`
-  (2 дня).
+- **Phase C** ✅ (только struct, см. заметку ниже) — generic struct/interface:
+  `тип Пара[A, B] = структура` (2 дня).
 - **Phase D** — generic ADT: `тип Дерево[T] = перечисление ...` (1 день).
 - **Phase E** — `реализация Список[T] ... конец` (2-3 дня).
 - **Phase F** — prelude cleanup: `Опция(T)` и `Результат(T, E)`
@@ -446,10 +446,26 @@ Phase A) и кладётся в ТУ ЖЕ карту `symbol_schemes` — мес
 потребовалось. Generic-методы (`реализация X ... функ м[T]`) явно
 отклоняются парсером — это Phase E.
 
+**Заметка по Phase C (сделано, только struct)**: generic-интерфейсы
+сознательно отложены — contract-matching поверх инстанцированных сигнатур
+методов оказался бы сравним по объёму с Phase E, не влез бы в один
+разумный PR вместе со структурами. Найдена и закрыта архитектурная дыра,
+которой не было в Phase A/B: `unify_types`/`types_are_equal` сравнивают
+`.Struct` ТОЛЬКО по identity указателя (не по имени/структурно) — без
+кэша каждое текстуальное вхождение `Пара(Число, Строка)` получало бы свой
+`^Type`-объект, и `пер p: Пара(Число,Строка) = Пара(1, "a")` (самый
+естественный способ написать код с generic-структурой) не типизировался
+бы. Добавлен `Type_Ctx.generic_instance_cache` — тот же паттерн, что уже
+был у `synth_enum_cache` для Опции/Результата. Заодно починен молчаливый
+баг: `Тип(Аргумент)` на НЕ-generic структуре раньше стирался в `Пусто`
+без единой ошибки (у `resolve_type_node`'s `Type_Generic`-ветки не было
+fallback'а) — теперь либо инстанцирует generic, либо репортит понятную
+ошибку. `реализация` на generic-структурах явно отклоняется — Phase E.
+
 **Порядок работ**:
 1. Phase A ✅: implicit rank-1 (1 день).
 2. Phase B ✅: явные generic functions + syntax `[T]` (2 дня).
-3. Phase C: generic structs/interfaces (2 дня).
+3. Phase C ✅: generic structs (интерфейсы отложены, 2 дня).
 4. Phase D: generic ADT (1 день).
 5. Phase E: impl over generic (2-3 дня).
 6. Phase F: prelude cleanup (1 день).

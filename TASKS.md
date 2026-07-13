@@ -394,7 +394,9 @@ Prerequisite: Стадия 6.
 - [x] Phase B: `функ имя[T](x: T) -> T` — переиспользует Type_Scheme/
       symbol_schemes из Phase A, инстанциация на вызове не потребовала
       правок в infer_call_expr (см. заметку в ROADMAP §Стадия 7)
-- [ ] Phase C: generic struct/interface
+- [x] Phase C: generic struct — только структуры (интерфейсы отложены,
+      сравнимы по объёму с Phase E); добавлен generic_instance_cache
+      (identity-канонизация инстанциаций, см. заметку в ROADMAP §Стадия 7)
 - [ ] Phase D: generic ADT
 - [ ] Phase E: `реализация Список[T]`
 - [ ] Phase F: prelude cleanup (Опция/Результат как user-declared ADT)

@@ -499,6 +499,20 @@ Type_Ctx :: struct {
 	// с сигнатурой. В отличие от current_type_params (ambient, временное)
 	// это хранится на весь typecheck_program.
 	decl_type_params:        map[Symbol_Id]map[string]^Type,
+	// Стадия 7 Phase C: ordered InferVar-список type-параметров generic-
+	// структуры в порядке заголовка [A, B, ...] — для позиционной
+	// подстановки в explicit-аннотациях (Пара(Число, Строка)).
+	// decl_type_params (map) и scheme.forall (порядок структурного обхода
+	// полей при generalize, может не совпасть с порядком заголовка, если
+	// поля объявлены в другом порядке) для этого не подходят.
+	decl_type_param_order: map[Symbol_Id][dynamic]^Type,
+	// Кэш инстанциаций generic-структур: (символ декларации + резолвленные
+	// type-аргументы) → канонический ^Type. unify_types/types_are_equal
+	// сравнивают .Struct ТОЛЬКО по identity указателя — без кэша каждое
+	// текстуальное вхождение Пара(Число, Строка) получало бы свой
+	// ^Type-объект, и они считались бы разными типами. Тот же паттерн, что
+	// synth_enum_cache выше (та же проблема, для Опции/Результата).
+	generic_instance_cache: map[string]^Type,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -513,6 +527,8 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		diagnostics = make([dynamic]Diagnostic),
 		symbol_schemes = make(map[Symbol_Id]Type_Scheme),
 		decl_type_params = make(map[Symbol_Id]map[string]^Type),
+		decl_type_param_order = make(map[Symbol_Id][dynamic]^Type),
+		generic_instance_cache = make(map[string]^Type),
 	}
 }
 
@@ -664,6 +680,8 @@ collect_free_infer_vars :: proc(t: ^Type, out: ^[dynamic]int) {
 	case .Result:
 		collect_free_infer_vars(typ.ok_type, out)
 		collect_free_infer_vars(typ.error_type, out)
+	case .Struct:
+		for f in typ.fields do collect_free_infer_vars(f.type, out)
 	}
 }
 
@@ -719,6 +737,20 @@ instantiate_type :: proc(ctx: ^Type_Ctx, t: ^Type, subst: ^map[int]^Type) -> ^Ty
 			instantiate_type(ctx, pruned.ok_type, subst),
 			instantiate_type(ctx, pruned.error_type, subst),
 		)
+	case .Struct:
+		fields := make([dynamic]Struct_Field)
+		for f in pruned.fields {
+			append(&fields, Struct_Field{name = f.name, type = instantiate_type(ctx, f.type, subst)})
+		}
+		t2 := new(Type)
+		t2.kind = .Struct
+		t2.name = pruned.name
+		t2.fields = fields
+		// Стадия 7 Phase C: generic-структуры не поддерживают реализация
+		// (см. ПРОХОД 3) — пустые карты, как у шаблона в ПРОХОД 1.
+		t2.methods = make(map[string]Symbol_Id)
+		t2.implemented_interfaces = make([dynamic]^Type)
+		return t2
 	}
 	return pruned
 }
@@ -729,6 +761,20 @@ instantiate_scheme :: proc(ctx: ^Type_Ctx, scheme: Type_Scheme) -> ^Type {
 	subst := make(map[int]^Type)
 	for id in scheme.forall do subst[id] = new_infer_var(ctx)
 	return instantiate_type(ctx, scheme.body, &subst)
+}
+
+// Стадия 7 Phase C: стабильный строковый ключ для generic_instance_cache —
+// символ декларации + указатели резолвленных type-аргументов по порядку.
+// Корректность опирается на то, что конкретные типы в этой системе —
+// синглтоны (TY_NUM/TY_STRING/... и один канонический ^Type на
+// структуру/enum); для вложенных generic-инстанциаций это тоже верно,
+// т.к. они сами проходят через этот же кэш раньше, чем становятся
+// аргументом внешней инстанциации.
+generic_instance_key :: proc(sym: Symbol_Id, args: [dynamic]^Type) -> string {
+	b := strings.builder_make()
+	fmt.sbprintf(&b, "%d", sym)
+	for a in args do fmt.sbprintf(&b, "|%p", a)
+	return strings.to_string(b)
 }
 
 // Унификация либо подтверждает совместимость типов, либо фиксирует InferVar.
@@ -1101,9 +1147,42 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			struct_type := ctx.res.symbol_types[sym]
 			struct_type.fields = make([dynamic]Struct_Field)
 
-			for f in d.fields {
-				field_type := resolve_type_node(ctx, f.type_annotation)
-				append(&struct_type.fields, Struct_Field{name = f.name, type = field_type})
+			// Стадия 7 Phase C: generic-структура — резолвим поля с
+			// type-параметрами в scope (свежий InferVar на каждое имя),
+			// затем generalize в полиморфную схему (тот же механизм, что
+			// Phase A/B, см. symbol_schemes). decl_type_param_order хранит
+			// ordered-список для позиционной явной подстановки в
+			// Type_Generic (Пара(Число, Строка)) — заполняется всегда при
+			// непустом d.type_params, даже если конкретный параметр не
+			// встречается ни в одном поле.
+			if len(d.type_params) > 0 {
+				prev := ctx.current_type_params
+				params_map := make(map[string]^Type)
+				ordered := make([dynamic]^Type)
+				for name in d.type_params {
+					tv := new_infer_var(ctx)
+					params_map[name] = tv
+					append(&ordered, tv)
+				}
+				ctx.current_type_params = params_map
+
+				for f in d.fields {
+					field_type := resolve_type_node(ctx, f.type_annotation)
+					append(&struct_type.fields, Struct_Field{name = f.name, type = field_type})
+				}
+				ctx.current_type_params = prev
+
+				scheme := generalize(ctx, struct_type)
+				if len(scheme.forall) > 0 {
+					ctx.symbol_schemes[sym] = scheme
+				}
+				ctx.decl_type_params[sym] = params_map
+				ctx.decl_type_param_order[sym] = ordered
+			} else {
+				for f in d.fields {
+					field_type := resolve_type_node(ctx, f.type_annotation)
+					append(&struct_type.fields, Struct_Field{name = f.name, type = field_type})
+				}
 			}
 
 		case ^Function_Decl:
@@ -1178,6 +1257,18 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				// target_type == nil ниже разыменовывается (.methods,
 				// .implemented_interfaces) — реализацию проверять нечем,
 				// пропускаем весь блок.
+				continue
+			}
+			if _, is_generic := ctx.decl_type_params[target_sym]; is_generic {
+				// Стадия 7 Phase C: target_type для generic-структуры —
+				// шаблон с InferVar-полями, методы на нём типизировать
+				// нельзя. Явный отказ вместо путаницы — это Phase E.
+				report(
+					ctx,
+					d.span,
+					"Type Error: generic-структуры пока не поддерживают 'реализация' (Стадия 7 Phase E): '%s'",
+					d.target_type,
+				)
 				continue
 			}
 			if target_type.kind == .Enum && d.interface_name != "" {
@@ -1387,6 +1478,43 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 				resolve_type_node(ctx, n.params[0]),
 				resolve_type_node(ctx, n.params[1]),
 			)
+		} else {
+			// Стадия 7 Phase C: пользовательский generic-тип (структура).
+			// Раньше здесь не было fallback'а вообще — неизвестное имя
+			// молча проваливалось в `return TY_VOID` в конце функции
+			// (например, Флаг(Число) для НЕ-generic структуры Флаг
+			// компилировалось без единой ошибки). Теперь либо находим
+			// generic-декларацию и инстанцируем, либо репортим понятную
+			// ошибку.
+			sym := lookup_symbol(ctx.res.global_scope, intern(n.name))
+			if sym == INVALID_SYMBOL {
+				return report(ctx, n.span, "Type Error: неизвестный тип '%s'", n.name)
+			}
+			ordered, is_generic := ctx.decl_type_param_order[sym]
+			if !is_generic {
+				return report(ctx, n.span, "Type Error: '%s' не является generic-типом", n.name)
+			}
+			if len(n.params) != len(ordered) {
+				return report(
+					ctx,
+					n.span,
+					"Type Error: '%s' ожидает %d параметров типа, получено %d",
+					n.name,
+					len(ordered),
+					len(n.params),
+				)
+			}
+			args := make([dynamic]^Type)
+			for p in n.params do append(&args, resolve_type_node(ctx, p))
+
+			key := generic_instance_key(sym, args)
+			if cached, found := ctx.generic_instance_cache[key]; found do return cached
+
+			subst := make(map[int]^Type)
+			for tv, i in ordered do subst[tv.infer_id] = args[i]
+			instance := instantiate_type(ctx, ctx.res.symbol_types[sym], &subst)
+			ctx.generic_instance_cache[key] = instance
+			return instance
 		}
 	case ^Error_Type_Node:
 		// Уже отрапортовано парсером — не дублируем diagnostic.
@@ -2658,6 +2786,26 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 		for arg, i in e.args do check_expr(ctx, arg, callee_type.fields[i].type)
 		ctx.call_infos[expr] = Call_Info{kind = .Constructor_Struct}
 		t = callee_type
+
+		// Стадия 7 Phase C: если это конструктор generic-структуры,
+		// callee_type — свежая (одноразовая) инстанциация от
+		// instantiate_scheme в infer_ident_expr, с полями, только что
+		// унифицированными выше в конкретные типы. Канонизируем через
+		// generic_instance_cache — иначе unify_types (сравнивает .Struct
+		// только по identity указателя) счёл бы два одинаковых
+		// Пара(Число, Строка) из разных мест кода разными типами.
+		if callee_sym != INVALID_SYMBOL {
+			if _, is_generic := ctx.decl_type_params[callee_sym]; is_generic {
+				arg_types := make([dynamic]^Type)
+				for f in callee_type.fields do append(&arg_types, prune_type(f.type))
+				key := generic_instance_key(callee_sym, arg_types)
+				if cached, found := ctx.generic_instance_cache[key]; found {
+					t = cached
+				} else {
+					ctx.generic_instance_cache[key] = t
+				}
+			}
+		}
 
 	} else if callee_type.kind == .Function {
 		if len(e.args) != len(callee_type.params) {

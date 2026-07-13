@@ -94,6 +94,9 @@ Field_Decl :: struct {
 Struct_Decl :: struct {
 	span:        Span,
 	name:        string,
+	// Стадия 7 Phase C: имена type-параметров из `[A, B]` после имени
+	// структуры. Пусто для обычных (не-generic) структур.
+	type_params: [dynamic]string,
 	fields:      [dynamic]Field_Decl,
 	is_exported: bool,
 }
@@ -584,7 +587,13 @@ parse_program :: proc(p: ^Parser) -> Program {
 				append(&prog.decls, err_decl)
 				continue
 			}
-			third_kind := p.stream.tokens[p.stream.current_idx + 3].kind
+			// Стадия 7 Phase C: раньше здесь стоял фиксированный offset +3
+			// ('тип' NAME '=' BODY_KIND) — но 'тип Пара[A, B] = структура'
+			// вставляет переменное число токенов между именем и '=', сдвигая
+			// BODY_KIND на непредсказуемый offset. peek_type_decl_body_kind
+			// не потребляет токены — сканирует вперёд мимо опционального
+			// '[...]' до '=' и возвращает токен сразу после него.
+			third_kind := peek_type_decl_body_kind(p)
 			if third_kind == .Struct {
 				decl := parse_struct_decl(p, is_exported)
 				append(&prog.decls, decl)
@@ -895,6 +904,38 @@ parse_type_params :: proc(p: ^Parser) -> [dynamic]string {
 	return names
 }
 
+// Стадия 7 Phase C: read-only аналог parse_program'овского lookahead —
+// НЕ потребляет токены (в отличие от parse_type_params). Начиная с токена
+// сразу после 'тип NAME' (current_idx+2), пропускает опциональный '[...]'
+// (с учётом вложенности скобок, хоть Phase C сама вложенность и не
+// генерирует) и возвращает kind токена сразу после '='. Если на месте '='
+// стоит что-то другое — возвращает этот токен как есть: parse_program
+// ниже сообщит "ожидалось структура/интерфейс/перечисление" с ним же,
+// как и раньше для не-generic случая.
+peek_type_decl_body_kind :: proc(p: ^Parser) -> TokenKind {
+	idx := p.stream.current_idx + 2 // токен сразу после 'тип NAME'
+	if idx < len(p.stream.tokens) && p.stream.tokens[idx].kind == .LBracket {
+		depth := 1
+		idx += 1
+		for idx < len(p.stream.tokens) && depth > 0 {
+			#partial switch p.stream.tokens[idx].kind {
+			case .LBracket:
+				depth += 1
+			case .RBracket:
+				depth -= 1
+			case .EOF:
+				return .EOF
+			}
+			idx += 1
+		}
+	}
+	if idx >= len(p.stream.tokens) do return .EOF
+	if p.stream.tokens[idx].kind != .Assign do return p.stream.tokens[idx].kind
+	idx += 1
+	if idx >= len(p.stream.tokens) do return .EOF
+	return p.stream.tokens[idx].kind
+}
+
 parse_param_list :: proc(p: ^Parser, require_types: bool) -> [dynamic]Param_Decl {
 	params := make([dynamic]Param_Decl)
 	expect(p, .LParen)
@@ -968,6 +1009,10 @@ parse_struct_decl :: proc(p: ^Parser, is_exported: bool) -> ^Struct_Decl {
 	name_tok := next_token(p.stream)
 	if name_tok.kind != .Ident do error(p, "Ожидалось имя типа")
 	decl.name = name_tok.data
+
+	if peek_token(p.stream).kind == .LBracket {
+		decl.type_params = parse_type_params(p)
+	}
 
 	expect(p, .Assign)
 	expect(p, .Struct)

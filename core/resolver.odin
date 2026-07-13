@@ -447,6 +447,59 @@ lookup_symbol :: proc(s: ^Scope, name: Interned) -> Symbol_Id {
 	return INVALID_SYMBOL
 }
 
+// Общий паттерн для Function_Decl/Struct_Decl/Interface_Decl/Enum_Decl (сам
+// тип, без вариантов) и методов Impl_Decl: интернировать имя, проверить
+// коллизию в module.scope.symbols, при отсутствии — записать в scope и (если
+// экспортируется) в module.exports. Возвращает символ ВСЕГДА (даже при
+// коллизии) — вызывающий пишет его в ctx.decl_symbols безусловно, тот же
+// poison-паттерн, что и везде в резолвере (не каскадировать вторичные
+// ошибки на отсутствующем symbol_id).
+register_named_symbol :: proc(
+	ctx: ^Resolver_Ctx,
+	module: ^Module,
+	name: string,
+	kind: Symbol_Kind,
+	decl: Decls,
+	span: Span,
+	is_exported: bool,
+) -> Symbol_Id {
+	sym := new_symbol(ctx.symbol_store, name, kind, module, is_exported, decl, span)
+	name_id := intern(name)
+	if name_id in module.scope.symbols {
+		report_resolve(ctx, span, "Resolve Error: символ '%s' уже объявлен", name)
+	} else {
+		module.scope.symbols[name_id] = sym
+		if is_exported {
+			module.exports[name_id] = sym
+		}
+	}
+	return sym
+}
+
+// Резолвит тело функции/метода: своя scope на аргументы (регистрирует их
+// как .Variable-символы), обход тела через resolve_stmt, запись args_syms в
+// ctx.func_args под ключом `key` (для Function_Decl — сам decl, для метода
+// Impl_Decl — узел метода). Общий паттерн для Function_Decl и методов
+// Impl_Decl.
+resolve_function_body :: proc(
+	ctx: ^Resolver_Ctx,
+	module: ^Module,
+	key: Decls,
+	args: []Param_Decl,
+	body: [dynamic]Stmt,
+) {
+	push_scope(ctx)
+	args_syms := make([dynamic]Symbol_Id)
+	for arg in args {
+		sym := new_symbol(ctx.symbol_store, arg.name, .Variable, module, span = arg.span)
+		ctx.current_scope.symbols[intern(arg.name)] = sym
+		append(&args_syms, sym)
+	}
+	ctx.func_args[key] = args_syms
+	for stmt in body do resolve_stmt(ctx, stmt)
+	pop_scope(ctx)
+}
+
 register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls) {
 	#partial switch d in decl {
 	case ^Import_Decl:
@@ -475,68 +528,22 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 		module.scope.symbols[alias_id] = sym
 
 	case ^Function_Decl:
-		sym := new_symbol(ctx.symbol_store, d.name, .Function, module, d.is_exported, decl, d.span)
-		name_id := intern(d.name)
-		ctx.decl_symbols[decl] = sym
-		if name_id in module.scope.symbols {
-			report_resolve(ctx, d.span, "Resolve Error: символ '%s' уже объявлен", d.name)
-		} else {
-			module.scope.symbols[name_id] = sym
-			if d.is_exported {
-				module.exports[name_id] = sym
-			}
-		}
+		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Function, decl, d.span, d.is_exported)
 
 	case ^Struct_Decl:
-		sym := new_symbol(ctx.symbol_store, d.name, .Type, module, d.is_exported, decl, d.span)
-		name_id := intern(d.name)
-		ctx.decl_symbols[decl] = sym
-		if name_id in module.scope.symbols {
-			report_resolve(ctx, d.span, "Resolve Error: символ '%s' уже объявлен", d.name)
-		} else {
-			module.scope.symbols[name_id] = sym
-			if d.is_exported {
-				module.exports[name_id] = sym
-			}
-		}
+		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Type, decl, d.span, d.is_exported)
 
 	case ^Interface_Decl:
-		sym := new_symbol(ctx.symbol_store, d.name, .Type, module, d.is_exported, decl, d.span)
-		name_id := intern(d.name)
-		ctx.decl_symbols[decl] = sym
-		if name_id in module.scope.symbols {
-			report_resolve(ctx, d.span, "Resolve Error: символ '%s' уже объявлен", d.name)
-		} else {
-			module.scope.symbols[name_id] = sym
-			if d.is_exported {
-				module.exports[name_id] = sym
-			}
-		}
+		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Type, decl, d.span, d.is_exported)
 
 	case ^Impl_Decl:
 		for m in d.methods {
-			sym := new_symbol(ctx.symbol_store, m.name, .Function, module, false, m, m.span)
-			name_id := intern(m.name)
-			ctx.decl_symbols[m] = sym
-			if name_id in module.scope.symbols {
-				report_resolve(ctx, m.span, "Resolve Error: символ '%s' уже объявлен", m.name)
-			} else {
-				module.scope.symbols[name_id] = sym
-			}
+			ctx.decl_symbols[m] = register_named_symbol(ctx, module, m.name, .Function, m, m.span, false)
 		}
 
 	case ^Enum_Decl:
-		type_name_id := intern(d.name)
-		type_sym := new_symbol(ctx.symbol_store, d.name, .Type, module, d.is_exported, decl, d.span)
+		type_sym := register_named_symbol(ctx, module, d.name, .Type, decl, d.span, d.is_exported)
 		ctx.decl_symbols[decl] = type_sym
-		if type_name_id in module.scope.symbols {
-			report_resolve(ctx, d.span, "Resolve Error: символ '%s' уже объявлен", d.name)
-		} else {
-			module.scope.symbols[type_name_id] = type_sym
-			if d.is_exported {
-				module.exports[type_name_id] = type_sym
-			}
-		}
 
 		for variant in d.variants {
 			variant_name_id := intern(variant.name)
@@ -607,34 +614,11 @@ resolve_module :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
 		// Импорты уже зарегистрированы в первом проходе.
 		case ^Impl_Decl:
 			for m in d.methods {
-				push_scope(&ctx)
-				args_syms := make([dynamic]Symbol_Id)
-				for arg in m.args {
-					sym := new_symbol(ctx.symbol_store, arg.name, .Variable, module, span = arg.span)
-					ctx.current_scope.symbols[intern(arg.name)] = sym
-					append(&args_syms, sym)
-				}
-				ctx.func_args[m] = args_syms
-				for stmt in m.body do resolve_stmt(&ctx, stmt)
-				pop_scope(&ctx)
+				resolve_function_body(&ctx, module, m, m.args[:], m.body)
 			}
 
 		case ^Function_Decl:
-			push_scope(&ctx)
-
-			args_syms := make([dynamic]Symbol_Id)
-			for arg in d.args {
-				sym := new_symbol(ctx.symbol_store, arg.name, .Variable, module, span = arg.span)
-				ctx.current_scope.symbols[intern(arg.name)] = sym
-				append(&args_syms, sym)
-			}
-			ctx.func_args[decl] = args_syms
-
-			for stmt in d.body {
-				resolve_stmt(&ctx, stmt)
-			}
-
-			pop_scope(&ctx)
+			resolve_function_body(&ctx, module, decl, d.args[:], d.body)
 		case ^Struct_Decl:
 		case ^Interface_Decl:
 		}

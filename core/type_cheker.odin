@@ -1185,6 +1185,53 @@ interface_method_types_match :: proc(expected: ^Type, actual: ^Type) -> bool {
 // Основной проход type checker'а идет в несколько стадий:
 // сначала регистрируем номинальные типы, потом сигнатуры, затем реализации,
 // и только после этого проверяем тела.
+// Создаёт свежий InferVar (помеченный is_decl_param — см. комментарий у
+// поля) на каждое имя type-параметра generic-декларации и кладёт в `into`
+// по имени. `ordered`, если не nil, копит тот же список позиционно —
+// нужно только Struct/Enum (decl_type_param_order, для позиционной
+// подстановки в explicit-аннотации Тип(A, B)); Function_Decl и
+// собственные type-параметры метода Impl_Decl это не используют.
+make_decl_type_params :: proc(
+	ctx: ^Type_Ctx,
+	names: []string,
+	into: ^map[string]^Type,
+	ordered: ^[dynamic]^Type = nil,
+) {
+	for name in names {
+		tv := new_infer_var(ctx)
+		tv.is_decl_param = true
+		into[name] = tv
+		if ordered != nil do append(ordered, tv)
+	}
+}
+
+// Обобщает построенный тип в Type_Scheme и, если нашлись свободные InferVar
+// (значит decl реально generic), кладёт схему в symbol_schemes — общий
+// хвост для Struct/Enum/Function_Decl и методов Impl_Decl.
+try_generalize :: proc(ctx: ^Type_Ctx, sym: Symbol_Id, t: ^Type) {
+	scheme := generalize(ctx, t)
+	if len(scheme.forall) > 0 {
+		ctx.symbol_schemes[sym] = scheme
+	}
+}
+
+// Тайпчекает тело функции/метода (ПРОХОД 4): связывает аргументы
+// (bind_function_args), затем, если для sym сохранены type-параметры
+// (generic функция/метод, см. ПРОХОД 2/3), резолвит тело в ТЕ ЖЕ
+// InferVar-узлы, что и сигнатура, — иначе без подмены current_type_params.
+// Общий паттерн для Function_Decl и методов Impl_Decl.
+check_decl_body :: proc(ctx: ^Type_Ctx, sym: Symbol_Id, d: ^Function_Decl, func_type: ^Type) {
+	bind_function_args(ctx, d, func_type)
+	if params_map, ok := ctx.decl_type_params[sym]; ok {
+		prev := ctx.current_type_params
+		ctx.current_type_params = params_map
+		check_function_body(ctx, d.span, d.body, func_type.return_type)
+		ctx.current_type_params = prev
+	} else {
+		check_function_body(ctx, d.span, d.body, func_type.return_type)
+	}
+}
+
 typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 	// ПРОХОД 1: создаем номинальные типы до разбора полей и сигнатур.
 	for decl in prog.decls {
@@ -1251,12 +1298,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				prev_declaring := ctx.currently_declaring_generic
 				params_map := make(map[string]^Type)
 				ordered := make([dynamic]^Type)
-				for name in d.type_params {
-					tv := new_infer_var(ctx)
-					tv.is_decl_param = true
-					params_map[name] = tv
-					append(&ordered, tv)
-				}
+				make_decl_type_params(ctx, d.type_params[:], &params_map, &ordered)
 				ctx.current_type_params = params_map
 				ctx.decl_type_params[sym] = params_map
 				ctx.decl_type_param_order[sym] = ordered
@@ -1269,10 +1311,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				ctx.current_type_params = prev_params
 				ctx.currently_declaring_generic = prev_declaring
 
-				scheme := generalize(ctx, struct_type)
-				if len(scheme.forall) > 0 {
-					ctx.symbol_schemes[sym] = scheme
-				}
+				try_generalize(ctx, sym, struct_type)
 			} else {
 				for f in d.fields {
 					field_type := resolve_type_node(ctx, f.type_annotation)
@@ -1290,21 +1329,14 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			if len(d.type_params) > 0 {
 				prev := ctx.current_type_params
 				params_map := make(map[string]^Type)
-				for name in d.type_params {
-					tv := new_infer_var(ctx)
-					tv.is_decl_param = true
-					params_map[name] = tv
-				}
+				make_decl_type_params(ctx, d.type_params[:], &params_map)
 				ctx.current_type_params = params_map
 
 				func_type := function_type_from_decl(ctx, d)
 				ctx.current_type_params = prev
 
 				ctx.res.symbol_types[sym] = func_type
-				scheme := generalize(ctx, func_type)
-				if len(scheme.forall) > 0 {
-					ctx.symbol_schemes[sym] = scheme
-				}
+				try_generalize(ctx, sym, func_type)
 				// ПРОХОД 4 должен резолвить T в теле в ТЕ ЖЕ узлы.
 				ctx.decl_type_params[sym] = params_map
 			} else {
@@ -1338,12 +1370,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				prev_declaring := ctx.currently_declaring_generic
 				params_map := make(map[string]^Type)
 				ordered := make([dynamic]^Type)
-				for name in d.type_params {
-					tv := new_infer_var(ctx)
-					tv.is_decl_param = true
-					params_map[name] = tv
-					append(&ordered, tv)
-				}
+				make_decl_type_params(ctx, d.type_params[:], &params_map, &ordered)
 				ctx.current_type_params = params_map
 				ctx.decl_type_params[enum_sym] = params_map
 				ctx.decl_type_param_order[enum_sym] = ordered
@@ -1361,10 +1388,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				ctx.current_type_params = prev_params
 				ctx.currently_declaring_generic = prev_declaring
 
-				scheme := generalize(ctx, enum_type)
-				if len(scheme.forall) > 0 {
-					ctx.symbol_schemes[enum_sym] = scheme
-				}
+				try_generalize(ctx, enum_sym, enum_type)
 			} else {
 				for variant in d.variants {
 					fields := make([dynamic]^Type)
@@ -1455,11 +1479,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 					if is_generic_target {
 						for k, v in ctx.decl_type_params[target_sym] do combined[k] = v
 					}
-					for name in m.type_params {
-						tv := new_infer_var(ctx)
-						tv.is_decl_param = true
-						combined[name] = tv
-					}
+					make_decl_type_params(ctx, m.type_params[:], &combined)
 					ctx.current_type_params = combined
 				}
 				method_type := function_type_from_decl(ctx, m)
@@ -1491,10 +1511,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 					// ссылка в параметре; collect_free_infer_vars проходит
 					// внутрь через .Struct/.Enum-case (с cycle-guard,
 					// Phase D) и находит оба.
-					scheme := generalize(ctx, method_type)
-					if len(scheme.forall) > 0 {
-						ctx.symbol_schemes[sym] = scheme
-					}
+					try_generalize(ctx, sym, method_type)
 					// Персистируем combined под СОБСТВЕННЫМ Symbol_Id
 					// метода — ПРОХОД 4 должен резолвить T/E в теле в ТЕ
 					// ЖЕ InferVar-узлы, что и сигнатура здесь, иначе тело
@@ -1555,18 +1572,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 		#partial switch d in decl {
 		case ^Function_Decl:
 			sym := ctx.res.decl_symbols[decl]
-			func_type := ctx.res.symbol_types[sym]
-			bind_function_args(ctx, d, func_type)
-			if params_map, ok := ctx.decl_type_params[sym]; ok {
-				// Стадия 7 Phase B: тело generic-функции резолвит T в ТЕ ЖЕ
-				// InferVar-узлы, что и сигнатура (см. ПРОХОД 2).
-				prev := ctx.current_type_params
-				ctx.current_type_params = params_map
-				check_function_body(ctx, d.span, d.body, func_type.return_type)
-				ctx.current_type_params = prev
-			} else {
-				check_function_body(ctx, d.span, d.body, func_type.return_type)
-			}
+			check_decl_body(ctx, sym, d, ctx.res.symbol_types[sym])
 		case ^Impl_Decl:
 			// Стадия 7 Phase E/F: тело generic-метода резолвит T/E в ТЕ ЖЕ
 			// InferVar, что и сигнатура в ПРОХОД 3 — ключ по СОБСТВЕННОМУ
@@ -1584,15 +1590,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 					// bind_function_args(nil).
 					continue
 				}
-				bind_function_args(ctx, m, func_type)
-				if params_map, ok := ctx.decl_type_params[sym]; ok {
-					prev := ctx.current_type_params
-					ctx.current_type_params = params_map
-					check_function_body(ctx, m.span, m.body, func_type.return_type)
-					ctx.current_type_params = prev
-				} else {
-					check_function_body(ctx, m.span, m.body, func_type.return_type)
-				}
+				check_decl_body(ctx, sym, m, func_type)
 			}
 		}
 	}

@@ -253,6 +253,52 @@ patch_signed_jump_to :: proc(c: ^Compiler, offset: int, target: int) {
 	c.current_function.instructions[offset + 1] = u8(jump_length & 0xff)
 }
 
+// Создаёт пустой Compiled_Function-скелет для sym и кладёт в registry —
+// общий hoisting-паттерн для Function_Decl и методов Impl_Decl (ПРОХОД 1),
+// позволяющий forward-вызовы (функция А зовёт Б, объявленную ниже).
+hoist_compiled_function :: proc(
+	res: ^Resolver_Ctx,
+	tc: ^Type_Ctx,
+	registry: ^map[string]^Compiled_Function,
+	sym: Symbol_Id,
+) {
+	fn := new(Compiled_Function)
+	fn.name = symbol_registry_key(res.symbol_store, sym)
+	func_type := tc.res.symbol_types[sym]
+	fn.returns_value = prune_type(func_type.return_type) != TY_VOID
+	fn.instructions = make([dynamic]u8)
+	fn.constants = make([dynamic]Value)
+	registry^[fn.name] = fn
+}
+
+// Компилирует тело функции/метода sym в уже захостенный (ПРОХОД 1)
+// Compiled_Function: строит Compiler, регистрирует locals по args_syms
+// (func_args ключуется AST-узлом декларации, не Symbol_Id — отдельный
+// параметр key), компилирует блок, эмиттит Return. Общий паттерн для
+// Function_Decl и методов Impl_Decl (ПРОХОД 2).
+compile_decl_body :: proc(
+	registry: ^map[string]^Compiled_Function,
+	tc: ^Type_Ctx,
+	res: ^Resolver_Ctx,
+	sym: Symbol_Id,
+	key: Decls,
+	body: [dynamic]Stmt,
+) {
+	ctx := Compiler {
+		registry         = registry,
+		current_function = registry^[symbol_registry_key(res.symbol_store, sym)],
+		tc               = tc,
+		res              = res,
+		locals           = make([dynamic]Local),
+	}
+	if args_syms, ok := ctx.res.func_args[key]; ok {
+		for s in args_syms do append(&ctx.locals, Local{symbol = s, depth = 0})
+	}
+	ctx.current_function.frame_size = len(ctx.locals)
+	compile_block(&ctx, body, true)
+	emit_opcode(&ctx, .Return)
+}
+
 compile_program :: proc(
 	res: ^Resolver_Ctx,
 	tc: ^Type_Ctx,
@@ -272,23 +318,11 @@ compile_program :: proc(
 		case ^Import_Decl:
 		// Импорты не порождают исполняемый код.
 		case ^Function_Decl:
-			fn := new(Compiled_Function)
-			fn.name = symbol_registry_key(res.symbol_store, res.decl_symbols[decl])
-			func_type := tc.res.symbol_types[res.decl_symbols[decl]]
-			fn.returns_value = prune_type(func_type.return_type) != TY_VOID
-			// Инициализируем массивы функции
-			fn.instructions = make([dynamic]u8)
-			fn.constants = make([dynamic]Value)
-			registry_ptr^[fn.name] = fn
+			hoist_compiled_function(res, tc, registry_ptr, res.decl_symbols[decl])
 		case ^Impl_Decl:
 			for m in d.methods {
-				fn := new(Compiled_Function); fn.name = symbol_registry_key(res.symbol_store, res.decl_symbols[m])
-				func_type := tc.res.symbol_types[res.decl_symbols[m]]
-				fn.returns_value = prune_type(func_type.return_type) != TY_VOID
-				fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
-				registry_ptr^[fn.name] = fn
+				hoist_compiled_function(res, tc, registry_ptr, res.decl_symbols[m])
 			}
-
 		}
 	}
 
@@ -296,36 +330,10 @@ compile_program :: proc(
 	for decl in program.decls {
 		#partial switch d in decl {
 		case ^Function_Decl:
-			ctx := Compiler {
-				registry         = registry_ptr,
-				current_function = registry_ptr^[symbol_registry_key(res.symbol_store, res.decl_symbols[decl])],
-				tc               = tc,
-				res              = res,
-				locals           = make([dynamic]Local),
-				scope_depth      = 0,
-			}
-
-			if args_syms, ok := ctx.res.func_args[decl]; ok {
-				for sym in args_syms do append(&ctx.locals, Local{symbol = sym, depth = 0})
-			}
-			ctx.current_function.frame_size = len(ctx.locals)
-			compile_block(&ctx, d.body, true)
-			emit_opcode(&ctx, .Return)
+			compile_decl_body(registry_ptr, tc, res, res.decl_symbols[decl], decl, d.body)
 		case ^Impl_Decl:
 			for m in d.methods {
-				ctx := Compiler {
-					registry         = registry_ptr,
-					current_function = registry_ptr^[symbol_registry_key(res.symbol_store, res.decl_symbols[m])],
-					tc               = tc,
-					res              = res,
-					locals           = make([dynamic]Local),
-				}
-				if args_syms, ok := ctx.res.func_args[m]; ok {
-					for sym in args_syms do append(&ctx.locals, Local{symbol = sym, depth = 0})
-				}
-				ctx.current_function.frame_size = len(ctx.locals)
-				compile_block(&ctx, m.body, true)
-				emit_opcode(&ctx, .Return)
+				compile_decl_body(registry_ptr, tc, res, res.decl_symbols[m], m, m.body)
 			}
 		}
 	}

@@ -19,8 +19,6 @@ Type_Kind :: enum {
 	Array,
 	Map,
 	Error,
-	Option,
-	Result,
 	InferVar,
 	Enum,
 	// Дескриптор открытого файла/потока (фс.открыть, ввод_вывод.поток) —
@@ -59,13 +57,11 @@ Type :: struct {
 	element_type:           ^Type,
 	key_type:               ^Type,
 	value_type:             ^Type,
-	ok_type:                ^Type,
-	error_type:             ^Type,
 	infer_id:               int,
 	binding:                ^Type,
-	// Для kind == .Enum (пользовательский ADT) — упорядоченный список
-	// вариантов. Также заполняется для kind == .Option / .Result при
-	// построении prelude, чтобы `выбор` разбирал их единым путём.
+	// Для kind == .Enum (пользовательский ADT, включая Опцию/Результат из
+	// прелюдии, Стадия 7 Phase F — больше не спецкейс, обычный generic-
+	// enum) — упорядоченный список вариантов.
 	variants:               [dynamic]Type_Variant,
 	// Индекс имени варианта в `variants` — заполняется вместе с variants,
 	// избавляет от O(V) линейного поиска в 3+ местах.
@@ -84,6 +80,20 @@ Type :: struct {
 	// сравнение ТОЛЬКО когда generic_origin совпадает (не по имени —
 	// коллизия имён между модулями не должна давать ложный "совместим").
 	generic_origin:         Symbol_Id,
+	// Стадия 7 Phase F: true для InferVar, созданного как ОБЪЯВЛЕННЫЙ
+	// type-параметр generic-декларации (Struct_Decl/Enum_Decl/метод со
+	// своими [E]) — т.е. ЭТО и есть T/E ШАБЛОНА, общего на весь граф
+	// (ctx.res.symbol_types[sym]), а не свежий per-call InferVar
+	// (instantiate_scheme/new_infer_var в обычных местах создают
+	// unmarked). bind_infer_var отказывается ЗАПИСЫВАТЬ .binding на
+	// такой InferVar (не мутирует шаблон), но по-прежнему считает
+	// unify успешным — иначе "это: Опция" (bare, resolve в САМ
+	// шаблонный ^Type, Phase E) внутри тела метода передало бы это как
+	// generic-value в конструктор ДРУГОГО generic-типа (Опция.Есть(x)
+	// внутри Результат.опция()) и unify_types бы НАВСЕГДА связал T/E
+	// шаблона Опции с чем попало — подтверждено живым тестом
+	// (Результат.ожидать возвращал InferVar после typecheck прелюдии).
+	is_decl_param:          bool,
 }
 
 // Ищет позицию варианта по имени в enum-типе (обычном или synth-view
@@ -165,23 +175,6 @@ new_map_type :: proc(key_type: ^Type, value_type: ^Type) -> ^Type {
 	return t
 }
 
-new_option_type :: proc(element_type: ^Type) -> ^Type {
-	t := new(Type)
-	t.kind = .Option
-	t.element_type = element_type
-	t.name = fmt.tprintf("Опция(%s)", element_type.name)
-	return t
-}
-
-new_result_type :: proc(ok_type: ^Type, error_type: ^Type) -> ^Type {
-	t := new(Type)
-	t.kind = .Result
-	t.ok_type = ok_type
-	t.error_type = error_type
-	t.name = fmt.tprintf("Результат(%s, %s)", ok_type.name, error_type.name)
-	return t
-}
-
 is_valid_map_key_type :: proc(t: ^Type) -> bool {
 	typ := prune_type(t)
 	return typ.kind == .Number || typ.kind == .Bool || typ.kind == .String
@@ -252,9 +245,10 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 	case ^Pattern_Ident:
 		info.span = pat.span
 		expected := prune_type(expected_type)
-		if expected.kind == .Enum || expected.kind == .Option || expected.kind == .Result {
+		if expected.kind == .Enum {
+			// Стадия 7 Phase F: Опция/Результат — обычные .Enum (прелюдия),
+			// synth_enum_view (виртуальный enum-вид) больше не нужен.
 			enum_view := expected
-			if expected.kind == .Option || expected.kind == .Result do enum_view = synth_enum_view(ctx, expected)
 			tag, found := variant_index(enum_view, pat.name)
 			if found {
 				if len(enum_view.variants[tag].fields) != 0 {
@@ -284,7 +278,7 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 	case ^Pattern_Constructor:
 		info.span = pat.span
 		expected := prune_type(expected_type)
-		if expected.kind != .Enum && expected.kind != .Option && expected.kind != .Result {
+		if expected.kind != .Enum {
 			report(
 				ctx,
 				pat.span,
@@ -296,7 +290,6 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 			return info
 		}
 		enum_view := expected
-		if expected.kind == .Option || expected.kind == .Result do enum_view = synth_enum_view(ctx, expected)
 		tag, found := variant_index(enum_view, pat.name)
 		if !found {
 			report(
@@ -332,42 +325,6 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 		}
 	}
 	return info
-}
-
-// Собираем виртуальный `.Enum` тип для встроенной `Опция(T)`, чтобы `выбор`
-// разбирал её единообразно (Q5, R5). Порядок вариантов зафиксирован:
-// 0 = Нет, 1 = Есть(T).
-synth_option_enum :: proc(option_type: ^Type) -> ^Type {
-	t := new(Type)
-	t.kind = .Enum
-	t.name = option_type.name
-	t.variants = make([dynamic]Type_Variant)
-	t.variant_index = make(map[string]int)
-	append(&t.variants, Type_Variant{name = "Нет", fields = make([dynamic]^Type)})
-	t.variant_index["Нет"] = 0
-	есть_fields := make([dynamic]^Type)
-	append(&есть_fields, option_type.element_type)
-	append(&t.variants, Type_Variant{name = "Есть", fields = есть_fields})
-	t.variant_index["Есть"] = 1
-	return t
-}
-
-// То же для `Результат(T, E)`: 0 = Успех(T), 1 = Неудача(E).
-synth_result_enum :: proc(result_type: ^Type) -> ^Type {
-	t := new(Type)
-	t.kind = .Enum
-	t.name = result_type.name
-	t.variants = make([dynamic]Type_Variant)
-	t.variant_index = make(map[string]int)
-	успех_fields := make([dynamic]^Type)
-	append(&успех_fields, result_type.ok_type)
-	append(&t.variants, Type_Variant{name = "Успех", fields = успех_fields})
-	t.variant_index["Успех"] = 0
-	неудача_fields := make([dynamic]^Type)
-	append(&неудача_fields, result_type.error_type)
-	append(&t.variants, Type_Variant{name = "Неудача", fields = неудача_fields})
-	t.variant_index["Неудача"] = 1
-	return t
 }
 
 // Чистая процедура: получает тип-subject и arm_infos, проверяет
@@ -476,11 +433,6 @@ Type_Ctx :: struct {
 	interface_casts:  map[Expr]^Type,
 	call_infos:       map[Expr]Call_Info,
 	match_arm_infos:  map[^Match_Expr][dynamic]Pattern_Info,
-	// Кэш synth-view Enum-типов для Опции/Результата: base type (Option/
-	// Result) → построенный virtual-Enum. Без кэша каждый match над одной
-	// Опцией/Результатом создаёт новый Type-объект (утечка + сломанный
-	// identity-check).
-	synth_enum_cache: map[^Type]^Type,
 	current_return:   ^Type,
 	loop_depth:       int,
 	next_infer_id:    int,
@@ -520,12 +472,12 @@ Type_Ctx :: struct {
 	// полей при generalize, может не совпасть с порядком заголовка, если
 	// поля объявлены в другом порядке) для этого не подходят.
 	decl_type_param_order: map[Symbol_Id][dynamic]^Type,
-	// Кэш инстанциаций generic-структур: (символ декларации + резолвленные
-	// type-аргументы) → канонический ^Type. unify_types/types_are_equal
-	// сравнивают .Struct ТОЛЬКО по identity указателя — без кэша каждое
-	// текстуальное вхождение Пара(Число, Строка) получало бы свой
-	// ^Type-объект, и они считались бы разными типами. Тот же паттерн, что
-	// synth_enum_cache выше (та же проблема, для Опции/Результата).
+	// Кэш инстанциаций generic-структур/enum'ов: (символ декларации +
+	// резолвленные type-аргументы) → канонический ^Type. unify_types/
+	// types_are_equal сравнивают .Struct/.Enum ТОЛЬКО по identity
+	// указателя — без кэша каждое текстуальное вхождение Пара(Число,
+	// Строка) получало бы свой ^Type-объект, и они считались бы разными
+	// типами.
 	generic_instance_cache: map[string]^Type,
 	// Стадия 7 Phase D: Symbol_Id generic-декларации, ЧЬЁ ТЕЛО СЕЙЧАС
 	// резолвится в ПРОХОД 2 (INVALID_SYMBOL вне этого). Рекурсивная ссылка
@@ -539,14 +491,13 @@ Type_Ctx :: struct {
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
-	return Type_Ctx {
+	ctx := Type_Ctx {
 		res = res,
 		node_types = make(map[Expr]^Type),
 		property_indices = make(map[Expr]int),
 		interface_casts = make(map[Expr]^Type),
 		call_infos = make(map[Expr]Call_Info),
 		match_arm_infos = make(map[^Match_Expr][dynamic]Pattern_Info),
-		synth_enum_cache = make(map[^Type]^Type),
 		diagnostics = make([dynamic]Diagnostic),
 		symbol_schemes = make(map[Symbol_Id]Type_Scheme),
 		decl_type_params = make(map[Symbol_Id]map[string]^Type),
@@ -554,6 +505,23 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		generic_instance_cache = make(map[string]^Type),
 		currently_declaring_generic = INVALID_SYMBOL,
 	}
+	// Стадия 7 Phase F: см. Resolver_Ctx.prelude_generic_order — прелюдия
+	// типизируется в СВОЁМ отдельном tc_ctx (ensure_prelude), любой другой
+	// Type_Ctx нуждается в скопированном ordered type-параметре Опции/
+	// Результата, иначе Опция(T)/Результат(T,E) в пользовательском модуле
+	// не резолвится как generic-тип. Через res (не res.module_graph) —
+	// module_graph resolve_program обнуляет после однократного резолва
+	// (см. там), а res переживает весь typecheck_program.
+	for sym, ordered in res.prelude_generic_order {
+		ctx.decl_type_param_order[sym] = ordered
+	}
+	// Стадия 7 Phase F Этап 4: см. Resolver_Ctx.prelude_symbol_schemes —
+	// без этого методы Опции/Результата с собственным generalize()-выводом
+	// (напр. "ожидать" -> T) вызывались бы с шаблонным, не свежим T.
+	for sym, scheme in res.prelude_symbol_schemes {
+		ctx.symbol_schemes[sym] = scheme
+	}
+	return ctx
 }
 
 // Копит ошибку вместо немедленного panic — так typecheck_program успевает
@@ -574,23 +542,6 @@ report :: proc(ctx: ^Type_Ctx, span: Span, format: string, args: ..any) -> ^Type
 	}
 	append(&ctx.diagnostics, Diagnostic{severity = .Error, span = span, message = msg})
 	return TY_POISON
-}
-
-// Кэширующая обёртка над synth_option_enum/synth_result_enum: один base
-// type даёт один synth-Enum на весь прогон type checker'а.
-synth_enum_view :: proc(ctx: ^Type_Ctx, base: ^Type) -> ^Type {
-	if cached, ok := ctx.synth_enum_cache[base]; ok do return cached
-	result: ^Type
-	#partial switch base.kind {
-	case .Option:
-		result = synth_option_enum(base)
-	case .Result:
-		result = synth_result_enum(base)
-	case:
-		fmt.panicf("Type Error: internal — synth_enum_view для не-Option/Result типа '%s'", base.name)
-	}
-	ctx.synth_enum_cache[base] = result
-	return result
 }
 
 // InferVar - внутренний временный тип. Он не равен Any: позже должен
@@ -648,15 +599,6 @@ type_contains_infer_var :: proc(t: ^Type, needle: ^Type) -> bool {
 			type_contains_infer_var(typ.key_type, needle) ||
 			type_contains_infer_var(typ.value_type, needle) \
 		)
-
-	case .Option:
-		return type_contains_infer_var(typ.element_type, needle)
-
-	case .Result:
-		return(
-			type_contains_infer_var(typ.ok_type, needle) ||
-			type_contains_infer_var(typ.error_type, needle) \
-		)
 	}
 
 	return false
@@ -668,6 +610,14 @@ bind_infer_var :: proc(var_type: ^Type, target: ^Type) -> bool {
 	if target_type == nil do return false
 	if target_type == var_type do return true
 	if type_contains_infer_var(target_type, var_type) do return false
+	// Стадия 7 Phase F: см. Type.is_decl_param — var_type ЭТО и есть T/E
+	// шаблона generic-декларации (общий на весь граф), а не свежий
+	// per-call InferVar. Считаем unify успешным (значение структурно
+	// совместимо по построению — оно и произошло от T), но НЕ пишем
+	// .binding — иначе одно случайное совпадение (напр. это: Опция,
+	// переданное в Опция.Есть(x) внутри ДРУГОГО метода) навсегда
+	// цементирует T/E шаблона для всей остальной программы.
+	if var_type.is_decl_param do return true
 	var_type.binding = target_type
 	return true
 }
@@ -717,11 +667,6 @@ collect_free_infer_vars :: proc(t: ^Type, out: ^[dynamic]int, visited: ^map[^Typ
 	case .Map:
 		collect_free_infer_vars(typ.key_type, out, v)
 		collect_free_infer_vars(typ.value_type, out, v)
-	case .Option:
-		collect_free_infer_vars(typ.element_type, out, v)
-	case .Result:
-		collect_free_infer_vars(typ.ok_type, out, v)
-		collect_free_infer_vars(typ.error_type, out, v)
 	case .Struct:
 		for f in typ.fields do collect_free_infer_vars(f.type, out, v)
 	case .Enum:
@@ -797,13 +742,6 @@ instantiate_type :: proc(ctx: ^Type_Ctx, t: ^Type, subst: ^map[int]^Type, visite
 		return new_map_type(
 			instantiate_type(ctx, pruned.key_type, subst, v),
 			instantiate_type(ctx, pruned.value_type, subst, v),
-		)
-	case .Option:
-		return new_option_type(instantiate_type(ctx, pruned.element_type, subst, v))
-	case .Result:
-		return new_result_type(
-			instantiate_type(ctx, pruned.ok_type, subst, v),
-			instantiate_type(ctx, pruned.error_type, subst, v),
 		)
 	case .Struct:
 		t2 := new(Type)
@@ -946,15 +884,6 @@ unify_types :: proc(a: ^Type, b: ^Type, visited: ^map[[2]^Type]bool = nil) -> bo
 			unify_types(left.value_type, right.value_type, v) \
 		)
 
-	case .Option:
-		return unify_types(left.element_type, right.element_type, v)
-
-	case .Result:
-		return(
-			unify_types(left.ok_type, right.ok_type, v) &&
-			unify_types(left.error_type, right.error_type, v) \
-		)
-
 	case .Struct, .Interface, .Enum:
 		// .Enum раньше не имел case здесь вообще — свитч проваливался,
 		// функция возвращала true БЕЗУСЛОВНО для любых двух разных
@@ -1021,12 +950,6 @@ has_unresolved_infer_vars :: proc(t: ^Type) -> bool {
 
 	case .Map:
 		return has_unresolved_infer_vars(typ.key_type) || has_unresolved_infer_vars(typ.value_type)
-
-	case .Option:
-		return has_unresolved_infer_vars(typ.element_type)
-
-	case .Result:
-		return has_unresolved_infer_vars(typ.ok_type) || has_unresolved_infer_vars(typ.error_type)
 	}
 
 	return false
@@ -1330,6 +1253,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				ordered := make([dynamic]^Type)
 				for name in d.type_params {
 					tv := new_infer_var(ctx)
+					tv.is_decl_param = true
 					params_map[name] = tv
 					append(&ordered, tv)
 				}
@@ -1366,7 +1290,11 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			if len(d.type_params) > 0 {
 				prev := ctx.current_type_params
 				params_map := make(map[string]^Type)
-				for name in d.type_params do params_map[name] = new_infer_var(ctx)
+				for name in d.type_params {
+					tv := new_infer_var(ctx)
+					tv.is_decl_param = true
+					params_map[name] = tv
+				}
 				ctx.current_type_params = params_map
 
 				func_type := function_type_from_decl(ctx, d)
@@ -1412,6 +1340,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				ordered := make([dynamic]^Type)
 				for name in d.type_params {
 					tv := new_infer_var(ctx)
+					tv.is_decl_param = true
 					params_map[name] = tv
 					append(&ordered, tv)
 				}
@@ -1526,7 +1455,11 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 					if is_generic_target {
 						for k, v in ctx.decl_type_params[target_sym] do combined[k] = v
 					}
-					for name in m.type_params do combined[name] = new_infer_var(ctx)
+					for name in m.type_params {
+						tv := new_infer_var(ctx)
+						tv.is_decl_param = true
+						combined[name] = tv
+					}
 					ctx.current_type_params = combined
 				}
 				method_type := function_type_from_decl(ctx, m)
@@ -1750,15 +1683,6 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 				)
 			}
 			return new_map_type(key_type, resolve_type_node(ctx, n.params[1]))
-		} else if n.name == "Опция" {
-			if len(n.params) != 1 do return report(ctx, n.span, "Type Error: Опция ожидает 1 параметр типа")
-			return new_option_type(resolve_type_node(ctx, n.params[0]))
-		} else if n.name == "Результат" {
-			if len(n.params) != 2 do return report(ctx, n.span, "Type Error: Результат ожидает 2 параметра типа")
-			return new_result_type(
-				resolve_type_node(ctx, n.params[0]),
-				resolve_type_node(ctx, n.params[1]),
-			)
 		} else {
 			// Стадия 7 Phase C: пользовательский generic-тип (структура).
 			// Раньше здесь не было fallback'а вообще — неизвестное имя
@@ -1863,15 +1787,6 @@ types_are_equal :: proc(a: ^Type, b: ^Type) -> bool {
 		return(
 			types_are_equal(left.key_type, right.key_type) &&
 			types_are_equal(left.value_type, right.value_type) \
-		)
-
-	case .Option:
-		return types_are_equal(left.element_type, right.element_type)
-
-	case .Result:
-		return(
-			types_are_equal(left.ok_type, right.ok_type) &&
-			types_are_equal(left.error_type, right.error_type) \
 		)
 
 	case .Struct, .Interface, .Enum:
@@ -2188,8 +2103,10 @@ Builtin_Ctor_Sig :: struct {
 	handler: proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type,
 }
 
-// Таблица builtin-конструкторов (Ошибка/Есть/Нет/Успех/Неудача/длина/
-// паника). Arity проверяется единообразно диспетчером; handler отвечает
+// Таблица builtin-конструкторов (Ошибка/длина/паника). Есть/Нет/Успех/
+// Неудача — теперь настоящие variant-конструкторы прелюдии (Стадия 7
+// Phase F), идут через обычный resolve_variant_ctor путь. Arity
+// проверяется единообразно диспетчером; handler отвечает
 // только за построение типа-результата и (для 'длина') за
 // дополнительную type-based валидацию.
 BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
@@ -2200,34 +2117,6 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 			check_expr(ctx, args[0], TY_STRING)
 			check_expr(ctx, args[1], TY_STRING)
 			return TY_ERROR
-		},
-	},
-	{
-		name = "Есть",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
-			return new_option_type(infer_expr(ctx, args[0]))
-		},
-	},
-	{
-		name = "Нет",
-		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
-			return new_option_type(new_infer_var(ctx))
-		},
-	},
-	{
-		name = "Успех",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
-			return new_result_type(infer_expr(ctx, args[0]), new_infer_var(ctx))
-		},
-	},
-	{
-		name = "Неудача",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
-			return new_result_type(new_infer_var(ctx), infer_expr(ctx, args[0]))
 		},
 	},
 	{
@@ -2289,198 +2178,40 @@ Method_Sig :: struct {
 	handler: proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type,
 }
 
-OPTION_METHODS := [?]Method_Sig {
-	{
-		name = "есть",
-		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
-	},
-	{
-		name = "пусто",
-		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
-	},
-	{
-		name = "значение",
-		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			return prune_type(receiver_type.element_type)
-		},
-	},
-	{
-		name = "получить",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			check_expr(ctx, args[0], receiver_type.element_type)
-			return prune_type(receiver_type.element_type)
-		},
-	},
-	{
-		name = "запас",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			fallback_type := prune_type(infer_expr(ctx, args[0]))
-			if fallback_type.kind != .Option {
-				report(
-					ctx,
-					expr_span(call),
-					"Type Error: Опция.запас() ожидает Опцию, получен '%s'",
-					fallback_type.name,
-				)
-			} else if !unify_types(receiver_type.element_type, fallback_type.element_type) {
-				report(
-					ctx,
-					expr_span(call),
-					"Type Error: Опция.запас() ожидает Опцию(%s), получен '%s'",
-					prune_type(receiver_type.element_type).name,
-					fallback_type.name,
-				)
-			}
-			return new_option_type(prune_type(receiver_type.element_type))
-		},
-	},
-	{
-		name = "ожидать",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			check_expr(ctx, args[0], TY_STRING)
-			return prune_type(receiver_type.element_type)
-		},
-	},
-	{
-		name = "результат_или",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			error_type := infer_expr(ctx, args[0])
-			return new_result_type(prune_type(receiver_type.element_type), prune_type(error_type))
-		},
-	},
-	{
-		name = "заменить_значение",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			element_type := infer_expr(ctx, args[0])
-			return new_option_type(prune_type(element_type))
-		},
-	},
+// Стадия 7 Phase F: Опция/Результат больше не Type_Kind — обычные generic-
+// enum'ы прелюдии. Общее ядро инстанциации без ctx/кэша — переиспользуется
+// и ctx-based instantiate_prelude_generic (typecheck-время), и stdlib.odin
+// (резолв-время, до существования Type_Ctx, только graph под рукой).
+// instantiate_type сам ctx не разыменовывает (см. его тело) — nil безопасен.
+instantiate_generic_raw :: proc(template: ^Type, ordered: [dynamic]^Type, args: []^Type) -> ^Type {
+	subst := make(map[int]^Type)
+	for tv, i in ordered do subst[tv.infer_id] = args[i]
+	return instantiate_type(nil, template, &subst)
 }
 
-RESULT_METHODS := [?]Method_Sig {
-	{
-		name = "успех",
-		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
-	},
-	{
-		name = "ошибка",
-		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_BOOL},
-	},
-	{
-		name = "значение",
-		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			return prune_type(receiver_type.ok_type)
-		},
-	},
-	{
-		name = "причина",
-		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			return prune_type(receiver_type.error_type)
-		},
-	},
-	{
-		name = "получить",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			check_expr(ctx, args[0], receiver_type.ok_type)
-			return prune_type(receiver_type.ok_type)
-		},
-	},
-	{
-		name = "получить_ошибку",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			check_expr(ctx, args[0], receiver_type.error_type)
-			return prune_type(receiver_type.error_type)
-		},
-	},
-	{
-		name = "запас",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			fallback_type := prune_type(infer_expr(ctx, args[0]))
-			if fallback_type.kind != .Result {
-				report(
-					ctx,
-					expr_span(call),
-					"Type Error: Результат.запас() ожидает Результат, получен '%s'",
-					fallback_type.name,
-				)
-				return new_result_type(prune_type(receiver_type.ok_type), prune_type(receiver_type.error_type))
-			}
-			if !unify_types(receiver_type.ok_type, fallback_type.ok_type) {
-				report(
-					ctx,
-					expr_span(call),
-					"Type Error: Результат.запас() ожидает Результат(%s, ...), получен '%s'",
-					prune_type(receiver_type.ok_type).name,
-					fallback_type.name,
-				)
-			}
-			return new_result_type(
-				prune_type(receiver_type.ok_type),
-				prune_type(fallback_type.error_type),
-			)
-		},
-	},
-	{
-		name = "ожидать",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			check_expr(ctx, args[0], TY_STRING)
-			return prune_type(receiver_type.ok_type)
-		},
-	},
-	{
-		name = "ожидать_ошибку",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			check_expr(ctx, args[0], TY_STRING)
-			return prune_type(receiver_type.error_type)
-		},
-	},
-	{
-		name = "опция",
-		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			return new_option_type(prune_type(receiver_type.ok_type))
-		},
-	},
-	{
-		name = "ошибка_опция",
-		arity = 0,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			return new_option_type(prune_type(receiver_type.error_type))
-		},
-	},
-	{
-		name = "заменить_значение",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			ok_type := infer_expr(ctx, args[0])
-			return new_result_type(prune_type(ok_type), prune_type(receiver_type.error_type))
-		},
-	},
-	{
-		name = "заменить_ошибку",
-		arity = 1,
-		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			error_type := infer_expr(ctx, args[0])
-			return new_result_type(prune_type(receiver_type.ok_type), prune_type(error_type))
-		},
-	},
+// FILE_METHODS/CONNECTION_METHODS всё ещё строят Результат(...) напрямую из
+// ^Type (не из AST-узла), поэтому нужен вход в тот же instantiate_type/
+// generic_instance_cache путь, что resolve_type_node использует для
+// Тип(args...) — иначе получим неканонический ^Type, который identity-only
+// unify_types (.Enum) не сочтёт равным "настоящей" Результат(Строка,
+// Ошибка), инстанцированной где-то ещё.
+instantiate_prelude_generic :: proc(ctx: ^Type_Ctx, sym: Symbol_Id, args: []^Type) -> ^Type {
+	instance := instantiate_generic_raw(ctx.res.symbol_types[sym], ctx.decl_type_param_order[sym], args)
+
+	canon_args := make([dynamic]^Type)
+	collect_instance_args(instance, &canon_args)
+	key := generic_instance_key(sym, canon_args)
+	if cached, found := ctx.generic_instance_cache[key]; found do return cached
+	ctx.generic_instance_cache[key] = instance
+	return instance
+}
+
+new_option_type :: proc(ctx: ^Type_Ctx, element_type: ^Type) -> ^Type {
+	return instantiate_prelude_generic(ctx, ctx.res.prelude_option_sym, []^Type{element_type})
+}
+
+new_result_type :: proc(ctx: ^Type_Ctx, ok_type: ^Type, error_type: ^Type) -> ^Type {
+	return instantiate_prelude_generic(ctx, ctx.res.prelude_result_sym, []^Type{ok_type, error_type})
 }
 
 FILE_METHODS := [?]Method_Sig {
@@ -2488,14 +2219,14 @@ FILE_METHODS := [?]Method_Sig {
 		name = "прочитать",
 		arity = 0,
 		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			return new_result_type(TY_STRING, TY_ERROR)
+			return new_result_type(ctx, TY_STRING, TY_ERROR)
 		},
 	},
 	{
 		name = "прочитать_строку",
 		arity = 0,
 		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			return new_result_type(TY_STRING, TY_ERROR)
+			return new_result_type(ctx, TY_STRING, TY_ERROR)
 		},
 	},
 	{
@@ -2503,7 +2234,7 @@ FILE_METHODS := [?]Method_Sig {
 		arity = 1,
 		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], TY_STRING)
-			return new_result_type(TY_NUM, TY_ERROR)
+			return new_result_type(ctx, TY_NUM, TY_ERROR)
 		},
 	},
 	{
@@ -2518,14 +2249,14 @@ CONNECTION_METHODS := [?]Method_Sig {
 		name = "получить",
 		arity = 0,
 		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			return new_result_type(TY_STRING, TY_ERROR)
+			return new_result_type(ctx, TY_STRING, TY_ERROR)
 		},
 	},
 	{
 		name = "получить_строку",
 		arity = 0,
 		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
-			return new_result_type(TY_STRING, TY_ERROR)
+			return new_result_type(ctx, TY_STRING, TY_ERROR)
 		},
 	},
 	{
@@ -2533,7 +2264,7 @@ CONNECTION_METHODS := [?]Method_Sig {
 		arity = 1,
 		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], TY_STRING)
-			return new_result_type(TY_NUM, TY_ERROR)
+			return new_result_type(ctx, TY_NUM, TY_ERROR)
 		},
 	},
 	{
@@ -2558,10 +2289,6 @@ standard_method_type :: proc(
 ) {
 	method_list: []Method_Sig
 	#partial switch receiver_type.kind {
-	case .Option:
-		method_list = OPTION_METHODS[:]
-	case .Result:
-		method_list = RESULT_METHODS[:]
 	case .File:
 		method_list = FILE_METHODS[:]
 	case .Connection:
@@ -2839,6 +2566,31 @@ infer_unary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Unary_Expr) -> ^Type {
 	return t
 }
 
+// Стадия 7 Phase F: ищет метод через ВЛАДЕЮЩИЙ ШАБЛОН (ctx.res.symbol_
+// types[obj_type.generic_origin].methods), а не через obj_type.methods
+// напрямую. instantiate_type копирует .methods присваиванием (t2.methods =
+// pruned.methods) — Odin-карты обычно алиасятся по ссылке, НО если .methods
+// СКОПИРОВАНА ДО того, как в неё что-то добавили (карта ещё пустая,
+// backing-массив не выделен), последующие вставки в ОРИГИНАЛ через ДРУГУЮ
+// переменную не видны через более раннюю копию — тот же класс бага, что и
+// graph.symbol_types (см. resolve_module). Живой баг: результат_или[E]
+// (Опция) резолвит "Результат(T, E)" ДО того, как ПРОХОД 3 дошёл до
+// "реализация Результат" (порядок деклараций в prelude.ps — Опция раньше
+// Результата) — инстанцированный Результат из результат_или получал
+// пустую .methods, "р.ошибка()" падал с "попытка получить поле у
+// не-структуры". Чтение напрямую из ВСЕГДА-АКТУАЛЬНОГО шаблона (единственный
+// объект, в который ПРОХОД 3 реально пишет) устраняет класс проблемы целиком.
+method_lookup :: proc(ctx: ^Type_Ctx, obj_type: ^Type, name: string) -> (Symbol_Id, bool) {
+	if obj_type.generic_origin != INVALID_SYMBOL {
+		if owner_type, ok := ctx.res.symbol_types[obj_type.generic_origin]; ok && owner_type != nil {
+			sym, found := owner_type.methods[name]
+			return sym, found
+		}
+	}
+	sym, found := obj_type.methods[name]
+	return sym, found
+}
+
 infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 	callee_sym := ctx.res.node_symbols[e.callee]
 	if callee_sym != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, callee_sym).kind == .Enum_Variant {
@@ -2884,7 +2636,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				export_type, found_type := ctx.res.symbol_types[export_sym_id]
 				if !found_type || export_type == nil {
 					if export_sym.kind == .Builtin {
-						export_type = builtin_export_type(resolve_interned(export_sym.full_name))
+						export_type = builtin_export_type(ctx.res.module_graph, resolve_interned(export_sym.full_name))
 						if export_type != nil {
 							ctx.res.symbol_types[export_sym_id] = export_type
 						}
@@ -2948,6 +2700,28 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 		}
 
 		obj_type := prune_type(infer_expr(ctx, prop_expr.object))
+
+		// Стадия 7 Phase F: приёмник метода мог оказаться СЫРЫМ (не
+		// инстанцированным) generic-шаблоном напрямую — например "это"
+		// внутри тела метода generic-типа (Результат/Опция/пользовательский
+		// generic), чьё объявленное "это: Тип" резолвится в ТОТ ЖЕ
+		// разделяемый ^Type, что ctx.res.symbol_types[owner] (см. ПРОХОД 3,
+		// "это: Коробка резолвится в сам шаблонный ^Type"). Если ЭТОТ метод
+		// внутри своего тела вызывает ДРУГОЙ метод на это (это.успех()
+		// внутри "ошибка") — unify_types(obj_type, свежий_экземпляр_
+		// вызываемого_метода) связал бы СОБСТВЕННЫЕ T/E шаблона напрямую,
+		// навсегда цементируя их для ВСЕЙ остальной программы (шаблон один
+		// на граф, см. Module_Graph.symbol_types). Живой баг: подтверждён
+		// живым тестом (Результат.ожидать возвращал нерезолвленный InferVar
+		// после Результат.ошибка() вызвала это.успех() где-то раньше).
+		// Свежая инстанциация здесь защищает шаблон, не меняя семантику
+		// самого вызова.
+		if obj_type.generic_origin != INVALID_SYMBOL &&
+		   obj_type == ctx.res.symbol_types[obj_type.generic_origin] {
+			if scheme, has_scheme := ctx.symbol_schemes[obj_type.generic_origin]; has_scheme {
+				obj_type = instantiate_scheme(ctx, scheme)
+			}
+		}
 
 		if method_type, handled := standard_method_type(
 			ctx,
@@ -3037,7 +2811,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 			}
 
 		} else if obj_type.kind == .Struct {
-			if method_sym, is_method := obj_type.methods[prop_expr.property]; is_method {
+			if method_sym, is_method := method_lookup(ctx, obj_type, prop_expr.property); is_method {
 				method_type := ctx.res.symbol_types[method_sym]
 				if scheme, has_scheme := ctx.symbol_schemes[method_sym]; has_scheme {
 					// Стадия 7 Phase E: свежая инстанциация на КАЖДЫЙ
@@ -3055,7 +2829,20 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 						len(method_type.params) - 1,
 					)
 				}
-				check_expr(ctx, prop_expr.object, method_type.params[0])
+				// Стадия 7 Phase F: НЕ check_expr(ctx, prop_expr.object, ...)
+				// — тот заново вызвал бы infer_expr на prop_expr.object,
+				// теряя защиту "свежая инстанциация вместо сырого шаблона"
+				// выше (obj_type уже содержит нужный, возможно
+				// переинстанцированный, тип получателя).
+				if !unify_types(obj_type, method_type.params[0]) {
+					report(
+						ctx,
+						expr_span(prop_expr.object),
+						"Type Error: ожидался '%s', получен '%s'",
+						prune_type(method_type.params[0]).name,
+						obj_type.name,
+					)
+				}
 				for arg, i in e.args do check_expr(ctx, arg, method_type.params[i + 1])
 
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
@@ -3066,7 +2853,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 			// имя историческое, кодогенерация в compiler.odin трактует его
 			// как "обычный вызов функции с receiver'ом первым аргументом",
 			// получателю всё равно, Aggregate_Value это или Variant_Value).
-			if method_sym, is_method := obj_type.methods[prop_expr.property]; is_method {
+			if method_sym, is_method := method_lookup(ctx, obj_type, prop_expr.property); is_method {
 				method_type := ctx.res.symbol_types[method_sym]
 				if scheme, has_scheme := ctx.symbol_schemes[method_sym]; has_scheme {
 					method_type = instantiate_scheme(ctx, scheme)
@@ -3080,7 +2867,17 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 						len(method_type.params) - 1,
 					)
 				}
-				check_expr(ctx, prop_expr.object, method_type.params[0])
+				// Стадия 7 Phase F: см. комментарий у .Struct-ветки выше —
+				// та же причина (не check_expr, теряет свежую инстанциацию).
+				if !unify_types(obj_type, method_type.params[0]) {
+					report(
+						ctx,
+						expr_span(prop_expr.object),
+						"Type Error: ожидался '%s', получен '%s'",
+						prune_type(method_type.params[0]).name,
+						obj_type.name,
+					)
+				}
 				for arg, i in e.args do check_expr(ctx, arg, method_type.params[i + 1])
 
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
@@ -3332,11 +3129,10 @@ infer_index_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Index_Expr) -> ^Type {
 }
 
 infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
+	// Стадия 7 Phase F: Опция/Результат — обычные .Enum (прелюдия), не
+	// нужен отдельный synth-вид.
 	subject_type_actual := prune_type(infer_expr(ctx, e.subject))
 	subject_type := subject_type_actual
-	if subject_type.kind == .Option || subject_type.kind == .Result {
-		subject_type = synth_enum_view(ctx, subject_type_actual)
-	}
 	if subject_type.kind != .Enum {
 		// Возвращаем сразу — иначе классификация каждой ветки ниже полезет
 		// в classify_pattern с невалидным subject_type и продублирует эту
@@ -3344,7 +3140,7 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 		return report(
 			ctx,
 			e.span,
-			"Type Error: выбор ожидает значение перечисления, Опции или Результата, получено '%s'",
+			"Type Error: выбор ожидает значение перечисления, получено '%s'",
 			subject_type_actual.name,
 		)
 	}
@@ -3390,37 +3186,44 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 	return prune_type(result_t)
 }
 
+// Стадия 7 Phase F: Опция/Результат больше не Type_Kind — обычные enum'ы
+// прелюдии, отличаем их от произвольного пользовательского enum'а через
+// generic_origin (Symbol_Id объявления Опции/Результата в прелюдии).
+// Нет=0/Есть=1 у Опции, Успех=0/Неудача=1 у Результата — тег-порядок
+// зафиксирован в prelude.odin.
 infer_try_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Try_Expr) -> ^Type {
 	t: ^Type
 	value_type := prune_type(infer_expr(ctx, e.value))
-	if value_type.kind == .Option {
+	if value_type.generic_origin != INVALID_SYMBOL &&
+	   value_type.generic_origin == ctx.res.prelude_option_sym {
 		return_type := prune_type(ctx.current_return)
-		if return_type == nil || return_type.kind != .Option {
+		if return_type == nil || return_type.generic_origin != ctx.res.prelude_option_sym {
 			report(
 				ctx,
 				e.span,
 				"Type Error: оператор '?' для Опции можно использовать только в функции, возвращающей Опцию",
 			)
 		}
-		t = prune_type(value_type.element_type)
-	} else if value_type.kind == .Result {
+		t = prune_type(value_type.variants[1].fields[0])
+	} else if value_type.generic_origin != INVALID_SYMBOL &&
+	   value_type.generic_origin == ctx.res.prelude_result_sym {
 		return_type := prune_type(ctx.current_return)
-		if return_type == nil || return_type.kind != .Result {
+		if return_type == nil || return_type.generic_origin != ctx.res.prelude_result_sym {
 			report(
 				ctx,
 				e.span,
 				"Type Error: оператор '?' можно использовать только в функции, возвращающей Результат",
 			)
-		} else if !unify_types(value_type.error_type, return_type.error_type) {
+		} else if !unify_types(value_type.variants[1].fields[0], return_type.variants[1].fields[0]) {
 			report(
 				ctx,
 				e.span,
 				"Type Error: оператор '?' возвращает ошибку типа '%s', но функция ожидает '%s'",
-				prune_type(value_type.error_type).name,
-				prune_type(return_type.error_type).name,
+				prune_type(value_type.variants[1].fields[0]).name,
+				prune_type(return_type.variants[1].fields[0]).name,
 			)
 		}
-		t = prune_type(value_type.ok_type)
+		t = prune_type(value_type.variants[0].fields[0])
 	} else if value_type.kind == .Poison {
 		t = TY_POISON
 	} else {
@@ -3460,7 +3263,7 @@ infer_property_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Property_Expr) -> ^T
 					return prune_type(typ)
 				}
 				if export_sym.kind == .Builtin {
-					bt := builtin_export_type(resolve_interned(export_sym.full_name))
+					bt := builtin_export_type(ctx.res.module_graph, resolve_interned(export_sym.full_name))
 					if bt != nil {
 						ctx.res.symbol_types[export_sym_id] = bt
 						return bt
@@ -3532,14 +3335,6 @@ infer_property_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Property_Expr) -> ^T
 		case:
 			t = report(ctx, e.span, "Type Error: у Ошибка нет поля '%s'", e.property)
 		}
-
-	} else if obj_type.kind == .Option || obj_type.kind == .Result {
-		return report(
-			ctx,
-			e.span,
-			"Type Error: метод '%s' нужно вызвать через ()",
-			e.property,
-		)
 
 	} else if obj_type.kind == .Poison {
 		t = TY_POISON

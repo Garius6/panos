@@ -1,0 +1,329 @@
+package core
+
+// Стадия 7 Phase F: Опция(T)/Результат(T,E) больше не хардкожены как
+// Type_Kind.Option/.Result — это обычные generic-enum'ы (тот же механизм,
+// что тип Дерево[T] = перечисление ... конец из Phase D), объявленные
+// здесь и неявно доступные КАЖДОМУ модулю без "импорт" — единственный
+// способ сохранить их поведение "всегда под рукой", раз panos не сливает
+// имена импортированного модуля в scope (см. resolve_module ниже).
+//
+// Embedded-строка, не файл на диске — panos file.ps должен работать
+// независимо от текущей директории/установки, без поиска "где лежит
+// stdlib".
+//
+// Тег-порядок вариантов (Нет=0/Есть=1, Успех=0/Неудача=1) сохраняет
+// рантайм-семантику, которую vm.odin уже предполагал для Option_Value/
+// Result_Value до этой фазы (variant_tag/variant_field).
+PRELUDE_SOURCE :: `
+экспорт тип Опция[T] = перечисление
+	Нет
+	Есть(T)
+конец
+
+экспорт тип Результат[T, E] = перечисление
+	Успех(T)
+	Неудача(E)
+конец
+
+реализация Опция
+	функ есть(это: Опция) -> Булево
+		выбор это
+			Нет -> ложь
+			Есть(_) -> истина
+		конец
+	конец
+
+	функ пусто(это: Опция) -> Булево
+		не это.есть()
+	конец
+
+	функ значение(это: Опция) -> T
+		выбор это
+			Есть(x) -> x
+			Нет -> паника("нет значения")
+		конец
+	конец
+
+	функ получить(это: Опция, запасное: T) -> T
+		выбор это
+			Есть(x) -> x
+			Нет -> запасное
+		конец
+	конец
+
+	функ запас(это: Опция, другая: Опция) -> Опция
+		выбор это
+			Есть(_) -> это
+			Нет -> другая
+		конец
+	конец
+
+	функ ожидать(это: Опция, сообщение: Строка) -> T
+		выбор это
+			Есть(x) -> x
+			Нет -> паника(сообщение)
+		конец
+	конец
+
+	функ результат_или[E](это: Опция, ошибка: E) -> Результат(T, E)
+		выбор это
+			Есть(x) -> Результат.Успех(x)
+			Нет -> Результат.Неудача(ошибка)
+		конец
+	конец
+
+	функ заменить_значение[U](это: Опция, новое: U) -> Опция(U)
+		выбор это
+			Есть(_) -> Опция.Есть(новое)
+			Нет -> Опция.Нет()
+		конец
+	конец
+конец
+
+реализация Результат
+	функ успех(это: Результат) -> Булево
+		выбор это
+			Успех(_) -> истина
+			Неудача(_) -> ложь
+		конец
+	конец
+
+	функ ошибка(это: Результат) -> Булево
+		не это.успех()
+	конец
+
+	функ значение(это: Результат) -> T
+		выбор это
+			Успех(x) -> x
+			Неудача(_) -> паника("нет значения")
+		конец
+	конец
+
+	функ причина(это: Результат) -> E
+		выбор это
+			Неудача(e) -> e
+			Успех(_) -> паника("нет ошибки")
+		конец
+	конец
+
+	функ получить(это: Результат, запасное: T) -> T
+		выбор это
+			Успех(x) -> x
+			Неудача(_) -> запасное
+		конец
+	конец
+
+	функ получить_ошибку(это: Результат, запасное: E) -> E
+		выбор это
+			Неудача(e) -> e
+			Успех(_) -> запасное
+		конец
+	конец
+
+	функ запас(это: Результат, другой: Результат) -> Результат
+		выбор это
+			Успех(_) -> это
+			Неудача(_) -> другой
+		конец
+	конец
+
+	функ ожидать(это: Результат, сообщение: Строка) -> T
+		выбор это
+			Успех(x) -> x
+			Неудача(_) -> паника(сообщение)
+		конец
+	конец
+
+	функ ожидать_ошибку(это: Результат, сообщение: Строка) -> E
+		выбор это
+			Неудача(e) -> e
+			Успех(_) -> паника(сообщение)
+		конец
+	конец
+
+	функ опция(это: Результат) -> Опция
+		выбор это
+			Успех(x) -> Опция.Есть(x)
+			Неудача(_) -> Опция.Нет()
+		конец
+	конец
+
+	функ ошибка_опция(это: Результат) -> Опция
+		выбор это
+			Неудача(e) -> Опция.Есть(e)
+			Успех(_) -> Опция.Нет()
+		конец
+	конец
+
+	функ заменить_значение[U](это: Результат, новое: U) -> Результат(U, E)
+		выбор это
+			Успех(_) -> Результат.Успех(новое)
+			Неудача(e) -> Результат.Неудача(e)
+		конец
+	конец
+
+	функ заменить_ошибку[V](это: Результат, новая: V) -> Результат(T, V)
+		выбор это
+			Успех(x) -> Результат.Успех(x)
+			Неудача(_) -> Результат.Неудача(новая)
+		конец
+	конец
+конец
+`
+
+PRELUDE_MODULE_KEY :: "@prelude"
+// u16-максимум — гарантированно не столкнётся с последовательными
+// file_id обычных модулей (0, 1, 2, ...), в т.ч. в run_code'вском
+// однократном графе, где file_id реальной программы — тоже 0.
+PRELUDE_FILE_ID :: max(u16)
+
+// Резолвит и типизирует прелюдию РОВНО ОДИН РАЗ на graph (мемоизация на
+// graph.modules[PRELUDE_MODULE_KEY]) — важно для cross-module identity:
+// если бы каждый модуль резолвил свою копию Опции, у них были бы РАЗНЫЕ
+// Symbol_Id/^Type для "одного" типа, ломая unify_types между модулями.
+ensure_prelude :: proc(graph: ^Module_Graph) -> ^Module {
+	if existing, ok := graph.modules[PRELUDE_MODULE_KEY]; ok {
+		return existing
+	}
+
+	tokens, lex_diags := tokenize(PRELUDE_SOURCE, PRELUDE_FILE_ID)
+	for d in lex_diags do append(&graph.parse_diagnostics, d)
+	stream := make_stream(tokens)
+	defer destroy_stream(&stream)
+
+	parser := Parser {
+		stream  = &stream,
+		file_id = PRELUDE_FILE_ID,
+	}
+	prog := parse_program(&parser)
+	for d in parser.diagnostics do append(&graph.parse_diagnostics, d)
+
+	module := new(Module)
+	module.path = PRELUDE_MODULE_KEY
+	module.dir = ""
+	module.exports = make(map[Interned]Symbol_Id)
+	module.file_id = PRELUDE_FILE_ID
+	module.source = PRELUDE_SOURCE
+	module.ast = prog
+
+	graph.file_paths[PRELUDE_FILE_ID] = PRELUDE_MODULE_KEY
+	graph.file_sources[PRELUDE_FILE_ID] = PRELUDE_SOURCE
+
+	// Регистрируем ДО resolve_module — resolve_module для НЕ-прелюдийных
+	// модулей сам вызывает ensure_prelude, а path == PRELUDE_MODULE_KEY
+	// внутри пропускает повторный вызов (см. там). Ставим в graph.modules
+	// заранее и на случай, если резолв самой прелюдии где-то внутри себя
+	// (не должен, но) попробует её же и найти.
+	graph.modules[PRELUDE_MODULE_KEY] = module
+
+	// Хип-аллоцированы (не локальные переменные) — ensure_prelude_compiled
+	// использует эти же res_ctx/tc_ctx ПОЗЖЕ, уже после возврата отсюда
+	// (компиляция методов Опции/Результата в registry — отдельный этап,
+	// см. там), стековые указатели к тому моменту были бы висячими.
+	graph.prelude_res_ctx = new(Resolver_Ctx)
+	graph.prelude_res_ctx^ = resolve_module(graph, module)
+	for d in graph.prelude_res_ctx.diagnostics do append(&graph.parse_diagnostics, d)
+
+	graph.prelude_tc_ctx = new(Type_Ctx)
+	graph.prelude_tc_ctx^ = new_type_ctx(graph.prelude_res_ctx)
+	typecheck_program(graph.prelude_tc_ctx, module.ast)
+	for d in graph.prelude_tc_ctx.diagnostics do append(&graph.parse_diagnostics, d)
+
+	// Стадия 7 Phase F: см. Module_Graph.prelude_generic_order — без этого
+	// Опция(T)/Результат(T,E) не резолвились бы как generic-типы ни в
+	// одном пользовательском модуле (у их СОБСТВЕННОГО Type_Ctx это поле
+	// иначе всегда пустое, т.к. Опция/Результат не объявлены в их AST).
+	if graph.prelude_generic_order == nil {
+		graph.prelude_generic_order = make(map[Symbol_Id][dynamic]^Type)
+	}
+	for sym, ordered in graph.prelude_tc_ctx.decl_type_param_order {
+		graph.prelude_generic_order[sym] = ordered
+	}
+	// Стадия 7 Phase F Этап 4: см. Module_Graph.prelude_symbol_schemes —
+	// без этого методы Опции/Результата (ожидать/результат_или/...)
+	// вызывались бы с НЕ-инстанцированным (шаблонным, зацементированным
+	// после первого вызова) T/E в любом пользовательском модуле.
+	if graph.prelude_symbol_schemes == nil {
+		graph.prelude_symbol_schemes = make(map[Symbol_Id]Type_Scheme)
+	}
+	for sym, scheme in graph.prelude_tc_ctx.symbol_schemes {
+		graph.prelude_symbol_schemes[sym] = scheme
+	}
+	graph.prelude_option_sym = module.exports[intern("Опция")]
+	graph.prelude_result_sym = module.exports[intern("Результат")]
+
+	// graph.symbol_types уже общий указатель на ту же map, что res_ctx.
+	// symbol_types (см. new_module_resolver_ctx) — типы Опции/Результата
+	// видны каждому следующему модулю без доп. присваивания. Но graph.
+	// symbol_types САМ может быть nil на первом использовании графа
+	// (до этого момента ни один модуль ещё не резолвился) — на всякий
+	// случай синхронизируем явно, как делает resolve_and_typecheck_all
+	// для обычных модулей.
+	graph.symbol_types = graph.prelude_res_ctx.symbol_types
+
+	return module
+}
+
+// Стадия 7 Phase F Этап 4: методы Опции/Результата (есть/значение/успех/
+// причина/...) — теперь настоящие Impl_Decl в prelude.ps, компилируются в
+// Compiled_Function ТОЧНО ТАК ЖЕ, как реализация любой пользовательской
+// структуры (Phase E) — просто нужно явно скомпилировать AST прелюдии в
+// тот же registry, что и пользовательский код, иначе Method_Struct-диспетчер
+// (compiler.odin) не находит функцию по Symbol_Id ("метод не найден").
+// Вызывается из каждой точки, что раньше звала compile_program напрямую
+// (run_code_with_args/run_module_file/main.odin) — ДО компиляции
+// пользовательского кода: .Method_Struct-диспетчер (compile_expr) кладёт в
+// байткод УЖЕ СКОМПИЛИРОВАННЫЙ указатель на функцию (emit_constant(fn_ptr)),
+// не отложенный лукап по имени — если тело пользовательской функции,
+// вызывающее Опция.значение()/Результат.ошибка()/т.п., скомпилируется
+// РАНЬШЕ прелюдии, реестр ещё пуст и compile_expr падает с "метод не
+// найден". Принимает res: ^Resolver_
+// Ctx (не graph) — resolve_program обнуляет module_graph после однократного
+// резолва (см. там), а res.prelude_res_ctx/prelude_tc_ctx (скопированы в
+// merge_prelude_exports) переживают это. Без memo-флага: повторный вызов
+// (напр. по разу на модуль в многомодульном графе) просто перезаписывает
+// registry идентичным байткодом — безвредно, но не бесплатно; вызывающие
+// зовут это ровно один раз на весь compile-проход.
+ensure_prelude_compiled :: proc(res: ^Resolver_Ctx, registry: ^map[string]^Compiled_Function) {
+	prelude_res := res.prelude_res_ctx
+	prelude_tc := res.prelude_tc_ctx
+	compile_program(prelude_res, prelude_tc, &prelude_res.current_module.ast, registry)
+}
+
+// Сливает exports прелюдии напрямую в scope резолвящегося модуля (module.
+// scope.symbols) — НЕ через .Module-обёртку, которой пользуется обычный
+// импорт (см. case ^Import_Decl в register_top_level_decl): импорт в
+// panos не сливает имена в scope вообще, даёт только alias.Имя. Прелюдия
+// должна быть доступна БЕЗ квалификации и без "импорт" — единственный
+// способ (Опция(T), не прелюдия.Опция(T)) — прямая запись Symbol_Id в
+// scope, как если бы пользователь сам объявил тип у себя в файле.
+//
+// module.variants (двухуровневая map вариантов, Стадия 18) мержить НЕ
+// нужно — Тип.Вариант резолвится через .module-поле САМОГО символа типа
+// (resolver.odin:776), который уже указывает на прелюдию независимо от
+// того, откуда на него сослались.
+merge_prelude_exports :: proc(ctx: ^Resolver_Ctx, graph: ^Module_Graph, module: ^Module, prelude: ^Module) {
+	// prelude.exports содержит И типы (Опция/Результат), И их варианты
+	// (Есть/Нет/Успех/Неудача — экспортированы для Тип.Вариант, см.
+	// register_top_level_decl case ^Enum_Decl). В scope льём ТОЛЬКО типы —
+	// варианты обязаны остаться доступны исключительно через
+	// Опция.Есть(...)/Результат.Успех(...) (Стадия 18); слияние вариантов
+	// в scope сделало бы голый Есть(...)/Успех(...) снова резолвящимся,
+	// прямо противоположное breaking change'у Phase F.
+	for name, sym in prelude.exports {
+		if symbol_at(ctx.symbol_store, sym).kind != .Type do continue
+		module.scope.symbols[name] = sym
+	}
+	ctx.prelude_option_sym = prelude.exports[intern("Опция")]
+	ctx.prelude_result_sym = prelude.exports[intern("Результат")]
+	// Копия graph.prelude_generic_order в САМ Resolver_Ctx — module_graph
+	// (в отличие от него) не переживает resolve_program (см. там,
+	// resolved.module_graph = nil), а Type_Ctx.decl_type_param_order
+	// (см. new_type_ctx) должен пережить весь typecheck_program.
+	ctx.prelude_generic_order = graph.prelude_generic_order
+	ctx.prelude_symbol_schemes = graph.prelude_symbol_schemes
+	// Копии для ensure_prelude_compiled (compiler.odin-этап) — тот же
+	// мотив, module_graph нулится, эти поля на Resolver_Ctx — нет.
+	ctx.prelude_res_ctx = graph.prelude_res_ctx
+	ctx.prelude_tc_ctx = graph.prelude_tc_ctx
+}

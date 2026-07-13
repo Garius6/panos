@@ -1062,20 +1062,31 @@ execute :: proc(vm: ^VM) {
 			continue
 
 		case .Try_Unwrap:
+			// Стадия 7 Phase F: Опция/Результат больше не отдельные
+			// Option_Value/Result_Value — обычные Variant_Value (как любой
+			// user-enum), построенные через Build_Variant. Тег-порядок
+			// (Нет=0/Есть=1, Успех=0/Неудача=1) зафиксирован в prelude.odin.
 			value := pop(&vm.stack)
-			if opt, ok_opt := value.(^Option_Value); ok_opt {
-				if opt.has_value {
-					append(&vm.stack, opt.value)
-				} else {
-					return_from_current_frame(vm, value)
-					continue
-				}
-			} else if res, ok_res := value.(^Result_Value); ok_res {
-				if res.is_ok {
-					append(&vm.stack, res.value)
-				} else {
-					return_from_current_frame(vm, value)
-					continue
+			if variant, ok := value.(^Variant_Value); ok {
+				switch variant.type_name {
+				case "Опция":
+					if variant.tag_index == 1 { 	// Есть
+						append(&vm.stack, variant.fields[0])
+					} else { 	// Нет
+						return_from_current_frame(vm, value)
+						continue
+					}
+				case "Результат":
+					if variant.tag_index == 0 { 	// Успех
+						append(&vm.stack, variant.fields[0])
+					} else { 	// Неудача
+						return_from_current_frame(vm, value)
+						continue
+					}
+				case:
+					fmt.panicf(
+						"Runtime Error: оператор '?' ожидал Опцию или Результат",
+					)
 				}
 			} else {
 				fmt.panicf(

@@ -97,6 +97,35 @@ Module_Graph :: struct {
 	// модулей, которые сейчас открыты как буферы. Пусто вне LSP — CLI
 	// (main.odin) всегда читает с диска.
 	source_overrides:  map[string]string,
+	// Стадия 7 Phase F: decl_type_param_order прелюдийных generic-типов
+	// (Опция/Результат) — обычно живёт только внутри Type_Ctx ОДНОГО
+	// typecheck_program-прохода (см. Type_Ctx.decl_type_param_order), но
+	// прелюдия резолвится/типизируется РОВНО ОДИН РАЗ в СВОЁМ tc_ctx
+	// (ensure_prelude), а каждый пользовательский модуль получает СВОЙ
+	// СВЕЖИЙ Type_Ctx — без этого поля ссылка Опция(Число) в любом
+	// пользовательском модуле теряла бы ordered type-параметры и падала
+	// с "не является generic-типом". new_type_ctx копирует это в
+	// decl_type_param_order каждого нового ctx.
+	prelude_generic_order: map[Symbol_Id][dynamic]^Type,
+	// Стадия 7 Phase F Этап 4: symbol_schemes методов Опции/Результата
+	// (Phase E generalize(), напр. "ожидать" — T выводится структурно из
+	// "это: Опция") — та же история, что и prelude_generic_order: живёт
+	// только в prelude_tc_ctx (СВОЙ typecheck-проход), пользовательский
+	// Type_Ctx никогда не видит прелюдийные Impl_Decl напрямую. Без копии
+	// вызов Результат.ожидать(...) получал бы НЕ-инстанцированный T,
+	// зацементированный на первом же вызове (или вовсе неразрешённый).
+	prelude_symbol_schemes: map[Symbol_Id]Type_Scheme,
+	// Symbol_Id Опции/Результата — нужны stdlib.odin (ensure_builtin_module
+	// работает ДО того, как для конкретного модуля есть Type_Ctx или даже
+	// Resolver_Ctx.prelude_option_sym, только graph под рукой).
+	prelude_option_sym:    Symbol_Id,
+	prelude_result_sym:    Symbol_Id,
+	// Хип-аллоцированные resolve/typecheck-контексты прелюдии — нужны
+	// ensure_prelude_compiled (compiler.odin-этап, см. там) ПОСЛЕ того,
+	// как ensure_prelude уже вернулась (её собственные локальные res_ctx/
+	// tc_ctx к тому моменту были бы недействительны на стеке).
+	prelude_res_ctx:       ^Resolver_Ctx,
+	prelude_tc_ctx:        ^Type_Ctx,
 }
 
 Scope :: struct {
@@ -304,6 +333,28 @@ Resolver_Ctx :: struct {
 	node_symbols:    map[Expr]Symbol_Id,
 	func_args:       map[Decls][dynamic]Symbol_Id,
 	lambda_args:     map[Expr][dynamic]Symbol_Id,
+
+	// Стадия 7 Phase F: Symbol_Id типов Опция/Результат из прелюдии —
+	// нужны type_cheker.odin (infer_try_expr, оператор `?`), чтобы отличить
+	// "это именно Опция/Результат" от произвольного пользовательского
+	// 2-вариантного enum (.kind == .Enum само по себе не различает).
+	// Выставляются в resolve_module после слияния экспортов прелюдии.
+	prelude_option_sym: Symbol_Id,
+	prelude_result_sym: Symbol_Id,
+	// Копия graph.prelude_generic_order (см. там) — Resolver_Ctx (в
+	// отличие от module_graph, который resolve_program обнуляет после
+	// однократного резолва, см. resolve_program) переживает весь
+	// typecheck_program. new_type_ctx копирует это в decl_type_param_order
+	// каждого нового Type_Ctx.
+	prelude_generic_order: map[Symbol_Id][dynamic]^Type,
+	// Копия graph.prelude_symbol_schemes (см. там) — new_type_ctx копирует
+	// это в symbol_schemes каждого нового Type_Ctx.
+	prelude_symbol_schemes: map[Symbol_Id]Type_Scheme,
+	// Копии graph.prelude_res_ctx/prelude_tc_ctx — нужны ensure_prelude_
+	// compiled (compiler.odin-этап), тем же способом: module_graph
+	// resolve_program обнуляет, эти поля на Resolver_Ctx — нет.
+	prelude_res_ctx:       ^Resolver_Ctx,
+	prelude_tc_ctx:        ^Type_Ctx,
 }
 
 report_resolve :: proc(ctx: ^Resolver_Ctx, span: Span, format: string, args: ..any) {
@@ -328,15 +379,11 @@ pop_scope :: proc(resolver: ^Resolver_Ctx) {
 }
 
 install_standard_symbols :: proc(ctx: ^Resolver_Ctx) {
-	names := [?]string {
-		"Ошибка",
-		"Есть",
-		"Нет",
-		"Успех",
-		"Неудача",
-		"длина",
-		"паника",
-	}
+	// Стадия 7 Phase F: Есть/Нет/Успех/Неудача раньше жили здесь как
+	// .Builtin-символы (голый вызов, не через Тип.Вариант) — теперь это
+	// настоящие Enum_Variant варианты Опции/Результата из прелюдии,
+	// доступные через слияние её exports в resolve_module (см. ниже).
+	names := [?]string{"Ошибка", "длина", "паника"}
 	for name in names {
 		sym := new_symbol(ctx.symbol_store, name, .Builtin, nil)
 		ctx.current_scope.symbols[intern(name)] = sym
@@ -530,6 +577,26 @@ resolve_module :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
 		module.exports = make(map[Interned]Symbol_Id)
 	}
 
+	// Стадия 7 Phase F: Опция/Результат доступны в КАЖДОМ модуле без
+	// "импорт" — module.path проверяем, чтобы резолв самой прелюдии не
+	// пытался слить себя же в собственный scope (ensure_prelude уже
+	// зарегистрировал module в graph.modules ДО вызова resolve_module,
+	// так что prelude != nil сработал бы неверно и без этой проверки —
+	// но path-проверка явнее и не завязана на порядок регистрации).
+	if module.path != PRELUDE_MODULE_KEY {
+		prelude := ensure_prelude(graph)
+		merge_prelude_exports(&ctx, graph, module, prelude)
+		// ensure_prelude типизирует прелюдию В СВОЁМ, ОТДЕЛЬНОМ вызове
+		// resolve_module — graph.symbol_types растёт с нуля (первая
+		// вставка в свежую map, см. resolve_and_typecheck_all — тот же
+		// паттерн, тот же комментарий: "эмпирически проверено"), и ctx.
+		// symbol_types (скопирован ДО этого роста, в new_module_resolver_
+		// ctx выше) остаётся указывать на СТАРУЮ, всё ещё пустую копию —
+		// без пересинхронизации типы Опции/Результата/фс/сеть и т.п.
+		// невидимы для typecheck_program этого модуля.
+		ctx.symbol_types = graph.symbol_types
+	}
+
 	for decl in module.ast.decls {
 		register_top_level_decl(&ctx, module, decl)
 	}
@@ -573,6 +640,10 @@ resolve_module :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
 		}
 	}
 
+	// См. комментарий у резинхронизации после ensure_prelude выше —
+	// register_top_level_decl (ensure_builtin_module/add_builtin_export)
+	// тоже пишет напрямую в graph.symbol_types, тот же риск расхождения.
+	ctx.symbol_types = graph.symbol_types
 	return ctx
 }
 

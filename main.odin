@@ -93,6 +93,9 @@ run_file :: proc(filename: string, program_args: []string = nil, verbose: bool =
 	print_diagnostics_and_exit(&graph, all_diags)
 
 	global_registry := make(map[string]^core.Compiled_Function)
+	if len(results) > 0 {
+		core.ensure_prelude_compiled(&results[0].res_ctx, &global_registry)
+	}
 
 	for i in 0 ..< len(results) {
 		r := &results[i]

@@ -116,6 +116,9 @@ Variant_Decl :: struct {
 Enum_Decl :: struct {
 	span:        Span,
 	name:        string,
+	// Стадия 7 Phase D: имена type-параметров из `[T]` после имени enum'а.
+	// Пусто для обычных (не-generic) перечислений.
+	type_params: [dynamic]string,
 	variants:    [dynamic]Variant_Decl,
 	is_exported: bool,
 }
@@ -682,6 +685,10 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
 	decl.name = name_tok.data
 	decl.is_exported = is_exported
 	decl.variants = make([dynamic]Variant_Decl)
+
+	if peek_token(p.stream).kind == .LBracket {
+		decl.type_params = parse_type_params(p)
+	}
 
 	expect(p, .Assign)
 	expect(p, .Enum)

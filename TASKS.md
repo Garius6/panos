@@ -397,7 +397,10 @@ Prerequisite: Стадия 6.
 - [x] Phase C: generic struct — только структуры (интерфейсы отложены,
       сравнимы по объёму с Phase E); добавлен generic_instance_cache
       (identity-канонизация инстанциаций, см. заметку в ROADMAP §Стадия 7)
-- [ ] Phase D: generic ADT
+- [x] Phase D: generic ADT — вскрыл и починил 3 бага по пути (identity
+      unify для .Enum, кэш-ключ конструктора structs по порядку полей
+      вместо заголовка, SIGSEGV на самоссылающихся generic-типах), см.
+      заметку в ROADMAP §Стадия 7
 - [ ] Phase E: `реализация Список[T]`
 - [ ] Phase F: prelude cleanup (Опция/Результат как user-declared ADT)
 

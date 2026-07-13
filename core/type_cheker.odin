@@ -70,6 +70,20 @@ Type :: struct {
 	// Индекс имени варианта в `variants` — заполняется вместе с variants,
 	// избавляет от O(V) линейного поиска в 3+ местах.
 	variant_index:          map[string]int,
+	// Стадия 7 Phase D: Symbol_Id generic-декларации (Struct_Decl/
+	// Enum_Decl), от которой произведён этот Type — INVALID_SYMBOL для
+	// НЕ-generic типов. Нужен unify_types/types_are_equal: у рекурсивных
+	// generic-типов (тип Список[T] = структура следующий: Опция(Список(T))
+	// конец) self-ссылка внутри ОДНОЙ инстанциации канонизируется через
+	// generic_instance_cache только ПОСЛЕ полной унификации конструктора
+	// — а до этого момента две РАЗНЫЕ инстанциации одного и того же
+	// generic-объявления (например, поле следующий текущего узла и уже
+	// построенный хвост списка) физически разные ^Type-указатели, хотя
+	// семантически один тип. identity-only сравнение (see .Struct case)
+	// ошибочно считает их несовместимыми — фоллбек на структурное
+	// сравнение ТОЛЬКО когда generic_origin совпадает (не по имени —
+	// коллизия имён между модулями не должна давать ложный "совместим").
+	generic_origin:         Symbol_Id,
 }
 
 // Ищет позицию варианта по имени в enum-типе (обычном или synth-view
@@ -513,6 +527,15 @@ Type_Ctx :: struct {
 	// ^Type-объект, и они считались бы разными типами. Тот же паттерн, что
 	// synth_enum_cache выше (та же проблема, для Опции/Результата).
 	generic_instance_cache: map[string]^Type,
+	// Стадия 7 Phase D: Symbol_Id generic-декларации, ЧЬЁ ТЕЛО СЕЙЧАС
+	// резолвится в ПРОХОД 2 (INVALID_SYMBOL вне этого). Рекурсивная ссылка
+	// на СЕБЯ ЖЕ (Дерево(T) внутри Дерево[T]) не может пройти обычную
+	// instantiate_type/generic_instance_cache — шаблон ещё не полностью
+	// заполнен (мы в процессе). Type_Generic-ветка, встретив ссылку на
+	// этот же символ, возвращает ctx.res.symbol_types[sym] напрямую — тот
+	// же мутируемый указатель, что ПРОХОД 2 продолжает достраивать
+	// append'ом; к моменту реального использования (ПРОХОД 4+) он уже полон.
+	currently_declaring_generic: Symbol_Id,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -529,6 +552,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		decl_type_params = make(map[Symbol_Id]map[string]^Type),
 		decl_type_param_order = make(map[Symbol_Id][dynamic]^Type),
 		generic_instance_cache = make(map[string]^Type),
+		currently_declaring_generic = INVALID_SYMBOL,
 	}
 }
 
@@ -652,7 +676,14 @@ bind_infer_var :: proc(var_type: ^Type, target: ^Type) -> bool {
 // что и type_contains_infer_var, только вместо поиска конкретного needle
 // копит все встреченные unbound InferVar (с дедупом). Используется
 // generalize'ом (Стадия 7 Phase A).
-collect_free_infer_vars :: proc(t: ^Type, out: ^[dynamic]int) {
+//
+// Стадия 7 Phase D: Struct/Enum могут ссылаться на себя рекурсивно (тип
+// Список[T] = структура значение: T следующий: Опция(Список(T)) конец) —
+// без visited-множества обход зациклился бы навсегда (SIGSEGV на
+// переполнении стека, подтверждено живым тестом на self_ref_struct.ps).
+// visited создаётся лениво верхним вызовом (generalize, visited == nil),
+// дальше передаётся по цепочке рекурсии.
+collect_free_infer_vars :: proc(t: ^Type, out: ^[dynamic]int, visited: ^map[^Type]bool = nil) {
 	typ := prune_type(t)
 	if typ == nil do return
 
@@ -664,24 +695,39 @@ collect_free_infer_vars :: proc(t: ^Type, out: ^[dynamic]int) {
 		return
 	}
 
+	v := visited
+	local_v: map[^Type]bool
+	if v == nil {
+		local_v = make(map[^Type]bool)
+		v = &local_v
+	}
+	if typ.kind == .Struct || typ.kind == .Enum {
+		if v[typ] do return
+		v[typ] = true
+	}
+
 	#partial switch typ.kind {
 	case .Function:
-		for param in typ.params do collect_free_infer_vars(param, out)
-		collect_free_infer_vars(typ.return_type, out)
+		for param in typ.params do collect_free_infer_vars(param, out, v)
+		collect_free_infer_vars(typ.return_type, out, v)
 	case .Tuple:
-		for el in typ.elements do collect_free_infer_vars(el, out)
+		for el in typ.elements do collect_free_infer_vars(el, out, v)
 	case .Array:
-		collect_free_infer_vars(typ.element_type, out)
+		collect_free_infer_vars(typ.element_type, out, v)
 	case .Map:
-		collect_free_infer_vars(typ.key_type, out)
-		collect_free_infer_vars(typ.value_type, out)
+		collect_free_infer_vars(typ.key_type, out, v)
+		collect_free_infer_vars(typ.value_type, out, v)
 	case .Option:
-		collect_free_infer_vars(typ.element_type, out)
+		collect_free_infer_vars(typ.element_type, out, v)
 	case .Result:
-		collect_free_infer_vars(typ.ok_type, out)
-		collect_free_infer_vars(typ.error_type, out)
+		collect_free_infer_vars(typ.ok_type, out, v)
+		collect_free_infer_vars(typ.error_type, out, v)
 	case .Struct:
-		for f in typ.fields do collect_free_infer_vars(f.type, out)
+		for f in typ.fields do collect_free_infer_vars(f.type, out, v)
+	case .Enum:
+		for variant in typ.variants {
+			for f in variant.fields do collect_free_infer_vars(f, out, v)
+		}
 	}
 }
 
@@ -707,9 +753,31 @@ generalize :: proc(ctx: ^Type_Ctx, t: ^Type) -> Type_Scheme {
 // (конкретные типы, Struct/Enum/Interface — не входят в forall) возвращает
 // тем же указателем без копии. Обходит тот же набор Type_Kind, что
 // type_contains_infer_var/collect_free_infer_vars.
-instantiate_type :: proc(ctx: ^Type_Ctx, t: ^Type, subst: ^map[int]^Type) -> ^Type {
+//
+// Стадия 7 Phase D: Struct/Enum могут ссылаться на себя рекурсивно (тип
+// Дерево[T] = перечисление Узел(T, Дерево(T), Дерево(T)) конец) — наивная
+// рекурсия зациклилась бы, копируя один и тот же тип бесконечно (SIGSEGV,
+// подтверждено живым тестом). visited — memo-карта template-указатель →
+// уже-созданная копия: копия регистрируется В НЕЙ ДО рекурсии в свои
+// поля/варианты (классический приём глубокого копирования циклического
+// графа), так что повторная встреча того же template-указателя внутри
+// собственных полей возвращает УЖЕ созданную (пока не до конца
+// заполненную) копию вместо попытки построить новую — к моменту, когда
+// внешний вызов допишет её поля, все ссылки (включая внутренние на саму
+// себя) видят финальное состояние через общий указатель.
+instantiate_type :: proc(ctx: ^Type_Ctx, t: ^Type, subst: ^map[int]^Type, visited: ^map[^Type]^Type = nil) -> ^Type {
 	pruned := prune_type(t)
 	if pruned == nil do return nil
+
+	v := visited
+	local_v: map[^Type]^Type
+	if v == nil {
+		local_v = make(map[^Type]^Type)
+		v = &local_v
+	}
+	if pruned.kind == .Struct || pruned.kind == .Enum {
+		if existing, ok := v[pruned]; ok do return existing
+	}
 
 	#partial switch pruned.kind {
 	case .InferVar:
@@ -717,39 +785,55 @@ instantiate_type :: proc(ctx: ^Type_Ctx, t: ^Type, subst: ^map[int]^Type) -> ^Ty
 		return pruned
 	case .Function:
 		params := make([dynamic]^Type)
-		for param in pruned.params do append(&params, instantiate_type(ctx, param, subst))
-		return new_function_type(params, instantiate_type(ctx, pruned.return_type, subst))
+		for param in pruned.params do append(&params, instantiate_type(ctx, param, subst, v))
+		return new_function_type(params, instantiate_type(ctx, pruned.return_type, subst, v))
 	case .Tuple:
 		elements := make([dynamic]^Type)
-		for el in pruned.elements do append(&elements, instantiate_type(ctx, el, subst))
+		for el in pruned.elements do append(&elements, instantiate_type(ctx, el, subst, v))
 		return new_tuple_type(elements)
 	case .Array:
-		return new_array_type(instantiate_type(ctx, pruned.element_type, subst))
+		return new_array_type(instantiate_type(ctx, pruned.element_type, subst, v))
 	case .Map:
 		return new_map_type(
-			instantiate_type(ctx, pruned.key_type, subst),
-			instantiate_type(ctx, pruned.value_type, subst),
+			instantiate_type(ctx, pruned.key_type, subst, v),
+			instantiate_type(ctx, pruned.value_type, subst, v),
 		)
 	case .Option:
-		return new_option_type(instantiate_type(ctx, pruned.element_type, subst))
+		return new_option_type(instantiate_type(ctx, pruned.element_type, subst, v))
 	case .Result:
 		return new_result_type(
-			instantiate_type(ctx, pruned.ok_type, subst),
-			instantiate_type(ctx, pruned.error_type, subst),
+			instantiate_type(ctx, pruned.ok_type, subst, v),
+			instantiate_type(ctx, pruned.error_type, subst, v),
 		)
 	case .Struct:
-		fields := make([dynamic]Struct_Field)
-		for f in pruned.fields {
-			append(&fields, Struct_Field{name = f.name, type = instantiate_type(ctx, f.type, subst)})
-		}
 		t2 := new(Type)
 		t2.kind = .Struct
 		t2.name = pruned.name
-		t2.fields = fields
+		t2.generic_origin = pruned.generic_origin
+		t2.fields = make([dynamic]Struct_Field)
 		// Стадия 7 Phase C: generic-структуры не поддерживают реализация
 		// (см. ПРОХОД 3) — пустые карты, как у шаблона в ПРОХОД 1.
 		t2.methods = make(map[string]Symbol_Id)
 		t2.implemented_interfaces = make([dynamic]^Type)
+		v[pruned] = t2 // регистрируем ДО рекурсии в поля — см. комментарий выше
+		for f in pruned.fields {
+			append(&t2.fields, Struct_Field{name = f.name, type = instantiate_type(ctx, f.type, subst, v)})
+		}
+		return t2
+	case .Enum:
+		t2 := new(Type)
+		t2.kind = .Enum
+		t2.name = pruned.name
+		t2.generic_origin = pruned.generic_origin
+		t2.variants = make([dynamic]Type_Variant)
+		t2.variant_index = pruned.variant_index // имена→индексы не меняются копией
+		t2.methods = make(map[string]Symbol_Id) // Phase D: реализация на generic enum — Phase E
+		v[pruned] = t2 // регистрируем ДО рекурсии в варианты
+		for variant in pruned.variants {
+			fields := make([dynamic]^Type)
+			for f in variant.fields do append(&fields, instantiate_type(ctx, f, subst, v))
+			append(&t2.variants, Type_Variant{name = variant.name, fields = fields})
+		}
 		return t2
 	}
 	return pruned
@@ -777,9 +861,36 @@ generic_instance_key :: proc(sym: Symbol_Id, args: [dynamic]^Type) -> string {
 	return strings.to_string(b)
 }
 
+// Стадия 7 Phase C/D: собирает pruned-типы полей структуры / полей всех
+// вариантов перечисления УЖЕ ИНСТАНЦИРОВАННОГО типа, в порядке
+// структурного обхода — единый источник для generic_instance_key. И
+// explicit-аннотация (Пара(Число,Строка)), и inferred-конструктор
+// (Пара(1,"a")) при одинаковой семантической инстанциации ДОЛЖНЫ давать
+// одинаковый ключ — раньше (Phase C) конструктор строил ключ по порядку
+// ПОЛЕЙ, а аннотация — по порядку ЗАГОЛОВКА [A, B]; расходятся, если поля
+// объявлены не в том же порядке, что заголовок. Единый обход убирает
+// расхождение по конструкции.
+collect_instance_args :: proc(instance: ^Type, out: ^[dynamic]^Type) {
+	#partial switch instance.kind {
+	case .Struct:
+		for f in instance.fields do append(out, prune_type(f.type))
+	case .Enum:
+		for v in instance.variants {
+			for f in v.fields do append(out, prune_type(f))
+		}
+	}
+}
+
 // Унификация либо подтверждает совместимость типов, либо фиксирует InferVar.
 // Это главный механизм вывода типов в лямбдах, аргументах и присваиваниях.
-unify_types :: proc(a: ^Type, b: ^Type) -> bool {
+//
+// Стадия 7 Phase D: visited — пары указателей, уже сравниваемые ВЫШЕ по
+// стеку рекурсии (нужно для рекурсивных generic-типов, тип Список[T] =
+// структура следующий: Опция(Список(T)) конец — сравнение двух РАЗНЫХ
+// инстанциаций одного объявления рекурсивно заходит в свои же поля).
+// Создаётся лениво верхним вызовом (visited == nil), дальше передаётся по
+// цепочке — тот же приём, что в instantiate_type/collect_free_infer_vars.
+unify_types :: proc(a: ^Type, b: ^Type, visited: ^map[[2]^Type]bool = nil) -> bool {
 	left := prune_type(a)
 	right := prune_type(b)
 	if left == nil || right == nil do return false
@@ -799,41 +910,83 @@ unify_types :: proc(a: ^Type, b: ^Type) -> bool {
 
 	if left.kind != right.kind do return false
 
+	v := visited
+	local_v: map[[2]^Type]bool
+	if v == nil {
+		local_v = make(map[[2]^Type]bool)
+		v = &local_v
+	}
+
 	#partial switch left.kind {
 	case .Tuple:
 		if len(left.elements) != len(right.elements) do return false
 		for i in 0 ..< len(left.elements) {
-			if !unify_types(left.elements[i], right.elements[i]) do return false
+			if !unify_types(left.elements[i], right.elements[i], v) do return false
 		}
 		return true
 
 	case .Function:
 		if len(left.params) != len(right.params) do return false
 		for i in 0 ..< len(left.params) {
-			if !unify_types(left.params[i], right.params[i]) do return false
+			if !unify_types(left.params[i], right.params[i], v) do return false
 		}
-		return unify_types(left.return_type, right.return_type)
+		return unify_types(left.return_type, right.return_type, v)
 
 	case .Array:
-		return unify_types(left.element_type, right.element_type)
+		return unify_types(left.element_type, right.element_type, v)
 
 	case .Map:
 		return(
-			unify_types(left.key_type, right.key_type) &&
-			unify_types(left.value_type, right.value_type) \
+			unify_types(left.key_type, right.key_type, v) &&
+			unify_types(left.value_type, right.value_type, v) \
 		)
 
 	case .Option:
-		return unify_types(left.element_type, right.element_type)
+		return unify_types(left.element_type, right.element_type, v)
 
 	case .Result:
 		return(
-			unify_types(left.ok_type, right.ok_type) &&
-			unify_types(left.error_type, right.error_type) \
+			unify_types(left.ok_type, right.ok_type, v) &&
+			unify_types(left.error_type, right.error_type, v) \
 		)
 
-	case .Struct, .Interface:
-		return false
+	case .Struct, .Interface, .Enum:
+		// .Enum раньше не имел case здесь вообще — свитч проваливался,
+		// функция возвращала true БЕЗУСЛОВНО для любых двух разных
+		// enum-типов (подтверждено живым тестом: тип А/тип Б,
+		// принимает_а(Б.ВариантБ) компилировался без ошибки).
+		//
+		// identity (left == right) уже проверена выше и не сработала —
+		// значит либо это ДЕЙСТВИТЕЛЬНО разные типы (generic_origin не
+		// совпадает или INVALID_SYMBOL — не generic вовсе), либо это
+		// self-ссылка ВНУТРИ рекурсивного generic-типа, ещё не
+		// канонизированная через generic_instance_cache (см.
+		// Type.generic_origin) — тогда сравниваем структурно.
+		if left.kind == .Interface || left.generic_origin == INVALID_SYMBOL ||
+		   left.generic_origin != right.generic_origin {
+			return false
+		}
+		pair := [2]^Type{left, right}
+		if v[pair] do return true // уже сравниваем эту пару выше по стеку — цикл, считаем совместимой
+		v[pair] = true
+
+		if left.kind == .Struct {
+			if len(left.fields) != len(right.fields) do return false
+			for i in 0 ..< len(left.fields) {
+				if !unify_types(left.fields[i].type, right.fields[i].type, v) do return false
+			}
+			return true
+		}
+		// .Enum
+		if len(left.variants) != len(right.variants) do return false
+		for i in 0 ..< len(left.variants) {
+			if left.variants[i].name != right.variants[i].name do return false
+			if len(left.variants[i].fields) != len(right.variants[i].fields) do return false
+			for j in 0 ..< len(left.variants[i].fields) {
+				if !unify_types(left.variants[i].fields[j], right.variants[i].fields[j], v) do return false
+			}
+		}
+		return true
 	}
 	return true
 }
@@ -1117,6 +1270,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			struct_type.implemented_interfaces = make([dynamic]^Type)
 
 			sym := ctx.res.decl_symbols[decl]
+			struct_type.generic_origin = sym
 			ctx.res.symbol_types[sym] = struct_type
 
 		case ^Interface_Decl:
@@ -1135,7 +1289,9 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			// Как у Struct — без этого `реализация X` для перечисления X
 			// падала бы на nil-map assignment в ПРОХОДЕ 3.
 			enum_type.methods = make(map[string]Symbol_Id)
-			ctx.res.symbol_types[ctx.res.decl_symbols[decl]] = enum_type
+			enum_sym := ctx.res.decl_symbols[decl]
+			enum_type.generic_origin = enum_sym
+			ctx.res.symbol_types[enum_sym] = enum_type
 		}
 	}
 
@@ -1155,8 +1311,16 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			// Type_Generic (Пара(Число, Строка)) — заполняется всегда при
 			// непустом d.type_params, даже если конкретный параметр не
 			// встречается ни в одном поле.
+			//
+			// Стадия 7 Phase D: decl_type_params/decl_type_param_order и
+			// currently_declaring_generic выставляются ДО цикла резолва
+			// полей (не после, как было в Phase C) — иначе самоссылка
+			// (тип Список[T] = структура ... следующий: Опция(Список(T))
+			// конец) не распознаётся как generic вообще на момент, когда
+			// до неё доходит resolve_type_node.
 			if len(d.type_params) > 0 {
-				prev := ctx.current_type_params
+				prev_params := ctx.current_type_params
+				prev_declaring := ctx.currently_declaring_generic
 				params_map := make(map[string]^Type)
 				ordered := make([dynamic]^Type)
 				for name in d.type_params {
@@ -1165,19 +1329,21 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 					append(&ordered, tv)
 				}
 				ctx.current_type_params = params_map
+				ctx.decl_type_params[sym] = params_map
+				ctx.decl_type_param_order[sym] = ordered
+				ctx.currently_declaring_generic = sym
 
 				for f in d.fields {
 					field_type := resolve_type_node(ctx, f.type_annotation)
 					append(&struct_type.fields, Struct_Field{name = f.name, type = field_type})
 				}
-				ctx.current_type_params = prev
+				ctx.current_type_params = prev_params
+				ctx.currently_declaring_generic = prev_declaring
 
 				scheme := generalize(ctx, struct_type)
 				if len(scheme.forall) > 0 {
 					ctx.symbol_schemes[sym] = scheme
 				}
-				ctx.decl_type_params[sym] = params_map
-				ctx.decl_type_param_order[sym] = ordered
 			} else {
 				for f in d.fields {
 					field_type := resolve_type_node(ctx, f.type_annotation)
@@ -1224,15 +1390,57 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			}
 
 		case ^Enum_Decl:
-			enum_type := ctx.res.symbol_types[ctx.res.decl_symbols[decl]]
-			for variant in d.variants {
-				fields := make([dynamic]^Type)
-				for tn in variant.types {
-					append(&fields, resolve_type_node(ctx, tn))
+			enum_sym := ctx.res.decl_symbols[decl]
+			enum_type := ctx.res.symbol_types[enum_sym]
+
+			// Стадия 7 Phase D: тот же паттерн, что Struct_Decl выше —
+			// decl_type_params/decl_type_param_order и
+			// currently_declaring_generic выставляются ДО цикла резолва
+			// вариантов (не после), иначе самоссылка (тип Дерево[T] =
+			// перечисление Узел(T, Дерево(T), Дерево(T)) конец) не
+			// распознаётся как generic на момент, когда до неё доходит
+			// resolve_type_node.
+			if len(d.type_params) > 0 {
+				prev_params := ctx.current_type_params
+				prev_declaring := ctx.currently_declaring_generic
+				params_map := make(map[string]^Type)
+				ordered := make([dynamic]^Type)
+				for name in d.type_params {
+					tv := new_infer_var(ctx)
+					params_map[name] = tv
+					append(&ordered, tv)
 				}
-				tag := len(enum_type.variants)
-				append(&enum_type.variants, Type_Variant{name = variant.name, fields = fields})
-				enum_type.variant_index[variant.name] = tag
+				ctx.current_type_params = params_map
+				ctx.decl_type_params[enum_sym] = params_map
+				ctx.decl_type_param_order[enum_sym] = ordered
+				ctx.currently_declaring_generic = enum_sym
+
+				for variant in d.variants {
+					fields := make([dynamic]^Type)
+					for tn in variant.types {
+						append(&fields, resolve_type_node(ctx, tn))
+					}
+					tag := len(enum_type.variants)
+					append(&enum_type.variants, Type_Variant{name = variant.name, fields = fields})
+					enum_type.variant_index[variant.name] = tag
+				}
+				ctx.current_type_params = prev_params
+				ctx.currently_declaring_generic = prev_declaring
+
+				scheme := generalize(ctx, enum_type)
+				if len(scheme.forall) > 0 {
+					ctx.symbol_schemes[enum_sym] = scheme
+				}
+			} else {
+				for variant in d.variants {
+					fields := make([dynamic]^Type)
+					for tn in variant.types {
+						append(&fields, resolve_type_node(ctx, tn))
+					}
+					tag := len(enum_type.variants)
+					append(&enum_type.variants, Type_Variant{name = variant.name, fields = fields})
+					enum_type.variant_index[variant.name] = tag
+				}
 			}
 		}
 	}
@@ -1260,13 +1468,14 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				continue
 			}
 			if _, is_generic := ctx.decl_type_params[target_sym]; is_generic {
-				// Стадия 7 Phase C: target_type для generic-структуры —
-				// шаблон с InferVar-полями, методы на нём типизировать
-				// нельзя. Явный отказ вместо путаницы — это Phase E.
+				// Стадия 7 Phase C/D: target_type для generic-структуры/
+				// enum'а — шаблон с InferVar-полями, методы на нём
+				// типизировать нельзя. Явный отказ вместо путаницы — это
+				// Phase E.
 				report(
 					ctx,
 					d.span,
-					"Type Error: generic-структуры пока не поддерживают 'реализация' (Стадия 7 Phase E): '%s'",
+					"Type Error: generic-типы пока не поддерживают 'реализация' (Стадия 7 Phase E): '%s'",
 					d.target_type,
 				)
 				continue
@@ -1490,6 +1699,16 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 			if sym == INVALID_SYMBOL {
 				return report(ctx, n.span, "Type Error: неизвестный тип '%s'", n.name)
 			}
+			// Стадия 7 Phase D: самоссылка (Дерево(T) внутри Дерево[T] =
+			// перечисление ... конец) — шаблон ЕЩЁ строится в этом же
+			// ПРОХОД 2 (variants неполны), instantiate_type/кэш
+			// скопировали бы недостроенный объект. Возвращаем шаблонный
+			// указатель напрямую — тот же мутируемый объект, ПРОХОД 2
+			// продолжает дополнять его append'ом, к моменту реального
+			// использования (ПРОХОД 4+) он уже полон.
+			if sym == ctx.currently_declaring_generic {
+				return ctx.res.symbol_types[sym]
+			}
 			ordered, is_generic := ctx.decl_type_param_order[sym]
 			if !is_generic {
 				return report(ctx, n.span, "Type Error: '%s' не является generic-типом", n.name)
@@ -1507,12 +1726,20 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 			args := make([dynamic]^Type)
 			for p in n.params do append(&args, resolve_type_node(ctx, p))
 
-			key := generic_instance_key(sym, args)
-			if cached, found := ctx.generic_instance_cache[key]; found do return cached
-
 			subst := make(map[int]^Type)
 			for tv, i in ordered do subst[tv.infer_id] = args[i]
 			instance := instantiate_type(ctx, ctx.res.symbol_types[sym], &subst)
+
+			// Стадия 7 Phase D: ключ строится ПОСЛЕ инстанциации, из
+			// самого instance (collect_instance_args) — не из сырых args
+			// до подстановки. Раньше (Phase C) ключ строился из args
+			// (порядок заголовка), а конструктор — из полей (порядок
+			// объявления); расходились, если поля объявлены не в порядке
+			// заголовка. Общий обход убирает расхождение.
+			canon_args := make([dynamic]^Type)
+			collect_instance_args(instance, &canon_args)
+			key := generic_instance_key(sym, canon_args)
+			if cached, found := ctx.generic_instance_cache[key]; found do return cached
 			ctx.generic_instance_cache[key] = instance
 			return instance
 		}
@@ -1575,7 +1802,7 @@ types_are_equal :: proc(a: ^Type, b: ^Type) -> bool {
 			types_are_equal(left.error_type, right.error_type) \
 		)
 
-	case .Struct, .Interface:
+	case .Struct, .Interface, .Enum:
 		return false
 	}
 	return true
@@ -2315,6 +2542,17 @@ resolve_variant_ctor :: proc(
 			resolve_interned(sym.name),
 		)
 	}
+
+	// Стадия 7 Phase D: generic enum — свежая инстанциация (тот же
+	// symbol_schemes-механизм, что structs/функции/лямбды). Канонизация
+	// через generic_instance_cache — ниже, после unify аргументов (нужны
+	// конкретные типы полей, а не свежие InferVar).
+	is_generic_owner := false
+	if scheme, has_scheme := ctx.symbol_schemes[owner]; has_scheme {
+		owner_type = instantiate_scheme(ctx, scheme)
+		is_generic_owner = true
+	}
+
 	tag, found := variant_index(owner_type, resolve_interned(sym.name))
 	if !found {
 		fmt.panicf(
@@ -2368,6 +2606,21 @@ resolve_variant_ctor :: proc(
 			)
 		}
 	}
+
+	// Стадия 7 Phase D: канонизация — см. комментарий у generic_instance_cache.
+	// Без неё два одинаковых Дерево.Лист(3) из разных мест кода получали
+	// бы разные ^Type-объекты.
+	if is_generic_owner {
+		canon_args := make([dynamic]^Type)
+		collect_instance_args(owner_type, &canon_args)
+		key := generic_instance_key(owner, canon_args)
+		if cached, found := ctx.generic_instance_cache[key]; found {
+			owner_type = cached
+		} else {
+			ctx.generic_instance_cache[key] = owner_type
+		}
+	}
+
 	ctx.call_infos[expr] = Call_Info {
 		kind    = .Constructor_Variant,
 		variant = Variant_Call_Info{owner_type = owner_type, tag_index = tag},
@@ -2794,10 +3047,13 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 		// generic_instance_cache — иначе unify_types (сравнивает .Struct
 		// только по identity указателя) счёл бы два одинаковых
 		// Пара(Число, Строка) из разных мест кода разными типами.
+		// collect_instance_args (не ad-hoc обход .fields) — тот же обход,
+		// что resolve_type_node использует для explicit-аннотаций, иначе
+		// два пути дают разные ключи при полях не в порядке заголовка.
 		if callee_sym != INVALID_SYMBOL {
 			if _, is_generic := ctx.decl_type_params[callee_sym]; is_generic {
 				arg_types := make([dynamic]^Type)
-				for f in callee_type.fields do append(&arg_types, prune_type(f.type))
+				collect_instance_args(callee_type, &arg_types)
 				key := generic_instance_key(callee_sym, arg_types)
 				if cached, found := ctx.generic_instance_cache[key]; found {
 					t = cached

@@ -471,6 +471,22 @@ Type_Ctx :: struct {
 	loop_depth:       int,
 	next_infer_id:    int,
 	diagnostics:      [dynamic]Diagnostic,
+	// Полиморфные схемы для let-биндингов лямбд (Стадия 7 Phase A). Отдельно
+	// от symbol_types (не меняем её тип — ~25 читателей в 4 файлах), карта
+	// заполняется только для обобщаемых лямбд, читается только в
+	// infer_ident_expr.
+	symbol_schemes:   map[Symbol_Id]Type_Scheme,
+	// Стадия 7 Phase A: узел ^Lambda_Expr (обёрнутый в Expr), которому СЕЙЧАС
+	// разрешено остаться с непривязанными InferVar — потому что вызывающий
+	// Let_Stmt сам решит, обобщить их (generalize) или зарепортить ошибку.
+	// Ambient-поле save/restore, тот же паттерн, что loop_depth (set перед
+	// вложенным вызовом, restore после), только identity вместо счётчика —
+	// это даёт check_lambda_expr (см. ensure_type_resolved там) пропустить
+	// проверку РОВНО для этой лямбды, а не для любой другой, случайно
+	// оказавшейся вложенной внутри её тела (например, bare-лямбда,
+	// переданная аргументом без ожидаемого типа, — для неё проверка
+	// остаётся строгой).
+	allow_unresolved_lambda: Expr,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -483,6 +499,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		match_arm_infos = make(map[^Match_Expr][dynamic]Pattern_Info),
 		synth_enum_cache = make(map[^Type]^Type),
 		diagnostics = make([dynamic]Diagnostic),
+		symbol_schemes = make(map[Symbol_Id]Type_Scheme),
 	}
 }
 
@@ -532,6 +549,14 @@ new_infer_var :: proc(ctx: ^Type_Ctx) -> ^Type {
 	t.name = fmt.tprintf("?%d", t.infer_id)
 	ctx.next_infer_id += 1
 	return t
+}
+
+// Полиморфная схема типа (rank-1 let-polymorphism, Стадия 7 Phase A):
+// forall — infer_id'ы, обобщённые в let-биндинге; body — тип с этими
+// InferVar внутри (сам узел, не копия — копии делает instantiate_type).
+Type_Scheme :: struct {
+	forall: [dynamic]int,
+	body:   ^Type,
 }
 
 // `prune_type` снимает все промежуточные связывания и возвращает фактический тип.
@@ -592,6 +617,105 @@ bind_infer_var :: proc(var_type: ^Type, target: ^Type) -> bool {
 	if type_contains_infer_var(target_type, var_type) do return false
 	var_type.binding = target_type
 	return true
+}
+
+// Собирает infer_id непривязанных InferVar, достижимых из t — тот же обход,
+// что и type_contains_infer_var, только вместо поиска конкретного needle
+// копит все встреченные unbound InferVar (с дедупом). Используется
+// generalize'ом (Стадия 7 Phase A).
+collect_free_infer_vars :: proc(t: ^Type, out: ^[dynamic]int) {
+	typ := prune_type(t)
+	if typ == nil do return
+
+	if typ.kind == .InferVar {
+		for id in out {
+			if id == typ.infer_id do return
+		}
+		append(out, typ.infer_id)
+		return
+	}
+
+	#partial switch typ.kind {
+	case .Function:
+		for param in typ.params do collect_free_infer_vars(param, out)
+		collect_free_infer_vars(typ.return_type, out)
+	case .Tuple:
+		for el in typ.elements do collect_free_infer_vars(el, out)
+	case .Array:
+		collect_free_infer_vars(typ.element_type, out)
+	case .Map:
+		collect_free_infer_vars(typ.key_type, out)
+		collect_free_infer_vars(typ.value_type, out)
+	case .Option:
+		collect_free_infer_vars(typ.element_type, out)
+	case .Result:
+		collect_free_infer_vars(typ.ok_type, out)
+		collect_free_infer_vars(typ.error_type, out)
+	}
+}
+
+// Строит полиморфную схему типа из уже выведенного типа лямбды (Стадия 7
+// Phase A). Обобщает КАЖДЫЙ InferVar, ещё не связанный после prune_type и
+// достижимый из t — без анализа охватывающей среды (environment/free-var
+// check). Корректно здесь и только здесь: top-level `функ` получает тип
+// исключительно из явной аннотации (function_type_from_decl), инференса
+// для них нет — значит нет внешней области видимости с незакрытыми
+// InferVar, которые могли бы случайно попасть в forall. Если в будущей
+// фазе (generic top-level функции, инференс без аннотаций) это условие
+// перестанет выполняться — правило нужно пересмотреть (классическая ML
+// ошибка over-eager generalization / value restriction).
+generalize :: proc(ctx: ^Type_Ctx, t: ^Type) -> Type_Scheme {
+	pruned := prune_type(t)
+	forall := make([dynamic]int)
+	collect_free_infer_vars(pruned, &forall)
+	return Type_Scheme{forall = forall, body = pruned}
+}
+
+// Инстанцирует тип из схемы: глубоко копирует t, заменяя InferVar, чей
+// infer_id есть в subst, на подставленный свежий InferVar; всё остальное
+// (конкретные типы, Struct/Enum/Interface — не входят в forall) возвращает
+// тем же указателем без копии. Обходит тот же набор Type_Kind, что
+// type_contains_infer_var/collect_free_infer_vars.
+instantiate_type :: proc(ctx: ^Type_Ctx, t: ^Type, subst: ^map[int]^Type) -> ^Type {
+	pruned := prune_type(t)
+	if pruned == nil do return nil
+
+	#partial switch pruned.kind {
+	case .InferVar:
+		if fresh, ok := subst[pruned.infer_id]; ok do return fresh
+		return pruned
+	case .Function:
+		params := make([dynamic]^Type)
+		for param in pruned.params do append(&params, instantiate_type(ctx, param, subst))
+		return new_function_type(params, instantiate_type(ctx, pruned.return_type, subst))
+	case .Tuple:
+		elements := make([dynamic]^Type)
+		for el in pruned.elements do append(&elements, instantiate_type(ctx, el, subst))
+		return new_tuple_type(elements)
+	case .Array:
+		return new_array_type(instantiate_type(ctx, pruned.element_type, subst))
+	case .Map:
+		return new_map_type(
+			instantiate_type(ctx, pruned.key_type, subst),
+			instantiate_type(ctx, pruned.value_type, subst),
+		)
+	case .Option:
+		return new_option_type(instantiate_type(ctx, pruned.element_type, subst))
+	case .Result:
+		return new_result_type(
+			instantiate_type(ctx, pruned.ok_type, subst),
+			instantiate_type(ctx, pruned.error_type, subst),
+		)
+	}
+	return pruned
+}
+
+// Инстанцирует полиморфную схему: каждому infer_id из forall — свежий
+// InferVar, затем instantiate_type с этой подстановкой.
+instantiate_scheme :: proc(ctx: ^Type_Ctx, scheme: Type_Scheme) -> ^Type {
+	subst := make(map[int]^Type)
+	for id in scheme.forall do subst[id] = new_infer_var(ctx)
+	return instantiate_type(ctx, scheme.body, &subst)
 }
 
 // Унификация либо подтверждает совместимость типов, либо фиксирует InferVar.
@@ -893,7 +1017,14 @@ check_lambda_expr :: proc(
 		}
 	}
 
-	ensure_type_resolved(ctx, lambda.span, function_type, "лямбды")
+	// Стадия 7 Phase A: если ИМЕННО эта лямбда — прямая цель let-биндинга
+	// (см. Type_Ctx.allow_unresolved_lambda), пропускаем строгую проверку —
+	// вызывающий Let_Stmt сам обобщит оставшиеся InferVar в полиморфную
+	// схему. Идентичность узла (не булев флаг) — чтобы проверка осталась
+	// строгой для любой другой лямбды, случайно вложенной в её тело.
+	if expr != ctx.allow_unresolved_lambda {
+		ensure_type_resolved(ctx, lambda.span, function_type, "лямбды")
+	}
 	return function_type
 }
 
@@ -1452,7 +1583,17 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 			check_expr(ctx, s.value, expected_type)
 			ctx.res.symbol_types[sym] = expected_type
 		} else {
+			// Стадия 7 Phase A: если s.value — лямбда, на время её инференса
+			// разрешаем ЕЙ (и только ей — см. Type_Ctx.allow_unresolved_lambda)
+			// остаться со свободными InferVar в теле; check_lambda_expr иначе
+			// репортит "не удалось вывести тип лямбды" до того, как мы вообще
+			// успеваем решить — generalize их или это правда ошибка.
+			_, is_lambda := s.value.(^Lambda_Expr)
+			prev_allow := ctx.allow_unresolved_lambda
+			if is_lambda do ctx.allow_unresolved_lambda = s.value
 			t := infer_expr(ctx, s.value)
+			ctx.allow_unresolved_lambda = prev_allow
+
 			t = prune_type(t)
 			if t == TY_VOID {
 				report(
@@ -1462,7 +1603,22 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 					s.name,
 				)
 			}
-			ensure_type_resolved(ctx, s.span, t, fmt.tprintf("переменной '%s'", s.name))
+
+			// Разрешение выше было условным — теперь решаем окончательно:
+			// обобщаем в полиморфную схему, если остались свободные InferVar,
+			// иначе (обычное значение или полностью резолвнутая лямбда) —
+			// прежняя строгая проверка.
+			generalized := false
+			if is_lambda && t.kind == .Function {
+				scheme := generalize(ctx, t)
+				if len(scheme.forall) > 0 {
+					ctx.symbol_schemes[sym] = scheme
+					generalized = true
+				}
+			}
+			if !generalized {
+				ensure_type_resolved(ctx, s.span, t, fmt.tprintf("переменной '%s'", s.name))
+			}
 			ctx.res.symbol_types[sym] = t
 		}
 
@@ -2067,6 +2223,15 @@ infer_ident_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Ident_Expr) -> ^Type {
 	}
 	var_type, ok := ctx.res.symbol_types[sym_id]
 	if !ok do return report(ctx, e.span, "Type Error: символ '%s' используется до инициализации", resolve_interned(sym.name))
+
+	// Стадия 7 Phase A: если символ хранит полиморфную схему (обобщённая
+	// лямбда, см. Let_Stmt в infer_stmt), каждое использование получает
+	// свежий инстанс — иначе все вызовы делили бы один и тот же InferVar
+	// и первый же конкретный вызов "запирал" бы тип для всех остальных.
+	if scheme, has_scheme := ctx.symbol_schemes[sym_id]; has_scheme && len(scheme.forall) > 0 {
+		return instantiate_scheme(ctx, scheme)
+	}
+
 	return prune_type(var_type)
 }
 

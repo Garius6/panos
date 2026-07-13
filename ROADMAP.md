@@ -380,7 +380,7 @@ LSP-фич Стадии 5 (completions/find-references/rename) не требуе
 
 **Что**:
 
-- **Phase A** — implicit rank-1 полиморфизм для лямбд (1 день).
+- **Phase A** ✅ — implicit rank-1 полиморфизм для лямбд (1 день).
 - **Phase B** — явные generic-функции: `функ имя[T](x: T) -> T` (2 дня).
 - **Phase C** — generic struct/interface: `тип Пара[A, B] = структура`
   (2 дня).
@@ -421,8 +421,20 @@ constraint всё так же оставляет переменную без bin
 каскадить производные ошибки. Просто здесь этот механизм естественно
 встраивается в solver, а не прикручивается отдельно.
 
+**Заметка по Phase A (сделано)**: реализовано на текущем eager-unify, БЕЗ
+перехода на constraint-based inference — для узкого случая let-polymorphism
+у лямбд eager-unify достаточно (см. `Type_Scheme`/`generalize`/
+`instantiate_type` в core/type_cheker.odin). Правило generalize нарочно
+узкое: обобщается любой InferVar, unbound после prune_type и достижимый из
+типа лямбды, без анализа охватывающей среды — корректно только пока
+top-level `функ` не имеет инференса (сигнатура строго из аннотаций).
+**Если Phase B введёт инференс сигнатур без аннотаций до того, как появится
+constraint-based solver — это правило нужно пересмотреть** (over-eager
+generalization / value restriction). Переход на constraint-based (генерация
+→ solve) остаётся нерешённым архитектурным вопросом для Phase B+, см. ниже.
+
 **Порядок работ**:
-1. Phase A: implicit rank-1 (1 день).
+1. Phase A ✅: implicit rank-1 (1 день).
 2. Phase B: явные generic functions + syntax `[T]` (2 дня).
 3. Phase C: generic structs/interfaces (2 дня).
 4. Phase D: generic ADT (1 день).

@@ -389,7 +389,8 @@ Prerequisite: Стадия 6.
 
 - [ ] Constraint generation pass (`Equal(t1, t2)` и т.п., без solve)
 - [ ] Constraint solver (batch unification над накопленными constraint'ами)
-- [ ] Phase A: implicit rank-1 для лямбд
+- [x] Phase A: implicit rank-1 для лямбд — сделано на eager-unify, БЕЗ
+      constraint-based (см. заметку в ROADMAP §Стадия 7 "Заметка по Phase A")
 - [ ] Phase B: `функ имя[T](x: T) -> T`
 - [ ] Phase C: generic struct/interface
 - [ ] Phase D: generic ADT

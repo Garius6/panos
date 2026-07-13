@@ -487,6 +487,18 @@ Type_Ctx :: struct {
 	// переданная аргументом без ожидаемого типа, — для неё проверка
 	// остаётся строгой).
 	allow_unresolved_lambda: Expr,
+	// Стадия 7 Phase B: имя→InferVar type-параметров ТЕКУЩЕЙ generic-функции,
+	// пока резолвится её сигнатура (ПРОХОД 2) или тело (ПРОХОД 4). nil вне
+	// generic-функции. Ambient-поле, тот же save/restore паттерн, что
+	// allow_unresolved_lambda — resolve_type_node проверяет его первым для
+	// case ^Type_Ident, до поиска в глобальных типах.
+	current_type_params: map[string]^Type,
+	// Персистентный мост между ПРОХОД 2 и ПРОХОД 4 для одной и той же
+	// generic-функции: ПРОХОД 4 должен резолвить T в ТЕ ЖЕ InferVar-узлы,
+	// что и сигнатура в ПРОХОД 2 (не свежие) — иначе unify не свяжет тело
+	// с сигнатурой. В отличие от current_type_params (ambient, временное)
+	// это хранится на весь typecheck_program.
+	decl_type_params:        map[Symbol_Id]map[string]^Type,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -500,6 +512,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		synth_enum_cache = make(map[^Type]^Type),
 		diagnostics = make([dynamic]Diagnostic),
 		symbol_schemes = make(map[Symbol_Id]Type_Scheme),
+		decl_type_params = make(map[Symbol_Id]map[string]^Type),
 	}
 }
 
@@ -1095,7 +1108,30 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 
 		case ^Function_Decl:
 			sym := ctx.res.decl_symbols[decl]
-			ctx.res.symbol_types[sym] = function_type_from_decl(ctx, d)
+
+			// Стадия 7 Phase B: generic-функция — резолвим сигнатуру с
+			// type-параметрами в scope (свежий InferVar на каждое имя),
+			// затем generalize в полиморфную схему (тот же механизм, что
+			// Phase A использует для лямбд, см. symbol_schemes).
+			if len(d.type_params) > 0 {
+				prev := ctx.current_type_params
+				params_map := make(map[string]^Type)
+				for name in d.type_params do params_map[name] = new_infer_var(ctx)
+				ctx.current_type_params = params_map
+
+				func_type := function_type_from_decl(ctx, d)
+				ctx.current_type_params = prev
+
+				ctx.res.symbol_types[sym] = func_type
+				scheme := generalize(ctx, func_type)
+				if len(scheme.forall) > 0 {
+					ctx.symbol_schemes[sym] = scheme
+				}
+				// ПРОХОД 4 должен резолвить T в теле в ТЕ ЖЕ узлы.
+				ctx.decl_type_params[sym] = params_map
+			} else {
+				ctx.res.symbol_types[sym] = function_type_from_decl(ctx, d)
+			}
 
 		case ^Interface_Decl:
 			iface_type := ctx.res.symbol_types[ctx.res.decl_symbols[decl]]
@@ -1225,9 +1261,19 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Function_Decl:
-			func_type := ctx.res.symbol_types[ctx.res.decl_symbols[decl]]
+			sym := ctx.res.decl_symbols[decl]
+			func_type := ctx.res.symbol_types[sym]
 			bind_function_args(ctx, d, func_type)
-			check_function_body(ctx, d.span, d.body, func_type.return_type)
+			if params_map, ok := ctx.decl_type_params[sym]; ok {
+				// Стадия 7 Phase B: тело generic-функции резолвит T в ТЕ ЖЕ
+				// InferVar-узлы, что и сигнатура (см. ПРОХОД 2).
+				prev := ctx.current_type_params
+				ctx.current_type_params = params_map
+				check_function_body(ctx, d.span, d.body, func_type.return_type)
+				ctx.current_type_params = prev
+			} else {
+				check_function_body(ctx, d.span, d.body, func_type.return_type)
+			}
 		case ^Impl_Decl:
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
@@ -1254,6 +1300,12 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 
 	switch n in node {
 	case ^Type_Ident:
+		// Стадия 7 Phase B: type-параметр текущей generic-функции
+		// перекрывает глобальные имена типов (обычная лексическая область
+		// видимости) — проверяем первым.
+		if ctx.current_type_params != nil {
+			if tv, ok := ctx.current_type_params[n.name]; ok do return tv
+		}
 		if base_type, ok := lookup_base_type(n.name); ok do return base_type
 		if sym := lookup_symbol(ctx.res.global_scope, intern(n.name)); sym != INVALID_SYMBOL {
 			if symbol_at(ctx.res.symbol_store, sym).kind == .Module {

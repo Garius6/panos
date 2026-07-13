@@ -54,6 +54,11 @@ Parser_Error :: enum {
 Function_Decl :: struct {
 	span:        Span,
 	name:        string,
+	// Стадия 7 Phase B: имена type-параметров из `[T, U]` после имени
+	// функции. Пусто для обычных (не-generic) функций и всегда пусто для
+	// методов внутри `реализация` — generic-методы отклоняются парсером
+	// (см. parse_impl_decl), это Phase E.
+	type_params: [dynamic]string,
 	args:        [dynamic]Param_Decl,
 	return_type: Type_Node,
 	body:        [dynamic]Stmt,
@@ -821,6 +826,17 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 				decl.target_type,
 			)
 		}
+		if len(method.type_params) > 0 {
+			// Стадия 7 Phase B поддерживает generic только у top-level
+			// функций. Generic-методы (реализация X ... функ м[T](...))
+			// — Phase E; явный отказ здесь понятнее, чем то, что T молча
+			// упал бы в "неизвестный тип" при резолве сигнатуры метода.
+			report_parse(
+				p,
+				method.span,
+				"Синтаксическая ошибка: generic-методы пока не поддержаны (Стадия 7 Phase E)",
+			)
+		}
 
 		method.name = fmt.tprintf("%s::%s", decl.target_type, method.name)
 		append(&decl.methods, method)
@@ -842,6 +858,10 @@ parse_function :: proc(p: ^Parser, is_exported: bool) -> ^Function_Decl {
 	if tok.kind != .Ident do report_parse(p, tok.span, "Синтаксическая ошибка: ожидалось имя функции, получено: %v", tok.kind)
 	function.name = tok.data
 
+	if peek_token(p.stream).kind == .LBracket {
+		function.type_params = parse_type_params(p)
+	}
+
 	function.args = parse_param_list(p, true)
 	function.return_type = parse_required_return_type(p, "функции")
 
@@ -852,6 +872,27 @@ parse_function :: proc(p: ^Parser, is_exported: bool) -> ^Function_Decl {
 
 	function.span = span_from(p, start)
 	return function
+}
+
+// Стадия 7 Phase B: `[T]` или `[T, U]` после имени функции. `.LBracket` уже
+// съеден вызывающим кодом? Нет — вызывающий только peek'ает, съедаем сами.
+parse_type_params :: proc(p: ^Parser) -> [dynamic]string {
+	next_token(p.stream) // .LBracket
+	names := make([dynamic]string)
+	for {
+		name_tok := next_token(p.stream)
+		if name_tok.kind != .Ident {
+			report_parse(p, name_tok.span, "Синтаксическая ошибка: в списке type-параметров '[...]' ожидается идентификатор")
+		}
+		append(&names, name_tok.data)
+		if peek_token(p.stream).kind == .Comma {
+			next_token(p.stream)
+		} else {
+			break
+		}
+	}
+	expect(p, .RBracket)
+	return names
 }
 
 parse_param_list :: proc(p: ^Parser, require_types: bool) -> [dynamic]Param_Decl {

@@ -391,7 +391,9 @@ Prerequisite: Стадия 6.
 - [ ] Constraint solver (batch unification над накопленными constraint'ами)
 - [x] Phase A: implicit rank-1 для лямбд — сделано на eager-unify, БЕЗ
       constraint-based (см. заметку в ROADMAP §Стадия 7 "Заметка по Phase A")
-- [ ] Phase B: `функ имя[T](x: T) -> T`
+- [x] Phase B: `функ имя[T](x: T) -> T` — переиспользует Type_Scheme/
+      symbol_schemes из Phase A, инстанциация на вызове не потребовала
+      правок в infer_call_expr (см. заметку в ROADMAP §Стадия 7)
 - [ ] Phase C: generic struct/interface
 - [ ] Phase D: generic ADT
 - [ ] Phase E: `реализация Список[T]`

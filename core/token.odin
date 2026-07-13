@@ -65,9 +65,14 @@ Span :: struct {
 }
 
 Token :: struct {
-	data: string,
-	kind: TokenKind,
-	span: Span,
+	data:      string,
+	kind:      TokenKind,
+	span:      Span,
+	// true, если между предыдущим токеном и этим был перевод строки — см.
+	// использование в parser.odin (parse_type): различает `Массив(Число)`
+	// (генерик, '(' на той же строке) от `-> Число\n(выражение)` (тело
+	// функции, начинающееся со скобки на СЛЕДУЮЩЕЙ строке — не генерик-аргс).
+	nl_before: bool,
 }
 
 token_to_string :: proc(t: Token) -> string {

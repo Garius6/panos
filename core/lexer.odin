@@ -60,9 +60,14 @@ peek_char :: proc(l: ^Lexer) -> rune {
 	return r
 }
 
-skip_whitespace_and_comments :: proc(l: ^Lexer) {
+// Возвращает true, если в пропущенном whitespace встретился перевод
+// строки — используется парсером для различения `Массив(Число)` (генерик)
+// от `(...)`, начинающего новый statement на следующей строке (см. Token.nl_before).
+skip_whitespace_and_comments :: proc(l: ^Lexer) -> bool {
+	saw_newline := false
 	for {
 		if unicode.is_space(l.ch) {
+			if l.ch == '\n' do saw_newline = true
 			advance(l)
 		} else if l.ch == '/' && peek_char(l) == '/' {
 			advance(l)
@@ -74,6 +79,7 @@ skip_whitespace_and_comments :: proc(l: ^Lexer) {
 			break
 		}
 	}
+	return saw_newline
 }
 
 read_identifier :: proc(l: ^Lexer) -> string {
@@ -218,7 +224,7 @@ lookup_ident :: proc(ident: string) -> TokenKind {
 // пришлось бы разбирать парсеру).
 next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 	for {
-	skip_whitespace_and_comments(l)
+	nl_before := skip_whitespace_and_comments(l)
 
 	start_pos := l.pos - l.width
 	tok: Token
@@ -372,6 +378,7 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 
 	end_pos := l.pos - l.width
 	tok.span = Span{file_id = file_id, start = u32(start_pos), end = u32(end_pos)}
+	tok.nl_before = nl_before
 	return tok
 	}
 }

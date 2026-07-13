@@ -1,5 +1,6 @@
 package core
 
+import "core:strings"
 import "core:unicode/utf8"
 
 // Срез строки [start, end) по индексам РУН (не байт) — согласовано с
@@ -44,4 +45,33 @@ get_character_at :: proc(s: string, target_index: int) -> (string, bool) {
 		current_index += 1
 	}
 	return "", false // Если индекс вышел за пределы
+}
+
+// Ищет первое вхождение pattern в text начиная с РУН-индекса from_rune
+// (не байт — согласовано со string_slice_by_rune/get_character_at выше),
+// возвращает РУН-индекс совпадения или -1. Используется строки::найти.
+string_find_rune :: proc(text: string, pattern: string, from_rune: int) -> int {
+	total := string_length(text)
+	if from_rune < 0 || from_rune > total do return -1
+
+	start_byte := len(text)
+	idx := 0
+	for _, offset in text {
+		if idx == from_rune {
+			start_byte = offset
+			break
+		}
+		idx += 1
+	}
+
+	byte_match := strings.index(text[start_byte:], pattern)
+	if byte_match == -1 do return -1
+
+	match_byte_abs := start_byte + byte_match
+	rune_idx := 0
+	for _, offset in text {
+		if offset == match_byte_abs do return rune_idx
+		rune_idx += 1
+	}
+	return -1 // не должно случиться — byte_match всегда указывает на начало руны
 }

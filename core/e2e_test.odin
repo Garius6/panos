@@ -1172,6 +1172,48 @@ test_math_and_logic :: proc(t: ^testing.T) {
 		`,
 			Value(perm_string("panos")),
 		},
+		{
+			"Стандартная библиотека: строки — найти/содержит/заменить/регистр",
+			`
+			импорт строки
+
+			функ старт() -> Строка
+				пер найдено = строки.найти("привет мир", "мир", 0)
+				пер не_найдено = строки.найти("привет мир", "нет", 0)
+				пер содержит = строки.содержит("привет мир", "вет")
+				пер заменено = строки.заменить("а-б-в", "-", "_")
+				пер верхний = строки.верхний_регистр("привет Мир")
+				пер нижний = строки.нижний_регистр("ПРИВЕТ Мир")
+				если найдено == 7 и не_найдено == -1 и содержит и заменено == "а_б_в" и верхний == "ПРИВЕТ МИР" и нижний == "привет мир" тогда
+					"ок"
+				иначе
+					"провал"
+				конец
+			конец
+		`,
+			Value(perm_string("ок")),
+		},
+		{
+			"Стандартная библиотека: строки — разбить/соединить/обрезать/аффиксы/сравнить",
+			`
+			импорт строки
+
+			функ старт() -> Строка
+				пер части = строки.разбить("а,б,в", ",")
+				пер обратно = строки.соединить(части, "|")
+				пер обрезано = строки.обрезать("  привет  ")
+				пер префикс = строки.начинается_с("привет", "при")
+				пер суффикс = строки.заканчивается_на("привет", "вет")
+				пер сравнение = строки.сравнить("а", "б")
+				если части.длина() == 3 и обратно == "а|б|в" и обрезано == "привет" и префикс и суффикс и сравнение == -1 тогда
+					"ок"
+				иначе
+					"провал"
+				конец
+			конец
+		`,
+			Value(perm_string("ок")),
+		},
 	}
 
 	for tc in tests {
@@ -1307,6 +1349,57 @@ test_http_url_parsing :: proc(t: ^testing.T) {
 	if !ok do return
 
 	testing.expectf(t, result == Value(true), "http url parsing: ожидалось true, получено %v", result)
+}
+
+// std/математика.ps — файловый std-модуль, а не builtin: run_code (inline-
+// исходник, module.dir == "") никогда не грузит реальные .ps-зависимости
+// через load_module_recursive, только builtin-модули (см. resolver.odin:
+// register_top_level_decl — imported_module ищется в ctx.module_graph.
+// modules, куда inline-путь ничего не кладёт). run_module_file — тот же
+// путь, что CLI/LSP (load_module_graph), поэтому std/ реально резолвится.
+@(test)
+test_math_stdlib :: proc(t: ^testing.T) {
+	result, ok := run_module_file("math_fixture_main.ps")
+	testing.expectf(t, ok, "математика: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(true), "математика: ожидалось true, получено %v", result)
+}
+
+@(test)
+test_collections_stdlib :: proc(t: ^testing.T) {
+	result, ok := run_module_file("collections_fixture_main.ps")
+	testing.expectf(t, ok, "коллекции: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(true), "коллекции: ожидалось true, получено %v", result)
+}
+
+@(test)
+test_json_stdlib :: proc(t: ^testing.T) {
+	result, ok := run_module_file("json_fixture_main.ps")
+	testing.expectf(t, ok, "json: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(true), "json: ожидалось true, получено %v", result)
+}
+
+@(test)
+test_test_stdlib :: proc(t: ^testing.T) {
+	result, ok := run_module_file("test_fixture_main.ps")
+	testing.expectf(t, ok, "тест: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(f64(0.0)), "тест: ожидалось 0 (все проверки прошли), получено %v", result)
+}
+
+@(test)
+test_flags_stdlib :: proc(t: ^testing.T) {
+	result, ok := run_module_file("flags_fixture_main.ps")
+	testing.expectf(t, ok, "флаги: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(true), "флаги: ожидалось true, получено %v", result)
 }
 
 @(test)

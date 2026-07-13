@@ -97,6 +97,28 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_NUM, TY_ERROR))
 	case "строки::из_числа":
 		return builtin_function_type_1(TY_NUM, TY_STRING)
+	case "строки::найти":
+		return builtin_function_type_3(TY_STRING, TY_STRING, TY_NUM, TY_NUM)
+	case "строки::содержит":
+		return builtin_function_type_2(TY_STRING, TY_STRING, TY_BOOL)
+	case "строки::заменить":
+		return builtin_function_type_3(TY_STRING, TY_STRING, TY_STRING, TY_STRING)
+	case "строки::разбить":
+		return builtin_function_type_2(TY_STRING, TY_STRING, new_array_type(TY_STRING))
+	case "строки::соединить":
+		return builtin_function_type_2(new_array_type(TY_STRING), TY_STRING, TY_STRING)
+	case "строки::обрезать":
+		return builtin_function_type_1(TY_STRING, TY_STRING)
+	case "строки::начинается_с":
+		return builtin_function_type_2(TY_STRING, TY_STRING, TY_BOOL)
+	case "строки::заканчивается_на":
+		return builtin_function_type_2(TY_STRING, TY_STRING, TY_BOOL)
+	case "строки::верхний_регистр":
+		return builtin_function_type_1(TY_STRING, TY_STRING)
+	case "строки::нижний_регистр":
+		return builtin_function_type_1(TY_STRING, TY_STRING)
+	case "строки::сравнить":
+		return builtin_function_type_2(TY_STRING, TY_STRING, TY_NUM)
 	case "сеть::подключиться":
 		return builtin_function_type_2(TY_STRING, TY_NUM, stdlib_result_type(graph, TY_CONNECTION, TY_ERROR))
 	case "сеть::кодировать_url":
@@ -215,6 +237,37 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 		)
 		add_builtin_export(graph, module, "в_число", builtin_export_type(graph, "строки::в_число"))
 		add_builtin_export(graph, module, "из_числа", builtin_export_type(graph, "строки::из_числа"))
+		add_builtin_export(graph, module, "найти", builtin_export_type(graph, "строки::найти"))
+		add_builtin_export(graph, module, "содержит", builtin_export_type(graph, "строки::содержит"))
+		add_builtin_export(graph, module, "заменить", builtin_export_type(graph, "строки::заменить"))
+		add_builtin_export(graph, module, "разбить", builtin_export_type(graph, "строки::разбить"))
+		add_builtin_export(graph, module, "соединить", builtin_export_type(graph, "строки::соединить"))
+		add_builtin_export(graph, module, "обрезать", builtin_export_type(graph, "строки::обрезать"))
+		add_builtin_export(
+			graph,
+			module,
+			"начинается_с",
+			builtin_export_type(graph, "строки::начинается_с"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"заканчивается_на",
+			builtin_export_type(graph, "строки::заканчивается_на"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"верхний_регистр",
+			builtin_export_type(graph, "строки::верхний_регистр"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"нижний_регистр",
+			builtin_export_type(graph, "строки::нижний_регистр"),
+		)
+		add_builtin_export(graph, module, "сравнить", builtin_export_type(graph, "строки::сравнить"))
 	} else if name == "сеть" {
 		add_builtin_export(
 			graph,

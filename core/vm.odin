@@ -889,6 +889,89 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 			fmt.panicf("Runtime Error: строки.из_числа() ожидает число")
 		}
 		return Value(gc_new_string(vm, fmt.tprintf("%v", num))), true
+
+	case "строки::найти":
+		expect_arg_count(name, len(args), 3)
+		text := expect_string_arg(name, args[0])
+		pattern := expect_string_arg(name, args[1])
+		from_idx := number_to_index(args[2])
+		return Value(f64(string_find_rune(text, pattern, from_idx))), true
+
+	case "строки::содержит":
+		expect_arg_count(name, len(args), 2)
+		text := expect_string_arg(name, args[0])
+		pattern := expect_string_arg(name, args[1])
+		return Value(strings.contains(text, pattern)), true
+
+	case "строки::заменить":
+		expect_arg_count(name, len(args), 3)
+		text := expect_string_arg(name, args[0])
+		old_part := expect_string_arg(name, args[1])
+		new_part := expect_string_arg(name, args[2])
+		replaced, _ := strings.replace_all(text, old_part, new_part, context.temp_allocator)
+		return Value(gc_new_string(vm, replaced)), true
+
+	case "строки::разбить":
+		expect_arg_count(name, len(args), 2)
+		text := expect_string_arg(name, args[0])
+		sep := expect_string_arg(name, args[1])
+		parts, _ := strings.split(text, sep, context.temp_allocator)
+		arr := gc_new(vm, Array_Value)
+		gc_protect(vm, Value(arr))
+		for part in parts {
+			append(&arr.elements, Value(gc_new_string(vm, part)))
+		}
+		gc_unprotect(vm, 1)
+		return Value(arr), true
+
+	case "строки::соединить":
+		expect_arg_count(name, len(args), 2)
+		arr, ok_arr := args[0].(^Array_Value)
+		if !ok_arr {
+			fmt.panicf("Runtime Error: строки.соединить() ожидает массив строк")
+		}
+		sep := expect_string_arg(name, args[1])
+		parts := make([dynamic]string, 0, len(arr.elements), context.temp_allocator)
+		for el in arr.elements {
+			append(&parts, expect_string_arg(name, el))
+		}
+		joined, _ := strings.join(parts[:], sep, context.temp_allocator)
+		return Value(gc_new_string(vm, joined)), true
+
+	case "строки::обрезать":
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		return Value(gc_new_string(vm, strings.trim_space(text))), true
+
+	case "строки::начинается_с":
+		expect_arg_count(name, len(args), 2)
+		text := expect_string_arg(name, args[0])
+		prefix := expect_string_arg(name, args[1])
+		return Value(strings.has_prefix(text, prefix)), true
+
+	case "строки::заканчивается_на":
+		expect_arg_count(name, len(args), 2)
+		text := expect_string_arg(name, args[0])
+		suffix := expect_string_arg(name, args[1])
+		return Value(strings.has_suffix(text, suffix)), true
+
+	case "строки::верхний_регистр":
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		upper, _ := strings.to_upper(text, context.temp_allocator)
+		return Value(gc_new_string(vm, upper)), true
+
+	case "строки::нижний_регистр":
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		lower, _ := strings.to_lower(text, context.temp_allocator)
+		return Value(gc_new_string(vm, lower)), true
+
+	case "строки::сравнить":
+		expect_arg_count(name, len(args), 2)
+		a := expect_string_arg(name, args[0])
+		b := expect_string_arg(name, args[1])
+		return Value(f64(strings.compare(a, b))), true
 	}
 
 	fmt.panicf(

@@ -811,9 +811,14 @@ instantiate_type :: proc(ctx: ^Type_Ctx, t: ^Type, subst: ^map[int]^Type, visite
 		t2.name = pruned.name
 		t2.generic_origin = pruned.generic_origin
 		t2.fields = make([dynamic]Struct_Field)
-		// Стадия 7 Phase C: generic-структуры не поддерживают реализация
-		// (см. ПРОХОД 3) — пустые карты, как у шаблона в ПРОХОД 1.
-		t2.methods = make(map[string]Symbol_Id)
+		// Стадия 7 Phase E: методы type-erased (один Symbol_Id/байткод на
+		// все инстанциации, см. resolve вызова метода в infer_call_expr)
+		// — alias карты шаблона безопасен, методы пишутся один раз в
+		// ПРОХОД 3 и никогда не мутируются потом. Odin-карты — reference
+		// type, так что дальнейшее заполнение pruned.methods в ПРОХОД 3
+		// (если эта инстанциация случилась раньше, во время ПРОХОД 2)
+		// всё равно видно через t2.methods — тот же указатель на данные.
+		t2.methods = pruned.methods
 		t2.implemented_interfaces = make([dynamic]^Type)
 		v[pruned] = t2 // регистрируем ДО рекурсии в поля — см. комментарий выше
 		for f in pruned.fields {
@@ -827,7 +832,7 @@ instantiate_type :: proc(ctx: ^Type_Ctx, t: ^Type, subst: ^map[int]^Type, visite
 		t2.generic_origin = pruned.generic_origin
 		t2.variants = make([dynamic]Type_Variant)
 		t2.variant_index = pruned.variant_index // имена→индексы не меняются копией
-		t2.methods = make(map[string]Symbol_Id) // Phase D: реализация на generic enum — Phase E
+		t2.methods = pruned.methods // Стадия 7 Phase E: см. комментарий в .Struct-case выше
 		v[pruned] = t2 // регистрируем ДО рекурсии в варианты
 		for variant in pruned.variants {
 			fields := make([dynamic]^Type)
@@ -1467,18 +1472,23 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				// пропускаем весь блок.
 				continue
 			}
-			if _, is_generic := ctx.decl_type_params[target_sym]; is_generic {
-				// Стадия 7 Phase C/D: target_type для generic-структуры/
-				// enum'а — шаблон с InferVar-полями, методы на нём
-				// типизировать нельзя. Явный отказ вместо путаницы — это
-				// Phase E.
-				report(
-					ctx,
-					d.span,
-					"Type Error: generic-типы пока не поддерживают 'реализация' (Стадия 7 Phase E): '%s'",
-					d.target_type,
-				)
-				continue
+			// Стадия 7 Phase E: реализация методов на generic-структурах/
+			// enum'ах поддержана — узкий отказ остался только для
+			// интерфейсной формы (генерик-интерфейсы отложены, см. Phase
+			// C). Раньше здесь был безусловный отказ для ЛЮБОЙ реализация
+			// на generic-типе.
+			is_generic_target := false
+			if _, ok := ctx.decl_type_params[target_sym]; ok {
+				is_generic_target = true
+				if d.interface_name != "" {
+					report(
+						ctx,
+						d.span,
+						"Type Error: реализация интерфейса для generic-типа пока не поддерживается: '%s'",
+						d.target_type,
+					)
+					continue
+				}
 			}
 			if target_type.kind == .Enum && d.interface_name != "" {
 				report(
@@ -1494,7 +1504,19 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			// Регистрируем методы
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
+
+				// Стадия 7 Phase E: сигнатура generic-метода резолвится под
+				// теми же InferVar владельца, что и его поля/варианты
+				// (ПРОХОД 2) — это: Коробка (bare Type_Ident) резолвится в
+				// сам шаблонный ^Type, а T/U и т.п. в остальных параметрах
+				// — в те же InferVar через current_type_params.
+				prev := ctx.current_type_params
+				if is_generic_target {
+					ctx.current_type_params = ctx.decl_type_params[target_sym]
+				}
 				method_type := function_type_from_decl(ctx, m)
+				ctx.current_type_params = prev
+
 				if len(method_type.params) == 0 ||
 				   !types_are_equal(method_type.params[0], target_type) {
 					report(
@@ -1508,6 +1530,23 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				ctx.res.symbol_types[sym] = method_type
 				original_name := m.name[len(d.target_type) + 2:]
 				target_type.methods[original_name] = sym
+
+				if is_generic_target {
+					// Метод получает СВОЮ Type_Scheme — иначе первый же
+					// вызов зацементирует T шаблона навсегда (structural
+					// fallback в unify_types, Phase D, связал бы шаблонный
+					// InferVar с конкретным типом ПОСТОЯННО, ведь это:
+					// Коробка ссылается на общий на все инстанциации
+					// шаблонный ^Type). generalize уже находит T
+					// автоматически: это: Коробка резолвится в сам
+					// шаблонный ^Type, collect_free_infer_vars проходит
+					// внутрь через .Struct/.Enum-case (с cycle-guard,
+					// Phase D) и находит T в .fields/.variants.
+					scheme := generalize(ctx, method_type)
+					if len(scheme.forall) > 0 {
+						ctx.symbol_schemes[sym] = scheme
+					}
+				}
 			}
 
 			// Строгая проверка интерфейсного контракта (только Struct — см.
@@ -1575,6 +1614,13 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				check_function_body(ctx, d.span, d.body, func_type.return_type)
 			}
 		case ^Impl_Decl:
+			// Стадия 7 Phase E: тело generic-метода резолвит T в ТЕ ЖЕ
+			// InferVar владельца, что и сигнатура в ПРОХОД 3 — тот же
+			// паттерн, что уже даёт ПРОХОД 4 top-level generic-функциям
+			// выше.
+			target_sym := ctx.res.global_scope.symbols[intern(d.target_type)]
+			params_map, is_generic_target := ctx.decl_type_params[target_sym]
+
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
 				func_type := ctx.res.symbol_types[sym]
@@ -1587,7 +1633,14 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 					continue
 				}
 				bind_function_args(ctx, m, func_type)
-				check_function_body(ctx, m.span, m.body, func_type.return_type)
+				if is_generic_target {
+					prev := ctx.current_type_params
+					ctx.current_type_params = params_map
+					check_function_body(ctx, m.span, m.body, func_type.return_type)
+					ctx.current_type_params = prev
+				} else {
+					check_function_body(ctx, m.span, m.body, func_type.return_type)
+				}
 			}
 		}
 	}
@@ -2967,6 +3020,13 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 		} else if obj_type.kind == .Struct {
 			if method_sym, is_method := obj_type.methods[prop_expr.property]; is_method {
 				method_type := ctx.res.symbol_types[method_sym]
+				if scheme, has_scheme := ctx.symbol_schemes[method_sym]; has_scheme {
+					// Стадия 7 Phase E: свежая инстанциация на КАЖДЫЙ
+					// вызов — та же защита от "зацементированного" T,
+					// что Phase A/B/C/D уже дают лямбдам/функциям/
+					// конструкторам.
+					method_type = instantiate_scheme(ctx, scheme)
+				}
 				if len(e.args) != len(method_type.params) - 1 {
 					return report(
 						ctx,
@@ -2989,6 +3049,9 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 			// получателю всё равно, Aggregate_Value это или Variant_Value).
 			if method_sym, is_method := obj_type.methods[prop_expr.property]; is_method {
 				method_type := ctx.res.symbol_types[method_sym]
+				if scheme, has_scheme := ctx.symbol_schemes[method_sym]; has_scheme {
+					method_type = instantiate_scheme(ctx, scheme)
+				}
 				if len(e.args) != len(method_type.params) - 1 {
 					return report(
 						ctx,

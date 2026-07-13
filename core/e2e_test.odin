@@ -230,25 +230,116 @@ test_generic_method_rejected :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_generic_struct_impl_rejected :: proc(t: ^testing.T) {
-	// Стадия 7 Phase C: реализация на generic-структуре целиком отклоняется
-	// (target_type — шаблон с InferVar-полями, методы на нём типизировать
-	// нельзя) — понятная ошибка вместо путаницы. Это Phase E.
-	diags := typecheck_only(`
+test_generic_struct_method_call :: proc(t: ^testing.T) {
+	// Стадия 7 Phase E: реализация методов на generic-структурах — раньше
+	// (Phase C/D) отклонялась целиком, теперь работает. это: Коробка
+	// (bare) резолвится в сам шаблонный тип, метод получает свою
+	// Type_Scheme и инстанцируется заново на каждый вызов.
+	result, ok := run_code(`
 		тип Коробка[T] = структура
 			значение: T
 		конец
 
 		реализация Коробка
-			функ метод(это: Коробка) -> Число
-				0
+			функ получить(это: Коробка) -> T
+				это.значение
+			конец
+		конец
+
+		функ старт() -> Число
+			пер к = Коробка(42)
+			к.получить()
+		конец
+	`)
+	testing.expectf(t, ok, "generic-struct method call: пустой стек")
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 42.0, "generic-struct method call: %v != 42.0", result)
+}
+
+@(test)
+test_generic_method_no_cemented_type_param :: proc(t: ^testing.T) {
+	// Стадия 7 Phase E: главный guard-тест — без своей Type_Scheme у
+	// метода первый же вызов (a.получить(), T=Число) зацементировал бы
+	// T шаблона навсегда через structural fallback в unify_types (Phase
+	// D, generic_origin совпадает у это: Коробка и любой инстанциации).
+	// Второй вызов с другим T (b.получить(), T=Строка) тогда падал бы
+	// Type Error'ом, хотя код корректен.
+	result, ok := run_code(`
+		тип Коробка[T] = структура
+			значение: T
+		конец
+
+		реализация Коробка
+			функ получить(это: Коробка) -> T
+				это.значение
+			конец
+		конец
+
+		функ старт() -> Число
+			пер a = Коробка(1)
+			пер b = Коробка("текст")
+			a.получить()
+		конец
+	`)
+	testing.expectf(t, ok, "generic method, два T подряд: пустой стек")
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 1.0, "generic method, два T подряд: %v != 1.0", result)
+}
+
+@(test)
+test_generic_enum_method_recursive :: proc(t: ^testing.T) {
+	// Стадия 7 Phase E: метод на рекурсивном ADT (Дерево ссылается на
+	// себя же в Узел) — generalize должен пройти сквозь cycle-guard
+	// (Phase D) при обнаружении T в это: Дерево, не зациклившись.
+	result, ok := run_code(`
+		тип Дерево[T] = перечисление
+			Лист(T)
+			Узел(Дерево(T), T, Дерево(T))
+		конец
+
+		реализация Дерево
+			функ корень(это: Дерево) -> T
+				выбор это
+					Лист(x) -> x
+					Узел(_, x, _) -> x
+				конец
+			конец
+		конец
+
+		функ старт() -> Число
+			пер д = Дерево.Узел(Дерево.Лист(1), 7, Дерево.Лист(3))
+			д.корень()
+		конец
+	`)
+	testing.expectf(t, ok, "generic enum method (рекурсивный): пустой стек")
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 7.0, "generic enum method (рекурсивный): %v != 7.0", result)
+}
+
+@(test)
+test_generic_interface_impl_rejected :: proc(t: ^testing.T) {
+	// Стадия 7 Phase E: реализация методов на generic-типах поддержана,
+	// но реализация ИНТЕРФЕЙСА на generic-типе — по-прежнему узко
+	// отклоняется (generic-интерфейсы отложены, см. Phase C).
+	diags := typecheck_only(`
+		тип Печатаемый = интерфейс
+			функ вСтроку() -> Строка
+		конец
+
+		тип Коробка[T] = структура
+			значение: T
+		конец
+
+		реализация Печатаемый для Коробка
+			функ вСтроку(это: Коробка) -> Строка
+				"коробка"
 			конец
 		конец
 
 		функ старт() -> Пусто
 		конец
 	`)
-	expect_diagnostic(t, diags, "Type Error: generic-типы пока не поддерживают 'реализация' (Стадия 7 Phase E): 'Коробка'")
+	expect_diagnostic(t, diags, "Type Error: реализация интерфейса для generic-типа пока не поддерживается: 'Коробка'")
 }
 
 @(test)

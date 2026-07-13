@@ -926,13 +926,23 @@ unify_types :: proc(a: ^Type, b: ^Type, visited: ^map[[2]^Type]bool = nil) -> bo
 }
 
 // После вывода типа проверяем, что в нем не осталось неизвестных частей.
+// InferVar с is_decl_param (объявленный type-параметр generic-функции/
+// метода, см. Type.is_decl_param) НЕ считается "неизвестной частью" — это
+// НЕ застрявший вывод, а T/U из [T]/[T, U], намеренно неразрешённый на
+// момент тайпчека САМОЙ generic-декларации (тело обязано ссылаться на
+// него как есть, resolve при каждом ВЫЗОВЕ через instantiate_scheme).
+// Раньше это ловило ЛЮБОЙ безымянный `пер x = ...`, чей тип содержит T —
+// т.е. ЛЮБОЙ generic function body, использующий for-in (десугарится в
+// `пер __for_N_iter = массив` без аннотации) или просто `пер копия =
+// generic_параметр`, падал с "не удалось вывести тип переменной". Живой
+// баг: подтверждён минимальным `функ f[T](m: Массив(T)) ... пер x = m ...`.
 has_unresolved_infer_vars :: proc(t: ^Type) -> bool {
 	typ := prune_type(t)
 	if typ == nil do return false
 
 	#partial switch typ.kind {
 	case .InferVar:
-		return true
+		return !typ.is_decl_param
 
 	case .Function:
 		for param in typ.params {

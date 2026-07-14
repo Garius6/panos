@@ -40,16 +40,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y lld
 
       # demo/panos.wasm — build-артефакт (.gitignore), собирается только
-      # здесь, не коммитится — см. заметку в Justfile/CLAUDE.md про
-      # `odin build wasm -target:js_wasm32`.
-      # -o:size обязателен: дефолтный -o:minimal даёт бинарь настолько
-      # большой/сложный, что JavaScriptCore (WebKit/Safari) падает с
-      # pas_panic_on_out_of_memory_error в фоновом Wasm Worklist Helper
-      # Thread при попытке OMG tier-up JIT-компиляции — воспроизводилось
-      # уже на 2-6 клике "Запустить" (Chrome куда снисходительнее, но и
-      # там реальный лимит просто дальше). -o:size даёт заметно меньший
-      # модуль (824KB → 690KB на test.ps), убирает крэш — проверено живьём
-      # через Playwright+webkit (150 кликов подряд без падения).
+      # здесь (см. `just build-wasm`). -o:size обязателен: дефолтный
+      # -o:minimal даёт модуль, на JIT-компиляции которого падает
+      # JavaScriptCore (Safari/WebKit) — см. комментарий в wasm/main.odin.
       - name: Собрать panos.wasm
         run: odin build wasm -target:js_wasm32 -o:size -out:demo/panos.wasm
 

@@ -9,7 +9,6 @@ resolve_existing_import_path :: proc(import_spec: string, importer_dir: string) 
 		return local_path, true
 	}
 
-	// if is_bare_import_spec(import_spec) {
 	modules_path := resolve_import_path(import_spec, "модули")
 	if os.exists(modules_path) {
 		return modules_path, true
@@ -26,7 +25,6 @@ resolve_existing_import_path :: proc(import_spec: string, importer_dir: string) 
 	if os.exists(stdlib_path) {
 		return stdlib_path, true
 	}
-	// }
 
 	return local_path, false
 }

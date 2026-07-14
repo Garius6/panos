@@ -13,7 +13,12 @@ build-lsp:
 build-lsp-debug:
 	odin build ./lsp -out:panos-lsp -debug -o:none
 
-build-all: build build-lsp
+# -o:size обязателен: дефолтный -o:minimal даёт модуль, на котором падает
+# JIT-компилятор Safari/WebKit (см. wasm/main.odin).
+build-wasm:
+	odin build wasm -target:js_wasm32 -o:size -out:demo/panos.wasm
+
+build-all: build build-lsp build-wasm
 
 test:
 	odin test ./core

@@ -42,7 +42,6 @@ new_vm :: proc(
 	vm.program_args = program_args
 	vm.gc = new_gc_state()
 
-	// Берем переданный словарь напрямую
 	vm.compiled_functions = compiled_functions
 
 	main_func, ok := vm.compiled_functions[Main_Function_Name]
@@ -58,7 +57,7 @@ new_vm :: proc(
 	append(&vm.frames, main_frame)
 
 	for _ in 0 ..< main_func.frame_size {
-		append(&vm.stack, 0.0) // Забиваем нулями/nil
+		append(&vm.stack, 0.0) // Резервируем слоты локальных под нулями
 	}
 	return vm
 }
@@ -107,16 +106,11 @@ variant_field :: proc(v: Value, i: int) -> (Value, bool) {
 	return Value{}, false
 }
 
-// visited — cycle-safe (тот же приём, что unify_types в type_cheker.odin:
-// пара указателей once-visited считается равной без рекурсии дальше) —
-// panos поддерживает мутацию полей (Set_Property), значит self-
-// ссылающийся runtime-граф (a.следующий = a) физически возможен, наивная
-// рекурсия зациклилась бы. Раньше здесь не было case для ^Aggregate_Value/
-// ^Array_Value/^Map_Value вовсе — падало в `return false` БЕЗУСЛОВНО, а
-// тайпчекер тем временем разрешает `==`/`<>` для любых unifiable типов
-// (structural check в unify_types) — `стр1 == стр2` для двух одинаковых
-// по полям структур молча всегда была `ложь` (сравнение по ссылке, а не
-// по значению), без единой диагностики.
+// Структурное сравнение (не по ссылке): тайпчекер разрешает `==`/`<>` для
+// любых unifiable типов, значит две одинаковые по полям структуры обязаны
+// быть равны. visited — cycle-safe: мутация полей (Set_Property) допускает
+// self-ссылающийся граф (a.следующий = a), пара once-visited указателей
+// считается равной без дальнейшей рекурсии.
 value_equals :: proc(a: Value, b: Value, visited: ^map[[2]rawptr]bool = nil) -> bool {
 	v := visited
 	local_v: map[[2]rawptr]bool
@@ -271,12 +265,10 @@ make_error_result :: proc(vm: ^VM, err: Value) -> Value {
 	return Value(res)
 }
 
-// Общая точка чтения одной строки из ЛЮБОГО bufio.Reader — используется и
-// для ввод_вывод::прочитать_строку (общий vm.stdin_reader), и для
-// File_Value.прочитать_строку у обычных файлов (свой reader на дескриптор),
-// и у Файл-обёртки над стдин (тот же vm.stdin_reader, см. get_stdin_reader).
-// Один и тот же путь чтения+trim для всех трёх случаев — то самое
-// "разделяет общий механизм", о котором просили.
+// Общая точка чтения одной строки из ЛЮБОГО bufio.Reader — общий путь
+// чтения+trim для ввод_вывод::прочитать_строку (общий vm.stdin_reader),
+// File_Value.прочитать_строку у файлов (свой reader на дескриптор) и у
+// Файл-обёртки над стдин (тот же vm.stdin_reader, см. get_stdin_reader).
 read_line_from_reader :: proc(vm: ^VM, r: ^bufio.Reader) -> Value {
 	line, err := bufio.reader_read_string(r, '\n', context.temp_allocator)
 	if err != nil && err != .EOF {
@@ -877,18 +869,18 @@ execute :: proc(vm: ^VM) {
 				val_b,
 			)
 		case .Subtract:
-			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
-			append(&vm.stack, l - r) // <-- ДОБАВЛЕНО
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
+			append(&vm.stack, l - r)
 
 		case .Multiply:
-			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
-			append(&vm.stack, l * r) // <-- ДОБАВЛЕНО
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
+			append(&vm.stack, l * r)
 		case .Divide:
-			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
-			append(&vm.stack, l / r) // <-- ДОБАВЛЕНО
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
+			append(&vm.stack, l / r)
 
 		case .Less:
-			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64) // <-- ДОБАВЛЕНО
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
 			append(&vm.stack, l < r)
 
 		case .Greater:
@@ -908,7 +900,7 @@ execute :: proc(vm: ^VM) {
 			frame.ip += 1
 			arg_count := int(instructions[frame.ip])
 
-			// 1. Ищем функцию на стеке. Она лежит под всеми аргументами!
+			// Функция лежит на стеке ПОД всеми аргументами
 			callee_index := len(vm.stack) - 1 - arg_count
 			callee_val := vm.stack[callee_index]
 
@@ -920,25 +912,23 @@ execute :: proc(vm: ^VM) {
 				)
 			}
 
-			// 2. Создаем новый фрейм
 			new_frame := CallFrame {
 				function      = func_ptr,
 				ip            = 0,
-				frame_pointer = callee_index + 1, // Переменные начинаются прямо с аргументов
+				frame_pointer = callee_index + 1, // локальные начинаются прямо с аргументов
 			}
 
-			// 3. Выделяем место под локальные переменные (нули)
+			// Дорезервируем слоты под остальные локальные (нулями)
 			locals_to_allocate := func_ptr.frame_size - arg_count
 			for _ in 0 ..< locals_to_allocate {
 				append(&vm.stack, Value(f64(0)))
 			}
 
-			// 4. Запоминаем точку возврата для текущ��й функции
+			// Точка возврата в вызывающий фрейм
 			vm.frames[len(vm.frames) - 1].ip = frame.ip + 1
 
-			// 5. Переключаем контекст!
 			append(&vm.frames, new_frame)
-			continue // ВАЖНО: Начинаем новый цикл, пропуская frame.ip += 1 в конце
+			continue // пропускаем frame.ip += 1 в конце цикла
 
 		case .Call_Builtin:
 			frame.ip += 1
@@ -956,12 +946,11 @@ execute :: proc(vm: ^VM) {
 			}
 
 		case .Return:
-			result: Value = f64(0) // Значение по умолчанию (если функция ничего не вернула)
+			result: Value = f64(0) // по умолчанию, если функция ничего не вернула
 
-			// Вычисляем, где заканчиваются локальные переменные
 			base_frame_size := frame.frame_pointer + frame.function.frame_size
 
-			// Если на стеке есть что-то ВЫШЕ локальных переменных — это наш результат!
+			// Всё, что выше слотов локальных, — возвращаемое значение
 			if len(vm.stack) > base_frame_size {
 				result = pop(&vm.stack)
 			}
@@ -970,10 +959,9 @@ execute :: proc(vm: ^VM) {
 			continue
 
 		case .Try_Unwrap:
-			// Стадия 7 Phase F: Опция/Результат больше не отдельные
-			// Option_Value/Result_Value — обычные Variant_Value (как любой
-			// user-enum), построенные через Build_Variant. Тег-порядок
-			// (Нет=0/Есть=1, Успех=0/Неудача=1) зафиксирован в prelude.odin.
+			// Опция/Результат — обычные Variant_Value (как любой user-enum),
+			// построенные через Build_Variant. Тег-порядок (Нет=0/Есть=1,
+			// Успех=0/Неудача=1) зафиксирован в prelude.odin.
 			value := pop(&vm.stack)
 			if variant, ok := value.(^Variant_Value); ok {
 				switch variant.type_name {
@@ -1003,7 +991,7 @@ execute :: proc(vm: ^VM) {
 			}
 
 		case .Jump_If_False:
-			// Читаем 2 байта смещения
+			// 2-байтовое смещение (big-endian), всегда вперёд
 			frame.ip += 1
 			high := u16(instructions[frame.ip])
 			frame.ip += 1
@@ -1011,15 +999,13 @@ execute :: proc(vm: ^VM) {
 
 			offset := (high << 8) | low
 
-			// Снимаем условие со стека
 			condition_val := pop(&vm.stack)
 
-			// Мы не делаем ok-проверку, потому что Type Checker
-			// УЖЕ гарантировал, что на стеке лежит строго bool!
+			// Без ok-проверки: тайпчекер гарантирует строго bool на стеке
 			condition := condition_val.(bool)
 
 			if !condition {
-				frame.ip += int(offset) // Прыгаем вперед!
+				frame.ip += int(offset)
 			}
 
 		case .Jump:
@@ -1030,8 +1016,7 @@ execute :: proc(vm: ^VM) {
 
 			offset := (high << 8) | low
 
-			// Безусловный прыжок (например, в конец if после выполнения then)
-			// Если offset отрицательный (в случае While), int() сохранит знак.
+			// Безусловный прыжок. offset знаковый (i16): While прыгает назад.
 			frame.ip += int(i16(offset))
 		case .Build_Aggregate:
 			frame.ip += 1
@@ -1040,13 +1025,11 @@ execute :: proc(vm: ^VM) {
 			agg := gc_new(vm, Aggregate_Value)
 			resize(&agg.elements, count)
 
-			// ВАЖНО: Снимаем значения со стека в ОБРАТНОМ порядке!
-			// Если было Игрок(10, 20), то 20 лежит на самом верху стека (индекс 1).
+			// Снимаем со стека в обратном порядке: последний аргумент сверху
 			for i := count - 1; i >= 0; i -= 1 {
 				agg.elements[i] = pop(&vm.stack)
 			}
 
-			// Кладем готовую структуру на стек
 			append(&vm.stack, Value(agg))
 
 		case .Build_Variant:

@@ -1,34 +1,36 @@
 #+feature dynamic-literals
 package main
 
+// Сборка этого пакета ОБЯЗАНА идти с -o:size (см. Justfile build-wasm /
+// .github/workflows/deploy-pages.yml): дефолтный -o:minimal даёт модуль,
+// на JIT-компиляции которого падает JavaScriptCore (Safari/WebKit) —
+// у него отдельный, куда более скромный бюджет памяти под компилятор,
+// чем у V8/Chrome.
+
 import "base:runtime"
 import core "../core"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 
-// Спайк-демо: JS пишет исходник panos-скрипта в этот статический буфер
-// (через WasmMemoryInterface.storeString на адрес из panos_source_ptr()),
-// затем зовёт panos_run(len). Простое, но достаточное решение для v1 —
-// без динамической аллокации со стороны JS (никакой malloc-обвязки).
+// JS пишет исходник panos-скрипта в этот статический буфер (через
+// WasmMemoryInterface.storeString на адрес из panos_source_ptr()), затем
+// зовёт panos_run(len). Статический буфер вместо динамической аллокации со
+// стороны JS — не нужна malloc-обвязка.
 SOURCE_BUF_SIZE :: 65536
 @(private)
 source_buf: [SOURCE_BUF_SIZE]byte
 
-// Один переиспользуемый Dynamic_Arena на весь WASM-инстанс (не новый на
-// каждый вызов) — попытка "создать арену → dynamic_arena_destroy в конце"
-// на каждый вызов (первая версия этого фикса) САМА оказалась источником
-// утечки: destroy реально free()'ит backing-блоки арены обратно в
-// default_wasm_allocator (порт emmalloc), а следующий init запрашивает
-// НОВЫЕ блоки — при неидеальном повторном использовании фрагментами
-// это раз за разом дёргает wasm_memory_grow() вместо переиспользования
-// уже освобождённого места (эмпирически подтверждено: ~4.7KB/вызов
-// panos_check, ~8.5KB/вызов panos_hover утекало ДАЖЕ с аренами). Фикс —
-// dynamic_arena_reset() вместо destroy: возвращает блоки в arena's
-// unused_blocks (реальный free() НЕ вызывается), следующий вызов их
-// переиспользует напрямую — подтверждено нативным прогоном с
-// Tracking_Allocator: 2000 повторных check_source стабилизируются на
-// одном и том же live-байте после первых ~5 вызовов, без роста дальше.
+// Один переиспользуемый Dynamic_Arena на весь WASM-инстанс, не новый на каждый
+// вызов. Схема "создать арену → dynamic_arena_destroy в конце" на каждый вызов
+// сама течёт: destroy free()'ит backing-блоки арены обратно в
+// default_wasm_allocator (порт emmalloc), а следующий init запрашивает новые
+// блоки — при фрагментированном повторном использовании это дёргает
+// wasm_memory_grow() вместо переиспользования уже освобождённого места.
+// Поэтому dynamic_arena_reset() вместо destroy: возвращает блоки в
+// arena.unused_blocks (без реального free()), следующий вызов переиспользует
+// их напрямую — стабилизируется на постоянном live-байте после первых
+// нескольких вызовов, дальше не растёт.
 @(private)
 scratch_arena: mem.Dynamic_Arena
 @(private)
@@ -39,17 +41,13 @@ scratch_arena_ready: bool
 @(private)
 reset_scratch_arena :: proc() -> runtime.Allocator {
 	if !scratch_arena_ready {
-		// Пробовал поднять out_band_size до block_size, чтобы типичные
-		// [dynamic]-массивы AST/диагностик (обычно >out_band_size по
-		// умолчанию, ~6.5KB) не гоняли malloc/free каждый dynamic_arena_reset
-		// (см. комментарий у scratch_arena выше про сам факт остаточного
-		// роста из-за out-of-band churn). НЕ прижилось: на реальном файле
-		// побольше (test.ps) это ловило WASM-трап ("memory access out of
-		// bounds") внутри dynamic_arena_resize_bytes_non_zeroed — похоже на
-		// баг в самом core:mem при in-block resize около границы block_size,
-		// не стоит той небольшой экономии. Дефолтный out_band_size живёт с
-		// малым, но безопасным остаточным ростом (см. комментарий у
-		// scratch_arena).
+		// Поднимать out_band_size до block_size (чтобы крупные
+		// [dynamic]-массивы AST/диагностик не гоняли malloc/free на каждый
+		// dynamic_arena_reset) НЕ стоит: на файле побольше это ловит WASM-трап
+		// "memory access out of bounds" внутри
+		// dynamic_arena_resize_bytes_non_zeroed — похоже на баг в core:mem при
+		// in-block resize около границы block_size. Дефолтный out_band_size
+		// безопасен, ценой малого остаточного роста.
 		mem.dynamic_arena_init(&scratch_arena, alignment = 64)
 		scratch_arena_ready = true
 	} else {
@@ -70,53 +68,43 @@ panos_source_capacity :: proc "c" () -> int {
 
 // Запускает panos-скрипт длиной source_len байт из source_buf. Вывод идёт
 // через fmt.print*/fmt.eprint* — на js_wasm32 core:fmt сам пишет в
-// odin_env.write (см. fmt_js.odin в тулчейне Odin), рантайм-обвязка
-// odin.js рендерит это в consoleElement страницы — без единой строчки
-// собственного JS-парсинга WASM-памяти под каждый print.
-// WASM-инстанс живёт ВЕСЬ сеанс страницы (не как нативный CLI, где
-// процесс завершается после одного прогона и ОС сама забирает всю
-// память) — каждый вызов panos_check/panos_hover/panos_complete/
-// panos_run заново гоняет tokenize→parse→resolve→typecheck(→compile→
-// execute), и ни один Parser/Resolver_Ctx/Type_Ctx/Compiled_Function
-// никогда явно не освобождался, а у Odin нет собственного GC. Живой баг
-// (подтверждён замером): ~180KB утекало ЗА ВЫЗОВ panos_check — линтер
-// гоняет его на каждое изменение документа, за несколько минут набора
-// текста набегали сотни мегабайт, браузер убивал вкладку ("страница
-// перезагружена из-за ошибки"). reset_scratch_arena() (см. определение
-// выше) даёт каждому вызову чистый scratch-allocator без утечки между
-// вызовами. free_all(context.temp_allocator) — отдельный источник:
-// context.temp_allocator НЕ совпадает с context.allocator (его арена
-// НЕ трогается reset_scratch_arena) — это Odin-глобальный 4MB Arena
-// (base:runtime/default_temporary_allocator.odin), который json.marshal
-// использует под капотом (сортировка ключей Object) и который по своей
-// же документации ("typically called with free_all() once per frame-
-// loop") требует ручного сброса — без него первое обращение к нему за
-// весь сеанс страницы лениво выделяет и больше никогда не освобождает
-// эти 4MB (подтверждено эмпирически: рост ровно ~4.26MB одним скачком
-// на несколько сотен вызовов вперёд, а не постепенно).
+// odin_env.write (см. fmt_js.odin в тулчейне Odin), обвязка odin.js рендерит
+// это в consoleElement страницы — без собственного JS-парсинга WASM-памяти.
 //
-// НЕ покрывает GC'd VM-значения (Aggregate/Array/Map/String и т.п.,
-// выделяются во время panos_run's execute) — gc_new/vm_heap_allocator
-// (gc.odin) намеренно ИГНОРИРУЮТ ambient context.allocator (pool_release
-// полагается на настоящий free() отдельных аллокаций — Dynamic_Arena
-// такого не даёт, см. комментарий у vm_heap_allocator в gc.odin). Это
-// отдельный, меньший по объёму остаточный лик — полноценный fix для
-// panos_run требует менять саму GC-архитектуру под "одноразовый VM"
-// (сейчас она рассчитана на один долгоживущий процесс с переиспользуемыми
-// пулами), вне scope этого патча.
+// WASM-инстанс живёт весь сеанс страницы (в отличие от нативного CLI, где
+// процесс завершается и ОС забирает память). Каждый вызов
+// panos_check/panos_hover/panos_complete/panos_run заново гоняет
+// tokenize→parse→resolve→typecheck(→compile→execute), и ни один
+// Parser/Resolver_Ctx/Type_Ctx/Compiled_Function не освобождался явно, а у
+// Odin нет GC — за сеанс набегали сотни мегабайт, браузер убивал вкладку.
+// reset_scratch_arena() (см. выше) даёт каждому вызову чистый
+// scratch-allocator без утечки между вызовами.
+//
+// free_all(context.temp_allocator) — отдельный источник: temp_allocator НЕ
+// совпадает с context.allocator (его арена не трогается reset_scratch_arena) —
+// это Odin-глобальный 4MB Arena (base:runtime/default_temporary_allocator.odin),
+// который json.marshal использует под капотом (сортировка ключей Object) и
+// который по своей документации требует ручного free_all() раз за цикл — без
+// него он лениво выделяет 4MB за сеанс и никогда не освобождает.
+//
+// НЕ покрывает GC'd VM-значения (Aggregate/Array/Map/String и т.п., выделяются
+// во время execute) — gc_new/vm_heap_allocator (gc.odin) намеренно игнорируют
+// ambient context.allocator (pool_release полагается на настоящий free()
+// отдельных аллокаций — Dynamic_Arena такого не даёт, см. комментарий у
+// vm_heap_allocator в gc.odin). Это отдельный, меньший остаточный лик —
+// полноценный fix требует менять GC-архитектуру под одноразовый VM (сейчас она
+// рассчитана на долгоживущий процесс с переиспользуемыми пулами), вне scope.
 @(export)
 panos_run :: proc "c" (source_len: int) {
 	context = runtime.default_context()
 	context.allocator = reset_scratch_arena()
 	free_all(context.temp_allocator)
 
-	// odin.js's writeToConsole копит вывод в закрытый (не доступный извне)
-	// массив infoConsoleLines и перерисовывает ВЕСЬ #console из него на
-	// каждый print — JS-сторона не может ни очистить, ни узнать про это
-	// состояние снаружи (не exposed на window.odin). Раз "очистить между
-	// запусками" architecturally недоступно, разделитель печатаем прямо
-	// отсюда — то же самое API, тот же поток, без гонки с внутренним
-	// состоянием рантайма.
+	// odin.js writeToConsole копит вывод в закрытый массив infoConsoleLines
+	// и перерисовывает весь #console из него — JS-сторона не может очистить
+	// это состояние (не exposed на window.odin). Раз "очистить между
+	// запусками" недоступно, разделитель печатаем отсюда — то же API, тот же
+	// поток, без гонки с внутренним состоянием рантайма.
 	fmt.println("── запуск ──")
 
 	if source_len < 0 || source_len > SOURCE_BUF_SIZE {
@@ -133,10 +121,10 @@ panos_run :: proc "c" (source_len: int) {
 		return
 	}
 	if has_result {
-		// ^Panos_String печатается как Odin-структура через голый %v (см.
-		// print_vm в vm.odin — тот же unwrap там, для той же причины) —
-		// достаём .data явно, иначе результат-строка попадает на страницу
-		// как "&Panos_String{header = ..., data = \"текст\"}".
+		// ^Panos_String через голый %v печатается как Odin-структура (см.
+		// print_vm в vm.odin — тот же unwrap для той же причины) — достаём
+		// .data явно, иначе строка попадёт на страницу как
+		// "&Panos_String{header = ..., data = \"текст\"}".
 		if ps, ok := result.(^core.Panos_String); ok {
 			fmt.println(ps.data)
 		} else {
@@ -145,14 +133,13 @@ panos_run :: proc "c" (source_len: int) {
 	}
 }
 
-// LSP-lite: несколько прямых экспортов вместо полного LSP-протокола —
-// panos-lsp (lsp/lsp_server.odin) целиком про МНОГОФАЙЛОВЫЙ граф импортов
-// (Module_Graph, overrides для незаписанных буферов), а браузерное демо
-// принципиально single-file (см. заметку у panos_run выше) — вся эта
-// инфраструктура тут не нужна. Переиспользует core.check_source (core/
-// pipeline.odin) + core.find_expr_in_program (core/position.odin) — те
-// же низкоуровневые функции, что использует panos-lsp, просто без
-// JSON-RPC обвязки и без графа модулей.
+// LSP-lite: прямые экспорты вместо полного LSP-протокола — panos-lsp
+// (lsp/lsp_server.odin) весь про многофайловый граф импортов (Module_Graph,
+// overrides для незаписанных буферов), а браузерное демо принципиально
+// single-file, вся эта инфраструктура тут не нужна. Переиспользует
+// core.check_source (core/pipeline.odin) + core.find_expr_in_program
+// (core/position.odin) — те же функции, что и panos-lsp, но без JSON-RPC
+// обвязки и без графа модулей.
 RESULT_BUF_SIZE :: 65536
 @(private)
 result_buf: [RESULT_BUF_SIZE]byte

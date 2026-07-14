@@ -7,12 +7,9 @@ import "core:time"
 
 main :: proc() {
 	// Отладочный хук: PANOS_LSP_DEBUG_WAIT=N (секунды) — пауза перед
-	// стартом read-loop, чтобы успеть attach'нуть дебаггер к уже
-	// запущенному editor'ом процессу (stdio-транспорт, см.
-	// lsp_transport.odin — launch "напрямую под дебаггером" бесполезен
-	// для интерактивной сессии, у свежего процесса будет отдельный,
-	// не подключенный к editor'у stdio). Без переменной — no-op, обычный
-	// старт без задержки.
+	// стартом read-loop, чтобы успеть attach'нуть дебаггер к процессу,
+	// запущенному editor'ом (stdio-транспорт — запустить процесс напрямую
+	// под дебаггером нельзя, его stdio не подключён к editor'у).
 	if delay_str, ok := os.lookup_env("PANOS_LSP_DEBUG_WAIT", context.allocator); ok {
 		delay, parsed := strconv.parse_int(delay_str)
 		if parsed {

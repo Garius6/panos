@@ -39,12 +39,12 @@ builtin_function_type_3 :: proc(param_1: ^Type, param_2: ^Type, param_3: ^Type, 
 	return new_function_type(fn_params, return_type)
 }
 
-// Стадия 7 Phase F: Опция/Результат больше не Type_Kind, а обычные generic-
-// enum'ы прелюдии — эти два хелпера строят их напрямую через graph
-// (Module_Graph), а НЕ через ctx-based new_option_type/new_result_type
-// (type_cheker.odin): ensure_builtin_module выполняется во время резолва
-// импорта, ДО того как для этого модуля существует Type_Ctx — только graph
-// (уже содержащий типизированную прелюдию, см. resolve_module) под рукой.
+// Опция/Результат — обычные generic-enum'ы прелюдии, а не Type_Kind. Эти
+// два хелпера строят их напрямую через graph, а НЕ через ctx-based
+// new_option_type/new_result_type (type_cheker.odin): ensure_builtin_module
+// выполняется во время резолва импорта, ДО того как для этого модуля
+// существует Type_Ctx — только graph (уже содержащий типизированную
+// прелюдию) под рукой.
 stdlib_option_type :: proc(graph: ^Module_Graph, element_type: ^Type) -> ^Type {
 	sym := graph.prelude_option_sym
 	return instantiate_generic_raw(graph.symbol_types[sym], graph.prelude_generic_order[sym], []^Type{element_type})
@@ -137,16 +137,14 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			name,
 		)
 	}
-	// Стадия 7 Phase F: фс::прочитать/открыть/... возвращают Результат(...)
-	// (stdlib_result_type ниже), которому нужны graph.prelude_result_sym/
-	// symbol_types[...]/prelude_generic_order — обычно выставляет
-	// resolve_module ДО своего register_top_level_decl. Но load_module_
-	// recursive (module_loader.odin) зовёт ensure_builtin_module ЕЩЁ РАНЬШЕ,
-	// на этапе сканирования импортов, до единого resolve_module для этого
-	// графа — без явного вызова здесь прелюдия ещё не существует, и
-	// ensure_builtin_module (self-мемоизация выше) закэшировал бы "фс" с
-	// nil-типами НАВСЕГДА. ensure_prelude сама мемоизирована — повторный
-	// вызов из resolve_module ниже по стеку — no-op.
+	// фс::прочитать/открыть/... возвращают Результат(...) (stdlib_result_type
+	// ниже), которому нужны graph.prelude_result_sym/symbol_types/
+	// prelude_generic_order — обычно выставляет resolve_module. Но
+	// load_module_recursive зовёт ensure_builtin_module ЕЩЁ РАНЬШЕ, на этапе
+	// сканирования импортов, до единого resolve_module для графа — без явного
+	// вызова здесь прелюдия ещё не существует, и self-мемоизация выше
+	// закэшировала бы "фс" с nil-типами НАВСЕГДА. ensure_prelude сама
+	// мемоизирована — повторный вызов ниже по стеку — no-op.
 	ensure_prelude(graph)
 
 	module := new(Module)

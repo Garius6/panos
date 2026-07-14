@@ -110,8 +110,7 @@ Loop_Context :: struct {
 symbol_registry_key :: proc(store: ^Symbol_Store, id: Symbol_Id) -> string {
 	if id == INVALID_SYMBOL do return ""
 	sym := symbol_at(store, id)
-	// Interned(0) зарезервирован под "" — так же, как раньше `len(...) > 0`
-	// отличал заданный full_name от незаполненного.
+	// Interned(0) зарезервирован под "" — отличает заданный full_name от незаполненного.
 	if sym.full_name != Interned(0) do return resolve_interned(sym.full_name)
 	return resolve_interned(sym.name)
 }
@@ -184,7 +183,6 @@ emit_opcode :: proc(c: ^Compiler, op: Opcode) {
 
 // Возвращает индекс константы в пуле (без генерации опкода .Constant)
 make_constant :: proc(c: ^Compiler, value: Value) -> u8 {
-	// Здесь Odin точно знает, что value имеет строгий тип Value, и append не сломается
 	append(&c.current_function.constants, value)
 	idx := len(c.current_function.constants) - 1
 
@@ -397,16 +395,10 @@ compile_statement :: proc(ctx: ^Compiler, statement: Stmt) {
 }
 
 // Эмитит приведение структуры к интерфейсу, если тайпчекер его пометил
-// (ctx.tc.interface_casts, см. check_expr в type_cheker.odin). Раньше это
-// была ОДНА проверка внизу compile_expr, применявшаяся ко ВСЕМ видам expr
-// единообразно — но `case ^Call_Expr:` внутри содержит СВОИ ранние `return`
-// (Constructor_Struct/Method_Interface/Builtin/...), которые выходят из
-// compile_expr ЦЕЛИКОМ, минуя эту проверку. Живой баг: `показать(Коробка(5))`
-// (конструктор структуры ПРЯМО в позиции аргумента интерфейсного параметра)
-// падал в рантайме на "попытка вызвать интерфейсный метод у не-интерфейса",
-// тогда как `пер к = Коробка(5); показать(к)` работал — Ident_Expr не имеет
-// ранних return'ов и доходил до проверки внизу. Теперь вызывается явно
-// перед КАЖДЫМ таким early-return, плюс один раз в общей развязке внизу.
+// (ctx.tc.interface_casts, см. check_expr в type_cheker.odin). Должен
+// вызываться перед КАЖДЫМ ранним return в case ^Call_Expr: (они выходят из
+// compile_expr целиком, минуя общую развязку внизу), плюс один раз в самой
+// развязке для всех прочих видов expr.
 maybe_emit_interface_cast :: proc(ctx: ^Compiler, expr: Expr) {
 	if struct_type, needs_cast := ctx.tc.interface_casts[expr]; needs_cast {
 		emit_opcode(ctx, .Cast_Interface)
@@ -495,13 +487,11 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 
 		if slot_index != -1 {
-			// Это локальная переменная
 			emit_opcode(ctx, .Get_Local)
 			emit_byte(ctx, u8(slot_index))
 		} else {
-			// 2. Если не локальная, ищем в глобальном реестре функций!
+			// Не локальная — ищем в глобальном реестре функций, кладём как константу.
 			if fn_ptr, ok := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, sym_id)]; ok {
-				// Кладем саму функцию на стек как константу!
 				emit_constant(ctx, Value(fn_ptr))
 			} else {
 				fmt.panicf("Compiler Error: символ '%s' не найден", resolve_interned(sym.name))
@@ -534,15 +524,9 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			}
 		} else {
 			// .And/.Or ниже сами компилируют e.left/e.right (с прыжками для
-			// short-circuit) — если предкомпилировать их здесь тоже, каждый
-			// операнд компилируется ДВАЖДЫ. Для цепочки `и`/`или` (левая
-			// ассоциативность — e.left САМ такой же Binary_Expr) это
-			// удваивается РЕКУРСИВНО на каждом уровне: O(2^n) вместо O(n),
-			// плюс лишние значения остаются на стеке VM (никогда не
-			// снимаются) — не только компилятор падает на "слишком много
-			// констант" при глубокой цепочке, но и результат в принципе
-			// мог быть тихо неверным из-за мусора в стеке под верхним
-			// значением. Подтверждено живым тестом (7 сцепленных `и`).
+			// short-circuit). Предкомпиляция здесь удвоила бы каждый операнд, а
+			// для цепочки `и`/`или` (левоассоциативной — e.left сам Binary_Expr)
+			// рекурсивно: O(2^n) инструкций плюс мусор на стеке VM.
 			if e.op != .And && e.op != .Or {
 				compile_expr(ctx, e.left); compile_expr(ctx, e.right)
 			}
@@ -767,7 +751,6 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		patch_jump(ctx, end_jump)
 
 	case ^While_Expr:
-		// 1. Запоминаем адрес начала цикла, чтобы возвращаться сюда
 		loop_start := len(ctx.current_function.instructions)
 		loop_ctx := Loop_Context {
 			continue_target = loop_start,
@@ -775,22 +758,17 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 		append(&ctx.loops, loop_ctx)
 
-		// 2. Условие
 		compile_expr(ctx, e.condition)
-
-		// 3. Если условие ложно, выпрыгиваем из цикла
 		exit_jump := emit_jump(ctx, .Jump_If_False)
 
-		// 4. Тело цикла
 		for stmt in e.body {
 			compile_statement(ctx, stmt)
 		}
 
-		// 5. Прыгаем обратно в начало (эмулируем Jump_Back)
+		// Обратный (знаковый) прыжок в начало — .Jump эмулирует Jump_Back.
 		loop_jump := emit_jump(ctx, .Jump)
 		patch_signed_jump_to(ctx, loop_jump, loop_start)
 
-		// 6. Зашиваем адрес выхода из цикла
 		patch_jump(ctx, exit_jump)
 		finished_loop := ctx.loops[len(ctx.loops) - 1]
 		for break_jump in finished_loop.break_jumps {
@@ -802,7 +780,6 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			compile_expr(ctx, el)
 		}
 
-		// 2. Говорим виртуальной машине собрать значения со стека в единый массив
 		emit_opcode(ctx, .Build_Aggregate)
 
 		if len(e.elements) > 255 {

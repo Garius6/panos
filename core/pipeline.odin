@@ -1,21 +1,13 @@
 package core
 
 // Inline-pipeline (без файлового I/O — ни module_loader, ни os) для
-// программ БЕЗ реальных file-based `импорт`. Вынесено из e2e_test.odin
-// (было test-only run_code/run_code_with_args) в постоянный файл по двум
-// причинам: (1) core/e2e_test.odin помечен `#+build !js_wasm32` (тянет
-// core:testing, которая не собирается под js в этом Odin-тулчейне) — сам
-// пайплайн нужен и WASM-входу (wasm/main.odin), которому core:testing не
-// нужен вообще; (2) не дублировать одну и ту же 30-строчную цепочку
-// tokenize→parse→resolve→typecheck→compile→execute в двух местах.
+// программ БЕЗ реальных file-based `импорт`. Общий для WASM-входа
+// (wasm/main.odin) и тестовых обёрток run_code в e2e_test.odin, поэтому
+// живёт здесь, а не в помеченном `#+build !js_wasm32` e2e_test.odin
+// (core:testing не собирается под js).
 //
-// В отличие от старого run_code_with_args (паниковал текстом первого
-// diagnostic'а — удобно для тестов, но непригодно для вызывающего кода,
-// которому нужны ВСЕ diagnostic'и как данные, не как panic), run_source_
-// with_args возвращает diagnostics явно. e2e_test.odin's run_code/
-// run_code_with_args остаются (в e2e_test.odin) тонкими panic-обёртками
-// поверх этой функции — существующие ~200 вызовов run_code(...) по тестам
-// не переписываются.
+// Возвращает diagnostics явно (как данные), а не паникует первым из них —
+// вызывающему коду нужны все диагностики.
 run_source_with_args :: proc(
 	source: string,
 	program_args: []string = nil,

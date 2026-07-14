@@ -504,13 +504,11 @@ const statusEl = document.getElementById("run-status");
 const runButton = document.getElementById("run");
 const memInterface = new odin.WasmMemoryInterface();
 
-// EditorView создаётся синхронно ниже (нужен для extensions — линтер/
-// hover/автокомплит регистрируются в момент создания), а odin.runWasm
-// грузит WASM асинхронно — CodeMirror's linter уже пытается прогнать
-// проверку на смонтированном документе ДО того, как memInterface.exports
-// вообще заполнен (живой баг на задеплоенной странице: "Cannot read
-// properties of null (reading 'panos_source_capacity')"). Флаг —
-// единственная точка входа (writeSourceToWasm), которую используют
+// EditorView создаётся синхронно (extensions — линтер/hover/автокомплит —
+// регистрируются в момент создания), а odin.runWasm грузит WASM асинхронно:
+// без этого флага CodeMirror's linter пытается прогнать проверку на
+// смонтированном документе до того, как memInterface.exports заполнен.
+// Единственная точка входа (writeSourceToWasm), которую используют
 // run/lint/hover/complete, отдаёт "нет результата" вместо падения, пока
 // WASM не догрузился.
 let wasmReady = false;
@@ -557,14 +555,13 @@ function runSource(source) {
 	try {
 		memInterface.exports.panos_run(written);
 	} catch (e) {
-		// паника() в Odin — WASM unreachable trap, JS видит как throw. Сам
-		// текст паники Odin уже успел напечатать через odin_env.write ДО
-		// trap'а (виден в #console выше) — WASM-инстанс переживает трап
-		// (проверено: следующий запуск в том же инстансе отрабатывает
-		// штатно). Ловим здесь, чтобы (а) необработанное исключение не
-		// всплывало в devtools, (б) дать понятный статус-маркер — сам
-		// #console нельзя пополнить напрямую (следующий print перезапишет
-		// его целиком из внутреннего буфера odin.js, см. комментарий выше),
+		// паника() в Odin — WASM unreachable trap, JS видит как throw. Текст
+		// паники Odin уже напечатал через odin_env.write до trap'а (виден в
+		// #console выше); WASM-инстанс переживает трап — следующий запуск в
+		// том же инстансе отрабатывает штатно. Ловим здесь, чтобы (а)
+		// необработанное исключение не всплывало в devtools, (б) дать
+		// понятный статус-маркер — #console нельзя пополнить напрямую
+		// (следующий print перезапишет его целиком, см. комментарий выше),
 		// поэтому маркер — отдельный, полностью JS-управляемый элемент.
 		statusEl.textContent = "⚠ выполнение прервано (паника)";
 		statusEl.classList.add("crashed");
@@ -629,10 +626,9 @@ const runCommand = () => {
 };
 
 // "Mod-Enter" одним биндингом ненадёжен — CodeMirror резолвит "Mod" через
-// navigator.platform/userAgentData, а headless Chromium (в т.ч. под
-// Playwright) не всегда репортит платформу так, как ожидает браузер
-// пользователя (живой тест: "Mod-Enter" молча не срабатывал в headless-
-// прогоне на macOS-хосте). Оба варианта явно, вместо одного "Mod-".
+// navigator.platform/userAgentData, а headless Chromium не всегда репортит
+// платформу так, как ожидает браузер пользователя. Оба варианта явно,
+// вместо одного "Mod-".
 const runKeymap = keymap.of([
 	indentWithTab,
 	{ key: "Mod-Enter", run: runCommand },
@@ -664,11 +660,10 @@ odin.runWasm("panos.wasm", consoleEl, {}, memInterface).then(() => {
 		runSource(editor.state.doc.toString());
 	});
 	// Линтер уже пытался прогнаться на смонтированном документе, пока
-	// wasmReady был false (см. комментарий выше) — forceLinting (а не
-	// пустой dispatch — тот не триггерит линтер, он слушает именно
-	// docChanged) прогоняет его заново сейчас, когда WASM реально готов,
-	// иначе первая диагностика появилась бы только на следующее РУЧНОЕ
-	// изменение документа.
+	// wasmReady был false (см. комментарий выше) — forceLinting (не пустой
+	// dispatch: тот не триггерит линтер, он слушает docChanged) прогоняет
+	// его заново сейчас, иначе первая диагностика появилась бы только на
+	// следующее ручное изменение документа.
 	forceLinting(editor);
 });
 </script>

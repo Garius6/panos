@@ -14,7 +14,7 @@ main :: proc() {
 	defer mem.dynamic_arena_destroy(&arena)
 	back.register_segfault_handler()
 
-	// Перенаправляем стандартный обработчик паник в библиотеку
+	// Перенаправляем обработчик паник в back-библиотеку (backtrace на assert)
 	context.assertion_failure_proc = back.assertion_failure_proc
 	context.allocator = mem.dynamic_arena_allocator(&arena)
 	when ODIN_DEBUG {
@@ -80,10 +80,9 @@ run_file :: proc(filename: string, program_args: []string = nil, verbose: bool =
 
 	results := core.resolve_and_typecheck_all(&graph)
 
-	// Гейт до компиляции: копим diagnostics со ВСЕХ модулей и фаз разом
-	// (не только первую упавшую) — тот же accumulate-not-panic принцип,
-	// что и внутри каждой фазы (см. Стадия 2/10), только теперь ещё и
-	// поперёк графа импортов.
+	// Гейт до компиляции: копим diagnostics со всех модулей и фаз разом (не
+	// только первую упавшую) — тот же accumulate-not-panic принцип, что и
+	// внутри каждой фазы, только теперь ещё и поперёк графа импортов.
 	all_diags := make([dynamic]core.Diagnostic)
 	for d in graph.parse_diagnostics do append(&all_diags, d)
 	for r in results {

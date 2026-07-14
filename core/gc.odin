@@ -3,14 +3,12 @@ package core
 import "base:runtime"
 import "core:strings"
 
-// runtime.heap_allocator() — прямая обёртка над malloc/free ОС — не
-// реализован на js/wasm/freestanding (unimplemented() panic при первом
-// же вызове, см. base:runtime/heap_allocator_other.odin в тулчейне Odin;
-// компилируется, но падает в рантайме — выяснено живым тестом WASM-
-// спайка). runtime.default_wasm_allocator() — wasm-native аллокатор
-// (порт emmalloc, растит через wasm memory.grow), корректная замена
-// ИМЕННО для js/wasm target'ов; на остальных платформах поведение не
-// меняется — тот же heap_allocator(), что и раньше.
+// Настоящий process-lifetime аллокатор. runtime.heap_allocator() (обёртка
+// над malloc/free ОС) не реализован на js/wasm — падает unimplemented()
+// panic'ом при первом вызове, поэтому там нужен wasm-native
+// default_wasm_allocator() (порт emmalloc, растёт через wasm memory.grow).
+// Используется INTERNER'ом (interner.odin), которому нужен permanent-хип
+// независимо от окружающего context.allocator — ср. vm_gc_allocator ниже.
 vm_heap_allocator :: proc() -> runtime.Allocator {
 	when ODIN_OS == .JS {
 		return runtime.default_wasm_allocator()
@@ -19,31 +17,20 @@ vm_heap_allocator :: proc() -> runtime.Allocator {
 	}
 }
 
-// Для GC'd VM-значений конкретно (Aggregate/Array/Map/String/Option/
-// Result/Interface/Variant — см. gc_new/perm_string/gc_new_string ниже),
-// В ОТЛИЧИЕ от vm_heap_allocator(): INTERNER (interner.odin) — намеренно
-// process-lifetime синглтон, ему нужен настоящий permanent-аллокатор
-// независимо от того, что творится вокруг вызова. VM же на WASM создаётся
-// заново и выбрасывается на каждый panos_run (см. wasm/main.odin) — если
-// её значения идут через тот же default_wasm_allocator() напрямую (как
-// раньше), они никогда не освобождаются между вызовами: pool_release
-// (sweep ниже) не free()'ит объекты, а переиспользует их пулами ВНУТРИ
-// одной VM — для одноразовой VM это чистая утечка. Живой баг: WebKit
-// (Safari) падал уже на 2-3 клике "Запустить" на demo/index.html (Chrome
-// куда снисходительнее к разросшейся WASM-памяти, но реальный лимит есть
-// и там — просто дальше). На JS/WASM уважаем ambient context.allocator:
-// у всех 4 экспортов wasm/main.odin это переиспользуемая Dynamic_Arena
-// (reset — не destroy — между вызовами, см. reset_scratch_arena), значит
-// GC'd значения теперь полностью покрываются тем же сбросом, что и
-// non-GC часть пайплайна. pool_release ниже зовёт delete() на отдельные
-// поля (val.methods и т.п.) — Dynamic_Arena's .Free возвращает
-// Mode_Not_Implemented (core:mem/allocators.odin), но delete()/free() в
-// Odin просто возвращают Allocator_Error вызывающему, а gc.odin нигде
-// его не проверяет — эти delete() молча становятся no-op (байты
-// освобождаются оптом при следующем reset, не поштучно), без паники.
-// На native — тот же heap_allocator(), что и раньше: GC там рассчитан
-// на один долгоживущий процесс с реальным переиспользованием пулов
-// между МНОГИМИ запусками одной VM, менять там нечего.
+// Аллокатор для GC'd VM-значений. В ОТЛИЧИЕ от vm_heap_allocator():
+// на JS/WASM намеренно уважает ambient context.allocator, а не process-
+// lifetime хип. Причина: VM на WASM создаётся заново и выбрасывается на
+// каждый panos_run (wasm/main.odin), но pool_release/sweep не free()'ят
+// объекты — они переиспользуют их пулами ВНУТРИ одной VM. Для одноразовой
+// VM это утечка, которая роняла Safari/WebKit после нескольких запусков.
+// context.allocator у всех экспортов wasm/main.odin — переиспользуемая
+// Dynamic_Arena (reset, не destroy, между вызовами), так что GC'd значения
+// сбрасываются вместе с остальным пайплайном. delete() в pool_release при
+// этом становится no-op (Dynamic_Arena .Free возвращает Mode_Not_Implemented,
+// Odin молча отдаёт Allocator_Error, который тут не проверяется) — байты
+// освобождаются оптом при reset. На native — настоящий heap_allocator():
+// один долгоживущий процесс с реальным переиспользованием пулов между
+// многими запусками VM.
 vm_gc_allocator :: proc() -> runtime.Allocator {
 	when ODIN_OS == .JS {
 		return context.allocator

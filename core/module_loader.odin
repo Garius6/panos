@@ -3,24 +3,17 @@ package core
 import "core:fmt"
 
 // read_file_text — в module_loader_native.odin/module_loader_wasm.odin
-// (#+build split, трогает os.exists/os.open/os.read_entire_file, а сам
-// импорт core:os падает compile-time panic'ом под js_wasm32). WASM-спайк
-// v1 не поддерживает файловый `импорт` вообще (браузер не имеет ФС) —
-// wasm-вариант просто всегда отвечает "не найдено", тот же контракт, что
-// и сегодня для отсутствующего файла.
+// (#+build split, трогает os.*, а импорт core:os падает compile-time
+// panic'ом под js_wasm32). WASM-вариант не имеет ФС и всегда отвечает
+// "не найдено" — тот же контракт, что и для отсутствующего файла.
 
-// Раньше все ошибки здесь были fmt.panicf — единственный оставшийся
-// "panicking" путь пайплайна (см. TASKS.md §Стадия 10 П6, "не live-typing
-// сценарий"). Это предположение оказалось неверным для LSP: файл вне
-// панos-репы без PANOS_STDLIB/std рядом — обычный live-typing сценарий,
-// а panicf здесь роняет весь LSP-процесс, не только диагностику одного
-// документа. Мигрировано на тот же accumulate-not-panic, что и
-// lexer/parser/resolver — module_key просто не попадает в graph.modules,
-// и резолвер уже умеет с этим жить (register_top_level_decl::Import_Decl
-// проверяет `ok` из map-lookup'а, а не полагается, что модуль есть всегда).
-// importer_span — span импортирующего `Import_Decl` (для diagnostic'а),
-// zero-value для входного файла (там винить нечего, см. main.odin's
-// отдельную проверку entry_module == nil).
+// Ошибки здесь аккумулируются, а не panicf: файл вне панos-репы без
+// PANOS_STDLIB/std рядом — обычный live-typing сценарий LSP, а panicf
+// уронил бы весь LSP-процесс. module_key просто не попадает в
+// graph.modules, и резолвер это переживает (register_top_level_decl::
+// Import_Decl проверяет `ok` из map-lookup'а). importer_span — span
+// импортирующего `Import_Decl` для diagnostic'а, zero-value для входного
+// файла (там винить нечего, см. отдельную проверку entry_module == nil).
 load_module_recursive :: proc(
 	graph: ^Module_Graph,
 	file_path: string,
@@ -128,8 +121,7 @@ load_module_graph :: proc(entry_path: string) -> Module_Graph {
 }
 
 // Как load_module_graph, но с картой module_key -> текст-из-редактора для
-// модулей, открытых сейчас как LSP-буферы (см. source_overrides в
-// Module_Graph). Остальные модули читаются с диска как обычно.
+// модулей, открытых сейчас как LSP-буферы. Остальные читаются с диска.
 load_module_graph_with_overrides :: proc(
 	entry_path: string,
 	overrides: map[string]string,
@@ -147,11 +139,9 @@ Module_Result :: struct {
 }
 
 // Общий цикл "resolve+typecheck каждый модуль в графе, в топологическом
-// порядке" — раньше дублировался в main.odin::run_file и
-// lsp/lsp_server.odin::revalidate_document один-в-один. Не гейтит и не
-// прерывается на diagnostics сама — это решает вызывающий код (CLI хочет
-// print+exit до компиляции, LSP хочет копить и публиковать per-file, без
-// exit).
+// порядке". Не гейтит и не прерывается на diagnostics — это решает
+// вызывающий код (CLI хочет print+exit до компиляции, LSP хочет копить и
+// публиковать per-file, без exit).
 resolve_and_typecheck_all :: proc(graph: ^Module_Graph) -> [dynamic]Module_Result {
 	// Ёмкость выставлена сразу под len(graph.order) — append() ниже не
 	// реаллоцирует backing-массив, что важно: Type_Ctx.res указывает на
@@ -166,19 +156,17 @@ resolve_and_typecheck_all :: proc(graph: ^Module_Graph) -> [dynamic]Module_Resul
 		tc_ctx := new_type_ctx(&res_ctx)
 		typecheck_program(&tc_ctx, module.ast)
 		append(&results, Module_Result{module = module, res_ctx = res_ctx, tc_ctx = tc_ctx})
-		// new_type_ctx(&res_ctx) выше указывал на ЛОКАЛЬНУЮ переменную
-		// res_ctx — append скопировал её значение в results, но
-		// tc_ctx.res всё ещё смотрит на уже недействительный (по выходу
-		// из этой итерации) стек. Перевешиваем на адрес внутри массива.
+		// new_type_ctx(&res_ctx) выше указывал на ЛОКАЛЬНУЮ res_ctx; append
+		// скопировал её значение в results, но tc_ctx.res всё ещё смотрит на
+		// стек, недействительный по выходу из итерации. Перевешиваем на адрес
+		// внутри массива.
 		last := &results[len(results) - 1]
 		last.tc_ctx.res = &last.res_ctx
-		// ВАЖНО: обновляем graph.symbol_types СРАЗУ, внутри этой же
-		// итерации — следующий модуль (зависящий от типов, построенных
-		// ЭТИМ модулем, напр. перечисление, на которое ссылается через
-		// импорт) резолвит свой Type_Ctx ДО того, как графовое присвоение
-		// снаружи цикла успело бы произойти. Без этой строки здесь
-		// cross-module ADT usage падает с "тип-владелец ещё не построен" —
-		// эмпирически проверено, не переименовывать в "no-op" без теста.
+		// Обновляем graph.symbol_types СРАЗУ, внутри итерации: следующий
+		// модуль (зависящий от типов ЭТОГО модуля, напр. перечисление,
+		// на которое ссылается через импорт) резолвит свой Type_Ctx ДО того,
+		// как графовое присвоение снаружи цикла успело бы произойти. Без этой
+		// строки cross-module ADT usage падает с "тип-владелец ещё не построен".
 		graph.symbol_types = last.res_ctx.symbol_types
 	}
 	return results

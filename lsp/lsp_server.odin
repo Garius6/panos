@@ -6,14 +6,12 @@ import "core:encoding/json"
 import "core:strings"
 
 // Каждый открытый в редакторе документ разбирается вместе со своим графом
-// импортов (core.Module_Graph) — не изолированно, как раньше. Открытые
-// документы подставляются в граф как in-memory overrides (см.
-// core.load_module_graph_with_overrides): их текст мог измениться в
-// редакторе и ещё не быть сохранён на диск. Остальные модули графа
-// читаются с диска как обычно. file_id — id ENTRY-модуля внутри ЕГО
-// собственного (каждый раз заново построенного) графа; graph хранится
-// целиком, чтобы go-to-definition мог указать на символ в ДРУГОМ файле
-// (граф даёт file_id -> путь через graph.file_paths).
+// импортов (core.Module_Graph). Открытые документы подставляются в граф как
+// in-memory overrides (см. core.load_module_graph_with_overrides): их текст
+// мог измениться в редакторе и ещё не быть сохранён на диск. Остальные модули
+// графа читаются с диска. file_id — id ENTRY-модуля внутри его собственного
+// графа; graph хранится целиком, чтобы go-to-definition мог указать на символ
+// в другом файле (граф даёт file_id -> путь через graph.file_paths).
 LSP_Document :: struct {
 	uri:     string,
 	path:    string, // абсолютный путь на диске, извлечённый из uri
@@ -23,22 +21,18 @@ LSP_Document :: struct {
 	prog:    core.Program,
 	res_ctx: core.Resolver_Ctx,
 	tc_ctx:  core.Type_Ctx,
-	// resolve/typecheck diagnostics СО ВСЕХ модулей графа (не только
-	// entry) — если зависимость (импортированный, но не открытый как
-	// свой документ файл) содержит свою собственную ошибку, она тоже
-	// должна попасть в diagnostics, а не потеряться вместе с её
-	// отброшенным Resolver_Ctx/Type_Ctx.
+	// resolve/typecheck diagnostics со всех модулей графа (не только entry):
+	// ошибка в импортированной зависимости тоже должна попасть в diagnostics,
+	// а не потеряться вместе с отброшенным Resolver_Ctx/Type_Ctx.
 	all_diagnostics: [dynamic]core.Diagnostic,
-	// Module_Result ПО КАЖДОМУ модулю графа (не только entry) —
-	// resolve_and_typecheck_all это уже считает, раньше выбрасывалось
-	// после сбора diagnostics. Нужно build_usages, чтобы find-references/
-	// rename видели использования символа во ВСЕХ файлах графа, не
-	// только в entry. Symbol_Id сравним между модулями — Symbol_Store
-	// общий на весь граф (resolver.odin, graph.symbol_store).
+	// Module_Result по каждому модулю графа — нужен build_usages, чтобы
+	// find-references/rename видели использования символа во всех файлах графа.
+	// Symbol_Id сравним между модулями — Symbol_Store общий на весь граф
+	// (resolver.odin, graph.symbol_store).
 	results: [dynamic]core.Module_Result,
-	// Symbol_Id -> все места использования ВО ВСЁМ ГРАФЕ (для
-	// find-references/rename). Не включает span объявления — тот
-	// берётся напрямую из symbol_at(...).span. Span несёт свой file_id —
+	// Symbol_Id -> все места использования во всём графе (для
+	// find-references/rename). Не включает span объявления — тот берётся
+	// напрямую из symbol_at(...).span. Span несёт свой file_id —
 	// межмодульность бесплатна, отдельной группировки по файлам не нужно.
 	usages:  map[core.Symbol_Id][dynamic]core.Span,
 }
@@ -102,7 +96,7 @@ run_lsp_server :: proc() {
 handle_initialize :: proc(id: json.Value) {
 	result := json.Object {
 		"capabilities" = json.Object {
-			"textDocumentSync" = json.Integer(1), // Full — TASKS.md явно просит full-reparse, не incremental
+			"textDocumentSync" = json.Integer(1), // Full sync: клиент шлёт весь текст, не incremental-дельты
 			"hoverProvider" = json.Boolean(true),
 			"definitionProvider" = json.Boolean(true),
 			"completionProvider" = json.Object{},
@@ -162,13 +156,12 @@ update_document :: proc(server: ^LSP_Server, uri: string, text: string) {
 	}
 	doc.source = strings.clone(text)
 
-	// Документ, который меняется, может быть чьей-то ЗАВИСИМОСТЬЮ — если
-	// util.ps редактируется (ещё не сохранён), main.ps, который его
-	// импортирует, должен пересчитаться тоже, иначе его diagnostics
-	// останутся устаревшими до следующего редактирования main.ps.
-	// Пересчитываем ВСЕ открытые документы, не только изменившийся —
-	// для типичного числа открытых файлов в LSP-сессии это дёшево и
-	// просто, в отличие от честного dependency-tracking.
+	// Изменившийся документ может быть чьей-то зависимостью: если util.ps
+	// редактируется (ещё не сохранён), импортирующий его main.ps должен
+	// пересчитаться тоже, иначе его diagnostics устареют до следующей правки
+	// main.ps. Пересчитываем все открытые документы, не только изменившийся —
+	// для типичного числа открытых файлов это дёшево, в отличие от честного
+	// dependency-tracking.
 	for _, other_doc in server.documents {
 		revalidate_document(server, other_doc)
 	}
@@ -216,12 +209,12 @@ revalidate_document :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
 }
 
 // Symbol_Id -> [span использования, ...] — проход по node_symbols
-// (Expr -> Symbol_Id) ВСЕХ модулей графа (не только entry) — Symbol_Id
-// сравним между ними (общий Symbol_Store на граф, см. LSP_Document.results).
-// Объявление само по себе не входит (доступно через symbol_at(...).span
-// отдельно) — в node_symbols попадают только Ident/Property-узлы,
-// ссылающиеся НА символ, а не место его создания (Let_Stmt.name — строка,
-// не Expr-узел). Span несёт свой file_id — межмодульность бесплатна.
+// (Expr -> Symbol_Id) всех модулей графа. Symbol_Id сравним между ними
+// (общий Symbol_Store на граф, см. LSP_Document.results). Объявление не
+// входит (доступно через symbol_at(...).span отдельно) — в node_symbols
+// попадают только Ident/Property-узлы, ссылающиеся на символ, а не место его
+// создания (Let_Stmt.name — строка, не Expr-узел). Span несёт свой file_id —
+// межмодульность бесплатна.
 build_usages :: proc(doc: ^LSP_Document) {
 	doc.usages = make(map[core.Symbol_Id][dynamic]core.Span)
 	for i in 0 ..< len(doc.results) {
@@ -235,10 +228,9 @@ build_usages :: proc(doc: ^LSP_Document) {
 	}
 }
 
-// Публикует diagnostics для ВСЕХ модулей графа (не только ENTRY) — если
-// открытый файл импортирует модуль с ошибкой, эта ошибка тоже должна
-// куда-то попасть, а не молча проглатываться. Группирует по file_id,
-// шлёт одно уведомление на файл (даже если тот сейчас не открыт в
+// Публикует diagnostics для всех модулей графа: ошибка в импортированном
+// модуле тоже должна куда-то попасть, а не молча проглатываться. Группирует
+// по file_id, шлёт одно уведомление на файл (даже если тот сейчас не открыт в
 // редакторе — publishDiagnostics это не требует).
 publish_diagnostics :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
 	by_file := make(map[u16][dynamic]core.Diagnostic, allocator = context.temp_allocator)
@@ -422,14 +414,12 @@ handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 		return
 	}
 
-	// Dot-режим: курсор сразу после `receiver.` — вместо плоского scope-
-	// дампа показываем поля/методы/варианты РЕЗОЛВЛЕННОГО типа receiver'а.
-	// Тот же паттерн поиска, что handle_hover — find_expr_in_program, но
-	// НЕ на позицию точки (offset-1) — span_contains использует
-	// [start,end) с исключённым концом, точка сама лежит ВНЕ span'а
-	// receiver'а. Ищем на offset-2 — последний байт receiver'а перед
-	// точкой (напр. "p." — точка на byte 2, "p" занимает [1,2), нужно
-	// искать на 1). node_types даёт тип найденного узла (см.
+	// Dot-режим: курсор сразу после `receiver.` — вместо плоского scope-дампа
+	// показываем поля/методы/варианты резолвленного типа receiver'а. Ищем на
+	// offset-2, а не offset-1: span_contains использует [start,end) с
+	// исключённым концом, точка лежит вне span'а receiver'а — нужен последний
+	// байт receiver'а перед точкой (напр. "p." — точка на byte 2, "p" занимает
+	// [1,2), ищем на 1). node_types даёт тип найденного узла (см.
 	// core.type_completion_members, core/completion.odin).
 	if offset > 1 && offset <= u32(len(doc.source)) && doc.source[offset - 1] == '.' {
 		receiver_expr := core.find_expr_in_program(doc.prog, doc.file_id, offset - 2)

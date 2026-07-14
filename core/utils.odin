@@ -4,10 +4,9 @@ import "core:strings"
 import "core:unicode/utf8"
 
 // Срез строки [start, end) по индексам РУН (не байт) — согласовано с
-// get_character_at/string_length, которые тоже считают руны, а не байты
-// (кириллица и т.п. многобайтовые). Panos не имеет `[a:b]`-синтаксиса —
-// строки.срез (см. call_builtin) заменяет его builtin-вызовом вместо
-// добавления Slice_Expr в парсер/резолвер/тайпчекер/компилятор/vm.
+// get_character_at/string_length, которые тоже считают руны (кириллица и
+// т.п. многобайтовые). Panos не имеет `[a:b]`-синтаксиса — строки.срез
+// (см. call_builtin) заменяет его builtin-вызовом.
 string_slice_by_rune :: proc(s: string, start: int, end: int) -> (string, bool) {
 	if start < 0 || end < start do return "", false
 

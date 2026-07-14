@@ -1,4 +1,4 @@
-name: Deploy web-песочница на GitHub Pages
+name: Deploy сайт (доки + web-песочница) на GitHub Pages
 
 on:
   push:
@@ -46,11 +46,35 @@ jobs:
       - name: Собрать panos.wasm
         run: odin build wasm -target:js_wasm32 -o:size -out:demo/panos.wasm
 
+      # mdBook публикует готовые бинарники в своих GitHub Releases — проще
+      # и надёжнее скачать напрямую, чем тянуть отдельный marketplace-экшен
+      # ради одной команды. Версия пинится (как и Odin выше) вместо
+      # "latest", чтобы сборка не ломалась незамеченным апдейтом.
+      - name: Установить mdbook
+        run: |
+          curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          sudo mv mdbook /usr/local/bin/
+
+      - name: Собрать документацию
+        run: mdbook build docs
+
+      # Один Pages-сайт на репозиторий — доки и песочница собираются в
+      # общий каталог: доки в корне (первая точка входа для новичка),
+      # песочница на /playground/ (относительные пути внутри demo/index.html
+      # — odin.js, panos.wasm — не зависят от того, под каким префиксом
+      # каталог отдаётся, переносить их не нужно).
+      - name: Собрать сайт
+        run: |
+          mkdir -p site
+          cp -r docs/book/. site/
+          mkdir -p site/playground
+          cp -r demo/. site/playground/
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: demo
+          path: site
 
       - id: deployment
         uses: actions/deploy-pages@v4

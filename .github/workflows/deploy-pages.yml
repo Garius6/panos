@@ -28,6 +28,11 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           release: nightly
 
+      # wasm-ld (линкер под -target:js_wasm32) — не в дефолтном ubuntu-
+      # раннере, ставится отдельно пакетом lld.
+      - name: Установить wasm-ld
+        run: sudo apt-get update && sudo apt-get install -y lld
+
       # demo/panos.wasm — build-артефакт (.gitignore), собирается только
       # здесь, не коммитится — см. заметку в Justfile/CLAUDE.md про
       # `odin build wasm -target:js_wasm32`.

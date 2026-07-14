@@ -1,84 +1,78 @@
-#+feature dynamic-literals
 package main
 
 import core "../core"
+import proto "protocol"
 import "core:encoding/json"
 
-// LSP-сообщения глубоко вложены, но нам нужно из них лишь несколько
-// листовых значений (uri, line/character, text). Полное описание каждого
-// LSP-типа Odin-структурой с json-тегами — оверинжиниринг для MVP с 3
-// фичами; вместо этого — точечная навигация по json.Value напрямую.
-
-json_get :: proc(v: json.Value, key: string) -> json.Value {
-	if obj, ok := v.(json.Object); ok {
-		if val, found := obj[key]; found do return val
-	}
-	return nil
+// JSON-RPC-конверт сообщения от клиента. method/params неизвестны заранее —
+// метод определяет, в какой конкретный proto.*Params разобрать params (см.
+// decode_params). id/params остаются json.Value: id может быть числом/
+// строкой/null (JSON-RPC), а params — заведомо неизвестной заранее формы.
+RPC_Envelope :: struct {
+	jsonrpc: string     `json:"jsonrpc"`,
+	id:      json.Value `json:"id"`,
+	method:  string     `json:"method"`,
+	params:  json.Value `json:"params"`,
 }
 
-json_str :: proc(v: json.Value, key: string) -> string {
-	val := json_get(v, key)
-	if s, ok := val.(json.String); ok do return string(s)
-	return ""
+// Раскодирует params (уже распарсенное поддерево) в конкретный
+// LSP-параметр-тип через промежуточный marshal → unmarshal: params уже
+// json.Value, а не сырые байты, так что второй проход дешёвый — не по
+// всему сообщению, а по одному вложенному объекту.
+decode_params :: proc($T: typeid, params: json.Value) -> (T, bool) {
+	data, merr := json.marshal(params, {})
+	if merr != nil do return {}, false
+	defer delete(data)
+	result: T
+	uerr := json.unmarshal(data, &result)
+	return result, uerr == nil
 }
 
-json_int :: proc(v: json.Value, key: string) -> int {
-	val := json_get(v, key)
-	if n, ok := val.(json.Integer); ok do return int(n)
-	if f, ok := val.(json.Float); ok do return int(f) // defensive: клиент прислал число без parse_integers-эффекта
-	return 0
+lsp_position :: proc(line: int, character: int) -> proto.Position {
+	return proto.Position{line = u32(line), character = u32(character)}
 }
 
-json_bool :: proc(v: json.Value, key: string) -> bool {
-	val := json_get(v, key)
-	if b, ok := val.(json.Boolean); ok do return bool(b)
-	return false
-}
-
-// Собирает LSP Position {line, character} как json.Value.
-lsp_position_json :: proc(line: int, character: int) -> json.Value {
-	return json.Object {
-		"line" = json.Integer(i64(line)),
-		"character" = json.Integer(i64(character)),
-	}
-}
-
-// Собирает LSP Range {start, end} из байтовых offset'ов в source.
-lsp_range_json :: proc(source: string, start_offset: u32, end_offset: u32) -> json.Value {
+lsp_range :: proc(source: string, start_offset: u32, end_offset: u32) -> proto.Range {
 	start_line, start_char := core.byte_offset_to_lsp_position(source, start_offset)
 	end_line, end_char := core.byte_offset_to_lsp_position(source, end_offset)
-	return json.Object {
-		"start" = lsp_position_json(start_line, start_char),
-		"end" = lsp_position_json(end_line, end_char),
-	}
+	return proto.Range{start = lsp_position(start_line, start_char), end = lsp_position(end_line, end_char)}
 }
 
-send_response :: proc(id: json.Value, result: json.Value) {
-	msg := json.Object {
-		"jsonrpc" = json.String("2.0"),
-		"id"      = id,
-		"result"  = result,
-	}
-	lsp_write_message(msg)
+RPC_Response :: struct($R: typeid) {
+	jsonrpc: string     `json:"jsonrpc"`,
+	id:      json.Value `json:"id"`,
+	result:  R          `json:"result"`,
+}
+
+send_response :: proc(id: json.Value, result: $T) {
+	lsp_write_message(RPC_Response(T){jsonrpc = "2.0", id = id, result = result})
+}
+
+// result: null — общий случай "нет ответа" (hover/definition/references
+// не нашли ничего под курсором и т.п.).
+send_null_response :: proc(id: json.Value) {
+	send_response(id, json.Value(nil))
+}
+
+RPC_Error_Response :: struct {
+	jsonrpc: string     `json:"jsonrpc"`,
+	id:      json.Value `json:"id"`,
+	error:   struct {
+		code:    int    `json:"code"`,
+		message: string `json:"message"`,
+	} `json:"error"`,
 }
 
 send_error_response :: proc(id: json.Value, code: int, message: string) {
-	msg := json.Object {
-		"jsonrpc" = json.String("2.0"),
-		"id"      = id,
-		"error"   = json.Object {
-			"code" = json.Integer(i64(code)),
-			"message" = json.String(message),
-		},
-	}
-	lsp_write_message(msg)
+	lsp_write_message(RPC_Error_Response{jsonrpc = "2.0", id = id, error = {code = code, message = message}})
 }
 
-send_notification :: proc(method: string, params: json.Value) {
-	msg := json.Object {
-		"jsonrpc" = json.String("2.0"),
-		"method"  = json.String(method),
-		"params"  = params,
-	}
-	lsp_write_message(msg)
+RPC_Notification :: struct($P: typeid) {
+	jsonrpc: string `json:"jsonrpc"`,
+	method:  string `json:"method"`,
+	params:  P      `json:"params"`,
+}
+
+send_notification :: proc(method: string, params: $T) {
+	lsp_write_message(RPC_Notification(T){jsonrpc = "2.0", method = method, params = params})
 }

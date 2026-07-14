@@ -1,7 +1,7 @@
-#+feature dynamic-literals
 package main
 
 import core "../core"
+import proto "protocol"
 import "core:encoding/json"
 import "core:strings"
 
@@ -49,24 +49,23 @@ run_lsp_server :: proc() {
 	lsp_reader_init(&reader)
 
 	for {
-		msg, ok := lsp_read_message(&reader)
+		data, ok := lsp_read_message(&reader)
 		if !ok do return // stdin закрыт клиентом — выходим тихо
 
-		obj, is_obj := msg.(json.Object)
-		if !is_obj do continue
-		method := json_str(msg, "method")
-		if method == "" do continue // это ответ НА НАШ запрос — мы запросов клиенту не шлём
+		envelope: RPC_Envelope
+		if json.unmarshal(data, &envelope) != nil do continue
+		if envelope.method == "" do continue // это ответ НА НАШ запрос — мы запросов клиенту не шлём
 
-		params := json_get(msg, "params")
-		id_val, has_id := obj["id"]
+		id_val := envelope.id
+		params := envelope.params
 
-		switch method {
+		switch envelope.method {
 		case "initialize":
 			handle_initialize(id_val)
 		case "initialized":
 		// notification от клиента после инициализации — квитировать нечем
 		case "shutdown":
-			send_response(id_val, nil)
+			send_null_response(id_val)
 		case "exit":
 			return
 		case "textDocument/didOpen":
@@ -86,7 +85,7 @@ run_lsp_server :: proc() {
 		case "textDocument/rename":
 			handle_rename(&server, id_val, params)
 		case:
-			if has_id {
+			if envelope.id != nil {
 				send_error_response(id_val, -32601, "method not found")
 			}
 		}
@@ -94,41 +93,49 @@ run_lsp_server :: proc() {
 }
 
 handle_initialize :: proc(id: json.Value) {
-	result := json.Object {
-		"capabilities" = json.Object {
-			"textDocumentSync" = json.Integer(1), // Full sync: клиент шлёт весь текст, не incremental-дельты
-			"hoverProvider" = json.Boolean(true),
-			"definitionProvider" = json.Boolean(true),
-			"completionProvider" = json.Object{},
-			"referencesProvider" = json.Boolean(true),
-			"renameProvider" = json.Boolean(true),
+	result := proto.InitializeResult {
+		capabilities = proto.ServerCapabilities {
+			text_document_sync = proto.TextDocumentSyncKind.Full, // клиент шлёт весь текст, не incremental-дельты
+			hover_provider = true,
+			definition_provider = true,
+			completion_provider = proto.CompletionOptions{},
+			references_provider = true,
+			rename_provider = true,
 		},
 	}
 	send_response(id, result)
 }
 
 handle_did_open :: proc(server: ^LSP_Server, params: json.Value) {
-	text_document := json_get(params, "textDocument")
-	uri := json_str(text_document, "uri")
-	text := json_str(text_document, "text")
-	update_document(server, uri, text)
+	p, ok := decode_params(proto.DidOpenTextDocumentParams, params)
+	if !ok do return
+	update_document(server, string(p.text_document.uri), p.text_document.text)
+}
+
+// Full sync (textDocumentSync = 1): contentChanges — не honest incremental
+// TextDocumentContentChangeEvent (union range+text/text-only), а всегда
+// последний элемент с полным текстом документа — поэтому не декодируем
+// в proto.TextDocumentContentChangeEvent (union из двух вариантов,
+// unmarshal в union не умеет выбирать вариант по форме JSON, см. commit
+// message), а забираем поле text напрямую: оно есть у обоих вариантов.
+Did_Change_Params :: struct {
+	text_document:   proto.VersionedTextDocumentIdentifier `json:"textDocument"`,
+	content_changes: []struct {
+		text: string `json:"text"`,
+	} `json:"contentChanges"`,
 }
 
 handle_did_change :: proc(server: ^LSP_Server, params: json.Value) {
-	text_document := json_get(params, "textDocument")
-	uri := json_str(text_document, "uri")
-	changes := json_get(params, "contentChanges")
-	arr, ok := changes.(json.Array)
-	if !ok || len(arr) == 0 do return
-	// Full sync (textDocumentSync = 1): последний change содержит весь текст.
-	text := json_str(arr[len(arr) - 1], "text")
-	update_document(server, uri, text)
+	p, ok := decode_params(Did_Change_Params, params)
+	if !ok || len(p.content_changes) == 0 do return
+	text := p.content_changes[len(p.content_changes) - 1].text
+	update_document(server, string(p.text_document.uri), text)
 }
 
 handle_did_close :: proc(server: ^LSP_Server, params: json.Value) {
-	text_document := json_get(params, "textDocument")
-	uri := json_str(text_document, "uri")
-	delete_key(&server.documents, uri)
+	p, ok := decode_params(proto.DidCloseTextDocumentParams, params)
+	if !ok do return
+	delete_key(&server.documents, string(p.text_document.uri))
 }
 
 // file:///abs/path -> /abs/path. Не декодирует %XX-escape'ы — для
@@ -259,23 +266,21 @@ publish_diagnostics :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
 		path := doc.graph.file_paths[file_id]
 		file_uri := path_to_uri(path)
 
-		diags := make([dynamic]json.Value, 0, len(file_diags))
+		diags := make([dynamic]proto.Diagnostic, 0, len(file_diags))
 		for d in file_diags {
 			append(
 				&diags,
-				json.Value(
-					json.Object {
-						"range" = lsp_range_json(source, d.span.start, d.span.end),
-						"severity" = json.Integer(1), // Error
-						"message" = json.String(d.message),
-					},
-				),
+				proto.Diagnostic {
+					range = lsp_range(source, d.span.start, d.span.end),
+					severity = proto.DiagnosticSeverity.Error,
+					message = d.message,
+				},
 			)
 		}
 
 		send_notification(
 			"textDocument/publishDiagnostics",
-			json.Object{"uri" = json.String(file_uri), "diagnostics" = json.Array(diags)},
+			proto.PublishDiagnosticsParams{uri = proto.DocumentUri(file_uri), diagnostics = diags[:]},
 		)
 	}
 }
@@ -283,29 +288,26 @@ publish_diagnostics :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
 handle_hover :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	doc, offset, ok := resolve_position(server, params)
 	if !ok {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 
 	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
 	if expr == nil {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 
 	typ, has_type := doc.tc_ctx.node_types[expr]
 	if !has_type || typ == nil {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 
 	sp := core.expr_span(expr)
-	result := json.Object {
-		"contents" = json.Object {
-			"kind" = json.String("plaintext"),
-			"value" = json.String(core.prune_type(typ).name),
-		},
-		"range" = lsp_range_json(doc.source, sp.start, sp.end),
+	result := proto.Hover {
+		contents = proto.MarkupContent{kind = proto.MarkupKind_PlainText, value = core.prune_type(typ).name},
+		range = lsp_range(doc.source, sp.start, sp.end),
 	}
 	send_response(id, result)
 }
@@ -313,19 +315,19 @@ handle_hover :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 handle_definition :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	doc, offset, ok := resolve_position(server, params)
 	if !ok {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 
 	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
 	if expr == nil {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 
 	sym_id, has_sym := doc.res_ctx.node_symbols[expr]
 	if !has_sym || sym_id == core.INVALID_SYMBOL {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 	// symbol_store общий на весь граф импортов (graph.symbol_store) —
@@ -335,7 +337,7 @@ handle_definition :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 	if sym.kind == .Builtin {
 		// Ошибка/Есть/Нет/Успех/Неудача/длина/паника — span нулевой
 		// (install_standard_symbols не задаёт его), некуда прыгать.
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 
@@ -346,60 +348,64 @@ handle_definition :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 		target_uri = path_to_uri(doc.graph.file_paths[sym.span.file_id])
 	}
 
-	result := json.Object {
-		"uri" = json.String(target_uri),
-		"range" = lsp_range_json(target_source, sym.span.start, sym.span.end),
+	result := proto.Location {
+		uri   = proto.DocumentUri(target_uri),
+		range = lsp_range(target_source, sym.span.start, sym.span.end),
 	}
 	send_response(id, result)
 }
 
-// Общая часть hover/definition: достаёт документ и byte offset курсора.
-resolve_position :: proc(server: ^LSP_Server, params: json.Value) -> (^LSP_Document, u32, bool) {
-	text_document := json_get(params, "textDocument")
-	uri := json_str(text_document, "uri")
-	position := json_get(params, "position")
-	line := json_int(position, "line")
-	character := json_int(position, "character")
+// textDocument/position — форма, общая для hover/definition/completion/
+// references/rename (все proto.*Params имеют эту пару полей плюс что-то
+// своё); decode_params игнорирует лишние поля, так что достаточно
+// декодировать только этот срез, а не полный proto.HoverParams и т.п.
+Text_Document_Position_Params :: struct {
+	text_document: proto.TextDocumentIdentifier `json:"textDocument"`,
+	position:      proto.Position               `json:"position"`,
+}
 
-	doc, found := server.documents[uri]
+// Общая часть hover/definition/etc: достаёт документ и byte offset курсора.
+resolve_position :: proc(server: ^LSP_Server, params: json.Value) -> (^LSP_Document, u32, bool) {
+	p, ok := decode_params(Text_Document_Position_Params, params)
+	if !ok do return nil, 0, false
+
+	doc, found := server.documents[string(p.text_document.uri)]
 	if !found do return nil, 0, false
 
-	offset := core.lsp_position_to_byte_offset(doc.source, line, character)
+	offset := core.lsp_position_to_byte_offset(doc.source, int(p.position.line), int(p.position.character))
 	return doc, offset, true
 }
 
-completion_kind :: proc(kind: core.Symbol_Kind) -> int {
-	// LSP CompletionItemKind: Function=3, Variable=6, Class=7, Module=9,
-	// EnumMember=20.
+completion_kind :: proc(kind: core.Symbol_Kind) -> proto.CompletionItemKind {
 	switch kind {
 	case .Function:
-		return 3
+		return .Function
 	case .Variable:
-		return 6
+		return .Variable
 	case .Type:
-		return 7
+		return .Class
 	case .Module:
-		return 9
+		return .Module
 	case .Builtin:
-		return 3
+		return .Function
 	case .Enum_Variant:
-		return 20
+		return .EnumMember
 	}
-	return 1
+	return .Text
 }
 
-// LSP CompletionItemKind для core.Completion_Member_Kind (Field=5, Method=2,
-// EnumMember=20 — та же нумерация, что уже использует completion_kind).
-member_completion_kind :: proc(kind: core.Completion_Member_Kind) -> int {
+// LSP CompletionItemKind для core.Completion_Member_Kind (Field/Method/
+// EnumMember — та же нумерация, что уже использует completion_kind).
+member_completion_kind :: proc(kind: core.Completion_Member_Kind) -> proto.CompletionItemKind {
 	switch kind {
 	case .Field:
-		return 5
+		return .Field
 	case .Method:
-		return 2
+		return .Method
 	case .Variant:
-		return 20
+		return .EnumMember
 	}
-	return 1
+	return .Text
 }
 
 // scope-aware enumeration (MVP): глобальные символы модуля (включая алиасы
@@ -410,7 +416,7 @@ member_completion_kind :: proc(kind: core.Completion_Member_Kind) -> int {
 handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	doc, offset, ok := resolve_position(server, params)
 	if !ok {
-		send_response(id, json.Array{})
+		send_response(id, []proto.CompletionItem{})
 		return
 	}
 
@@ -426,33 +432,28 @@ handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 		if receiver_expr != nil {
 			if typ, has_type := doc.tc_ctx.node_types[receiver_expr]; has_type && typ != nil {
 				members := core.type_completion_members(typ)
-				dot_items := make([dynamic]json.Value)
+				dot_items := make([dynamic]proto.CompletionItem)
 				dot_seen := make(map[string]bool, allocator = context.temp_allocator)
 				for m in members {
 					if m.name == "" || dot_seen[m.name] do continue
 					dot_seen[m.name] = true
-					append(
-						&dot_items,
-						json.Value(
-							json.Object{"label" = json.String(m.name), "kind" = json.Integer(i64(member_completion_kind(m.kind)))},
-						),
-					)
+					append(&dot_items, proto.CompletionItem{label = m.name, kind = member_completion_kind(m.kind)})
 				}
-				send_response(id, json.Array(dot_items))
+				send_response(id, dot_items[:])
 				return
 			}
 		}
-		send_response(id, json.Array{})
+		send_response(id, []proto.CompletionItem{})
 		return
 	}
 
-	items := make([dynamic]json.Value)
+	items := make([dynamic]proto.CompletionItem)
 	seen := make(map[string]bool, allocator = context.temp_allocator)
 
-	add_item := proc(items: ^[dynamic]json.Value, seen: ^map[string]bool, name: string, kind: int) {
+	add_item := proc(items: ^[dynamic]proto.CompletionItem, seen: ^map[string]bool, name: string, kind: proto.CompletionItemKind) {
 		if name == "" || seen[name] do return
 		seen[name] = true
-		append(items, json.Value(json.Object{"label" = json.String(name), "kind" = json.Integer(i64(kind))}))
+		append(items, proto.CompletionItem{label = name, kind = kind})
 	}
 
 	for name_id, sym_id in doc.res_ctx.global_scope.symbols {
@@ -465,9 +466,9 @@ handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 		res: ^core.Resolver_Ctx,
 		decl: core.Decls,
 		body: [dynamic]core.Stmt,
-		items: ^[dynamic]json.Value,
+		items: ^[dynamic]proto.CompletionItem,
 		seen: ^map[string]bool,
-		add_item: proc(^[dynamic]json.Value, ^map[string]bool, string, int),
+		add_item: proc(^[dynamic]proto.CompletionItem, ^map[string]bool, string, proto.CompletionItemKind),
 	) {
 		if args, ok := res.func_args[decl]; ok {
 			for a in args {
@@ -495,15 +496,15 @@ handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 		}
 	}
 
-	send_response(id, json.Array(items))
+	send_response(id, items[:])
 }
 
 // Собирает Location[] по Symbol_Id: объявление (в этом или другом файле
 // графа — symbol_store общий) + все usages ИЗ ЭТОГО документа (doc.usages
 // не сканирует другие открытые файлы — см. ограничение в
 // handle_references).
-collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_decl: bool) -> [dynamic]json.Value {
-	locations := make([dynamic]json.Value)
+collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_decl: bool) -> [dynamic]proto.Location {
+	locations := make([dynamic]proto.Location)
 	if include_decl {
 		decl_span := core.symbol_at(doc.res_ctx.symbol_store, sym_id).span
 		decl_source := doc.source
@@ -514,12 +515,7 @@ collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_de
 		}
 		append(
 			&locations,
-			json.Value(
-				json.Object {
-					"uri" = json.String(decl_uri),
-					"range" = lsp_range_json(decl_source, decl_span.start, decl_span.end),
-				},
-			),
+			proto.Location{uri = proto.DocumentUri(decl_uri), range = lsp_range(decl_source, decl_span.start, decl_span.end)},
 		)
 	}
 	for sp in doc.usages[sym_id] {
@@ -534,9 +530,7 @@ collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_de
 		}
 		append(
 			&locations,
-			json.Value(
-				json.Object{"uri" = json.String(usage_uri), "range" = lsp_range_json(usage_source, sp.start, sp.end)},
-			),
+			proto.Location{uri = proto.DocumentUri(usage_uri), range = lsp_range(usage_source, sp.start, sp.end)},
 		)
 	}
 	return locations
@@ -550,59 +544,65 @@ collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_de
 handle_references :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	doc, offset, ok := resolve_position(server, params)
 	if !ok {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
 	if expr == nil {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 	sym_id, has_sym := doc.res_ctx.node_symbols[expr]
 	if !has_sym || sym_id == core.INVALID_SYMBOL {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 
-	include_decl := json_bool(json_get(params, "context"), "includeDeclaration")
-	locations := collect_locations(doc, sym_id, include_decl)
-	send_response(id, json.Array(locations))
+	p, dok := decode_params(proto.ReferenceParams, params)
+	if !dok {
+		send_null_response(id)
+		return
+	}
+	locations := collect_locations(doc, sym_id, p.context_.include_declaration)
+	send_response(id, locations[:])
 }
 
 handle_rename :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	doc, offset, ok := resolve_position(server, params)
 	if !ok {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
-	new_name := json_str(params, "newName")
+	p, dok := decode_params(proto.RenameParams, params)
+	if !dok {
+		send_null_response(id)
+		return
+	}
 	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
 	if expr == nil {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 	sym_id, has_sym := doc.res_ctx.node_symbols[expr]
 	if !has_sym || sym_id == core.INVALID_SYMBOL {
-		send_response(id, nil)
+		send_null_response(id)
 		return
 	}
 
 	locations := collect_locations(doc, sym_id, true)
 	// changes сгруппирован по uri — declaration может лежать в ДРУГОМ
 	// файле (импортированном модуле), чем usages.
-	changes := make(json.Object)
+	changes_dyn := make(map[proto.DocumentUri][dynamic]proto.TextEdit, allocator = context.temp_allocator)
 	for loc in locations {
-		obj := loc.(json.Object)
-		uri := string(obj["uri"].(json.String))
-		edit := json.Value(json.Object{"range" = obj["range"], "newText" = json.String(new_name)})
-		if existing, found := changes[uri]; found {
-			arr := existing.(json.Array)
-			append(&arr, edit)
-			changes[uri] = json.Value(arr)
-		} else {
-			changes[uri] = json.Value(json.Array{edit})
-		}
+		edit := proto.TextEdit{range = loc.range, new_text = p.new_name}
+		existing := changes_dyn[loc.uri]
+		append(&existing, edit)
+		changes_dyn[loc.uri] = existing
 	}
-	result := json.Object{"changes" = json.Value(changes)}
+	changes := make(map[proto.DocumentUri][]proto.TextEdit)
+	for uri, edits in changes_dyn {
+		changes[uri] = edits[:]
+	}
+	result := proto.WorkspaceEdit{changes = changes}
 	send_response(id, result)
 }

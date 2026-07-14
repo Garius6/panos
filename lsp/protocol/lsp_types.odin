@@ -821,11 +821,11 @@ ServerCapabilitiesWorkspace :: struct {
 	// The server supports workspace folder.
 	// 
 	// @since 3.6.0
-	workspace_folders: ^WorkspaceFoldersServerCapabilities `json:"workspaceFolders,omitempty"`,
+	workspace_folders: Maybe(WorkspaceFoldersServerCapabilities) `json:"workspaceFolders,omitempty"`,
 	// The server is interested in notifications/requests for operations on files.
 	// 
 	// @since 3.16.0
-	file_operations: ^FileOperationOptions `json:"fileOperations,omitempty"`,
+	file_operations: Maybe(FileOperationOptions) `json:"fileOperations,omitempty"`,
 }
 
 CompletionOptionsCompletionItem :: struct {
@@ -1332,7 +1332,7 @@ ColorPresentation :: struct {
 	// An {@link TextEdit edit} which is applied to a document when selecting
 	// this presentation for the color.  When `falsy` the {@link ColorPresentation.label label}
 	// is used.
-	text_edit: ^TextEdit `json:"textEdit,omitempty"`,
+	text_edit: Maybe(TextEdit) `json:"textEdit,omitempty"`,
 	// An optional array of additional {@link TextEdit text edits} that are applied when
 	// selecting this color presentation. Edits must not overlap with the main {@link ColorPresentation.textEdit edit} nor with themselves.
 	additional_text_edits: Maybe([]TextEdit) `json:"additionalTextEdits,omitempty"`,
@@ -1659,7 +1659,7 @@ ShowDocumentParams :: struct {
 	// document. Clients might ignore the property if an
 	// external program is started or the file is not a text
 	// file.
-	selection: ^Range `json:"selection,omitempty"`,
+	selection: Maybe(Range) `json:"selection,omitempty"`,
 }
 
 // The result of a showDocument request.
@@ -2154,9 +2154,9 @@ InlineCompletionItem :: struct {
 	// A text that is used to decide if this inline completion should be shown. When `falsy` the {@link InlineCompletionItem.insertText} is used.
 	filter_text: Maybe(string) `json:"filterText,omitempty"`,
 	// The range to replace. Must begin and end on the same line.
-	range: ^Range `json:"range,omitempty"`,
+	range: Maybe(Range) `json:"range,omitempty"`,
 	// An optional {@link Command} that is executed *after* inserting this completion.
-	command: ^Command `json:"command,omitempty"`,
+	command: Maybe(Command) `json:"command,omitempty"`,
 }
 
 // Inline completion options used during static or dynamic registration.
@@ -2407,7 +2407,7 @@ CompletionParams :: struct {
 	partial_result_token: Maybe(ProgressToken) `json:"partialResultToken,omitempty"`,
 	// The completion context. This is only available if the client specifies
 	// to send this using the client capability `textDocument.completion.contextSupport === true`
-	context_: ^CompletionContext `json:"context,omitempty"`,
+	context_: Maybe(CompletionContext) `json:"context,omitempty"`,
 }
 
 // A completion item represents a text snippet that is
@@ -2424,7 +2424,7 @@ CompletionItem :: struct {
 	// Additional details for the label
 	// 
 	// @since 3.17.0
-	label_details: ^CompletionItemLabelDetails `json:"labelDetails,omitempty"`,
+	label_details: Maybe(CompletionItemLabelDetails) `json:"labelDetails,omitempty"`,
 	// The kind of this completion item. Based of the kind
 	// an icon is chosen by the editor.
 	kind: Maybe(CompletionItemKind) `json:"kind,omitempty"`,
@@ -2526,7 +2526,7 @@ CompletionItem :: struct {
 	// An optional {@link Command command} that is executed *after* inserting this completion. *Note* that
 	// additional modifications to the current document should be described with the
 	// {@link CompletionItem.additionalTextEdits additionalTextEdits}-property.
-	command: ^Command `json:"command,omitempty"`,
+	command: Maybe(Command) `json:"command,omitempty"`,
 	// A data entry field that is preserved on a completion item between a
 	// {@link CompletionRequest} and a {@link CompletionResolveRequest}.
 	data: Maybe(LSPAny) `json:"data,omitempty"`,
@@ -2608,7 +2608,7 @@ Hover :: struct {
 	contents: union {MarkupContent, MarkedString, []MarkedString} `json:"contents"`,
 	// An optional range inside the text document that is used to
 	// visualize the hover, e.g. by changing the background color.
-	range: ^Range `json:"range,omitempty"`,
+	range: Maybe(Range) `json:"range,omitempty"`,
 }
 
 // Registration options for a {@link HoverRequest}.
@@ -2631,7 +2631,7 @@ SignatureHelpParams :: struct {
 	// to send this using the client capability `textDocument.signatureHelp.contextSupport === true`
 	// 
 	// @since 3.15.0
-	context_: ^SignatureHelpContext `json:"context,omitempty"`,
+	context_: Maybe(SignatureHelpContext) `json:"context,omitempty"`,
 }
 
 // Signature help represents the signature of something
@@ -2905,11 +2905,11 @@ CodeAction :: struct {
 	// @since 3.16.0
 	disabled: Maybe(CodeActionDisabled) `json:"disabled,omitempty"`,
 	// The workspace edit this code action performs.
-	edit: ^WorkspaceEdit `json:"edit,omitempty"`,
+	edit: Maybe(WorkspaceEdit) `json:"edit,omitempty"`,
 	// A command this code action executes. If a code action
 	// provides an edit and a command, first the edit is
 	// executed and then the command.
-	command: ^Command `json:"command,omitempty"`,
+	command: Maybe(Command) `json:"command,omitempty"`,
 	// A data entry field that is preserved on a code action between
 	// a `textDocument/codeAction` and a `codeAction/resolve` request.
 	// 
@@ -3007,7 +3007,7 @@ CodeLens :: struct {
 	// The range in which this code lens is valid. Should only span a single line.
 	range: Range `json:"range"`,
 	// The command this code lens represents.
-	command: ^Command `json:"command,omitempty"`,
+	command: Maybe(Command) `json:"command,omitempty"`,
 	// A data entry field that is preserved on a code lens item between
 	// a {@link CodeLensRequest} and a {@link CodeLensResolveRequest}
 	data: Maybe(LSPAny) `json:"data,omitempty"`,
@@ -3331,7 +3331,7 @@ LocationLink :: struct {
 	// 
 	// Used as the underlined span for mouse interaction. Defaults to the word range at
 	// the definition position.
-	origin_selection_range: ^Range `json:"originSelectionRange,omitempty"`,
+	origin_selection_range: Maybe(Range) `json:"originSelectionRange,omitempty"`,
 	// The target resource identifier of this link.
 	target_uri: DocumentUri `json:"targetUri"`,
 	// The full target range of this link. If the target for example is a symbol then target range is the
@@ -3535,7 +3535,7 @@ CreateFile :: struct {
 	// The resource to create.
 	uri: DocumentUri `json:"uri"`,
 	// Additional options
-	options: ^CreateFileOptions `json:"options,omitempty"`,
+	options: Maybe(CreateFileOptions) `json:"options,omitempty"`,
 }
 
 // Rename file operation
@@ -3551,7 +3551,7 @@ RenameFile :: struct {
 	// The new location.
 	new_uri: DocumentUri `json:"newUri"`,
 	// Rename options.
-	options: ^RenameFileOptions `json:"options,omitempty"`,
+	options: Maybe(RenameFileOptions) `json:"options,omitempty"`,
 }
 
 // Delete file operation
@@ -3565,7 +3565,7 @@ DeleteFile :: struct {
 	// The file to delete.
 	uri: DocumentUri `json:"uri"`,
 	// Delete options.
-	options: ^DeleteFileOptions `json:"options,omitempty"`,
+	options: Maybe(DeleteFileOptions) `json:"options,omitempty"`,
 }
 
 // Additional information that describes document changes.
@@ -3699,12 +3699,12 @@ InlayHintLabelPart :: struct {
 	// 
 	// Depending on the client capability `inlayHint.resolveSupport` clients
 	// might resolve this property late using the resolve request.
-	location: ^Location `json:"location,omitempty"`,
+	location: Maybe(Location) `json:"location,omitempty"`,
 	// An optional command for this label part.
 	// 
 	// Depending on the client capability `inlayHint.resolveSupport` clients
 	// might resolve this property late using the resolve request.
-	command: ^Command `json:"command,omitempty"`,
+	command: Maybe(Command) `json:"command,omitempty"`,
 }
 
 // A `MarkupContent` literal represents a string value which content is interpreted base on its
@@ -3919,7 +3919,7 @@ InlineCompletionContext :: struct {
 	// Describes how the inline completion was triggered.
 	trigger_kind: InlineCompletionTriggerKind `json:"triggerKind"`,
 	// Provides information about the currently selected item in the autocomplete widget if it is visible.
-	selected_completion_info: ^SelectedCompletionInfo `json:"selectedCompletionInfo,omitempty"`,
+	selected_completion_info: Maybe(SelectedCompletionInfo) `json:"selectedCompletionInfo,omitempty"`,
 }
 
 // A string value used as a snippet is a template which allows to insert text
@@ -4042,11 +4042,11 @@ ServerCapabilities :: struct {
 	// @since 3.17.0
 	notebook_document_sync: Maybe(union {NotebookDocumentSyncOptions, NotebookDocumentSyncRegistrationOptions}) `json:"notebookDocumentSync,omitempty"`,
 	// The server provides completion support.
-	completion_provider: ^CompletionOptions `json:"completionProvider,omitempty"`,
+	completion_provider: Maybe(CompletionOptions) `json:"completionProvider,omitempty"`,
 	// The server provides hover support.
 	hover_provider: Maybe(union {bool, HoverOptions}) `json:"hoverProvider,omitempty"`,
 	// The server provides signature help support.
-	signature_help_provider: ^SignatureHelpOptions `json:"signatureHelpProvider,omitempty"`,
+	signature_help_provider: Maybe(SignatureHelpOptions) `json:"signatureHelpProvider,omitempty"`,
 	// The server provides Goto Declaration support.
 	declaration_provider: Maybe(union {bool, DeclarationOptions, DeclarationRegistrationOptions}) `json:"declarationProvider,omitempty"`,
 	// The server provides goto definition support.
@@ -4066,9 +4066,9 @@ ServerCapabilities :: struct {
 	// `codeActionLiteralSupport` in its initial `initialize` request.
 	code_action_provider: Maybe(union {bool, CodeActionOptions}) `json:"codeActionProvider,omitempty"`,
 	// The server provides code lens.
-	code_lens_provider: ^CodeLensOptions `json:"codeLensProvider,omitempty"`,
+	code_lens_provider: Maybe(CodeLensOptions) `json:"codeLensProvider,omitempty"`,
 	// The server provides document link support.
-	document_link_provider: ^DocumentLinkOptions `json:"documentLinkProvider,omitempty"`,
+	document_link_provider: Maybe(DocumentLinkOptions) `json:"documentLinkProvider,omitempty"`,
 	// The server provides color provider support.
 	color_provider: Maybe(union {bool, DocumentColorOptions, DocumentColorRegistrationOptions}) `json:"colorProvider,omitempty"`,
 	// The server provides workspace symbol support.
@@ -4078,7 +4078,7 @@ ServerCapabilities :: struct {
 	// The server provides document range formatting.
 	document_range_formatting_provider: Maybe(union {bool, DocumentRangeFormattingOptions}) `json:"documentRangeFormattingProvider,omitempty"`,
 	// The server provides document formatting on typing.
-	document_on_type_formatting_provider: ^DocumentOnTypeFormattingOptions `json:"documentOnTypeFormattingProvider,omitempty"`,
+	document_on_type_formatting_provider: Maybe(DocumentOnTypeFormattingOptions) `json:"documentOnTypeFormattingProvider,omitempty"`,
 	// The server provides rename support. RenameOptions may only be
 	// specified if the client states that it supports
 	// `prepareSupport` in its initial `initialize` request.
@@ -4088,7 +4088,7 @@ ServerCapabilities :: struct {
 	// The server provides selection range support.
 	selection_range_provider: Maybe(union {bool, SelectionRangeOptions, SelectionRangeRegistrationOptions}) `json:"selectionRangeProvider,omitempty"`,
 	// The server provides execute command support.
-	execute_command_provider: ^ExecuteCommandOptions `json:"executeCommandProvider,omitempty"`,
+	execute_command_provider: Maybe(ExecuteCommandOptions) `json:"executeCommandProvider,omitempty"`,
 	// The server provides call hierarchy support.
 	// 
 	// @since 3.16.0
@@ -4179,7 +4179,7 @@ Diagnostic :: struct {
 	// Requires the code field (above) to be present/not null.
 	// 
 	// @since 3.16.0
-	code_description: ^CodeDescription `json:"codeDescription,omitempty"`,
+	code_description: Maybe(CodeDescription) `json:"codeDescription,omitempty"`,
 	// A human-readable string describing the source of this
 	// diagnostic, e.g. 'typescript' or 'super lint'. It usually
 	// appears in the user interface.
@@ -4288,7 +4288,7 @@ SignatureHelpContext :: struct {
 	// 
 	// The `activeSignatureHelp` has its `SignatureHelp.activeSignature` field updated based on
 	// the user navigating through available signatures.
-	active_signature_help: ^SignatureHelp `json:"activeSignatureHelp,omitempty"`,
+	active_signature_help: Maybe(SignatureHelp) `json:"activeSignatureHelp,omitempty"`,
 }
 
 // Represents the signature of something callable. A signature
@@ -4578,7 +4578,7 @@ FileOperationPattern :: struct {
 	// Matches both if undefined.
 	matches: Maybe(FileOperationPatternKind) `json:"matches,omitempty"`,
 	// Additional options used during matching.
-	options: ^FileOperationPatternOptions `json:"options,omitempty"`,
+	options: Maybe(FileOperationPatternOptions) `json:"options,omitempty"`,
 }
 
 // A full document diagnostic report for a workspace diagnostic result.
@@ -4638,7 +4638,7 @@ NotebookCell :: struct {
 	metadata: Maybe(LSPObject) `json:"metadata,omitempty"`,
 	// Additional execution summary information
 	// if supported by the client.
-	execution_summary: ^ExecutionSummary `json:"executionSummary,omitempty"`,
+	execution_summary: Maybe(ExecutionSummary) `json:"executionSummary,omitempty"`,
 }
 
 // A change describing how to move a `NotebookCell`
@@ -4668,19 +4668,19 @@ SelectedCompletionInfo :: struct {
 // Defines the capabilities provided by the client.
 ClientCapabilities :: struct {
 	// Workspace specific client capabilities.
-	workspace: ^WorkspaceClientCapabilities `json:"workspace,omitempty"`,
+	workspace: Maybe(WorkspaceClientCapabilities) `json:"workspace,omitempty"`,
 	// Text document specific client capabilities.
-	text_document: ^TextDocumentClientCapabilities `json:"textDocument,omitempty"`,
+	text_document: Maybe(TextDocumentClientCapabilities) `json:"textDocument,omitempty"`,
 	// Capabilities specific to the notebook document support.
 	// 
 	// @since 3.17.0
-	notebook_document: ^NotebookDocumentClientCapabilities `json:"notebookDocument,omitempty"`,
+	notebook_document: Maybe(NotebookDocumentClientCapabilities) `json:"notebookDocument,omitempty"`,
 	// Window specific client capabilities.
-	window: ^WindowClientCapabilities `json:"window,omitempty"`,
+	window: Maybe(WindowClientCapabilities) `json:"window,omitempty"`,
 	// General client capabilities.
 	// 
 	// @since 3.16.0
-	general: ^GeneralClientCapabilities `json:"general,omitempty"`,
+	general: Maybe(GeneralClientCapabilities) `json:"general,omitempty"`,
 	// Experimental client capabilities.
 	experimental: Maybe(LSPAny) `json:"experimental,omitempty"`,
 }
@@ -4756,17 +4756,17 @@ WorkspaceFoldersServerCapabilities :: struct {
 // @since 3.16.0
 FileOperationOptions :: struct {
 	// The server is interested in receiving didCreateFiles notifications.
-	did_create: ^FileOperationRegistrationOptions `json:"didCreate,omitempty"`,
+	did_create: Maybe(FileOperationRegistrationOptions) `json:"didCreate,omitempty"`,
 	// The server is interested in receiving willCreateFiles requests.
-	will_create: ^FileOperationRegistrationOptions `json:"willCreate,omitempty"`,
+	will_create: Maybe(FileOperationRegistrationOptions) `json:"willCreate,omitempty"`,
 	// The server is interested in receiving didRenameFiles notifications.
-	did_rename: ^FileOperationRegistrationOptions `json:"didRename,omitempty"`,
+	did_rename: Maybe(FileOperationRegistrationOptions) `json:"didRename,omitempty"`,
 	// The server is interested in receiving willRenameFiles requests.
-	will_rename: ^FileOperationRegistrationOptions `json:"willRename,omitempty"`,
+	will_rename: Maybe(FileOperationRegistrationOptions) `json:"willRename,omitempty"`,
 	// The server is interested in receiving didDeleteFiles file notifications.
-	did_delete: ^FileOperationRegistrationOptions `json:"didDelete,omitempty"`,
+	did_delete: Maybe(FileOperationRegistrationOptions) `json:"didDelete,omitempty"`,
 	// The server is interested in receiving willDeleteFiles file requests.
-	will_delete: ^FileOperationRegistrationOptions `json:"willDelete,omitempty"`,
+	will_delete: Maybe(FileOperationRegistrationOptions) `json:"willDelete,omitempty"`,
 }
 
 // Structure to capture a description for an error code.
@@ -4846,15 +4846,15 @@ WorkspaceClientCapabilities :: struct {
 	// 'workspace/applyEdit'
 	apply_edit: Maybe(bool) `json:"applyEdit,omitempty"`,
 	// Capabilities specific to `WorkspaceEdit`s.
-	workspace_edit: ^WorkspaceEditClientCapabilities `json:"workspaceEdit,omitempty"`,
+	workspace_edit: Maybe(WorkspaceEditClientCapabilities) `json:"workspaceEdit,omitempty"`,
 	// Capabilities specific to the `workspace/didChangeConfiguration` notification.
-	did_change_configuration: ^DidChangeConfigurationClientCapabilities `json:"didChangeConfiguration,omitempty"`,
+	did_change_configuration: Maybe(DidChangeConfigurationClientCapabilities) `json:"didChangeConfiguration,omitempty"`,
 	// Capabilities specific to the `workspace/didChangeWatchedFiles` notification.
-	did_change_watched_files: ^DidChangeWatchedFilesClientCapabilities `json:"didChangeWatchedFiles,omitempty"`,
+	did_change_watched_files: Maybe(DidChangeWatchedFilesClientCapabilities) `json:"didChangeWatchedFiles,omitempty"`,
 	// Capabilities specific to the `workspace/symbol` request.
-	symbol: ^WorkspaceSymbolClientCapabilities `json:"symbol,omitempty"`,
+	symbol: Maybe(WorkspaceSymbolClientCapabilities) `json:"symbol,omitempty"`,
 	// Capabilities specific to the `workspace/executeCommand` request.
-	execute_command: ^ExecuteCommandClientCapabilities `json:"executeCommand,omitempty"`,
+	execute_command: Maybe(ExecuteCommandClientCapabilities) `json:"executeCommand,omitempty"`,
 	// The client has support for workspace folders.
 	// 
 	// @since 3.6.0
@@ -4867,134 +4867,134 @@ WorkspaceClientCapabilities :: struct {
 	// workspace.
 	// 
 	// @since 3.16.0.
-	semantic_tokens: ^SemanticTokensWorkspaceClientCapabilities `json:"semanticTokens,omitempty"`,
+	semantic_tokens: Maybe(SemanticTokensWorkspaceClientCapabilities) `json:"semanticTokens,omitempty"`,
 	// Capabilities specific to the code lens requests scoped to the
 	// workspace.
 	// 
 	// @since 3.16.0.
-	code_lens: ^CodeLensWorkspaceClientCapabilities `json:"codeLens,omitempty"`,
+	code_lens: Maybe(CodeLensWorkspaceClientCapabilities) `json:"codeLens,omitempty"`,
 	// The client has support for file notifications/requests for user operations on files.
 	// 
 	// Since 3.16.0
-	file_operations: ^FileOperationClientCapabilities `json:"fileOperations,omitempty"`,
+	file_operations: Maybe(FileOperationClientCapabilities) `json:"fileOperations,omitempty"`,
 	// Capabilities specific to the inline values requests scoped to the
 	// workspace.
 	// 
 	// @since 3.17.0.
-	inline_value: ^InlineValueWorkspaceClientCapabilities `json:"inlineValue,omitempty"`,
+	inline_value: Maybe(InlineValueWorkspaceClientCapabilities) `json:"inlineValue,omitempty"`,
 	// Capabilities specific to the inlay hint requests scoped to the
 	// workspace.
 	// 
 	// @since 3.17.0.
-	inlay_hint: ^InlayHintWorkspaceClientCapabilities `json:"inlayHint,omitempty"`,
+	inlay_hint: Maybe(InlayHintWorkspaceClientCapabilities) `json:"inlayHint,omitempty"`,
 	// Capabilities specific to the diagnostic requests scoped to the
 	// workspace.
 	// 
 	// @since 3.17.0.
-	diagnostics: ^DiagnosticWorkspaceClientCapabilities `json:"diagnostics,omitempty"`,
+	diagnostics: Maybe(DiagnosticWorkspaceClientCapabilities) `json:"diagnostics,omitempty"`,
 	// Capabilities specific to the folding range requests scoped to the workspace.
 	// 
 	// @since 3.18.0
 	// @proposed
-	folding_range: ^FoldingRangeWorkspaceClientCapabilities `json:"foldingRange,omitempty"`,
+	folding_range: Maybe(FoldingRangeWorkspaceClientCapabilities) `json:"foldingRange,omitempty"`,
 }
 
 // Text document specific client capabilities.
 TextDocumentClientCapabilities :: struct {
 	// Defines which synchronization capabilities the client supports.
-	synchronization: ^TextDocumentSyncClientCapabilities `json:"synchronization,omitempty"`,
+	synchronization: Maybe(TextDocumentSyncClientCapabilities) `json:"synchronization,omitempty"`,
 	// Capabilities specific to the `textDocument/completion` request.
-	completion: ^CompletionClientCapabilities `json:"completion,omitempty"`,
+	completion: Maybe(CompletionClientCapabilities) `json:"completion,omitempty"`,
 	// Capabilities specific to the `textDocument/hover` request.
-	hover: ^HoverClientCapabilities `json:"hover,omitempty"`,
+	hover: Maybe(HoverClientCapabilities) `json:"hover,omitempty"`,
 	// Capabilities specific to the `textDocument/signatureHelp` request.
-	signature_help: ^SignatureHelpClientCapabilities `json:"signatureHelp,omitempty"`,
+	signature_help: Maybe(SignatureHelpClientCapabilities) `json:"signatureHelp,omitempty"`,
 	// Capabilities specific to the `textDocument/declaration` request.
 	// 
 	// @since 3.14.0
-	declaration: ^DeclarationClientCapabilities `json:"declaration,omitempty"`,
+	declaration: Maybe(DeclarationClientCapabilities) `json:"declaration,omitempty"`,
 	// Capabilities specific to the `textDocument/definition` request.
-	definition: ^DefinitionClientCapabilities `json:"definition,omitempty"`,
+	definition: Maybe(DefinitionClientCapabilities) `json:"definition,omitempty"`,
 	// Capabilities specific to the `textDocument/typeDefinition` request.
 	// 
 	// @since 3.6.0
-	type_definition: ^TypeDefinitionClientCapabilities `json:"typeDefinition,omitempty"`,
+	type_definition: Maybe(TypeDefinitionClientCapabilities) `json:"typeDefinition,omitempty"`,
 	// Capabilities specific to the `textDocument/implementation` request.
 	// 
 	// @since 3.6.0
-	implementation: ^ImplementationClientCapabilities `json:"implementation,omitempty"`,
+	implementation: Maybe(ImplementationClientCapabilities) `json:"implementation,omitempty"`,
 	// Capabilities specific to the `textDocument/references` request.
-	references: ^ReferenceClientCapabilities `json:"references,omitempty"`,
+	references: Maybe(ReferenceClientCapabilities) `json:"references,omitempty"`,
 	// Capabilities specific to the `textDocument/documentHighlight` request.
-	document_highlight: ^DocumentHighlightClientCapabilities `json:"documentHighlight,omitempty"`,
+	document_highlight: Maybe(DocumentHighlightClientCapabilities) `json:"documentHighlight,omitempty"`,
 	// Capabilities specific to the `textDocument/documentSymbol` request.
-	document_symbol: ^DocumentSymbolClientCapabilities `json:"documentSymbol,omitempty"`,
+	document_symbol: Maybe(DocumentSymbolClientCapabilities) `json:"documentSymbol,omitempty"`,
 	// Capabilities specific to the `textDocument/codeAction` request.
-	code_action: ^CodeActionClientCapabilities `json:"codeAction,omitempty"`,
+	code_action: Maybe(CodeActionClientCapabilities) `json:"codeAction,omitempty"`,
 	// Capabilities specific to the `textDocument/codeLens` request.
-	code_lens: ^CodeLensClientCapabilities `json:"codeLens,omitempty"`,
+	code_lens: Maybe(CodeLensClientCapabilities) `json:"codeLens,omitempty"`,
 	// Capabilities specific to the `textDocument/documentLink` request.
-	document_link: ^DocumentLinkClientCapabilities `json:"documentLink,omitempty"`,
+	document_link: Maybe(DocumentLinkClientCapabilities) `json:"documentLink,omitempty"`,
 	// Capabilities specific to the `textDocument/documentColor` and the
 	// `textDocument/colorPresentation` request.
 	// 
 	// @since 3.6.0
-	color_provider: ^DocumentColorClientCapabilities `json:"colorProvider,omitempty"`,
+	color_provider: Maybe(DocumentColorClientCapabilities) `json:"colorProvider,omitempty"`,
 	// Capabilities specific to the `textDocument/formatting` request.
-	formatting: ^DocumentFormattingClientCapabilities `json:"formatting,omitempty"`,
+	formatting: Maybe(DocumentFormattingClientCapabilities) `json:"formatting,omitempty"`,
 	// Capabilities specific to the `textDocument/rangeFormatting` request.
-	range_formatting: ^DocumentRangeFormattingClientCapabilities `json:"rangeFormatting,omitempty"`,
+	range_formatting: Maybe(DocumentRangeFormattingClientCapabilities) `json:"rangeFormatting,omitempty"`,
 	// Capabilities specific to the `textDocument/onTypeFormatting` request.
-	on_type_formatting: ^DocumentOnTypeFormattingClientCapabilities `json:"onTypeFormatting,omitempty"`,
+	on_type_formatting: Maybe(DocumentOnTypeFormattingClientCapabilities) `json:"onTypeFormatting,omitempty"`,
 	// Capabilities specific to the `textDocument/rename` request.
-	rename: ^RenameClientCapabilities `json:"rename,omitempty"`,
+	rename: Maybe(RenameClientCapabilities) `json:"rename,omitempty"`,
 	// Capabilities specific to the `textDocument/foldingRange` request.
 	// 
 	// @since 3.10.0
-	folding_range: ^FoldingRangeClientCapabilities `json:"foldingRange,omitempty"`,
+	folding_range: Maybe(FoldingRangeClientCapabilities) `json:"foldingRange,omitempty"`,
 	// Capabilities specific to the `textDocument/selectionRange` request.
 	// 
 	// @since 3.15.0
-	selection_range: ^SelectionRangeClientCapabilities `json:"selectionRange,omitempty"`,
+	selection_range: Maybe(SelectionRangeClientCapabilities) `json:"selectionRange,omitempty"`,
 	// Capabilities specific to the `textDocument/publishDiagnostics` notification.
-	publish_diagnostics: ^PublishDiagnosticsClientCapabilities `json:"publishDiagnostics,omitempty"`,
+	publish_diagnostics: Maybe(PublishDiagnosticsClientCapabilities) `json:"publishDiagnostics,omitempty"`,
 	// Capabilities specific to the various call hierarchy requests.
 	// 
 	// @since 3.16.0
-	call_hierarchy: ^CallHierarchyClientCapabilities `json:"callHierarchy,omitempty"`,
+	call_hierarchy: Maybe(CallHierarchyClientCapabilities) `json:"callHierarchy,omitempty"`,
 	// Capabilities specific to the various semantic token request.
 	// 
 	// @since 3.16.0
-	semantic_tokens: ^SemanticTokensClientCapabilities `json:"semanticTokens,omitempty"`,
+	semantic_tokens: Maybe(SemanticTokensClientCapabilities) `json:"semanticTokens,omitempty"`,
 	// Capabilities specific to the `textDocument/linkedEditingRange` request.
 	// 
 	// @since 3.16.0
-	linked_editing_range: ^LinkedEditingRangeClientCapabilities `json:"linkedEditingRange,omitempty"`,
+	linked_editing_range: Maybe(LinkedEditingRangeClientCapabilities) `json:"linkedEditingRange,omitempty"`,
 	// Client capabilities specific to the `textDocument/moniker` request.
 	// 
 	// @since 3.16.0
-	moniker: ^MonikerClientCapabilities `json:"moniker,omitempty"`,
+	moniker: Maybe(MonikerClientCapabilities) `json:"moniker,omitempty"`,
 	// Capabilities specific to the various type hierarchy requests.
 	// 
 	// @since 3.17.0
-	type_hierarchy: ^TypeHierarchyClientCapabilities `json:"typeHierarchy,omitempty"`,
+	type_hierarchy: Maybe(TypeHierarchyClientCapabilities) `json:"typeHierarchy,omitempty"`,
 	// Capabilities specific to the `textDocument/inlineValue` request.
 	// 
 	// @since 3.17.0
-	inline_value: ^InlineValueClientCapabilities `json:"inlineValue,omitempty"`,
+	inline_value: Maybe(InlineValueClientCapabilities) `json:"inlineValue,omitempty"`,
 	// Capabilities specific to the `textDocument/inlayHint` request.
 	// 
 	// @since 3.17.0
-	inlay_hint: ^InlayHintClientCapabilities `json:"inlayHint,omitempty"`,
+	inlay_hint: Maybe(InlayHintClientCapabilities) `json:"inlayHint,omitempty"`,
 	// Capabilities specific to the diagnostic pull model.
 	// 
 	// @since 3.17.0
-	diagnostic: ^DiagnosticClientCapabilities `json:"diagnostic,omitempty"`,
+	diagnostic: Maybe(DiagnosticClientCapabilities) `json:"diagnostic,omitempty"`,
 	// Client capabilities specific to inline completions.
 	// 
 	// @since 3.18.0
 	// @proposed
-	inline_completion: ^InlineCompletionClientCapabilities `json:"inlineCompletion,omitempty"`,
+	inline_completion: Maybe(InlineCompletionClientCapabilities) `json:"inlineCompletion,omitempty"`,
 }
 
 // Capabilities specific to the notebook document support.
@@ -5021,11 +5021,11 @@ WindowClientCapabilities :: struct {
 	// Capabilities specific to the showMessage request.
 	// 
 	// @since 3.16.0
-	show_message: ^ShowMessageRequestClientCapabilities `json:"showMessage,omitempty"`,
+	show_message: Maybe(ShowMessageRequestClientCapabilities) `json:"showMessage,omitempty"`,
 	// Capabilities specific to the showDocument request.
 	// 
 	// @since 3.16.0
-	show_document: ^ShowDocumentClientCapabilities `json:"showDocument,omitempty"`,
+	show_document: Maybe(ShowDocumentClientCapabilities) `json:"showDocument,omitempty"`,
 }
 
 // General client capabilities.
@@ -5042,11 +5042,11 @@ GeneralClientCapabilities :: struct {
 	// Client capabilities specific to regular expressions.
 	// 
 	// @since 3.16.0
-	regular_expressions: ^RegularExpressionsClientCapabilities `json:"regularExpressions,omitempty"`,
+	regular_expressions: Maybe(RegularExpressionsClientCapabilities) `json:"regularExpressions,omitempty"`,
 	// Client capabilities specific to the client's markdown parser.
 	// 
 	// @since 3.16.0
-	markdown: ^MarkdownClientCapabilities `json:"markdown,omitempty"`,
+	markdown: Maybe(MarkdownClientCapabilities) `json:"markdown,omitempty"`,
 	// The position encodings supported by the client. Client and server
 	// have to agree on the same position encoding to ensure that offsets
 	// (e.g. character position in a line) are interpreted the same on both

@@ -52,8 +52,16 @@ RPC_Response :: struct($R: typeid) {
 	result:  R          `json:"result"`,
 }
 
+// Гарантирует клиенту ответ на запрос с этим id даже при ошибке marshal —
+// иначе request, на который сервер молча ничего не прислал, зависает у
+// клиента без таймаута (см. commit message: initialize с ^CompletionOptions
+// раньше именно так и падал). RPC_Error_Response собрана из string/int/
+// json.Value — типов, которые marshal поддерживает всегда, так что этот
+// фолбэк сам сломаться не может.
 send_response :: proc(id: json.Value, result: $T) {
-	lsp_write_message(RPC_Response(T){jsonrpc = "2.0", id = id, result = result})
+	if !lsp_write_message(RPC_Response(T){jsonrpc = "2.0", id = id, result = result}) {
+		send_error_response(id, -32603, "internal error: failed to marshal result")
+	}
 }
 
 // result: null — общий случай "нет ответа" (hover/definition/references

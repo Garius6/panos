@@ -65,13 +65,17 @@ lsp_read_message :: proc(r: ^LSP_Reader, allocator := context.allocator) -> ([]b
 // Пишет JSON-RPC сообщение в stdout с LSP-фреймингом, маршаля v напрямую —
 // v обычно RPC_Response(T)/RPC_Notification(T)/RPC_Error_Response
 // (см. lsp_protocol.odin), собранные из типизированных proto.*-структур.
-lsp_write_message :: proc(v: $T) {
+// Возвращает false при ошибке marshal — вызывающая сторона (send_response)
+// использует это, чтобы гарантировать клиенту хоть какой-то ответ вместо
+// зависшего в ожидании запроса (см. commit message).
+lsp_write_message :: proc(v: $T) -> bool {
 	data, err := json.marshal(v, {})
 	if err != nil {
 		fmt.eprintln("panos-lsp: не смог замаршалить сообщение:", err, "(тип:", typeid_of(T), ")")
-		return
+		return false
 	}
 	defer delete(data)
 	fmt.printf("Content-Length: %d\r\n\r\n", len(data))
 	os.write(os.stdout, data)
+	return true
 }

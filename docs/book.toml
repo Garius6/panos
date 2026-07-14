@@ -1,0 +1,9 @@
+[book]
+title = "panos"
+description = "Скриптовый язык с русскими ключевыми словами — документация и гайды"
+authors = ["panos contributors"]
+language = "ru"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/Garius6/panos"

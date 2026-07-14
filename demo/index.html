@@ -42,7 +42,7 @@
 import {EditorView, basicSetup} from "https://esm.sh/codemirror@6.0.1";
 import {keymap, hoverTooltip} from "https://esm.sh/@codemirror/view@6";
 import {indentWithTab} from "https://esm.sh/@codemirror/commands@6";
-import {linter} from "https://esm.sh/@codemirror/lint@6";
+import {linter, forceLinting} from "https://esm.sh/@codemirror/lint@6";
 import {autocompletion} from "https://esm.sh/@codemirror/autocomplete@6";
 
 const DEFAULT_SOURCE = `функ старт() -> Число
@@ -51,13 +51,26 @@ const DEFAULT_SOURCE = `функ старт() -> Число
 
 const consoleEl = document.getElementById("console");
 const statusEl = document.getElementById("run-status");
+const runButton = document.getElementById("run");
 const memInterface = new odin.WasmMemoryInterface();
+
+// EditorView создаётся синхронно ниже (нужен для extensions — линтер/
+// hover/автокомплит регистрируются в момент создания), а odin.runWasm
+// грузит WASM асинхронно — CodeMirror's linter уже пытается прогнать
+// проверку на смонтированном документе ДО того, как memInterface.exports
+// вообще заполнен (живой баг на задеплоенной странице: "Cannot read
+// properties of null (reading 'panos_source_capacity')"). Флаг —
+// единственная точка входа (writeSourceToWasm), которую используют
+// run/lint/hover/complete, отдаёт "нет результата" вместо падения, пока
+// WASM не догрузился.
+let wasmReady = false;
 
 // Общая точка записи исходника в WASM-буфер — переиспользуется run/check/
 // hover/complete (все пишут в один и тот же source_buf со стороны Odin,
 // см. wasm/main.odin). Синхронный вызов без await между write и read —
 // JS/WASM однопоточные, гонки внутри одного тика быть не может.
 function writeSourceToWasm(source) {
+	if (!wasmReady) return null;
 	const cap = memInterface.exports.panos_source_capacity();
 	// Байтовая (не символьная) длина — исходник в UTF-8 внутри WASM-памяти,
 	// кириллица занимает 2 байта на символ. Проверяем ДО storeString —
@@ -78,6 +91,7 @@ function readResultJson() {
 }
 
 function runSource(source) {
+	if (!wasmReady) return; // кнопка/keymap не должны быть активны раньше времени, но на всякий случай
 	// #console — постоянно растущий лог (odin.js рендерит его из
 	// внутреннего, недоступного снаружи буфера — очистить между запусками
 	// нельзя, см. комментарий у panos_run в wasm/main.odin, который сам
@@ -190,10 +204,22 @@ const editor = new EditorView({
 // модульные скрипты не кладут свои top-level переменные в window сами.
 window.panosEditor = editor;
 
+runButton.disabled = true;
+runButton.textContent = "Загрузка...";
 odin.runWasm("panos.wasm", consoleEl, {}, memInterface).then(() => {
-	document.getElementById("run").addEventListener("click", () => {
+	wasmReady = true;
+	runButton.disabled = false;
+	runButton.textContent = "Запустить";
+	runButton.addEventListener("click", () => {
 		runSource(editor.state.doc.toString());
 	});
+	// Линтер уже пытался прогнаться на смонтированном документе, пока
+	// wasmReady был false (см. комментарий выше) — forceLinting (а не
+	// пустой dispatch — тот не триггерит линтер, он слушает именно
+	// docChanged) прогоняет его заново сейчас, когда WASM реально готов,
+	// иначе первая диагностика появилась бы только на следующее РУЧНОЕ
+	// изменение документа.
+	forceLinting(editor);
 });
 </script>
 </body>

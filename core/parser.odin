@@ -584,6 +584,15 @@ parse_program :: proc(p: ^Parser) -> Program {
 			if p.stream.current_idx+3 >= len(p.stream.tokens) {
 				bad_span := peek_token(p.stream).span
 				report_parse(p, bad_span, "Синтаксическая ошибка: неполное объявление типа")
+				// .TypeDecl сам по себе sync-токен (is_sync_token) — без
+				// next_token тут skip_to_sync вернулся бы немедленно, не
+				// продвинув поток, а внешний for заново увидел бы тот же
+				// .TypeDecl: бесконечный цикл (живой баг, найден при вводе
+				// незавершённого 'тип X' в браузерном демо — линтер вешал
+				// вкладку на КАЖДОЙ такой промежуточной раскладке при наборе
+				// текста). Остальные error-ветки этой функции уже потребляют
+				// токен перед skip_to_sync — этой не хватало того же.
+				next_token(p.stream)
 				skip_to_sync(p)
 				err_decl := new(Error_Decl)
 				err_decl.span = span_from(p, bad_span)

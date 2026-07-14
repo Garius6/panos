@@ -39,19 +39,18 @@ scratch_arena_ready: bool
 @(private)
 reset_scratch_arena :: proc() -> runtime.Allocator {
 	if !scratch_arena_ready {
-		// out_band_size = block_size — умолчание (10% от block_size, ~6.5KB)
-		// отправляло любую аллокацию ≥6.5KB (типичные [dynamic]-массивы
-		// AST/диагностик) по отдельному malloc/free-циклу ПРИ КАЖДОМ
-		// dynamic_arena_reset (см. блок "outband" в комментарии выше вокруг
-		// scratch_arena) — сами блоки переиспользовались (used/unused
-		// подтверждено стабильными через panos_debug_arena), а вот out-of-
-		// band malloc+free каждый вызов на default_wasm_allocator (emmalloc)
-		// не был идеально memory-neutral, что и давало остаточный рост.
-		// Подняв порог до размера блока, обычные in-block аллокации (всё,
-		// что умещается в один блок) остаются в пуле и переиспользуются
-		// как used_blocks/unused_blocks, без единого malloc/free после
-		// первого вызова.
-		mem.dynamic_arena_init(&scratch_arena, alignment = 64, out_band_size = mem.DYNAMIC_ARENA_BLOCK_SIZE_DEFAULT)
+		// Пробовал поднять out_band_size до block_size, чтобы типичные
+		// [dynamic]-массивы AST/диагностик (обычно >out_band_size по
+		// умолчанию, ~6.5KB) не гоняли malloc/free каждый dynamic_arena_reset
+		// (см. комментарий у scratch_arena выше про сам факт остаточного
+		// роста из-за out-of-band churn). НЕ прижилось: на реальном файле
+		// побольше (test.ps) это ловило WASM-трап ("memory access out of
+		// bounds") внутри dynamic_arena_resize_bytes_non_zeroed — похоже на
+		// баг в самом core:mem при in-block resize около границы block_size,
+		// не стоит той небольшой экономии. Дефолтный out_band_size живёт с
+		// малым, но безопасным остаточным ростом (см. комментарий у
+		// scratch_arena).
+		mem.dynamic_arena_init(&scratch_arena, alignment = 64)
 		scratch_arena_ready = true
 	} else {
 		mem.dynamic_arena_reset(&scratch_arena)

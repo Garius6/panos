@@ -23,10 +23,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # release: nightly подтягивал ПОСЛЕДНИЙ ночной билд на момент запуска
+      # CI, а не тот, что стоит локально (dev-2026-06:285f6d87b) — расхождение
+      # в месяц+ уже один раз сломало сборку: core:mem's dynamic_arena_init
+      # между версиями поменял набор именованных параметров ("No parameter
+      # named 'alignment'"). Пиним конкретный тег релиза, совпадающий с
+      # локальным тулчейном, вместо плавающего "nightly".
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: nightly
+          release: dev-2026-06
 
       # wasm-ld (линкер под -target:js_wasm32) — не в дефолтном ubuntu-
       # раннере, ставится отдельно пакетом lld.

@@ -19,6 +19,39 @@ vm_heap_allocator :: proc() -> runtime.Allocator {
 	}
 }
 
+// Для GC'd VM-значений конкретно (Aggregate/Array/Map/String/Option/
+// Result/Interface/Variant — см. gc_new/perm_string/gc_new_string ниже),
+// В ОТЛИЧИЕ от vm_heap_allocator(): INTERNER (interner.odin) — намеренно
+// process-lifetime синглтон, ему нужен настоящий permanent-аллокатор
+// независимо от того, что творится вокруг вызова. VM же на WASM создаётся
+// заново и выбрасывается на каждый panos_run (см. wasm/main.odin) — если
+// её значения идут через тот же default_wasm_allocator() напрямую (как
+// раньше), они никогда не освобождаются между вызовами: pool_release
+// (sweep ниже) не free()'ит объекты, а переиспользует их пулами ВНУТРИ
+// одной VM — для одноразовой VM это чистая утечка. Живой баг: WebKit
+// (Safari) падал уже на 2-3 клике "Запустить" на demo/index.html (Chrome
+// куда снисходительнее к разросшейся WASM-памяти, но реальный лимит есть
+// и там — просто дальше). На JS/WASM уважаем ambient context.allocator:
+// у всех 4 экспортов wasm/main.odin это переиспользуемая Dynamic_Arena
+// (reset — не destroy — между вызовами, см. reset_scratch_arena), значит
+// GC'd значения теперь полностью покрываются тем же сбросом, что и
+// non-GC часть пайплайна. pool_release ниже зовёт delete() на отдельные
+// поля (val.methods и т.п.) — Dynamic_Arena's .Free возвращает
+// Mode_Not_Implemented (core:mem/allocators.odin), но delete()/free() в
+// Odin просто возвращают Allocator_Error вызывающему, а gc.odin нигде
+// его не проверяет — эти delete() молча становятся no-op (байты
+// освобождаются оптом при следующем reset, не поштучно), без паники.
+// На native — тот же heap_allocator(), что и раньше: GC там рассчитан
+// на один долгоживущий процесс с реальным переиспользованием пулов
+// между МНОГИМИ запусками одной VM, менять там нечего.
+vm_gc_allocator :: proc() -> runtime.Allocator {
+	when ODIN_OS == .JS {
+		return context.allocator
+	} else {
+		return runtime.heap_allocator()
+	}
+}
+
 // Простой non-moving mark-and-sweep — сырых указателей на Value-объекты
 // разбросано по всему vm.odin/compiler.odin, moving/copying-коллектор
 // потребовал бы fixup всех этих мест при каждом перемещении. Не инкрементальный
@@ -80,7 +113,7 @@ GC_State :: struct {
 GC_MIN_THRESHOLD :: 1024 * 1024
 
 new_gc_state :: proc() -> GC_State {
-	context.allocator = vm_heap_allocator()
+	context.allocator = vm_gc_allocator()
 	return GC_State {
 		all_objects = make([dynamic]Value),
 		protect_stack = make([dynamic]Value),
@@ -160,7 +193,7 @@ gc_new :: proc(vm: ^VM, $T: typeid) -> ^T {
 	}
 
 	if obj == nil {
-		context.allocator = vm_heap_allocator()
+		context.allocator = vm_gc_allocator()
 		obj = new(T)
 	} else {
 		obj.header.marked = false
@@ -174,7 +207,7 @@ gc_new :: proc(vm: ^VM, $T: typeid) -> ^T {
 // столько же, сколько сама функция (весь процесс). Не регистрируется в
 // GC — sweep её не видит.
 perm_string :: proc(s: string) -> ^Panos_String {
-	context.allocator = vm_heap_allocator()
+	context.allocator = vm_gc_allocator()
 	ps := new(Panos_String)
 	ps.data = strings.clone(s)
 	return ps
@@ -183,7 +216,7 @@ perm_string :: proc(s: string) -> ^Panos_String {
 // runtime-строка — полноценно GC-managed.
 gc_new_string :: proc(vm: ^VM, s: string) -> ^Panos_String {
 	ps := gc_new(vm, Panos_String)
-	context.allocator = vm_heap_allocator()
+	context.allocator = vm_gc_allocator()
 	delete(ps.data) // на случай переиспользования из free_strings — старые байты чужие
 	ps.data = strings.clone(s)
 	vm.gc.bytes_allocated += len(ps.data)
@@ -317,7 +350,7 @@ value_size :: proc(v: Value) -> int {
 // нового malloc. methods (map) у Interface_Value — редкий, некрупный
 // случай, здесь просто delete()'им (не настолько горячий путь).
 pool_release :: proc(vm: ^VM, v: Value) {
-	context.allocator = vm_heap_allocator()
+	context.allocator = vm_gc_allocator()
 	switch val in v {
 	case f64, bool, ^Compiled_Function:
 	// не GC-managed

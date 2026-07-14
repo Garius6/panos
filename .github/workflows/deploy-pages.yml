@@ -1,0 +1,44 @@
+name: Deploy web-песочница на GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: nightly
+
+      # demo/panos.wasm — build-артефакт (.gitignore), собирается только
+      # здесь, не коммитится — см. заметку в Justfile/CLAUDE.md про
+      # `odin build wasm -target:js_wasm32`.
+      - name: Собрать panos.wasm
+        run: odin build wasm -target:js_wasm32 -out:demo/panos.wasm
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -20,5 +20,12 @@ build-wasm:
 
 build-all: build build-lsp build-wasm
 
+# Тянет сгенерённые LSP-типы из github.com/Garius6/odin-lsp-protocol
+# (pinned на тег, не auto-sync — при апдейте версии поправить тег тут).
+sync-lsp-protocol:
+	curl -sL https://raw.githubusercontent.com/Garius6/odin-lsp-protocol/v0.1.0/generated/lsp_types.odin \
+		| sed 's/^package lsp$/package lsp_protocol/' \
+		> lsp/protocol/lsp_types.odin
+
 test:
 	odin test ./core

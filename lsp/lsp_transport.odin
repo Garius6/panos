@@ -28,23 +28,35 @@ lsp_read_message :: proc(r: ^LSP_Reader, allocator := context.allocator) -> ([]b
 	content_length := -1
 	for {
 		line, err := bufio.reader_read_string(&r.buf, '\n', context.temp_allocator)
-		if err != nil do return nil, false
+		if err != nil {
+			if err != .EOF do fmt.eprintln("panos-lsp: ошибка чтения заголовка:", err)
+			return nil, false
+		}
 		line = strings.trim_right(line, "\r\n")
 		if line == "" do break // пустая строка — конец заголовков
 		if strings.has_prefix(line, "Content-Length:") {
 			num_str := strings.trim_space(line[len("Content-Length:"):])
 			n, ok := strconv.parse_int(num_str)
-			if !ok do return nil, false
+			if !ok {
+				fmt.eprintln("panos-lsp: не число в Content-Length:", num_str)
+				return nil, false
+			}
 			content_length = n
 		}
 	}
-	if content_length < 0 do return nil, false
+	if content_length < 0 {
+		fmt.eprintln("panos-lsp: заголовки без Content-Length")
+		return nil, false
+	}
 
 	body := make([]byte, content_length, allocator)
 	n_read := 0
 	for n_read < content_length {
 		n, err := bufio.reader_read(&r.buf, body[n_read:])
-		if err != nil && n == 0 do return nil, false
+		if err != nil && n == 0 {
+			if err != .EOF do fmt.eprintln("panos-lsp: ошибка чтения тела сообщения:", err)
+			return nil, false
+		}
 		n_read += n
 	}
 	return body, true
@@ -55,7 +67,10 @@ lsp_read_message :: proc(r: ^LSP_Reader, allocator := context.allocator) -> ([]b
 // (см. lsp_protocol.odin), собранные из типизированных proto.*-структур.
 lsp_write_message :: proc(v: $T) {
 	data, err := json.marshal(v, {})
-	if err != nil do return
+	if err != nil {
+		fmt.eprintln("panos-lsp: не смог замаршалить сообщение:", err, "(тип:", typeid_of(T), ")")
+		return
+	}
 	defer delete(data)
 	fmt.printf("Content-Length: %d\r\n\r\n", len(data))
 	os.write(os.stdout, data)

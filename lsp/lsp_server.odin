@@ -3,6 +3,7 @@ package main
 import core "../core"
 import proto "protocol"
 import "core:encoding/json"
+import "core:fmt"
 import "core:strings"
 
 // Каждый открытый в редакторе документ разбирается вместе со своим графом
@@ -53,7 +54,10 @@ run_lsp_server :: proc() {
 		if !ok do return // stdin закрыт клиентом — выходим тихо
 
 		envelope: RPC_Envelope
-		if json.unmarshal(data, &envelope) != nil do continue
+		if uerr := json.unmarshal(data, &envelope); uerr != nil {
+			fmt.eprintln("panos-lsp: не смог разобрать envelope:", uerr, "raw:", string(data))
+			continue
+		}
 		if envelope.method == "" do continue // это ответ НА НАШ запрос — мы запросов клиенту не шлём
 
 		id_val := envelope.id

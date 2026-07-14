@@ -3,6 +3,7 @@ package main
 import core "../core"
 import proto "protocol"
 import "core:encoding/json"
+import "core:fmt"
 
 // JSON-RPC-конверт сообщения от клиента. method/params неизвестны заранее —
 // метод определяет, в какой конкретный proto.*Params разобрать params (см.
@@ -21,11 +22,18 @@ RPC_Envelope :: struct {
 // всему сообщению, а по одному вложенному объекту.
 decode_params :: proc($T: typeid, params: json.Value) -> (T, bool) {
 	data, merr := json.marshal(params, {})
-	if merr != nil do return {}, false
+	if merr != nil {
+		fmt.eprintln("panos-lsp: не смог замаршалить params для decode_params:", merr, "(тип:", typeid_of(T), ")")
+		return {}, false
+	}
 	defer delete(data)
 	result: T
 	uerr := json.unmarshal(data, &result)
-	return result, uerr == nil
+	if uerr != nil {
+		fmt.eprintln("panos-lsp: не смог разобрать params в", typeid_of(T), ":", uerr)
+		return {}, false
+	}
+	return result, true
 }
 
 lsp_position :: proc(line: int, character: int) -> proto.Position {

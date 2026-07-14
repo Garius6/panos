@@ -56,17 +56,24 @@ jobs:
           sudo mv mdbook /usr/local/bin/
 
       - name: Собрать документацию
-        run: mdbook build docs
+        run: |
+          mdbook build docs
+          mdbook build docs/tour
+          mdbook build docs/by-example
 
-      # Один Pages-сайт на репозиторий — доки и песочница собираются в
-      # общий каталог: доки в корне (первая точка входа для новичка),
-      # песочница на /playground/ (относительные пути внутри demo/index.html
-      # — odin.js, panos.wasm — не зависят от того, под каким префиксом
-      # каталог отдаётся, переносить их не нужно).
+      # Один Pages-сайт на репозиторий — все части собираются в общий
+      # каталог: основная документация в корне (первая точка входа),
+      # тур на /tour/, примеры на /by-example/, песочница на /playground/
+      # (относительные пути внутри demo/index.html — odin.js, panos.wasm —
+      # не зависят от префикса, переносить их не нужно).
       - name: Собрать сайт
         run: |
           mkdir -p site
           cp -r docs/book/. site/
+          mkdir -p site/tour
+          cp -r docs/tour/book/. site/tour/
+          mkdir -p site/by-example
+          cp -r docs/by-example/book/. site/by-example/
           mkdir -p site/playground
           cp -r demo/. site/playground/
 

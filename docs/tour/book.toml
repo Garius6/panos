@@ -1,0 +1,9 @@
+[book]
+title = "Тур по panos"
+description = "Короткий последовательный тур по языку panos — для тех, кто видит язык впервые"
+authors = ["panos contributors"]
+language = "ru"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/Garius6/panos"

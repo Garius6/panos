@@ -8,5 +8,7 @@ panos.dSYM/
 /panos-lsp.dSYM/
 /demo/panos.wasm
 /docs/book/
+/docs/tour/book/
+/docs/by-example/book/
 /site/
 

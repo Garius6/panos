@@ -1,0 +1,9 @@
+[book]
+title = "panos by examples"
+description = "panos на примерах — короткие рабочие сниппеты по темам, для быстрого поиска"
+authors = ["panos contributors"]
+language = "ru"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/Garius6/panos"

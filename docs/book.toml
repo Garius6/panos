@@ -7,3 +7,5 @@ src = "src"
 
 [output.html]
 git-repository-url = "https://github.com/Garius6/panos"
+additional-css = ["src/assets/interactive.css"]
+additional-js = ["src/assets/interactive.js"]

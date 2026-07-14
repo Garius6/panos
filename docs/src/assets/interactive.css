@@ -1,0 +1,66 @@
+.panos-widget {
+	margin: 1em 0;
+	border: 1px solid #444;
+	border-radius: 4px;
+	overflow: hidden;
+}
+
+.panos-widget textarea {
+	display: block;
+	width: 100%;
+	box-sizing: border-box;
+	border: none;
+	resize: vertical;
+	font-family: var(--mono-font, monospace);
+	font-size: 0.875em;
+	line-height: 1.4;
+	padding: 0.8em;
+	background: #1e1e1e;
+	color: #ddd;
+	tab-size: 4;
+}
+
+.panos-widget .panos-toolbar {
+	display: flex;
+	align-items: center;
+	gap: 0.8em;
+	padding: 0.4em 0.8em;
+	background: #2a2a2a;
+	border-top: 1px solid #444;
+}
+
+.panos-widget button {
+	font-size: 0.9em;
+	padding: 0.3em 1em;
+	cursor: pointer;
+}
+
+.panos-widget button:disabled {
+	cursor: default;
+	opacity: 0.6;
+}
+
+.panos-widget .panos-status {
+	font-size: 0.8em;
+	color: #999;
+}
+
+.panos-widget .panos-status.panos-crashed {
+	color: #f66;
+	font-weight: bold;
+}
+
+.panos-widget .panos-output {
+	margin: 0;
+	padding: 0.8em;
+	background: #111;
+	color: #ddd;
+	white-space: pre-wrap;
+	font-size: 0.875em;
+	min-height: 1.4em;
+	border-top: 1px solid #444;
+}
+
+.panos-widget .panos-output:empty {
+	display: none;
+}

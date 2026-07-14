@@ -1358,7 +1358,7 @@ test_math_and_logic :: proc(t: ^testing.T) {
 
 @(test)
 test_modules :: proc(t: ^testing.T) {
-	result, ok := run_module_file("module_fixture_main.ps")
+	result, ok := run_module_file("fixtures/module_fixture_main.ps")
 	testing.expectf(t, ok, "Модули: стек пуст, нет результата")
 	if !ok do return
 
@@ -1369,7 +1369,7 @@ test_modules :: proc(t: ^testing.T) {
 		result,
 	)
 
-	stdlib_result, stdlib_ok := run_module_file("stdlib_fixture_main.ps")
+	stdlib_result, stdlib_ok := run_module_file("fixtures/stdlib_fixture_main.ps")
 	testing.expectf(
 		t,
 		stdlib_ok,
@@ -1390,7 +1390,7 @@ test_modules :: proc(t: ^testing.T) {
 // покрытия не было. См. также std/кодирование/toml.ps.
 @(test)
 test_nested_module_import :: proc(t: ^testing.T) {
-	result, ok := run_module_file("module_fixture_nested_main.ps")
+	result, ok := run_module_file("fixtures/module_fixture_nested_main.ps")
 	testing.expectf(t, ok, "Вложенный модуль: стек пуст, нет результата")
 	if !ok do return
 
@@ -1409,7 +1409,7 @@ test_nested_module_import :: proc(t: ^testing.T) {
 // TASKS.md §Стадия 15) — Python HTTP-сервер на loopback.
 @(test)
 test_http_url_parsing :: proc(t: ^testing.T) {
-	result, ok := run_module_file("http_url_fixture_main.ps")
+	result, ok := run_module_file("fixtures/http_url_fixture_main.ps")
 	testing.expectf(t, ok, "http url parsing: стек пуст, нет результата")
 	if !ok do return
 
@@ -1424,7 +1424,7 @@ test_http_url_parsing :: proc(t: ^testing.T) {
 // путь, что CLI/LSP (load_module_graph), поэтому std/ реально резолвится.
 @(test)
 test_math_stdlib :: proc(t: ^testing.T) {
-	result, ok := run_module_file("math_fixture_main.ps")
+	result, ok := run_module_file("fixtures/math_fixture_main.ps")
 	testing.expectf(t, ok, "математика: стек пуст, нет результата")
 	if !ok do return
 
@@ -1433,7 +1433,7 @@ test_math_stdlib :: proc(t: ^testing.T) {
 
 @(test)
 test_collections_stdlib :: proc(t: ^testing.T) {
-	result, ok := run_module_file("collections_fixture_main.ps")
+	result, ok := run_module_file("fixtures/collections_fixture_main.ps")
 	testing.expectf(t, ok, "коллекции: стек пуст, нет результата")
 	if !ok do return
 
@@ -1442,7 +1442,7 @@ test_collections_stdlib :: proc(t: ^testing.T) {
 
 @(test)
 test_json_stdlib :: proc(t: ^testing.T) {
-	result, ok := run_module_file("json_fixture_main.ps")
+	result, ok := run_module_file("fixtures/json_fixture_main.ps")
 	testing.expectf(t, ok, "json: стек пуст, нет результата")
 	if !ok do return
 
@@ -1451,7 +1451,7 @@ test_json_stdlib :: proc(t: ^testing.T) {
 
 @(test)
 test_test_stdlib :: proc(t: ^testing.T) {
-	result, ok := run_module_file("test_fixture_main.ps")
+	result, ok := run_module_file("fixtures/test_fixture_main.ps")
 	testing.expectf(t, ok, "тест: стек пуст, нет результата")
 	if !ok do return
 
@@ -1460,7 +1460,7 @@ test_test_stdlib :: proc(t: ^testing.T) {
 
 @(test)
 test_flags_stdlib :: proc(t: ^testing.T) {
-	result, ok := run_module_file("flags_fixture_main.ps")
+	result, ok := run_module_file("fixtures/flags_fixture_main.ps")
 	testing.expectf(t, ok, "флаги: стек пуст, нет результата")
 	if !ok do return
 
@@ -1469,7 +1469,7 @@ test_flags_stdlib :: proc(t: ^testing.T) {
 
 @(test)
 test_adt_cross_module_qualified_use :: proc(t: ^testing.T) {
-	result, ok := run_module_file("adt_fixture_main.ps")
+	result, ok := run_module_file("fixtures/adt_fixture_main.ps")
 	testing.expectf(t, ok, "cross-module: пустой стек")
 	if !ok do return
 	v, is_variant := result.(^Variant_Value)
@@ -1486,7 +1486,7 @@ test_adt_cross_module_qualified_use :: proc(t: ^testing.T) {
 
 @(test)
 test_adt_cross_module_short_form :: proc(t: ^testing.T) {
-	result, ok := run_module_file("adt_fixture_short.ps")
+	result, ok := run_module_file("fixtures/adt_fixture_short.ps")
 	testing.expectf(t, ok, "cross-module short: пустой стек")
 	if !ok do return
 	v, is_variant := result.(^Variant_Value)
@@ -1503,7 +1503,7 @@ test_adt_cross_module_short_form :: proc(t: ^testing.T) {
 @(test)
 test_adt_non_exported_use_rejected :: proc(t: ^testing.T) {
 	testing.expect_assert(t, "Resolve Error: модуль 'ф' не экспортирует 'Круг'")
-	run_module_file("adt_fixture_private_use.ps")
+	run_module_file("fixtures/adt_fixture_private_use.ps")
 }
 
 @(test)
@@ -2728,7 +2728,7 @@ test_void_function_explicit_return_value_still_rejected :: proc(t: ^testing.T) {
 // просто не получает эту вершину, diagnostic копится как обычно.
 @(test)
 test_module_loader_missing_import_does_not_panic :: proc(t: ^testing.T) {
-	graph := load_module_graph("module_fixture_missing_import_main.ps")
+	graph := load_module_graph("fixtures/module_fixture_missing_import_main.ps")
 	found := false
 	for d in graph.parse_diagnostics {
 		if d.message == "Module Loader Error: модуль 'не_существует_вообще_никогда' не найден" {

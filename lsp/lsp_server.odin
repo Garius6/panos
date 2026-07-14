@@ -29,10 +29,17 @@ LSP_Document :: struct {
 	// должна попасть в diagnostics, а не потеряться вместе с её
 	// отброшенным Resolver_Ctx/Type_Ctx.
 	all_diagnostics: [dynamic]core.Diagnostic,
-	// Symbol_Id -> все места использования В ЭТОМ документе (для
+	// Module_Result ПО КАЖДОМУ модулю графа (не только entry) —
+	// resolve_and_typecheck_all это уже считает, раньше выбрасывалось
+	// после сбора diagnostics. Нужно build_usages, чтобы find-references/
+	// rename видели использования символа во ВСЕХ файлах графа, не
+	// только в entry. Symbol_Id сравним между модулями — Symbol_Store
+	// общий на весь граф (resolver.odin, graph.symbol_store).
+	results: [dynamic]core.Module_Result,
+	// Symbol_Id -> все места использования ВО ВСЁМ ГРАФЕ (для
 	// find-references/rename). Не включает span объявления — тот
-	// берётся напрямую из symbol_at(...).span. НЕ сканирует другие
-	// открытые документы — см. ограничение в handle_references.
+	// берётся напрямую из symbol_at(...).span. Span несёт свой file_id —
+	// межмодульность бесплатна, отдельной группировки по файлам не нужно.
 	usages:  map[core.Symbol_Id][dynamic]core.Span,
 }
 
@@ -201,24 +208,30 @@ revalidate_document :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
 		}
 	}
 	doc.all_diagnostics = all_diagnostics
+	doc.results = results
 
 	build_usages(doc)
 
 	publish_diagnostics(server, doc)
 }
 
-// Symbol_Id -> [span использования, ...] — единственный проход по
-// node_symbols (Expr -> Symbol_Id) ENTRY-модуля. Объявление само по себе
-// не входит (доступно через symbol_at(...).span отдельно) — в
-// node_symbols попадают только Ident/Property-узлы, ссылающиеся НА
-// символ, а не место его создания (Let_Stmt.name — строка, не Expr-узел).
+// Symbol_Id -> [span использования, ...] — проход по node_symbols
+// (Expr -> Symbol_Id) ВСЕХ модулей графа (не только entry) — Symbol_Id
+// сравним между ними (общий Symbol_Store на граф, см. LSP_Document.results).
+// Объявление само по себе не входит (доступно через symbol_at(...).span
+// отдельно) — в node_symbols попадают только Ident/Property-узлы,
+// ссылающиеся НА символ, а не место его создания (Let_Stmt.name — строка,
+// не Expr-узел). Span несёт свой file_id — межмодульность бесплатна.
 build_usages :: proc(doc: ^LSP_Document) {
 	doc.usages = make(map[core.Symbol_Id][dynamic]core.Span)
-	for expr, sym_id in doc.res_ctx.node_symbols {
-		sp := core.expr_span(expr)
-		list := doc.usages[sym_id]
-		append(&list, sp)
-		doc.usages[sym_id] = list
+	for i in 0 ..< len(doc.results) {
+		r := &doc.results[i]
+		for expr, sym_id in r.res_ctx.node_symbols {
+			sp := core.expr_span(expr)
+			list := doc.usages[sym_id]
+			append(&list, sp)
+			doc.usages[sym_id] = list
+		}
 	}
 }
 
@@ -282,7 +295,7 @@ handle_hover :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 		return
 	}
 
-	expr := find_expr_in_program(doc.prog, doc.file_id, offset)
+	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
 	if expr == nil {
 		send_response(id, nil)
 		return
@@ -312,7 +325,7 @@ handle_definition :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 		return
 	}
 
-	expr := find_expr_in_program(doc.prog, doc.file_id, offset)
+	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
 	if expr == nil {
 		send_response(id, nil)
 		return
@@ -359,7 +372,7 @@ resolve_position :: proc(server: ^LSP_Server, params: json.Value) -> (^LSP_Docum
 	doc, found := server.documents[uri]
 	if !found do return nil, 0, false
 
-	offset := lsp_position_to_byte_offset(doc.source, line, character)
+	offset := core.lsp_position_to_byte_offset(doc.source, line, character)
 	return doc, offset, true
 }
 
@@ -383,6 +396,20 @@ completion_kind :: proc(kind: core.Symbol_Kind) -> int {
 	return 1
 }
 
+// LSP CompletionItemKind для core.Completion_Member_Kind (Field=5, Method=2,
+// EnumMember=20 — та же нумерация, что уже использует completion_kind).
+member_completion_kind :: proc(kind: core.Completion_Member_Kind) -> int {
+	switch kind {
+	case .Field:
+		return 5
+	case .Method:
+		return 2
+	case .Variant:
+		return 20
+	}
+	return 1
+}
+
 // scope-aware enumeration (MVP): глобальные символы модуля (включая алиасы
 // импортов как Module-kind символы — сами экспорты импортированного
 // модуля не разворачиваются, обращение к ним всегда через `модуль.имя`)
@@ -391,6 +418,40 @@ completion_kind :: proc(kind: core.Symbol_Kind) -> int {
 handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	doc, offset, ok := resolve_position(server, params)
 	if !ok {
+		send_response(id, json.Array{})
+		return
+	}
+
+	// Dot-режим: курсор сразу после `receiver.` — вместо плоского scope-
+	// дампа показываем поля/методы/варианты РЕЗОЛВЛЕННОГО типа receiver'а.
+	// Тот же паттерн поиска, что handle_hover — find_expr_in_program, но
+	// НЕ на позицию точки (offset-1) — span_contains использует
+	// [start,end) с исключённым концом, точка сама лежит ВНЕ span'а
+	// receiver'а. Ищем на offset-2 — последний байт receiver'а перед
+	// точкой (напр. "p." — точка на byte 2, "p" занимает [1,2), нужно
+	// искать на 1). node_types даёт тип найденного узла (см.
+	// core.type_completion_members, core/completion.odin).
+	if offset > 1 && offset <= u32(len(doc.source)) && doc.source[offset - 1] == '.' {
+		receiver_expr := core.find_expr_in_program(doc.prog, doc.file_id, offset - 2)
+		if receiver_expr != nil {
+			if typ, has_type := doc.tc_ctx.node_types[receiver_expr]; has_type && typ != nil {
+				members := core.type_completion_members(typ)
+				dot_items := make([dynamic]json.Value)
+				dot_seen := make(map[string]bool, allocator = context.temp_allocator)
+				for m in members {
+					if m.name == "" || dot_seen[m.name] do continue
+					dot_seen[m.name] = true
+					append(
+						&dot_items,
+						json.Value(
+							json.Object{"label" = json.String(m.name), "kind" = json.Integer(i64(member_completion_kind(m.kind)))},
+						),
+					)
+				}
+				send_response(id, json.Array(dot_items))
+				return
+			}
+		}
 		send_response(id, json.Array{})
 		return
 	}
@@ -409,7 +470,7 @@ handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 		add_item(&items, &seen, core.resolve_interned(name_id), completion_kind(sym.kind))
 	}
 
-	decl := find_enclosing_decl(doc.prog, doc.file_id, offset)
+	decl := core.find_enclosing_decl(doc.prog, doc.file_id, offset)
 	body_and_args :: proc(
 		res: ^core.Resolver_Ctx,
 		decl: core.Decls,
@@ -425,7 +486,7 @@ handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 			}
 		}
 		locals := make([dynamic]core.Symbol_Id, context.temp_allocator)
-		collect_local_symbols(res, body, &locals)
+		core.collect_local_symbols(res, body, &locals)
 		for l in locals {
 			sym := core.symbol_at(res.symbol_store, l)
 			add_item(items, seen, core.resolve_interned(sym.name), completion_kind(sym.kind))
@@ -437,7 +498,7 @@ handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 			body_and_args(&doc.res_ctx, decl, d.body, &items, &seen, add_item)
 		case ^core.Impl_Decl:
 			for m in d.methods {
-				if span_contains(m.span, doc.file_id, offset) {
+				if core.span_contains(m.span, doc.file_id, offset) {
 					body_and_args(&doc.res_ctx, m, m.body, &items, &seen, add_item)
 				}
 			}
@@ -472,10 +533,19 @@ collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_de
 		)
 	}
 	for sp in doc.usages[sym_id] {
+		// sp может лежать в ЛЮБОМ модуле графа (build_usages теперь
+		// сканирует все) — тот же file_id-aware выбор источника/uri, что
+		// уже используется для decl_span выше, а не всегда doc.uri/doc.source.
+		usage_source := doc.source
+		usage_uri := doc.uri
+		if sp.file_id != doc.file_id {
+			usage_source = doc.graph.file_sources[sp.file_id]
+			usage_uri = path_to_uri(doc.graph.file_paths[sp.file_id])
+		}
 		append(
 			&locations,
 			json.Value(
-				json.Object{"uri" = json.String(doc.uri), "range" = lsp_range_json(doc.source, sp.start, sp.end)},
+				json.Object{"uri" = json.String(usage_uri), "range" = lsp_range_json(usage_source, sp.start, sp.end)},
 			),
 		)
 	}
@@ -493,7 +563,7 @@ handle_references :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 		send_response(id, nil)
 		return
 	}
-	expr := find_expr_in_program(doc.prog, doc.file_id, offset)
+	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
 	if expr == nil {
 		send_response(id, nil)
 		return
@@ -516,7 +586,7 @@ handle_rename :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 		return
 	}
 	new_name := json_str(params, "newName")
-	expr := find_expr_in_program(doc.prog, doc.file_id, offset)
+	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
 	if expr == nil {
 		send_response(id, nil)
 		return

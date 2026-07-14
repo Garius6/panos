@@ -1,6 +1,5 @@
-package main
+package core
 
-import core "../core"
 import "core:unicode/utf8"
 
 // LSP использует UTF-16 code unit'ы для character-offset'а внутри строки
@@ -54,30 +53,51 @@ utf16_len :: proc(s: string) -> int {
 	return n
 }
 
-// --- ПОИСК AST-УЗЛА ПО ПОЗИЦИИ ---
-
-decl_span :: proc(d: core.Decls) -> core.Span {
-	if d == nil do return core.Span{}
-	switch v in d {
-	case ^core.Import_Decl:
-		return v.span
-	case ^core.Function_Decl:
-		return v.span
-	case ^core.Struct_Decl:
-		return v.span
-	case ^core.Impl_Decl:
-		return v.span
-	case ^core.Interface_Decl:
-		return v.span
-	case ^core.Enum_Decl:
-		return v.span
-	case ^core.Error_Decl:
-		return v.span
-	}
-	return core.Span{}
+// Байтовый offset -> плоский UTF-16 offset от начала ВСЕГО source (не
+// line-relative, в отличие от byte_offset_to_lsp_position выше) — формат,
+// который ждёт CodeMirror (число, а не {line, character}), см. wasm/main.odin.
+byte_offset_to_utf16_offset :: proc(source: string, byte_offset: u32) -> int {
+	limit := int(byte_offset)
+	if limit > len(source) do limit = len(source)
+	return utf16_len(source[:limit])
 }
 
-span_contains :: proc(sp: core.Span, file_id: u16, offset: u32) -> bool {
+// Обратное: плоский UTF-16 offset (от CodeMirror) -> байтовый offset.
+utf16_offset_to_byte_offset :: proc(source: string, utf16_offset: int) -> u32 {
+	i := 0
+	units := 0
+	for units < utf16_offset && i < len(source) {
+		r, w := utf8.decode_rune_in_string(source[i:])
+		i += w
+		units += r > 0xFFFF ? 2 : 1
+	}
+	return u32(i)
+}
+
+// --- ПОИСК AST-УЗЛА ПО ПОЗИЦИИ ---
+
+decl_span :: proc(d: Decls) -> Span {
+	if d == nil do return Span{}
+	switch v in d {
+	case ^Import_Decl:
+		return v.span
+	case ^Function_Decl:
+		return v.span
+	case ^Struct_Decl:
+		return v.span
+	case ^Impl_Decl:
+		return v.span
+	case ^Interface_Decl:
+		return v.span
+	case ^Enum_Decl:
+		return v.span
+	case ^Error_Decl:
+		return v.span
+	}
+	return Span{}
+}
+
+span_contains :: proc(sp: Span, file_id: u16, offset: u32) -> bool {
 	return sp.file_id == file_id && offset >= sp.start && offset < sp.end
 }
 
@@ -85,51 +105,51 @@ span_contains :: proc(sp: core.Span, file_id: u16, offset: u32) -> bool {
 // дочерние узлы; если ни один потомок не содержит offset (напр. курсор на
 // операторе/скобке), возвращает сам e — этого достаточно для hover
 // ("тип этого под-выражения").
-find_expr_at :: proc(e: core.Expr, file_id: u16, offset: u32) -> core.Expr {
+find_expr_at :: proc(e: Expr, file_id: u16, offset: u32) -> Expr {
 	if e == nil do return nil
-	if !span_contains(core.expr_span(e), file_id, offset) do return nil
+	if !span_contains(expr_span(e), file_id, offset) do return nil
 
 	#partial switch v in e {
-	case ^core.Binary_Expr:
+	case ^Binary_Expr:
 		if r := find_expr_at(v.left, file_id, offset); r != nil do return r
 		if r := find_expr_at(v.right, file_id, offset); r != nil do return r
-	case ^core.Unary_Expr:
+	case ^Unary_Expr:
 		if r := find_expr_at(v.right, file_id, offset); r != nil do return r
-	case ^core.Call_Expr:
+	case ^Call_Expr:
 		if r := find_expr_at(v.callee, file_id, offset); r != nil do return r
 		for arg in v.args {
 			if r := find_expr_at(arg, file_id, offset); r != nil do return r
 		}
-	case ^core.While_Expr:
+	case ^While_Expr:
 		if r := find_expr_at(v.condition, file_id, offset); r != nil do return r
 		if r := find_in_body(v.body, file_id, offset); r != nil do return r
-	case ^core.If_Expr:
+	case ^If_Expr:
 		if r := find_expr_at(v.condition, file_id, offset); r != nil do return r
 		if r := find_in_body(v.then_branch, file_id, offset); r != nil do return r
 		if r := find_in_body(v.else_branch, file_id, offset); r != nil do return r
-	case ^core.Tuple_Expr:
+	case ^Tuple_Expr:
 		for el in v.elements {
 			if r := find_expr_at(el, file_id, offset); r != nil do return r
 		}
-	case ^core.Property_Expr:
+	case ^Property_Expr:
 		if r := find_expr_at(v.object, file_id, offset); r != nil do return r
-	case ^core.Lambda_Expr:
+	case ^Lambda_Expr:
 		if r := find_in_body(v.body, file_id, offset); r != nil do return r
-	case ^core.Array_Expr:
+	case ^Array_Expr:
 		for el in v.elements {
 			if r := find_expr_at(el, file_id, offset); r != nil do return r
 		}
-	case ^core.Map_Expr:
+	case ^Map_Expr:
 		for entry in v.entries {
 			if r := find_expr_at(entry.key, file_id, offset); r != nil do return r
 			if r := find_expr_at(entry.value, file_id, offset); r != nil do return r
 		}
-	case ^core.Index_Expr:
+	case ^Index_Expr:
 		if r := find_expr_at(v.object, file_id, offset); r != nil do return r
 		if r := find_expr_at(v.index, file_id, offset); r != nil do return r
-	case ^core.Try_Expr:
+	case ^Try_Expr:
 		if r := find_expr_at(v.value, file_id, offset); r != nil do return r
-	case ^core.Match_Expr:
+	case ^Match_Expr:
 		if r := find_expr_at(v.subject, file_id, offset); r != nil do return r
 		for arm in v.arms {
 			if r := find_in_body(arm.body, file_id, offset); r != nil do return r
@@ -138,21 +158,21 @@ find_expr_at :: proc(e: core.Expr, file_id: u16, offset: u32) -> core.Expr {
 	return e
 }
 
-find_in_body :: proc(body: [dynamic]core.Stmt, file_id: u16, offset: u32) -> core.Expr {
+find_in_body :: proc(body: [dynamic]Stmt, file_id: u16, offset: u32) -> Expr {
 	for stmt in body {
 		if r := find_in_stmt(stmt, file_id, offset); r != nil do return r
 	}
 	return nil
 }
 
-find_in_stmt :: proc(stmt: core.Stmt, file_id: u16, offset: u32) -> core.Expr {
+find_in_stmt :: proc(stmt: Stmt, file_id: u16, offset: u32) -> Expr {
 	if stmt == nil do return nil
 	#partial switch s in stmt {
-	case ^core.Return_Stmt:
+	case ^Return_Stmt:
 		return find_expr_at(s.value, file_id, offset)
-	case ^core.Let_Stmt:
+	case ^Let_Stmt:
 		return find_expr_at(s.value, file_id, offset)
-	case ^core.Expr_Stmt:
+	case ^Expr_Stmt:
 		return find_expr_at(s.expr, file_id, offset)
 	}
 	return nil
@@ -160,13 +180,13 @@ find_in_stmt :: proc(stmt: core.Stmt, file_id: u16, offset: u32) -> core.Expr {
 
 // Верхнеуровневая точка входа: находит Expr в программе по byte offset.
 // Сперва находит объемлющий Decl (функцию/метод), затем спускается внутрь.
-find_expr_in_program :: proc(prog: core.Program, file_id: u16, offset: u32) -> core.Expr {
+find_expr_in_program :: proc(prog: Program, file_id: u16, offset: u32) -> Expr {
 	for decl in prog.decls {
 		if !span_contains(decl_span(decl), file_id, offset) do continue
 		#partial switch d in decl {
-		case ^core.Function_Decl:
+		case ^Function_Decl:
 			return find_in_body(d.body, file_id, offset)
-		case ^core.Impl_Decl:
+		case ^Impl_Decl:
 			for m in d.methods {
 				if span_contains(m.span, file_id, offset) {
 					return find_in_body(m.body, file_id, offset)
@@ -180,7 +200,7 @@ find_expr_in_program :: proc(prog: core.Program, file_id: u16, offset: u32) -> c
 
 // Для completion: находит объемлющую top-level декларацию (функцию/impl)
 // по byte offset — без спуска внутрь тела, в отличие от find_expr_in_program.
-find_enclosing_decl :: proc(prog: core.Program, file_id: u16, offset: u32) -> core.Decls {
+find_enclosing_decl :: proc(prog: Program, file_id: u16, offset: u32) -> Decls {
 	for decl in prog.decls {
 		if span_contains(decl_span(decl), file_id, offset) do return decl
 	}
@@ -192,65 +212,65 @@ find_enclosing_decl :: proc(prog: core.Program, file_id: u16, offset: u32) -> co
 // (без учёта позиции курсора — MVP слегка over-suggest'ит: предлагает
 // локали из непройденных веток if/match, но не даёт ложных отрицаний).
 
-collect_local_symbols :: proc(res: ^core.Resolver_Ctx, body: [dynamic]core.Stmt, out: ^[dynamic]core.Symbol_Id) {
+collect_local_symbols :: proc(res: ^Resolver_Ctx, body: [dynamic]Stmt, out: ^[dynamic]Symbol_Id) {
 	for stmt in body {
 		collect_local_symbols_stmt(res, stmt, out)
 	}
 }
 
-collect_local_symbols_stmt :: proc(res: ^core.Resolver_Ctx, stmt: core.Stmt, out: ^[dynamic]core.Symbol_Id) {
+collect_local_symbols_stmt :: proc(res: ^Resolver_Ctx, stmt: Stmt, out: ^[dynamic]Symbol_Id) {
 	if stmt == nil do return
 	#partial switch s in stmt {
-	case ^core.Let_Stmt:
+	case ^Let_Stmt:
 		if sym, ok := res.stmt_symbols[stmt]; ok do append(out, sym)
 		collect_local_symbols_expr(res, s.value, out)
-	case ^core.Return_Stmt:
+	case ^Return_Stmt:
 		collect_local_symbols_expr(res, s.value, out)
-	case ^core.Expr_Stmt:
+	case ^Expr_Stmt:
 		collect_local_symbols_expr(res, s.expr, out)
 	}
 }
 
-collect_local_symbols_expr :: proc(res: ^core.Resolver_Ctx, expr: core.Expr, out: ^[dynamic]core.Symbol_Id) {
+collect_local_symbols_expr :: proc(res: ^Resolver_Ctx, expr: Expr, out: ^[dynamic]Symbol_Id) {
 	if expr == nil do return
 	#partial switch e in expr {
-	case ^core.Binary_Expr:
+	case ^Binary_Expr:
 		collect_local_symbols_expr(res, e.left, out)
 		collect_local_symbols_expr(res, e.right, out)
-	case ^core.Unary_Expr:
+	case ^Unary_Expr:
 		collect_local_symbols_expr(res, e.right, out)
-	case ^core.Call_Expr:
+	case ^Call_Expr:
 		collect_local_symbols_expr(res, e.callee, out)
 		for arg in e.args do collect_local_symbols_expr(res, arg, out)
-	case ^core.If_Expr:
+	case ^If_Expr:
 		collect_local_symbols_expr(res, e.condition, out)
 		for s in e.then_branch do collect_local_symbols_stmt(res, s, out)
 		for s in e.else_branch do collect_local_symbols_stmt(res, s, out)
-	case ^core.While_Expr:
+	case ^While_Expr:
 		collect_local_symbols_expr(res, e.condition, out)
 		for s in e.body do collect_local_symbols_stmt(res, s, out)
-	case ^core.Tuple_Expr:
+	case ^Tuple_Expr:
 		for el in e.elements do collect_local_symbols_expr(res, el, out)
-	case ^core.Property_Expr:
+	case ^Property_Expr:
 		collect_local_symbols_expr(res, e.object, out)
-	case ^core.Lambda_Expr:
+	case ^Lambda_Expr:
 		if args, ok := res.lambda_args[expr]; ok {
 			for a in args do append(out, a)
 		}
 		for s in e.body do collect_local_symbols_stmt(res, s, out)
-	case ^core.Array_Expr:
+	case ^Array_Expr:
 		for el in e.elements do collect_local_symbols_expr(res, el, out)
-	case ^core.Map_Expr:
+	case ^Map_Expr:
 		for entry in e.entries {
 			collect_local_symbols_expr(res, entry.key, out)
 			collect_local_symbols_expr(res, entry.value, out)
 		}
-	case ^core.Index_Expr:
+	case ^Index_Expr:
 		collect_local_symbols_expr(res, e.object, out)
 		collect_local_symbols_expr(res, e.index, out)
-	case ^core.Try_Expr:
+	case ^Try_Expr:
 		collect_local_symbols_expr(res, e.value, out)
-	case ^core.Match_Expr:
+	case ^Match_Expr:
 		collect_local_symbols_expr(res, e.subject, out)
 		for arm in e.arms {
 			collect_pattern_binders(res, arm.pattern, out)
@@ -259,14 +279,14 @@ collect_local_symbols_expr :: proc(res: ^core.Resolver_Ctx, expr: core.Expr, out
 	}
 }
 
-collect_pattern_binders :: proc(res: ^core.Resolver_Ctx, pattern: core.Pattern, out: ^[dynamic]core.Symbol_Id) {
+collect_pattern_binders :: proc(res: ^Resolver_Ctx, pattern: Pattern, out: ^[dynamic]Symbol_Id) {
 	switch p in pattern {
-	case ^core.Pattern_Wildcard:
-	case ^core.Pattern_Literal:
-	case ^core.Pattern_Ident:
+	case ^Pattern_Wildcard:
+	case ^Pattern_Literal:
+	case ^Pattern_Ident:
 		if sym, ok := res.pattern_binders[p]; ok do append(out, sym)
-	case ^core.Pattern_Constructor:
+	case ^Pattern_Constructor:
 		for arg in p.args do collect_pattern_binders(res, arg, out)
-	case ^core.Error_Pattern:
+	case ^Error_Pattern:
 	}
 }

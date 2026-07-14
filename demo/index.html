@@ -19,38 +19,45 @@
 	.toolbar { margin: 1em 0; display: flex; align-items: center; gap: 1em; }
 	button { font-size: 16px; padding: 0.5em 1.5em; }
 	.hint { color: #666; font-size: 13px; }
+	#run-status.crashed { color: #f66; font-weight: bold; }
 </style>
 </head>
 <body>
 <h1>panos — демо в браузере</h1>
 <p>Без <code>импорт</code> — только чистая логика в одном файле (стандартная библиотека
-в браузере пока не поддержана, см. ROADMAP.md).</p>
+в браузере пока не поддержана, см. ROADMAP.md). Подсветка ошибок, hover и автокомплит
+после <code>.</code> работают через тот же тайпчекер, что и <code>panos-lsp</code>
+(см. wasm/main.odin — LSP-lite, без полного протокола).</p>
 
 <div id="editor"></div>
 <div class="toolbar">
 	<button id="run">Запустить</button>
 	<span class="hint">или Cmd/Ctrl+Enter</span>
+	<span id="run-status" class="hint"></span>
 </div>
 <div id="console">— результат появится здесь —</div>
 
 <script src="odin.js"></script>
 <script type="module">
 import {EditorView, basicSetup} from "https://esm.sh/codemirror@6.0.1";
-import {keymap} from "https://esm.sh/@codemirror/view@6";
+import {keymap, hoverTooltip} from "https://esm.sh/@codemirror/view@6";
 import {indentWithTab} from "https://esm.sh/@codemirror/commands@6";
+import {linter} from "https://esm.sh/@codemirror/lint@6";
+import {autocompletion} from "https://esm.sh/@codemirror/autocomplete@6";
 
 const DEFAULT_SOURCE = `функ старт() -> Число
 	10 + 20
 конец`;
 
 const consoleEl = document.getElementById("console");
+const statusEl = document.getElementById("run-status");
 const memInterface = new odin.WasmMemoryInterface();
 
-function runSource(source) {
-	// #console — постоянно растущий лог (odin.js рендерит его из
-	// внутреннего, недоступного снаружи буфера — очистить между запусками
-	// нельзя, см. комментарий у panos_run в wasm/main.odin, который сам
-	// печатает разделитель "── запуск ──" перед каждым прогоном).
+// Общая точка записи исходника в WASM-буфер — переиспользуется run/check/
+// hover/complete (все пишут в один и тот же source_buf со стороны Odin,
+// см. wasm/main.odin). Синхронный вызов без await между write и read —
+// JS/WASM однопоточные, гонки внутри одного тика быть не может.
+function writeSourceToWasm(source) {
 	const cap = memInterface.exports.panos_source_capacity();
 	// Байтовая (не символьная) длина — исходник в UTF-8 внутри WASM-памяти,
 	// кириллица занимает 2 байта на символ. Проверяем ДО storeString —
@@ -58,14 +65,98 @@ function runSource(source) {
 	// затёрла бы соседнюю память ДО того, как мы вообще узнали бы о
 	// переполнении.
 	const byteLen = new TextEncoder().encode(source).length;
-	if (byteLen > cap) {
+	if (byteLen > cap) return null;
+	const ptr = memInterface.exports.panos_source_ptr();
+	return memInterface.storeString(ptr, source);
+}
+
+function readResultJson() {
+	const ptr = memInterface.exports.panos_result_ptr();
+	const len = memInterface.exports.panos_result_len();
+	const bytes = new Uint8Array(memInterface.memory.buffer, ptr, len);
+	return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function runSource(source) {
+	// #console — постоянно растущий лог (odin.js рендерит его из
+	// внутреннего, недоступного снаружи буфера — очистить между запусками
+	// нельзя, см. комментарий у panos_run в wasm/main.odin, который сам
+	// печатает разделитель "── запуск ──" перед каждым прогоном).
+	statusEl.textContent = "";
+	statusEl.classList.remove("crashed");
+	const written = writeSourceToWasm(source);
+	if (written === null) {
 		consoleEl.style.color = "#f66";
-		consoleEl.textContent = `Ошибка: исходник длиннее буфера демо (${byteLen} > ${cap} байт)`;
+		consoleEl.textContent = "Ошибка: исходник длиннее буфера демо";
 		return;
 	}
-	const ptr = memInterface.exports.panos_source_ptr();
-	const written = memInterface.storeString(ptr, source);
-	memInterface.exports.panos_run(written);
+	try {
+		memInterface.exports.panos_run(written);
+	} catch (e) {
+		// паника() в Odin — WASM unreachable trap, JS видит как throw. Сам
+		// текст паники Odin уже успел напечатать через odin_env.write ДО
+		// trap'а (виден в #console выше) — WASM-инстанс переживает трап
+		// (проверено: следующий запуск в том же инстансе отрабатывает
+		// штатно). Ловим здесь, чтобы (а) необработанное исключение не
+		// всплывало в devtools, (б) дать понятный статус-маркер — сам
+		// #console нельзя пополнить напрямую (следующий print перезапишет
+		// его целиком из внутреннего буфера odin.js, см. комментарий выше),
+		// поэтому маркер — отдельный, полностью JS-управляемый элемент.
+		statusEl.textContent = "⚠ выполнение прервано (паника)";
+		statusEl.classList.add("crashed");
+	}
+}
+
+// @codemirror/lint: source-функция вызывается автоматически на каждое
+// изменение документа (debounced самим CodeMirror). from/to у
+// panos_check уже в плоском UTF-16-offset формате, который лит ждёт —
+// конвертация сделана на стороне Odin (core.byte_offset_to_utf16_offset).
+function panosLinter(view) {
+	const source = view.state.doc.toString();
+	const written = writeSourceToWasm(source);
+	if (written === null) return [];
+	memInterface.exports.panos_check(written);
+	const diags = readResultJson();
+	return diags.map(d => ({from: d.from, to: d.to, severity: d.severity, message: d.message}));
+}
+
+// @codemirror/view: hoverTooltip — вызывается при наведении, pos уже в
+// том же плоском UTF-16-offset формате.
+function panosHover(view, pos) {
+	const source = view.state.doc.toString();
+	const written = writeSourceToWasm(source);
+	if (written === null) return null;
+	memInterface.exports.panos_hover(written, pos);
+	const result = readResultJson();
+	if (result === null) return null;
+	return {
+		pos: result.from,
+		end: result.to,
+		above: true,
+		create() {
+			const dom = document.createElement("div");
+			dom.textContent = result.type;
+			dom.style.cssText = "background:#222;color:#eee;padding:4px 8px;border-radius:4px;font-family:monospace;";
+			return {dom};
+		},
+	};
+}
+
+// @codemirror/autocomplete: срабатывает на "." (явный триггер) — panos_complete
+// сам возвращает [], если позиция не сразу после точки (см. wasm/main.odin).
+function panosCompletionSource(context) {
+	const dotMatch = context.matchBefore(/\.$/);
+	if (!dotMatch && !context.explicit) return null;
+	const source = context.state.doc.toString();
+	const written = writeSourceToWasm(source);
+	if (written === null) return null;
+	memInterface.exports.panos_complete(written, context.pos);
+	const items = readResultJson();
+	if (!items.length) return null;
+	return {
+		from: context.pos,
+		options: items.map(it => ({label: it.label, type: it.kind})),
+	};
 }
 
 const runCommand = () => {
@@ -86,9 +177,18 @@ const runKeymap = keymap.of([
 
 const editor = new EditorView({
 	doc: DEFAULT_SOURCE,
-	extensions: [basicSetup, runKeymap],
+	extensions: [
+		basicSetup,
+		runKeymap,
+		linter(panosLinter),
+		hoverTooltip(panosHover),
+		autocompletion({override: [panosCompletionSource]}),
+	],
 	parent: document.getElementById("editor"),
 });
+// Для программной замены содержимого при автотестах (Playwright) —
+// модульные скрипты не кладут свои top-level переменные в window сами.
+window.panosEditor = editor;
 
 odin.runWasm("panos.wasm", consoleEl, {}, memInterface).then(() => {
 	document.getElementById("run").addEventListener("click", () => {

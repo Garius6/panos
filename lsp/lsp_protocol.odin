@@ -1,6 +1,7 @@
 #+feature dynamic-literals
 package main
 
+import core "../core"
 import "core:encoding/json"
 
 // LSP-сообщения глубоко вложены, но нам нужно из них лишь несколько
@@ -44,8 +45,8 @@ lsp_position_json :: proc(line: int, character: int) -> json.Value {
 
 // Собирает LSP Range {start, end} из байтовых offset'ов в source.
 lsp_range_json :: proc(source: string, start_offset: u32, end_offset: u32) -> json.Value {
-	start_line, start_char := byte_offset_to_lsp_position(source, start_offset)
-	end_line, end_char := byte_offset_to_lsp_position(source, end_offset)
+	start_line, start_char := core.byte_offset_to_lsp_position(source, start_offset)
+	end_line, end_char := core.byte_offset_to_lsp_position(source, end_offset)
 	return json.Object {
 		"start" = lsp_position_json(start_line, start_char),
 		"end" = lsp_position_json(end_line, end_char),

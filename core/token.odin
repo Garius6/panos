@@ -44,6 +44,7 @@ TokenKind :: enum {
 	For,
 	Return,
 	Let,
+	Const,
 	Import,
 	Export,
 	Enum,

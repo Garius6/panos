@@ -3268,3 +3268,70 @@ test_value_to_display_string_covers_primitives_and_collections :: proc(t: ^testi
 		output,
 	)
 }
+
+// Стадия 27: конст-биндинг компилируется/исполняется как обычный пер —
+// сама фича не меняет чтение значения, только запрещает переприсвоение.
+@(test)
+test_const_binding_reads_like_normal_let :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			конст x = 5
+			x + 1
+		конец
+	`)
+	testing.expectf(t, ok, "[конст: чтение] стек пуст")
+	n, is_num := result.(f64)
+	testing.expectf(t, is_num && n == 6, "[конст: чтение] ожидалось 6, получено %v", result)
+}
+
+// Негативный кейс: переприсвоение конст даёт diagnostic, не крэш и не
+// молчаливый успех.
+@(test)
+test_const_reassignment_is_error :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			конст x = 5
+			x = 10
+			x
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: попытка переприсвоить константу 'x'")
+}
+
+// Regression (Explore-находка): переприсваивание параметров функции
+// по-прежнему работает — конст не распространяется на них автоматически.
+@(test)
+test_function_params_still_reassignable :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ f(x: Число) -> Число
+			x = x + 1
+			x
+		конец
+
+		функ старт() -> Число
+			f(5)
+		конец
+	`)
+	testing.expectf(t, ok, "[конст: параметры] стек пуст")
+	n, is_num := result.(f64)
+	testing.expectf(t, is_num && n == 6, "[конст: параметры] ожидалось 6, получено %v", result)
+}
+
+// Regression (Explore-находка): конст во вложенном scope не мешает пер
+// с тем же именем во внешнем scope (каждый scope — независимый Symbol).
+@(test)
+test_const_shadowing_nested_scope_still_works :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер x = 5
+			если истина тогда
+				конст x = 10
+				x
+			конец
+			x
+		конец
+	`)
+	testing.expectf(t, ok, "[конст: shadowing] стек пуст")
+	n, is_num := result.(f64)
+	testing.expectf(t, is_num && n == 5, "[конст: shadowing] ожидалось 5, получено %v", result)
+}

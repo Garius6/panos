@@ -214,6 +214,7 @@ Let_Stmt :: struct {
 	name:            string,
 	value:           Expr,
 	type_annotation: Type_Node,
+	is_const:        bool,
 }
 
 Expr_Stmt :: struct {
@@ -1146,7 +1147,7 @@ parse_stmt :: proc(p: ^Parser) -> Stmt {
 	#partial switch tok.kind {
 	case .Return:
 		return parse_return_stmt(p)
-	case .Let:
+	case .Let, .Const:
 		return parse_let_stmt(p)
 	case .Continue:
 		return parse_continue_stmt(p)
@@ -1411,11 +1412,16 @@ parse_return_stmt :: proc(p: ^Parser) -> Stmt {
 
 parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 	start := peek_token(p.stream).span
+	is_const := peek_token(p.stream).kind == .Const
 	next_token(p.stream)
 	stmt := new(Let_Stmt)
+	stmt.is_const = is_const
 
 	ident_tok := next_token(p.stream)
-	if ident_tok.kind != .Ident do report_parse(p, ident_tok.span, "Синтаксическая ошибка: после 'пер' ожидается идентификатор")
+	if ident_tok.kind != .Ident {
+		keyword := is_const ? "конст" : "пер"
+		report_parse(p, ident_tok.span, "Синтаксическая ошибка: после '%s' ожидается идентификатор", keyword)
+	}
 	stmt.name = ident_tok.data
 
 	if peek_token(p.stream).kind == .Colon {

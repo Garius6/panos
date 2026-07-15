@@ -1306,6 +1306,60 @@ Refs: [ROADMAP §Стадия 26](ROADMAP.md#стадия-26-grilled-три-ра
 
 ---
 
+## Стадия 27 (grilled, один раунд) — `конст`: неизменяемые биндинги ✅
+
+Refs: [ROADMAP §Стадия 27](ROADMAP.md#стадия-27-grilled-один-раунд--конст-неизменяемые-биндинги).
+
+Новое ключевое слово `конст`, параллельное `пер` — запрещает
+переприсвоение имени после объявления. НЕ deep immutability (поля
+структуры через `x.поле = 5` по-прежнему мутируемы — `конст`
+контролирует только сам биндинг, не то, на что он указывает).
+
+**Решено**:
+- [x] Уровень — binding-immutability (JS `const`/Kotlin `val`-style), не
+      deep immutability. Дешевле, не трогает Set_Property/Set_Index,
+      не требует протаскивать mutability через type checker
+
+**Explore-находки (эмпирически, тестовыми прогонами через `run_code`)**:
+- [x] Переприсваивание параметров функции УЖЕ работает сегодня — конст
+      не трогает параметры, вне scope фичи
+- [x] Shadowing в ТОМ ЖЕ scope УЖЕ запрещено резолвером ("Имя x уже
+      объявлено") независимо от const/mut — конст наследует бесплатно
+- [x] Shadowing во ВЛОЖЕННОМ scope УЖЕ работает (независимый Symbol на
+      scope) — is_const корректен здесь без спецкейсов
+- [x] LSP hover сейчас показывает ТОЛЬКО имя типа, без symbol-lookup —
+      конст-префикс в hover был бы net-new доработкой, не правкой
+      (вынесено опциональным шагом 9, не блокирует core-фичу)
+
+**Порядок работ (реализовано)**:
+1. [x] `core/lexer.odin:157` / `core/token.odin` — `"конст" -> .Const`
+       (новый `Token_Kind`)
+2. [x] `core/parser.odin:212` — `Let_Stmt.is_const: bool`
+3. [x] `core/parser.odin:1146-1150` — `parse_stmt`: `.Let, .Const ->
+       parse_let_stmt`
+4. [x] `core/parser.odin:1412-1431` — `parse_let_stmt` читает, какой
+       токен съеден, выставляет `is_const` (+ error-message теперь
+       называет правильное ключевое слово вместо хардкода "пер")
+5. [x] `core/resolver.odin:285-298`/`16-28` — `new_symbol`/`Symbol`
+       получают `is_const: bool` (форма `is_pattern_binder`)
+6. [x] `core/resolver.odin:710-720` — `Let_Stmt`-резолв передаёт
+       `is_const = s.is_const`
+7. [x] `core/type_cheker.odin:2749` — `case .Assign:` — если `e.left`
+       `^Ident_Expr` с `Symbol.is_const`, diagnostic ПЕРЕД
+       unify_types-проверкой. Property_Expr/Index_Expr вне проверки
+8. [x] compiler.odin — без изменений (typecheck гейтит пайплайн)
+9. [ ] (опционально, вне core-скоупа, НЕ сделано) LSP hover —
+       конст-префикс, требует symbol-lookup в `handle_hover`
+10. [x] e2e-тесты (core/e2e_test.odin): позитив
+       (`test_const_binding_reads_like_normal_let`), негатив
+       (`test_const_reassignment_is_error`), 2 regression
+       (`test_function_params_still_reassignable`,
+       `test_const_shadowing_nested_scope_still_works`)
+
+`odin test ./core` — 100/100. native/lsp/wasm сборки чисты.
+
+---
+
 ## Заметки
 
 - `.claude/` и `CLAUDE.md` намеренно исключены из git (agent-context).

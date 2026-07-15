@@ -22,6 +22,11 @@ Symbol :: struct {
 	decl:              Decls,
 	owner_type:        Symbol_Id,
 	is_pattern_binder: bool,
+	// Стадия 27: конст-биндинг — запрещает переприсвоение через `=`
+	// (type_cheker.odin's infer_binary_expr, case .Assign). НЕ deep
+	// immutability — поля/элементы (Property_Expr/Index_Expr) не
+	// проверяются, только сам биндинг (Ident_Expr).
+	is_const:          bool,
 	// Span объявления — для LSP go-to-definition. Zero-value у builtin'ов
 	// (нет исходника, куда прыгать).
 	span:              Span,
@@ -292,6 +297,7 @@ new_symbol :: proc(
 	span: Span = {},
 	owner_type: Symbol_Id = INVALID_SYMBOL,
 	is_pattern_binder: bool = false,
+	is_const: bool = false,
 	// Для kind == .Module: символ должен указывать на импортированный модуль,
 	// а не на модуль-импортёр (тот нужен только для вычисления full_name).
 	module_override: ^Module = nil,
@@ -305,6 +311,7 @@ new_symbol :: proc(
 		span              = span,
 		owner_type        = owner_type,
 		is_pattern_binder = is_pattern_binder,
+		is_const          = is_const,
 	}
 	if module != nil && len(module.path) > 0 {
 		sym.full_name = intern(fmt.tprintf("%s::%s", module.path, name))
@@ -710,7 +717,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 	case ^Let_Stmt:
 		resolve_expr(ctx, s.value)
 
-		sym := new_symbol(ctx.symbol_store, s.name, .Variable, ctx.current_module, span = s.span)
+		sym := new_symbol(ctx.symbol_store, s.name, .Variable, ctx.current_module, span = s.span, is_const = s.is_const)
 		name_id := intern(s.name)
 		if name_id in ctx.current_scope.symbols {
 			report_resolve(ctx, s.span, "Имя %s уже объявлено", s.name)

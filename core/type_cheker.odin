@@ -2747,6 +2747,22 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 		}
 
 	case .Assign:
+		// Стадия 27: конст-биндинг — запрещает переприсвоение самого
+		// имени. Только Ident_Expr (сам биндинг) — Property_Expr/
+		// Index_Expr (поля/элементы через `.`/`[]`) не входят: конст —
+		// binding-immutability, не deep immutability (у panos структур
+		// reference semantics, конст не защищает то, на что ссылается).
+		if ident, is_ident := e.left.(^Ident_Expr); is_ident {
+			if sym_id := ctx.res.node_symbols[ident];
+			   sym_id != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, sym_id).is_const {
+				report(
+					ctx,
+					e.span,
+					"Type Error: попытка переприсвоить константу '%s'",
+					resolve_interned(ident.name),
+				)
+			}
+		}
 		left_t := infer_expr(ctx, e.left)
 		check_expr(ctx, e.right, left_t)
 		right_t := infer_expr(ctx, e.right)

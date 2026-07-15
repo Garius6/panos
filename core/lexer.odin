@@ -156,6 +156,8 @@ lookup_ident :: proc(ident: string) -> TokenKind {
 	switch ident {
 	case "пер":
 		return .Let
+	case "конст":
+		return .Const
 	case "истина", "ложь":
 		return .Boolean
 	case "функ":

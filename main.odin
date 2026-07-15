@@ -1,6 +1,6 @@
 package main
 
-import "back"
+import "external/back"
 import core "core"
 import "core:fmt"
 import "core:mem"

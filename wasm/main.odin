@@ -66,6 +66,48 @@ panos_source_capacity :: proc "c" () -> int {
 	return SOURCE_BUF_SIZE
 }
 
+// Синтетический путь "входного файла" плейграунда — реального файла нет
+// (JS пишет исходник в source_buf), но graph-based pipeline (та же, что у
+// LSP — см. lsp/lsp_server.odin::revalidate_document) требует путь-ключ
+// для source_overrides. `импорт` внутри плейграунда резолвится либо через
+// него (относительные импорты — всегда "не найдено", в браузере кроме
+// самого плейграунда ничего нет), либо через std/, вшитую в бинарь
+// (core/wasm_stdlib.odin) — см. resolver_import_wasm.odin/
+// module_loader_wasm.odin.
+WASM_ENTRY_PATH :: "плейграунд.ps"
+
+// Строит Module_Graph из ОДНОГО исходника плейграунда + всех модулей,
+// импортированных им (транзитивно) — только std/, реальной ФС нет.
+// Раньше (single-file core.run_source/check_source) `импорт` в браузере
+// не работал вообще: resolve_existing_import_path/read_file_text под
+// #+build js всегда возвращали "не найдено", а run_source_with_args в
+// принципе не строил граф. Теперь используется тот же
+// load_module_graph_with_overrides + resolve_and_typecheck_all, что и LSP.
+@(private)
+wasm_load_graph :: proc(source: string) -> (graph: core.Module_Graph, results: [dynamic]core.Module_Result) {
+	overrides := make(map[string]string)
+	overrides[WASM_ENTRY_PATH] = source
+	graph = core.load_module_graph_with_overrides(WASM_ENTRY_PATH, overrides)
+	results = core.resolve_and_typecheck_all(&graph)
+	return
+}
+
+// graph.order (и, следовательно, results) — топологический порядок
+// зависимостей: импортируемые модули идут ПЕРЕД импортирующим
+// (module_loader.odin аппендит модуль в graph.order только после того, как
+// обработаны все его импорты) — значит entry обычно НЕ results[0], его надо
+// искать явно по указателю на Module (graph.modules[WASM_ENTRY_PATH]), тот
+// же паттерн, что revalidate_document в lsp_server.odin.
+@(private)
+wasm_find_entry :: proc(graph: ^core.Module_Graph, results: ^[dynamic]core.Module_Result) -> ^core.Module_Result {
+	entry_module := graph.modules[WASM_ENTRY_PATH]
+	if entry_module == nil do return nil
+	for i in 0 ..< len(results) {
+		if results[i].module == entry_module do return &results[i]
+	}
+	return nil
+}
+
 // Запускает panos-скрипт длиной source_len байт из source_buf. Вывод идёт
 // через fmt.print*/fmt.eprint* — на js_wasm32 core:fmt сам пишет в
 // odin_env.write (см. fmt_js.odin в тулчейне Odin), обвязка odin.js рендерит
@@ -113,14 +155,38 @@ panos_run :: proc "c" (source_len: int) {
 	}
 	source := string(source_buf[:source_len])
 
-	result, has_result, diags := core.run_source(source)
-	if len(diags) > 0 {
-		for d in diags {
+	graph, results := wasm_load_graph(source)
+
+	// Тот же accumulate-not-panic гейт, что run_file в main.odin (native
+	// CLI) — diagnostics со всех стадий и всех модулей графа разом, не
+	// только первая упавшая.
+	all_diags := make([dynamic]core.Diagnostic)
+	for d in graph.parse_diagnostics do append(&all_diags, d)
+	for r in results {
+		for d in r.res_ctx.diagnostics do append(&all_diags, d)
+		for d in r.tc_ctx.diagnostics do append(&all_diags, d)
+	}
+	if len(all_diags) > 0 {
+		for d in all_diags {
 			fmt.eprintln(d.message)
 		}
 		return
 	}
-	if has_result {
+
+	global_registry := make(map[string]^core.Compiled_Function)
+	if len(results) > 0 {
+		core.ensure_prelude_compiled(&results[0].res_ctx, &global_registry)
+	}
+	for i in 0 ..< len(results) {
+		r := &results[i]
+		core.compile_program(&r.res_ctx, &r.tc_ctx, &r.module.ast, &global_registry)
+	}
+
+	vm := core.new_vm(global_registry, nil)
+	core.execute(vm)
+
+	if len(vm.stack) > 0 {
+		result := vm.stack[len(vm.stack) - 1]
 		// ^Panos_String через голый %v печатается как Odin-структура (см.
 		// print_vm в vm.odin — тот же unwrap для той же причины) — достаём
 		// .data явно, иначе строка попадёт на страницу как
@@ -133,13 +199,13 @@ panos_run :: proc "c" (source_len: int) {
 	}
 }
 
-// LSP-lite: прямые экспорты вместо полного LSP-протокола — panos-lsp
-// (lsp/lsp_server.odin) весь про многофайловый граф импортов (Module_Graph,
-// overrides для незаписанных буферов), а браузерное демо принципиально
-// single-file, вся эта инфраструктура тут не нужна. Переиспользует
-// core.check_source (core/pipeline.odin) + core.find_expr_in_program
-// (core/position.odin) — те же функции, что и panos-lsp, но без JSON-RPC
-// обвязки и без графа модулей.
+// LSP-lite: прямые экспорты вместо полного LSP-протокола — браузерное
+// демо принципиально single-buffer (одно текстовое поле, без набора
+// открытых файлов), так что полноценный JSON-RPC/LSP_Document (lsp/
+// lsp_server.odin) тут не нужен. Но `импорт` теперь резолвится через тот
+// же graph-based pipeline (wasm_load_graph/wasm_find_entry выше), что и
+// panos_run — иначе hover/diagnostics/completion не видели бы типы из
+// std/, импортированной в плейграунде.
 RESULT_BUF_SIZE :: 65536
 @(private)
 result_buf: [RESULT_BUF_SIZE]byte
@@ -175,13 +241,32 @@ source_from_buf :: proc(source_len: int) -> (string, bool) {
 	return string(source_buf[:source_len]), true
 }
 
+@(private)
+add_diag_if_own_file :: proc(items: ^[dynamic]json.Value, source: string, file_id: u16, d: core.Diagnostic) {
+	// parse_diagnostics — плоский список по ВСЕМ модулям графа (включая
+	// std/, если бы там была ошибка); diagnostics плейграунда (единственный
+	// видимый пользователю буфер) — только с его file_id, иначе from/to
+	// считались бы как UTF-16 offset в ЧУЖОМ source.
+	if d.span.file_id != file_id do return
+	append(
+		items,
+		json.Value(
+			json.Object {
+				"from" = json.Integer(i64(core.byte_offset_to_utf16_offset(source, d.span.start))),
+				"to" = json.Integer(i64(core.byte_offset_to_utf16_offset(source, d.span.end))),
+				"severity" = json.String("error"),
+				"message" = json.String(d.message),
+			},
+		),
+	)
+}
+
 // Диагностики source_buf'а как JSON-массив {from, to, severity, message} —
 // формат напрямую под @codemirror/lint's Diagnostic (from/to — плоский
 // UTF-16 offset от начала документа, не line/character, как у LSP).
-// Арена — см. развёрнутый комментарий у panos_run выше. check_source
-// (в отличие от panos_run) не трогает vm_heap_allocator вообще — не
-// компилирует и не исполняет, только tokenize/parse/resolve/typecheck —
-// значит покрытие аренами здесь ПОЛНОЕ, без остаточного лика.
+// Арена — см. развёрнутый комментарий у panos_run выше. Компиляция/
+// исполнение не трогаются (только tokenize/parse/resolve/typecheck по
+// всему графу) — покрытие аренами полное, без остаточного лика.
 @(export)
 panos_check :: proc "c" (source_len: int) {
 	context = runtime.default_context()
@@ -194,21 +279,18 @@ panos_check :: proc "c" (source_len: int) {
 		return
 	}
 
-	check := core.check_source(source)
-	items := make([dynamic]json.Value)
-	for d in check.diags {
-		append(
-			&items,
-			json.Value(
-				json.Object {
-					"from" = json.Integer(i64(core.byte_offset_to_utf16_offset(source, d.span.start))),
-					"to" = json.Integer(i64(core.byte_offset_to_utf16_offset(source, d.span.end))),
-					"severity" = json.String("error"),
-					"message" = json.String(d.message),
-				},
-			),
-		)
+	graph, results := wasm_load_graph(source)
+	entry := wasm_find_entry(&graph, &results)
+	if entry == nil {
+		write_result_string("[]")
+		return
 	}
+
+	items := make([dynamic]json.Value)
+	for d in graph.parse_diagnostics do add_diag_if_own_file(&items, source, entry.module.file_id, d)
+	for d in entry.res_ctx.diagnostics do add_diag_if_own_file(&items, source, entry.module.file_id, d)
+	for d in entry.tc_ctx.diagnostics do add_diag_if_own_file(&items, source, entry.module.file_id, d)
+
 	data, _ := json.marshal(json.Array(items), {})
 	write_result(data)
 }
@@ -217,7 +299,7 @@ panos_check :: proc "c" (source_len: int) {
 // to} или null. Тот же паттерн, что handle_hover в lsp_server.odin —
 // find_expr_in_program + node_types.
 // Арена — см. комментарий у panos_run/panos_check выше. Полное покрытие,
-// как у panos_check (тоже только check_source, без compile/execute).
+// как у panos_check (тоже без compile/execute).
 @(export)
 panos_hover :: proc "c" (source_len: int, offset: int) {
 	context = runtime.default_context()
@@ -230,14 +312,20 @@ panos_hover :: proc "c" (source_len: int, offset: int) {
 		return
 	}
 
-	check := core.check_source(source)
+	graph, results := wasm_load_graph(source)
+	entry := wasm_find_entry(&graph, &results)
+	if entry == nil {
+		write_result_string("null")
+		return
+	}
+
 	byte_offset := core.utf16_offset_to_byte_offset(source, offset)
-	expr := core.find_expr_in_program(check.prog, 0, byte_offset)
+	expr := core.find_expr_in_program(entry.module.ast, entry.module.file_id, byte_offset)
 	if expr == nil {
 		write_result_string("null")
 		return
 	}
-	typ, has_type := check.tc_ctx.node_types[expr]
+	typ, has_type := entry.tc_ctx.node_types[expr]
 	if !has_type || typ == nil {
 		write_result_string("null")
 		return
@@ -260,7 +348,7 @@ panos_hover :: proc "c" (source_len: int, offset: int) {
 // арифметика, что handle_completion в lsp_server.odin (offset-2, не
 // offset-1 — точка сама вне span'а receiver'а, см. комментарий там).
 // Арена — см. комментарий у panos_run/panos_check выше. Полное покрытие,
-// как у panos_check (тоже только check_source, без compile/execute).
+// как у panos_check (тоже без compile/execute).
 @(export)
 panos_complete :: proc "c" (source_len: int, offset: int) {
 	context = runtime.default_context()
@@ -279,13 +367,19 @@ panos_complete :: proc "c" (source_len: int, offset: int) {
 		return
 	}
 
-	check := core.check_source(source)
-	receiver_expr := core.find_expr_in_program(check.prog, 0, byte_offset - 2)
+	graph, results := wasm_load_graph(source)
+	entry := wasm_find_entry(&graph, &results)
+	if entry == nil {
+		write_result_string("[]")
+		return
+	}
+
+	receiver_expr := core.find_expr_in_program(entry.module.ast, entry.module.file_id, byte_offset - 2)
 	if receiver_expr == nil {
 		write_result_string("[]")
 		return
 	}
-	typ, has_type := check.tc_ctx.node_types[receiver_expr]
+	typ, has_type := entry.tc_ctx.node_types[receiver_expr]
 	if !has_type || typ == nil {
 		write_result_string("[]")
 		return

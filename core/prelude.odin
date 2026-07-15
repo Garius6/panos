@@ -35,6 +35,27 @@ PRELUDE_SOURCE :: `
 	функ равно(другое: Равнозначное) -> Булево
 конец
 
+// Стадия 23: Арифметика — 4 раздельных интерфейса (не один, как
+// Сравниваемое), потому что +/-/*// мат. независимы друг от друга —
+// тип может поддерживать сложение без деления (вектор без деления на
+// вектор). Self-тип (параметр и возврат) — тот же механизм, что у
+// Сравниваемое.сравнить.
+экспорт тип Складываемое = интерфейс
+	функ сложить(другое: Складываемое) -> Складываемое
+конец
+
+экспорт тип Вычитаемое = интерфейс
+	функ вычесть(другое: Вычитаемое) -> Вычитаемое
+конец
+
+экспорт тип Умножаемое = интерфейс
+	функ умножить(другое: Умножаемое) -> Умножаемое
+конец
+
+экспорт тип Делимое = интерфейс
+	функ разделить(другое: Делимое) -> Делимое
+конец
+
 реализация Опция
 	функ есть(это: Опция) -> Булево
 		выбор это
@@ -262,6 +283,10 @@ ensure_prelude :: proc(graph: ^Module_Graph) -> ^Module {
 	graph.prelude_result_sym = module.exports[intern("Результат")]
 	graph.prelude_comparable_sym = module.exports[intern("Сравниваемое")]
 	graph.prelude_equatable_sym = module.exports[intern("Равнозначное")]
+	graph.prelude_addable_sym = module.exports[intern("Складываемое")]
+	graph.prelude_subtractable_sym = module.exports[intern("Вычитаемое")]
+	graph.prelude_multipliable_sym = module.exports[intern("Умножаемое")]
+	graph.prelude_divisible_sym = module.exports[intern("Делимое")]
 
 	// graph.symbol_types уже общий указатель на ту же map, что res_ctx.
 	// symbol_types — типы Опции/Результата видны каждому следующему модулю.
@@ -315,6 +340,10 @@ merge_prelude_exports :: proc(ctx: ^Resolver_Ctx, graph: ^Module_Graph, module: 
 	ctx.prelude_result_sym = prelude.exports[intern("Результат")]
 	ctx.prelude_comparable_sym = prelude.exports[intern("Сравниваемое")]
 	ctx.prelude_equatable_sym = prelude.exports[intern("Равнозначное")]
+	ctx.prelude_addable_sym = prelude.exports[intern("Складываемое")]
+	ctx.prelude_subtractable_sym = prelude.exports[intern("Вычитаемое")]
+	ctx.prelude_multipliable_sym = prelude.exports[intern("Умножаемое")]
+	ctx.prelude_divisible_sym = prelude.exports[intern("Делимое")]
 	// Копия graph.prelude_generic_order в САМ Resolver_Ctx — module_graph
 	// не переживает resolve_program (resolved.module_graph = nil), а
 	// decl_type_param_order должен пережить весь typecheck_program.

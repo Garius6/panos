@@ -1262,7 +1262,12 @@ interface_method_types_match :: proc(
 	if expected == nil || actual == nil do return false
 	if expected.kind != .Function || actual.kind != .Function do return false
 	if len(expected.params) != len(actual.params) do return false
-	if !types_are_equal(actual.return_type, expected.return_type) do return false
+
+	if expected.return_type == iface_type {
+		if actual.return_type != target_type do return false
+	} else if !types_are_equal(actual.return_type, expected.return_type) {
+		return false
+	}
 
 	for i in 1 ..< len(expected.params) {
 		if expected.params[i] == iface_type {
@@ -2577,6 +2582,63 @@ implements_prelude_interface :: proc(ctx: ^Type_Ctx, t: ^Type, iface_sym: Symbol
 	return false
 }
 
+// Стадия 23: left_t уже подтверждён implements_prelude_interface(iface_sym)
+// — общий хвост для +/-/*// sugar: проверить, что right_t == left_t (та же
+// схема, что Стадия 22's Сравниваемое — оба операнда одного Self-типа),
+// записать Call_Info для compiler.odin, вернуть Self (НЕ Число — в отличие
+// от сравнить, арифметические методы возвращают Self, напр. Вектор+Вектор).
+infer_arithmetic_sugar :: proc(
+	ctx: ^Type_Ctx,
+	expr: Expr,
+	span: Span,
+	left_t: ^Type,
+	right_t: ^Type,
+	method_name: string,
+	iface_name: string,
+) -> ^Type {
+	if left_t != right_t {
+		return report(
+			ctx,
+			span,
+			"Type Error: тип '%s' реализует %s, но не с типом '%s'",
+			left_t.name,
+			iface_name,
+			right_t.name,
+		)
+	}
+	method_sym, _ := method_lookup(ctx, left_t, method_name)
+	ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
+	return left_t
+}
+
+// Общее тело для Minus/Star/Slash — идентичны с точностью до
+// интерфейса/имени метода (в отличие от Plus, не имеют спец-кейса
+// Строка+Строка, так что тело короче и целиком переиспользуемо).
+infer_arithmetic_op :: proc(
+	ctx: ^Type_Ctx,
+	expr: Expr,
+	e: ^Binary_Expr,
+	iface_sym: Symbol_Id,
+	method_name: string,
+	iface_name: string,
+) -> ^Type {
+	left_t := prune_type(infer_expr(ctx, e.left))
+	right_t := prune_type(infer_expr(ctx, e.right))
+
+	if left_t == TY_NUM && right_t == TY_NUM {
+		return TY_NUM
+	}
+	if left_t.kind == .Poison || right_t.kind == .Poison {
+		return TY_POISON
+	}
+	if left_t.kind == .Struct && implements_prelude_interface(ctx, left_t, iface_sym) {
+		return infer_arithmetic_sugar(ctx, expr, e.span, left_t, right_t, method_name, iface_name)
+	}
+	check_expr(ctx, e.left, TY_NUM)
+	check_expr(ctx, e.right, TY_NUM)
+	return TY_NUM
+}
+
 infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type {
 	t: ^Type
 	#partial switch e.op {
@@ -2605,6 +2667,8 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 			// без явного шорт-каута отчитались бы производной ошибкой поверх
 			// уже отчитанной первопричины.
 			t = TY_POISON
+		} else if left_t.kind == .Struct && implements_prelude_interface(ctx, left_t, ctx.res.prelude_addable_sym) {
+			t = infer_arithmetic_sugar(ctx, expr, e.span, left_t, right_t, "сложить", "Складываемое")
 		} else {
 			t = report(
 				ctx,
@@ -2614,10 +2678,12 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 				right_t.name,
 			)
 		}
-	case .Minus, .Star, .Slash:
-		check_expr(ctx, e.left, TY_NUM)
-		check_expr(ctx, e.right, TY_NUM)
-		t = TY_NUM
+	case .Minus:
+		t = infer_arithmetic_op(ctx, expr, e, ctx.res.prelude_subtractable_sym, "вычесть", "Вычитаемое")
+	case .Star:
+		t = infer_arithmetic_op(ctx, expr, e, ctx.res.prelude_multipliable_sym, "умножить", "Умножаемое")
+	case .Slash:
+		t = infer_arithmetic_op(ctx, expr, e, ctx.res.prelude_divisible_sym, "разделить", "Делимое")
 
 	case .Less, .Greater, .LessEqual, .GreaterEqual:
 		left_t := prune_type(infer_expr(ctx, e.left))

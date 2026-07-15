@@ -523,15 +523,17 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_opcode(ctx, .Set_Index)
 			}
 		} else if info, has_sugar := ctx.tc.call_infos[expr]; has_sugar && info.kind == .Method_Struct {
-			// Стадия 22: Сравниваемое/Равнозначное sugar — реюз того же
-			// .Method_Struct-кодогена, что Call_Expr (см. case .Method_Struct
-			// выше в этом файле): push fn-константа, компиляция receiver'а
-			// (e.left) и единственного арга (e.right), .Call 2. Порядок push
-			// другой, чем у native-пути ниже (fn ПЕРЕД операндами, не сами
-			// операнды) — этот путь сам решает, что на стеке и в каком
-			// порядке, поэтому предкомпиляция e.left/e.right выше не подходит.
-			// maybe_emit_interface_cast не нужен — результат всегда примитив
-			// (Число из сравнить/Булево из равно), никогда не апкастится.
+			// Стадия 22/23: Сравниваемое/Равнозначное/Арифметика sugar —
+			// реюз того же .Method_Struct-кодогена, что Call_Expr (см. case
+			// .Method_Struct выше в этом файле): push fn-константа, компиляция
+			// receiver'а (e.left) и единственного арга (e.right), .Call 2.
+			// Порядок push другой, чем у native-пути ниже (fn ПЕРЕД
+			// операндами, не сами операнды) — этот путь сам решает, что на
+			// стеке и в каком порядке, поэтому предкомпиляция e.left/e.right
+			// выше не подходит. maybe_emit_interface_cast не нужен —
+			// результат либо примитив (Число из сравнить/Булево из равно),
+			// либо Self-структура (из сложить/вычесть/...) — ни один не
+			// апкастится в интерфейс.
 			fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, info.symbol_ref)]
 			if !found {
 				fmt.panicf("Compiler Error: метод не найден")
@@ -561,6 +563,9 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_opcode(ctx, .Negate)
 			case .Equal:
 			// равно() уже возвращает Булево — результат вызова и есть ответ.
+			case .Plus, .Minus, .Star, .Slash:
+			// Стадия 23: сложить/вычесть/умножить/разделить уже возвращают
+			// Self — результат вызова и есть ответ, без пост-обработки.
 			}
 		} else {
 			// .And/.Or ниже сами компилируют e.left/e.right (с прыжками для

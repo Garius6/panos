@@ -139,6 +139,11 @@ Module_Graph :: struct {
 	// именем сравнить" — типизация номинальная, не структурная.
 	prelude_comparable_sym: Symbol_Id,
 	prelude_equatable_sym:  Symbol_Id,
+	// Symbol_Id 4 интерфейсов Арифметики (Стадия 23) — тот же мотив.
+	prelude_addable_sym:    Symbol_Id,
+	prelude_subtractable_sym: Symbol_Id,
+	prelude_multipliable_sym: Symbol_Id,
+	prelude_divisible_sym:    Symbol_Id,
 	// Хип-аллоцированные resolve/typecheck-контексты прелюдии — нужны
 	// ensure_prelude_compiled (compiler.odin-этап, см. там) ПОСЛЕ того,
 	// как ensure_prelude уже вернулась (её собственные локальные res_ctx/
@@ -342,6 +347,11 @@ Resolver_Ctx :: struct {
 	// поля на Module_Graph, тот же мотив.
 	prelude_comparable_sym: Symbol_Id,
 	prelude_equatable_sym:  Symbol_Id,
+	// Symbol_Id 4 интерфейсов Арифметики (Стадия 23) — тот же мотив.
+	prelude_addable_sym:    Symbol_Id,
+	prelude_subtractable_sym: Symbol_Id,
+	prelude_multipliable_sym: Symbol_Id,
+	prelude_divisible_sym:    Symbol_Id,
 	// Копия graph.prelude_generic_order (см. там) — Resolver_Ctx (в
 	// отличие от module_graph, который resolve_program обнуляет после
 	// однократного резолва, см. resolve_program) переживает весь

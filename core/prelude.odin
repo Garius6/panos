@@ -21,6 +21,20 @@ PRELUDE_SOURCE :: `
 	Неудача(E)
 конец
 
+// Стадия 22: сравнить возвращает Число по конвенции
+// отрицательное/0/положительное — переиспользует существующие числовые
+// опкоды для </>/<=/>= вместо нового рантайм-представления сравнения.
+экспорт тип Сравниваемое = интерфейс
+	функ сравнить(другое: Сравниваемое) -> Число
+конец
+
+// Опционален (opt-in override) — структурное == уже работает на любых
+// типах (value_equals, vm.odin), Равнозначное переопределяет его для
+// типов, которым дефолт не подходит.
+экспорт тип Равнозначное = интерфейс
+	функ равно(другое: Равнозначное) -> Булево
+конец
+
 реализация Опция
 	функ есть(это: Опция) -> Булево
 		выбор это
@@ -246,6 +260,8 @@ ensure_prelude :: proc(graph: ^Module_Graph) -> ^Module {
 	}
 	graph.prelude_option_sym = module.exports[intern("Опция")]
 	graph.prelude_result_sym = module.exports[intern("Результат")]
+	graph.prelude_comparable_sym = module.exports[intern("Сравниваемое")]
+	graph.prelude_equatable_sym = module.exports[intern("Равнозначное")]
 
 	// graph.symbol_types уже общий указатель на ту же map, что res_ctx.
 	// symbol_types — типы Опции/Результата видны каждому следующему модулю.
@@ -297,6 +313,8 @@ merge_prelude_exports :: proc(ctx: ^Resolver_Ctx, graph: ^Module_Graph, module: 
 	}
 	ctx.prelude_option_sym = prelude.exports[intern("Опция")]
 	ctx.prelude_result_sym = prelude.exports[intern("Результат")]
+	ctx.prelude_comparable_sym = prelude.exports[intern("Сравниваемое")]
+	ctx.prelude_equatable_sym = prelude.exports[intern("Равнозначное")]
 	// Копия graph.prelude_generic_order в САМ Resolver_Ctx — module_graph
 	// не переживает resolve_program (resolved.module_graph = nil), а
 	// decl_type_param_order должен пережить весь typecheck_program.

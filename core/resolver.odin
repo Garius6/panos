@@ -119,6 +119,13 @@ Module_Graph :: struct {
 	// Resolver_Ctx.prelude_option_sym, только graph под рукой).
 	prelude_option_sym:    Symbol_Id,
 	prelude_result_sym:    Symbol_Id,
+	// Symbol_Id Сравниваемое/Равнозначное (Стадия 22) — тот же мотив, что у
+	// prelude_option_sym: typechecker'у нужно по ^Type конкретной структуры
+	// проверить "реализует ли она ИМЕННО Сравниваемое" (указательное
+	// сравнение с implemented_interfaces), не просто "есть ли метод с
+	// именем сравнить" — типизация номинальная, не структурная.
+	prelude_comparable_sym: Symbol_Id,
+	prelude_equatable_sym:  Symbol_Id,
 	// Хип-аллоцированные resolve/typecheck-контексты прелюдии — нужны
 	// ensure_prelude_compiled (compiler.odin-этап, см. там) ПОСЛЕ того,
 	// как ensure_prelude уже вернулась (её собственные локальные res_ctx/
@@ -318,6 +325,10 @@ Resolver_Ctx :: struct {
 	// Выставляются в resolve_module после слияния экспортов прелюдии.
 	prelude_option_sym: Symbol_Id,
 	prelude_result_sym: Symbol_Id,
+	// Symbol_Id Сравниваемое/Равнозначное (Стадия 22) — см. одноимённые
+	// поля на Module_Graph, тот же мотив.
+	prelude_comparable_sym: Symbol_Id,
+	prelude_equatable_sym:  Symbol_Id,
 	// Копия graph.prelude_generic_order (см. там) — Resolver_Ctx (в
 	// отличие от module_graph, который resolve_program обнуляет после
 	// однократного резолва, см. resolve_program) переживает весь

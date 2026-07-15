@@ -1234,14 +1234,30 @@ check_lambda_expr :: proc(
 	return function_type
 }
 
-interface_method_types_match :: proc(expected: ^Type, actual: ^Type) -> bool {
+// iface_type/target_type включают Self-подстановку: параметр, объявленный
+// в самом интерфейсе КАК ТИП ЭТОГО ЖЕ ИНТЕРФЕЙСА (указательно == iface_type
+// — interface_method_type_from_signature резолвит такую аннотацию в тот же
+// iface_type, что и неявный receiver в params[0]), обязан у impl'а быть
+// конкретным target_type, а не оставаться интерфейсным — иначе тело метода
+// не получает доступа к полям конкретного типа (нужно для контрактов вида
+// "сравни меня с другим Self", напр. Сравниваемое.сравнить(другое: Self)).
+interface_method_types_match :: proc(
+	expected: ^Type,
+	actual: ^Type,
+	iface_type: ^Type,
+	target_type: ^Type,
+) -> bool {
 	if expected == nil || actual == nil do return false
 	if expected.kind != .Function || actual.kind != .Function do return false
 	if len(expected.params) != len(actual.params) do return false
 	if !types_are_equal(actual.return_type, expected.return_type) do return false
 
 	for i in 1 ..< len(expected.params) {
-		if !types_are_equal(actual.params[i], expected.params[i]) do return false
+		if expected.params[i] == iface_type {
+			if actual.params[i] != target_type do return false
+		} else if !types_are_equal(actual.params[i], expected.params[i]) {
+			return false
+		}
 	}
 	return true
 }
@@ -1620,7 +1636,7 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 
 					expected_method_type := iface_type.interface_methods[req_name]
 					actual_method_type := ctx.res.symbol_types[method_sym]
-					if !interface_method_types_match(expected_method_type, actual_method_type) {
+					if !interface_method_types_match(expected_method_type, actual_method_type, iface_type, target_type) {
 						report(
 							ctx,
 							d.span,
@@ -2534,6 +2550,21 @@ infer_ident_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Ident_Expr) -> ^Type {
 	return prune_type(var_type)
 }
 
+// Стадия 22: номинальная проверка "реализует ли t именно этот prelude-
+// интерфейс" (указательное сравнение с implemented_interfaces) — НЕ просто
+// "есть ли метод с подходящим именем". Типизация интерфейсов в panos
+// номинальная, не структурная (см. docs/src/language/interfaces.md);
+// случайно одноимённый несвязанный метод не должен включать sugar.
+implements_prelude_interface :: proc(ctx: ^Type_Ctx, t: ^Type, iface_sym: Symbol_Id) -> bool {
+	if t == nil || iface_sym == INVALID_SYMBOL do return false
+	iface_type, ok := ctx.res.symbol_types[iface_sym]
+	if !ok || iface_type == nil do return false
+	for impl in t.implemented_interfaces {
+		if impl == iface_type do return true
+	}
+	return false
+}
+
 infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type {
 	t: ^Type
 	#partial switch e.op {
@@ -2577,9 +2608,35 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 		t = TY_NUM
 
 	case .Less, .Greater, .LessEqual, .GreaterEqual:
-		check_expr(ctx, e.left, TY_NUM)
-		check_expr(ctx, e.right, TY_NUM)
-		t = TY_BOOL
+		left_t := prune_type(infer_expr(ctx, e.left))
+		right_t := prune_type(infer_expr(ctx, e.right))
+
+		if left_t == TY_NUM && right_t == TY_NUM {
+			t = TY_BOOL
+		} else if left_t.kind == .Poison || right_t.kind == .Poison {
+			t = TY_POISON
+		} else if left_t.kind == .Struct && implements_prelude_interface(ctx, left_t, ctx.res.prelude_comparable_sym) {
+			if left_t == right_t {
+				method_sym, _ := method_lookup(ctx, left_t, "сравнить")
+				ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
+				t = TY_BOOL
+			} else {
+				// Grilled: left_t реализует Сравниваемое, но не с ЭТИМ
+				// операндом (другой тип или Число) — точное сообщение вместо
+				// вводящего в заблуждение "ожидал Число" ниже.
+				t = report(
+					ctx,
+					e.span,
+					"Type Error: тип '%s' реализует Сравниваемое, но не с типом '%s'",
+					left_t.name,
+					right_t.name,
+				)
+			}
+		} else {
+			check_expr(ctx, e.left, TY_NUM)
+			check_expr(ctx, e.right, TY_NUM)
+			t = TY_BOOL
+		}
 
 	case .And, .Or:
 		check_expr(ctx, e.left, TY_BOOL)
@@ -2587,18 +2644,28 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 		t = TY_BOOL
 
 	case .Equal, .NotEqual:
-		left_t := infer_expr(ctx, e.left)
-		right_t := infer_expr(ctx, e.right)
-		if !unify_types(left_t, right_t) {
-			report(
-				ctx,
-				e.span,
-				"Type Error: оператор '==' ожидает совместимые типы, получено '%s' и '%s'",
-				prune_type(left_t).name,
-				prune_type(right_t).name,
-			)
+		left_t := prune_type(infer_expr(ctx, e.left))
+		right_t := prune_type(infer_expr(ctx, e.right))
+
+		if left_t == right_t && left_t.kind == .Struct && implements_prelude_interface(ctx, left_t, ctx.res.prelude_equatable_sym) {
+			method_sym, _ := method_lookup(ctx, left_t, "равно")
+			ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
+			t = TY_BOOL
+		} else {
+			// Равнозначное — opt-in override (см. Стадия 22): без impl'а
+			// падаем в прежний структурный путь (unify_types + value_equals
+			// в рантайме), без diagnostic — это не обязаловка, как у Ord.
+			if !unify_types(left_t, right_t) {
+				report(
+					ctx,
+					e.span,
+					"Type Error: оператор '==' ожидает совместимые типы, получено '%s' и '%s'",
+					prune_type(left_t).name,
+					prune_type(right_t).name,
+				)
+			}
+			t = TY_BOOL
 		}
-		t = TY_BOOL
 
 	case .Assign:
 		left_t := infer_expr(ctx, e.left)

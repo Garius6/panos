@@ -522,6 +522,46 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				compile_expr(ctx, e.right)
 				emit_opcode(ctx, .Set_Index)
 			}
+		} else if info, has_sugar := ctx.tc.call_infos[expr]; has_sugar && info.kind == .Method_Struct {
+			// Стадия 22: Сравниваемое/Равнозначное sugar — реюз того же
+			// .Method_Struct-кодогена, что Call_Expr (см. case .Method_Struct
+			// выше в этом файле): push fn-константа, компиляция receiver'а
+			// (e.left) и единственного арга (e.right), .Call 2. Порядок push
+			// другой, чем у native-пути ниже (fn ПЕРЕД операндами, не сами
+			// операнды) — этот путь сам решает, что на стеке и в каком
+			// порядке, поэтому предкомпиляция e.left/e.right выше не подходит.
+			// maybe_emit_interface_cast не нужен — результат всегда примитив
+			// (Число из сравнить/Булево из равно), никогда не апкастится.
+			fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, info.symbol_ref)]
+			if !found {
+				fmt.panicf("Compiler Error: метод не найден")
+			}
+			emit_constant(ctx, Value(fn_ptr))
+			compile_expr(ctx, e.left)
+			compile_expr(ctx, e.right)
+			emit_opcode(ctx, .Call)
+			emit_byte(ctx, 2)
+
+			#partial switch e.op {
+			case .Less:
+				emit_constant(ctx, Value(0.0))
+				emit_opcode(ctx, .Less)
+			case .Greater:
+				emit_constant(ctx, Value(0.0))
+				emit_opcode(ctx, .Greater)
+			case .LessEqual:
+				emit_constant(ctx, Value(0.0))
+				emit_opcode(ctx, .Greater)
+				emit_opcode(ctx, .Negate)
+			case .GreaterEqual:
+				emit_constant(ctx, Value(0.0))
+				emit_opcode(ctx, .Less)
+				emit_opcode(ctx, .Negate)
+			case .NotEqual:
+				emit_opcode(ctx, .Negate)
+			case .Equal:
+			// равно() уже возвращает Булево — результат вызова и есть ответ.
+			}
 		} else {
 			// .And/.Or ниже сами компилируют e.left/e.right (с прыжками для
 			// short-circuit). Предкомпиляция здесь удвоила бы каждый операнд, а

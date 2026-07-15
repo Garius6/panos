@@ -182,6 +182,7 @@ Call_Kind :: enum {
 	Method_Collection,
 	Constructor_Struct,
 	Constructor_Variant,
+	Print_Value,
 }
 
 // Единая точка истины про то, как Call_Expr (или bare Ident/Property для
@@ -193,8 +194,8 @@ Call_Kind :: enum {
 // значит запись просто не создаётся) остаётся default-веткой.
 Call_Info :: struct {
 	kind:       Call_Kind,
-	symbol_ref: Symbol_Id,         // Method_Struct
-	text_name:  string,            // Builtin, Method_Interface, Method_Collection
+	symbol_ref: Symbol_Id,         // Method_Struct, Print_Value (вСтроку, если implements Печатаемое)
+	text_name:  string,            // Builtin, Method_Interface, Method_Collection, Print_Value (реальный builtin: печать/строка)
 	variant:    Variant_Call_Info, // Constructor_Variant
 }
 
@@ -2844,6 +2845,37 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 					)
 				}
 				export_sym := symbol_at(ctx.res.symbol_store, export_sym_id)
+
+				// Стадия 23 (Печатаемое): ввод_вывод::печать/строка обходят
+				// обычную unификацию параметров ниже (жёстко TY_STRING через
+				// builtin_export_type) — принимают ЛЮБОЙ Value. Аргумент
+				// типизируется без коэрсии; если это struct с реализация
+				// Печатаемое — компилятор вызовет .вСтроку() ПЕРЕД реальным
+				// builtin'ом (Print_Value), иначе runtime сам форматирует
+				// (Число/Строка/Булево нативно, остальное — structural dump,
+				// см. value_to_display_string в vm.odin — тот же принцип, что
+				// Равнозначное: интерфейс — opt-in override дефолтного пути).
+				if export_sym.kind == .Builtin &&
+				   (resolve_interned(export_sym.full_name) == "ввод_вывод::печать" ||
+						   resolve_interned(export_sym.full_name) == "ввод_вывод::строка") {
+					if len(e.args) != 1 {
+						return report(ctx, e.span, "Type Error: неверное количество аргументов")
+					}
+					full_name := resolve_interned(export_sym.full_name)
+					arg_type := prune_type(infer_expr(ctx, e.args[0]))
+					if arg_type.kind == .Struct &&
+					   implements_prelude_interface(ctx, arg_type, ctx.res.prelude_printable_sym) {
+						method_sym, _ := method_lookup(ctx, arg_type, "вСтроку")
+						ctx.call_infos[expr] = Call_Info {
+							kind       = .Print_Value,
+							symbol_ref = method_sym,
+							text_name  = full_name,
+						}
+					} else {
+						ctx.call_infos[expr] = Call_Info{kind = .Builtin, text_name = full_name}
+					}
+					return TY_VOID
+				}
 
 				export_type, found_type := ctx.res.symbol_types[export_sym_id]
 				if !found_type || export_type == nil {

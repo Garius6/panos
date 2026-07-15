@@ -56,6 +56,15 @@ PRELUDE_SOURCE :: `
 	функ разделить(другое: Делимое) -> Делимое
 конец
 
+// Стадия 23: Печатаемое — opt-in override форматирования (тот же принцип,
+// что Равнозначное: дефолт есть без неё — structural-дамп полей, живёт в
+// vm.odin's value_to_display_string, зеркалит value_equals). Только Self-
+// ПАРАМЕТР (неявный receiver) — возврат Строка, не Self, так что фикс
+// Стадии 23 под Self-возврат тут не участвует.
+экспорт тип Печатаемое = интерфейс
+	функ вСтроку() -> Строка
+конец
+
 реализация Опция
 	функ есть(это: Опция) -> Булево
 		выбор это
@@ -287,6 +296,7 @@ ensure_prelude :: proc(graph: ^Module_Graph) -> ^Module {
 	graph.prelude_subtractable_sym = module.exports[intern("Вычитаемое")]
 	graph.prelude_multipliable_sym = module.exports[intern("Умножаемое")]
 	graph.prelude_divisible_sym = module.exports[intern("Делимое")]
+	graph.prelude_printable_sym = module.exports[intern("Печатаемое")]
 
 	// graph.symbol_types уже общий указатель на ту же map, что res_ctx.
 	// symbol_types — типы Опции/Результата видны каждому следующему модулю.
@@ -344,6 +354,7 @@ merge_prelude_exports :: proc(ctx: ^Resolver_Ctx, graph: ^Module_Graph, module: 
 	ctx.prelude_subtractable_sym = prelude.exports[intern("Вычитаемое")]
 	ctx.prelude_multipliable_sym = prelude.exports[intern("Умножаемое")]
 	ctx.prelude_divisible_sym = prelude.exports[intern("Делимое")]
+	ctx.prelude_printable_sym = prelude.exports[intern("Печатаемое")]
 	// Копия graph.prelude_generic_order в САМ Resolver_Ctx — module_graph
 	// не переживает resolve_program (resolved.module_graph = nil), а
 	// decl_type_param_order должен пережить весь typecheck_program.

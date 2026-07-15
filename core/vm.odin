@@ -181,6 +181,102 @@ value_equals :: proc(a: Value, b: Value, visited: ^map[[2]rawptr]bool = nil) -> 
 	return false
 }
 
+// Стадия 23 (Печатаемое): дефолтный (structural) путь форматирования —
+// зеркалит value_equals по набору покрываемых Value-вариантов, но
+// печатает вместо сравнивает. Вызывается ТОЛЬКО когда компилятор НЕ
+// вставил Print_Value-путь (реализация Печатаемое для struct'а) — см.
+// infer_call_expr (type_cheker.odin) и compiler.odin's .Print_Value.
+// Aggregate_Value (struct) не хранит имя типа в рантайме (нет RTTI,
+// см. компиляторную заметку у самой структуры) — дамп позиционный,
+// "(поле1, поле2)", без имени типа/полей. Variant_Value хранит type_name,
+// но НЕ имя конкретного варианта (только tag_index) — тоже позиционный
+// дамп после имени типа.
+value_to_display_string :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]bool = nil) -> string {
+	v := visited
+	local_v: map[rawptr]bool
+	if v == nil {
+		local_v = make(map[rawptr]bool, context.temp_allocator)
+		v = &local_v
+	}
+
+	#partial switch val in value {
+	case f64:
+		return fmt.tprintf("%v", val)
+	case bool:
+		return val ? "истина" : "ложь"
+	case ^Panos_String:
+		return val.data
+	case ^Error_Value:
+		return fmt.tprintf("Ошибка(%s, %s)", val.code.data, val.message.data)
+	case ^Option_Value:
+		if val.has_value do return fmt.tprintf("Есть(%s)", value_to_display_string(vm, val.value, v))
+		return "Нет"
+	case ^Result_Value:
+		if val.is_ok do return fmt.tprintf("Успех(%s)", value_to_display_string(vm, val.value, v))
+		return fmt.tprintf("Неудача(%s)", value_to_display_string(vm, val.error, v))
+	case ^Interface_Value:
+		return value_to_display_string(vm, Value(val.data), v)
+	case ^Compiled_Function:
+		return fmt.tprintf("<функция %s>", val.name)
+	case ^File_Value:
+		return "<файл>"
+	case ^Socket_Value:
+		return "<сокет>"
+	case ^Variant_Value:
+		if v[val] do return fmt.tprintf("%s(...)", val.type_name)
+		v[val] = true
+		if len(val.fields) == 0 do return val.type_name
+		builder: strings.Builder
+		strings.builder_init(&builder, context.temp_allocator)
+		fmt.sbprintf(&builder, "%s(", val.type_name)
+		for field, i in val.fields {
+			if i > 0 do strings.write_string(&builder, ", ")
+			strings.write_string(&builder, value_to_display_string(vm, field, v))
+		}
+		strings.write_string(&builder, ")")
+		return strings.to_string(builder)
+	case ^Aggregate_Value:
+		if v[val] do return "(...)"
+		v[val] = true
+		builder: strings.Builder
+		strings.builder_init(&builder, context.temp_allocator)
+		strings.write_string(&builder, "(")
+		for el, i in val.elements {
+			if i > 0 do strings.write_string(&builder, ", ")
+			strings.write_string(&builder, value_to_display_string(vm, el, v))
+		}
+		strings.write_string(&builder, ")")
+		return strings.to_string(builder)
+	case ^Array_Value:
+		if v[val] do return "[...]"
+		v[val] = true
+		builder: strings.Builder
+		strings.builder_init(&builder, context.temp_allocator)
+		strings.write_string(&builder, "[")
+		for el, i in val.elements {
+			if i > 0 do strings.write_string(&builder, ", ")
+			strings.write_string(&builder, value_to_display_string(vm, el, v))
+		}
+		strings.write_string(&builder, "]")
+		return strings.to_string(builder)
+	case ^Map_Value:
+		if v[val] do return "{...}"
+		v[val] = true
+		builder: strings.Builder
+		strings.builder_init(&builder, context.temp_allocator)
+		strings.write_string(&builder, "{")
+		for entry, i in val.entries {
+			if i > 0 do strings.write_string(&builder, ", ")
+			strings.write_string(&builder, value_to_display_string(vm, entry.key, v))
+			strings.write_string(&builder, ": ")
+			strings.write_string(&builder, value_to_display_string(vm, entry.value, v))
+		}
+		strings.write_string(&builder, "}")
+		return strings.to_string(builder)
+	}
+	return "?"
+}
+
 number_to_index :: proc(value: Value) -> int {
 	number, ok := value.(f64)
 	if !ok {
@@ -618,15 +714,17 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		return Value(arr), true
 
 	case "ввод_вывод::печать":
+		// Стадия 23 (Печатаемое): аргумент — ЛЮБОЙ Value, не только Строка.
+		// Если он реализует Печатаемое, компилятор уже подменил его на
+		// результат .вСтроку() (см. .Print_Value в compiler.odin) — сюда
+		// приходит готовая Panos_String. Иначе — structural dump.
 		expect_arg_count(name, len(args), 1)
-		text := expect_string_arg(name, args[0])
-		fmt.print(text)
+		fmt.print(value_to_display_string(vm, args[0]))
 		return Value(f64(0)), false
 
 	case "ввод_вывод::строка":
 		expect_arg_count(name, len(args), 1)
-		text := expect_string_arg(name, args[0])
-		fmt.println(text)
+		fmt.println(value_to_display_string(vm, args[0]))
 		return Value(f64(0)), false
 
 	case "сеть::кодировать_url":

@@ -1,6 +1,7 @@
 #+build !js
 package core
 
+import "core:os"
 import "core:testing"
 
 // Парсер, резолвер и тайпчекер больше не panic'уют на первой ошибке — все
@@ -33,6 +34,28 @@ run_code_with_args :: proc(source: string, program_args: []string = nil) -> (Val
 
 run_code :: proc(source: string) -> (Value, bool) {
 	return run_code_with_args(source)
+}
+
+// Стадия 23 (Печатаемое): ввод_вывод::печать/строка пишут через
+// fmt.print/fmt.println в os.stdout (fmt перечитывает os.stdout при
+// КАЖДОМ вызове, не кэширует writer) — подменяем глобал на временный
+// файл на время run_code, чтобы e2e-тесты могли проверить РЕАЛЬНЫЙ
+// печатаемый текст (structural-дамп/вызов вСтроку()), а не только
+// "выполнилось без паники".
+run_code_capture_stdout :: proc(source: string) -> (Value, bool, string) {
+	tmp_path := "/tmp/panos_e2e_stdout_capture.txt"
+	file, create_err := os.create(tmp_path)
+	if create_err != nil {
+		panic("не удалось создать временный файл для захвата stdout")
+	}
+	old_stdout := os.stdout
+	os.stdout = file
+	result, ok := run_code(source)
+	os.stdout = old_stdout
+	os.close(file)
+	data, _ := os.read_entire_file(tmp_path, context.temp_allocator)
+	os.remove(tmp_path)
+	return result, ok, string(data)
 }
 
 run_module_file :: proc(filename: string) -> (Value, bool) {
@@ -3169,4 +3192,79 @@ test_subtractable_wrong_method_not_confused_with_addable :: proc(t: ^testing.T) 
 		конец
 	`)
 	expect_diagnostic(t, diags, "Type Error: ожидался 'Число', получен 'БезВычитаемого'")
+}
+
+// Стадия 23 (Печатаемое): struct с реализация Печатаемое — печать() зовёт
+// .вСтроку() (Print_Value codegen: push fn, компиляция receiver'а, .Call 1,
+// РЕЗУЛЬТАТ передаётся в реальный builtin через Call_Builtin), а не
+// structural dump.
+@(test)
+test_printable_interface_used_by_print :: proc(t: ^testing.T) {
+	_, ok, output := run_code_capture_stdout(`
+		импорт ввод_вывод
+		импорт строки
+
+		тип Точка = структура
+			x: Число
+			y: Число
+		конец
+
+		реализация Печатаемое для Точка
+			функ вСтроку(это: Точка) -> Строка
+				"Точка(" + строки.из_числа(это.x) + ", " + строки.из_числа(это.y) + ")"
+			конец
+		конец
+
+		функ старт() -> Число
+			ввод_вывод.печать(Точка(3, 4))
+			0
+		конец
+	`)
+	testing.expectf(t, ok, "[Печатаемое: печать] стек пуст")
+	testing.expectf(t, output == "Точка(3, 4)", "[Печатаемое: печать] ожидалось 'Точка(3, 4)', получено %q", output)
+}
+
+// Негативный/дефолтный кейс: struct БЕЗ реализация Печатаемое — печать()
+// падает в structural dump (value_to_display_string, vm.odin) — позиционный
+// дамп полей БЕЗ имени типа (рантайм не хранит RTTI для Aggregate_Value).
+@(test)
+test_non_printable_struct_falls_back_to_structural_dump :: proc(t: ^testing.T) {
+	_, ok, output := run_code_capture_stdout(`
+		импорт ввод_вывод
+
+		тип Точка = структура
+			x: Число
+			y: Число
+		конец
+
+		функ старт() -> Число
+			ввод_вывод.печать(Точка(3, 4))
+			0
+		конец
+	`)
+	testing.expectf(t, ok, "[Печатаемое: fallback] стек пуст")
+	testing.expectf(t, output == "(3, 4)", "[Печатаемое: fallback] ожидалось '(3, 4)', получено %q", output)
+}
+
+// value_to_display_string покрывает Число/Булево/Массив/Соответствие/
+// Опция/Результат — smoke-тест на каждый, чтобы формат не сломался молча.
+@(test)
+test_value_to_display_string_covers_primitives_and_collections :: proc(t: ^testing.T) {
+	_, ok, output := run_code_capture_stdout(`
+		импорт ввод_вывод
+
+		функ старт() -> Число
+			ввод_вывод.печать(истина)
+			ввод_вывод.печать(42)
+			ввод_вывод.печать(массив(1, 2, 3))
+			0
+		конец
+	`)
+	testing.expectf(t, ok, "[value_to_display_string] стек пуст")
+	testing.expectf(
+		t,
+		output == "истина42[1, 2, 3]",
+		"[value_to_display_string] ожидалось 'истина42[1, 2, 3]', получено %q",
+		output,
+	)
 }

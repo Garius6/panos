@@ -763,6 +763,25 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_byte(ctx, u8(len(e.args)))
 				maybe_emit_interface_cast(ctx, expr)
 				return
+
+			case .Print_Value:
+				// Стадия 23 (Печатаемое): e.args[0] реализует Печатаемое —
+				// вызвать .вСтроку() (push fn, receiver = e.args[0], .Call 1),
+				// РЕЗУЛЬТАТ (Строка) передать в реальный builtin (печать/
+				// строка) через Call_Builtin. Без пост-обработки между —
+				// вСтроку() уже даёт готовую Строку.
+				if fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, info.symbol_ref)]; found {
+					emit_constant(ctx, Value(fn_ptr))
+				} else {
+					fmt.panicf("Compiler Error: метод вСтроку не найден")
+				}
+				compile_expr(ctx, e.args[0])
+				emit_opcode(ctx, .Call)
+				emit_byte(ctx, 1)
+				emit_opcode(ctx, .Call_Builtin)
+				emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
+				emit_byte(ctx, 1)
+				return
 			}
 		}
 		if ident, ok := e.callee.(^Ident_Expr); ok {

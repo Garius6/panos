@@ -1359,6 +1359,22 @@ Refs: [ROADMAP §Стадия 27](ROADMAP.md#стадия-27-grilled-один-р
 
 `odin test ./core` — 100/100. native/lsp/wasm сборки чисты.
 
+**Расширение (тот же раунд) — параметры функций/лямбд immutable по
+умолчанию**:
+- [x] Развёл 2 оси: запрет переприсвоения (реализовано) vs copy-on-call
+      (пересекается с Копируемое, вне скоупа)
+- [x] Kotlin/Swift-style — ВСЕ параметры immutable по умолчанию (не
+      opt-in `конст` перед параметром), без opt-out на v1
+- [x] `core/resolver.odin:515` (`resolve_function_body`) и `:867`
+      (`Lambda_Expr`) — `new_symbol(..., is_const = true)`
+- [x] BREAKING CHANGE проверен эмпирически — сломался только
+      собственный regression-тест исходной Стадии 27 (переписан в
+      `test_function_params_are_immutable_by_default` +
+      `test_function_params_still_readable`), `std/*.ps` параметры
+      нигде не переприсваивает (blast radius пуст)
+
+`odin test ./core` — 101/101. native/lsp/wasm сборки чисты.
+
 ---
 
 ## Заметки

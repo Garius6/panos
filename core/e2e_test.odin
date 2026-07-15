@@ -3298,11 +3298,16 @@ test_const_reassignment_is_error :: proc(t: ^testing.T) {
 	expect_diagnostic(t, diags, "Type Error: попытка переприсвоить константу 'x'")
 }
 
-// Regression (Explore-находка): переприсваивание параметров функции
-// по-прежнему работает — конст не распространяется на них автоматически.
+// Стадия 27 (расширение): параметры функций immutable по умолчанию
+// (Kotlin/Swift-style) — переприсвоение параметра теперь ошибка, как у
+// конст-локалей. Это НАМЕРЕННОЕ изменение поведения относительно
+// исходной Стадии 27 (тогда параметры были reassignable — см. Explore
+// в ROADMAP) — тест заменяет прежний
+// test_function_params_still_reassignable, который проверял старое
+// поведение.
 @(test)
-test_function_params_still_reassignable :: proc(t: ^testing.T) {
-	result, ok := run_code(`
+test_function_params_are_immutable_by_default :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
 		функ f(x: Число) -> Число
 			x = x + 1
 			x
@@ -3312,9 +3317,24 @@ test_function_params_still_reassignable :: proc(t: ^testing.T) {
 			f(5)
 		конец
 	`)
-	testing.expectf(t, ok, "[конст: параметры] стек пуст")
+	expect_diagnostic(t, diags, "Type Error: попытка переприсвоить константу 'x'")
+}
+
+// Читать параметр (без переприсвоения) по-прежнему работает как раньше.
+@(test)
+test_function_params_still_readable :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ f(x: Число) -> Число
+			x + 1
+		конец
+
+		функ старт() -> Число
+			f(5)
+		конец
+	`)
+	testing.expectf(t, ok, "[конст: параметры чтение] стек пуст")
 	n, is_num := result.(f64)
-	testing.expectf(t, is_num && n == 6, "[конст: параметры] ожидалось 6, получено %v", result)
+	testing.expectf(t, is_num && n == 6, "[конст: параметры чтение] ожидалось 6, получено %v", result)
 }
 
 // Regression (Explore-находка): конст во вложенном scope не мешает пер

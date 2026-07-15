@@ -512,7 +512,11 @@ resolve_function_body :: proc(
 	push_scope(ctx)
 	args_syms := make([dynamic]Symbol_Id)
 	for arg in args {
-		sym := new_symbol(ctx.symbol_store, arg.name, .Variable, module, span = arg.span)
+		// Стадия 27 (расширение): параметры immutable по умолчанию
+		// (Kotlin/Swift-style, не opt-in как обычный `конст` для локалей) —
+		// нет способа сделать параметр мутируемым, нужна копия в `пер`
+		// внутри тела, если требуется.
+		sym := new_symbol(ctx.symbol_store, arg.name, .Variable, module, span = arg.span, is_const = true)
 		ctx.current_scope.symbols[intern(arg.name)] = sym
 		append(&args_syms, sym)
 	}
@@ -864,7 +868,9 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		push_scope(ctx)
 		args_syms := make([dynamic]Symbol_Id)
 		for arg in e.args {
-			sym := new_symbol(ctx.symbol_store, arg.name, .Variable, ctx.current_module, span = arg.span)
+			// Стадия 27 (расширение) — та же immutable-by-default политика,
+			// что у обычных функций (resolve_function_body).
+			sym := new_symbol(ctx.symbol_store, arg.name, .Variable, ctx.current_module, span = arg.span, is_const = true)
 			ctx.current_scope.symbols[intern(arg.name)] = sym
 			append(&args_syms, sym)
 		}

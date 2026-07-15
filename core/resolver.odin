@@ -84,6 +84,19 @@ Module_Graph :: struct {
 	loading:          map[string]bool,
 	symbol_types:     map[Symbol_Id]^Type,
 	symbol_store:     ^Symbol_Store,
+	// Найдено при отладке Стадии 22 (не её баг): cross-module вызов
+	// экспортированной generic-функции (алиас.функция(...)) НЕ инстанцировал
+	// схему заново — infer_call_expr's Property_Expr-ветка использовала
+	// export_type напрямую (шаблонный тип с общими InferVar), в отличие от
+	// infer_ident_expr (same-file вызов), которая уже давно инстанцирует
+	// через symbol_schemes. Symbol_Id generic-функции узнаётся ("реально
+	// generic") только ПОСЛЕ typecheck_program той декларации
+	// (try_generalize) — значит, в отличие от symbol_types (растёт во
+	// время resolve, доступен как единая шаренная map с самого начала),
+	// схемы нужно копить ПОСЛЕ каждого модуля и раздавать СЛЕДУЮЩИМ —
+	// см. resolve_and_typecheck_all (module_loader.odin) и new_type_ctx
+	// (type_cheker.odin), тот же паттерн, что prelude_symbol_schemes.
+	symbol_schemes:   map[Symbol_Id]Type_Scheme,
 	// file_id → путь/исходник, нужно чтобы превратить Span в line:col при
 	// печати diagnostic'а (Span хранит только file_id, не путь).
 	file_paths:       map[u16]string,

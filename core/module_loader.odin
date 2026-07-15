@@ -168,6 +168,21 @@ resolve_and_typecheck_all :: proc(graph: ^Module_Graph) -> [dynamic]Module_Resul
 		// как графовое присвоение снаружи цикла успело бы произойти. Без этой
 		// строки cross-module ADT usage падает с "тип-владелец ещё не построен".
 		graph.symbol_types = last.res_ctx.symbol_types
+		// Найдено при отладке Стадии 22 (не её баг, см. Module_Graph.
+		// symbol_schemes): тот же мотив, но symbol_schemes — НЕ шаренная
+		// map (в отличие от symbol_types), а свежая копия на каждый
+		// Type_Ctx (new_type_ctx) — накапливаем явно, не переприсваиванием
+		// указателя. Без этого экспортированная generic-функция
+		// (кол.отфильтровать/отсортировать и т.п.), вызванная из ДРУГОГО
+		// модуля, не инстанцировалась бы заново на каждый call site —
+		// первый же вызов "цементировал" бы T навсегда (symptom: "попытка
+		// получить поле у не-структуры (тип: ?N)" на результате).
+		if graph.symbol_schemes == nil {
+			graph.symbol_schemes = make(map[Symbol_Id]Type_Scheme)
+		}
+		for sym, scheme in last.tc_ctx.symbol_schemes {
+			graph.symbol_schemes[sym] = scheme
+		}
 	}
 	return results
 }

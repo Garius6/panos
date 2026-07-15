@@ -515,6 +515,18 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 	for sym, scheme in res.prelude_symbol_schemes {
 		ctx.symbol_schemes[sym] = scheme
 	}
+	// Найдено при отладке Стадии 22 (не её баг, см. Module_Graph.symbol_schemes):
+	// схемы generic-функций/методов УЖЕ типизированных модулей графа — иначе
+	// cross-module вызов экспортированной generic-функции получал бы
+	// НЕ-инстанцированный, общий на все вызовы тип (см. infer_call_expr,
+	// case .Function внутри Property_Expr-ветки). module_graph может быть
+	// nil здесь (resolve_program's throwaway одномодульный граф, см. его
+	// комментарий "resolved.module_graph = nil") — тогда просто нечего копировать.
+	if res.module_graph != nil {
+		for sym, scheme in res.module_graph.symbol_schemes {
+			ctx.symbol_schemes[sym] = scheme
+		}
+	}
 	return ctx
 }
 
@@ -2789,6 +2801,15 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 					}
 				}
 				export_type = prune_type(export_type)
+				// Найдено при отладке Стадии 22 (не её баг): cross-module вызов
+				// generic-функции (алиас.функция(...)) без этого использовал бы
+				// ОБЩИЙ, не-инстанцированный тип — первый же вызов "цементировал"
+				// бы T навсегда для ВСЕХ последующих вызовов (см. пометку у
+				// Module_Graph.symbol_schemes). Тот же instantiate_scheme, что
+				// infer_ident_expr уже делает для same-file вызовов.
+				if scheme, has_scheme := ctx.symbol_schemes[export_sym_id]; has_scheme && len(scheme.forall) > 0 {
+					export_type = prune_type(instantiate_scheme(ctx, scheme))
+				}
 				#partial switch export_type.kind {
 				case .Function:
 					if len(e.args) != len(export_type.params) {

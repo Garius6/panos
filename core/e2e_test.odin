@@ -3019,3 +3019,24 @@ test_struct_without_equatable_keeps_structural_equality :: proc(t: ^testing.T) {
 	b, is_bool := result.(bool)
 	testing.expectf(t, is_bool && b, "[структурное == без Равнозначное] ожидалось true, получено %v", result)
 }
+
+// Найдено при отладке Стадии 22 (не её баг, предсуществующий): вызов
+// ЭКСПОРТИРОВАННОЙ generic-функции ЧЕРЕЗ АЛИАС МОДУЛЯ (либ.применить_ко_
+// всем(...)) не инстанцировал T заново — infer_call_expr's Property_Expr-
+// ветка использовала общий, не-инстанцированный export_type напрямую, в
+// отличие от same-file вызова (infer_ident_expr, который уже инстанцирует
+// через symbol_schemes). Симптом: "попытка получить поле у не-структуры" на
+// результате, потому что T = ^Aggregate не резолвился корректно после
+// возврата из вызова. Requires run_module_file (не run_code) — баг
+// специфичен именно для МЕЖМОДУЛЬНОГО вызова, single-file inline-pipeline
+// его не воспроизводит. Фикс: Module_Graph.symbol_schemes — накапливается
+// в resolve_and_typecheck_all (module_loader.odin) после каждого модуля,
+// раздаётся следующим через new_type_ctx, infer_call_expr инстанцирует
+// схему тем же instantiate_scheme, что и same-file путь.
+@(test)
+test_generic_function_called_across_module_boundary_instantiates_fresh :: proc(t: ^testing.T) {
+	result, ok := run_module_file("fixtures/generic_cross_module_fixture_main.ps")
+	testing.expectf(t, ok, "[cross-module generic] стек пуст")
+	b, is_bool := result.(bool)
+	testing.expectf(t, is_bool && b, "[cross-module generic] ожидалось true, получено %v", result)
+}

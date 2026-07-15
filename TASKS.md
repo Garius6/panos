@@ -1248,6 +1248,11 @@ Refs: [ROADMAP §Стадия 26](ROADMAP.md#стадия-26-grilled-три-ра
 - [x] Манифест парсит [`Up05/toml_parser`](https://github.com/Up05/toml_parser)
       (Odin TOML-библиотека, registry v1.2.0) — НЕ `std/кодирование/toml.ps`
       (тот panos-уровневый, манифест парсит нативный хост, не VM)
+- [x] Найдено: `Up05/toml_parser` ОДНОНАПРАВЛЕННЫЙ — только parse/
+      unmarshal, нет marshal/encode/write. Для записи `панос.lock`
+      (и, возможно, `панос.toml` при `init`) нужен СВОЙ маленький
+      TOML-writer — задача мала (узкий формат, шаблонный `fmt.fprintf`,
+      не общий "TOML наоборот")
 - [x] Разрешение версий — ПЛОСКИЙ список прямых зависимостей, БЕЗ
       транзитивного резолва/MVS (v1)
 - [x] Версионирование — обычные semver git-теги, БЕЗ Go-style
@@ -1256,11 +1261,15 @@ Refs: [ROADMAP §Стадия 26](ROADMAP.md#стадия-26-grilled-три-ра
 - [x] Целостность — SHA-256 hash-lock в `панос.lock` (go.sum-style),
       проверка при установке
 
-**Investigate (после решений выше — конкретные touch-точки)**:
+**Сделано заранее** (вне порядка работ, но уже готово):
+- [x] `laytan/odin-http`/`Up05/toml_parser` завендорены в
+      `external/odin-http`/`external/toml_parser` (plain tracked files,
+      тем же способом что `external/back`) — `odin check` на оба чисто
+
+**Investigate/реализовать (после решений выше — конкретные touch-точки)**:
 - [ ] main.odin — новые subcommands (`panos mod init`/`get`/аналоги)
-- [ ] Интеграция `laytan/odin-http`/`Up05/toml_parser` как зависимостей
-      САМОГО panos-репозитория (не panos-языка) — куда векторить,
-      как собирать вместе с остальным Odin-кодом
+- [ ] Свой TOML-writer для `панос.lock`/`панос.toml` — `Up05/toml_parser`
+      однонаправленный (только parse/unmarshal), писать самим
 - [ ] Свой TAR-парсер — конкретная реализация (read-only, обычные
       файлы/директории)
 - [ ] Формат `модули/`-vendoring layout для многофайловых пакетов

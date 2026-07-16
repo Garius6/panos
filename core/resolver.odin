@@ -151,6 +151,13 @@ Module_Graph :: struct {
 	prelude_divisible_sym:    Symbol_Id,
 	// Symbol_Id Печатаемое (Стадия 23) — тот же мотив.
 	prelude_printable_sym:    Symbol_Id,
+	// Symbol_Id Копируемое (Стадия 23) — не используется typecheck/
+	// compiler-кодом самого Копируемое (обычный прямой вызов метода, без
+	// sugar), но заведён для консистентности с остальными 5 интерфейсами
+	// И для будущей Стадии 24 (copy-on-send: нужно будет отличить "есть
+	// ли у типа кастомный .клонировать()" от дефолтного reflective-копи-
+	// рования при отправке сообщения в mailbox).
+	prelude_copyable_sym:     Symbol_Id,
 	// Хип-аллоцированные resolve/typecheck-контексты прелюдии — нужны
 	// ensure_prelude_compiled (compiler.odin-этап, см. там) ПОСЛЕ того,
 	// как ensure_prelude уже вернулась (её собственные локальные res_ctx/
@@ -363,6 +370,8 @@ Resolver_Ctx :: struct {
 	prelude_divisible_sym:    Symbol_Id,
 	// Symbol_Id Печатаемое (Стадия 23) — тот же мотив.
 	prelude_printable_sym:    Symbol_Id,
+	// Symbol_Id Копируемое (Стадия 23) — тот же мотив.
+	prelude_copyable_sym:     Symbol_Id,
 	// Копия graph.prelude_generic_order (см. там) — Resolver_Ctx (в
 	// отличие от module_graph, который resolve_program обнуляет после
 	// однократного резолва, см. resolve_program) переживает весь

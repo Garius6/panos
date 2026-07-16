@@ -65,6 +65,23 @@ PRELUDE_SOURCE :: `
 	функ вСтроку() -> Строка
 конец
 
+// Стадия 23: Копируемое — единственный способ получить независимую
+// копию структуры (panos структуры reference semantics по умолчанию,
+// присваивание копирует указатель, не поля). НЕ operator sugar (в
+// отличие от Сравниваемое/Равнозначное/Арифметики) — .клонировать()
+// обычный прямой вызов метода, работает через уже существующий generic
+// interface-dispatch (Стадия 6) без единой строчки нового кода в
+// type_cheker.odin/compiler.odin — Self-возврат уже покрыт фиксом,
+// добавленным для Арифметики (interface_method_types_match). "Глубокая
+// копия" — НЕ auto-derive (как и у всех прочих интерфейсов, тело метода
+// пишется руками): чтобы клон был действительно глубоким, тело обязано
+// САМО рекурсивно звать .клонировать() на вложенных struct-полях, а не
+// просто копировать их как есть (иначе получится поверхностная копия
+// с расшаренными вложенными структурами).
+экспорт тип Копируемое = интерфейс
+	функ клонировать() -> Копируемое
+конец
+
 реализация Опция
 	функ есть(это: Опция) -> Булево
 		выбор это
@@ -297,6 +314,7 @@ ensure_prelude :: proc(graph: ^Module_Graph) -> ^Module {
 	graph.prelude_multipliable_sym = module.exports[intern("Умножаемое")]
 	graph.prelude_divisible_sym = module.exports[intern("Делимое")]
 	graph.prelude_printable_sym = module.exports[intern("Печатаемое")]
+	graph.prelude_copyable_sym = module.exports[intern("Копируемое")]
 
 	// graph.symbol_types уже общий указатель на ту же map, что res_ctx.
 	// symbol_types — типы Опции/Результата видны каждому следующему модулю.
@@ -355,6 +373,7 @@ merge_prelude_exports :: proc(ctx: ^Resolver_Ctx, graph: ^Module_Graph, module: 
 	ctx.prelude_multipliable_sym = prelude.exports[intern("Умножаемое")]
 	ctx.prelude_divisible_sym = prelude.exports[intern("Делимое")]
 	ctx.prelude_printable_sym = prelude.exports[intern("Печатаемое")]
+	ctx.prelude_copyable_sym = prelude.exports[intern("Копируемое")]
 	// Копия graph.prelude_generic_order в САМ Resolver_Ctx — module_graph
 	// не переживает resolve_program (resolved.module_graph = nil), а
 	// decl_type_param_order должен пережить весь typecheck_program.

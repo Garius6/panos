@@ -49,7 +49,11 @@ Result_Value :: struct {
 
 Interface_Value :: struct {
 	header:  GC_Header,
-	data:    ^Aggregate_Value,
+	// Стадия 25: было ^Aggregate_Value — перечисления тоже могут
+	// реализовывать интерфейсы, receiver может оказаться ^Variant_Value.
+	// Value уже union из всех вариантов, ничего не меняется в остальных
+	// потребителях (Invoke_Interface просто кладёт data на стек как есть).
+	data:    Value,
 	// VTable: связывает имя метода из контракта с реальной скомпилированной функцией
 	methods: map[string]^Compiled_Function,
 }
@@ -72,6 +76,35 @@ Variant_Value :: struct {
 // не может делать реальный ФС/сокеты) — см. заметку в ROADMAP про WASM-
 // спайк.
 
+// Стадия 24 (actor model): собственные frames/stack — НЕ VM.frames/
+// VM.stack напрямую. Планировщик перед вызовом execute() свопает
+// vm.frames/vm.stack на process.frames/process.stack (дешёво — dynamic
+// array это заголовок ptr/len/cap, не копия данных), после — свопает
+// обратно. CallFrame не хранит обратной ссылки на VM (vm.odin), так что
+// frames независимо переносимы между процессами без правок в самих
+// opcode-обработчиках execute(). mailbox — FIFO, простое поле, не
+// отдельный gc_new'd объект (не первоклассное panos-значение, никогда
+// не появляется на стеке само по себе — живёт и умирает вместе с
+// владеющим Process_Value, как Map_Value.entries живёт внутри Map_Value,
+// не как отдельный аллоцированный объект). is_alive=false после
+// Completed (см. VM.processes) — тихий no-op при отправить() на мёртвый
+// процесс, GC собирает Process_Value, когда последний хэндл на него
+// исчезает.
+Process_Value :: struct {
+	header:   GC_Header,
+	id:       int,
+	mailbox:  [dynamic]Value,
+	frames:   [dynamic]CallFrame,
+	stack:    [dynamic]Value,
+	is_alive: bool,
+	// Свежеспавненный процесс ЕЩЁ НЕ выполнялся ни разу — планировщик
+	// обязан дать ему хотя бы один execute()-вызов, даже если mailbox
+	// пуст (тело процесса может не начинаться с получить() вообще).
+	// После первого execute() has_run=true — дальше пустой mailbox уже
+	// значит "действительно нечего делать", не "ещё не стартовал".
+	has_run:  bool,
+}
+
 Value :: union {
 	f64,
 	bool,
@@ -87,6 +120,7 @@ Value :: union {
 	^Variant_Value,
 	^File_Value,
 	^Socket_Value,
+	^Process_Value,
 }
 
 Compiled_Function :: struct {
@@ -169,6 +203,8 @@ Opcode :: enum u8 {
 	Get_Variant_Field, // Операнд: 1 байт (индекс поля). Снимает variant, кладёт значение поля.
 	Match_Fail, // Без операнда. Runtime-трап при недостижимом промахе `выбор`.
 	Build_Variant, // Операнды: 3 байта (type_name_const, tag, arity). Снимает arity полей, кладёт ^Variant_Value.
+	Spawn, // Операнд: 1 байт (arg_count). Стек: fn, arg1..argN (как .Call). Не выполняет callee — создаёт новый Process_Value, кладёт его как handle.
+	Receive, // Без операндов. Если mailbox текущего процесса пуст — .Suspended (ip не двигается). Иначе снимает первое сообщение (FIFO), кладёт на стек.
 }
 
 // Записать 1 байт в массив инструкций
@@ -808,6 +844,12 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			emit_byte(ctx, name_const)
 			emit_byte(ctx, u8(info.variant.tag_index))
 			emit_byte(ctx, 0)
+			// Стадия 25: раньше не нужно было (enum'ы не реализовывали
+			// интерфейсы) — безымянный (без payload) конструктор варианта,
+			// переданный туда, где ожидается интерфейсный тип
+			// (`бой(Фигура.Линия)`), тоже должен приводиться так же, как
+			// Constructor_Struct уже делает.
+			maybe_emit_interface_cast(ctx, expr)
 			return
 		}
 		if sym_id, ok := ctx.res.node_symbols[expr]; ok {
@@ -951,11 +993,42 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
 				emit_byte(ctx, 1)
 				return
+
+			case .Send_Copy:
+				// Стадия 24: e.args[1] (сообщение) реализует Копируемое —
+				// компилировать процесс, ЗАТЕМ вызвать .клонировать() на
+				// сообщении (push fn, receiver = e.args[1], .Call 1), и
+				// отдать УЖЕ клонированное значение в
+				// "отправить_без_копии" (не "отправить" — та делает
+				// reflective copy заново поверх намеренно НЕ
+				// скопированных пользователем полей).
+				compile_expr(ctx, e.args[0])
+				if fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, info.symbol_ref)]; found {
+					emit_constant(ctx, Value(fn_ptr))
+				} else {
+					fmt.panicf("Compiler Error: метод клонировать не найден")
+				}
+				compile_expr(ctx, e.args[1])
+				emit_opcode(ctx, .Call)
+				emit_byte(ctx, 1)
+				emit_opcode(ctx, .Call_Builtin)
+				emit_byte(ctx, make_constant(ctx, Value(perm_string("отправить_без_копии"))))
+				emit_byte(ctx, 2)
+				return
 			}
 		}
 		if ident, ok := e.callee.(^Ident_Expr); ok {
 			if sym_id := ctx.res.node_symbols[e.callee];
 			   sym_id != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, sym_id).kind == .Builtin {
+				// Стадия 24 (actor model): получить() — единственный bare
+				// builtin, компилирующийся НЕ в .Call_Builtin, а в свой
+				// опкод .Receive (suspend/resume механика execute(), см.
+				// vm.odin) — отправить() остаётся обычным .Call_Builtin.
+				if resolve_interned(ident.name) == "получить" {
+					emit_opcode(ctx, .Receive)
+					maybe_emit_interface_cast(ctx, expr)
+					return
+				}
 				for arg in e.args do compile_expr(ctx, arg)
 				emit_opcode(ctx, .Call_Builtin)
 				emit_byte(ctx, make_constant(ctx, Value(perm_string(resolve_interned(ident.name)))))
@@ -1049,6 +1122,20 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		// Компилятор запускается только после typecheck_program с нулём
 		// diagnostics (main.odin) — Error_Expr сюда дойти не должен.
 		fmt.panicf("Compiler Error: внутренняя ошибка — Error_Expr дошёл до компиляции")
+
+	case ^Spawn_Expr:
+		// `запусти f(args...)` — НЕ обычный вызов: push fn-константы (как
+		// Ident_Expr для функции, см. выше), компиляция аргументов БЕЗ их
+		// исполнения, .Spawn создаёт Process_Value в рантайме (vm.odin).
+		callee_sym := ctx.res.node_symbols[e.call.callee]
+		fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, callee_sym)]
+		if !found {
+			fmt.panicf("Compiler Error: запусти: функция не найдена в реестре")
+		}
+		emit_constant(ctx, Value(fn_ptr))
+		for arg in e.call.args do compile_expr(ctx, arg)
+		emit_opcode(ctx, .Spawn)
+		emit_byte(ctx, u8(len(e.call.args)))
 	}
 
 	maybe_emit_interface_cast(ctx, expr)

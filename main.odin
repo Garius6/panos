@@ -119,7 +119,7 @@ run_file :: proc(filename: string, program_args: []string = nil, verbose: bool =
 		fmt.printf("--------------------------\n")
 	}
 	vm := core.new_vm(global_registry, program_args)
-	core.execute(vm)
+	core.run_scheduler(vm)
 	// Не гейтим за verbose — это фактический результат прогона (значение,
 	// оставшееся на стеке после старт()), а не внутренняя отладочная
 	// информация компилятора.

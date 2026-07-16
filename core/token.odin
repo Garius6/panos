@@ -53,6 +53,7 @@ TokenKind :: enum {
 	Semicolon,
 	Comma,
 	Question,
+	Spawn,
 	EOF,
 }
 

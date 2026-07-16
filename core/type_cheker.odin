@@ -27,6 +27,12 @@ Type_Kind :: enum {
 	// TCP-соединение (сеть.подключиться) — непараметрический тип, методы
 	// см. CONNECTION_METHODS.
 	Connection,
+	// Стадия 24 (actor model): Процесс(T) — T хранится в element_type
+	// (тот же приём, что .Array), НЕ через Type_Scheme/instantiate_scheme
+	// (Struct/Enum generics) — резолвится третьей веткой в Type_Generic-
+	// цепочке (resolve_type_node), рядом с Массив/Соответствие. См.
+	// new_process_type.
+	Process,
 	// Заглушка для узла, где уже была зарепорчена ошибка. Unify'ится с чем
 	// угодно (см. unify_types/types_are_equal) — не даёт одной первопричине
 	// расплодиться в десяток производных диагностик по всему выражению.
@@ -168,6 +174,18 @@ is_valid_map_key_type :: proc(t: ^Type) -> bool {
 	return typ.kind == .Number || typ.kind == .Bool || typ.kind == .String
 }
 
+// Стадия 24: Процесс(T) — тот же приём, что new_array_type/new_map_type
+// (builtin generic-тип, T просто хранится полем на ^Type, БЕЗ InferVar/
+// Type_Scheme/instantiate_scheme — та инфраструктура нужна только для
+// пользовательских Struct/Enum-деклараций).
+new_process_type :: proc(message_type: ^Type) -> ^Type {
+	t := new(Type)
+	t.kind = .Process
+	t.element_type = message_type
+	t.name = fmt.tprintf("Процесс(%s)", message_type.name)
+	return t
+}
+
 // --- КОНТЕКСТ ---
 
 Variant_Call_Info :: struct {
@@ -183,6 +201,12 @@ Call_Kind :: enum {
 	Constructor_Struct,
 	Constructor_Variant,
 	Print_Value,
+	// Стадия 24 (actor model): отправить(процесс, сообщение), где T
+	// сообщения реализует Копируемое — вставить .клонировать()(сообщение)
+	// ПЕРЕД builtin'ом, компилировать в "отправить_без_копии" (не
+	// "отправить" — иначе runtime reflective copy исказил бы намеренно
+	// не скопированные пользователем поля).
+	Send_Copy,
 }
 
 // Стадия 23 (Итерируемое): какую форму компилировать для конкретного
@@ -508,6 +532,34 @@ Type_Ctx :: struct {
 	// emit_constraint/solve_constraints выше. Дренируется solve_constraints
 	// в конце каждой join-точки — не переживает её.
 	pending_constraints: [dynamic]Constraint,
+	// Стадия 24 (actor model): T сообщений процесса выводится не из
+	// сигнатуры (получить() в ней не участвует), а из паттернов `выбор
+	// получить()` В ТЕЛЕ функции — ambient-поле, тот же save/restore
+	// паттерн, что current_type_params. nil, пока функция не содержит ни
+	// одного получить(); первый вызов получить() внутри тела заводит
+	// свежий InferVar, все ПОСЛЕДУЮЩИЕ получить() в ЭТОЙ ЖЕ функции
+	// переиспользуют его же (один mailbox — один T на функцию).
+	current_process_message_var: ^Type,
+	// Персистентный (не ambient) результат: T каждой функции, где
+	// получить() встретился — заполняется в check_decl_body ПОСЛЕ
+	// проверки тела (когда current_process_message_var уже прунится).
+	// Читается infer_spawn_expr для `запусти <вызов>`.
+	process_message_types: map[Symbol_Id]^Type,
+	// Обратная карта к res.decl_symbols (только Function_Decl) —
+	// заполняется в ПРОХОД 2 целиком, ДО начала ПРОХОД 4 body-checking.
+	// Нужна ensure_body_checked: `запусти f(...)`, встреченный ДО того,
+	// как ПРОХОД 4 сам дошёл до f (f объявлена позже по файлу), должен
+	// суметь типизировать f ПРЯМО СЕЙЧАС — T процесса не зависит от
+	// вызывающих (только от получить()-паттернов внутри f), так что
+	// внеочередная проверка тела f корректна и идемпотентна (см. checked_
+	// bodies).
+	symbol_to_func_decl: map[Symbol_Id]^Function_Decl,
+	// Мемоизация: тело каждой функции проверяется РОВНО один раз — либо
+	// обычным ПРОХОД 4 (по порядку деклараций), либо раньше — по запросу
+	// ensure_body_checked из запусти. Без этого функция, спавненная ДО
+	// своего "родного" места в ПРОХОД 4, проверилась бы дважды (дублируя
+	// diagnostics).
+	checked_bodies: map[Symbol_Id]bool,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -525,6 +577,9 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		generic_instance_cache = make(map[string]^Type),
 		currently_declaring_generic = INVALID_SYMBOL,
 		pending_constraints = make([dynamic]Constraint),
+		process_message_types = make(map[Symbol_Id]^Type),
+		symbol_to_func_decl = make(map[Symbol_Id]^Function_Decl),
+		checked_bodies = make(map[Symbol_Id]bool),
 	}
 	// Стадия 7 Phase F: см. Resolver_Ctx.prelude_generic_order — прелюдия
 	// типизируется в СВОЁМ отдельном tc_ctx (ensure_prelude), любой другой
@@ -816,6 +871,13 @@ instantiate_type :: proc(ctx: ^Type_Ctx, t: ^Type, subst: ^map[int]^Type, visite
 		t2.variants = make([dynamic]Type_Variant)
 		t2.variant_index = pruned.variant_index // имена→индексы не меняются копией
 		t2.methods = pruned.methods // Стадия 7 Phase E: см. комментарий в .Struct-case выше
+		// Стадия 25: тот же баг/фикс, что уже описан у .Struct-case выше
+		// (плоский снимок, не пустой массив) — раньше недостижимо (enum'ы
+		// не реализовывали интерфейсы), теперь `Опция`/`Результат`/
+		// пользовательские generic-enum'ы с `реализация X для Тип` молча
+		// теряли бы implemented_interfaces при КАЖДОЙ инстанциации
+		// (Опция(Число), Опция(Строка) и т.д.) без этой строки.
+		t2.implemented_interfaces = pruned.implemented_interfaces
 		v[pruned] = t2 // регистрируем ДО рекурсии в варианты
 		for variant in pruned.variants {
 			fields := make([dynamic]^Type)
@@ -889,7 +951,9 @@ unify_types :: proc(a: ^Type, b: ^Type, visited: ^map[[2]^Type]bool = nil) -> bo
 	if left.kind == .InferVar do return bind_infer_var(left, right)
 	if right.kind == .InferVar do return bind_infer_var(right, left)
 
-	if right.kind == .Interface && left.kind == .Struct {
+	// Стадия 25: перечисления тоже могут реализовывать интерфейсы —
+	// implemented_interfaces теперь заполняется и для .Enum (ПРОХОД 1/3).
+	if right.kind == .Interface && (left.kind == .Struct || left.kind == .Enum) {
 		for iface in left.implemented_interfaces {
 			if iface == right do return true
 		}
@@ -1355,6 +1419,15 @@ try_generalize :: proc(ctx: ^Type_Ctx, sym: Symbol_Id, t: ^Type) {
 // Общий паттерн для Function_Decl и методов Impl_Decl.
 check_decl_body :: proc(ctx: ^Type_Ctx, sym: Symbol_Id, d: ^Function_Decl, func_type: ^Type) {
 	bind_function_args(ctx, d, func_type)
+
+	// Стадия 24: T сообщений — ambient на ВРЕМЯ ЭТОЙ функции (save/restore,
+	// тот же паттерн, что current_type_params) — получить() внутри вложенной
+	// лямбды НЕ должен путать T с T объемлющей функции (у лямбд процессов
+	// не бывает, но save/restore защищает от случайной путаницы, если
+	// check_decl_body вызовется реентерабельно, см. ensure_body_checked).
+	prev_msg_var := ctx.current_process_message_var
+	ctx.current_process_message_var = nil
+
 	if params_map, ok := ctx.decl_type_params[sym]; ok {
 		prev := ctx.current_type_params
 		ctx.current_type_params = params_map
@@ -1363,6 +1436,28 @@ check_decl_body :: proc(ctx: ^Type_Ctx, sym: Symbol_Id, d: ^Function_Decl, func_
 	} else {
 		check_function_body(ctx, d.span, d.body, func_type.return_type)
 	}
+
+	if ctx.current_process_message_var != nil {
+		ctx.process_message_types[sym] = prune_type(ctx.current_process_message_var)
+	}
+	ctx.current_process_message_var = prev_msg_var
+}
+
+// Стадия 24: типизирует тело функции sym НЕМЕДЛЕННО, если оно ещё не было
+// проверено — идемпотентно (checked_bodies), так что и обычный ПРОХОД 4
+// (по порядку деклараций), и внеочередной запрос из infer_spawn_expr
+// (функция объявлена ПОСЛЕ места её `запусти`) в сумме проверяют каждое
+// тело РОВНО один раз. T процесса (process_message_types) зависит только
+// от получить()-паттернов ВНУТРИ f, не от вызывающих — внеочередная
+// проверка корректна при любом порядке.
+ensure_body_checked :: proc(ctx: ^Type_Ctx, sym: Symbol_Id) {
+	if ctx.checked_bodies[sym] do return
+	ctx.checked_bodies[sym] = true
+	d, ok := ctx.symbol_to_func_decl[sym]
+	if !ok do return
+	func_type := ctx.res.symbol_types[sym]
+	if func_type == nil do return
+	check_decl_body(ctx, sym, d, func_type)
 }
 
 typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
@@ -1407,6 +1502,11 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			// Как у Struct — без этого `реализация X` для перечисления X
 			// падала бы на nil-map assignment в ПРОХОДЕ 3.
 			enum_type.methods = make(map[string]Symbol_Id)
+			// Стадия 25: перечисления теперь тоже могут реализовывать
+			// интерфейсы — без этого append ниже (ПРОХОД 3) писал бы в
+			// nil dynamic array (append на nil работает в Odin, но поле
+			// остаётся не read-инициализированным для единообразия со Struct).
+			enum_type.implemented_interfaces = make([dynamic]^Type)
 			enum_sym := ctx.res.decl_symbols[decl]
 			enum_type.generic_origin = enum_sym
 			ctx.res.symbol_types[enum_sym] = enum_type
@@ -1464,6 +1564,10 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 
 		case ^Function_Decl:
 			sym := ctx.res.decl_symbols[decl]
+			// Стадия 24: полная карта ДО начала ПРОХОД 4 — см. комментарий
+			// у symbol_to_func_decl (ensure_body_checked должен находить
+			// ЛЮБУЮ функцию по символу независимо от порядка деклараций).
+			ctx.symbol_to_func_decl[sym] = d
 
 			// Стадия 7 Phase B: generic-функция — резолвим сигнатуру с
 			// type-параметрами в scope (свежий InferVar на каждое имя),
@@ -1614,16 +1718,16 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			// вообще никак. generic-интерфейсы САМИ ПО СЕБЕ (тип с [T] в
 			// заголовке интерфейса) — по-прежнему вне scope, отдельная
 			// фича.
-			if target_type.kind == .Enum && d.interface_name != "" {
-				report(
-					ctx,
-					d.span,
-					"Type Error: перечисление '%s' не может реализовывать интерфейс '%s'",
-					d.target_type,
-					d.interface_name,
-				)
-				continue
-			}
+			// Стадия 25: перечисления теперь МОГУТ реализовывать интерфейсы
+			// (раньше здесь стоял безусловный отказ) — interface_method_
+			// types_match ниже уже работает mimo receiver'а generic'и,
+			// Self-фикс (params[i] == iface_type -> == target_type) не
+			// делает предположений о kind target_type (Struct vs Enum),
+			// vtable-механизм рантайма (vm.odin, Cast_Interface) тоже
+			// kind-агностичен по имени типа. Единственные реальные правки
+			// — расширить interface-коэрсию (unify_types/types_are_equal,
+			// check_expr) и рантайм (Interface_Value.data/Cast_Interface)
+			// на .Enum — см. эти места.
 
 			// Регистрируем методы
 			for m in d.methods {
@@ -1761,7 +1865,10 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 		#partial switch d in decl {
 		case ^Function_Decl:
 			sym := ctx.res.decl_symbols[decl]
-			check_decl_body(ctx, sym, d, ctx.res.symbol_types[sym])
+			// Стадия 24: могла уже быть проверена внеочередно (запусти
+			// сослался на неё раньше по файлу) — ensure_body_checked не
+			// продублирует.
+			ensure_body_checked(ctx, sym)
 		case ^Impl_Decl:
 			// Стадия 7 Phase E/F: тело generic-метода резолвит T/E в ТЕ ЖЕ
 			// InferVar, что и сигнатура в ПРОХОД 3 — ключ по СОБСТВЕННОМУ
@@ -1870,6 +1977,9 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 				)
 			}
 			return new_map_type(key_type, resolve_type_node(ctx, n.params[1]))
+		} else if n.name == "Процесс" {
+			if len(n.params) != 1 do return report(ctx, n.span, "Type Error: Процесс ожидает 1 параметр типа")
+			return new_process_type(resolve_type_node(ctx, n.params[0]))
 		} else {
 			// Стадия 7 Phase C: пользовательский generic-тип (структура).
 			// Раньше здесь не было fallback'а вообще — неизвестное имя
@@ -1942,7 +2052,9 @@ types_are_equal :: proc(a: ^Type, b: ^Type) -> bool {
 	if left.kind == .Poison || right.kind == .Poison do return true
 	if left.kind == .InferVar || right.kind == .InferVar do return false
 
-	if right.kind == .Interface && left.kind == .Struct {
+	// Стадия 25: перечисления тоже могут реализовывать интерфейсы —
+	// implemented_interfaces теперь заполняется и для .Enum (ПРОХОД 1/3).
+	if right.kind == .Interface && (left.kind == .Struct || left.kind == .Enum) {
 		for iface in left.implemented_interfaces {
 			if iface == right do return true
 		}
@@ -2366,7 +2478,8 @@ check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type) {
 
 	actual := prune_type(infer_expr(ctx, expr))
 
-	if expected_type.kind == .Interface && actual.kind == .Struct {
+	// Стадия 25: перечисления тоже приводятся к интерфейсу.
+	if expected_type.kind == .Interface && (actual.kind == .Struct || actual.kind == .Enum) {
 		if unify_types(actual, expected_type) {
 			ctx.interface_casts[expr] = actual
 			return
@@ -2429,6 +2542,80 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
 			check_expr(ctx, args[0], TY_STRING)
 			return TY_NEVER
+		},
+	},
+	{
+		// Стадия 24 (actor model): получить() — bare builtin (как длина/
+		// паника), но БЕЗ фиксированного типа результата. Первый вызов В
+		// ТЕЛЕ ТЕКУЩЕЙ функции заводит свежий InferVar (ctx.current_
+		// process_message_var), последующие вызовы В ТОЙ ЖЕ функции
+		// переиспользуют его же — один mailbox, один T. Компилируется в
+		// опкод .Receive (см. compiler.odin), реальное значение приходит
+		// из mailbox текущего процесса в рантайме.
+		name = "получить",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
+			if ctx.current_process_message_var == nil {
+				ctx.current_process_message_var = new_infer_var(ctx)
+			}
+			return ctx.current_process_message_var
+		},
+	},
+	{
+		// Стадия 24: себя() — Процесс(T)-хэндл ТЕКУЩЕГО процесса (T — тот
+		// же message-var, что у получить() в ЭТОЙ ЖЕ функции — переиспользует
+		// поле, а не заводит отдельный; себя() до первого получить() в
+		// теле заводит его сам). Нужен, чтобы `старт()` мог передать
+		// СВОЙ адрес спавненному процессу и получить ответ через
+		// собственный получить() — единственный способ реализовать
+		// "получить() на своём mailbox даёт ожидание ответа" (см. ROADMAP
+		// §Стадия 24, п.6) без отдельного join/monitor-примитива.
+		name = "себя",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
+			if ctx.current_process_message_var == nil {
+				ctx.current_process_message_var = new_infer_var(ctx)
+			}
+			return new_process_type(ctx.current_process_message_var)
+		},
+	},
+	{
+		// Стадия 24: отправить(процесс, сообщение) — обычная 2-арг
+		// builtin-функция (НЕ новый опкод, см. Порядок работ ROADMAP).
+		// Тихий no-op на мёртвый процесс проверяется в рантайме (Process_
+		// Value.is_alive), не здесь — типизация не знает о живости.
+		name = "отправить",
+		arity = 2,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
+			proc_type := prune_type(infer_expr(ctx, args[0]))
+			if proc_type.kind == .Poison do return TY_VOID
+			if proc_type.kind != .Process {
+				return report(
+					ctx,
+					expr_span(args[0]),
+					"Type Error: отправить() ожидает Процесс(T) первым аргументом, получен '%s'",
+					proc_type.name,
+				)
+			}
+			check_expr(ctx, args[1], proc_type.element_type)
+
+			// Стадия 24 (actor model): copy-on-send. T реализует
+			// Копируемое — компилятор вставляет .клонировать() ПЕРЕД
+			// builtin'ом (тот же Call_Info-паттерн, что Print_Value у
+			// Печатаемого, Стадия 23) и компилирует в
+			// "отправить_без_копии" (сообщение УЖЕ независимая копия —
+			// повторный reflective walk исказил бы намеренно НЕ
+			// скопированные пользователем поля, см. prelude.odin). Не
+			// реализует — обычный "отправить", рантайм сам обходит
+			// структуру (message_deep_copy, vm.odin).
+			msg_type := prune_type(proc_type.element_type)
+			if (msg_type.kind == .Struct || msg_type.kind == .Enum) &&
+			   implements_prelude_interface(ctx, msg_type, ctx.res.prelude_copyable_sym) {
+				if method_sym, found := method_lookup(ctx, msg_type, "клонировать"); found {
+					ctx.call_infos[call] = Call_Info{kind = .Send_Copy, symbol_ref = method_sym}
+				}
+			}
+			return TY_VOID
 		},
 	},
 }
@@ -2783,7 +2970,11 @@ infer_arithmetic_sugar :: proc(
 	method_name: string,
 	iface_name: string,
 ) -> ^Type {
-	if left_t != right_t {
+	// Стадия 25: unify_types вместо !=, иначе нулевой-payload вариант
+	// generic-enum'а (напр. Опция.Нет(), T не выводится из самого
+	// значения) ложно репортился бы как "другой тип", хотя T должен
+	// связаться с тем, что предоставляет other-операнд.
+	if !unify_types(left_t, right_t) {
 		return report(
 			ctx,
 			span,
@@ -2818,7 +3009,9 @@ infer_arithmetic_op :: proc(
 	if left_t.kind == .Poison || right_t.kind == .Poison {
 		return TY_POISON
 	}
-	if left_t.kind == .Struct && implements_prelude_interface(ctx, left_t, iface_sym) {
+	// Стадия 25: перечисления тоже могут реализовывать Арифметику.
+	if (left_t.kind == .Struct || left_t.kind == .Enum) &&
+	   implements_prelude_interface(ctx, left_t, iface_sym) {
 		return infer_arithmetic_sugar(ctx, expr, e.span, left_t, right_t, method_name, iface_name)
 	}
 	check_expr(ctx, e.left, TY_NUM)
@@ -2854,7 +3047,8 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 			// без явного шорт-каута отчитались бы производной ошибкой поверх
 			// уже отчитанной первопричины.
 			t = TY_POISON
-		} else if left_t.kind == .Struct && implements_prelude_interface(ctx, left_t, ctx.res.prelude_addable_sym) {
+		} else if (left_t.kind == .Struct || left_t.kind == .Enum) &&
+		   implements_prelude_interface(ctx, left_t, ctx.res.prelude_addable_sym) {
 			t = infer_arithmetic_sugar(ctx, expr, e.span, left_t, right_t, "сложить", "Складываемое")
 		} else {
 			t = report(
@@ -2880,8 +3074,9 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 			t = TY_BOOL
 		} else if left_t.kind == .Poison || right_t.kind == .Poison {
 			t = TY_POISON
-		} else if left_t.kind == .Struct && implements_prelude_interface(ctx, left_t, ctx.res.prelude_comparable_sym) {
-			if left_t == right_t {
+		} else if (left_t.kind == .Struct || left_t.kind == .Enum) &&
+		   implements_prelude_interface(ctx, left_t, ctx.res.prelude_comparable_sym) {
+			if unify_types(left_t, right_t) {
 				method_sym, _ := method_lookup(ctx, left_t, "сравнить")
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
 				t = TY_BOOL
@@ -2912,7 +3107,15 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 		left_t := prune_type(infer_expr(ctx, e.left))
 		right_t := prune_type(infer_expr(ctx, e.right))
 
-		if left_t == right_t && left_t.kind == .Struct && implements_prelude_interface(ctx, left_t, ctx.res.prelude_equatable_sym) {
+		// Стадия 25: unify_types вместо == — та же причина, что у
+		// infer_arithmetic_sugar (нулевой-payload вариант generic-enum'а
+		// не выводит T из самого значения, должен связаться с other-
+		// операндом). Порядок важен: kind/implements ПЕРЕД unify_types —
+		// unify_types мутирует InferVar'ы побочным эффектом, не должен
+		// срабатывать для типов, вообще не реализующих Равнозначное.
+		if (left_t.kind == .Struct || left_t.kind == .Enum) &&
+		   implements_prelude_interface(ctx, left_t, ctx.res.prelude_equatable_sym) &&
+		   unify_types(left_t, right_t) {
 			method_sym, _ := method_lookup(ctx, left_t, "равно")
 			ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
 			t = TY_BOOL
@@ -3006,6 +3209,63 @@ method_lookup :: proc(ctx: ^Type_Ctx, obj_type: ^Type, name: string) -> (Symbol_
 	return sym, found
 }
 
+// Стадия 24 (actor model): `запусти <вызов>` — НЕ выполняет callee,
+// порождает процесс. Требуем bare-имя функции (не метод/лямбда-выражение —
+// v1 сознательно ограничен, см. ROADMAP) — иначе не от кого взять
+// process_message_types. Аргументы типизируются КАК у обычного вызова
+// (арность + позиционная проверка), само тело f типизируется НЕМЕДЛЕННО
+// через ensure_body_checked, если ещё не было (см. её комментарий) — так
+// T процесса известен независимо от того, объявлена ли f раньше или позже
+// текущей функции по файлу.
+infer_spawn_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Spawn_Expr) -> ^Type {
+	call := e.call
+	ident, ok := call.callee.(^Ident_Expr)
+	if !ok {
+		return report(ctx, call.span, "Type Error: 'запусти' ожидает вызов функции по имени")
+	}
+
+	callee_sym := ctx.res.node_symbols[call.callee]
+	if callee_sym == INVALID_SYMBOL {
+		return TY_POISON // резолвер уже отрапортовал undefined-переменную
+	}
+	if symbol_at(ctx.res.symbol_store, callee_sym).kind != .Function {
+		return report(
+			ctx,
+			call.span,
+			"Type Error: 'запусти' ожидает вызов функции, '%s' — не функция",
+			resolve_interned(ident.name),
+		)
+	}
+
+	func_type := prune_type(ctx.res.symbol_types[callee_sym])
+	if func_type == nil || func_type.kind != .Function {
+		return report(ctx, call.span, "Type Error: '%s' — не функция", resolve_interned(ident.name))
+	}
+	if len(call.args) != len(func_type.params) {
+		return report(
+			ctx,
+			call.span,
+			"Type Error: функция '%s' ожидает %d аргументов, получено %d",
+			resolve_interned(ident.name),
+			len(func_type.params),
+			len(call.args),
+		)
+	}
+	for i in 0 ..< len(call.args) {
+		check_expr(ctx, call.args[i], func_type.params[i])
+	}
+
+	ensure_body_checked(ctx, callee_sym)
+	msg_type, has_msg := ctx.process_message_types[callee_sym]
+	if !has_msg {
+		// f никогда не вызывает получить() — валидный "fire and forget"
+		// процесс. T ничем не ограничен, свежий InferVar (как у пустой
+		// Опция.Нет() без контекста).
+		msg_type = new_infer_var(ctx)
+	}
+	return new_process_type(msg_type)
+}
+
 infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 	callee_sym := ctx.res.node_symbols[e.callee]
 	if callee_sym != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, callee_sym).kind == .Enum_Variant {
@@ -3065,7 +3325,8 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 					}
 					full_name := resolve_interned(export_sym.full_name)
 					arg_type := prune_type(infer_expr(ctx, e.args[0]))
-					if arg_type.kind == .Struct &&
+					// Стадия 25: перечисления тоже могут реализовывать Печатаемое.
+					if (arg_type.kind == .Struct || arg_type.kind == .Enum) &&
 					   implements_prelude_interface(ctx, arg_type, ctx.res.prelude_printable_sym) {
 						method_sym, _ := method_lookup(ctx, arg_type, "вСтроку")
 						ctx.call_infos[expr] = Call_Info {
@@ -3614,6 +3875,30 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 	// нужен отдельный synth-вид.
 	subject_type_actual := prune_type(infer_expr(ctx, e.subject))
 	subject_type := subject_type_actual
+
+	// Стадия 24 (actor model): subject неразрешённого типа (InferVar) —
+	// получить() не знает T заранее (см. BUILTIN_CTORS-запись "получить").
+	// Единственный способ узнать T без внешнего контекста — квалификация
+	// паттерна (Тип.Вариант); ЗА счёт этого требуем полную квалификацию
+	// (Сообщение.Увеличить, не голое Увеличить) для `выбор получить()`,
+	// как в примере ROADMAP §Стадия 24. bind_infer_var — тот же
+	// unify-примитив, что и везде в файле, просто источник цели —
+	// найденный по имени enum, а не другое выражение.
+	if subject_type.kind == .InferVar {
+		for arm in e.arms {
+			ctor, ok := arm.pattern.(^Pattern_Constructor)
+			if !ok || ctor.module_name == "" do continue
+			sym := lookup_symbol(ctx.res.global_scope, intern(ctor.module_name))
+			if sym == INVALID_SYMBOL do continue
+			candidate, has_type := ctx.res.symbol_types[sym]
+			if !has_type || candidate == nil || candidate.kind != .Enum do continue
+			bind_infer_var(subject_type, candidate)
+			break
+		}
+		subject_type_actual = prune_type(subject_type_actual)
+		subject_type = subject_type_actual
+	}
+
 	if subject_type.kind != .Enum {
 		// Возвращаем сразу — иначе классификация каждой ветки ниже полезет
 		// в classify_pattern с невалидным subject_type и продублирует эту
@@ -3886,6 +4171,8 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	case ^Error_Expr:
 		// Уже отрапортовано парсером — не дублируем diagnostic.
 		t = TY_POISON
+	case ^Spawn_Expr:
+		t = infer_spawn_expr(ctx, expr, e)
 	}
 
 	ctx.node_types[expr] = t

@@ -183,7 +183,7 @@ panos_run :: proc "c" (source_len: int) {
 	}
 
 	vm := core.new_vm(global_registry, nil)
-	core.execute(vm)
+	core.run_scheduler(vm)
 
 	if len(vm.stack) > 0 {
 		result := vm.stack[len(vm.stack) - 1]

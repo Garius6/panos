@@ -93,6 +93,7 @@ GC_State :: struct {
 	free_strings:    [dynamic]^Panos_String,
 	free_files:      [dynamic]^File_Value,
 	free_sockets:    [dynamic]^Socket_Value,
+	free_processes:  [dynamic]^Process_Value,
 }
 
 // Не собираем, пока живой хип меньше этого — иначе на маленьких
@@ -116,6 +117,7 @@ new_gc_state :: proc() -> GC_State {
 		free_strings = make([dynamic]^Panos_String),
 		free_files = make([dynamic]^File_Value),
 		free_sockets = make([dynamic]^Socket_Value),
+		free_processes = make([dynamic]^Process_Value),
 	}
 }
 
@@ -177,6 +179,8 @@ gc_new :: proc(vm: ^VM, $T: typeid) -> ^T {
 		obj = pool_take(&vm.gc.free_files)
 	} else when T == Socket_Value {
 		obj = pool_take(&vm.gc.free_sockets)
+	} else when T == Process_Value {
+		obj = pool_take(&vm.gc.free_processes)
 	}
 
 	if obj == nil {
@@ -237,6 +241,8 @@ get_header :: proc(v: Value) -> ^GC_Header {
 		return &val.header
 	case ^Socket_Value:
 		return &val.header
+	case ^Process_Value:
+		return &val.header
 	case f64, bool, ^Compiled_Function:
 		return nil
 	}
@@ -276,9 +282,28 @@ mark_value :: proc(v: Value) {
 		mark_value(val.value)
 		mark_value(val.error)
 	case ^Interface_Value:
-		if val.data != nil do mark_value(Value(val.data))
+		// Стадия 25: data теперь Value (было ^Aggregate_Value) — всегда
+		// заполнено сразу при конструировании (Cast_Interface, vm.odin),
+		// nil-проверка была актуальна только для голого указателя.
+		mark_value(val.data)
 	case ^Variant_Value:
 		for f in val.fields do mark_value(f)
+	case ^Process_Value:
+		// Стадия 24: mailbox + собственные frames/stack. Для ТЕКУЩЕГО
+		// (сейчас исполняемого) процесса process.frames/.stack могут быть
+		// устаревшими относительно vm.frames/vm.stack (append во время
+		// исполнения переаллоцирует backing-массив, свежий указатель
+		// попадает в vm.frames/vm.stack, не в process.frames/.stack — те
+		// синхронизируются только при swap обратно, см. VM.current_process
+		// в vm.odin) — mark_roots обходит vm.frames/vm.stack ОТДЕЛЬНО для
+		// текущего процесса и пропускает его здесь ТЕЛОМ (не через этот
+		// случай), см. mark_roots.
+		// CallFrame.function — ^Compiled_Function, не GC-managed (живёт в
+		// глобальном реестре всю программу, get_header возвращает nil для
+		// него) — только .stack нуждается в обходе, сами frames не хранят
+		// Value напрямую (ip/frame_pointer — просто int).
+		for msg in val.mailbox do mark_value(msg)
+		for v2 in val.stack do mark_value(v2)
 	}
 }
 
@@ -292,6 +317,22 @@ mark_roots :: proc(vm: ^VM) {
 	for v in vm.gc.protect_stack do mark_value(v)
 	for _, fn in vm.compiled_functions {
 		for c in fn.constants do mark_value(c)
+	}
+	// Стадия 24 (actor model): планировщик (vm.processes) сам по себе
+	// источник корней — процесс остаётся живым/маркированным, даже если
+	// НИКТО больше не держит его Процесс(T)-хэндл (он всё ещё исполнится
+	// планировщиком). Текущий процесс уже учтён выше через vm.stack —
+	// это ЕДИНСТВЕННЫЙ актуальный вид его стека, пока он исполняется
+	// (process.stack — дескриptor {ptr,len,cap}, может быть устаревшим
+	// относительно vm.stack после append()-реаллокации ВНУТРИ этого же
+	// execute(), см. комментарий у VM.processes) — повторно process.stack
+	// текущего НЕ обходим. mailbox же НИКОГДА не свопается (.Receive/
+	// отправить читают его через vm.processes[i] напрямую, не через
+	// vm.*), поэтому актуален всегда — обходим для ВСЕХ процессов.
+	for process, i in vm.processes {
+		for v in process.mailbox do mark_value(v)
+		if i == vm.current_process do continue
+		for v in process.stack do mark_value(v)
 	}
 }
 
@@ -327,6 +368,8 @@ value_size :: proc(v: Value) -> int {
 		return size_of(File_Value)
 	case ^Socket_Value:
 		return size_of(Socket_Value)
+	case ^Process_Value:
+		return size_of(Process_Value)
 	}
 	return 0
 }
@@ -388,6 +431,17 @@ pool_release :: proc(vm: ^VM, v: Value) {
 		// (см. vm.odin), а не течёт до конца процесса.
 		close_socket_value(val)
 		append(&vm.gc.free_sockets, val)
+	case ^Process_Value:
+		// Стадия 24: обычно уже пусто к этому моменту (планировщик чистит
+		// frames/stack сразу при завершении процесса, is_alive=false — см.
+		// vm.odin) — clear() здесь просто гарантия консистентности на
+		// случай, если объект стал недостижим, ещё будучи is_alive.
+		clear(&val.mailbox)
+		clear(&val.frames)
+		clear(&val.stack)
+		val.is_alive = false
+		val.has_run = false
+		append(&vm.gc.free_processes, val)
 	}
 }
 

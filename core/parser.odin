@@ -329,6 +329,16 @@ Call_Expr :: struct {
 	callee: Expr,
 }
 
+// Стадия 24 (actor model): `запусти <вызов>` — оборачивает Call_Expr, не
+// заменяет его. Резолвер/типизатор проверяют/резолвят call ТАК ЖЕ, как
+// обычный вызов (resolve_expr(ctx, e.call) переиспользует ^Call_Expr-
+// ветку целиком) — Spawn_Expr лишь маркирует "не выполнять callee
+// синхронно, породить процесс".
+Spawn_Expr :: struct {
+	span: Span,
+	call: ^Call_Expr,
+}
+
 Property_Expr :: struct {
 	span:     Span,
 	object:   Expr,
@@ -410,6 +420,7 @@ Expr :: union {
 	^Try_Expr,
 	^Match_Expr,
 	^Error_Expr,
+	^Spawn_Expr,
 }
 
 // --- ПЕЧАТЬ AST ---
@@ -1724,6 +1735,22 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 	case .Match:
 		return parse_match_expr(p)
 
+	case .Spawn:
+		start := tok.span
+		rbp := prefix_bp(tok)
+		operand := parse_expr(p, rbp)
+		call, ok := operand.(^Call_Expr)
+		if !ok {
+			report_parse(p, span_from(p, start), "Синтаксическая ошибка: 'запусти' ожидает вызов функции")
+			err := new(Error_Expr)
+			err.span = span_from(p, start)
+			return err
+		}
+		s := new(Spawn_Expr)
+		s.call = call
+		s.span = span_from(p, start)
+		return s
+
 	case:
 		report_parse(p, tok.span, "Синтаксическая ошибка: неожиданный токен '%s' (%v) в начале выражения", tok.data, tok.kind)
 		err := new(Error_Expr)
@@ -2079,6 +2106,8 @@ expr_span :: proc(e: Expr) -> Span {
 	case ^Match_Expr:
 		return v.span
 	case ^Error_Expr:
+		return v.span
+	case ^Spawn_Expr:
 		return v.span
 	}
 	return Span{}

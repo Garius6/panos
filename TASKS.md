@@ -11,11 +11,10 @@ completions/references/rename; Type_Id отложен). Следующие
 24 (lightweight
 processes, Elixir/Akka-style actor model — дважды пересмотрена, CSP-каналы
 заменены на actor model) — ключевые решения grilled и подтверждены,
-touch-точки требуют Explore до плана. 25 (интерфейсы для перечислений)
-— untracked gap, найден при grilling 22, независим, не исследован.
+touch-точки требуют Explore до плана. 25 (интерфейсы для перечислений) ✅.
 26 (`panos mod` — встроенный пакетный менеджер, go mod style) — ключевые
 решения grilled (три раунда), touch-точки требуют Explore. **Приоритет
-(grilled)**: 23/24/25/26/4/8 — следующие кандидаты. Type_Id/SoA (остаток
+(grilled)**: 24/26/4/8 — следующие кандидаты. Type_Id/SoA (остаток
 Стадии 5) — отдельная перформансная задача без
 явного триггера.
 **Roadmap**: [ROADMAP.md](ROADMAP.md)
@@ -1250,9 +1249,13 @@ cross-contamination; негатив — нарушение формы контр
 
 ---
 
-## Стадия 24 (grilled — дважды пересмотрено, actor model) — lightweight processes (Elixir/Akka-style)
+## Стадия 24 ✅ (grilled — дважды пересмотрено, actor model) — lightweight processes (Elixir/Akka-style)
 
 Refs: [ROADMAP §Стадия 24](ROADMAP.md#стадия-24-grilled--дважды-пересмотрено-actor-model--lightweight-processes-elixirakka-style).
+
+**ЗАКРЫТА ПОЛНОСТЬЮ** — Task 43-49 реализованы, 8 e2e-тестов,
+`odin test ./core` 123/123, native/lsp/wasm чисто (см. ROADMAP §Стадия
+24 «Task 43-49» для деталей верификации).
 
 ПЕРЕСМОТРЕНА ЦЕЛИКОМ вторым grilling-раундом: первый раунд спроектировал
 CSP-style shared-memory `Канал(T)` + generic `дай`-yield корутины —
@@ -1289,43 +1292,122 @@ vm.odin:800 — frames/stack уже в куче, suspend/resume без asm/OS-fi
 - [x] Отправка мёртвому процессу — тихий no-op (Erlang-поведение), НЕ
       `Результат` (синхронная проверка живости всё равно гонка)
 
-**Investigate (не решения, а факты, которые нужно найти в коде перед
-Порядком работ)**:
-- [ ] Компиляция `запусти`/`получить`/`отправить` — новые Opcode или
-      builtin-функции? (compiler.odin/vm.odin)
-- [ ] Типизация `Процесс(T)` как generic-типа, интеграция с
-      инфраструктурой дженериков (Стадия 7 ✅)
+**Investigate (Explore проведён, находки записаны в ROADMAP §Стадия
+24)**:
+- [x] Компиляция `запусти`/`получить`/`отправить` — три разных
+      механизма: `запусти` новый `nud()`-префикс + опкод `.Spawn`,
+      `получить()` — bare-имя builtin (`BUILTIN_CTORS`-механизм) → опкод
+      `.Receive`, `отправить(процесс, сообщение)` — обычная 2-арг
+      builtin-функция без нового опкода
+- [x] Типизация `Процесс(T)` как generic-типа — ТРЕТЬЯ ветка в
+      `Type_Generic`-цепочке `resolve_type_node` (как `Массив`/
+      `Соответствие`), НЕ через Struct/Enum `Type_Scheme`-механизм
 - [ ] Reflective deep-copy механизм (для copy-on-send по умолчанию) —
-      новый, отдельный от Копируемое; возможно переиспользуем GC's value
-      walker (gc.odin, уже обходит те же структуры для root-marking)
+      новый, отдельный от Копируемое; переиспользуем GC's value walker
+      (gc.odin, уже обходит те же структуры для root-marking) — Task 47
 - [ ] GC root-walking по множеству стеков процессов (gc.odin) — сейчас
-      один `vm.stack`/`vm.frames`, тривиальный корень
-- [ ] Mailbox — структура данных: простая FIFO-очередь на процесс
-      (проще первого раунда — не нужен wait-list с fairness между
-      многими ожидающими одного канала)
-- [ ] Синтаксис `Процесс(T)` + `запусти`-как-выражение (не statement,
-      раз теперь возвращает значение) — parser.odin
+      один `vm.stack`/`vm.frames`, тривиальный корень — Task 47
+- [x] Mailbox — простая FIFO-очередь ([dynamic]Value) прямо полем на
+      `Process_Value`, БЕЗ отдельного GC-объекта (упрощено от
+      Explore-предложения отдельного `Mailbox_Value`)
+- [x] Синтаксис `Процесс(T)` + `запусти`-как-выражение — `Spawn_Expr`
+      (parser.odin), оборачивает `Call_Expr` (резолвер/typecheck/
+      compiler переиспользуют существующие Call_Expr-пути через
+      `e.call`, не дублируют логику)
+
+**Реализация (Task 43-49, см. ROADMAP §Стадия 24 «Порядок работ» +
+«Найдено по ходу»)**:
+- [x] Task 43 — Value/Type foundation: `Process_Value` (compiler.odin),
+      `Type_Kind.Process`/`new_process_type` (type_cheker.odin)
+- [x] Task 44 — VM struct: `Exec_Result`, `VM.processes`, `new_vm()`
+      строит старт() как `Process_Value` "процесс #0", `run_scheduler()`
+      (round-robin, `has_run`-based skip, genuine-deadlock panic)
+- [x] Task 45 — опкоды `.Spawn`/`.Receive` (compiler.odin Opcode enum,
+      vm.odin execute())
+- [x] Task 46 — парсер (`запусти`-префикс, `.Spawn`-токен, лексер) +
+      typecheck (`Процесс(T)`, `получить`/`отправить` builtin'ы,
+      `ensure_body_checked`-мемоизация для T процесса независимо от
+      порядка деклараций, `infer_match_expr` unify-ветка для
+      InferVar-subject через квалифицированные паттерны) + compiler
+      (`.Spawn`-кодоген, `получить()` → `.Receive`, `отправить` →
+      `.Call_Builtin`) + рантайм-обработчик `отправить` (vm.odin,
+      copy-on-send пока БЕЗ реального deep-copy — Task 47). Найден и
+      исправлен попутный баг: `install_standard_symbols` резервировал
+      builtin-имена в общей global scope, конфликтуя с существующими
+      user-функциями `получить`/`отправить` в 2 e2e-тестах — фикс:
+      user-декларация может перетереть `.Builtin`-символ (обычное
+      затенение). Сквозная проверка: spawn → send → suspend (deadlock
+      корректно детектится, когда некому разбудить); негативные типы
+      (`запусти` не-функции, `отправить` не-Процесс) — понятные
+      diagnostics, не крэш.
+- [x] Task 47 — `mark_roots` (gc.odin) теперь ходит циклом по
+      `vm.processes`: mailbox каждого процесса (никогда не свопается,
+      всегда актуален) + `.stack` только НЕ-текущих процессов (текущий
+      уже учтён через `vm.stack` — `process.stack`-дескриптор может быть
+      устаревшим относительно него сразу после append-реаллокации).
+      `message_deep_copy` (vm.odin, адаптация `value_to_display_string`'а
+      walker'а, visited теперь map ОРИГИНАЛ→КОПИЯ — сохраняет топологию
+      циклов, а не просто обрывает обход) — новый `Call_Kind.Send_Copy`
+      (type_cheker.odin): T реализует Копируемое → компилятор вставляет
+      явный `.клонировать()` и эмитит внутреннее имя
+      `отправить_без_копии` (НЕ настоящий `отправить` — иначе рантайм
+      reflective copy исказил бы намеренно НЕ скопированные
+      пользователем поля, см. Копируемое-комментарий в prelude.odin); не
+      реализует → обычный `отправить`, рантайм сам обходит структуру.
+      Проверено: mutation-after-send не искажает уже отправленное
+      значение; explicit-Копируемое путь компилируется и выполняется без
+      ошибок (raw reference-sharing путь vs явный `.клонировать()`-путь
+      оба протестированы).
+- [x] Task 48 — end-to-end интеграция scheduler'а. Найдено по ходу:
+      Порядок работ п.6 подразумевал "получить() на своём mailbox
+      старт() даёт ожидание ответа", но не было способа передать
+      спавненному процессу СВОЙ адрес — добавлен `себя()` (bare
+      builtin, тот же механизм что `получить`, возвращает `Процесс(T)`
+      текущего процесса). Полный цикл (`запусти` → `отправить(...,
+      себя())` → suspend на `получить()` у отправителя → удалённый
+      `отправить` → resume → значение) протестирован end-to-end,
+      воспроизводит ROADMAP-пример дословно.
+- [ ] Task 49 — e2e тесты (перенести ad-hoc smoke-тесты в
+      e2e_test.odin) + финальная верификация (odin test/lsp/wasm) +
+      commit
+
+`odin test ./core` 115/115 после Task 43-48 (0 регрессий). native/lsp/wasm
+чисто.
 
 ---
 
-## Стадия 25 (обнаружено при grilling Стадии 22, не исследовано) — интерфейсы для перечислений
+## Стадия 25 ✅ — интерфейсы для перечислений
 
-Refs: [ROADMAP §Стадия 25](ROADMAP.md#стадия-25-обнаружено-при-grilling-стадии-22-не-исследовано--интерфейсы-для-перечислений).
+Refs: [ROADMAP §Стадия 25](ROADMAP.md#стадия-25--интерфейсы-для-перечислений).
 
-Untracked gap, найден при grilling Стадии 22: `реализация X для
-СвойПеречисление` безусловно отклоняется (type_cheker.odin ~1479,
-Стадия 7 — "узкий scope, не design-ограничение"). Без снятия — Ord/Eq
-(Стадия 22) и любой будущий интерфейс работают только для структур,
-хотя panos активно строится вокруг ADT. Стадия 22 сама эту зависимость
-НЕ требует (остаётся структуры-only) — Стадия 25 независима, полезна
-как отдельное расширение.
+- [x] typecheck guard снят (`target_type.kind == .Enum && d.interface_name
+      != ""` в ПРОХОД 3) + `enum_type.implemented_interfaces`
+      инициализация в ПРОХОД 1 (не было, в отличие от Struct)
+- [x] `unify_types`/`types_are_equal`/`check_expr`'s интерфейс-коэрсия
+      расширена с `left.kind == .Struct` на `|| .Enum` (3 site'а)
+- [x] Рантайм: `Interface_Value.data` `^Aggregate_Value` → `Value`
+      (compiler.odin); `.Cast_Interface` принимает Aggregate_Value ИЛИ
+      Variant_Value (vm.odin); `.Set_Property` через интерфейс остаётся
+      struct-only с понятной ошибкой (Variant_Value без settable-полей);
+      `gc.odin` mark/sweep поправлен под новый тип поля
+- [x] Найден и исправлен: `compiler.odin`'s `case ^Property_Expr:` —
+      ранний `return` для безаргументного конструктора варианта не звал
+      `maybe_emit_interface_cast` (payload-варианты через Call_Expr уже
+      звали)
+- [x] Найден и исправлен: `instantiate_type`'s `case .Enum:` не копировал
+      `implemented_interfaces` при инстанциации generic enum'а (у
+      `.Struct` уже был этот фикс из Стадии 7) — молча терялась
+      реализация интерфейса при каждой инстанциации `Опция(T)`
+- [x] Operator sugar (Ord/Eq/Арифметика/Печатаемое, Стадия 22/23)
+      расширен на `.Enum` — 5 site'ов с `left_t.kind == .Struct`
+- [x] Найден и исправлен (отдельно от enum-специфики): sugar-проверка
+      "тот же тип" использовала `==`/`!=` (указатель) вместо
+      `unify_types` — ложно отвергала нулевой-payload вариант generic-
+      enum'а (`Опция.Нет()`, T не выводится из значения). Подтверждает
+      исходный мотивирующий пример дословно: `Опция.Есть(5) <
+      Опция.Есть(10)` и `Опция.Нет() < Опция.Есть(1)`
 
-- [ ] Investigate: почему контрактный путь (`interface_method_types_match`
-      и вокруг) ограничен Struct-получателями — технический блокер
-      (variant payload access внутри метода интерфейса на enum) или
-      просто отсутствие investment на момент Стадии 7
-- [ ] Investigate: снятие блока в type_cheker.odin ~1479 — что ломается
-      при первом же тесте `реализация X для СвойПеречисление`
+5 e2e-тестов. `odin test ./core` 115/115. native/lsp/wasm чисто.
 
 ---
 

@@ -423,7 +423,7 @@ install_standard_symbols :: proc(ctx: ^Resolver_Ctx) {
 	// Есть/Нет/Успех/Неудача сюда НЕ входят — это Enum_Variant варианты
 	// Опции/Результата из прелюдии, доступные через слияние её exports
 	// в resolve_module (см. ниже).
-	names := [?]string{"Ошибка", "длина", "паника"}
+	names := [?]string{"Ошибка", "длина", "паника", "получить", "отправить", "себя"}
 	for name in names {
 		sym := new_symbol(ctx.symbol_store, name, .Builtin, nil)
 		ctx.current_scope.symbols[intern(name)] = sym
@@ -505,7 +505,16 @@ register_named_symbol :: proc(
 ) -> Symbol_Id {
 	sym := new_symbol(ctx.symbol_store, name, kind, module, is_exported, decl, span)
 	name_id := intern(name)
-	if name_id in module.scope.symbols {
+	if existing_id, taken := module.scope.symbols[name_id];
+	   taken && symbol_at(ctx.symbol_store, existing_id).kind != .Builtin {
+		// Стадия 24: install_standard_symbols резервирует "получить"/
+		// "отправить" (обычные глагольные имена, легко пересекающиеся с
+		// пользовательским кодом — уже было в test_http_url_parsing/
+		// test_math_and_logic, оба объявляют СВОЙ "получить"). Builtin —
+		// не настоящая декларация, пользовательская функция с тем же
+		// именем перетирает её (обычное затенение), а НЕ конфликт.
+		// Настоящий конфликт (два user-decl с одним именем) — по-прежнему
+		// ошибка.
 		report_resolve(ctx, span, "Resolve Error: символ '%s' уже объявлен", name)
 	} else {
 		module.scope.symbols[name_id] = sym
@@ -814,6 +823,11 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		for arg in e.args {
 			resolve_expr(ctx, arg)
 		}
+	case ^Spawn_Expr:
+		// `запусти <вызов>` резолвится ТОЧНО как обычный Call_Expr — сам
+		// Spawn_Expr лишь маркер для typecheck/compile, резолверу нечего
+		// делать по-другому (callee + аргументы резолвятся как всегда).
+		resolve_expr(ctx, e.call)
 	case ^If_Expr:
 		resolve_expr(ctx, e.condition)
 

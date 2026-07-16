@@ -15,6 +15,15 @@ CallFrame :: struct {
 	frame_pointer: int, // Индекс в vm.stack, где начинаются локальные переменные ЭТОЙ функции
 }
 
+// Стадия 24 (actor model): что вернул execute() — доработала ли текущая
+// функция до конца (frames опустели) или приостановилась на .Receive с
+// пустым mailbox (ip остался НА .Receive, resume = повторный вызов
+// execute() для того же процесса).
+Exec_Result :: enum {
+	Completed,
+	Suspended,
+}
+
 VM :: struct {
 	frames:             [dynamic]CallFrame,
 	compiled_functions: map[string]^Compiled_Function,
@@ -28,6 +37,18 @@ VM :: struct {
 	// каждый свой кусок и теряли байты, уже вычитанные другим.
 	stdin_reader:       bufio.Reader,
 	stdin_reader_ready: bool,
+	// Стадия 24 (actor model): все живые процессы (включая старт() —
+	// "процесс #0", см. new_vm). .frames/.stack выше — это ТЕКУЩЕГО
+	// (сейчас исполняемого) процесса, свопнутые в планировщиком
+	// (run_scheduler) перед вызовом execute(); current_process — его
+	// индекс в processes, нужен для root-marking'а в GC (mark_roots
+	// обходит vm.frames/vm.stack для текущего процесса напрямую, а НЕ
+	// через processes[current_process].frames — та копия дескриптора
+	// dynamic array может быть устаревшей относительно vm.frames после
+	// append/реаллокации, синхронизируется только при swap обратно).
+	processes:          [dynamic]^Process_Value,
+	current_process:    int,
+	next_process_id:    int,
 }
 
 // get_stdin_reader — в vm_io_native.odin/vm_io_wasm.odin (#+build split,
@@ -38,7 +59,6 @@ new_vm :: proc(
 	program_args: []string = nil,
 ) -> ^VM {
 	vm := new(VM)
-	vm.frames = make([dynamic]CallFrame)
 	vm.program_args = program_args
 	vm.gc = new_gc_state()
 
@@ -49,16 +69,28 @@ new_vm :: proc(
 		fmt.panicf("Не определена функция 'старт'")
 	}
 
-	main_frame := CallFrame {
-		function      = main_func,
-		ip            = 0,
-		frame_pointer = 0,
-	}
-	append(&vm.frames, main_frame)
-
+	// Стадия 24 (actor model): старт() — "процесс #0", та же
+	// Process_Value-инфраструктура, что запусти-порождённые процессы
+	// (Вопрос 6 грилинга) — без спецкейсов в планировщике дальше.
+	// Единственное, что здесь особенное — САМО создание (никто не
+	// "запускает" старт(), в отличие от остальных процессов).
+	main_process := gc_new(vm, Process_Value)
+	main_process.id = vm.next_process_id
+	vm.next_process_id += 1
+	main_process.is_alive = true
+	append(&main_process.frames, CallFrame{function = main_func, ip = 0, frame_pointer = 0})
 	for _ in 0 ..< main_func.frame_size {
-		append(&vm.stack, 0.0) // Резервируем слоты локальных под нулями
+		append(&main_process.stack, 0.0) // Резервируем слоты локальных под нулями
 	}
+	append(&vm.processes, main_process)
+	vm.current_process = 0
+
+	// Свопаем данные процесса #0 в vm.frames/vm.stack сразу — execute()
+	// работает НАД vm.frames/vm.stack напрямую (см. Exec_Result), не
+	// над processes[i].frames напрямую.
+	vm.frames = main_process.frames
+	vm.stack = main_process.stack
+
 	return vm
 }
 
@@ -275,6 +307,92 @@ value_to_display_string :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]bool
 		return strings.to_string(builder)
 	}
 	return "?"
+}
+
+// Стадия 24 (actor model): copy-on-send reflective deep-copy — адаптация
+// value_to_display_string'а walker'а выше, только вместо строки строит
+// НЕЗАВИСИМУЮ копию через gc_new. Вызывается ТОЛЬКО когда T сообщения НЕ
+// реализует Копируемое (иначе компилятор уже эмитировал явный вызов
+// .клонировать() и "отправить_без_копии", см. Call_Kind.Send_Copy,
+// type_cheker.odin). Примитивы/строки/функции/File/Socket — иммутабельны
+// или намеренно небезопасны для копирования, шарятся по ссылке как есть.
+// Процесс(T)-хэндл — тоже по ссылке (сам процесс не "данные").
+//
+// visited — не просто cycle-guard (как в value_to_display_string), а
+// map ОРИГИНАЛ→КОПИЯ: при повторной встрече уже скопированного указателя
+// возвращает ТУ ЖЕ копию (не оригинал) — сохраняет топологию графа
+// (в т.ч. циклы) в результирующей копии, а не просто обрывает обход.
+message_deep_copy :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]Value) -> Value {
+	#partial switch val in value {
+	case ^Error_Value:
+		if existing, ok := visited[val]; ok do return existing
+		cp := gc_new(vm, Error_Value)
+		visited[val] = Value(cp)
+		cp.code = val.code
+		cp.message = val.message
+		return Value(cp)
+	case ^Option_Value:
+		if existing, ok := visited[val]; ok do return existing
+		cp := gc_new(vm, Option_Value)
+		visited[val] = Value(cp)
+		cp.has_value = val.has_value
+		cp.value = message_deep_copy(vm, val.value, visited)
+		return Value(cp)
+	case ^Result_Value:
+		if existing, ok := visited[val]; ok do return existing
+		cp := gc_new(vm, Result_Value)
+		visited[val] = Value(cp)
+		cp.is_ok = val.is_ok
+		cp.value = message_deep_copy(vm, val.value, visited)
+		cp.error = message_deep_copy(vm, val.error, visited)
+		return Value(cp)
+	case ^Interface_Value:
+		if existing, ok := visited[val]; ok do return existing
+		cp := gc_new(vm, Interface_Value)
+		visited[val] = Value(cp)
+		cp.methods = val.methods
+		cp.data = message_deep_copy(vm, val.data, visited)
+		return Value(cp)
+	case ^Variant_Value:
+		if existing, ok := visited[val]; ok do return existing
+		cp := gc_new(vm, Variant_Value)
+		visited[val] = Value(cp)
+		cp.type_name = val.type_name
+		cp.tag_index = val.tag_index
+		cp.fields = make([dynamic]Value, len(val.fields))
+		for f, i in val.fields do cp.fields[i] = message_deep_copy(vm, f, visited)
+		return Value(cp)
+	case ^Aggregate_Value:
+		if existing, ok := visited[val]; ok do return existing
+		cp := gc_new(vm, Aggregate_Value)
+		visited[val] = Value(cp)
+		cp.elements = make([dynamic]Value, len(val.elements))
+		for el, i in val.elements do cp.elements[i] = message_deep_copy(vm, el, visited)
+		return Value(cp)
+	case ^Array_Value:
+		if existing, ok := visited[val]; ok do return existing
+		cp := gc_new(vm, Array_Value)
+		visited[val] = Value(cp)
+		cp.elements = make([dynamic]Value, len(val.elements))
+		for el, i in val.elements do cp.elements[i] = message_deep_copy(vm, el, visited)
+		return Value(cp)
+	case ^Map_Value:
+		if existing, ok := visited[val]; ok do return existing
+		cp := gc_new(vm, Map_Value)
+		visited[val] = Value(cp)
+		cp.entries = make([dynamic]Map_Entry_Value, len(val.entries))
+		for entry, i in val.entries {
+			cp.entries[i] = Map_Entry_Value {
+				key   = message_deep_copy(vm, entry.key, visited),
+				value = message_deep_copy(vm, entry.value, visited),
+			}
+		}
+		return Value(cp)
+	}
+	// f64/bool/^Panos_String/^Compiled_Function/^File_Value/^Socket_Value/
+	// ^Process_Value — без копии (иммутабельны либо намеренно небезопасны/
+	// бессмысленны для копирования).
+	return value
 }
 
 number_to_index :: proc(value: Value) -> int {
@@ -702,6 +820,45 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		message := expect_string_arg(name, args[0])
 		fmt.panicf("Runtime Panic: %s", message)
 
+	case "себя":
+		expect_arg_count(name, len(args), 0)
+		return Value(vm.processes[vm.current_process]), true
+
+	case "отправить":
+		expect_arg_count(name, len(args), 2)
+		process, ok := args[0].(^Process_Value)
+		if !ok {
+			fmt.panicf("Runtime Error: отправить() ожидает Процесс(T) первым аргументом")
+		}
+		if !process.is_alive {
+			// Erlang-поведение: тихий no-op на мёртвый процесс (ROADMAP
+			// Стадия 24, п.8) — синхронная проверка живости всё равно
+			// гонка, Результат создал бы ложное чувство надёжности.
+			return Value(f64(0)), false
+		}
+		// T сообщения НЕ реализует Копируемое (иначе компилятор эмитил
+		// бы "отправить_без_копии", см. Call_Kind.Send_Copy) — рантайм
+		// сам делает reflective deep-copy.
+		visited := make(map[rawptr]Value, 0, context.temp_allocator)
+		append(&process.mailbox, message_deep_copy(vm, args[1], &visited))
+		return Value(f64(0)), false
+
+	case "отправить_без_копии":
+		// Стадия 24: внутреннее имя, эмитится ТОЛЬКО компилятором
+		// (Call_Kind.Send_Copy) — сообщение уже прошло .клонировать(),
+		// повторный reflective copy исказил бы намеренно НЕ
+		// скопированные пользователем поля.
+		expect_arg_count(name, len(args), 2)
+		process, ok := args[0].(^Process_Value)
+		if !ok {
+			fmt.panicf("Runtime Error: отправить() ожидает Процесс(T) первым аргументом")
+		}
+		if !process.is_alive {
+			return Value(f64(0)), false
+		}
+		append(&process.mailbox, args[1])
+		return Value(f64(0)), false
+
 	case "ос::аргументы":
 		expect_arg_count(name, len(args), 0)
 		arr := gc_new(vm, Array_Value)
@@ -895,7 +1052,13 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	)
 }
 
-execute :: proc(vm: ^VM) {
+// Стадия 24 (actor model): работает над vm.frames/vm.stack — планировщик
+// (run_scheduler) отвечает за то, чтобы они отражали ТЕКУЩИЙ процесс
+// перед вызовом. Возвращает .Suspended, если наткнулась на .Receive с
+// пустым mailbox (ip остаётся на самом .Receive — resume перепроверит),
+// .Completed, если верхнеуровневая функция процесса действительно
+// вернулась (frames опустели).
+execute :: proc(vm: ^VM) -> Exec_Result {
 
 	for len(vm.frames) > 0 {
 
@@ -1253,7 +1416,17 @@ execute :: proc(vm: ^VM) {
 			if agg, ok_agg := target.(^Aggregate_Value); ok_agg {
 				agg.elements[idx] = value
 			} else if iface, ok_iface := target.(^Interface_Value); ok_iface {
-				iface.data.elements[idx] = value
+				// Стадия 25: iface.data теперь Value (было ^Aggregate_Value
+				// напрямую) — перечисления тоже могут стоять за интерфейсом,
+				// но у Variant_Value нет settable-полей (не Aggregate_Value),
+				// присваивание через интерфейс им не смысленно.
+				agg, ok_agg := iface.data.(^Aggregate_Value)
+				if !ok_agg {
+					fmt.panicf(
+						"Runtime Error: присваивание полю через интерфейс поддержано только для структур",
+					)
+				}
+				agg.elements[idx] = value
 			} else if err, ok_err := target.(^Error_Value); ok_err {
 				text, ok_text := value.(^Panos_String)
 				if !ok_text {
@@ -1350,18 +1523,24 @@ execute :: proc(vm: ^VM) {
 			struct_name := frame.function.constants[struct_name_index].(^Panos_String).data
 
 			val := pop(&vm.stack)
-			agg, ok := val.(^Aggregate_Value)
-			if !ok {
+			// Стадия 25: структура ИЛИ перечисление — vtable-механизм ниже
+			// ищет методы по имени "ИмяТипа::метод" среди vm.compiled_
+			// functions, ему всё равно, Aggregate_Value это или
+			// Variant_Value (то же самое, что уже верно для обычного
+			// вызова метода на структуре/enum — см. infer_property_expr).
+			_, is_agg := val.(^Aggregate_Value)
+			_, is_variant := val.(^Variant_Value)
+			if !is_agg && !is_variant {
 				fmt.panicf(
-					"Runtime Error: в интерфейс можно привести только структуру",
+					"Runtime Error: в интерфейс можно привести только структуру или перечисление",
 				)
 			}
-			// agg только что снят со стека — до gc_new(Interface_Value) он
+			// val только что снят со стека — до gc_new(Interface_Value) он
 			// нигде не закреплён, protect'им явно (см. gc_protect в gc.odin).
 			gc_protect(vm, val)
 
 			iface := gc_new(vm, Interface_Value)
-			iface.data = agg
+			iface.data = val
 			iface.methods = make(map[string]^Compiled_Function)
 
 			prefix := fmt.tprintf("%s::", struct_name)
@@ -1438,12 +1617,135 @@ execute :: proc(vm: ^VM) {
 			if has_result {
 				append(&vm.stack, result)
 			}
+
+		case .Spawn:
+			frame.ip += 1
+			arg_count := int(instructions[frame.ip])
+
+			// Функция и аргументы лежат на ТЕКУЩЕМ стеке — как перед .Call —
+			// но мы НЕ выполняем callee здесь, а копируем аргументы в СВЕЖИЙ
+			// стек нового процесса (own frames/stack, см. Process_Value).
+			callee_index := len(vm.stack) - 1 - arg_count
+			callee_val := vm.stack[callee_index]
+
+			func_ptr, ok := callee_val.(^Compiled_Function)
+			if !ok {
+				fmt.panicf(
+					"Runtime Error: попытка запустить (запусти) не функцию (получено: %v)",
+					callee_val,
+				)
+			}
+
+			new_process := gc_new(vm, Process_Value)
+			new_process.id = vm.next_process_id
+			vm.next_process_id += 1
+			new_process.is_alive = true
+
+			append(
+				&new_process.frames,
+				CallFrame{function = func_ptr, ip = 0, frame_pointer = 0},
+			)
+			for i := 0; i < arg_count; i += 1 {
+				append(&new_process.stack, vm.stack[callee_index + 1 + i])
+			}
+			locals_to_allocate := func_ptr.frame_size - arg_count
+			for _ in 0 ..< locals_to_allocate {
+				append(&new_process.stack, Value(f64(0)))
+			}
+
+			append(&vm.processes, new_process)
+
+			// Снимаем fn+аргументы с текущего стека, кладём handle процесса
+			resize(&vm.stack, callee_index)
+			append(&vm.stack, Value(new_process))
+
+		case .Receive:
+			process := vm.processes[vm.current_process]
+			if len(process.mailbox) == 0 {
+				// Чистый ранний выход: ip НЕ двигаем (даже байт операнда —
+				// у .Receive его нет), при resume execute() снова начнёт
+				// именно с этой же инструкции .Receive и перепроверит mailbox.
+				return .Suspended
+			}
+			msg := process.mailbox[0]
+			ordered_remove(&process.mailbox, 0)
+			append(&vm.stack, msg)
 		}
 
 		// Двигаем IP текущего фрейма вперед
 		frame.ip += 1
 	}
 
+	return .Completed
+}
+
+// Стадия 24 (actor model): единственная точка входа для запуска VM —
+// раньше был один вызов execute(vm) (Value 1 старт()), теперь execute()
+// нужно вызывать МНОГО раз (по одному на процесс за тик), round-robin
+// (Вопрос 2 грилинга — простой вариант, без runnable/waiting очередей).
+// Возвращает управление, когда старт() ("процесс #0") завершается —
+// программа выходит СРАЗУ, не дожидаясь осиротевших процессов (Вопрос 6).
+// vm.frames/vm.stack по возврату — финальное состояние процесса #0, тот
+// же контракт, что раньше давал одиночный execute(vm) (vm.stack[len-1] —
+// результат старт()).
+run_scheduler :: proc(vm: ^VM) {
+	for {
+		any_ran := false
+
+		i := 0
+		for i < len(vm.processes) {
+			process := vm.processes[i]
+
+			// Пустой mailbox у УЖЕ хоть раз запущенного процесса — нечего
+			// делать, пропускаем без входа в execute() (deadlock-guard:
+			// если так для ВСЕХ процессов подряд — некому никого
+			// разбудить, см. ниже). Свежеспавненный (has_run=false)
+			// обязан получить хотя бы один прогон, даже с пустым mailbox —
+			// тело процесса не обязано начинаться с получить().
+			if process.has_run && len(process.mailbox) == 0 {
+				i += 1
+				continue
+			}
+
+			any_ran = true
+			process.has_run = true
+
+			vm.frames = process.frames
+			vm.stack = process.stack
+			vm.current_process = i
+
+			result := execute(vm)
+
+			process.frames = vm.frames
+			process.stack = vm.stack
+
+			if result == .Completed {
+				if i == 0 {
+					// старт() завершился — программа выходит немедленно,
+					// vm.frames/vm.stack уже отражают его финальное
+					// состояние (ничего дополнительно свопать не нужно).
+					return
+				}
+				process.is_alive = false
+				clear(&process.frames)
+				clear(&process.stack)
+				clear(&process.mailbox)
+				unordered_remove(&vm.processes, i)
+				continue // swap-remove передвинул последний элемент на место i — не увеличиваем i
+			}
+
+			i += 1
+		}
+
+		if !any_ran {
+			// Ни один процесс не выполнялся за целый круг — никто не
+			// сможет никого разбудить (отправить() вызывается ТОЛЬКО из
+			// исполняющегося кода). Настоящий дедлок, не приближение.
+			fmt.panicf(
+				"Runtime Error: все процессы заблокированы в ожидании сообщений (дедлок)",
+			)
+		}
+	}
 }
 
 print_vm :: proc(vm: ^VM) {

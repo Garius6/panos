@@ -42,7 +42,7 @@ run_source_with_args :: proc(
 
 	// 4. Выполнение (VM)
 	vm := new_vm(registry, program_args)
-	execute(vm)
+	run_scheduler(vm)
 
 	if len(vm.stack) > 0 {
 		return vm.stack[len(vm.stack) - 1], true, nil

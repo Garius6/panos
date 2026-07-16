@@ -1264,16 +1264,23 @@ interface_method_types_match :: proc(
 	if expected.kind != .Function || actual.kind != .Function do return false
 	if len(expected.params) != len(actual.params) do return false
 
+	// Стадия 28: unify_types вместо types_are_equal — для НЕ-generic
+	// интерфейсов (нет свободных InferVar в expected) ведёт себя ИДЕНТИЧНО
+	// types_are_equal (структурное сравнение конкретных типов). Для
+	// generic-интерфейсов expected уже содержит свежую InferVar на месте
+	// T (подставлена вызывающим кодом перед вызовом, см. ПРОХОД 3) —
+	// unify_types СВЯЗЫВАЕТ её с actual (напр. Число), types_are_equal
+	// такое отвергла бы (InferVar никогда не "равна" конкретному типу).
 	if expected.return_type == iface_type {
 		if actual.return_type != target_type do return false
-	} else if !types_are_equal(actual.return_type, expected.return_type) {
+	} else if !unify_types(actual.return_type, expected.return_type) {
 		return false
 	}
 
 	for i in 1 ..< len(expected.params) {
 		if expected.params[i] == iface_type {
 			if actual.params[i] != target_type do return false
-		} else if !types_are_equal(actual.params[i], expected.params[i]) {
+		} else if !unify_types(actual.params[i], expected.params[i]) {
 			return false
 		}
 	}
@@ -1353,7 +1360,17 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			iface_type.kind = .Interface
 			iface_type.name = d.name
 			iface_type.interface_methods = make(map[string]^Type)
-			ctx.res.symbol_types[ctx.res.decl_symbols[decl]] = iface_type
+			iface_sym := ctx.res.decl_symbols[decl]
+			// Стадия 28: generic-интерфейсы — generic_origin выставляем
+			// симметрично Struct_Decl/Enum_Decl (см. ниже), хотя сам
+			// механизм инстанциации иной (см. ПРОХОД 3, проверка
+			// контракта) — try_generalize/scheme для интерфейсов НЕ
+			// используется, T подставляется напрямую через
+			// decl_type_param_order в месте проверки impl.
+			if len(d.type_params) > 0 {
+				iface_type.generic_origin = iface_sym
+			}
+			ctx.res.symbol_types[iface_sym] = iface_type
 
 		case ^Enum_Decl:
 			enum_type := new(Type)
@@ -1444,14 +1461,39 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			}
 
 		case ^Interface_Decl:
-			iface_type := ctx.res.symbol_types[ctx.res.decl_symbols[decl]]
+			iface_sym := ctx.res.decl_symbols[decl]
+			iface_type := ctx.res.symbol_types[iface_sym]
 			iface_type.interface_methods = make(map[string]^Type)
-			for m in d.methods {
-				iface_type.interface_methods[m.name] = interface_method_type_from_signature(
-					ctx,
-					iface_type,
-					m,
-				)
+
+			// Стадия 28: тот же паттерн, что Struct_Decl/Enum_Decl выше —
+			// T резолвится в scope (свежий InferVar на имя) на время
+			// резолва сигнатур методов, чтобы `Опция(T)` внутри резолвился
+			// через ctx.current_type_params, как поле generic-структуры.
+			if len(d.type_params) > 0 {
+				prev_params := ctx.current_type_params
+				params_map := make(map[string]^Type)
+				ordered := make([dynamic]^Type)
+				make_decl_type_params(ctx, d.type_params[:], &params_map, &ordered)
+				ctx.current_type_params = params_map
+				ctx.decl_type_params[iface_sym] = params_map
+				ctx.decl_type_param_order[iface_sym] = ordered
+
+				for m in d.methods {
+					iface_type.interface_methods[m.name] = interface_method_type_from_signature(
+						ctx,
+						iface_type,
+						m,
+					)
+				}
+				ctx.current_type_params = prev_params
+			} else {
+				for m in d.methods {
+					iface_type.interface_methods[m.name] = interface_method_type_from_signature(
+						ctx,
+						iface_type,
+						m,
+					)
+				}
 			}
 
 		case ^Enum_Decl:
@@ -1653,6 +1695,24 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 					}
 
 					expected_method_type := iface_type.interface_methods[req_name]
+
+					// Стадия 28: generic-интерфейс — T в expected_method_type
+					// сейчас та же InferVar, что и в ДЕКЛАРАЦИИ интерфейса
+					// (общая на ВСЕ impl-блоки). Подставляем СВЕЖУЮ InferVar
+					// на T ПЕРЕД сравнением — иначе связывание T первым же
+					// impl'ом (interface_method_types_match ниже теперь
+					// unify_types, не types_are_equal) зацементировало бы T
+					// навсегда, ломая проверку второго impl с другим T.
+					// instantiate_type НЕ трогает сам iface_type (нет кейса
+					// под .Interface — проходит как есть, тот же указатель),
+					// так что Self-проверка (params[0] == iface_type) ниже не
+					// страдает — подставляются только вхождения T.
+					if order, has_params := ctx.decl_type_param_order[iface_sym]; has_params && len(order) > 0 {
+						subst := make(map[int]^Type)
+						for tv in order do subst[tv.infer_id] = new_infer_var(ctx)
+						expected_method_type = instantiate_type(ctx, expected_method_type, &subst)
+					}
+
 					actual_method_type := ctx.res.symbol_types[method_sym]
 					if !interface_method_types_match(expected_method_type, actual_method_type, iface_type, target_type) {
 						report(

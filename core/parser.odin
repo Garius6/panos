@@ -78,6 +78,10 @@ Method_Signature :: struct {
 Interface_Decl :: struct {
 	span:        Span,
 	name:        string,
+	// Стадия 28: имена type-параметров из `[T]` после имени интерфейса
+	// (та же форма, что Struct_Decl.type_params). Пусто для обычных
+	// (не-generic) интерфейсов.
+	type_params: [dynamic]string,
 	methods:     [dynamic]Method_Signature,
 	is_exported: bool,
 }
@@ -776,6 +780,10 @@ parse_interface_decl :: proc(p: ^Parser, is_exported: bool) -> ^Interface_Decl {
 
 	name_tok := next_token(p.stream)
 	decl.name = name_tok.data
+
+	if peek_token(p.stream).kind == .LBracket {
+		decl.type_params = parse_type_params(p)
+	}
 
 	expect(p, .Assign)
 	expect(p, .Interface)

@@ -248,6 +248,12 @@ Match_Arm_Kind :: enum {
 	Wildcard,
 	Binder,
 	Constructor,
+	Literal,
+	// `выбор точка { Точка(1, x) -> ... }` — структура вместо enum-варианта.
+	// В отличие от .Constructor, тут нет тега (у структуры одна форма) —
+	// компилятор не эмитит .Match_Tag, сразу распаковывает поля через
+	// .Get_Property и рекурсивно проверяет sub_patterns.
+	Struct_Constructor,
 }
 
 Pattern_Info :: struct {
@@ -257,6 +263,11 @@ Pattern_Info :: struct {
 	// Для конструктора: рекурсивные под-шаблоны, по одному на поле варианта.
 	sub_patterns: [dynamic]Pattern_Info,
 	span:         Span,
+	// Для .Literal: сам литерал (Number_Expr/String_Expr/Boolean_Expr) —
+	// compiler.odin компилирует его как обычное выражение (emit_constant
+	// через compile_expr) и сравнивает через .Equal, тот же опкод, что уже
+	// делает структурное сравнение для оператора == (value_equals, vm.odin).
+	literal_expr: Expr,
 }
 
 classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type) -> Pattern_Info {
@@ -274,8 +285,20 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 		info.kind = .Wildcard
 	case ^Pattern_Literal:
 		info.span = pat.span
-		report(ctx, pat.span, "Type Error: литеральные шаблоны в выборе пока не поддерживаются")
-		info.kind = .Wildcard
+		expected := prune_type(expected_type)
+		if expected.kind != .Number && expected.kind != .String && expected.kind != .Bool {
+			report(
+				ctx,
+				pat.span,
+				"Type Error: литеральный шаблон ожидает Число/Строку/Булево, получено '%s'",
+				expected.name,
+			)
+			info.kind = .Wildcard
+			return info
+		}
+		check_expr(ctx, pat.value, expected)
+		info.kind = .Literal
+		info.literal_expr = pat.value
 	case ^Pattern_Ident:
 		info.span = pat.span
 		expected := prune_type(expected_type)
@@ -312,11 +335,49 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 	case ^Pattern_Constructor:
 		info.span = pat.span
 		expected := prune_type(expected_type)
+		if expected.kind == .Struct {
+			// `Точка(1, x)` на Struct-subject: не enum-тег, а разбор полей
+			// по ПОРЯДКУ ОБЪЯВЛЕНИЯ — тот же принцип, что и `пер Точка(a,
+			// b) = ...` (Стадия 30), но с полноценными под-шаблонами
+			// (литералы/`_`/биндеры/вложенные конструкторы), а не только
+			// именами.
+			if pat.name != expected.name {
+				report(
+					ctx,
+					pat.span,
+					"Type Error: шаблон-конструктор '%s' не совпадает со структурой '%s'",
+					pat.name,
+					expected.name,
+				)
+				info.kind = .Wildcard
+				return info
+			}
+			if len(pat.args) != len(expected.fields) {
+				report(
+					ctx,
+					pat.span,
+					"Type Error: у структуры '%s' %d полей, в шаблоне '%s(...)' %d аргументов",
+					expected.name,
+					len(expected.fields),
+					pat.name,
+					len(pat.args),
+				)
+				info.kind = .Wildcard
+				return info
+			}
+			info.kind = .Struct_Constructor
+			info.sub_patterns = make([dynamic]Pattern_Info)
+			for arg_pat, i in pat.args {
+				sub := classify_pattern(ctx, arg_pat, expected.fields[i].type)
+				append(&info.sub_patterns, sub)
+			}
+			return info
+		}
 		if expected.kind != .Enum {
 			report(
 				ctx,
 				pat.span,
-				"Type Error: шаблон-конструктор '%s' ожидает значение перечисления, получено '%s'",
+				"Type Error: шаблон-конструктор '%s' ожидает значение перечисления или структуры, получено '%s'",
 				pat.name,
 				expected.name,
 			)
@@ -374,6 +435,10 @@ check_match_coverage :: proc(
 	total := len(subject_type.variants)
 	covered := make([dynamic]bool, total, context.temp_allocator)
 	catch_all := false
+	// Булево — единственный литеральный тип с конечным (2-элементным) доменом,
+	// поэтому для него, в отличие от Число/Строка, возможна настоящая
+	// exhaustiveness-проверка без обязательного catch_all: [0]=ложь, [1]=истина.
+	bool_covered: [2]bool
 
 	for pi, arm_idx in arm_infos {
 		if catch_all {
@@ -412,13 +477,14 @@ check_match_coverage :: proc(
 					"Type Error: внутренняя ошибка — тег варианта вне диапазона",
 				)
 			}
-			// Constructor-с-нетривиальными-подшаблонами (nested constructors or
-			// non-wildcard binders) НЕ покрывает вариант целиком — семантика
-			// exhaustiveness требует полного покрытия. Помечаем как covered
-			// только если все подшаблоны — Wildcard или Binder.
+			// Constructor-с-нетривиальными-подшаблонами (nested constructors,
+			// литеральные под-шаблоны или non-wildcard биндеры) НЕ покрывает
+			// вариант целиком — семантика exhaustiveness требует полного
+			// покрытия. Помечаем как covered только если все подшаблоны —
+			// Wildcard или Binder.
 			fully_covers := true
 			for sub in pi.sub_patterns {
-				if sub.kind == .Constructor {
+				if sub.kind == .Constructor || sub.kind == .Struct_Constructor || sub.kind == .Literal {
 					fully_covers = false
 					break
 				}
@@ -434,10 +500,94 @@ check_match_coverage :: proc(
 				)
 			}
 			if fully_covers do covered[pi.tag_index] = true
+		case .Struct_Constructor:
+			// У структуры одна форма (не enum-теги) — единственный вопрос
+			// исчерпываемости: покрывает ли эта ветка ВСЕ поля целиком
+			// (все под-шаблоны — Wildcard/Binder). Если да — эквивалентно
+			// голому `_`/биндеру, catch_all и обязана быть последней.
+			// Если нет (как `Точка(1, x)` — первое поле сужено литералом)
+			// — просто ещё одна частичная ветка, ничего не покрывает сама
+			// по себе, нужна финальная catch-all ветка (см. конец функции).
+			fully_covers := true
+			for sub in pi.sub_patterns {
+				if sub.kind == .Constructor || sub.kind == .Struct_Constructor || sub.kind == .Literal {
+					fully_covers = false
+					break
+				}
+			}
+			if fully_covers {
+				catch_all = true
+				if arm_idx != len(arm_infos) - 1 {
+					report(
+						ctx,
+						pi.span,
+						"Type Error: ветка-конструктор структуры, покрывающая все поля, должна быть только последней — она покрывает все случаи",
+					)
+				}
+			}
+		case .Literal:
+			// Число/Строка: домен неперечислим, ничего не покрывает —
+			// единственная гарантия exhaustiveness для них — обязательный
+			// catch_all (проверка ниже). Булево — особый случай, покрываем
+			// конкретное значение.
+			if subject_type.kind == .Bool {
+				if b, ok := pi.literal_expr.(^Boolean_Expr); ok {
+					idx := b.value ? 1 : 0
+					if bool_covered[idx] {
+						report(
+							ctx,
+							pi.span,
+							"Type Error: значение '%s' покрыто повторно в ветке #%d",
+							b.value ? "истина" : "ложь",
+							arm_idx + 1,
+						)
+					}
+					bool_covered[idx] = true
+				}
+			}
 		}
 	}
 
 	if catch_all do return
+
+	if subject_type.kind == .Bool {
+		if bool_covered[0] && bool_covered[1] do return // оба значения покрыты — действительно исчерпывающе
+		missing := make([dynamic]string, context.temp_allocator)
+		if !bool_covered[0] do append(&missing, "ложь")
+		if !bool_covered[1] do append(&missing, "истина")
+		joined := strings.join(missing[:], ", ", context.temp_allocator)
+		report(ctx, match_span, "Type Error: выбор не покрывает значения: %s", joined)
+		return
+	}
+
+	if subject_type.kind == .Struct {
+		// У структуры одна форма — ни одна ветка выше не была fully_covers
+		// (иначе catch_all уже сработал и мы вернулись раньше), значит все
+		// они частично сужены (литералами/вложенными конструкторами) и
+		// вместе не гарантируют покрытие. Нужна финальная catch-all ветка.
+		report(
+			ctx,
+			match_span,
+			"Type Error: выбор по '%s' должен заканчиваться веткой '_', биндером или конструктором, покрывающим все поля (например '%s(_, _)')",
+			subject_type.name,
+			subject_type.name,
+		)
+		return
+	}
+
+	if subject_type.kind != .Enum {
+		// Число/Строка — домен не перечислим, в отличие от enum'а (и
+		// Булево выше) тут нет способа перечислить "что осталось",
+		// единственная гарантия exhaustiveness — обязательная ветка
+		// `_`/биндер в конце.
+		report(
+			ctx,
+			match_span,
+			"Type Error: выбор по '%s' должен заканчиваться веткой '_' или биндером — набор литеральных веток не может быть исчерпывающим",
+			subject_type.name,
+		)
+		return
+	}
 
 	missing := make([dynamic]string, context.temp_allocator)
 	for was_covered, i in covered {
@@ -2323,6 +2473,80 @@ infer_for_in_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, s: ^For_In_Stmt) {
 	ctx.loop_depth -= 1
 }
 
+// Деструктуризация в пер/конст — `пер (a, b) = кортеж` (тупл, s.names
+// непусто, s.destructure_type == "") или `пер Тип(a, b) = значение`
+// (структура, поля по ПОРЯДКУ ОБЪЯВЛЕНИЯ — тот же позиционный принцип,
+// что и у обычного конструктора `Тип(1, 2)`). Тот же общий каркас, что
+// infer_for_in_stmt использует для `для (a, b) в ...` — bind_poison на
+// несовпадении формы, без каскада вторичных diagnostics.
+infer_let_destructure_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, s: ^Let_Stmt) {
+	syms := ctx.res.let_destructure_syms[stmt]
+	value_type := prune_type(infer_expr(ctx, s.value))
+
+	bind_poison := proc(ctx: ^Type_Ctx, syms: [dynamic]Symbol_Id) {
+		for sym in syms do ctx.res.symbol_types[sym] = TY_POISON
+	}
+
+	if value_type.kind == .Poison {
+		bind_poison(ctx, syms)
+		return
+	}
+
+	if s.destructure_type != "" {
+		if value_type.kind != .Struct || value_type.name != s.destructure_type {
+			report(
+				ctx,
+				s.span,
+				"Type Error: шаблон 'пер %s(...)' не совпадает со значением типа '%s'",
+				s.destructure_type,
+				value_type.name,
+			)
+			bind_poison(ctx, syms)
+			return
+		}
+		if len(value_type.fields) != len(syms) {
+			report(
+				ctx,
+				s.span,
+				"Type Error: у структуры '%s' %d полей, в шаблоне деструктуризации %d имён",
+				value_type.name,
+				len(value_type.fields),
+				len(syms),
+			)
+			bind_poison(ctx, syms)
+			return
+		}
+		for i in 0 ..< len(syms) {
+			ctx.res.symbol_types[syms[i]] = prune_type(value_type.fields[i].type)
+		}
+	} else {
+		if value_type.kind != .Tuple {
+			report(
+				ctx,
+				s.span,
+				"Type Error: шаблон 'пер (...)' ожидает тупл, получено '%s'",
+				value_type.name,
+			)
+			bind_poison(ctx, syms)
+			return
+		}
+		if len(value_type.elements) != len(syms) {
+			report(
+				ctx,
+				s.span,
+				"Type Error: тупл из %d элементов не совпадает с шаблоном из %d имён",
+				len(value_type.elements),
+				len(syms),
+			)
+			bind_poison(ctx, syms)
+			return
+		}
+		for i in 0 ..< len(syms) {
+			ctx.res.symbol_types[syms[i]] = prune_type(value_type.elements[i])
+		}
+	}
+}
+
 // --- ПРОВЕРКА ИНСТРУКЦИЙ (STATEMENTS) ---
 
 // Statement-level проверка знает ожидаемый тип возврата окружения.
@@ -2359,6 +2583,10 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 		return TY_VOID
 
 	case ^Let_Stmt:
+		if len(s.names) > 0 {
+			infer_let_destructure_stmt(ctx, stmt, s)
+			return nil
+		}
 		sym := ctx.res.stmt_symbols[stmt]
 		if s.type_annotation != nil {
 			expected_type := resolve_type_node(ctx, s.type_annotation)
@@ -3899,14 +4127,18 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 		subject_type = subject_type_actual
 	}
 
-	if subject_type.kind != .Enum {
+	if subject_type.kind != .Enum &&
+	   subject_type.kind != .Number &&
+	   subject_type.kind != .String &&
+	   subject_type.kind != .Bool &&
+	   subject_type.kind != .Struct {
 		// Возвращаем сразу — иначе классификация каждой ветки ниже полезет
 		// в classify_pattern с невалидным subject_type и продублирует эту
 		// же ошибку на каждую ветку.
 		return report(
 			ctx,
 			e.span,
-			"Type Error: выбор ожидает значение перечисления, получено '%s'",
+			"Type Error: выбор ожидает значение перечисления, структуры, числа, строки или булево, получено '%s'",
 			subject_type_actual.name,
 		)
 	}

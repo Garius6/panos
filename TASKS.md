@@ -1249,6 +1249,105 @@ cross-contamination; негатив — нарушение формы контр
 
 ---
 
+## Стадия 29 ✅ — литеральные шаблоны в `выбор`
+
+Refs: [ROADMAP §Стадия 29](ROADMAP.md#стадия-29--литеральные-шаблоны-в-выбор).
+
+`Pattern_Literal` был в AST давно, но парсер его никогда не создавал
+(любой не-Ident токен — сразу parse error), `classify_pattern` безусловно
+репортил "пока не поддерживаются", `infer_match_expr` требовал
+`.Enum`-subject строго — `выбор` на Число/Строка/Булево был недостижим
+целиком.
+
+- [x] `core/parser.odin` — `parse_pattern`: 3 новых `if`-ветки
+      (Number/String/Boolean)
+- [x] `core/resolver.odin` — `resolve_pattern`'s `Pattern_Literal`-кейс
+      резолвит `p.value` вместо ошибки
+- [x] `core/type_cheker.odin` — `Match_Arm_Kind.Literal` +
+      `Pattern_Info.literal_expr`; `classify_pattern` типчекает литерал
+      против `expected_type`; `infer_match_expr` — Enum-only gate
+      расширен на Number/String/Bool; `check_match_coverage` — Bool
+      получает НАСТОЯЩУЮ exhaustiveness (2-элементный `bool_covered`,
+      `_` не обязателен при покрытых истина+ложь), Number/Строка требуют
+      обязательный catch-all (домен неперечислим)
+- [x] `core/compiler.odin` — `compile_pattern`'s `.Literal`-кейс:
+      `.Equal` + `.Jump_If_False`, БЕЗ нового опкода (переиспользует
+      структурное сравнение оператора `==`, Стадия 22)
+- [x] Бесплатный бонус: литеральные шаблоны работают как под-шаблоны
+      внутри `Событие.Клик(1, y)` — `classify_pattern` уже рекурсивен
+
+**Отклонено**: отрицательные числовые литералы (`-1 -> ...`) — реализация
+была написана и убрана после того, как ручная трассировка (не Explore)
+нашла причину непонятной ошибки парсинга: `parse_match_expr` парсит
+subject без newline-aware терминации, `выбор x\n-1 -> ...` неотличимо от
+`x - 1` на уровне токенов (ведущий `-` одновременно валиден как
+префиксный унарный минус И инфиксное вычитание). Не полумера — явное
+отсутствие фичи лучше, чем ловушка на конкретной комбинации subject +
+первая ветка.
+
+7 e2e-тестов (Число+`_`, Строка+биндер-catchall, Булево БЕЗ `_`
+exhaustive, литерал в Constructor-подшаблоне, 3 негативных). `odin test
+./core` 130/130 (0 регрессий). native/lsp/wasm чисто.
+
+---
+
+## Стадия 30 ✅ — деструктуризация в `пер`/`конст`
+
+Refs: [ROADMAP §Стадия 30](ROADMAP.md#стадия-30--деструктуризация-в-перконст).
+
+Естественное продолжение Стадии 29 в том же разговоре. Две формы, обе
+позиционные: `пер (a, b) = кортеж` (тупл) и `пер Тип(a, b) = значение`
+(структура, по порядку объявления полей). `конст (a, b) = ...` тоже
+работает — `is_const` пробрасывается на каждое имя бесплатно.
+
+- [x] `core/parser.odin` — `Let_Stmt.names`/`.destructure_type`,
+      `parse_let_stmt` разбирает `(a, b)` и `Тип(a, b)`
+- [x] `core/resolver.odin` — `let_destructure_syms` (та же форма, что
+      `for_in_names_syms`), символ на каждое имя
+- [x] `core/type_cheker.odin` — `infer_let_destructure_stmt`: тупл-ветка
+      (`.Tuple` + длина), структур-ветка (`.Struct` + имя + число полей)
+- [x] `core/compiler.odin` — `Let_Stmt`-кейс: RHS в temp slot,
+      `.Get_Property`(i) + `.Set_Local` на каждое имя — БЕЗ нового
+      опкода, тот же приём, что `compile_for_in_stmt` уже применяет
+- [x] `core/position.odin` — `collect_local_symbols_stmt` видит
+      деструктурированные имена (LSP-автодополнение)
+
+5 e2e-тестов (тупл, структура, `конст`-immutability, 2 негативных —
+arity mismatch, wrong struct type). `odin test ./core` 135/135 (0
+регрессий). native/lsp/wasm чисто.
+
+---
+
+## Стадия 31 ✅ — структурные конструктор-шаблоны в `выбор`
+
+Refs: [ROADMAP §Стадия 31](ROADMAP.md#стадия-31--структурные-конструктор-шаблоны-в-выбор).
+
+Запрос: объединить `выбор` и деструктуризацию — `выбор точка { Точка(1,
+x) -> ...; Точка(_, _) -> ... }`. `Pattern_Constructor` теперь работает
+и на структурах, не только enum-вариантах — по ИМЕНИ ТИПА, поля по
+порядку объявления, полноценные под-шаблоны (не только имена, как у
+`пер`-деструктуризации Стадии 30).
+
+- [x] `core/type_cheker.odin` — `Match_Arm_Kind.Struct_Constructor`;
+      `classify_pattern`'s `Pattern_Constructor`-кейс: новая struct-ветка
+      (имя + число полей) перед enum-веткой; `infer_match_expr` gate
+      расширен на `.Struct`; `check_match_coverage` — `.Struct_
+      Constructor` с всеми-wildcard подшаблонами = catch_all (как голый
+      `_`), иначе требует финальную catch-all ветку
+- [x] `core/compiler.odin` — `compile_pattern`'s `.Struct_Constructor`:
+      БЕЗ `.Match_Tag` (одна форма, нечего сравнивать), сразу
+      `.Get_Property` + рекурсия — тот же приём, что пер-деструктуризация
+
+Известное консервативное упрощение (унаследовано от Стадии 25/29, не
+регрессия): вложенный конструктор-под-шаблон всегда "не покрывает
+целиком", даже если сам исчерпывающий — та же аппроксимация, что уже
+была у `.Literal`/`.Constructor` под-шаблонов.
+
+4 e2e-теста (полный пример из запроса, 3 негативных). `odin test ./core`
+139/139 (0 регрессий). native/lsp/wasm чисто.
+
+---
+
 ## Стадия 24 ✅ (grilled — дважды пересмотрено, actor model) — lightweight processes (Elixir/Akka-style)
 
 Refs: [ROADMAP §Стадия 24](ROADMAP.md#стадия-24-grilled--дважды-пересмотрено-actor-model--lightweight-processes-elixirakka-style).

@@ -226,6 +226,9 @@ collect_local_symbols_stmt :: proc(res: ^Resolver_Ctx, stmt: Stmt, out: ^[dynami
 	#partial switch s in stmt {
 	case ^Let_Stmt:
 		if sym, ok := res.stmt_symbols[stmt]; ok do append(out, sym)
+		if syms, ok := res.let_destructure_syms[stmt]; ok {
+			for sym in syms do append(out, sym)
+		}
 		collect_local_symbols_expr(res, s.value, out)
 	case ^Return_Stmt:
 		collect_local_symbols_expr(res, s.value, out)

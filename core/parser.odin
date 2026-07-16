@@ -233,6 +233,13 @@ Let_Stmt :: struct {
 	value:           Expr,
 	type_annotation: Type_Node,
 	is_const:        bool,
+	// Деструктуризация: непусто вместо name для `пер (a, b) = ...` (tuple,
+	// destructure_type == "") или `пер Тип(a, b) = ...` (структура,
+	// destructure_type == "Тип" — поля берутся по ПОРЯДКУ ОБЪЯВЛЕНИЯ, тем
+	// же позиционным принципом, что и обычный конструктор `Тип(1, 2)`).
+	// Та же форма, что For_In_Stmt.names.
+	names:            [dynamic]string,
+	destructure_type: string,
 }
 
 Expr_Stmt :: struct {
@@ -1426,16 +1433,27 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 	stmt := new(Let_Stmt)
 	stmt.is_const = is_const
 
-	ident_tok := next_token(p.stream)
-	if ident_tok.kind != .Ident {
-		keyword := is_const ? "конст" : "пер"
-		report_parse(p, ident_tok.span, "Синтаксическая ошибка: после '%s' ожидается идентификатор", keyword)
-	}
-	stmt.name = ident_tok.data
-
-	if peek_token(p.stream).kind == .Colon {
-		next_token(p.stream)
-		stmt.type_annotation = parse_type(p)
+	if peek_token(p.stream).kind == .LParen {
+		// Тупл-деструктуризация: пер (a, b) = ...
+		stmt.names = parse_destructure_names(p)
+	} else {
+		ident_tok := next_token(p.stream)
+		if ident_tok.kind != .Ident {
+			keyword := is_const ? "конст" : "пер"
+			report_parse(p, ident_tok.span, "Синтаксическая ошибка: после '%s' ожидается идентификатор", keyword)
+		}
+		if peek_token(p.stream).kind == .LParen {
+			// Структурная деструктуризация: пер Тип(a, b) = ... — поля по
+			// порядку объявления, как и обычный позиционный конструктор.
+			stmt.names = parse_destructure_names(p)
+			stmt.destructure_type = ident_tok.data
+		} else {
+			stmt.name = ident_tok.data
+			if peek_token(p.stream).kind == .Colon {
+				next_token(p.stream)
+				stmt.type_annotation = parse_type(p)
+			}
+		}
 	}
 
 	expect(p, .Assign)
@@ -1443,6 +1461,27 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 	consume_semicolon_or_newline(p)
 	stmt.span = span_from(p, start)
 	return stmt
+}
+
+// Общий разбор "(a, b, ...)" для обеих форм деструктуризации `пер` —
+// зеркалит for-in'овый список имён (parse_for_stmt_into).
+parse_destructure_names :: proc(p: ^Parser) -> [dynamic]string {
+	next_token(p.stream) // '('
+	names := make([dynamic]string)
+	for {
+		name_tok := next_token(p.stream)
+		if name_tok.kind != .Ident {
+			report_parse(p, name_tok.span, "Синтаксическая ошибка: в шаблоне деструктуризации ожидается идентификатор")
+		}
+		append(&names, name_tok.data)
+		if peek_token(p.stream).kind == .Comma {
+			next_token(p.stream)
+		} else {
+			break
+		}
+	}
+	expect(p, .RParen)
+	return names
 }
 
 parse_expr_stmt :: proc(p: ^Parser) -> Stmt {
@@ -1832,6 +1871,27 @@ parse_pattern :: proc(p: ^Parser) -> Pattern {
 		}
 		pat := new(Pattern_Ident)
 		pat.name = name
+		pat.span = span_from(p, start)
+		return pat
+	}
+	if tok.kind == .Number {
+		pat := new(Pattern_Literal)
+		pat.value = new_int_lit(p, tok)
+		pat.span = span_from(p, start)
+		return pat
+	}
+	if tok.kind == .String {
+		lit := new(String_Expr)
+		lit.value = tok.data
+		lit.span = tok.span
+		pat := new(Pattern_Literal)
+		pat.value = lit
+		pat.span = span_from(p, start)
+		return pat
+	}
+	if tok.kind == .Boolean {
+		pat := new(Pattern_Literal)
+		pat.value = new_boolean_lit(tok)
 		pat.span = span_from(p, start)
 		return pat
 	}

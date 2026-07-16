@@ -359,6 +359,9 @@ Resolver_Ctx :: struct {
 	// или tuple-деструктуризация `для (к, з) в ...`), позиционно
 	// параллельно names. Та же форма, что func_args/lambda_args.
 	for_in_names_syms: map[Stmt][dynamic]Symbol_Id,
+	// Деструктуризация в пер/конст (Let_Stmt.names непусто) — та же форма,
+	// что for_in_names_syms, позиционно параллельно Let_Stmt.names.
+	let_destructure_syms: map[Stmt][dynamic]Symbol_Id,
 
 	// Symbol_Id типов Опция/Результат из прелюдии —
 	// нужны type_cheker.odin (infer_try_expr, оператор `?`), чтобы отличить
@@ -707,7 +710,7 @@ resolve_pattern :: proc(ctx: ^Resolver_Ctx, pattern: Pattern) {
 	case ^Pattern_Wildcard:
 	// ничего не привязывает
 	case ^Pattern_Literal:
-		report_resolve(ctx, p.span, "Semantic Error: литеральные шаблоны в выборе пока не поддерживаются")
+		resolve_expr(ctx, p.value)
 	case ^Pattern_Ident:
 		if p.name == "_" {
 			// Формально не должно случиться — parse_pattern уже
@@ -749,14 +752,30 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 	case ^Let_Stmt:
 		resolve_expr(ctx, s.value)
 
-		sym := new_symbol(ctx.symbol_store, s.name, .Variable, ctx.current_module, span = s.span, is_const = s.is_const)
-		name_id := intern(s.name)
-		if name_id in ctx.current_scope.symbols {
-			report_resolve(ctx, s.span, "Имя %s уже объявлено", s.name)
-		}
-		ctx.current_scope.symbols[name_id] = sym
+		if len(s.names) > 0 {
+			// Деструктуризация (тупл или структура) — символ на КАЖДОЕ имя,
+			// та же форма, что For_In_Stmt.names/for_in_names_syms.
+			syms := make([dynamic]Symbol_Id)
+			for name in s.names {
+				sym := new_symbol(ctx.symbol_store, name, .Variable, ctx.current_module, span = s.span, is_const = s.is_const)
+				name_id := intern(name)
+				if name_id in ctx.current_scope.symbols {
+					report_resolve(ctx, s.span, "Имя %s уже объявлено", name)
+				}
+				ctx.current_scope.symbols[name_id] = sym
+				append(&syms, sym)
+			}
+			ctx.let_destructure_syms[stmt] = syms
+		} else {
+			sym := new_symbol(ctx.symbol_store, s.name, .Variable, ctx.current_module, span = s.span, is_const = s.is_const)
+			name_id := intern(s.name)
+			if name_id in ctx.current_scope.symbols {
+				report_resolve(ctx, s.span, "Имя %s уже объявлено", s.name)
+			}
+			ctx.current_scope.symbols[name_id] = sym
 
-		ctx.stmt_symbols[stmt] = sym
+			ctx.stmt_symbols[stmt] = sym
+		}
 
 	case ^Return_Stmt:
 		resolve_expr(ctx, s.value)

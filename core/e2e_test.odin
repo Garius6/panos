@@ -4149,3 +4149,301 @@ test_actor_send_to_non_process_reports_type_error :: proc(t: ^testing.T) {
 	`)
 	expect_diagnostic(t, diags, "Type Error: отправить() ожидает Процесс(T) первым аргументом, получен 'Число'")
 }
+
+// `выбор` на литералах: выбор больше не ограничен .Enum-subject'ами —
+// Число/Строка/Булево дают Match_Arm_Kind.Literal-ветки, компилирующиеся
+// в обычное .Equal (та же структурная семантика, что у оператора ==).
+@(test)
+test_match_number_literal_pattern :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ описать(x: Число) -> Строка
+			выбор x
+				1 -> "один"
+				2 -> "два"
+				_ -> "другое"
+			конец
+		конец
+
+		функ старт() -> Строка
+			описать(1) + " " + описать(2) + " " + описать(99)
+		конец
+	`)
+	testing.expectf(t, ok, "[выбор: Число] стек пуст")
+	s, is_str := result.(^Panos_String)
+	testing.expectf(t, is_str && s.data == "один два другое", "[выбор: Число] ожидалось 'один два другое', получено %v", result)
+}
+
+@(test)
+test_match_string_literal_pattern_with_binder_catchall :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ разобрать(s: Строка) -> Число
+			выбор s
+				"да" -> 1
+				"нет" -> 0
+				остальное -> -1
+			конец
+		конец
+
+		функ старт() -> Число
+			разобрать("да") + разобрать("нет") + разобрать("???")
+		конец
+	`)
+	testing.expectf(t, ok, "[выбор: Строка] стек пуст")
+	n, is_num := result.(f64)
+	testing.expectf(t, is_num && n == 0, "[выбор: Строка] ожидалось 0 (1+0-1), получено %v", result)
+}
+
+// Булево — единственный литеральный тип с конечным доменом (2 значения):
+// выбор по обеим веткам истина/ложь исчерпывающий БЕЗ обязательного `_`,
+// в отличие от Число/Строка (см. следующий негативный тест).
+@(test)
+test_match_boolean_exhaustive_without_wildcard :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Строка
+			выбор истина
+				истина -> "да"
+				ложь -> "нет"
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "[выбор: Булево exhaustive] стек пуст")
+	s, is_str := result.(^Panos_String)
+	testing.expectf(t, is_str && s.data == "да", "[выбор: Булево exhaustive] ожидалось 'да', получено %v", result)
+}
+
+// Литеральные шаблоны работают и как под-шаблоны внутри конструктора
+// варианта (Событие.Клик(1, y)) — classify_pattern рекурсивен по
+// expected_fields, литеральная ветка не требует отдельного кода для
+// этого случая.
+@(test)
+test_match_literal_inside_constructor_subpattern :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Событие = перечисление
+			Клик(Число, Число)
+		конец
+
+		функ старт() -> Строка
+			пер e = Событие.Клик(1, 2)
+			выбор e
+				Событие.Клик(1, y) -> "клик по x=1"
+				Событие.Клик(x, y) -> "обычный клик"
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "[выбор: литерал в конструкторе] стек пуст")
+	s, is_str := result.(^Panos_String)
+	testing.expectf(t, is_str && s.data == "клик по x=1", "[выбор: литерал в конструкторе] ожидалось 'клик по x=1', получено %v", result)
+}
+
+// Число/Строка — неперечислимый домен, без завершающей `_`/биндер-ветки
+// выбор не может считаться исчерпывающим (в отличие от Булево выше).
+@(test)
+test_match_number_literal_requires_catchall :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Строка
+			выбор 1
+				1 -> "один"
+				2 -> "два"
+			конец
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: выбор по 'Число' должен заканчиваться веткой '_' или биндером — набор литеральных веток не может быть исчерпывающим")
+}
+
+@(test)
+test_match_boolean_missing_value_reports_diagnostic :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Строка
+			выбор истина
+				истина -> "да"
+			конец
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: выбор не покрывает значения: ложь")
+}
+
+@(test)
+test_match_literal_type_mismatch_reports_diagnostic :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Строка
+			выбор 5
+				"пять" -> "текст"
+				_ -> "другое"
+			конец
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: ожидался 'Число', получен 'Строка'")
+}
+
+// Деструктуризация в пер/конст: `пер (a, b) = кортеж` (тупл, позиционно)
+// и `пер Тип(a, b) = значение` (структура, по порядку объявления полей —
+// тот же принцип, что и у обычного позиционного конструктора Тип(1, 2)).
+// Компилируется через .Get_Property по числовому индексу — тот же приём,
+// что уже применяет for-in для `для (a, b) в ...`.
+@(test)
+test_let_tuple_destructure :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			пер (a, b, c) = (1, 2, 3)
+			a + b + c
+		конец
+	`)
+	testing.expectf(t, ok, "[пер: тупл-деструктуризация] стек пуст")
+	n, is_num := result.(f64)
+	testing.expectf(t, is_num && n == 6, "[пер: тупл-деструктуризация] ожидалось 6, получено %v", result)
+}
+
+@(test)
+test_let_struct_destructure :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Точка = структура
+			x: Число
+			y: Число
+		конец
+
+		функ старт() -> Число
+			пер точка = Точка(3, 4)
+			пер Точка(x, y) = точка
+			x + y
+		конец
+	`)
+	testing.expectf(t, ok, "[пер: структурная деструктуризация] стек пуст")
+	n, is_num := result.(f64)
+	testing.expectf(t, is_num && n == 7, "[пер: структурная деструктуризация] ожидалось 7, получено %v", result)
+}
+
+// конст-деструктуризация: is_const проброшен на КАЖДОЕ извлечённое имя —
+// переприсваивание любого из них должно паниковать так же, как обычный
+// конст (Стадия 27).
+@(test)
+test_const_tuple_destructure_is_immutable :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			конст (a, b) = (1, 2)
+			a = 99
+			a + b
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: попытка переприсвоить константу 'a'")
+}
+
+@(test)
+test_let_tuple_destructure_arity_mismatch_reports_diagnostic :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			пер (a, b, c) = (1, 2)
+			a + b + c
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: тупл из 2 элементов не совпадает с шаблоном из 3 имён")
+}
+
+@(test)
+test_let_struct_destructure_wrong_type_reports_diagnostic :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		тип Точка = структура
+			x: Число
+			y: Число
+		конец
+		тип Вектор = структура
+			x: Число
+			y: Число
+		конец
+
+		функ старт() -> Число
+			пер точка = Точка(1, 2)
+			пер Вектор(x, y) = точка
+			x + y
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: шаблон 'пер Вектор(...)' не совпадает со значением типа 'Точка'")
+}
+
+// `выбор` на структурах: Точка(1, x) разбирает поля по порядку объявления
+// с полноценными под-шаблонами (литерал/`_`/биндер), Точка(_, _) — все
+// поля wildcard, выступает как catch-all (та же exhaustiveness-семантика,
+// что и голый `_`/биндер).
+@(test)
+test_match_struct_constructor_pattern :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Точка = структура
+			x: Число
+			y: Число
+		конец
+
+		функ описать(п: Точка) -> Строка
+			выбор п
+				Точка(1, x) -> "первая"
+				Точка(2, x) -> "вторая"
+				Точка(_, _) -> "другая"
+			конец
+		конец
+
+		функ старт() -> Строка
+			описать(Точка(1, 99)) + " " + описать(Точка(2, 99)) + " " + описать(Точка(5, 99))
+		конец
+	`)
+	testing.expectf(t, ok, "[выбор: структурный конструктор] стек пуст")
+	s, is_str := result.(^Panos_String)
+	testing.expectf(t, is_str && s.data == "первая вторая другая", "[выбор: структурный конструктор] ожидалось 'первая вторая другая', получено %v", result)
+}
+
+@(test)
+test_match_struct_missing_catchall_reports_diagnostic :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		тип Точка = структура
+			x: Число
+			y: Число
+		конец
+
+		функ старт() -> Строка
+			пер п = Точка(1, 2)
+			выбор п
+				Точка(1, x) -> "один"
+			конец
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: выбор по 'Точка' должен заканчиваться веткой '_', биндером или конструктором, покрывающим все поля (например 'Точка(_, _)')")
+}
+
+@(test)
+test_match_struct_wrong_type_name_reports_diagnostic :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		тип Точка = структура
+			x: Число
+			y: Число
+		конец
+		тип Вектор = структура
+			x: Число
+			y: Число
+		конец
+
+		функ старт() -> Строка
+			пер п = Точка(1, 2)
+			выбор п
+				Вектор(x, y) -> "вектор"
+				_ -> "другое"
+			конец
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: шаблон-конструктор 'Вектор' не совпадает со структурой 'Точка'")
+}
+
+@(test)
+test_match_struct_fully_covering_arm_must_be_last :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		тип Точка = структура
+			x: Число
+			y: Число
+		конец
+
+		функ старт() -> Строка
+			пер п = Точка(1, 2)
+			выбор п
+				Точка(x, y) -> "любая"
+				Точка(1, y) -> "недостижимо"
+			конец
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: ветка-конструктор структуры, покрывающая все поля, должна быть только последней — она покрывает все случаи")
+}

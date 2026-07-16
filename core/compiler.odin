@@ -385,16 +385,38 @@ compile_decl :: proc(c: ^Compiler, decl: Decls) {
 compile_statement :: proc(ctx: ^Compiler, statement: Stmt) {
 	switch stmt in statement {
 	case ^Let_Stmt:
-		compile_expr(ctx, stmt.value)
+		if len(stmt.names) > 0 {
+			// Деструктуризация (тупл или структура — оба Aggregate_Value,
+			// .Get_Property по числовому индексу работает для обоих
+			// одинаково, тот же приём, что for-in уже использует для
+			// `для (a, b) в ...`, см. compile_for_in_stmt).
+			compile_expr(ctx, stmt.value)
+			value_slot := allocate_temp_slot(ctx, "__let_destructure")
+			emit_opcode(ctx, .Set_Local)
+			emit_byte(ctx, u8(value_slot))
 
-		sym := ctx.res.stmt_symbols[stmt]
-		append(&ctx.locals, Local{symbol = sym, depth = ctx.scope_depth})
-		slot_index := len(ctx.locals) - 1
+			syms := ctx.res.let_destructure_syms[statement]
+			for sym, i in syms {
+				binder_slot := register_binder_slot(ctx, sym)
+				emit_opcode(ctx, .Get_Local)
+				emit_byte(ctx, u8(value_slot))
+				emit_opcode(ctx, .Get_Property)
+				emit_byte(ctx, u8(i))
+				emit_opcode(ctx, .Set_Local)
+				emit_byte(ctx, u8(binder_slot))
+			}
+		} else {
+			compile_expr(ctx, stmt.value)
 
-		ctx.current_function.frame_size = max(ctx.current_function.frame_size, len(ctx.locals))
+			sym := ctx.res.stmt_symbols[stmt]
+			append(&ctx.locals, Local{symbol = sym, depth = ctx.scope_depth})
+			slot_index := len(ctx.locals) - 1
 
-		emit_opcode(ctx, .Set_Local)
-		emit_byte(ctx, u8(slot_index))
+			ctx.current_function.frame_size = max(ctx.current_function.frame_size, len(ctx.locals))
+
+			emit_opcode(ctx, .Set_Local)
+			emit_byte(ctx, u8(slot_index))
+		}
 
 	case ^Return_Stmt:
 		if stmt.value != nil {
@@ -1165,6 +1187,18 @@ compile_pattern :: proc(
 	switch pi.kind {
 	case .Wildcard:
 	// без условия — совпадает всегда
+	case .Literal:
+		// Обычное сравнение через .Equal — тот же опкод, что уже делает
+		// структурное сравнение для оператора == (value_equals, vm.odin),
+		// работает на Число/Строка/Булево без нового рантайм-механизма.
+		// literal_expr компилируется как обычное выражение (Number_Expr/
+		// String_Expr/Boolean_Expr, в т.ч. отрицательные числа) —
+		// compile_expr сам знает, как эмитить константу.
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(value_slot))
+		compile_expr(ctx, pi.literal_expr)
+		emit_opcode(ctx, .Equal)
+		append(fail_jumps, emit_jump(ctx, .Jump_If_False))
 	case .Binder:
 		binder_slot := register_binder_slot(ctx, pi.binder_sym)
 		emit_opcode(ctx, .Get_Local)
@@ -1185,6 +1219,23 @@ compile_pattern :: proc(
 			emit_opcode(ctx, .Get_Local)
 			emit_byte(ctx, u8(value_slot))
 			emit_opcode(ctx, .Get_Variant_Field)
+			emit_byte(ctx, u8(field_idx))
+			emit_opcode(ctx, .Set_Local)
+			emit_byte(ctx, u8(field_slot))
+			compile_pattern(ctx, &sub, field_slot, fail_jumps)
+		}
+	case .Struct_Constructor:
+		// Структура — одна форма, нет тега для проверки (в отличие от
+		// .Constructor's .Match_Tag) — сразу распаковываем поля через
+		// .Get_Property (тот же опкод, что и обычный s.поле, и что уже
+		// использует пер-деструктуризация, Стадия 30) и рекурсивно
+		// сравниваем под-шаблоны.
+		for &sub, field_idx in pi.sub_patterns {
+			if sub.kind == .Wildcard do continue
+			field_slot := allocate_temp_slot(ctx, "__match_field")
+			emit_opcode(ctx, .Get_Local)
+			emit_byte(ctx, u8(value_slot))
+			emit_opcode(ctx, .Get_Property)
 			emit_byte(ctx, u8(field_idx))
 			emit_opcode(ctx, .Set_Local)
 			emit_byte(ctx, u8(field_slot))

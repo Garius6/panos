@@ -185,6 +185,27 @@ Call_Kind :: enum {
 	Print_Value,
 }
 
+// Стадия 23 (Итерируемое): какую форму компилировать для конкретного
+// For_In_Stmt — решается typecheck'ом (знает тип `в`-выражения), читается
+// compiler.odin. Fast_Array — тот же байткод, что раньше строил parser
+// (idx-счётчик + .длина() + [idx]), просто эмитится в compiler.odin
+// напрямую, а не десахаривается на этапе парсинга. Iterator_Protocol —
+// повторный вызов .следующий() + Match_Tag/Get_Variant_Field на Опция
+// (тот же опкод, что использует компиляция `выбор`, без синтетического
+// Match_Expr узла).
+For_In_Kind :: enum {
+	Fast_Array,
+	Iterator_Protocol,
+}
+
+For_In_Info :: struct {
+	kind:            For_In_Kind,
+	// Iterator_Protocol: Symbol_Id метода следующий() конкретного impl'а
+	// (для поиска function pointer в registry, тот же путь, что
+	// Method_Struct).
+	next_method_sym: Symbol_Id,
+}
+
 // Единая точка истины про то, как Call_Expr (или bare Ident/Property для
 // нульарных конструкторов вариантов) должен компилироваться. Раньше это
 // было 6 разных map'ов на Type_Ctx (is_constructor, method_calls,
@@ -422,6 +443,11 @@ Type_Ctx :: struct {
 	interface_casts:  map[Expr]^Type,
 	call_infos:       map[Expr]Call_Info,
 	match_arm_infos:  map[^Match_Expr][dynamic]Pattern_Info,
+	// Стадия 23 (Итерируемое): решение "как компилировать этот for-in"
+	// (fast-path Массив vs iterator-protocol) — тот же принцип, что
+	// Call_Info: не десахаривает AST, аннотирует существующий узел,
+	// compiler.odin читает при кодогене.
+	for_in_infos:     map[Stmt]For_In_Info,
 	current_return:   ^Type,
 	loop_depth:       int,
 	next_infer_id:    int,
@@ -2088,6 +2114,103 @@ infer_function_body :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 	return actual_return
 }
 
+// Стадия 23 (Итерируемое): For_In_Stmt НЕ десахарен parser'ом (в отличие
+// от for-range, которая всегда числовая и не нуждается в типе) — сам
+// выбирает форму компиляции здесь, зная тип `в`-выражения. Два пути:
+//   1. Fast_Array — obj_type.kind == .Array (Соответствие НЕ поддержан
+//      напрямую и раньше — только через .записи(), возвращающую Массив
+//      кортежей, см. существующий error hint в infer_index_expr).
+//   2. Iterator_Protocol — obj_type implements Итерируемое (nominal,
+//      как остальные interface-checks в этом файле).
+// Решение пишется в ctx.for_in_infos[stmt] — читает compiler.odin.
+infer_for_in_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, s: ^For_In_Stmt) {
+	iter_type := prune_type(infer_expr(ctx, s.iterable))
+	names_syms := ctx.res.for_in_names_syms[stmt]
+
+	bind_poison := proc(ctx: ^Type_Ctx, syms: [dynamic]Symbol_Id) {
+		for sym in syms do ctx.res.symbol_types[sym] = TY_POISON
+	}
+
+	if iter_type.kind == .Poison {
+		bind_poison(ctx, names_syms)
+	} else if iter_type.kind == .Array {
+		elem_type := prune_type(iter_type.element_type)
+		if len(s.names) == 1 {
+			ctx.res.symbol_types[names_syms[0]] = elem_type
+		} else if elem_type.kind == .Tuple && len(elem_type.elements) == len(s.names) {
+			for i in 0 ..< len(s.names) {
+				ctx.res.symbol_types[names_syms[i]] = prune_type(elem_type.elements[i])
+			}
+		} else {
+			report(
+				ctx,
+				s.span,
+				"Type Error: шаблон 'для (...)' из %d имён не совпадает с элементом массива типа '%s'",
+				len(s.names),
+				elem_type.name,
+			)
+			bind_poison(ctx, names_syms)
+		}
+		ctx.for_in_infos[stmt] = For_In_Info{kind = .Fast_Array}
+	} else if iter_type.kind == .Struct &&
+	   implements_prelude_interface(ctx, iter_type, ctx.res.prelude_iterable_sym) {
+		method_sym, _ := method_lookup(ctx, iter_type, "следующий")
+		method_type := prune_type(ctx.res.symbol_types[method_sym])
+		// method_type.return_type — конкретный Опция(T) ЭТОГО impl'а
+		// (variants[1] = Есть, fields[0] = T — тот же паттерн, что
+		// infer_try_expr уже использует для `?`-оператора). T может быть
+		// туплом ("для (a, b) в ...") — тот же паттерн деструктуризации,
+		// что fast-path уже применяет к Массив((К,З)).
+		option_type := prune_type(method_type.return_type)
+		elem_type := prune_type(option_type.variants[1].fields[0])
+		if len(s.names) == 1 {
+			ctx.res.symbol_types[names_syms[0]] = elem_type
+		} else if elem_type.kind == .Tuple && len(elem_type.elements) == len(s.names) {
+			for i in 0 ..< len(s.names) {
+				ctx.res.symbol_types[names_syms[i]] = prune_type(elem_type.elements[i])
+			}
+		} else {
+			report(
+				ctx,
+				s.span,
+				"Type Error: шаблон 'для (...)' из %d имён не совпадает со значением Итерируемое типа '%s'",
+				len(s.names),
+				elem_type.name,
+			)
+			bind_poison(ctx, names_syms)
+		}
+		ctx.for_in_infos[stmt] = For_In_Info{kind = .Iterator_Protocol, next_method_sym = method_sym}
+	} else if iter_type.kind == .Map {
+		// Тот же hint, что раньше давала infer_index_expr, когда старое
+		// parse-time-десахаренное `для x в карта` доходило до `[idx]` с
+		// Число-индексом на Map (ключ обычно НЕ Число) — теперь Map
+		// перехватывается ЗДЕСЬ до всякого Index_Expr, hint нужно
+		// воспроизвести явно, иначе регрессия diagnostic UX.
+		report(
+			ctx,
+			s.span,
+			"Type Error: соответствие индексируется по ключу типа '%s', получено 'Число' — Соответствие не поддерживает позиционный доступ; для перебора элементов используйте .записи() и 'для (ключ, значение) в ...'",
+			prune_type(iter_type.key_type).name,
+		)
+		bind_poison(ctx, names_syms)
+	} else {
+		report(
+			ctx,
+			s.span,
+			"Type Error: тип '%s' не поддерживает 'для x в' (нужен Массив или тип, реализующий Итерируемое)",
+			iter_type.name,
+		)
+		bind_poison(ctx, names_syms)
+		// for_in_infos НЕ пишется — diagnostics гейтят пайплайн до
+		// компиляции (тот же принцип, что у всех остальных sugar-путей
+		// в этом файле), compiler.odin сюда не дойдёт.
+	}
+
+	ctx.loop_depth += 1
+	infer_block_type(ctx, s.body)
+	ctx.loop_depth -= 1
+}
+
 // --- ПРОВЕРКА ИНСТРУКЦИЙ (STATEMENTS) ---
 
 // Statement-level проверка знает ожидаемый тип возврата окружения.
@@ -2107,7 +2230,7 @@ check_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, expected_return: ^Type) {
 			)
 		}
 
-	case ^Let_Stmt, ^Expr_Stmt, ^Continue_Stmt, ^Break_Stmt, ^Error_Stmt:
+	case ^Let_Stmt, ^Expr_Stmt, ^Continue_Stmt, ^Break_Stmt, ^Error_Stmt, ^For_In_Stmt:
 		infer_stmt(ctx, stmt)
 	}
 }
@@ -2200,6 +2323,9 @@ infer_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> ^Type {
 
 	case ^Error_Stmt:
 	// Уже отрапортовано парсером — нечего проверять.
+
+	case ^For_In_Stmt:
+		infer_for_in_stmt(ctx, stmt, s)
 	}
 	return nil
 }

@@ -391,6 +391,175 @@ compile_statement :: proc(ctx: ^Compiler, statement: Stmt) {
 		// Компилятор запускается только после typecheck_program с нулём
 		// diagnostics (main.odin) — Error_Stmt сюда дойти не должен.
 		fmt.panicf("Compiler Error: внутренняя ошибка — Error_Stmt дошёл до компиляции")
+
+	case ^For_In_Stmt:
+		compile_for_in_stmt(ctx, statement, stmt)
+	}
+}
+
+// Стадия 23 (Итерируемое): For_In_Stmt НЕ десахарен parser'ом — сам
+// решает форму (ctx.tc.for_in_infos[stmt]) и эмитит байткод напрямую,
+// без синтетического AST (Let_Stmt/While_Expr/Match_Expr), которое раньше
+// строил parser.odin. Обе формы используют Loop_Context (ctx.loops) тем
+// же способом, что While_Expr (compile_expr, case ^While_Expr) —
+// прервать/продолжить внутри тела работают идентично.
+compile_for_in_stmt :: proc(ctx: ^Compiler, statement: Stmt, s: ^For_In_Stmt) {
+	info, has_info := ctx.tc.for_in_infos[statement]
+	if !has_info {
+		fmt.panicf("Compiler Error: for_in_infos отсутствует для for-in")
+	}
+
+	names_syms := ctx.res.for_in_names_syms[statement]
+	names_slots := make([dynamic]int, context.temp_allocator)
+	for sym in names_syms {
+		append(&names_slots, register_binder_slot(ctx, sym))
+	}
+
+	compile_expr(ctx, s.iterable)
+	iter_slot := allocate_temp_slot(ctx, "__for_iter")
+	emit_opcode(ctx, .Set_Local)
+	emit_byte(ctx, u8(iter_slot))
+
+	#partial switch info.kind {
+	case .Fast_Array:
+		emit_constant(ctx, f64(-1))
+		idx_slot := allocate_temp_slot(ctx, "__for_idx")
+		emit_opcode(ctx, .Set_Local)
+		emit_byte(ctx, u8(idx_slot))
+
+		loop_start := len(ctx.current_function.instructions)
+		loop_ctx := Loop_Context {
+			continue_target = loop_start,
+			break_jumps     = make([dynamic]int),
+		}
+		append(&ctx.loops, loop_ctx)
+
+		// __for_idx = __for_idx + 1
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(idx_slot))
+		emit_constant(ctx, f64(1))
+		emit_opcode(ctx, .Add)
+		emit_opcode(ctx, .Set_Local)
+		emit_byte(ctx, u8(idx_slot))
+
+		// пока __for_idx != __for_iter.длина() (иначе — выход из цикла).
+		// NotEqual, не Equal: Jump_If_False прыгает на exit, когда УСЛОВИЕ
+		// ПРОДОЛЖЕНИЯ ложно (idx == длина) — тот же принцип, что уже
+		// использует Match_Tag ниже в Iterator_Protocol-ветке (пушит
+		// "матч?", Jump_If_False прыгает на fail/exit при НЕ-матче).
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(idx_slot))
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(iter_slot))
+		emit_opcode(ctx, .Invoke_Collection)
+		emit_byte(ctx, make_constant(ctx, Value(perm_string("длина"))))
+		emit_byte(ctx, 0)
+		emit_opcode(ctx, .Equal)
+		emit_opcode(ctx, .Negate)
+		exit_jump := emit_jump(ctx, .Jump_If_False)
+
+		// пер <элемент(ы)> = __for_iter[__for_idx]
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(iter_slot))
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(idx_slot))
+		emit_opcode(ctx, .Get_Index)
+		if len(names_slots) == 1 {
+			emit_opcode(ctx, .Set_Local)
+			emit_byte(ctx, u8(names_slots[0]))
+		} else {
+			elem_slot := allocate_temp_slot(ctx, "__for_elem")
+			emit_opcode(ctx, .Set_Local)
+			emit_byte(ctx, u8(elem_slot))
+			for slot, i in names_slots {
+				emit_opcode(ctx, .Get_Local)
+				emit_byte(ctx, u8(elem_slot))
+				emit_opcode(ctx, .Get_Property)
+				emit_byte(ctx, u8(i))
+				emit_opcode(ctx, .Set_Local)
+				emit_byte(ctx, u8(slot))
+			}
+		}
+
+		for body_stmt in s.body do compile_statement(ctx, body_stmt)
+
+		loop_jump := emit_jump(ctx, .Jump)
+		patch_signed_jump_to(ctx, loop_jump, loop_start)
+
+		patch_jump(ctx, exit_jump)
+		finished_loop := ctx.loops[len(ctx.loops) - 1]
+		for break_jump in finished_loop.break_jumps do patch_jump(ctx, break_jump)
+		pop(&ctx.loops)
+
+	case .Iterator_Protocol:
+		fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, info.next_method_sym)]
+		if !found {
+			fmt.panicf("Compiler Error: метод следующий не найден")
+		}
+		fn_const := make_constant(ctx, Value(fn_ptr))
+
+		loop_start := len(ctx.current_function.instructions)
+		loop_ctx := Loop_Context {
+			continue_target = loop_start,
+			break_jumps     = make([dynamic]int),
+		}
+		append(&ctx.loops, loop_ctx)
+
+		// __for_iter.следующий()
+		emit_opcode(ctx, .Constant)
+		emit_byte(ctx, fn_const)
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(iter_slot))
+		emit_opcode(ctx, .Call)
+		emit_byte(ctx, 1)
+
+		subject_slot := allocate_temp_slot(ctx, "__for_subject")
+		emit_opcode(ctx, .Set_Local)
+		emit_byte(ctx, u8(subject_slot))
+
+		// выбор __for_subject { Есть(x) -> <тело>; Нет -> прервать }
+		// Тег Есть=1 (см. prelude.odin) — Match_Tag/Get_Variant_Field, те
+		// же опкоды, что использует компиляция `выбор` (compile_pattern),
+		// без синтетического Match_Expr узла.
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(subject_slot))
+		emit_opcode(ctx, .Match_Tag)
+		emit_byte(ctx, make_constant(ctx, Value(f64(1))))
+		exit_jump := emit_jump(ctx, .Jump_If_False)
+
+		// Значение из Есть(x) — x может быть туплом ("для (a, b) в ...",
+		// см. infer_for_in_stmt): тот же паттерн деструктуризации, что
+		// Fast_Array-ветка выше применяет к Get_Index-результату.
+		emit_opcode(ctx, .Get_Local)
+		emit_byte(ctx, u8(subject_slot))
+		emit_opcode(ctx, .Get_Variant_Field)
+		emit_byte(ctx, 0)
+		if len(names_slots) == 1 {
+			emit_opcode(ctx, .Set_Local)
+			emit_byte(ctx, u8(names_slots[0]))
+		} else {
+			elem_slot := allocate_temp_slot(ctx, "__for_elem")
+			emit_opcode(ctx, .Set_Local)
+			emit_byte(ctx, u8(elem_slot))
+			for slot, i in names_slots {
+				emit_opcode(ctx, .Get_Local)
+				emit_byte(ctx, u8(elem_slot))
+				emit_opcode(ctx, .Get_Property)
+				emit_byte(ctx, u8(i))
+				emit_opcode(ctx, .Set_Local)
+				emit_byte(ctx, u8(slot))
+			}
+		}
+
+		for body_stmt in s.body do compile_statement(ctx, body_stmt)
+
+		loop_jump := emit_jump(ctx, .Jump)
+		patch_signed_jump_to(ctx, loop_jump, loop_start)
+
+		patch_jump(ctx, exit_jump)
+		finished_loop := ctx.loops[len(ctx.loops) - 1]
+		for break_jump in finished_loop.break_jumps do patch_jump(ctx, break_jump)
+		pop(&ctx.loops)
 	}
 }
 

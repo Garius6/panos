@@ -206,6 +206,20 @@ Stmt :: union {
 	^Continue_Stmt,
 	^Break_Stmt,
 	^Error_Stmt,
+	^For_In_Stmt,
+}
+
+// Стадия 23 (Итерируемое): НЕ десахаривается на этапе парсинга (в
+// отличие от for-range, `parse_for_range_stmt_into` ниже) — тип
+// `iterable` неизвестен парсеру, а выбор формы компиляции (fast-path
+// для Массив/Строка vs iterator-protocol для Итерируемое) требует
+// типа. Резолвится/типизируется как обычный узел, десахаривание/кодоген
+// — в compiler.odin (см. ctx.tc.for_in_infos).
+For_In_Stmt :: struct {
+	span:     Span,
+	names:    [dynamic]string,
+	iterable: Expr,
+	body:     [dynamic]Stmt,
 }
 
 Return_Stmt :: struct {
@@ -468,6 +482,13 @@ print_stmt :: proc(stmt: Stmt, prefix: string = "", is_last: bool = true) {
 
 	case ^Error_Stmt:
 		fmt.printf("%s%s<parse error>\n", prefix, marker)
+
+	case ^For_In_Stmt:
+		fmt.printf("%s%sFor_In(%v)\n", prefix, marker, s.names)
+		print_ast(s.iterable, next_prefix, false)
+		for body_stmt, i in s.body {
+			print_stmt(body_stmt, next_prefix, i == len(s.body) - 1)
+		}
 	}
 }
 
@@ -1263,43 +1284,12 @@ parse_for_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt) {
 
 	span := span_from(p, start)
 
-	p.for_counter += 1
-	suffix := fmt.tprintf("__for_%d", p.for_counter)
-	iter_name := fmt.tprintf("%s_iter", suffix)
-	idx_name := fmt.tprintf("%s_idx", suffix)
-
-	// пер __for_N_iter = <expr>
-	append(out, mk_let(iter_name, iterable, span))
-	// пер __for_N_idx = -1
-	append(out, mk_let(idx_name, mk_unary(.Minus, mk_num(1, span), span), span))
-
-	body := make([dynamic]Stmt)
-
-	// __for_N_idx = __for_N_idx + 1
-	append(&body, mk_incr(idx_name, span))
-
-	// если __for_N_idx == __for_N_iter.длина() тогда прервать конец
-	len_call := mk_call0(mk_prop(mk_ident(iter_name, span), "длина", span), span)
-	append(&body, mk_if_break(mk_bin(.Equal, mk_ident(idx_name, span), len_call, span), span))
-
-	// пер <элемент(ы)> = __for_N_iter[__for_N_idx]
-	index_expr := mk_index(mk_ident(iter_name, span), mk_ident(idx_name, span), span)
-	if len(names) == 1 {
-		append(&body, mk_let(names[0], index_expr, span))
-	} else {
-		elem_name := fmt.tprintf("%s_elem", suffix)
-		append(&body, mk_let(elem_name, index_expr, span))
-		for name, i in names {
-			field_prop := mk_prop(mk_ident(elem_name, span), fmt.tprintf("%d", i), span)
-			append(&body, mk_let(name, field_prop, span))
-		}
-	}
-
-	for stmt in user_body {
-		append(&body, stmt)
-	}
-
-	append(out, mk_while(mk_bool(true, span), body, span))
+	stmt := new(For_In_Stmt)
+	stmt.span = span
+	stmt.names = names
+	stmt.iterable = iterable
+	stmt.body = user_body
+	append(out, stmt)
 }
 
 // Разворачивает числовой диапазон `для сч = <start> по <end> цикл ... конец`

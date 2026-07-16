@@ -158,6 +158,10 @@ Module_Graph :: struct {
 	// ли у типа кастомный .клонировать()" от дефолтного reflective-копи-
 	// рования при отправке сообщения в mailbox).
 	prelude_copyable_sym:     Symbol_Id,
+	// Symbol_Id Итерируемое (Стадия 23, generic-интерфейс — Стадия 28) —
+	// нужен for-in'у (type_cheker.odin, case ^For_In_Stmt) для нominal-
+	// проверки "implements Итерируемое" тем же способом, что и остальные.
+	prelude_iterable_sym:     Symbol_Id,
 	// Хип-аллоцированные resolve/typecheck-контексты прелюдии — нужны
 	// ensure_prelude_compiled (compiler.odin-этап, см. там) ПОСЛЕ того,
 	// как ensure_prelude уже вернулась (её собственные локальные res_ctx/
@@ -351,6 +355,10 @@ Resolver_Ctx :: struct {
 	node_symbols:    map[Expr]Symbol_Id,
 	func_args:       map[Decls][dynamic]Symbol_Id,
 	lambda_args:     map[Expr][dynamic]Symbol_Id,
+	// Стадия 23 (Итерируемое): For_In_Stmt.names — 1+ имён (одиночное
+	// или tuple-деструктуризация `для (к, з) в ...`), позиционно
+	// параллельно names. Та же форма, что func_args/lambda_args.
+	for_in_names_syms: map[Stmt][dynamic]Symbol_Id,
 
 	// Symbol_Id типов Опция/Результат из прелюдии —
 	// нужны type_cheker.odin (infer_try_expr, оператор `?`), чтобы отличить
@@ -372,6 +380,8 @@ Resolver_Ctx :: struct {
 	prelude_printable_sym:    Symbol_Id,
 	// Symbol_Id Копируемое (Стадия 23) — тот же мотив.
 	prelude_copyable_sym:     Symbol_Id,
+	// Symbol_Id Итерируемое (Стадия 23) — тот же мотив.
+	prelude_iterable_sym:     Symbol_Id,
 	// Копия graph.prelude_generic_order (см. там) — Resolver_Ctx (в
 	// отличие от module_graph, который resolve_program обнуляет после
 	// однократного резолва, см. resolve_program) переживает весь
@@ -748,6 +758,29 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 	case ^Continue_Stmt:
 	case ^Break_Stmt:
 	case ^Error_Stmt:
+
+	case ^For_In_Stmt:
+		resolve_expr(ctx, s.iterable)
+
+		push_scope(ctx)
+		names_syms := make([dynamic]Symbol_Id)
+		for name in s.names {
+			// is_const НЕ выставляем (в отличие от параметров функций,
+			// Стадия 27) — старое parse-time десахаривание использовало
+			// mk_let (обычный `пер`, reassignable); сохраняем то же
+			// поведение, не меняем его этим рефакторингом попутно.
+			sym := new_symbol(ctx.symbol_store, name, .Variable, ctx.current_module, span = s.span)
+			name_id := intern(name)
+			if name_id in ctx.current_scope.symbols {
+				report_resolve(ctx, s.span, "Имя %s уже объявлено", name)
+			}
+			ctx.current_scope.symbols[name_id] = sym
+			append(&names_syms, sym)
+		}
+		ctx.for_in_names_syms[stmt] = names_syms
+
+		for body_stmt in s.body do resolve_stmt(ctx, body_stmt)
+		pop_scope(ctx)
 	}
 }
 

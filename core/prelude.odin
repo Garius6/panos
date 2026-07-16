@@ -82,6 +82,19 @@ PRELUDE_SOURCE :: `
 	функ клонировать() -> Копируемое
 конец
 
+// Стадия 23 (Итерируемое): iterator protocol (grilled — не indexable,
+// см. ROADMAP §Стадия 23) — единственный метод следующий() -> Опция(T),
+// НЕ отдельная пара "производитель итератора"+"итератор" (Rust-style
+// IntoIterator/Iterator) — сам реализующий тип мутирует своё внутреннее
+// состояние между вызовами (это: Т — immutable БИНДИНГ, но поля через
+// это.поле = ... мутируемы, у structs reference semantics). T —
+// НЕЗАВИСИМЫЙ параметр интерфейса (Стадия 28, generic-интерфейсы,
+// prerequisite) — первый интерфейс в языке, которому Self-фикса
+// недостаточно.
+экспорт тип Итерируемое[T] = интерфейс
+	функ следующий() -> Опция(T)
+конец
+
 реализация Опция
 	функ есть(это: Опция) -> Булево
 		выбор это
@@ -315,6 +328,7 @@ ensure_prelude :: proc(graph: ^Module_Graph) -> ^Module {
 	graph.prelude_divisible_sym = module.exports[intern("Делимое")]
 	graph.prelude_printable_sym = module.exports[intern("Печатаемое")]
 	graph.prelude_copyable_sym = module.exports[intern("Копируемое")]
+	graph.prelude_iterable_sym = module.exports[intern("Итерируемое")]
 
 	// graph.symbol_types уже общий указатель на ту же map, что res_ctx.
 	// symbol_types — типы Опции/Результата видны каждому следующему модулю.
@@ -374,6 +388,7 @@ merge_prelude_exports :: proc(ctx: ^Resolver_Ctx, graph: ^Module_Graph, module: 
 	ctx.prelude_divisible_sym = prelude.exports[intern("Делимое")]
 	ctx.prelude_printable_sym = prelude.exports[intern("Печатаемое")]
 	ctx.prelude_copyable_sym = prelude.exports[intern("Копируемое")]
+	ctx.prelude_iterable_sym = prelude.exports[intern("Итерируемое")]
 	// Копия graph.prelude_generic_order в САМ Resolver_Ctx — module_graph
 	// не переживает resolve_program (resolved.module_graph = nil), а
 	// decl_type_param_order должен пережить весь typecheck_program.

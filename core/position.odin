@@ -174,6 +174,9 @@ find_in_stmt :: proc(stmt: Stmt, file_id: u16, offset: u32) -> Expr {
 		return find_expr_at(s.value, file_id, offset)
 	case ^Expr_Stmt:
 		return find_expr_at(s.expr, file_id, offset)
+	case ^For_In_Stmt:
+		if r := find_expr_at(s.iterable, file_id, offset); r != nil do return r
+		return find_in_body(s.body, file_id, offset)
 	}
 	return nil
 }
@@ -228,6 +231,12 @@ collect_local_symbols_stmt :: proc(res: ^Resolver_Ctx, stmt: Stmt, out: ^[dynami
 		collect_local_symbols_expr(res, s.value, out)
 	case ^Expr_Stmt:
 		collect_local_symbols_expr(res, s.expr, out)
+	case ^For_In_Stmt:
+		collect_local_symbols_expr(res, s.iterable, out)
+		if syms, ok := res.for_in_names_syms[stmt]; ok {
+			for sym in syms do append(out, sym)
+		}
+		collect_local_symbols(res, s.body, out)
 	}
 }
 

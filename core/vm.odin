@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:math"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 import "core:unicode"
 import "core:unicode/utf8"
 
@@ -61,6 +62,11 @@ VM :: struct {
 	// return .Crashed из execute() — run_scheduler читает его сразу
 	// после возврата (см. Exec_Result.Crashed).
 	crash_message:      string,
+	// Стадия 46 (время.монотонно_мс): момент старта VM — эпоха, от
+	// которой отсчитываются монотонные тики. Tick (не Time/wall-clock)
+	// — иммунна к переводу системных часов, то же обоснование, что у
+	// sliding-window лимита рестартов в std/супервизор.ps.
+	monotonic_epoch:    time.Tick,
 }
 
 // get_stdin_reader — в vm_io_native.odin/vm_io_wasm.odin (#+build split,
@@ -73,6 +79,7 @@ new_vm :: proc(
 	vm := new(VM)
 	vm.program_args = program_args
 	vm.gc = new_gc_state()
+	vm.monotonic_epoch = time.tick_now()
 
 	vm.compiled_functions = compiled_functions
 
@@ -1058,6 +1065,21 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		}
 		gc_unprotect(vm, 1)
 		return Value(arr), true
+
+	case "время::монотонно_мс":
+		// Стадия 46: тики с момента старта VM (vm.monotonic_epoch,
+		// выставляется один раз в new_vm) — иммунно к переводу системных
+		// часов, для sliding-window лимита рестартов супервизора нужно
+		// именно это, не время::сейчас_мс.
+		expect_arg_count(name, len(args), 0)
+		return Value(time.duration_milliseconds(time.tick_since(vm.monotonic_epoch))), true
+
+	case "время::сейчас_мс":
+		// Стадия 46: wall-clock, unix-время в миллисекундах — для логов/
+		// отображения, НЕ для измерения интервалов (перевод часов ломает
+		// монотонность).
+		expect_arg_count(name, len(args), 0)
+		return Value(f64(time.to_unix_nanoseconds(time.now())) / 1e6), true
 
 	case "ввод_вывод::печать":
 		// Стадия 23 (Печатаемое): аргумент — ЛЮБОЙ Value, не только Строка.

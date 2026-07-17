@@ -5179,7 +5179,7 @@ test_qualified_impl_supervisor_restarts_then_gives_up :: proc(t: ^testing.T) {
 	// первым.
 	testing.expect_assert(
 		t,
-		"Runtime Panic: супервизор (один-за-одного): 'падающий-рабочий' превысил лимит перезапусков (1): процесс уже не существует",
+		"Runtime Panic: супервизор (один-за-одного): 'падающий-рабочий' превысил лимит перезапусков (1 за 60000мс): процесс уже не существует",
 	)
 	run_module_file("fixtures/supervisor_fixture_main.ps")
 }
@@ -5191,7 +5191,7 @@ test_qualified_impl_supervisor_restarts_then_gives_up :: proc(t: ^testing.T) {
 test_supervisor_one_for_all_restarts_whole_group_then_gives_up :: proc(t: ^testing.T) {
 	testing.expect_assert(
 		t,
-		"Runtime Panic: супервизор (групповой рестарт): краш 'падающая' исчерпал лимит групповых перезапусков (1): Runtime Panic: бум",
+		"Runtime Panic: супервизор (групповой рестарт): краш 'падающая' исчерпал лимит групповых перезапусков (1 за 60000мс): Runtime Panic: бум",
 	)
 	run_module_file("fixtures/supervisor_one_for_all_fixture_main.ps")
 }
@@ -5203,7 +5203,7 @@ test_supervisor_one_for_all_restarts_whole_group_then_gives_up :: proc(t: ^testi
 test_supervisor_rest_for_one_restarts_tail_then_gives_up :: proc(t: ^testing.T) {
 	testing.expect_assert(
 		t,
-		"Runtime Panic: супервизор (групповой рестарт): краш 'падающая' исчерпал лимит групповых перезапусков (1): Runtime Panic: бум",
+		"Runtime Panic: супервизор (групповой рестарт): краш 'падающая' исчерпал лимит групповых перезапусков (1 за 60000мс): Runtime Panic: бум",
 	)
 	run_module_file("fixtures/supervisor_rest_for_one_fixture_main.ps")
 }
@@ -5673,7 +5673,7 @@ test_spawn_qualified_call_non_function_export_reports_error :: proc(t: ^testing.
 test_supervisor_dynamic_add_child_gets_supervised :: proc(t: ^testing.T) {
 	testing.expect_assert(
 		t,
-		"Runtime Panic: Runtime Panic: супервизор (один-за-одного): 'динамический-рабочий' превысил лимит перезапусков (1): процесс уже не существует",
+		"Runtime Panic: Runtime Panic: супервизор (один-за-одного): 'динамический-рабочий' превысил лимит перезапусков (1 за 60000мс): процесс уже не существует",
 	)
 	run_module_file("fixtures/supervisor_dynamic_add_fixture_main.ps")
 }
@@ -5688,7 +5688,79 @@ test_supervisor_dynamic_add_child_gets_supervised :: proc(t: ^testing.T) {
 test_supervisor_dynamic_remove_child_stops_and_untracked :: proc(t: ^testing.T) {
 	testing.expect_assert(
 		t,
-		"Runtime Panic: Runtime Panic: супервизор (один-за-одного): 'падающая-после-удаления' превысил лимит перезапусков (1): процесс уже не существует",
+		"Runtime Panic: Runtime Panic: супервизор (один-за-одного): 'падающая-после-удаления' превысил лимит перезапусков (1 за 60000мс): процесс уже не существует",
 	)
 	run_module_file("fixtures/supervisor_dynamic_remove_fixture_main.ps")
+}
+
+// Стадия 46: время.монотонно_мс() — тики с момента старта VM, растут
+// между двумя последовательными вызовами в одном процессе (никогда не
+// убывают, даже если оба вызова происходят в одной "тактовой" ячейке
+// исполнения — используем >=, а не строгое >, чтобы не флаковать на
+// системах с грубой гранулярностью часов).
+@(test)
+test_time_monotonic_ms_increases :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт время
+
+		функ старт() -> Число
+			пер a = время.монотонно_мс()
+			пер b = время.монотонно_мс()
+			b - a
+		конец
+	`)
+	testing.expectf(t, ok, "время.монотонно_мс: пустой стек")
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f >= 0.0, "время.монотонно_мс: разница отрицательна: %v", result)
+}
+
+// Стадия 46: время.сейчас_мс() — unix-время в миллисекундах, wall-clock.
+// Проверяем правдоподобность (не 0, не отрицательное, в разумных
+// пределах современных дат — заведомо больше 2020-01-01, заведомо
+// меньше 2100-01-01) вместо точного значения (зависит от момента
+// прогона теста).
+@(test)
+test_time_now_ms_returns_plausible_unix_time :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт время
+
+		функ старт() -> Число
+			время.сейчас_мс()
+		конец
+	`)
+	testing.expectf(t, ok, "время.сейчас_мс: пустой стек")
+	f, is_num := result.(f64)
+	// 2020-01-01 = 1577836800000 мс, 2100-01-01 = 4102444800000 мс.
+	testing.expectf(
+		t,
+		is_num && f > 1577836800000.0 && f < 4102444800000.0,
+		"время.сейчас_мс: неправдоподобное значение: %v",
+		result,
+	)
+}
+
+// Стадия 46: доказательство, что окно_мс супервизора РЕАЛЬНО
+// консультируется, не молча игнорируется. Ребёнок падает РОВНО 3 раза
+// (бюджет-поле осталось в фикстуре), макс_рестартов=2 — СТАРАЯ
+// (Стадия 45, счётчик за всю жизнь) семантика запаниковала бы на 3-м
+// крахе. Окно (0.001мс) заведомо уже, чем реальное время одного цикла
+// краш→relay→сигнал→рестарт (на 2+ порядка) — sliding window "забывает"
+// каждый предыдущий крах ДО следующего, лимит не достигается ни разу за
+// все 3 краха. После исчерпания бюджета ребёнок больше не падает —
+// ничего в программе больше не проснётся — детерминированный дедлок
+// планировщика (НЕ паника лимита рестартов) — единственный исход,
+// который отличал бы "окно реально фильтрует" от "окно принимается, но
+// игнорируется" (при игнорировании — обычная паника лимита на 3-м
+// крахе, см. ручную проверку в ROADMAP §Стадия 46 с тем же сценарием на
+// широком окне). Первая версия этого теста (без бюджета, окно=0.1мс,
+// макс_рестартов=5) была отброшена — эмпирически требовала ~2660
+// циклов рестарта до дедлока (иногда две метки СЛУЧАЙНО попадали в
+// 0.1мс друг от друга под системным джиттером, лимит почти
+// накапливался) — это проверяло исчерпание системных ресурсов после
+// тысяч спавнов, а не логику окна. Бюджетная версия — ровно 3 цикла,
+// быстро и без опоры на джиттер планировщика.
+@(test)
+test_supervisor_narrow_window_never_exhausts_limit :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Runtime Error: все процессы заблокированы в ожидании сообщений (дедлок)")
+	run_module_file("fixtures/supervisor_narrow_window_fixture_main.ps")
 }

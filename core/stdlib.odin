@@ -8,7 +8,8 @@ is_builtin_module_name :: proc(name: string) -> bool {
 		name == "ос" ||
 		name == "ввод_вывод" ||
 		name == "строки" ||
-		name == "сеть" \
+		name == "сеть" ||
+		name == "время" \
 	)
 }
 
@@ -125,6 +126,10 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_2(TY_STRING, TY_NUM, stdlib_result_type(graph, TY_CONNECTION, TY_ERROR))
 	case "сеть::кодировать_url":
 		return builtin_function_type_1(TY_STRING, TY_STRING)
+	case "время::монотонно_мс":
+		return new_function_type(make([dynamic]^Type), TY_NUM)
+	case "время::сейчас_мс":
+		return new_function_type(make([dynamic]^Type), TY_NUM)
 	}
 	return nil
 }
@@ -281,6 +286,19 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"кодировать_url",
 			builtin_export_type(graph, "сеть::кодировать_url"),
+		)
+	} else if name == "время" {
+		add_builtin_export(
+			graph,
+			module,
+			"монотонно_мс",
+			builtin_export_type(graph, "время::монотонно_мс"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"сейчас_мс",
+			builtin_export_type(graph, "время::сейчас_мс"),
 		)
 	}
 

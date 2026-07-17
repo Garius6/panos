@@ -422,24 +422,57 @@ pop_scope :: proc(resolver: ^Resolver_Ctx) {
 	}
 }
 
+// Reserved-имена builtin-функций (второй тир зарезервированной лексики,
+// см. docs/src/language/basic-types.md "Зарезервированные слова" — первый
+// тир — жёсткие keyword'ы лексера типа "пер"/"тип"/"функ"/"в", которые
+// вообще не могут стать .Ident-токеном). Единая hard-reserved политика:
+// НИ ОДНО из этих имён нельзя объявить заново — ни как top-level функцию/
+// тип (register_named_symbol проверяет коллизию с module.scope.symbols
+// без исключения для .Builtin), ни как локальную переменную/параметр/
+// pattern-биндер (check_not_reserved, вызывается во всех местах, где
+// заводится .Variable-символ). "в" (for-in) в этот список НЕ входит — она
+// теперь настоящий Token_Kind.In лексера (см. lexer.odin/parser.odin),
+// другой механизм той же политики.
+RESERVED_BUILTIN_NAMES := [?]string {
+	"Ошибка",
+	"длина",
+	"паника",
+	"получить",
+	"отправить",
+	"себя",
+	"наблюдать",
+	"получить_сигнал",
+}
+
 install_standard_symbols :: proc(ctx: ^Resolver_Ctx) {
 	// Есть/Нет/Успех/Неудача сюда НЕ входят — это Enum_Variant варианты
 	// Опции/Результата из прелюдии, доступные через слияние её exports
 	// в resolve_module (см. ниже).
-	names := [?]string {
-		"Ошибка",
-		"длина",
-		"паника",
-		"получить",
-		"отправить",
-		"себя",
-		"наблюдать",
-		"получить_сигнал",
-	}
-	for name in names {
+	for name in RESERVED_BUILTIN_NAMES {
 		sym := new_symbol(ctx.symbol_store, name, .Builtin, nil)
 		ctx.current_scope.symbols[intern(name)] = sym
 	}
+}
+
+// Проверяет, что name НЕ входит в RESERVED_BUILTIN_NAMES — вызывается
+// перед КАЖДОЙ регистрацией НОВОГО локального .Variable-символа (пер/
+// конст/деструктуризация/for-in/параметры функций и лямбд/pattern-
+// биндеры в выборе), т.к. эти места НЕ идут через register_named_symbol
+// (module-scope-only коллизия) и по умолчанию разрешают затенение любого
+// внешнего имени (обычная вложенная область видимости) — без этой явной
+// проверки reserved-имя было бы затеняемым локально, что нарушило бы
+// единую hard-reserved политику. Возвращает true (и репортит diagnostic),
+// если имя зарезервировано — вызывающий код продолжает регистрацию
+// символа как обычно (poison-паттерн резолвера — не блокировать остальной
+// проход из-за одной ошибки).
+check_not_reserved :: proc(ctx: ^Resolver_Ctx, name: string, span: Span) -> bool {
+	for reserved in RESERVED_BUILTIN_NAMES {
+		if name == reserved {
+			report_resolve(ctx, span, "Resolve Error: '%s' — зарезервированное имя, нельзя использовать", name)
+			return true
+		}
+	}
+	return false
 }
 
 new_resolver_ctx :: proc() -> Resolver_Ctx {
@@ -517,16 +550,13 @@ register_named_symbol :: proc(
 ) -> Symbol_Id {
 	sym := new_symbol(ctx.symbol_store, name, kind, module, is_exported, decl, span)
 	name_id := intern(name)
-	if existing_id, taken := module.scope.symbols[name_id];
-	   taken && symbol_at(ctx.symbol_store, existing_id).kind != .Builtin {
-		// Стадия 24: install_standard_symbols резервирует "получить"/
-		// "отправить" (обычные глагольные имена, легко пересекающиеся с
-		// пользовательским кодом — уже было в test_http_url_parsing/
-		// test_math_and_logic, оба объявляют СВОЙ "получить"). Builtin —
-		// не настоящая декларация, пользовательская функция с тем же
-		// именем перетирает её (обычное затенение), а НЕ конфликт.
-		// Настоящий конфликт (два user-decl с одним именем) — по-прежнему
-		// ошибка.
+	// Единая hard-reserved политика (см. RESERVED_BUILTIN_NAMES выше):
+	// install_standard_symbols заранее кладёт builtin'ы ("получить" и
+	// т.п.) в module.scope.symbols — коллизия с ними теперь ТА ЖЕ ошибка,
+	// что коллизия с обычным пользовательским объявлением, без исключения
+	// для .Builtin (раньше — Стадия 24 — было наоборот, затенение
+	// разрешалось; см. ROADMAP §Стадия 39).
+	if _, taken := module.scope.symbols[name_id]; taken {
 		report_resolve(ctx, span, "Resolve Error: символ '%s' уже объявлен", name)
 	} else {
 		module.scope.symbols[name_id] = sym
@@ -556,6 +586,7 @@ resolve_function_body :: proc(
 		// (Kotlin/Swift-style, не opt-in как обычный `конст` для локалей) —
 		// нет способа сделать параметр мутируемым, нужна копия в `пер`
 		// внутри тела, если требуется.
+		check_not_reserved(ctx, arg.name, arg.span)
 		sym := new_symbol(ctx.symbol_store, arg.name, .Variable, module, span = arg.span, is_const = true)
 		ctx.current_scope.symbols[intern(arg.name)] = sym
 		append(&args_syms, sym)
@@ -740,6 +771,7 @@ resolve_pattern :: proc(ctx: ^Resolver_Ctx, pattern: Pattern) {
 			ctx.pattern_binders[p] = sym
 		} else {
 			// Обычный биндер.
+			check_not_reserved(ctx, p.name, p.span)
 			binder := new_symbol(
 				ctx.symbol_store,
 				p.name,
@@ -774,6 +806,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 			// та же форма, что For_In_Stmt.names/for_in_names_syms.
 			syms := make([dynamic]Symbol_Id)
 			for name in s.names {
+				check_not_reserved(ctx, name, s.span)
 				sym := new_symbol(ctx.symbol_store, name, .Variable, ctx.current_module, span = s.span, is_const = s.is_const)
 				name_id := intern(name)
 				if name_id in ctx.current_scope.symbols {
@@ -784,6 +817,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 			}
 			ctx.let_destructure_syms[stmt] = syms
 		} else {
+			check_not_reserved(ctx, s.name, s.span)
 			sym := new_symbol(ctx.symbol_store, s.name, .Variable, ctx.current_module, span = s.span, is_const = s.is_const)
 			name_id := intern(s.name)
 			if name_id in ctx.current_scope.symbols {
@@ -814,6 +848,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 			// Стадия 27) — старое parse-time десахаривание использовало
 			// mk_let (обычный `пер`, reassignable); сохраняем то же
 			// поведение, не меняем его этим рефакторингом попутно.
+			check_not_reserved(ctx, name, s.span)
 			sym := new_symbol(ctx.symbol_store, name, .Variable, ctx.current_module, span = s.span)
 			name_id := intern(name)
 			if name_id in ctx.current_scope.symbols {
@@ -962,6 +997,7 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		for arg in e.args {
 			// Стадия 27 (расширение) — та же immutable-by-default политика,
 			// что у обычных функций (resolve_function_body).
+			check_not_reserved(ctx, arg.name, arg.span)
 			sym := new_symbol(ctx.symbol_store, arg.name, .Variable, ctx.current_module, span = arg.span, is_const = true)
 			ctx.current_scope.symbols[intern(arg.name)] = sym
 			append(&args_syms, sym)

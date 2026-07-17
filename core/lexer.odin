@@ -208,6 +208,8 @@ lookup_ident :: proc(ident: string) -> TokenKind {
 		return .As
 	case "запусти":
 		return .Spawn
+	case "в":
+		return .In
 	}
 	return .Ident
 }

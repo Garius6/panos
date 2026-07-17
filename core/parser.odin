@@ -1318,9 +1318,14 @@ parse_stmt_into :: proc(p: ^Parser, body: ^[dynamic]Stmt) {
 // позиции); для карты сначала .записи(), возвращающая Массив((К,З)),
 // совместимый с шаблоном "для (к, з) в ...".
 //
-// "в" — контекстный keyword: НЕ зарезервированное слово лексера (иначе нельзя
-// было бы использовать "в" как имя переменной), сравнивается по тексту токена
-// только в этой одной позиции грамматики.
+// "в" — настоящий keyword лексера (TokenKind.In, lexer.odin), как "для"/
+// "как"/"запусти". Раньше сравнивался по тексту токена в этой одной
+// позиции грамматики и не резервировал имя вовсе — приведено к единой
+// hard-reserved политике (см. docs/src/language/basic-types.md
+// "Зарезервированные слова"): всё зарезервированное слово либо жёсткий
+// keyword лексера (как здесь), либо reserved-имя в резолвере
+// (install_standard_symbols + check_not_reserved, resolver.odin) —
+// ничего не затеняемо пользовательским кодом.
 parse_for_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt) {
 	start := peek_token(p.stream).span
 	next_token(p.stream) // .For
@@ -1357,7 +1362,7 @@ parse_for_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt) {
 	}
 
 	in_tok := next_token(p.stream)
-	if in_tok.kind != .Ident || in_tok.data != "в" {
+	if in_tok.kind != .In {
 		report_parse(p, in_tok.span, "Синтаксическая ошибка: после списка переменных 'для' ожидается 'в'")
 	}
 

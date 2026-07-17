@@ -936,6 +936,57 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		}
 		return Value(f64(0)), false
 
+	case "убить":
+		// Стадия 42 (kill-примитив): принудительно останавливает ЧУЖОЙ
+		// процесс — единственный способ прервать выполнение процесса
+		// извне (до этого — только естественное завершение/краш).
+		// Переиспользует ТОТ ЖЕ путь очистки, что run_scheduler уже
+		// делает для .Completed/.Crashed (is_alive=false, notify_
+		// watchers, очистка frames/stack/mailbox/watchers/signals,
+		// unordered_remove из vm.processes) — просто выполняется
+		// синхронно здесь, а не в цикле планировщика.
+		//
+		// Самоубийство и убийство "старт()" (процесс #0) запрещены явно:
+		// для самоубийства понадобился бы способ немедленно прервать
+		// ТЕКУЩИЙ execute() (этот builtin — обычный синхронный вызов
+		// внутри него, простой return отсюда НЕ останавливает
+		// оставшиеся инструкции тела процесса); а старт() — корневой
+		// процесс, крашing/завершение которого и так уже имеет особую
+		// семантику (вся программа завершается) — убийство его извне
+		// потребовало бы прокидывать этот сигнал обратно в run_scheduler
+		// из глубины call_builtin, что не стоит сложности ради узкого
+		// кейса ("зачем убивать процесс, за которым и так некому
+		// наблюдать").
+		expect_arg_count(name, len(args), 1)
+		target, ok := args[0].(^Process_Value)
+		if !ok {
+			fmt.panicf("Runtime Error: убить() ожидает Процесс(T) первым аргументом")
+		}
+		current := vm.processes[vm.current_process]
+		if target == current {
+			fmt.panicf("Runtime Error: убить() нельзя применить к самому себе")
+		}
+		if target.id == 0 {
+			fmt.panicf("Runtime Error: убить() нельзя применить к главному процессу")
+		}
+		if !target.is_alive {
+			return Value(f64(0)), false
+		}
+		for i := 0; i < len(vm.processes); i += 1 {
+			if vm.processes[i] == target {
+				target.is_alive = false
+				notify_watchers(vm, target.id, target.watchers[:], "процесс принудительно остановлен (убить())")
+				clear(&target.frames)
+				clear(&target.stack)
+				clear(&target.mailbox)
+				clear(&target.watchers)
+				clear(&target.signals)
+				unordered_remove(&vm.processes, i)
+				break
+			}
+		}
+		return Value(f64(0)), false
+
 	case "ос::аргументы":
 		expect_arg_count(name, len(args), 0)
 		arr := gc_new(vm, Array_Value)

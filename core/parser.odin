@@ -246,6 +246,16 @@ Let_Stmt :: struct {
 	// Та же форма, что For_In_Stmt.names.
 	names:            [dynamic]string,
 	destructure_type: string,
+	// Именованная форма (`пер Тип(x: a, y: b) = значение`) — ТОЛЬКО у
+	// структурной деструктуризации (тупл-форма без имён полей, как enum-
+	// варианты в match-шаблонах). Параллельно `names`, пусто целиком =
+	// позиционная форма. `имя_поля: имя_переменной` — тот же `:`, что
+	// именованные под-шаблоны в `выбор` (Стадия 35), не `=`, как
+	// именованные аргументы вызова (Стадия 36) — деструктуризация
+	// концептуально ближе к сопоставлению с шаблоном, чем к вызову.
+	// Может быть ЧАСТИЧНОЙ (в отличие от вызовов) — неупомянутые поля
+	// просто не извлекаются, не связывается никакая локальная переменная.
+	destructure_field_names: [dynamic]string,
 }
 
 Expr_Stmt :: struct {
@@ -277,6 +287,12 @@ Pattern_Constructor :: struct {
 	module_name: string,
 	name:        string,
 	args:        [dynamic]Pattern,
+	// Именованные поля (`Точка(x: 1, y: _)`) — параллельно args, тот же
+	// индекс. Пусто целиком, если использована обычная позиционная форма
+	// (`Точка(1, _)`) — единственная форма, поддержанная у enum-вариантов
+	// (у них нет имён полей, только позиционные типы). Смешивать формы в
+	// одном шаблоне нельзя — решается по ПЕРВОМУ аргументу при парсинге.
+	field_names: [dynamic]string,
 }
 
 Error_Pattern :: struct {
@@ -337,9 +353,15 @@ Binary_Expr :: struct {
 }
 
 Call_Expr :: struct {
-	span:   Span,
-	args:   [dynamic]Expr,
-	callee: Expr,
+	span:      Span,
+	args:      [dynamic]Expr,
+	callee:    Expr,
+	// Именованные аргументы (`f(x = 1, y = 2)`) — параллельно args, пусто
+	// целиком у позиционной формы (нулевой риск регрессии). `=`, не `:` —
+	// та же нотация, что у записей соответствие(ключ = значение), не
+	// field-аннотации структур. Смешивать с позиционной формой в одном
+	// вызове нельзя, решается по ПЕРВОМУ аргументу при парсинге.
+	arg_names: [dynamic]string,
 }
 
 // Стадия 24 (actor model): `запусти <вызов>` — оборачивает Call_Expr, не
@@ -1494,8 +1516,10 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 	stmt.is_const = is_const
 
 	if peek_token(p.stream).kind == .LParen {
-		// Тупл-деструктуризация: пер (a, b) = ...
-		stmt.names = parse_destructure_names(p)
+		// Тупл-деструктуризация: пер (a, b) = ... — тупл без имён полей,
+		// именованная форма не имеет смысла (та же причина, что enum-
+		// варианты в match-шаблонах, Стадия 35).
+		stmt.names, _ = parse_destructure_names(p, false)
 	} else {
 		ident_tok := next_token(p.stream)
 		if ident_tok.kind != .Ident {
@@ -1503,9 +1527,10 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 			report_parse(p, ident_tok.span, "Синтаксическая ошибка: после '%s' ожидается идентификатор", keyword)
 		}
 		if peek_token(p.stream).kind == .LParen {
-			// Структурная деструктуризация: пер Тип(a, b) = ... — поля по
-			// порядку объявления, как и обычный позиционный конструктор.
-			stmt.names = parse_destructure_names(p)
+			// Структурная деструктуризация: пер Тип(a, b) = ... (позиционная,
+			// поля по порядку объявления) или пер Тип(x: a, y: b) = ...
+			// (именованная, частичная — Стадия 37).
+			stmt.names, stmt.destructure_field_names = parse_destructure_names(p, true)
 			stmt.destructure_type = ident_tok.data
 		} else {
 			stmt.name = ident_tok.data
@@ -1523,12 +1548,41 @@ parse_let_stmt :: proc(p: ^Parser) -> Stmt {
 	return stmt
 }
 
-// Общий разбор "(a, b, ...)" для обеих форм деструктуризации `пер` —
-// зеркалит for-in'овый список имён (parse_for_stmt_into).
-parse_destructure_names :: proc(p: ^Parser) -> [dynamic]string {
+// Общий разбор "(a, b, ...)" (позиционная) или "(x: a, y: b, ...)"
+// (именованная, только если allow_named — структурная форма) для обеих
+// форм деструктуризации `пер` — зеркалит for-in'овый список имён
+// (parse_for_stmt_into) плюс именованный вариант из Стадии 35/36 (та же
+// схема: решается по ПЕРВОМУ элементу, `Ident Colon` впереди однозначно
+// сигналит именованную форму, смешивать с позиционной нельзя).
+parse_destructure_names :: proc(p: ^Parser, allow_named: bool) -> (names: [dynamic]string, field_names: [dynamic]string) {
 	next_token(p.stream) // '('
-	names := make([dynamic]string)
+	names = make([dynamic]string)
+	is_named :=
+		allow_named &&
+		peek_token(p.stream).kind == .Ident &&
+		peek_second_token(p.stream).kind == .Colon
+	if is_named {
+		field_names = make([dynamic]string)
+	}
 	for {
+		if is_named {
+			field_tok := next_token(p.stream)
+			if field_tok.kind != .Ident {
+				report_parse(
+					p,
+					field_tok.span,
+					"Синтаксическая ошибка: ожидалось имя поля перед ':' в именованной деструктуризации",
+				)
+			}
+			expect(p, .Colon)
+			append(&field_names, field_tok.data)
+		} else if allow_named && peek_token(p.stream).kind == .Ident && peek_second_token(p.stream).kind == .Colon {
+			report_parse(
+				p,
+				peek_token(p.stream).span,
+				"Синтаксическая ошибка: нельзя смешивать позиционную и именованную деструктуризацию в одном выражении",
+			)
+		}
 		name_tok := next_token(p.stream)
 		if name_tok.kind != .Ident {
 			report_parse(p, name_tok.span, "Синтаксическая ошибка: в шаблоне деструктуризации ожидается идентификатор")
@@ -1541,7 +1595,7 @@ parse_destructure_names :: proc(p: ^Parser) -> [dynamic]string {
 		}
 	}
 	expect(p, .RParen)
-	return names
+	return names, field_names
 }
 
 parse_expr_stmt :: proc(p: ^Parser) -> Stmt {
@@ -1703,7 +1757,39 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 			call.args = make([dynamic]Expr)
 
 			if peek_token(p.stream).kind != .RParen {
+				// Именованные аргументы (`f(x = 1, y = 2)`) — решается по
+				// ПЕРВОМУ аргументу: `Ident Assign` впереди однозначно
+				// сигналит именованную форму. `x = 1` как позиционное
+				// выражение-присваивание тут не теряется по факту —
+				// присваивание возвращает Пусто, а Пусто нигде не может
+				// быть типом параметра, так что старая интерпретация
+				// НИКОГДА не типизировалась бы успешно ни в одной
+				// реальной программе.
+				is_named :=
+					peek_token(p.stream).kind == .Ident &&
+					peek_second_token(p.stream).kind == .Assign
+				if is_named {
+					call.arg_names = make([dynamic]string)
+				}
 				for {
+					if is_named {
+						name_tok := next_token(p.stream)
+						if name_tok.kind != .Ident {
+							report_parse(
+								p,
+								name_tok.span,
+								"Синтаксическая ошибка: ожидалось имя аргумента перед '=' в именованном вызове",
+							)
+						}
+						expect(p, .Assign)
+						append(&call.arg_names, name_tok.data)
+					} else if peek_token(p.stream).kind == .Ident && peek_second_token(p.stream).kind == .Assign {
+						report_parse(
+							p,
+							peek_token(p.stream).span,
+							"Синтаксическая ошибка: нельзя смешивать позиционные и именованные аргументы в одном вызове",
+						)
+					}
 					append(&call.args, parse_expr(p, 0))
 					if peek_token(p.stream).kind == .Comma {
 						next_token(p.stream)
@@ -1909,7 +1995,35 @@ parse_pattern :: proc(p: ^Parser) -> Pattern {
 					name,
 				)
 			}
+			// Именованные поля (`Точка(x: 1, y: _)`) — решается по ПЕРВОМУ
+			// аргументу: `Ident Colon` впереди однозначно сигналит именованную
+			// форму (ни один валидный позиционный под-шаблон не начинается с
+			// голого `идент:`). Смешивать формы в одном шаблоне нельзя.
+			is_named :=
+				peek_token(p.stream).kind == .Ident &&
+				peek_second_token(p.stream).kind == .Colon
+			if is_named {
+				pat.field_names = make([dynamic]string)
+			}
 			for {
+				if is_named {
+					field_tok := next_token(p.stream)
+					if field_tok.kind != .Ident {
+						report_parse(
+							p,
+							field_tok.span,
+							"Синтаксическая ошибка: ожидалось имя поля перед ':' в именованном шаблоне",
+						)
+					}
+					expect(p, .Colon)
+					append(&pat.field_names, field_tok.data)
+				} else if peek_token(p.stream).kind == .Ident && peek_second_token(p.stream).kind == .Colon {
+					report_parse(
+						p,
+						peek_token(p.stream).span,
+						"Синтаксическая ошибка: нельзя смешивать позиционные и именованные поля в одном шаблоне",
+					)
+				}
 				append(&pat.args, parse_pattern(p))
 				if peek_token(p.stream).kind == .Comma {
 					next_token(p.stream)

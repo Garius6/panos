@@ -103,6 +103,14 @@ Process_Value :: struct {
 	// После первого execute() has_run=true — дальше пустой mailbox уже
 	// значит "действительно нечего делать", не "ещё не стартовал".
 	has_run:  bool,
+	// Стадия 38 (monitor): кто наблюдает за МОИМ завершением — на смерть
+	// (штатную или краш) рассылаем сигнал каждому отсюда (notify_watchers,
+	// vm.odin). signals — МОЯ входящая очередь DOWN-уведомлений (получить_
+	// сигнал() читает отсюда) — отдельный канал от mailbox (см. ROADMAP
+	// §Стадия 38, п.3 — типизированный mailbox не годится для сигналов
+	// другого типа).
+	watchers: [dynamic]^Process_Value,
+	signals:  [dynamic]Value,
 }
 
 Value :: union {
@@ -207,6 +215,7 @@ Opcode :: enum u8 {
 	Receive, // Без операндов. Если mailbox текущего процесса пуст — .Suspended (ip не двигается). Иначе снимает первое сообщение (FIFO), кладёт на стек.
 	Int_Divide, // Целое/Целое: усечение к нулю (в отличие от .Divide — обычное деление). Выбор опкода — на компиляторе (ctx.tc.node_types), рантайм-представление то же f64.
 	Modulo, // Остаток от Int_Divide — тот же принцип усечения, знак следует делимому.
+	Receive_Signal, // Стадия 38: без операндов. Если очередь сигналов текущего процесса пуста — .Suspended (ip не двигается). Иначе снимает первый сигнал (Целое, Опция(Строка)), кладёт на стек.
 }
 
 // Записать 1 байт в массив инструкций
@@ -410,12 +419,17 @@ compile_statement :: proc(ctx: ^Compiler, statement: Stmt) {
 			emit_byte(ctx, u8(value_slot))
 
 			syms := ctx.res.let_destructure_syms[statement]
+			// Стадия 37: field_indices[i] — реальный индекс поля для
+			// syms[i] (тождественно i для позиционной формы, реальный
+			// индекс по имени для именованной — см. Type_Ctx.let_
+			// destructure_field_indices/infer_let_destructure_stmt).
+			field_indices := ctx.tc.let_destructure_field_indices[statement]
 			for sym, i in syms {
 				binder_slot := register_binder_slot(ctx, sym)
 				emit_opcode(ctx, .Get_Local)
 				emit_byte(ctx, u8(value_slot))
 				emit_opcode(ctx, .Get_Property)
-				emit_byte(ctx, u8(i))
+				emit_byte(ctx, u8(field_indices[i]))
 				emit_opcode(ctx, .Set_Local)
 				emit_byte(ctx, u8(binder_slot))
 			}
@@ -1090,6 +1104,13 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				// vm.odin) — отправить() остаётся обычным .Call_Builtin.
 				if resolve_interned(ident.name) == "получить" {
 					emit_opcode(ctx, .Receive)
+					maybe_emit_interface_cast(ctx, expr)
+					return
+				}
+				// Стадия 38: получить_сигнал() — тот же suspend/resume
+				// паттерн, свой опкод .Receive_Signal.
+				if resolve_interned(ident.name) == "получить_сигнал" {
+					emit_opcode(ctx, .Receive_Signal)
 					maybe_emit_interface_cast(ctx, expr)
 					return
 				}

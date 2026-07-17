@@ -291,6 +291,30 @@ Pattern_Info :: struct {
 	// через compile_expr) и сравнивает через .Equal, тот же опкод, что уже
 	// делает структурное сравнение для оператора == (value_equals, vm.odin).
 	literal_expr: Expr,
+	// Два родственных, но РАЗНЫХ вопроса про покрытие — заполняются снизу
+	// вверх в classify_pattern (рекурсивно):
+	//
+	// - fields_fully_covered: ДАНО, что тег/форма уже зафиксирована этим
+	//   шаблоном (для Constructor — конкретный tag_index, для Struct_
+	//   Constructor — единственная форма структуры) — покрывают ли ВСЕ
+	//   под-шаблоны СВОИ поля целиком? Это то, что нужно check_match_
+	//   coverage на ВЕРХНЕМ уровне ветки: "засчитать covered[tag_index]"
+	//   не зависит от того, сколько ВСЕГО вариантов у enum'а — это
+	//   отдельно трекает covered[]-массив по каждой ветке.
+	// - is_exhaustive: покрывает ли этот шаблон ВЕСЬ домен СВОЕГО
+	//   ожидаемого типа целиком (а не только "свой тег") — для Wildcard/
+	//   Binder то же, что fields_fully_covered; для Constructor — ТОЛЬКО
+	//   если у enum'а ровно один вариант (иначе один тег не покрывает
+	//   остальные), даже если fields_fully_covered истинно. Нужен, когда
+	//   ЭТОТ шаблон сам используется как под-шаблон РОДИТЕЛЯ на уровень
+	//   выше (`Событие.Клик(Точка(_, _))` — родитель Событие.Клик читает
+	//   is_exhaustive у Точка(_, _), а не fields_fully_covered у себя
+	//   самого) — раньше (Стадия 25/29/31) вложенный Constructor/Struct_
+	//   Constructor под-шаблон ВСЕГДА считался "не покрывает", даже если
+	//   сам исчерпывающий — консервативное, но раздражающее пользователя
+	//   упрощение, снятое здесь.
+	fields_fully_covered: bool,
+	is_exhaustive:        bool,
 }
 
 classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type) -> Pattern_Info {
@@ -303,9 +327,13 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 		// каскадировать вторичные диагностики (exhaustiveness и т.п.).
 		info.span = pat.span
 		info.kind = .Wildcard
+		info.fields_fully_covered = true
+		info.is_exhaustive = true
 	case ^Pattern_Wildcard:
 		info.span = pat.span
 		info.kind = .Wildcard
+		info.fields_fully_covered = true
+		info.is_exhaustive = true
 	case ^Pattern_Literal:
 		info.span = pat.span
 		expected := prune_type(expected_type)
@@ -320,11 +348,20 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 				expected.name,
 			)
 			info.kind = .Wildcard
+			info.fields_fully_covered = true
+			info.is_exhaustive = true
 			return info
 		}
 		check_expr(ctx, pat.value, expected)
 		info.kind = .Literal
 		info.literal_expr = pat.value
+		// Один литерал никогда не покрывает домен целиком — даже Булево
+		// (у него всего 2 значения, но конкретный литеральный под-шаблон
+		// фиксирует ровно ОДНО из них). Настоящая 2-значная exhaustiveness
+		// для Булево считается отдельно, на уровне ВЕТОК match'а (см.
+		// bool_covered в check_match_coverage) — не здесь, не per-шаблон.
+		info.fields_fully_covered = false
+		info.is_exhaustive = false
 	case ^Pattern_Ident:
 		info.span = pat.span
 		expected := prune_type(expected_type)
@@ -346,6 +383,12 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 				info.kind = .Constructor
 				info.tag_index = tag
 				info.sub_patterns = make([dynamic]Pattern_Info)
+				// Нет полей — нечему не покрыться, тег зафиксирован целиком.
+				info.fields_fully_covered = true
+				// Но покрывает ВЕСЬ enum (для использования этого шаблона
+				// как под-шаблона родителя) только если у enum'а ровно один
+				// вариант — иначе это всего лишь ОДИН тег из нескольких.
+				info.is_exhaustive = len(enum_view.variants) == 1
 				return info
 			}
 		}
@@ -353,10 +396,14 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 		if binder_sym == INVALID_SYMBOL {
 			report(ctx, pat.span, "Type Error: не разрешён шаблон '%s'", pat.name)
 			info.kind = .Wildcard
+			info.fields_fully_covered = true
+			info.is_exhaustive = true
 			return info
 		}
 		info.kind = .Binder
 		info.binder_sym = binder_sym
+		info.fields_fully_covered = true
+		info.is_exhaustive = true
 		ctx.res.symbol_types[binder_sym] = expected_type
 	case ^Pattern_Constructor:
 		info.span = pat.span
@@ -376,6 +423,68 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 					expected.name,
 				)
 				info.kind = .Wildcard
+				info.fields_fully_covered = true
+				info.is_exhaustive = true
+				return info
+			}
+			if len(pat.field_names) > 0 {
+				// Именованные поля (`Точка(x: 1, y: _)`) — частичные:
+				// неупомянутые поля структуры трактуются как неявный `_`
+				// (не влияют на exhaustiveness этой ветки — is_exhaustive
+				// неявного wildcard'а всегда true). Порядок в info.
+				// sub_patterns ВСЕГДА позиционный (по объявлению структуры,
+				// не по порядку в шаблоне) — compile_pattern (compiler.odin)
+				// продолжает работать НЕИЗМЕННО, читает sub_patterns[i] для
+				// поля #i через .Get_Property, знать не знает про имена.
+				info.kind = .Struct_Constructor
+				info.sub_patterns = make([dynamic]Pattern_Info, len(expected.fields))
+				matched := make([dynamic]bool, len(expected.fields), context.temp_allocator)
+				info.fields_fully_covered = true
+				for field_name, i in pat.field_names {
+					field_idx := -1
+					for f, fi in expected.fields {
+						if f.name == field_name {
+							field_idx = fi
+							break
+						}
+					}
+					if field_idx == -1 {
+						report(
+							ctx,
+							pat.span,
+							"Type Error: у структуры '%s' нет поля '%s'",
+							expected.name,
+							field_name,
+						)
+						continue
+					}
+					if matched[field_idx] {
+						report(
+							ctx,
+							pat.span,
+							"Type Error: поле '%s' указано в шаблоне повторно",
+							field_name,
+						)
+						continue
+					}
+					matched[field_idx] = true
+					sub := classify_pattern(ctx, pat.args[i], expected.fields[field_idx].type)
+					info.sub_patterns[field_idx] = sub
+					if !sub.is_exhaustive do info.fields_fully_covered = false
+				}
+				// Неупомянутые поля — неявный `_`, не сужают покрытие.
+				for was_matched, i in matched {
+					if !was_matched {
+						info.sub_patterns[i] = Pattern_Info {
+							kind                  = .Wildcard,
+							tag_index             = -1,
+							span                  = pat.span,
+							fields_fully_covered  = true,
+							is_exhaustive         = true,
+						}
+					}
+				}
+				info.is_exhaustive = info.fields_fully_covered
 				return info
 			}
 			if len(pat.args) != len(expected.fields) {
@@ -389,14 +498,27 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 					len(pat.args),
 				)
 				info.kind = .Wildcard
+				info.fields_fully_covered = true
+				info.is_exhaustive = true
 				return info
 			}
 			info.kind = .Struct_Constructor
 			info.sub_patterns = make([dynamic]Pattern_Info)
+			info.fields_fully_covered = true
 			for arg_pat, i in pat.args {
 				sub := classify_pattern(ctx, arg_pat, expected.fields[i].type)
 				append(&info.sub_patterns, sub)
+				// У структуры одна форма (нет тегов) — целиком покрывает
+				// поле, только если ВСЕ под-шаблоны рекурсивно покрывают
+				// СВОИ поля/тип целиком (Pattern_Info.is_exhaustive — не
+				// fields_fully_covered: вложенный Constructor-подшаблон
+				// сам обязан быть исчерпывающим для СВОЕГО типа, не только
+				// для своего тега).
+				if !sub.is_exhaustive do info.fields_fully_covered = false
 			}
+			// Структура — одна форма, нет тега-гейта: is_exhaustive совпадает
+			// с fields_fully_covered.
+			info.is_exhaustive = info.fields_fully_covered
 			return info
 		}
 		if expected.kind != .Enum {
@@ -408,6 +530,24 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 				expected.name,
 			)
 			info.kind = .Wildcard
+			info.fields_fully_covered = true
+			info.is_exhaustive = true
+			return info
+		}
+		if len(pat.field_names) > 0 {
+			// У вариантов перечисления нет ИМЁН полей (Variant_Decl.types —
+			// список типов, не именованных полей, в отличие от Struct_Decl.
+			// fields) — именованная форма шаблона тут в принципе не может
+			// иметь смысла.
+			report(
+				ctx,
+				pat.span,
+				"Type Error: вариант перечисления '%s' не имеет именованных полей — только позиционные",
+				pat.name,
+			)
+			info.kind = .Wildcard
+			info.fields_fully_covered = true
+			info.is_exhaustive = true
 			return info
 		}
 		enum_view := expected
@@ -421,6 +561,8 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 				enum_view.name,
 			)
 			info.kind = .Wildcard
+			info.fields_fully_covered = true
+			info.is_exhaustive = true
 			return info
 		}
 		expected_fields := enum_view.variants[tag].fields
@@ -435,15 +577,25 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 				len(pat.args),
 			)
 			info.kind = .Wildcard
+			info.fields_fully_covered = true
+			info.is_exhaustive = true
 			return info
 		}
 		info.kind = .Constructor
 		info.tag_index = tag
 		info.sub_patterns = make([dynamic]Pattern_Info)
+		info.fields_fully_covered = true
 		for arg_pat, i in pat.args {
 			sub := classify_pattern(ctx, arg_pat, expected_fields[i])
 			append(&info.sub_patterns, sub)
+			if !sub.is_exhaustive do info.fields_fully_covered = false
 		}
+		// Один конкретный тег покрывает ВЕСЬ enum (для использования этого
+		// шаблона как под-шаблона родителя), только если у enum'а ровно
+		// один вариант — иначе остальные теги не покрыты этим шаблоном,
+		// даже если fields_fully_covered истинно (см. тот же принцип у
+		// голого варианта без скобок выше).
+		info.is_exhaustive = info.fields_fully_covered && len(enum_view.variants) == 1
 	}
 	return info
 }
@@ -503,19 +655,14 @@ check_match_coverage :: proc(
 					"Type Error: внутренняя ошибка — тег варианта вне диапазона",
 				)
 			}
-			// Constructor-с-нетривиальными-подшаблонами (nested constructors,
-			// литеральные под-шаблоны или non-wildcard биндеры) НЕ покрывает
-			// вариант целиком — семантика exhaustiveness требует полного
-			// покрытия. Помечаем как covered только если все подшаблоны —
-			// Wildcard или Binder.
-			fully_covers := true
-			for sub in pi.sub_patterns {
-				if sub.kind == .Constructor || sub.kind == .Struct_Constructor || sub.kind == .Literal {
-					fully_covers = false
-					break
-				}
-			}
-			if fully_covers && covered[pi.tag_index] {
+			// pi.fields_fully_covered — рекурсивно посчитан в classify_pattern:
+			// тег УЖЕ зафиксирован (pi.tag_index) на этом верхнем уровне,
+			// вопрос только "покрыты ли ЕГО поля целиком" — не "покрывает
+			// ли этот единственный тег ВЕСЬ enum" (это отдельно трекает
+			// covered[]-массив по каждой ветке). Рекурсия учитывает вложенный
+			// Constructor/Struct_Constructor под-шаблон, если сам
+			// исчерпывающий для СВОЕГО типа (`Событие.Клик(Точка(_, _))`).
+			if pi.fields_fully_covered && covered[pi.tag_index] {
 				report(
 					ctx,
 					pi.span,
@@ -525,23 +672,19 @@ check_match_coverage :: proc(
 					arm_idx + 1,
 				)
 			}
-			if fully_covers do covered[pi.tag_index] = true
+			if pi.fields_fully_covered do covered[pi.tag_index] = true
 		case .Struct_Constructor:
 			// У структуры одна форма (не enum-теги) — единственный вопрос
 			// исчерпываемости: покрывает ли эта ветка ВСЕ поля целиком
-			// (все под-шаблоны — Wildcard/Binder). Если да — эквивалентно
-			// голому `_`/биндеру, catch_all и обязана быть последней.
-			// Если нет (как `Точка(1, x)` — первое поле сужено литералом)
-			// — просто ещё одна частичная ветка, ничего не покрывает сама
-			// по себе, нужна финальная catch-all ветка (см. конец функции).
-			fully_covers := true
-			for sub in pi.sub_patterns {
-				if sub.kind == .Constructor || sub.kind == .Struct_Constructor || sub.kind == .Literal {
-					fully_covers = false
-					break
-				}
-			}
-			if fully_covers {
+			// (pi.fields_fully_covered, рекурсивно посчитан в
+			// classify_pattern — вложенный Constructor/Struct_Constructor
+			// под-шаблон тоже зачитывается, если сам исчерпывающий для
+			// СВОЕГО типа). Если да — эквивалентно голому `_`/биндеру,
+			// catch_all и обязана быть последней. Если нет (как `Точка(1,
+			// x)` — первое поле сужено литералом) — просто ещё одна
+			// частичная ветка, ничего не покрывает сама по себе, нужна
+			// финальная catch-all ветка (см. конец функции).
+			if pi.fields_fully_covered {
 				catch_all = true
 				if arm_idx != len(arm_infos) - 1 {
 					report(
@@ -643,6 +786,15 @@ Type_Ctx :: struct {
 	interface_casts:  map[Expr]^Type,
 	call_infos:       map[Expr]Call_Info,
 	match_arm_infos:  map[^Match_Expr][dynamic]Pattern_Info,
+	// Именованная деструктуризация (Стадия 37, `пер Тип(x: a, y: b) =
+	// ...`) — .Get_Property-индекс поля для КАЖДОГО symbol'а в ctx.res.
+	// let_destructure_syms[stmt] (тот же порядок). Для позиционной формы
+	// (структурной или тупл) — тождественно [0, 1, 2, ...]; для именованной
+	// — реальный индекс поля по имени, возможно НЕ по порядку в шаблоне
+	// (частичная форма — не все поля структуры обязаны быть перечислены).
+	// compiler.odin читает вместо голого `i` из цикла — единственная
+	// правка в кодогене, сам .Get_Property/Set_Local-паттерн не меняется.
+	let_destructure_field_indices: map[Stmt][dynamic]int,
 	// Стадия 23 (Итерируемое): решение "как компилировать этот for-in"
 	// (fast-path Массив vs iterator-protocol) — тот же принцип, что
 	// Call_Info: не десахаривает AST, аннотирует существующий узел,
@@ -773,6 +925,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		symbol_to_func_decl = make(map[Symbol_Id]^Function_Decl),
 		checked_bodies = make(map[Symbol_Id]bool),
 		generic_call_instantiations = make(map[Expr][dynamic]^Type),
+		let_destructure_field_indices = make(map[Stmt][dynamic]int),
 	}
 	// Стадия 7 Phase F: см. Resolver_Ctx.prelude_generic_order — прелюдия
 	// типизируется в СВОЁМ отдельном tc_ctx (ensure_prelude), любой другой
@@ -1990,6 +2143,12 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			// Регистрируем методы
 			for m in d.methods {
 				sym := ctx.res.decl_symbols[m]
+				// Именованные аргументы (Стадия 36): method_sym -> ^Function_
+				// Decl, та же карта, что топ-уровневые функции получают в
+				// case ^Function_Decl: выше — нужна resolve_named_call_args
+				// на методах (m.args[0] — "это", исключается там же, где
+				// читается).
+				ctx.symbol_to_func_decl[sym] = m
 
 				// Стадия 7 Phase E: сигнатура generic-метода резолвится под
 				// теми же InferVar владельца, что и его поля/варианты
@@ -2635,6 +2794,52 @@ infer_let_destructure_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, s: ^Let_Stmt) {
 			bind_poison(ctx, syms)
 			return
 		}
+		if len(s.destructure_field_names) > 0 {
+			// Именованная, ЧАСТИЧНАЯ форма (Стадия 37) — в отличие от
+			// позиционной ниже, не требует упомянуть ВСЕ поля структуры.
+			field_indices := make([dynamic]int, len(syms))
+			seen := make([dynamic]bool, len(value_type.fields), context.temp_allocator)
+			ok := true
+			for field_name, i in s.destructure_field_names {
+				idx := -1
+				for f, fi in value_type.fields {
+					if f.name == field_name {
+						idx = fi
+						break
+					}
+				}
+				if idx == -1 {
+					report(
+						ctx,
+						s.span,
+						"Type Error: у структуры '%s' нет поля '%s'",
+						value_type.name,
+						field_name,
+					)
+					ok = false
+					continue
+				}
+				if seen[idx] {
+					report(
+						ctx,
+						s.span,
+						"Type Error: поле '%s' указано в деструктуризации повторно",
+						field_name,
+					)
+					ok = false
+					continue
+				}
+				seen[idx] = true
+				field_indices[i] = idx
+				ctx.res.symbol_types[syms[i]] = prune_type(value_type.fields[idx].type)
+			}
+			if !ok {
+				bind_poison(ctx, syms)
+				return
+			}
+			ctx.let_destructure_field_indices[stmt] = field_indices
+			return
+		}
 		if len(value_type.fields) != len(syms) {
 			report(
 				ctx,
@@ -2647,9 +2852,12 @@ infer_let_destructure_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, s: ^Let_Stmt) {
 			bind_poison(ctx, syms)
 			return
 		}
+		field_indices := make([dynamic]int, len(syms))
 		for i in 0 ..< len(syms) {
+			field_indices[i] = i
 			ctx.res.symbol_types[syms[i]] = prune_type(value_type.fields[i].type)
 		}
+		ctx.let_destructure_field_indices[stmt] = field_indices
 	} else {
 		if value_type.kind != .Tuple {
 			report(
@@ -2672,9 +2880,12 @@ infer_let_destructure_stmt :: proc(ctx: ^Type_Ctx, stmt: Stmt, s: ^Let_Stmt) {
 			bind_poison(ctx, syms)
 			return
 		}
+		field_indices := make([dynamic]int, len(syms))
 		for i in 0 ..< len(syms) {
+			field_indices[i] = i
 			ctx.res.symbol_types[syms[i]] = prune_type(value_type.elements[i])
 		}
+		ctx.let_destructure_field_indices[stmt] = field_indices
 	}
 }
 
@@ -3026,6 +3237,44 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 				}
 			}
 			return TY_VOID
+		},
+	},
+	{
+		// Стадия 38 (monitor): наблюдать(процесс) — регистрирует ТЕКУЩИЙ
+		// процесс наблюдателем цели, для ЛЮБОГО T (типизация не знает и
+		// не должна знать T цели — сигнал несёт только id + причину, не
+		// само сообщение, см. получить_сигнал ниже). Обычный .Call_Builtin
+		// путь (не suspend/resume) — регистрация синхронна и всегда
+		// завершается немедленно.
+		name = "наблюдать",
+		arity = 1,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
+			proc_type := prune_type(infer_expr(ctx, args[0]))
+			if proc_type.kind == .Poison do return TY_VOID
+			if proc_type.kind != .Process {
+				return report(
+					ctx,
+					expr_span(args[0]),
+					"Type Error: наблюдать() ожидает Процесс(T) первым аргументом, получен '%s'",
+					proc_type.name,
+				)
+			}
+			return TY_VOID
+		},
+	},
+	{
+		// Стадия 38: получить_сигнал() — ФИКСИРОВАННЫЙ тип результата
+		// (Целое, Опция(Строка)), в отличие от получить() не заводит
+		// InferVar — сигналы приходят от РАЗНЫХ наблюдаемых процессов с
+		// разным T, единственное общее — id (Целое) и причина
+		// (Нет=штатно, Есть(текст)=краш).
+		name = "получить_сигнал",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
+			id_and_reason := make([dynamic]^Type, 0, 2)
+			append(&id_and_reason, TY_INT)
+			append(&id_and_reason, new_option_type(ctx, TY_STRING))
+			return new_tuple_type(id_and_reason)
 		},
 	},
 }
@@ -3816,6 +4065,84 @@ infer_spawn_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Spawn_Expr) -> ^Type {
 	return new_process_type(msg_type)
 }
 
+// Имена параметров функции/метода в порядке объявления — для
+// resolve_named_call_args. Отдельно от Struct_Field.name (структуры)
+// т.к. Param_Decl — другой тип узла.
+param_decl_names :: proc(args: [dynamic]Param_Decl) -> []string {
+	names := make([]string, len(args))
+	for arg, i in args do names[i] = arg.name
+	return names
+}
+
+// Имена полей структуры в порядке объявления — для resolve_named_
+// call_args на конструкторах (`Точка(x = 1, y = 2)`).
+struct_field_names :: proc(struct_type: ^Type) -> []string {
+	names := make([]string, len(struct_type.fields))
+	for f, i in struct_type.fields do names[i] = f.name
+	return names
+}
+
+// param_decl_names БЕЗ receiver'а (m.args[0], всегда "это" — методы
+// объявляют получателя явным первым параметром, см. реализация-блоки).
+// method_type.params[0] — тот же receiver позиционно, поэтому здесь
+// пропускается симметрично.
+method_param_names :: proc(m: ^Function_Decl) -> []string {
+	if len(m.args) == 0 do return []string{}
+	return param_decl_names(m.args)[1:]
+}
+
+// Именованные аргументы (`f(x = 1, y = 2)`) — если вызов использовал
+// именованную форму (Call_Expr.arg_names непусто), переставляет e.args
+// в порядок param_names ПРЯМО В AST. После этого КАЖДЫЙ из ~8 путей
+// разрешения вызова ниже (обычная функция, метод структуры/enum'а/
+// интерфейса, конструктор структуры, bounded generic, cross-module
+// разновидности всех этих) продолжает работать НЕИЗМЕНЁННО — они все
+// уже делают `for arg, i in e.args do check_expr(ctx, arg, params[i])`,
+// который просто не видит разницы между "аргументы пришли позиционно"
+// и "аргументы пришли именованно, но уже переставлены сюда". Только
+// "всё именовано" или "всё позиционно" — parser это уже гарантировал
+// (см. parse_expr's LParen-кейс), здесь только сверяем имена/арность.
+resolve_named_call_args :: proc(ctx: ^Type_Ctx, e: ^Call_Expr, param_names: []string) -> bool {
+	if len(e.arg_names) == 0 do return true
+	if len(e.arg_names) != len(param_names) {
+		report(
+			ctx,
+			e.span,
+			"Type Error: ожидалось %d именованных аргументов, получено %d",
+			len(param_names),
+			len(e.arg_names),
+		)
+		return false
+	}
+	reordered := make([dynamic]Expr, len(param_names))
+	matched := make([dynamic]bool, len(param_names), context.temp_allocator)
+	ok := true
+	for arg_name, i in e.arg_names {
+		idx := -1
+		for pname, pi in param_names {
+			if pname == arg_name {
+				idx = pi
+				break
+			}
+		}
+		if idx == -1 {
+			report(ctx, e.span, "Type Error: неизвестный именованный аргумент '%s'", arg_name)
+			ok = false
+			continue
+		}
+		if matched[idx] {
+			report(ctx, e.span, "Type Error: именованный аргумент '%s' указан повторно", arg_name)
+			ok = false
+			continue
+		}
+		matched[idx] = true
+		reordered[idx] = e.args[i]
+	}
+	if !ok do return false
+	e.args = reordered
+	return true
+}
+
 // Bounded traits: вызов `f(...)` где f — generic-функция хотя бы с одним
 // bound'ом (`f.type_param_bounds` непусто). Отдельная от общего пути
 // (infer_call_expr's `callee_type.kind == .Function` ветка ниже) ветка —
@@ -3844,6 +4171,9 @@ infer_bounded_generic_call :: proc(
 	}
 	subst := make(map[int]^Type)
 	instantiated := instantiate_scheme_with_subst(ctx, scheme, &subst)
+	if !resolve_named_call_args(ctx, e, param_decl_names(fn_decl.args)) {
+		return TY_POISON
+	}
 	if len(e.args) != len(instantiated.params) {
 		return report(ctx, e.span, "Type Error: неверное количество аргументов")
 	}
@@ -4016,6 +4346,19 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				}
 				#partial switch export_type.kind {
 				case .Function:
+					if len(e.arg_names) > 0 {
+						fn_decl, has_fn_decl := export_sym.decl.(^Function_Decl)
+						if !has_fn_decl {
+							return report(
+								ctx,
+								e.span,
+								"Type Error: именованные аргументы не поддержаны для этого вызова",
+							)
+						}
+						if !resolve_named_call_args(ctx, e, param_decl_names(fn_decl.args)) {
+							return TY_POISON
+						}
+					}
 					if len(e.args) != len(export_type.params) {
 						return report(
 							ctx,
@@ -4033,6 +4376,9 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 					return prune_type(export_type.return_type)
 
 				case .Struct:
+					if !resolve_named_call_args(ctx, e, struct_field_names(export_type)) {
+						return TY_POISON
+					}
 					if len(e.args) != len(export_type.fields) {
 						return report(
 							ctx,
@@ -4179,6 +4525,12 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 					// конструкторам.
 					method_type = instantiate_scheme(ctx, scheme)
 				}
+				if len(e.arg_names) > 0 {
+					m_decl, has_m_decl := ctx.symbol_to_func_decl[method_sym]
+					if !has_m_decl || !resolve_named_call_args(ctx, e, method_param_names(m_decl)) {
+						return TY_POISON
+					}
+				}
 				if len(e.args) != len(method_type.params) - 1 {
 					return report(
 						ctx,
@@ -4217,6 +4569,12 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				if scheme, has_scheme := ctx.symbol_schemes[method_sym]; has_scheme {
 					method_type = instantiate_scheme(ctx, scheme)
 				}
+				if len(e.arg_names) > 0 {
+					m_decl, has_m_decl := ctx.symbol_to_func_decl[method_sym]
+					if !has_m_decl || !resolve_named_call_args(ctx, e, method_param_names(m_decl)) {
+						return TY_POISON
+					}
+				}
 				if len(e.args) != len(method_type.params) - 1 {
 					return report(
 						ctx,
@@ -4244,6 +4602,18 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 			}
 		} else if obj_type.kind == .Interface {
 			if method_type, exists := obj_type.interface_methods[prop_expr.property]; exists {
+				if len(e.arg_names) > 0 {
+					// Интерфейсный вызов — динамическая диспетчеризация по
+					// имени, interface_methods хранит только резолвленный
+					// ^Type (без исходных имён параметров из Method_
+					// Signature) — именованные аргументы здесь не
+					// поддержаны, узкое, явно диагностируемое ограничение.
+					return report(
+						ctx,
+						e.span,
+						"Type Error: именованные аргументы не поддержаны для интерфейсных вызовов",
+					)
+				}
 				if len(e.args) != len(method_type.params) - 1 {
 					return report(ctx, e.span, "Ожидалось %d аргументов", len(method_type.params) - 1)
 				}
@@ -4260,11 +4630,32 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 					prop_expr.property,
 				)
 			}
+		} else if obj_type.kind == .Process {
+			// Стадия 38 (monitor): .номер() — единственный метод на
+			// Процесс(T) пока что, даёт id для сравнения с сигналами
+			// получить_сигнал() (value_equals не сравнивает
+			// ^Process_Value по значению — id-сравнение проще).
+			switch prop_expr.property {
+			case "номер":
+				if len(e.args) != 0 do return report(ctx, e.span, "Type Error: Процесс.номер() не принимает аргументы")
+				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
+				return TY_INT
+			case:
+				return report(
+					ctx,
+					e.span,
+					"Type Error: у Процесс(T) нет метода '%s'",
+					prop_expr.property,
+				)
+			}
 		}
 	}
 
 	callee_type := prune_type(infer_expr(ctx, e.callee))
 	if callee_type.kind == .Struct {
+		if !resolve_named_call_args(ctx, e, struct_field_names(callee_type)) {
+			return TY_POISON
+		}
 		if len(e.args) != len(callee_type.fields) {
 			return report(
 				ctx,
@@ -4302,6 +4693,19 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 		}
 
 	} else if callee_type.kind == .Function {
+		if len(e.arg_names) > 0 {
+			fn_decl, has_fn_decl := ctx.symbol_to_func_decl[callee_sym]
+			if !has_fn_decl {
+				return report(
+					ctx,
+					e.span,
+					"Type Error: именованные аргументы не поддержаны для этого вызова",
+				)
+			}
+			if !resolve_named_call_args(ctx, e, param_decl_names(fn_decl.args)) {
+				return TY_POISON
+			}
+		}
 		if len(e.args) != len(callee_type.params) {
 			return report(ctx, e.span, "Type Error: неверное количество аргументов")
 		}

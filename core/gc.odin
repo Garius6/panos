@@ -304,6 +304,10 @@ mark_value :: proc(v: Value) {
 		// Value напрямую (ip/frame_pointer — просто int).
 		for msg in val.mailbox do mark_value(msg)
 		for v2 in val.stack do mark_value(v2)
+		// Стадия 38 (monitor): signals — та же природа, что mailbox
+		// (никогда не свопается, читается напрямую через vm.processes),
+		// та же разметка.
+		for sig in val.signals do mark_value(sig)
 	}
 }
 
@@ -331,6 +335,8 @@ mark_roots :: proc(vm: ^VM) {
 	// vm.*), поэтому актуален всегда — обходим для ВСЕХ процессов.
 	for process, i in vm.processes {
 		for v in process.mailbox do mark_value(v)
+		// Стадия 38: signals — та же логика, что mailbox выше.
+		for v in process.signals do mark_value(v)
 		if i == vm.current_process do continue
 		for v in process.stack do mark_value(v)
 	}

@@ -143,3 +143,14 @@ peek_token :: proc(s: ^TokenStream) -> ^Token {
 	}
 	return &s.tokens[s.current_idx]
 }
+
+// Второй токен вперёд (после peek_token), не потребляя ни одного —
+// нужен для двухтокенного lookahead (напр. `Ident Colon` в начале
+// именованного поля шаблона-конструктора).
+peek_second_token :: proc(s: ^TokenStream) -> ^Token {
+	idx := s.current_idx + 1
+	if idx >= len(s.tokens) {
+		return &s.tokens[len(s.tokens) - 1]
+	}
+	return &s.tokens[idx]
+}

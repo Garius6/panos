@@ -17,12 +17,19 @@ CallFrame :: struct {
 }
 
 // Стадия 24 (actor model): что вернул execute() — доработала ли текущая
-// функция до конца (frames опустели) или приостановилась на .Receive с
-// пустым mailbox (ip остался НА .Receive, resume = повторный вызов
-// execute() для того же процесса).
+// функция до конца (frames опустели) или приостановилась на .Receive/
+// .Receive_Signal с пустой очередью (ip остался НА инструкции, resume =
+// повторный вызов execute() для того же процесса).
+// Стадия 38 (monitor): .Crashed — процесс словил catchable runtime-
+// ошибку (паника()/деление на ноль/индекс за границей — см. VM.crash_
+// message) вместо fmt.panicf, который раньше ронял ВСЮ программу.
+// run_scheduler решает, что делать: для "старт()" (i==0) — по-прежнему
+// fmt.panicf (фатально, как раньше), для остальных процессов — изоляция
+// (см. notify_watchers).
 Exec_Result :: enum {
 	Completed,
 	Suspended,
+	Crashed,
 }
 
 VM :: struct {
@@ -50,6 +57,10 @@ VM :: struct {
 	processes:          [dynamic]^Process_Value,
 	current_process:    int,
 	next_process_id:    int,
+	// Стадия 38 (monitor): выставляется catchable-сайтом ПЕРЕД
+	// return .Crashed из execute() — run_scheduler читает его сразу
+	// после возврата (см. Exec_Result.Crashed).
+	crash_message:      string,
 }
 
 // get_stdin_reader — в vm_io_native.odin/vm_io_wasm.odin (#+build split,
@@ -480,6 +491,37 @@ make_error_result :: proc(vm: ^VM, err: Value) -> Value {
 	return Value(res)
 }
 
+// Стадия 38 (monitor): рассылает DOWN-сигнал `(Целое, Опция(Строка))`
+// всем watchers'ам умершего процесса target_id — crash_reason.?
+// отсутствует для штатного завершения (получатель видит (id, Нет)),
+// присутствует для краша (получатель видит (id, Есть(причина))).
+// Вызывается из run_scheduler в обеих ветках (.Completed и .Crashed при
+// i != 0, watchers = process.watchers[:]), а также из call_builtin
+// ("наблюдать") для синтетического немедленного сигнала ОДНОМУ
+// вотчеру, если цель уже мертва на момент регистрации (watchers —
+// одноэлементный слайс, а не поле умершего Process_Value, у которого к
+// этому моменту watchers уже мог быть очищен планировщиком).
+notify_watchers :: proc(vm: ^VM, target_id: int, watchers: []^Process_Value, crash_reason: Maybe(string)) {
+	if len(watchers) == 0 do return
+	reason_opt := gc_new(vm, Option_Value)
+	gc_protect(vm, Value(reason_opt))
+	if reason, crashed := crash_reason.?; crashed {
+		reason_opt.has_value = true
+		reason_opt.value = Value(gc_new_string(vm, reason))
+	} else {
+		reason_opt.has_value = false
+		reason_opt.value = f64(0)
+	}
+	payload := gc_new(vm, Aggregate_Value)
+	gc_protect(vm, Value(payload))
+	append(&payload.elements, Value(f64(target_id)))
+	append(&payload.elements, Value(reason_opt))
+	for watcher in watchers {
+		append(&watcher.signals, Value(payload))
+	}
+	gc_unprotect(vm, 2)
+}
+
 // Общая точка чтения одной строки из ЛЮБОГО bufio.Reader — общий путь
 // чтения+trim для ввод_вывод::прочитать_строку (общий vm.stdin_reader),
 // File_Value.прочитать_строку у файлов (свой reader на дескриптор) и у
@@ -697,6 +739,14 @@ invoke_collection_method :: proc(
 		}
 	}
 
+	if p, ok_process := receiver.(^Process_Value); ok_process {
+		switch method_name {
+		case "номер":
+			expect_arg_count(method_name, len(args), 0)
+			return Value(f64(p.id)), true
+		}
+	}
+
 	if m, ok_map := receiver.(^Map_Value); ok_map {
 		switch method_name {
 		case "длина":
@@ -817,9 +867,16 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		)
 
 	case "паника":
+		// Стадия 38 (monitor): не fmt.panicf (ронял бы ВСЮ программу) —
+		// crash_message читается сразу после call_builtin() (.Call_Builtin
+		// в execute()), которая превращает его в Exec_Result.Crashed.
+		// Единственная реальная точка user-triggered краша (см. ROADMAP
+		// §Стадия 38): .значение()/.ожидать() и т.п. у Опции/Результата —
+		// panos-функции из PRELUDE_SOURCE (prelude.odin), зовущие паника().
 		expect_arg_count(name, len(args), 1)
 		message := expect_string_arg(name, args[0])
-		fmt.panicf("Runtime Panic: %s", message)
+		vm.crash_message = fmt.tprintf("Runtime Panic: %s", message)
+		return Value(f64(0)), false
 
 	case "себя":
 		expect_arg_count(name, len(args), 0)
@@ -858,6 +915,25 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 			return Value(f64(0)), false
 		}
 		append(&process.mailbox, args[1])
+		return Value(f64(0)), false
+
+	case "наблюдать":
+		// Стадия 38 (monitor): регистрирует ТЕКУЩИЙ процесс наблюдателем
+		// цели. Если цель уже мертва — синтетический немедленный сигнал
+		// (симметрично тому, что отправить() на мёртвый процесс уже
+		// тихий no-op — здесь вместо тишины сигнал, иначе получить_
+		// сигнал() вызывающего зависнет навечно, никто его не разбудит).
+		expect_arg_count(name, len(args), 1)
+		target, ok := args[0].(^Process_Value)
+		if !ok {
+			fmt.panicf("Runtime Error: наблюдать() ожидает Процесс(T) первым аргументом")
+		}
+		watcher := vm.processes[vm.current_process]
+		if !target.is_alive {
+			notify_watchers(vm, target.id, []^Process_Value{watcher}, "процесс уже не существует")
+		} else {
+			append(&target.watchers, watcher)
+		}
 		return Value(f64(0)), false
 
 	case "ос::аргументы":
@@ -1156,7 +1232,9 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			// см. Type_Kind.Integer) — только выбор опкода статический.
 			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
 			if r == 0 {
-				fmt.panicf("Runtime Error: деление на ноль")
+				// Стадия 38: catchable — см. Exec_Result.Crashed.
+				vm.crash_message = "Runtime Error: деление на ноль"
+				return .Crashed
 			}
 			append(&vm.stack, math.trunc(l / r))
 
@@ -1165,7 +1243,8 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			// семантика, что math.mod/C-шный fmod, согласовано с .Int_Divide).
 			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
 			if r == 0 {
-				fmt.panicf("Runtime Error: деление на ноль (остаток)")
+				vm.crash_message = "Runtime Error: деление на ноль (остаток)"
+				return .Crashed
 			}
 			append(&vm.stack, math.mod(l, r))
 
@@ -1229,7 +1308,13 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			name := frame.function.constants[name_index].(^Panos_String).data
 			args_start := len(vm.stack) - arg_count
 			args := vm.stack[args_start:]
+			// Стадия 38: сброс ПЕРЕД вызовом — только "паника" может
+			// выставить его внутри call_builtin, читаем сразу после.
+			vm.crash_message = ""
 			result, has_result := call_builtin(vm, name, args)
+			if vm.crash_message != "" {
+				return .Crashed
+			}
 			resize(&vm.stack, args_start)
 			if has_result {
 				append(&vm.stack, result)
@@ -1487,18 +1572,19 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			if arr, ok_arr := receiver.(^Array_Value); ok_arr {
 				idx := number_to_index(index)
 				if idx >= len(arr.elements) {
-					fmt.panicf(
+					// Стадия 38: catchable — см. Exec_Result.Crashed.
+					vm.crash_message = fmt.tprintf(
 						"Runtime Error: индекс %d выходит за границы массива",
 						idx,
 					)
+					return .Crashed
 				}
 				append(&vm.stack, arr.elements[idx])
 			} else if m, ok_map := receiver.(^Map_Value); ok_map {
 				idx := map_find_index(m, index)
 				if idx == -1 {
-					fmt.panicf(
-						"Runtime Error: ключ не найден в соответствии",
-					)
+					vm.crash_message = "Runtime Error: ключ не найден в соответствии"
+					return .Crashed
 				}
 				append(&vm.stack, m.entries[idx].value)
 			} else if m, ok_string := receiver.(^Panos_String); ok_string {
@@ -1508,10 +1594,11 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 					new_string := Value(gc_new_string(vm, char_str))
 					append(&vm.stack, new_string)
 				} else {
-					fmt.panicf(
+					vm.crash_message = fmt.tprintf(
 						"Runtime Error: индекс %d выходит за границы массива",
 						idx,
 					)
+					return .Crashed
 				}
 			} else {
 				fmt.panicf(
@@ -1527,10 +1614,11 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			if arr, ok_arr := receiver.(^Array_Value); ok_arr {
 				idx := number_to_index(index)
 				if idx >= len(arr.elements) {
-					fmt.panicf(
+					vm.crash_message = fmt.tprintf(
 						"Runtime Error: индекс %d выходит за границы массива",
 						idx,
 					)
+					return .Crashed
 				}
 				arr.elements[idx] = value
 			} else if m, ok_map := receiver.(^Map_Value); ok_map {
@@ -1699,6 +1787,19 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			msg := process.mailbox[0]
 			ordered_remove(&process.mailbox, 0)
 			append(&vm.stack, msg)
+
+		case .Receive_Signal:
+			// Стадия 38: тот же suspend/resume паттерн, что .Receive, но
+			// своя очередь (process.signals) — сигнал уже готовый тупл
+			// (Целое, Опция(Строка)), построенный notify_watchers'ом,
+			// просто снимается с FIFO и кладётся на стек.
+			process := vm.processes[vm.current_process]
+			if len(process.signals) == 0 {
+				return .Suspended
+			}
+			sig := process.signals[0]
+			ordered_remove(&process.signals, 0)
+			append(&vm.stack, sig)
 		}
 
 		// Двигаем IP текущего фрейма вперед
@@ -1725,13 +1826,17 @@ run_scheduler :: proc(vm: ^VM) {
 		for i < len(vm.processes) {
 			process := vm.processes[i]
 
-			// Пустой mailbox у УЖЕ хоть раз запущенного процесса — нечего
-			// делать, пропускаем без входа в execute() (deadlock-guard:
-			// если так для ВСЕХ процессов подряд — некому никого
+			// Пустые mailbox И signals у УЖЕ хоть раз запущенного процесса
+			// — нечего делать, пропускаем без входа в execute() (deadlock-
+			// guard: если так для ВСЕХ процессов подряд — некому никого
 			// разбудить, см. ниже). Свежеспавненный (has_run=false)
-			// обязан получить хотя бы один прогон, даже с пустым mailbox —
-			// тело процесса не обязано начинаться с получить().
-			if process.has_run && len(process.mailbox) == 0 {
+			// обязан получить хотя бы один прогон, даже с пустыми обеими
+			// очередями — тело процесса не обязано начинаться с получить()/
+			// получить_сигнал(). Стадия 38: signals — та же логика, что
+			// mailbox, иначе процесс, приостановленный на получить_
+			// сигнал(), никогда не получит второй шанс исполниться после
+			// прихода сигнала (deadlock-guard ложно сработал бы первым).
+			if process.has_run && len(process.mailbox) == 0 && len(process.signals) == 0 {
 				i += 1
 				continue
 			}
@@ -1756,11 +1861,39 @@ run_scheduler :: proc(vm: ^VM) {
 					return
 				}
 				process.is_alive = false
+				// Стадия 38: штатное завершение — наблюдатели видят
+				// (id, Нет).
+				notify_watchers(vm, process.id, process.watchers[:], nil)
 				clear(&process.frames)
 				clear(&process.stack)
 				clear(&process.mailbox)
+				clear(&process.watchers)
+				clear(&process.signals)
 				unordered_remove(&vm.processes, i)
 				continue // swap-remove передвинул последний элемент на место i — не увеличиваем i
+			}
+
+			if result == .Crashed {
+				if i == 0 {
+					// Стадия 38: краш "старт()" — по-прежнему фатален для
+					// всей программы, тот же текст, что раньше шёл в
+					// fmt.panicf на самом catchable-сайте (см. Exec_
+					// Result.Crashed) — регрессии в существующих тестах
+					// на паника()/Опция/Результат нет.
+					fmt.panicf("%s", vm.crash_message)
+				}
+				process.is_alive = false
+				// Изоляция: наблюдатели видят (id, Есть(причина)), ВСЯ
+				// остальная программа продолжает работать — раньше любой
+				// краш здесь ронял всё через fmt.panicf.
+				notify_watchers(vm, process.id, process.watchers[:], vm.crash_message)
+				clear(&process.frames)
+				clear(&process.stack)
+				clear(&process.mailbox)
+				clear(&process.watchers)
+				clear(&process.signals)
+				unordered_remove(&vm.processes, i)
+				continue
 			}
 
 			i += 1

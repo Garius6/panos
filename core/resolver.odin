@@ -426,7 +426,16 @@ install_standard_symbols :: proc(ctx: ^Resolver_Ctx) {
 	// Есть/Нет/Успех/Неудача сюда НЕ входят — это Enum_Variant варианты
 	// Опции/Результата из прелюдии, доступные через слияние её exports
 	// в resolve_module (см. ниже).
-	names := [?]string{"Ошибка", "длина", "паника", "получить", "отправить", "себя"}
+	names := [?]string {
+		"Ошибка",
+		"длина",
+		"паника",
+		"получить",
+		"отправить",
+		"себя",
+		"наблюдать",
+		"получить_сигнал",
+	}
 	for name in names {
 		sym := new_symbol(ctx.symbol_store, name, .Builtin, nil)
 		ctx.current_scope.symbols[intern(name)] = sym

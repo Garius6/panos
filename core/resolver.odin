@@ -102,6 +102,16 @@ Module_Graph :: struct {
 	// см. resolve_and_typecheck_all (module_loader.odin) и new_type_ctx
 	// (type_cheker.odin), тот же паттерн, что prelude_symbol_schemes.
 	symbol_schemes:   map[Symbol_Id]Type_Scheme,
+	// Стадия 45: T процесса (см. Type_Ctx.process_message_types) каждой
+	// уже протипизированной функции графа — нужен для `запусти Модуль.
+	// функция(...)` (infer_spawn_expr): T процесса зависит только от
+	// получить()-паттернов ВНУТРИ функции, но process_message_types
+	// живёт в Type_Ctx конкретного модуля (module_loader.odin создаёт
+	// СВОЙ tc_ctx на модуль) — без этой карты запусти на чужой модуль не
+	// видело бы T, вычисленный при тайпчеке того модуля. Тот же
+	// накопительный паттерн, что symbol_schemes выше (resolve_and_
+	// typecheck_all/new_type_ctx).
+	process_message_types: map[Symbol_Id]^Type,
 	// file_id → путь/исходник, нужно чтобы превратить Span в line:col при
 	// печати diagnostic'а (Span хранит только file_id, не путь).
 	file_paths:       map[u16]string,

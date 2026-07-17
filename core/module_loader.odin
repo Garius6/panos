@@ -183,6 +183,14 @@ resolve_and_typecheck_all :: proc(graph: ^Module_Graph) -> [dynamic]Module_Resul
 		for sym, scheme in last.tc_ctx.symbol_schemes {
 			graph.symbol_schemes[sym] = scheme
 		}
+		// Стадия 45: тот же мотив/паттерн, что symbol_schemes выше — см.
+		// Module_Graph.process_message_types.
+		if graph.process_message_types == nil {
+			graph.process_message_types = make(map[Symbol_Id]^Type)
+		}
+		for sym, t in last.tc_ctx.process_message_types {
+			graph.process_message_types[sym] = t
+		}
 	}
 	return results
 }

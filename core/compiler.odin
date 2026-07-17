@@ -1217,8 +1217,30 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		// `запусти f(args...)` — НЕ обычный вызов: push fn-константы (как
 		// Ident_Expr для функции, см. выше), компиляция аргументов БЕЗ их
 		// исполнения, .Spawn создаёт Process_Value в рантайме (vm.odin).
-		callee_sym := ctx.res.node_symbols[e.call.callee]
-		fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, callee_sym)]
+		fn_ptr: ^Compiled_Function
+		found: bool
+		#partial switch callee in e.call.callee {
+		case ^Property_Expr:
+			// Стадия 45: `запусти Модуль.функция(...)` — node_symbols не
+			// резолвит Property_Expr целиком (та же логика, что обычный
+			// Property_Expr-как-значение выше в этом proc'е), резолвим
+			// export вручную через object/property.
+			obj_ident := callee.object.(^Ident_Expr)
+			obj_sym_id := ctx.res.node_symbols[callee.object]
+			imported_module := symbol_at(ctx.res.symbol_store, obj_sym_id).module
+			export_sym, export_found := imported_module.exports[intern(callee.property)]
+			if !export_found {
+				fmt.panicf(
+					"Compiler Error: запусти: '%s.%s' не найден в реестре",
+					resolve_interned(obj_ident.name),
+					callee.property,
+				)
+			}
+			fn_ptr, found = ctx.registry^[symbol_registry_key(ctx.res.symbol_store, export_sym)]
+		case:
+			callee_sym := ctx.res.node_symbols[e.call.callee]
+			fn_ptr, found = ctx.registry^[symbol_registry_key(ctx.res.symbol_store, callee_sym)]
+		}
 		if !found {
 			fmt.panicf("Compiler Error: запусти: функция не найдена в реестре")
 		}

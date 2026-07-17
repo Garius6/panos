@@ -954,6 +954,13 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		for sym, scheme in res.module_graph.symbol_schemes {
 			ctx.symbol_schemes[sym] = scheme
 		}
+		// Стадия 45: T процессов уже протипизированных модулей графа —
+		// без этого `запусти Модуль.функция(...)`, где функция сама
+		// вызывает получить() в своём теле, не видело бы её T (см.
+		// Module_Graph.process_message_types).
+		for sym, t in res.module_graph.process_message_types {
+			ctx.process_message_types[sym] = t
+		}
 	}
 	return ctx
 }
@@ -3599,7 +3606,24 @@ resolve_variant_ctor :: proc(
 	for arg, i in args {
 		actual := prune_type(infer_expr(ctx, arg))
 		actual = widen_num_literal_to_int(ctx, arg, actual, prune_type(expected[i]))
-		if !unify_types(actual, expected[i]) {
+		field_type := prune_type(expected[i])
+		// Стадия 45: поле-интерфейс варианта (напр. СобытиеСупервизора.
+		// ДобавитьЗадачу(ДочерняяЗадача)) — тот же приём coercion'а, что
+		// check_expr уже делает для обычных вызовов (~строка 3140 выше).
+		// Без записи в interface_casts компилятор не обернёт struct/enum-
+		// значение в Interface_Value (maybe_emit_interface_cast читает
+		// именно эту карту) — рантайм получил бы "сырое" значение там, где
+		// ожидается интерфейс, и падал бы на первом же вызове метода через
+		// него ("попытка вызвать интерфейсный метод у не-интерфейса").
+		// Не всплывало раньше — ни у одного варианта в кодовой базе до
+		// этой стадии не было интерфейсного поля.
+		if field_type.kind == .Interface && (actual.kind == .Struct || actual.kind == .Enum) {
+			if unify_types(actual, field_type) {
+				ctx.interface_casts[arg] = actual
+				continue
+			}
+		}
+		if !unify_types(actual, field_type) {
 			report(
 				ctx,
 				expr_span(arg),
@@ -3607,7 +3631,7 @@ resolve_variant_ctor :: proc(
 				owner_type.name,
 				resolve_interned(sym.name),
 				i,
-				prune_type(expected[i]).name,
+				field_type.name,
 				prune_type(actual).name,
 			)
 		}
@@ -4091,11 +4115,21 @@ method_lookup :: proc(ctx: ^Type_Ctx, obj_type: ^Type, name: string) -> (Symbol_
 // текущей функции по файлу.
 infer_spawn_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Spawn_Expr) -> ^Type {
 	call := e.call
-	ident, ok := call.callee.(^Ident_Expr)
-	if !ok {
+
+	#partial switch callee in call.callee {
+	case ^Ident_Expr:
+		return infer_spawn_local_call(ctx, call, callee)
+	case ^Property_Expr:
+		return infer_spawn_qualified_call(ctx, call, callee)
+	case:
 		return report(ctx, call.span, "Type Error: 'запусти' ожидает вызов функции по имени")
 	}
+}
 
+// `запусти f(...)` — f объявлена в ТОМ ЖЕ файле. Выделено из infer_spawn_
+// expr при добавлении Стадии 45 (запусти Модуль.функция(...)) — раньше
+// было единственным путём.
+infer_spawn_local_call :: proc(ctx: ^Type_Ctx, call: ^Call_Expr, ident: ^Ident_Expr) -> ^Type {
 	callee_sym := ctx.res.node_symbols[call.callee]
 	if callee_sym == INVALID_SYMBOL {
 		return TY_POISON // резолвер уже отрапортовал undefined-переменную
@@ -4133,6 +4167,87 @@ infer_spawn_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Spawn_Expr) -> ^Type {
 		// f никогда не вызывает получить() — валидный "fire and forget"
 		// процесс. T ничем не ограничен, свежий InferVar (как у пустой
 		// Опция.Нет() без контекста).
+		msg_type = new_infer_var(ctx)
+	}
+	return new_process_type(msg_type)
+}
+
+// Стадия 45: `запусти Модуль.функция(...)` — резолв модуля/экспорта тот
+// же паттерн, что infer_call_expr's Property_Expr-ветка (~строка 4339
+// выше), но БЕЗ ensure_body_checked: экспортирующий модуль уже ПОЛНОСТЬЮ
+// протипизирован раньше по топологическому порядку графа
+// (resolve_and_typecheck_all, module_loader.odin) — его process_message_
+// types уже скопирован в Module_Graph и оттуда в ctx (new_type_ctx), так
+// что читаем напрямую. Не поддерживает Печатаемое-сахар и generic-схемы
+// (module.экспорт) — `запусти` не спавнит builtin'ы и generic-функции
+// сюда не подходят по смыслу (T процесса — не generic-параметр функции).
+infer_spawn_qualified_call :: proc(ctx: ^Type_Ctx, call: ^Call_Expr, prop_expr: ^Property_Expr) -> ^Type {
+	obj_ident, ok := prop_expr.object.(^Ident_Expr)
+	if !ok {
+		return report(ctx, call.span, "Type Error: 'запусти' ожидает вызов функции по имени")
+	}
+	obj_sym := ctx.res.node_symbols[prop_expr.object]
+	if obj_sym == INVALID_SYMBOL || symbol_at(ctx.res.symbol_store, obj_sym).kind != .Module {
+		return report(ctx, call.span, "Type Error: 'запусти' ожидает вызов функции по имени")
+	}
+	imported_module := symbol_at(ctx.res.symbol_store, obj_sym).module
+	if imported_module == nil {
+		return report(ctx, call.span, "Type Error: модуль '%s' не загружен", resolve_interned(obj_ident.name))
+	}
+	export_sym_id, found := imported_module.exports[intern(prop_expr.property)]
+	if !found {
+		return report(
+			ctx,
+			call.span,
+			"Type Error: модуль '%s' не экспортирует '%s'",
+			resolve_interned(obj_ident.name),
+			prop_expr.property,
+		)
+	}
+	export_sym := symbol_at(ctx.res.symbol_store, export_sym_id)
+	if export_sym.kind != .Function {
+		return report(
+			ctx,
+			call.span,
+			"Type Error: 'запусти' ожидает вызов функции, '%s.%s' — не функция",
+			resolve_interned(obj_ident.name),
+			prop_expr.property,
+		)
+	}
+
+	export_type, found_type := ctx.res.symbol_types[export_sym_id]
+	if !found_type || export_type == nil {
+		if fn_decl, has_fn_decl := export_sym.decl.(^Function_Decl); has_fn_decl {
+			export_type = function_type_from_decl(ctx, fn_decl)
+		}
+	}
+	func_type := prune_type(export_type)
+	if func_type == nil || func_type.kind != .Function {
+		return report(
+			ctx,
+			call.span,
+			"Type Error: '%s.%s' — не функция",
+			resolve_interned(obj_ident.name),
+			prop_expr.property,
+		)
+	}
+	if len(call.args) != len(func_type.params) {
+		return report(
+			ctx,
+			call.span,
+			"Type Error: функция '%s.%s' ожидает %d аргументов, получено %d",
+			resolve_interned(obj_ident.name),
+			prop_expr.property,
+			len(func_type.params),
+			len(call.args),
+		)
+	}
+	for i in 0 ..< len(call.args) {
+		check_expr(ctx, call.args[i], func_type.params[i])
+	}
+
+	msg_type, has_msg := ctx.process_message_types[export_sym_id]
+	if !has_msg {
 		msg_type = new_infer_var(ctx)
 	}
 	return new_process_type(msg_type)

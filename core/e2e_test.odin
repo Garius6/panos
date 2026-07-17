@@ -97,6 +97,24 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 	return 0.0, false
 }
 
+// Стадия 45: как run_module_file, но останавливается ПОСЛЕ resolve+
+// typecheck (не компилирует/не исполняет) и возвращает накопленные
+// diagnostic'и со всех модулей графа разом — для негативных тестов на
+// `запусти Модуль.функция(...)` (модуль/функция не существуют), где
+// нужен РЕАЛЬНЫЙ импорт (в отличие от typecheck_only, у которого
+// Resolver_Ctx.module_graph == nil — однофайловый путь, см. её пометку).
+typecheck_only_module_file :: proc(filename: string) -> [dynamic]Diagnostic {
+	graph := load_module_graph(filename)
+	results := resolve_and_typecheck_all(&graph)
+	all := make([dynamic]Diagnostic)
+	for d in graph.parse_diagnostics do append(&all, d)
+	for r in results {
+		for d in r.res_ctx.diagnostics do append(&all, d)
+		for d in r.tc_ctx.diagnostics do append(&all, d)
+	}
+	return all
+}
+
 // Прогоняет только парсинг+резолв+типизацию (без компиляции/исполнения) и
 // возвращает накопленные diagnostic'и СО ВСЕХ трёх стадий разом — для
 // тестов, которые хотят увидеть ВСЕ ошибки, а не только первую (в отличие
@@ -5142,9 +5160,26 @@ test_monitor_multiple_watchers_all_notified :: proc(t: ^testing.T) {
 // ребёнка и оригинальную причину краша.
 @(test)
 test_qualified_impl_supervisor_restarts_then_gives_up :: proc(t: ^testing.T) {
+	// Стадия 45: наблюдать(proc) переехал из старт_рабочего() в
+	// per-child relay (ретранслятор_рабочего) — наблюдать() регистрирует
+	// ТЕКУЩИЙ процесс как наблюдателя, значит наблюдателем обязан быть
+	// именно relay (см. std/супервизор.ps). Это узкий, детерминированный
+	// побочный эффект: в ЭТОЙ фикстуре (один ребёнок, крашится СРАЗУ на
+	// первое же сообщение, отправленное синхронно в том же вызове
+	// запустить()) worker успевает выполниться и упасть РАНЬШЕ, чем
+	// scheduler впервые дойдёт до его relay (порядок обхода vm.processes
+	// — по индексу, worker всегда спавнится раньше relay). наблюдать()
+	// на уже мёртвую цель — штатный (Стадия 38) синтетический сигнал
+	// "процесс уже не существует" вместо РЕАЛЬНОГО текста паники — restart/
+	// лимит-логика на это НЕ влияет (Есть(причина) обрабатывается
+	// одинаково), меняется только текст. Реальный воркер-краш ("рабочий
+	// сломался") НАДЁЖНО виден в фикстурах с несколькими детьми
+	// (supervisor_one_for_all/rest_for_one) — там на момент паники это
+	// уже РЕСТАРТ (после swap-remove'ов), relay успевает зарегистрироваться
+	// первым.
 	testing.expect_assert(
 		t,
-		"Runtime Panic: супервизор (один-за-одного): 'падающий-рабочий' превысил лимит перезапусков (1): Runtime Panic: рабочий сломался",
+		"Runtime Panic: супервизор (один-за-одного): 'падающий-рабочий' превысил лимит перезапусков (1): процесс уже не существует",
 	)
 	run_module_file("fixtures/supervisor_fixture_main.ps")
 }
@@ -5581,4 +5616,79 @@ test_link_to_root_is_fatal_error :: proc(t: ^testing.T) {
 			конец
 		конец
 	`)
+}
+
+// Стадия 45: `запусти Модуль.функция(...)` (qualified-форма) — раньше
+// `запусти` жёстко требовал bare-ident callee (infer_spawn_expr,
+// type_cheker.odin). Позитив: handle РЕАЛЬНО типобезопасен (не
+// unconstrained fire-and-forget) — сообщение доходит с правильным
+// payload'ом (видно через панику "эхо получило: привет", пойманную
+// наблюдать()+получить_сигнал() в старт()).
+@(test)
+test_spawn_qualified_call_gives_typed_handle :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Runtime Panic: Runtime Panic: эхо получило: привет")
+	run_module_file("fixtures/spawn_qualified_fixture_main.ps")
+}
+
+// Негатив: handle от qualified-запусти отвергает НЕПОДХОДЯЩИЙ тип на
+// этапе typecheck — доказывает, что T реально выведен из получить()-
+// паттерна ВНУТРИ спавненной функции (эхо()), а не оставлен свободным.
+@(test)
+test_spawn_qualified_call_rejects_wrong_message_type :: proc(t: ^testing.T) {
+	diags := typecheck_only_module_file("fixtures/spawn_qualified_bad_type_fixture_main.ps")
+	expect_diagnostic(t, diags, "Type Error: ожидался 'Команда', получен 'Строка'")
+}
+
+// Негатив: `запусти НесуществующийМодуль.функция()` — понятная ошибка,
+// не крэш компилятора.
+@(test)
+test_spawn_qualified_call_unknown_module_reports_error :: proc(t: ^testing.T) {
+	diags := typecheck_only_module_file("fixtures/spawn_qualified_bad_module_fixture_main.ps")
+	expect_diagnostic(t, diags, "Type Error: 'запусти' ожидает вызов функции по имени")
+}
+
+// Негатив: `запусти Модуль.Экспорт(...)`, где Экспорт существует, но не
+// функция (тип-перечисление) — понятная Type Error.
+@(test)
+test_spawn_qualified_call_non_function_export_reports_error :: proc(t: ^testing.T) {
+	diags := typecheck_only_module_file("fixtures/spawn_qualified_not_function_fixture_main.ps")
+	expect_diagnostic(t, diags, "Type Error: 'запусти' ожидает вызов функции, 'супервизор.Стратегия' — не функция")
+}
+
+// Стадия 45: динамическое добавление ребёнка во время работы супервизора
+// — супервизор спавнится напрямую (qualified запусти), получает
+// типобезопасный Процесс(СобытиеСупервизора), внешний код шлёт
+// ДобавитьЗадачу(...). Добавленный ребёнок падает, супервизор его
+// перезапускает до лимита, затем паникует — доказывает, что динамически
+// добавленный ребёнок реально под наблюдением (не осиротевший).
+//
+// Текст причины ("процесс уже не существует" вместо "динамический
+// рабочий сломался") — тот же детерминированный нюанс планировщика, что
+// у test_qualified_impl_supervisor_restarts_then_gives_up (см. её
+// пометку): единственный ребёнок крашится на первое же сообщение,
+// отправленное синхронно в том же вызове запустить(), — worker
+// успевает упасть раньше, чем scheduler впервые дойдёт до его relay.
+// Restart/лимит-логика не зависит от точного текста причины.
+@(test)
+test_supervisor_dynamic_add_child_gets_supervised :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Runtime Panic: Runtime Panic: супервизор (один-за-одного): 'динамический-рабочий' превысил лимит перезапусков (1): процесс уже не существует",
+	)
+	run_module_file("fixtures/supervisor_dynamic_add_fixture_main.ps")
+}
+
+// Стадия 45: динамическое удаление ребёнка — "тихая" задача на индексе 0
+// удаляется (УбратьЗадачу(0), tombstone id_ов[0] = -1) ДО того, как
+// добавляется падающая задача (индекс 1). Итоговая паника ссылается
+// ИМЕННО на падающую задачу с ОЖИДАЕМЫМ (не перепутанным) именем/лимитом
+// — доказательство, что tombstone-запись не путает индексацию
+// последующих задач.
+@(test)
+test_supervisor_dynamic_remove_child_stops_and_untracked :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Runtime Panic: Runtime Panic: супервизор (один-за-одного): 'падающая-после-удаления' превысил лимит перезапусков (1): процесс уже не существует",
+	)
+	run_module_file("fixtures/supervisor_dynamic_remove_fixture_main.ps")
 }

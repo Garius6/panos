@@ -443,6 +443,7 @@ RESERVED_BUILTIN_NAMES := [?]string {
 	"наблюдать",
 	"получить_сигнал",
 	"убить",
+	"связать",
 }
 
 install_standard_symbols :: proc(ctx: ^Resolver_Ctx) {

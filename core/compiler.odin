@@ -111,6 +111,11 @@ Process_Value :: struct {
 	// другого типа).
 	watchers: [dynamic]^Process_Value,
 	signals:  [dynamic]Value,
+	// Стадия 44 (link): двусторонний список — связать(A, B) добавляет
+	// B в A.links И A в B.links. В отличие от watchers (только
+	// уведомление), крах ЛЮБОЙ стороны (не штатное завершение — см.
+	// terminate_process, vm.odin) каскадно завершает и другую.
+	links:    [dynamic]^Process_Value,
 }
 
 Value :: union {

@@ -522,6 +522,49 @@ notify_watchers :: proc(vm: ^VM, target_id: int, watchers: []^Process_Value, cra
 	gc_unprotect(vm, 2)
 }
 
+// Стадия 44 (link-примитив): единая точка "процесс окончательно мёртв"
+// — переиспользуется run_scheduler'ом (.Completed/.Crashed, i != 0) и
+// call_builtin'ом ("убить"), был раньше продублирован в обоих местах.
+// Помечает is_alive=false, уведомляет watchers (notify_watchers, Стадия
+// 38), КАСКАДНО завершает связанные (links, Стадия 44) процессы — но
+// ТОЛЬКО если это НЕНОРМАЛЬНОЕ завершение (reason.? присутствует), тот
+// же принцип, что у Erlang: 'normal' exit не убивает linked процессы,
+// только краш/убить(). Затем очищает поля и удаляет из vm.processes.
+//
+// Гарантированно НИКОГДА не вызывается с target.id == 0 ("старт()") —
+// у этого процесса особая семантика (завершение = вся программа
+// заканчивается), реализованная ТОЛЬКО в run_scheduler для i==0;
+// terminate_process не умеет её воспроизвести (нет пути наверх до
+// main()), поэтому связать()/убить() отдельно запрещают root как цель
+// (и связать() — как инициатора, иначе root мог бы попасть в чей-то
+// links и получить каскад). run_scheduler сам никогда не зовёт эту
+// функцию для i == 0 (у него отдельная fmt.panicf/return ветка).
+terminate_process :: proc(vm: ^VM, target: ^Process_Value, reason: Maybe(string)) {
+	if !target.is_alive do return // cycle guard: уже завершён, в т.ч. рекурсивно через links
+	target.is_alive = false
+	notify_watchers(vm, target.id, target.watchers[:], reason)
+
+	if crash_text, crashed := reason.?; crashed {
+		linked_reason := fmt.tprintf("связанный процесс #%d упал: %s", target.id, crash_text)
+		for linked in target.links {
+			terminate_process(vm, linked, linked_reason)
+		}
+	}
+
+	for i := 0; i < len(vm.processes); i += 1 {
+		if vm.processes[i] == target {
+			clear(&target.frames)
+			clear(&target.stack)
+			clear(&target.mailbox)
+			clear(&target.watchers)
+			clear(&target.signals)
+			clear(&target.links)
+			unordered_remove(&vm.processes, i)
+			break
+		}
+	}
+}
+
 // Общая точка чтения одной строки из ЛЮБОГО bufio.Reader — общий путь
 // чтения+trim для ввод_вывод::прочитать_строку (общий vm.stdin_reader),
 // File_Value.прочитать_строку у файлов (свой reader на дескриптор) и у
@@ -940,11 +983,10 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		// Стадия 42 (kill-примитив): принудительно останавливает ЧУЖОЙ
 		// процесс — единственный способ прервать выполнение процесса
 		// извне (до этого — только естественное завершение/краш).
-		// Переиспользует ТОТ ЖЕ путь очистки, что run_scheduler уже
-		// делает для .Completed/.Crashed (is_alive=false, notify_
-		// watchers, очистка frames/stack/mailbox/watchers/signals,
-		// unordered_remove из vm.processes) — просто выполняется
-		// синхронно здесь, а не в цикле планировщика.
+		// terminate_process (Стадия 44 — вынесена в общую функцию, была
+		// продублирована здесь и в run_scheduler) переиспользует тот же
+		// путь очистки, что и .Completed/.Crashed, плюс (новое) каскадно
+		// завершает связанные через связать() процессы.
 		//
 		// Самоубийство и убийство "старт()" (процесс #0) запрещены явно:
 		// для самоубийства понадобился бы способ немедленно прервать
@@ -969,22 +1011,41 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		if target.id == 0 {
 			fmt.panicf("Runtime Error: убить() нельзя применить к главному процессу")
 		}
+		terminate_process(vm, target, "процесс принудительно остановлен (убить())")
+		return Value(f64(0)), false
+
+	case "связать":
+		// Стадия 44 (link-примитив): двусторонняя связь — крах ЛЮБОЙ
+		// стороны (Есть(причина), не Нет — см. terminate_process)
+		// каскадно завершает и другую. "Просто уведомить, не убивать"
+		// уже даёт наблюдать()/получить_сигнал() (Стадия 38) — связать()
+		// не нуждается в Erlang-style trap_exit opt-out, раз оба
+		// поведения уже доступны как два разных builtin'а.
+		//
+		// Самолинковка разрешена (как у наблюдать() — безвредна, cycle
+		// guard в terminate_process её же обезвреживает). "Старт()"
+		// (процесс #0) запрещён и как цель, И как инициатор — если бы
+		// root попал в чей-то links, каскад попытался бы завершить его
+		// через terminate_process, у которой нет способа воспроизвести
+		// особую семантику root'а (программа заканчивается) — только
+		// run_scheduler это умеет, для i == 0 отдельной веткой.
+		expect_arg_count(name, len(args), 1)
+		target, ok := args[0].(^Process_Value)
+		if !ok {
+			fmt.panicf("Runtime Error: связать() ожидает Процесс(T) первым аргументом")
+		}
+		current := vm.processes[vm.current_process]
+		if current.id == 0 {
+			fmt.panicf("Runtime Error: связать() нельзя вызвать из главного процесса")
+		}
+		if target.id == 0 {
+			fmt.panicf("Runtime Error: связать() нельзя применить к главному процессу")
+		}
 		if !target.is_alive {
 			return Value(f64(0)), false
 		}
-		for i := 0; i < len(vm.processes); i += 1 {
-			if vm.processes[i] == target {
-				target.is_alive = false
-				notify_watchers(vm, target.id, target.watchers[:], "процесс принудительно остановлен (убить())")
-				clear(&target.frames)
-				clear(&target.stack)
-				clear(&target.mailbox)
-				clear(&target.watchers)
-				clear(&target.signals)
-				unordered_remove(&vm.processes, i)
-				break
-			}
-		}
+		append(&current.links, target)
+		append(&target.links, current)
 		return Value(f64(0)), false
 
 	case "ос::аргументы":
@@ -1911,16 +1972,10 @@ run_scheduler :: proc(vm: ^VM) {
 					// состояние (ничего дополнительно свопать не нужно).
 					return
 				}
-				process.is_alive = false
 				// Стадия 38: штатное завершение — наблюдатели видят
-				// (id, Нет).
-				notify_watchers(vm, process.id, process.watchers[:], nil)
-				clear(&process.frames)
-				clear(&process.stack)
-				clear(&process.mailbox)
-				clear(&process.watchers)
-				clear(&process.signals)
-				unordered_remove(&vm.processes, i)
+				// (id, Нет), links (Стадия 44) НЕ каскадируют (нормальное
+				// завершение не убивает связанных — см. terminate_process).
+				terminate_process(vm, process, nil)
 				continue // swap-remove передвинул последний элемент на место i — не увеличиваем i
 			}
 
@@ -1933,17 +1988,11 @@ run_scheduler :: proc(vm: ^VM) {
 					// на паника()/Опция/Результат нет.
 					fmt.panicf("%s", vm.crash_message)
 				}
-				process.is_alive = false
 				// Изоляция: наблюдатели видят (id, Есть(причина)), ВСЯ
 				// остальная программа продолжает работать — раньше любой
-				// краш здесь ронял всё через fmt.panicf.
-				notify_watchers(vm, process.id, process.watchers[:], vm.crash_message)
-				clear(&process.frames)
-				clear(&process.stack)
-				clear(&process.mailbox)
-				clear(&process.watchers)
-				clear(&process.signals)
-				unordered_remove(&vm.processes, i)
+				// краш здесь ронял всё через fmt.panicf. Стадия 44:
+				// связанные (links) процессы каскадно завершаются тоже.
+				terminate_process(vm, process, vm.crash_message)
 				continue
 			}
 

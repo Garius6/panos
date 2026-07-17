@@ -3315,6 +3315,27 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 		},
 	},
 	{
+		// Стадия 44 (link-примитив): связать(процесс) — двусторонняя
+		// связь, для ЛЮБОГО T (та же логика, что у наблюдать()/убить()).
+		// Самолинковка/запрет на "старт()" — рантайм-проверки (vm.odin),
+		// не здесь: типизация не знает "текущий процесс" статически.
+		name = "связать",
+		arity = 1,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
+			proc_type := prune_type(infer_expr(ctx, args[0]))
+			if proc_type.kind == .Poison do return TY_VOID
+			if proc_type.kind != .Process {
+				return report(
+					ctx,
+					expr_span(args[0]),
+					"Type Error: связать() ожидает Процесс(T) первым аргументом, получен '%s'",
+					proc_type.name,
+				)
+			}
+			return TY_VOID
+		},
+	},
+	{
 		// Стадия 38: получить_сигнал() — ФИКСИРОВАННЫЙ тип результата
 		// (Целое, Опция(Строка)), в отличие от получить() не заводит
 		// InferVar — сигналы приходят от РАЗНЫХ наблюдаемых процессов с

@@ -86,7 +86,7 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 	case "ввод_вывод::поток":
 		return new_function_type(make([dynamic]^Type), TY_FILE)
 	case "строки::срез":
-		return builtin_function_type_3(TY_STRING, TY_NUM, TY_NUM, TY_STRING)
+		return builtin_function_type_3(TY_STRING, TY_INT, TY_INT, TY_STRING)
 	case "строки::это_цифра":
 		return builtin_function_type_1(TY_STRING, TY_BOOL)
 	case "строки::это_буква":
@@ -97,8 +97,10 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_NUM, TY_ERROR))
 	case "строки::из_числа":
 		return builtin_function_type_1(TY_NUM, TY_STRING)
+	case "строки::из_целого":
+		return builtin_function_type_1(TY_INT, TY_STRING)
 	case "строки::найти":
-		return builtin_function_type_3(TY_STRING, TY_STRING, TY_NUM, TY_NUM)
+		return builtin_function_type_3(TY_STRING, TY_STRING, TY_INT, TY_INT)
 	case "строки::содержит":
 		return builtin_function_type_2(TY_STRING, TY_STRING, TY_BOOL)
 	case "строки::заменить":
@@ -235,6 +237,7 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 		)
 		add_builtin_export(graph, module, "в_число", builtin_export_type(graph, "строки::в_число"))
 		add_builtin_export(graph, module, "из_числа", builtin_export_type(graph, "строки::из_числа"))
+		add_builtin_export(graph, module, "из_целого", builtin_export_type(graph, "строки::из_целого"))
 		add_builtin_export(graph, module, "найти", builtin_export_type(graph, "строки::найти"))
 		add_builtin_export(graph, module, "содержит", builtin_export_type(graph, "строки::содержит"))
 		add_builtin_export(graph, module, "заменить", builtin_export_type(graph, "строки::заменить"))

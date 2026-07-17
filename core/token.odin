@@ -54,6 +54,7 @@ TokenKind :: enum {
 	Comma,
 	Question,
 	Spawn,
+	Percent,
 	EOF,
 }
 

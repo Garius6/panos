@@ -2,6 +2,7 @@ package core
 
 import "core:bufio"
 import "core:fmt"
+import "core:math"
 import "core:strconv"
 import "core:strings"
 import "core:unicode"
@@ -962,6 +963,14 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		}
 		return Value(gc_new_string(vm, fmt.tprintf("%v", num))), true
 
+	case "строки::из_целого":
+		expect_arg_count(name, len(args), 1)
+		num, ok_num := args[0].(f64)
+		if !ok_num {
+			fmt.panicf("Runtime Error: строки.из_целого() ожидает целое")
+		}
+		return Value(gc_new_string(vm, fmt.tprintf("%d", i64(num)))), true
+
 	case "строки::найти":
 		expect_arg_count(name, len(args), 3)
 		text := expect_string_arg(name, args[0])
@@ -1139,6 +1148,26 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 		case .Divide:
 			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
 			append(&vm.stack, l / r)
+
+		case .Int_Divide:
+			// Целое/Целое: усечение к нулю (как в C/Rust/Go — НЕ floor
+			// как в Python, см. согласование в ROADMAP/чате). Рантайм
+			// по-прежнему f64 (Целое не имеет отдельного Value-варианта,
+			// см. Type_Kind.Integer) — только выбор опкода статический.
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
+			if r == 0 {
+				fmt.panicf("Runtime Error: деление на ноль")
+			}
+			append(&vm.stack, math.trunc(l / r))
+
+		case .Modulo:
+			// Остаток при усечении к нулю — знак следует делимому (та же
+			// семантика, что math.mod/C-шный fmod, согласовано с .Int_Divide).
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
+			if r == 0 {
+				fmt.panicf("Runtime Error: деление на ноль (остаток)")
+			}
+			append(&vm.stack, math.mod(l, r))
 
 		case .Less:
 			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)

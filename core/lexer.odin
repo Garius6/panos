@@ -311,6 +311,11 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 				kind = .Slash,
 				data = "/",
 			}; advance(l)
+		case '%':
+			tok = Token {
+				kind = .Percent,
+				data = "%",
+			}; advance(l)
 		case '(':
 			tok = Token {
 				kind = .LParen,

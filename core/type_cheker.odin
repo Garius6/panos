@@ -1,6 +1,7 @@
 package core
 
 import "core:fmt"
+import "core:math"
 import "core:strconv"
 import "core:strings"
 
@@ -8,6 +9,18 @@ import "core:strings"
 
 Type_Kind :: enum {
 	Number,
+	// Целое — отдельный от Число тип. На РАНТАЙМЕ представлен ТЕМ ЖЕ f64
+	// (нет отдельного Value-варианта, нет своего GC/opcode-семейства для
+	// +/-/*), различие целиком на уровне типов: только компилятор решает,
+	// какой опкод для `/` эмитить (.Divide для Число, .Int_Divide для
+	// Целое — оба уже видят статические типы операндов через
+	// ctx.tc.node_types). Целочисленные литералы (без точки) по умолчанию
+	// Целое, но "расширяются" до Число в Число-контексте — см. check_expr
+	// и infer_binary_expr, литерал остаётся Число-совместимым синтаксисом,
+	// а не значением с неявной коэрцией (коэрция между УЖЕ типизированными
+	// Целое/Число переменными сознательно НЕ реализована в этом проходе —
+	// отложено до отдельной задачи с explicit-конверсией).
+	Integer,
 	Bool,
 	Void,
 	Never,
@@ -90,6 +103,14 @@ Type :: struct {
 	// иначе одно случайное совпадение навсегда зацементировало бы T/E
 	// шаблона для всей остальной программы (шаблон один на граф).
 	is_decl_param:          bool,
+	// Bounded traits: список интерфейсов, которые ОБЯЗАН реализовывать
+	// конкретный тип, подставляемый вместо этого decl-param InferVar
+	// (`[T: Сравниваемое + Печатаемое]`). Пусто у всех типов, кроме
+	// bounded decl-param InferVar — заполняется в make_decl_type_params.
+	// НЕ используется для method_lookup (это делает только конкретный
+	// тип на этапе мономорфизации, см. core/monomorphize.odin) — только
+	// для type_satisfies_interface на этапе абстрактной проверки тела.
+	required_interfaces:   [dynamic]^Type,
 }
 
 // Ищет позицию варианта по имени в enum-типе (обычном или synth-view
@@ -106,6 +127,7 @@ Struct_Field :: struct {
 
 // Интернированные базовые типы
 TY_NUM := &Type{kind = .Number, name = "Число"}
+TY_INT := &Type{kind = .Integer, name = "Целое"}
 TY_BOOL := &Type{kind = .Bool, name = "Булево"}
 TY_VOID := &Type{kind = .Void, name = "Пусто"}
 TY_NEVER := &Type{kind = .Never, name = "Никогда"}
@@ -125,6 +147,7 @@ Base_Type_Entry :: struct {
 
 BASE_TYPES := [?]Base_Type_Entry {
 	{"Число", TY_NUM},
+	{"Целое", TY_INT},
 	{"Булево", TY_BOOL},
 	{"Строка", TY_STRING},
 	{"Пусто", TY_VOID},
@@ -171,7 +194,7 @@ new_map_type :: proc(key_type: ^Type, value_type: ^Type) -> ^Type {
 
 is_valid_map_key_type :: proc(t: ^Type) -> bool {
 	typ := prune_type(t)
-	return typ.kind == .Number || typ.kind == .Bool || typ.kind == .String
+	return typ.kind == .Number || typ.kind == .Integer || typ.kind == .Bool || typ.kind == .String
 }
 
 // Стадия 24: Процесс(T) — тот же приём, что new_array_type/new_map_type
@@ -286,11 +309,14 @@ classify_pattern :: proc(ctx: ^Type_Ctx, pattern: Pattern, expected_type: ^Type)
 	case ^Pattern_Literal:
 		info.span = pat.span
 		expected := prune_type(expected_type)
-		if expected.kind != .Number && expected.kind != .String && expected.kind != .Bool {
+		if expected.kind != .Number &&
+		   expected.kind != .Integer &&
+		   expected.kind != .String &&
+		   expected.kind != .Bool {
 			report(
 				ctx,
 				pat.span,
-				"Type Error: литеральный шаблон ожидает Число/Строку/Булево, получено '%s'",
+				"Type Error: литеральный шаблон ожидает Число/Целое/Строку/Булево, получено '%s'",
 				expected.name,
 			)
 			info.kind = .Wildcard
@@ -710,6 +736,22 @@ Type_Ctx :: struct {
 	// своего "родного" места в ПРОХОД 4, проверилась бы дважды (дублируя
 	// diagnostics).
 	checked_bodies: map[Symbol_Id]bool,
+	// Bounded traits: Call_Expr вызова bounded generic-функции -> конкретные
+	// резолвленные типы её type-параметров (в порядке Function_Decl.
+	// type_params), заполняется в infer_bounded_generic_call. Читает
+	// core/monomorphize.odin — по этой карте driver находит, какие
+	// инстанциации нужно скомпилировать, и compiler.odin — на call site
+	// нужен ключ инстанциации вместо обычного symbol_registry_key.
+	generic_call_instantiations: map[Expr][dynamic]^Type,
+	// true во время АБСТРАКТНОГО прохода тела generic-декларации
+	// (check_decl_body, T/E ещё decl-param InferVar) — см. пометку там.
+	// infer_bounded_generic_call читает: не удалось вывести конкретный тип
+	// параметра — при true это ожидаемо (рекурсия/вложенный generic-вызов
+	// внутри абстрактного тела), не diagnostic; при false — настоящая
+	// ошибка вызывающего кода. false во время typecheck клона
+	// (monomorphize_one зовёт check_function_body напрямую, не через
+	// check_decl_body).
+	in_abstract_generic_body:    bool,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -730,6 +772,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		process_message_types = make(map[Symbol_Id]^Type),
 		symbol_to_func_decl = make(map[Symbol_Id]^Function_Decl),
 		checked_bodies = make(map[Symbol_Id]bool),
+		generic_call_instantiations = make(map[Expr][dynamic]^Type),
 	}
 	// Стадия 7 Phase F: см. Resolver_Ctx.prelude_generic_order — прелюдия
 	// типизируется в СВОЁМ отдельном tc_ctx (ensure_prelude), любой другой
@@ -1045,6 +1088,19 @@ instantiate_scheme :: proc(ctx: ^Type_Ctx, scheme: Type_Scheme) -> ^Type {
 	subst := make(map[int]^Type)
 	for id in scheme.forall do subst[id] = new_infer_var(ctx)
 	return instantiate_type(ctx, scheme.body, &subst)
+}
+
+// Тот же instantiate_scheme, но отдаёт вызывающему саму subst-карту
+// (infer_id шаблонного decl-param -> свежий InferVar этой инстанциации).
+// Нужна ТОЛЬКО infer_bounded_generic_call — обычный instantiate_scheme
+// не трогаем (много вызывающих, subst им не нужна).
+instantiate_scheme_with_subst :: proc(
+	ctx: ^Type_Ctx,
+	scheme: Type_Scheme,
+	out_subst: ^map[int]^Type,
+) -> ^Type {
+	for id in scheme.forall do out_subst[id] = new_infer_var(ctx)
+	return instantiate_type(ctx, scheme.body, out_subst)
 }
 
 // Стадия 7 Phase C: стабильный строковый ключ для generic_instance_cache —
@@ -1538,15 +1594,50 @@ interface_method_types_match :: proc(
 // нужно только Struct/Enum (decl_type_param_order, для позиционной
 // подстановки в explicit-аннотации Тип(A, B)); Function_Decl и
 // собственные type-параметры метода Impl_Decl это не используют.
+// bounds — ТОЛЬКО у Function_Decl (см. Function_Decl.type_param_bounds);
+// nil у Struct/Enum/Interface_Decl-вызовов (bounded traits сознательно
+// ограничены функциями). Для каждого имени с непустым списком bounds
+// резолвит имена интерфейсов ТЕМ ЖЕ путём, что resolve_type_node
+// резолвит голый Type_Ident (глобальный scope модуля), проверяет
+// kind == .Interface, копит в tv.required_interfaces.
 make_decl_type_params :: proc(
 	ctx: ^Type_Ctx,
 	names: []string,
 	into: ^map[string]^Type,
 	ordered: ^[dynamic]^Type = nil,
+	bounds: map[string][dynamic]string = nil,
+	bounds_span: Span = {},
 ) {
 	for name in names {
 		tv := new_infer_var(ctx)
 		tv.is_decl_param = true
+		if iface_names, has_bounds := bounds[name]; has_bounds {
+			for iface_name in iface_names {
+				sym := lookup_symbol(ctx.res.global_scope, intern(iface_name))
+				if sym == INVALID_SYMBOL {
+					report(
+						ctx,
+						bounds_span,
+						"Type Error: неизвестный интерфейс '%s' в bound'е type-параметра '%s'",
+						iface_name,
+						name,
+					)
+					continue
+				}
+				iface_type, has_type := ctx.res.symbol_types[sym]
+				if !has_type || iface_type == nil || iface_type.kind != .Interface {
+					report(
+						ctx,
+						bounds_span,
+						"Type Error: '%s' не интерфейс, не может быть bound'ом type-параметра '%s'",
+						iface_name,
+						name,
+					)
+					continue
+				}
+				append(&tv.required_interfaces, iface_type)
+			}
+		}
 		into[name] = tv
 		if ordered != nil do append(ordered, tv)
 	}
@@ -1581,7 +1672,18 @@ check_decl_body :: proc(ctx: ^Type_Ctx, sym: Symbol_Id, d: ^Function_Decl, func_
 	if params_map, ok := ctx.decl_type_params[sym]; ok {
 		prev := ctx.current_type_params
 		ctx.current_type_params = params_map
+		// Bounded traits: тело ЭТОЙ generic-декларации сейчас проверяется
+		// АБСТРАКТНО (T/E — decl-param InferVar, не конкретный тип) — если
+		// внутри есть вызов ДРУГОЙ (или той же — рекурсия) bounded generic-
+		// функции, infer_bounded_generic_call не сможет вывести конкретный
+		// тип-параметр (и не должна пытаться — это НЕ ошибка, а нормальное
+		// свойство абстрактного прохода, см. флаг там). Клоны (core/
+		// monomorphize.odin's monomorphize_one) типизируются НЕ через
+		// check_decl_body, флаг для них остаётся false.
+		prev_abstract := ctx.in_abstract_generic_body
+		ctx.in_abstract_generic_body = true
 		check_function_body(ctx, d.span, d.body, func_type.return_type)
+		ctx.in_abstract_generic_body = prev_abstract
 		ctx.current_type_params = prev
 	} else {
 		check_function_body(ctx, d.span, d.body, func_type.return_type)
@@ -1726,7 +1828,13 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			if len(d.type_params) > 0 {
 				prev := ctx.current_type_params
 				params_map := make(map[string]^Type)
-				make_decl_type_params(ctx, d.type_params[:], &params_map)
+				make_decl_type_params(
+					ctx,
+					d.type_params[:],
+					&params_map,
+					bounds = d.type_param_bounds,
+					bounds_span = d.span,
+				)
 				ctx.current_type_params = params_map
 
 				func_type := function_type_from_decl(ctx, d)
@@ -2265,6 +2373,19 @@ new_tuple_type :: proc(elements: [dynamic]^Type) -> ^Type {
 // --- ПРОВЕРКА БЛОКОВ (Expression-Oriented Programming) ---
 
 // В expression-oriented блоках типом блока считается тип последнего выражения.
+// Последнее выражение блока, если блок заканчивается Expr_Stmt (тот же
+// критерий, что infer_block_type использует, чтобы решить, какое выражение
+// "становится" типом блока) — nil, если блок заканчивается чем-то другим
+// (Let/Return/пустой блок). Нужен check_function_body, чтобы дотянуться до
+// самого литерала для widen_num_literal_to_int (implicit return бежит через
+// infer_expr, не check_expr, поэтому обычный widening по expected-типу сюда
+// не долетает сам по себе).
+last_block_expr :: proc(body: [dynamic]Stmt) -> Expr {
+	if len(body) == 0 do return nil
+	if s, ok := body[len(body) - 1].(^Expr_Stmt); ok do return s.expr
+	return nil
+}
+
 infer_block_type :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 	if len(body) == 0 do return TY_VOID
 
@@ -2308,6 +2429,16 @@ check_function_body :: proc(ctx: ^Type_Ctx, span: Span, body: [dynamic]Stmt, exp
 	}
 
 	body_type := prune_type(infer_block_type(ctx, body))
+	// Implicit return (последнее выражение блока без `возврат`) идёт через
+	// infer_expr, не check_expr — обычный литерал-widening (см. check_expr's
+	// Number_Expr-кейс) сюда не попадает. Целое-возвращающая функция с
+	// голым `42` последней строкой — тот же случай, что `x + 5` при
+	// x: Целое, поэтому переиспользуем widen_num_literal_to_int.
+	if body_type == TY_NUM && expected_return_type == TY_INT {
+		if last := last_block_expr(body); last != nil {
+			body_type = widen_num_literal_to_int(ctx, last, body_type, TY_INT)
+		}
+	}
 	explicit_return_type := prune_type(infer_function_body(ctx, body))
 
 	if expected_return_type == TY_VOID {
@@ -2679,6 +2810,57 @@ check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type) {
 	expected_type := prune_type(expected)
 
 	#partial switch e in expr {
+	case ^Number_Expr:
+		// Литерал сам по себе всегда Число (infer_expr) — Целое достижим
+		// ТОЛЬКО явно, через контекст с ожидаемым Целое (аннотация/поле/
+		// параметр). Дробный литерал в Целое-контексте — ошибка, не
+		// молчаливое усечение.
+		if expected_type == TY_INT {
+			if e.value != math.trunc(e.value) {
+				report(
+					ctx,
+					expr_span(expr),
+					"Type Error: дробный литерал '%v' несовместим с Целое",
+					e.value,
+				)
+			}
+			ctx.node_types[expr] = TY_INT
+			return
+		}
+	case ^Unary_Expr:
+		// Отрицательный целочисленный литерал (`-5`) в Целое-контексте —
+		// тот же принцип, что голый литерал выше, только сам литерал на
+		// один уровень глубже (под Unary_Expr), см. классификацию
+		// Число vs Целое по СИНТАКСИСУ выражения в целом, не отдельному
+		// узлу.
+		if expected_type == TY_INT && e.op == .Minus {
+			if num, ok := e.right.(^Number_Expr); ok && num.value == math.trunc(num.value) {
+				ctx.node_types[e.right] = TY_INT
+				ctx.node_types[expr] = TY_INT
+				return
+			}
+		}
+	case ^Binary_Expr:
+		// Составное арифметическое выражение (`длина(x) - 1`, `0 - 1`) в
+		// Целое-контексте — литерал-кейс выше widen'ит только САМ литерал
+		// напрямую под check_expr, но `а - б` тут — Binary_Expr, не
+		// Number_Expr, и без явного проталкивания контекста ВНИЗ на a/b
+		// (см. для-range desugar в parser.odin: `пер <сч> = <start> - 1`,
+		// оба операнда литералы, ни один не видит Целое-ожидание сам по
+		// себе) типизация бы застряла на Число по умолчанию.
+		#partial switch e.op {
+		case .Plus, .Minus, .Star:
+			if expected_type == TY_INT {
+				check_expr(ctx, e.left, TY_INT)
+				check_expr(ctx, e.right, TY_INT)
+				left_t := prune_type(infer_expr(ctx, e.left))
+				right_t := prune_type(infer_expr(ctx, e.right))
+				if left_t == TY_INT && right_t == TY_INT {
+					ctx.node_types[expr] = TY_INT
+					return
+				}
+			}
+		}
 	case ^Lambda_Expr:
 		if expected_type.kind == .Function {
 			check_lambda_expr(ctx, expr, e, expected_type)
@@ -2753,7 +2935,7 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
 			arg_type := prune_type(infer_expr(ctx, args[0]))
 			if arg_type.kind == .String || arg_type.kind == .Array || arg_type.kind == .Map {
-				return TY_NUM
+				return TY_INT
 			}
 			if arg_type.kind == .Poison do return TY_POISON
 			return report(
@@ -3094,6 +3276,7 @@ resolve_variant_ctor :: proc(
 	}
 	for arg, i in args {
 		actual := prune_type(infer_expr(ctx, arg))
+		actual = widen_num_literal_to_int(ctx, arg, actual, prune_type(expected[i]))
 		if !unify_types(actual, expected[i]) {
 			report(
 				ctx,
@@ -3184,6 +3367,49 @@ implements_prelude_interface :: proc(ctx: ^Type_Ctx, t: ^Type, iface_sym: Symbol
 	return false
 }
 
+// Bounded traits: примитивы (Число/Целое/Строка/Булево) НЕ регистрируют
+// себя в implemented_interfaces (их `<`/`+`/`==` — нативный хардкод в
+// infer_binary_expr, не impl-блок) — без этого fallback'а `T:
+// Сравниваемое` отказал бы в вызове с T=Число, хотя `<` на числах и так
+// работает. Равнозначное НЕ входит сюда — это opt-in override уже
+// ВСЕГДА доступного структурного `==` (Стадия 22), а не отсутствующий
+// дефолт, который нужно чем-то восполнить; "T: Равнозначное" остаётся
+// строго "T реализует Равнозначное явно" — так же строго, как для
+// конкретных структур/enum'ов без impl'а (см. type_satisfies_interface
+// ниже, .Equal/.NotEqual в infer_binary_expr).
+primitive_satisfies_interface :: proc(ctx: ^Type_Ctx, t: ^Type, iface_sym: Symbol_Id) -> bool {
+	if t == nil || iface_sym == INVALID_SYMBOL do return false
+	switch iface_sym {
+	case ctx.res.prelude_comparable_sym:
+		return t == TY_NUM || t == TY_INT || t == TY_STRING
+	case ctx.res.prelude_addable_sym:
+		return t == TY_NUM || t == TY_INT || t == TY_STRING
+	case ctx.res.prelude_subtractable_sym, ctx.res.prelude_multipliable_sym, ctx.res.prelude_divisible_sym:
+		return t == TY_NUM || t == TY_INT
+	}
+	return false
+}
+
+// Единая точка "удовлетворяет ли конкретный/decl-param тип этому
+// bound'у" — используется и абстрактной проверкой тела bounded generic-
+// функции (t.kind == .InferVar && is_decl_param — сверка с required_
+// interfaces, см. make_decl_type_params), и обычной sugar-резолюцией
+// операторов на конкретных типах (структуры/enum'ы через impl-блок,
+// примитивы через primitive_satisfies_interface).
+type_satisfies_interface :: proc(ctx: ^Type_Ctx, t: ^Type, iface_sym: Symbol_Id) -> bool {
+	t := prune_type(t)
+	if t.kind == .InferVar && t.is_decl_param {
+		iface_type, ok := ctx.res.symbol_types[iface_sym]
+		if !ok || iface_type == nil do return false
+		for req in t.required_interfaces {
+			if req == iface_type do return true
+		}
+		return false
+	}
+	if primitive_satisfies_interface(ctx, t, iface_sym) do return true
+	return implements_prelude_interface(ctx, t, iface_sym)
+}
+
 // Стадия 23: left_t уже подтверждён implements_prelude_interface(iface_sym)
 // — общий хвост для +/-/*// sugar: проверить, что right_t == left_t (та же
 // схема, что Стадия 22's Сравниваемое — оба операнда одного Self-типа),
@@ -3217,9 +3443,36 @@ infer_arithmetic_sugar :: proc(
 	return left_t
 }
 
-// Общее тело для Minus/Star/Slash — идентичны с точностью до
-// интерфейса/имени метода (в отличие от Plus, не имеют спец-кейса
-// Строка+Строка, так что тело короче и целиком переиспользуемо).
+// Литерал сам по себе — всегда Число (infer_expr). Но рядом с УЖЕ
+// Целое-типизированным операндом (переменная/параметр/поле, явно
+// объявленные Целое — единственный способ получить Целое-значение в
+// этом проходе) — литерал "сужается" до Целое, чтобы `x + 5` при
+// `x: Целое` работало без явной аннотации на каждом литерале. НЕ
+// коэрсия произвольного Число-значения — только у самого литерала нет
+// закреплённого типа до этого момента. Дробный литерал рядом с Целое-
+// операндом НЕ сужается (остаётся Число, естественно даёт type error
+// ниже — 1.5 никогда не Целое).
+widen_num_literal_to_int :: proc(ctx: ^Type_Ctx, expr: Expr, t: ^Type, other_t: ^Type) -> ^Type {
+	if t == TY_NUM && other_t == TY_INT {
+		if num, ok := expr.(^Number_Expr); ok && num.value == math.trunc(num.value) {
+			ctx.node_types[expr] = TY_INT
+			return TY_INT
+		}
+		if un, ok := expr.(^Unary_Expr); ok && un.op == .Minus {
+			if num, ok := un.right.(^Number_Expr); ok && num.value == math.trunc(num.value) {
+				ctx.node_types[un.right] = TY_INT
+				ctx.node_types[expr] = TY_INT
+				return TY_INT
+			}
+		}
+	}
+	return t
+}
+
+// Общее тело для Minus/Star (Slash — отдельно, разное деление у Число/
+// Целое) — идентичны с точностью до интерфейса/имени метода (в отличие
+// от Plus, не имеют спец-кейса Строка+Строка, так что тело короче и
+// целиком переиспользуемо).
 infer_arithmetic_op :: proc(
 	ctx: ^Type_Ctx,
 	expr: Expr,
@@ -3230,7 +3483,12 @@ infer_arithmetic_op :: proc(
 ) -> ^Type {
 	left_t := prune_type(infer_expr(ctx, e.left))
 	right_t := prune_type(infer_expr(ctx, e.right))
+	left_t = widen_num_literal_to_int(ctx, e.left, left_t, right_t)
+	right_t = widen_num_literal_to_int(ctx, e.right, right_t, left_t)
 
+	if left_t == TY_INT && right_t == TY_INT {
+		return TY_INT
+	}
 	if left_t == TY_NUM && right_t == TY_NUM {
 		return TY_NUM
 	}
@@ -3238,8 +3496,9 @@ infer_arithmetic_op :: proc(
 		return TY_POISON
 	}
 	// Стадия 25: перечисления тоже могут реализовывать Арифметику.
-	if (left_t.kind == .Struct || left_t.kind == .Enum) &&
-	   implements_prelude_interface(ctx, left_t, iface_sym) {
+	if (left_t.kind == .Struct || left_t.kind == .Enum ||
+		   (left_t.kind == .InferVar && left_t.is_decl_param)) &&
+	   type_satisfies_interface(ctx, left_t, iface_sym) {
 		return infer_arithmetic_sugar(ctx, expr, e.span, left_t, right_t, method_name, iface_name)
 	}
 	check_expr(ctx, e.left, TY_NUM)
@@ -3266,8 +3525,12 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 
 		left_t = prune_type(left_t)
 		right_t = prune_type(right_t)
+		left_t = widen_num_literal_to_int(ctx, e.left, left_t, right_t)
+		right_t = widen_num_literal_to_int(ctx, e.right, right_t, left_t)
 		if left_t == TY_STRING && right_t == TY_STRING {
 			t = TY_STRING
+		} else if left_t == TY_INT && right_t == TY_INT {
+			t = TY_INT
 		} else if left_t == TY_NUM && right_t == TY_NUM {
 			t = TY_NUM
 		} else if left_t.kind == .Poison || right_t.kind == .Poison {
@@ -3275,8 +3538,9 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 			// без явного шорт-каута отчитались бы производной ошибкой поверх
 			// уже отчитанной первопричины.
 			t = TY_POISON
-		} else if (left_t.kind == .Struct || left_t.kind == .Enum) &&
-		   implements_prelude_interface(ctx, left_t, ctx.res.prelude_addable_sym) {
+		} else if (left_t.kind == .Struct || left_t.kind == .Enum ||
+			   (left_t.kind == .InferVar && left_t.is_decl_param)) &&
+		   type_satisfies_interface(ctx, left_t, ctx.res.prelude_addable_sym) {
 			t = infer_arithmetic_sugar(ctx, expr, e.span, left_t, right_t, "сложить", "Складываемое")
 		} else {
 			t = report(
@@ -3292,18 +3556,68 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 	case .Star:
 		t = infer_arithmetic_op(ctx, expr, e, ctx.res.prelude_multipliable_sym, "умножить", "Умножаемое")
 	case .Slash:
-		t = infer_arithmetic_op(ctx, expr, e, ctx.res.prelude_divisible_sym, "разделить", "Делимое")
+		// Отдельно от Minus/Star (не через infer_arithmetic_op) — деление
+		// Целое/Целое отличается семантически (усечение к нулю, компилятор
+		// эмитит .Int_Divide) от Число/Число (обычное деление, .Divide).
+		left_t := prune_type(infer_expr(ctx, e.left))
+		right_t := prune_type(infer_expr(ctx, e.right))
+		left_t = widen_num_literal_to_int(ctx, e.left, left_t, right_t)
+		right_t = widen_num_literal_to_int(ctx, e.right, right_t, left_t)
+		if left_t == TY_INT && right_t == TY_INT {
+			t = TY_INT
+		} else if left_t == TY_NUM && right_t == TY_NUM {
+			t = TY_NUM
+		} else if left_t.kind == .Poison || right_t.kind == .Poison {
+			t = TY_POISON
+		} else if (left_t.kind == .Struct || left_t.kind == .Enum ||
+			   (left_t.kind == .InferVar && left_t.is_decl_param)) &&
+		   type_satisfies_interface(ctx, left_t, ctx.res.prelude_divisible_sym) {
+			t = infer_arithmetic_sugar(ctx, expr, e.span, left_t, right_t, "разделить", "Делимое")
+		} else {
+			check_expr(ctx, e.left, TY_NUM)
+			check_expr(ctx, e.right, TY_NUM)
+			t = TY_NUM
+		}
+
+	case .Percent:
+		// Остаток от целочисленного деления — только Целое в этом
+		// проходе (мотивирующий кейс — счётчики/индексы; float-остаток,
+		// как C-шный fmod, сознательно не реализован). Усечение к нулю,
+		// знак результата следует делимому (тот же принцип, что .Int_Divide
+		// в компиляторе — согласовано друг с другом).
+		left_t := prune_type(infer_expr(ctx, e.left))
+		right_t := prune_type(infer_expr(ctx, e.right))
+		left_t = widen_num_literal_to_int(ctx, e.left, left_t, right_t)
+		right_t = widen_num_literal_to_int(ctx, e.right, right_t, left_t)
+		if left_t == TY_INT && right_t == TY_INT {
+			t = TY_INT
+		} else if left_t.kind == .Poison || right_t.kind == .Poison {
+			t = TY_POISON
+		} else {
+			t = report(
+				ctx,
+				e.span,
+				"Type Error: оператор '%%' поддержан только для Целое, получено '%s' и '%s'",
+				left_t.name,
+				right_t.name,
+			)
+		}
 
 	case .Less, .Greater, .LessEqual, .GreaterEqual:
 		left_t := prune_type(infer_expr(ctx, e.left))
 		right_t := prune_type(infer_expr(ctx, e.right))
+		left_t = widen_num_literal_to_int(ctx, e.left, left_t, right_t)
+		right_t = widen_num_literal_to_int(ctx, e.right, right_t, left_t)
 
-		if left_t == TY_NUM && right_t == TY_NUM {
+		if left_t == TY_INT && right_t == TY_INT {
+			t = TY_BOOL
+		} else if left_t == TY_NUM && right_t == TY_NUM {
 			t = TY_BOOL
 		} else if left_t.kind == .Poison || right_t.kind == .Poison {
 			t = TY_POISON
-		} else if (left_t.kind == .Struct || left_t.kind == .Enum) &&
-		   implements_prelude_interface(ctx, left_t, ctx.res.prelude_comparable_sym) {
+		} else if (left_t.kind == .Struct || left_t.kind == .Enum ||
+			   (left_t.kind == .InferVar && left_t.is_decl_param)) &&
+		   type_satisfies_interface(ctx, left_t, ctx.res.prelude_comparable_sym) {
 			if unify_types(left_t, right_t) {
 				method_sym, _ := method_lookup(ctx, left_t, "сравнить")
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
@@ -3334,6 +3648,8 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 	case .Equal, .NotEqual:
 		left_t := prune_type(infer_expr(ctx, e.left))
 		right_t := prune_type(infer_expr(ctx, e.right))
+		left_t = widen_num_literal_to_int(ctx, e.left, left_t, right_t)
+		right_t = widen_num_literal_to_int(ctx, e.right, right_t, left_t)
 
 		// Стадия 25: unify_types вместо == — та же причина, что у
 		// infer_arithmetic_sugar (нулевой-payload вариант generic-enum'а
@@ -3341,8 +3657,9 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 		// операндом). Порядок важен: kind/implements ПЕРЕД unify_types —
 		// unify_types мутирует InferVar'ы побочным эффектом, не должен
 		// срабатывать для типов, вообще не реализующих Равнозначное.
-		if (left_t.kind == .Struct || left_t.kind == .Enum) &&
-		   implements_prelude_interface(ctx, left_t, ctx.res.prelude_equatable_sym) &&
+		if (left_t.kind == .Struct || left_t.kind == .Enum ||
+			   (left_t.kind == .InferVar && left_t.is_decl_param)) &&
+		   type_satisfies_interface(ctx, left_t, ctx.res.prelude_equatable_sym) &&
 		   unify_types(left_t, right_t) {
 			method_sym, _ := method_lookup(ctx, left_t, "равно")
 			ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
@@ -3403,8 +3720,13 @@ infer_unary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Unary_Expr) -> ^Type {
 	t: ^Type
 	#partial switch e.op {
 	case .Minus:
-		check_expr(ctx, e.right, TY_NUM)
-		t = TY_NUM
+		operand_t := prune_type(infer_expr(ctx, e.right))
+		if operand_t == TY_INT {
+			t = TY_INT
+		} else {
+			check_expr(ctx, e.right, TY_NUM)
+			t = TY_NUM
+		}
 	case .Negate:
 		check_expr(ctx, e.right, TY_BOOL)
 		t = TY_BOOL
@@ -3494,10 +3816,103 @@ infer_spawn_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Spawn_Expr) -> ^Type {
 	return new_process_type(msg_type)
 }
 
+// Bounded traits: вызов `f(...)` где f — generic-функция хотя бы с одним
+// bound'ом (`f.type_param_bounds` непусто). Отдельная от общего пути
+// (infer_call_expr's `callee_type.kind == .Function` ветка ниже) ветка —
+// нужна собственная instantiate_scheme_with_subst (обычный instantiate_
+// scheme не отдаёт subst-карту, а без неё не восстановить, какой свежий
+// InferVar соответствует какому ИМЕНОВАННОМУ type-параметру после
+// унификации аргументов). Пишет ctx.generic_call_instantiations[expr] —
+// читает core/monomorphize.odin (какие инстанциации нужно скомпилировать)
+// и core/compiler.odin (ключ инстанциации на call site вместо обычного
+// symbol_registry_key).
+infer_bounded_generic_call :: proc(
+	ctx: ^Type_Ctx,
+	expr: Expr,
+	e: ^Call_Expr,
+	callee_sym: Symbol_Id,
+	fn_decl: ^Function_Decl,
+) -> ^Type {
+	scheme, has_scheme := ctx.symbol_schemes[callee_sym]
+	if !has_scheme {
+		return report(
+			ctx,
+			e.span,
+			"Type Error: не удалось инстанцировать generic-функцию '%s'",
+			fn_decl.name,
+		)
+	}
+	subst := make(map[int]^Type)
+	instantiated := instantiate_scheme_with_subst(ctx, scheme, &subst)
+	if len(e.args) != len(instantiated.params) {
+		return report(ctx, e.span, "Type Error: неверное количество аргументов")
+	}
+	for arg, i in e.args do check_expr(ctx, arg, instantiated.params[i])
+
+	template_params := ctx.decl_type_params[callee_sym]
+	concrete_types := make([dynamic]^Type)
+	for name in fn_decl.type_params {
+		template_var := template_params[name]
+		fresh_var, found := subst[template_var.infer_id]
+		if !found {
+			if ctx.in_abstract_generic_body do return prune_type(instantiated.return_type)
+			return report(
+				ctx,
+				e.span,
+				"Type Error: тип-параметр '%s' функции '%s' не выводится из аргументов",
+				name,
+				fn_decl.name,
+			)
+		}
+		concrete := prune_type(fresh_var)
+		if concrete.kind == .InferVar {
+			// Абстрактный проход (рекурсия/вложенный generic-вызов внутри
+			// ЕЩЁ НЕ-конкретного тела, см. ctx.in_abstract_generic_body) —
+			// ожидаемо, не diagnostic. Инстанциацию не пишем (нечего писать
+			// без конкретного типа) — реальные конкретные вызовы этой же
+			// функции извне (или клон САМОЙ f, если f рекурсивна) закроют
+			// это через свои собственные infer_bounded_generic_call.
+			if ctx.in_abstract_generic_body do return prune_type(instantiated.return_type)
+			return report(
+				ctx,
+				e.span,
+				"Type Error: не удалось вывести конкретный тип для '%s' функции '%s'",
+				name,
+				fn_decl.name,
+			)
+		}
+		if bound_names, has_bounds := fn_decl.type_param_bounds[name]; has_bounds {
+			for iface_name in bound_names {
+				iface_sym := lookup_symbol(ctx.res.global_scope, intern(iface_name))
+				if !type_satisfies_interface(ctx, concrete, iface_sym) {
+					report(
+						ctx,
+						e.span,
+						"Type Error: тип '%s' не реализует '%s', требуется для type-параметра '%s' функции '%s'",
+						concrete.name,
+						iface_name,
+						name,
+						fn_decl.name,
+					)
+				}
+			}
+		}
+		append(&concrete_types, concrete)
+	}
+	ctx.generic_call_instantiations[expr] = concrete_types
+	return prune_type(instantiated.return_type)
+}
+
 infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 	callee_sym := ctx.res.node_symbols[e.callee]
 	if callee_sym != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, callee_sym).kind == .Enum_Variant {
 		return resolve_variant_ctor(ctx, expr, callee_sym, e.args[:], true)
+	}
+	if callee_sym != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, callee_sym).kind == .Function {
+		if fn_decl, has_decl := ctx.symbol_to_func_decl[callee_sym];
+		   has_decl && len(fn_decl.type_param_bounds) > 0 {
+			return infer_bounded_generic_call(ctx, expr, e, callee_sym, fn_decl)
+		}
 	}
 	if ident, ok := e.callee.(^Ident_Expr); ok {
 		if sym := ctx.res.node_symbols[e.callee];
@@ -3682,7 +4097,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 			case "длина":
 				if len(e.args) != 0 do return report(ctx, e.span, "Type Error: массив.длина() не принимает аргументы")
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
-				return TY_NUM
+				return TY_INT
 			case "добавить":
 				if len(e.args) != 1 do return report(ctx, e.span, "Type Error: массив.добавить() ожидает 1 аргумент")
 				check_expr(ctx, e.args[0], obj_type.element_type)
@@ -3690,13 +4105,13 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				return TY_VOID
 			case "получить":
 				if len(e.args) != 2 do return report(ctx, e.span, "Type Error: массив.получить() ожидает индекс и значение по умолчанию")
-				check_expr(ctx, e.args[0], TY_NUM)
+				check_expr(ctx, e.args[0], TY_INT)
 				check_expr(ctx, e.args[1], obj_type.element_type)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return obj_type.element_type
 			case "есть":
 				if len(e.args) != 1 do return report(ctx, e.span, "Type Error: массив.есть() ожидает индекс")
-				check_expr(ctx, e.args[0], TY_NUM)
+				check_expr(ctx, e.args[0], TY_INT)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return TY_BOOL
 			case "содержит":
@@ -3718,7 +4133,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 			case "длина":
 				if len(e.args) != 0 do return report(ctx, e.span, "Type Error: соответствие.длина() не принимает аргументы")
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
-				return TY_NUM
+				return TY_INT
 			case "есть":
 				if len(e.args) != 1 do return report(ctx, e.span, "Type Error: соответствие.есть() ожидает ключ")
 				check_expr(ctx, e.args[0], obj_type.key_type)
@@ -3915,8 +4330,18 @@ infer_if_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^If_Expr) -> ^Type {
 		infer_block_type(ctx, e.then_branch)
 		t = TY_VOID
 	} else {
-		then_type := infer_block_type(ctx, e.then_branch)
-		else_type := infer_block_type(ctx, e.else_branch)
+		then_type := prune_type(infer_block_type(ctx, e.then_branch))
+		else_type := prune_type(infer_block_type(ctx, e.else_branch))
+		// Ветка-литерал (`иначе 0 конец`) рядом с Целое-веткой (напр. чужой
+		// .длина()) — тот же widening, что и бинарные операторы: без него
+		// `если ... тогда x.длина() иначе 0 конец` ложно репортился бы как
+		// разнотипные ветки.
+		if then_last := last_block_expr(e.then_branch); then_last != nil {
+			then_type = widen_num_literal_to_int(ctx, then_last, then_type, else_type)
+		}
+		if else_last := last_block_expr(e.else_branch); else_last != nil {
+			else_type = widen_num_literal_to_int(ctx, else_last, else_type, then_type)
+		}
 
 		emit_constraint(
 			ctx,
@@ -4052,7 +4477,7 @@ infer_index_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Index_Expr) -> ^Type {
 	t: ^Type
 	obj_type := prune_type(infer_expr(ctx, e.object))
 	if obj_type.kind == .Array {
-		check_expr(ctx, e.index, TY_NUM)
+		check_expr(ctx, e.index, TY_INT)
 		t = prune_type(obj_type.element_type)
 	} else if obj_type.kind == .Map {
 		// Частый источник этой ошибки — для-in напрямую на Соответствие
@@ -4083,7 +4508,7 @@ infer_index_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Index_Expr) -> ^Type {
 		}
 		t = prune_type(obj_type.value_type)
 	} else if obj_type.kind == .String {
-		check_expr(ctx, e.index, TY_NUM)
+		check_expr(ctx, e.index, TY_INT)
 		t = TY_STRING
 	} else if obj_type.kind == .Poison {
 		t = TY_POISON
@@ -4129,6 +4554,7 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 
 	if subject_type.kind != .Enum &&
 	   subject_type.kind != .Number &&
+	   subject_type.kind != .Integer &&
 	   subject_type.kind != .String &&
 	   subject_type.kind != .Bool &&
 	   subject_type.kind != .Struct {
@@ -4144,17 +4570,20 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 	}
 	arm_infos := make([dynamic]Pattern_Info)
 	result_t: ^Type
+	result_expr: Expr
 	for arm in e.arms {
 		pi := classify_pattern(ctx, arm.pattern, subject_type_actual)
 		append(&arm_infos, pi)
 
 		// Тело ветки
 		body_t: ^Type
+		body_expr: Expr
 		for stmt, i in arm.body {
 			is_last := i == len(arm.body) - 1
 			if is_last {
 				if expr_stmt, ok := stmt.(^Expr_Stmt); ok {
 					body_t = prune_type(infer_expr(ctx, expr_stmt.expr))
+					body_expr = expr_stmt.expr
 				} else {
 					check_stmt(ctx, stmt, ctx.current_return)
 					body_t = TY_VOID
@@ -4167,7 +4596,16 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 		if body_t.kind != .Never {
 			if result_t == nil {
 				result_t = body_t
+				result_expr = body_expr
 			} else {
+				// Литерал-ветка рядом с Целое-веткой (напр. чужой .длина())
+				// — тот же widening, что если/иначе и бинарные операторы.
+				if body_expr != nil {
+					body_t = widen_num_literal_to_int(ctx, body_expr, body_t, result_t)
+				}
+				if result_expr != nil {
+					result_t = widen_num_literal_to_int(ctx, result_expr, result_t, body_t)
+				}
 				// join-точка (Стадия 7 constraint-based) — сравнение
 				// откладывается в общий батч ниже, после того как ВСЕ
 				// ветки уже выведены (result_t тут — уже финальный тип
@@ -4367,6 +4805,11 @@ infer_expr :: proc(ctx: ^Type_Ctx, expr: Expr) -> ^Type {
 	t: ^Type
 	switch e in expr {
 	case ^Number_Expr:
+		// Литералы всегда Число, независимо от наличия точки в исходнике.
+		// Целое сознательно не выводится из литерального синтаксиса в этом
+		// проходе (коэрция Целое<->Число отложена до cast) — get Целое можно
+		// только через явно Целое-типизированные значения (параметры,
+		// поля структур и т.п.), не через "голый" литерал.
 		t = TY_NUM
 	case ^Boolean_Expr:
 		t = TY_BOOL

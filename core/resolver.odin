@@ -686,20 +686,28 @@ resolve_module :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
 }
 
 resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program) {
-	module := Module {
-		path    = "",
-		dir     = "",
-		ast     = prog,
-		scope   = nil,
-		exports = make(map[Interned]Symbol_Id),
-	}
+	// new(Module), не стековый композитный литерал — каждый созданный здесь
+	// Symbol хранит указатель НА ЭТОТ Module (Symbol.module) и переживает
+	// саму resolve_program (читается вплоть до compile_program/
+	// monomorphize_program, см. core/monomorphize.odin). Стековая версия
+	// (была здесь раньше) давала dangling pointer, как только resolve_program
+	// возвращалась — молча не всплывало годами, пока bounded traits'
+	// monomorphize_one не стал первым кодом, читающим Symbol.module ТАК
+	// поздно (на этапе компиляции, стек уже многократно переиспользован) —
+	// тот же класс бага, что stack-escape в parse_for_range_stmt_into
+	// (Стадия 32, Целое).
+	module := new(Module)
+	module.path = ""
+	module.dir = ""
+	module.ast = prog
+	module.exports = make(map[Interned]Symbol_Id)
 	if ctx.global_scope == nil {
 		push_scope(ctx)
 		ctx.global_scope = ctx.current_scope
 	}
 	module.scope = ctx.global_scope
 	graph := new_module_graph()
-	resolved := resolve_module(&graph, &module)
+	resolved := resolve_module(&graph, module)
 	resolved.module_graph = nil
 	resolved.current_module = nil
 	ctx^ = resolved

@@ -13,10 +13,12 @@ processes, Elixir/Akka-style actor model — дважды пересмотрен
 заменены на actor model) — ключевые решения grilled и подтверждены,
 touch-точки требуют Explore до плана. 25 (интерфейсы для перечислений) ✅.
 26 (`panos mod` — встроенный пакетный менеджер, go mod style) — ключевые
-решения grilled (три раунда), touch-точки требуют Explore. **Приоритет
+решения grilled (три раунда), touch-точки требуют Explore. 29/30/31/32/33
+ЗАКРЫТЫ ✅ (литеральные шаблоны в `выбор`, деструктуризация,
+структурные конструктор-шаблоны, `Целое` — отдельный целочисленный
+тип, bounded traits — мономорфизация generic-функций). **Приоритет
 (grilled)**: 24/26/4/8 — следующие кандидаты. Type_Id/SoA (остаток
-Стадии 5) — отдельная перформансная задача без
-явного триггера.
+Стадии 5) — отдельная перформансная задача без явного триггера.
 **Roadmap**: [ROADMAP.md](ROADMAP.md)
 
 Работа отслеживается через mkdnflow.nvim в Neovim. `<CR>` на строке
@@ -311,13 +313,44 @@ diagnostics корректно пусты при валидном импорте
 
 ## Стадия 4 — FFI фаза A: raylib demo
 
-Refs: [ROADMAP §Стадия 4](ROADMAP.md#стадия-4--ffi-фаза-a-raylib-demo-3-дня).
+Refs: [ROADMAP §Стадия 4](ROADMAP.md#стадия-4--ffi-фаза-a-raylib-demo-3-дня)
+— расширено 16.07.2026 конкретными touch-точками для самостоятельной
+реализации (не Explore-агентом, вручную).
 
-Prerequisite: нет. Независимо.
+Prerequisite: нет содержательного, но полезно сначала прочитать
+`core/stdlib.odin`/`core/vm_io_native.odin` — эта стадия копирует их
+шаблон (`is_builtin_module_name`/`builtin_export_type`/
+`ensure_builtin_module` + `call_builtin_io`-подобная функция) почти
+без изменений, только для нового модуля `графика`.
 
-- [ ] `raylib_bindings.odin` — foreign import + ~50 функций
-- [ ] Panos-модуль `графика` в stdlib
-- [ ] Demo: pong / snake в `demos/`
+Не настоящий FFI (см. Стадию 8) — статические Odin-биндинги, вручную
+завёрнутые в один модуль. **Решить перед стартом**: системный raylib
+(`brew install raylib` + `foreign import "system:raylib"`) vs vendored
+(`external/raylib/`, C-компилятор в пайплайне сборки) — raylib НЕ
+vendored в репозитории сейчас.
+
+- [ ] `core/raylib_bindings.odin` (`#+build !js` — обязательно, иначе
+      WASM-сборка попытается слинковать raylib) — foreign import +
+      Odin-сигнатуры нужных функций (не все ~50 сразу — минимум для
+      pong: InitWindow/CloseWindow/WindowShouldClose/BeginDrawing/
+      EndDrawing/ClearBackground/DrawRectangle/DrawCircleV/IsKeyDown/
+      GetFrameTime)
+- [ ] `core/vm_graphics_native.odin` (`#+build !js`) — `call_builtin_
+      graphics`, по образцу `vm_io_native.odin:101`'s `call_builtin_io`,
+      подключить в `call_builtin` (vm.odin:753)
+- [ ] `core/stdlib.odin` — 4 точки: `is_builtin_module_name` (добавить
+      "графика"), `builtin_export_type` (case на каждую функцию),
+      `ensure_builtin_module` (новая ветка), готовые хелперы
+      `builtin_function_type_1/2/3` (для функций с 4+ параметрами
+      понадобится `_4`+ по аналогии)
+- [ ] Vector2/Color БЕЗ новых Type_Kind — Vector2 = обычный panos-тупл
+      `(Число, Число)`, распаковка через `.Get_Property` в
+      graphics-обёртке; Color — тупл `(Число×4)` или маленькая
+      panos-структура, объявленная прямо в демо-программе
+- [ ] Demo: pong / snake в новом каталоге `demos/` (сейчас не
+      существует)
+- [ ] Проверить `just build-wasm` не ломается (графика недоступна в
+      браузере, как `фс`/`ос`/`сеть` сейчас)
 - [ ] README gif с демо
 
 ---
@@ -443,22 +476,89 @@ Prerequisite: Стадия 6.
 
 ## Стадия 8 — FFI фаза B: dynamic
 
-Refs: [ROADMAP §Стадия 8](ROADMAP.md#стадия-8--ffi-фаза-b-dynamic-3-4-недели).
+Refs: [ROADMAP §Стадия 8](ROADMAP.md#стадия-8--ffi-фаза-b-dynamic-3-4-недели)
+— существенно расширено 16.07.2026, включая исправление ошибочного
+prerequisite (см. ниже) и 5 непринятых архитектурных решений, требующих
+грилинга перед кодом.
 
-Prerequisite: Стадия 1 + Стадия 6.
+**Исправленный prerequisite**: НЕ "Стадия 1 (GC finalizers обязательны)"
+— такого общего механизма в Стадии 1 нет и не было (проверено —
+`core/gc.odin`, ~line 417-444: `pool_release`'s cleanup для `File_Value`/
+`Socket_Value` — два ЖЁСТКО ЗАШИТЫХ case'а, не generic-инфраструктура).
+Хорошая новость: `Указатель(T)` с `(владеет_я)` нужен ТРЕТИЙ такой же
+hardcoded case по тому же образцу — новой инфраструктуры строить не
+нужно. Реальный prerequisite — только Стадия 6 (✅, `Call_Info`/
+`Call_Kind`).
 
-- [ ] Грамматика `внешний "libc" функ ...`
-- [ ] FFI-типы (`Число_32`, `КСтрока`, `Указатель(T)`, `ff_структура`)
-- [ ] libffi static-linked binding
-- [ ] Type descriptor builder (Panos type → ffi_type)
+**Не решено — 5 вопросов для самостоятельного грилинга, см. ROADMAP для
+полного разбора каждого**:
+1. `foreign import` (compile-time, годится только для Стадии 4) vs
+   `core:dynlib` (`dlopen`/`dlsym` в рантайме — обязательно для
+   ДЕЙСТВИТЕЛЬНО динамической `внешний`-декларации) + libffi
+   (`ffi_call` — вызов функции с рантайм-сигнатурой) — это ДВЕ разные
+   проблемы (найти функцию vs вызвать её), обе нужны одновременно
+2. Статическая линковка libffi (C toolchain в build-пайплайне) vs
+   системная (`foreign import "system:ffi"`) — libffi НЕ vendored
+   в репозитории
+3. `Число_32`/аналоги — новый `Type_Kind` (точная диагностика, много
+   работы) или чисто marshalling-аннотация внутри `внешний`-сигнатуры
+   (минимальные изменения, `Число` остаётся единственным числовым типом
+   для остального языка) — рекомендация начать со второго
+4. `ff_структура` — новое объявление с C-совместимым memory layout
+   (вероятно НЕ `Aggregate_Value`, у которого нет layout-контроля) или
+   переиспользование обычной `структура` — вероятно самая объёмная
+   под-задача во всей стадии
+5. Платформенный охват SIGSEGV-recovery — POSIX (`sigaction`) реализуемо
+   переиспользуемо, Windows (SEH) принципиально другой механизм; решить,
+   входит ли Windows в scope v1
+
+**Конкретные touch-точки в текущем коде (не зависят от решений выше)**:
+- [ ] Грамматика `внешний`: новый `TokenKind` + `lookup_ident`
+      (core/lexer.odin, тот же свитч что "функ"/"тип") + `^Foreign_Decl`
+      в `Decls` (core/parser.odin:143-151, сейчас 7 членов) +
+      `parse_foreign_decl` + новая ветка в `parse_program`'s dispatch
+      (core/parser.odin:600-688, вставить перед catch-all на line 676)
+- [ ] `Указатель(T)` как opaque generic-тип — точный прецедент
+      `Процесс(T)` (Стадия 24: `Type_Kind.Process`, `new_process_type`,
+      третья ветка `Type_Generic`-цепочки в `resolve_type_node`, БЕЗ
+      `Type_Scheme`) — `Указатель(T)` четвёртая ветка той же цепочки
+- [ ] `Pointer_Value` как новый Value-вариант — точный прецедент
+      `File_Value`/`Socket_Value`/`Process_Value`: struct{header:
+      GC_Header; ...} + добавление в `Value :: union{}` (compiler.odin)
+      → Odin's exhaustive-switch САМ укажет все 5 точек в gc.odin
+      (get_header/mark_value/value_size/pool_release/gc_new) как ошибки
+      компиляции сразу после добавления — тот же метод, которым велась
+      вся работа над Стадией 24
+- [ ] Типизация `внешний`: таблица "имя → тип функции" должна строиться
+      ДИНАМИЧЕСКИ из самой decl'арации (в отличие от `core/stdlib.odin`'s
+      РУЧНОЙ таблицы для фс/ос/сеть) — ближе по духу к обычному
+      `Function_Decl`-резолву (ПРОХОД 2, type_cheker.odin)
+- [ ] `Call_Foreign` opcode (compiler.odin `Opcode` enum) — операнды по
+      образцу `.Call_Builtin`/`.Call`, точная форма зависит от решения
+      вопроса 1 выше
+- [ ] Вендоринг libffi (если решение по вопросу 2 — vendored):
+      конвенция `external/` уже задана Стадией 26 +
+      `external/back`/`external/odin-http`/`external/toml_parser`
+
+**Порядок работ** (полный список 16 шагов — см. ROADMAP, здесь только
+чеклист):
+
+- [ ] Грилинг вопросов 1-5 (архитектура — до кода)
+- [ ] Грамматика `внешний` (TokenKind/lexer/Decls/parser)
+- [ ] `core:dynlib`-based загрузка библиотек
+- [ ] libffi bindings в Odin
+- [ ] Type descriptor builder
 - [ ] Primitive marshalling
-- [ ] Struct-by-value marshalling
+- [ ] `Указатель(T)`/`Pointer_Value` + владение через `pool_release`
+- [ ] String marshalling (КСтрока ↔ Panos_String)
+- [ ] `ff_структура` marshalling
 - [ ] `Call_Foreign` opcode + VM handler
-- [ ] Callback'и через ffi_closure
-- [ ] Memory ownership аннотации + GC finalizers
+- [ ] Тесты через libc (printf/getpid/open)
 - [ ] SIGSEGV recovery
-- [ ] Обёртка raylib на Panos-стороне (замена FFI-A)
-- [ ] Обёртка libc `фс` (миграция host stdlib)
+- [ ] Callback'и через ffi_closure
+- [ ] (опционально) Обёртка raylib на Panos-стороне (замена Стадии 4)
+- [ ] (опционально) Обёртка libc `фс` (миграция host stdlib)
+- [ ] Docs — новая глава `docs/src/language/ffi.md`
 
 ---
 
@@ -1345,6 +1445,127 @@ x) -> ...; Точка(_, _) -> ... }`. `Pattern_Constructor` теперь раб
 
 4 e2e-теста (полный пример из запроса, 3 негативных). `odin test ./core`
 139/139 (0 регрессий). native/lsp/wasm чисто.
+
+---
+
+## Стадия 32 ✅ — `Целое`: отдельный целочисленный тип
+
+Refs: [ROADMAP §Стадия 32](ROADMAP.md#стадия-32--целое-отдельный-целочисленный-тип).
+
+Запрос: добавить `Целое` рядом с `Число` (НЕ переименование). На
+рантайме то же f64-представление — различие только на уровне типов.
+
+- [x] `Type_Kind.Integer`/`TY_INT` + `BASE_TYPES` запись
+- [x] Литералы — Число по умолчанию, Целое только явно (первый проход —
+      наоборот — вызвал массовую регрессию, откачен; см. ROADMAP —
+      обсуждался и отклонён proper InferVar-default механизм как
+      избыточная сложность для узкого выигрыша)
+- [x] `check_expr`: `Number_Expr`/`Unary_Expr`(унарный минус)/
+      `Binary_Expr`(+/-/*, нужно для составных Целое-контекстных
+      выражений типа `длина(x) - 1`) — литерал/составное выражение
+      сужается до Целое по контексту
+- [x] `widen_num_literal_to_int` — литерал-сосед Целое-операнда в
+      бинарных операторах тоже становится Целое (`x + 5` при `x: Целое`)
+- [x] `/` на Целое/Целое — усечение к нулю (C/Rust/Go, не Python-флор),
+      новый опкод `.Int_Divide`, опкод выбирает компилятор по
+      статическому типу операнда
+- [x] `%` — новый токен/оператор, только Целое, новый опкод `.Modulo`
+- [x] `выбор` на Целое-subject — literal patterns, как у Число/Строка
+      (Стадия 29), обязательный catch-all
+- [x] Индекс массива/строки — Целое строго (отдельный запрос в этом же
+      раунде): `infer_index_expr`, `длина()`/`.длина()`,
+      `.получить(индекс,...)`/`.есть(индекс)`, числовой диапазон `для
+      i = A по B` (счётчик+граница Целое — парсер добавляет аннотацию
+      синтетическим Let_Stmt'ам), `строки.срез`/`строки.найти`,
+      новый builtin `строки.из_целого` (нет overloading — `из_числа`
+      не годится для Целое-аргумента)
+- [x] `is_valid_map_key_type` — забытый кейс, `Целое` не был валидным
+      ключом карты, поправлено заодно
+- [x] Стандартная библиотека под новую строгость: `std/коллекции.ps`,
+      `std/кодирование/json.ps`, `std/кодирование/toml.ps`,
+      `std/сеть/http.ps` — счётчики/позиции/длины → Целое
+- [x] `test.ps` — примеры под Целое-длину/-счётчик, новая
+      `проверка_целых()`; `docs/src/language/basic-types.md` — новый
+      раздел «Число и Целое»; `collections.md`/`control-flow.md`
+      поправлены
+
+Найденный по ходу баг (не регрессия этой стадии, а свежий баг в НОВОМ
+коде текущей стадии): `&Type_Ident{...}` composite-literal-address-of в
+парсере — стековая аллокация в Odin, не heap; указатель дальше терялся,
+segfault при чтении в резолвере. Фикс: `new(Type_Ident)`.
+
+`odin test ./core` — 139/139 (0 регрессий, 5 существующих e2e-тестов
+переписаны под Целое). native/lsp/wasm чисто. `test.ps`/`test_toml.ps`/
+`test_http.ps` + все 4 сетевых/кодирующих fixture — вручную прогнаны.
+
+---
+
+## Стадия 33 ✅ — Bounded traits: trait bounds на type-параметрах generic-функций
+
+Refs: [ROADMAP §Стадия 33](ROADMAP.md#стадия-33--bounded-traits-trait-bounds-на-type-параметрах-generic-функций).
+
+Запрос: `функ f[T: Сравниваемое](...)` — T ограничен списком
+интерфейсов через `+`, внутри тела `x < y`/арифметика/`==` работают как
+sugar. Grilled (три раунда): bound-синтаксис (несколько через `+`),
+scope (только функции, не структуры/интерфейсы), диспатч
+(**мономорфизация**, не рантайм-диспатч по type-тегу).
+
+- [x] `core/parser.odin` — `Function_Decl.type_param_bounds`,
+      `parse_function_type_params` (только функции)
+- [x] `core/type_cheker.odin` — `Type.required_interfaces`,
+      `make_decl_type_params` bounds-параметр (резолв имён интерфейсов,
+      kind==.Interface проверка)
+- [x] `type_satisfies_interface`/`primitive_satisfies_interface` —
+      единая точка, примитивы (Число/Целое/Строка) удовлетворяют
+      "родным" bound'ам без impl-блока (иначе T:Сравниваемое отказал бы
+      Числу); Равнозначное СОЗНАТЕЛЬНО не в fallback'е (opt-in override,
+      универсальный fallback дал бы sugar-путь на структуры без impl —
+      живой баг, пойман тестами)
+- [x] 5 sugar-гейтов в `infer_binary_expr` — kind-гейт расширен на
+      `.InferVar`, `type_satisfies_interface` вместо
+      `implements_prelude_interface`
+- [x] `ctx.in_abstract_generic_body` — отличает "рекурсия/вложенный
+      generic-вызов внутри ЕЩЁ абстрактного тела, не diagnostic" от
+      "вызывающий код реально не вывел тип, настоящая ошибка"
+- [x] `core/ast_clone.odin` (новый) — `clone_expr`/`clone_stmt`/
+      `clone_type_node` (19+7+6 вариантов) — нужен, т.к. `ctx.node_
+      types`/`ctx.call_infos` ключуются ПО УКАЗАТЕЛЮ узла, повторный
+      typecheck ТЕХ ЖЕ узлов с разным T перезаписал бы прошлую
+      инстанциацию
+- [x] `core/monomorphize.odin` (новый) — `ctx.generic_call_
+      instantiations`, `infer_bounded_generic_call` (отдельная ветка,
+      своя `instantiate_scheme_with_subst`), `build_instantiation_key`
+      (человекочитаемый `"f$Число"`, не pointer-based, как у generic_
+      instance_cache), `monomorphize_one` (клон → resolve_function_body
+      → typecheck с T напрямую подставленным в current_type_params →
+      compile → registry), `monomorphize_program` (fixed-point driver,
+      снимок необработанных ключей на каждой итерации — рекурсия
+      добавляет новые записи ВО ВРЕМЯ обработки, обход+мутация одной
+      map одновременно была бы UB)
+- [x] `core/compiler.odin` — `monomorphize_program` МЕЖДУ pass 1
+      (hoisting) и pass 2 (тела) — не ПЕРЕД pass 1 целиком (живой баг,
+      первая версия ставила ДО hoisting'а, клоны не находили обычные
+      методы типа `.сравнить()` в registry); bounded generic
+      `Function_Decl` исключены из pass 1/2; call site — ключ
+      инстанциации вместо `symbol_registry_key`
+
+Побочная находка — **серьёзный pre-existing баг, не регрессия этой
+стадии**: `core/resolver.odin`'s `resolve_program` создавала `Module`
+стековым композитным литералом, `Symbol.module` хранит `^Module` на
+него — dangling pointer сразу после возврата из `resolve_program`.
+Молчал годами (ничего раньше не читало `Symbol.module` так поздно в
+pipeline'е); `monomorphize_one` — первый код, дочитывающийся до
+`symbol_at(...).module.path` на этапе КОМПИЛЯЦИИ. Тот же класс бага,
+что stack-escape в Стадии 32. Фикс: `new(Module)`, как везде в
+`module_loader.odin`.
+
+Известное ограничение (сознательно, отложено): только generic-функции —
+bounded generic-структуры/интерфейсы вне scope.
+
+4 новых e2e-теста (primitive+struct dispatch в одной программе с
+разными скомпилированными версиями; негативный без impl; multi-bound с
+недостающим интерфейсом; рекурсия). `odin test ./core` — 143/143 (0
+регрессий). native/lsp/wasm чисто.
 
 ---
 

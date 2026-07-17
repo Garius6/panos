@@ -205,6 +205,8 @@ Opcode :: enum u8 {
 	Build_Variant, // Операнды: 3 байта (type_name_const, tag, arity). Снимает arity полей, кладёт ^Variant_Value.
 	Spawn, // Операнд: 1 байт (arg_count). Стек: fn, arg1..argN (как .Call). Не выполняет callee — создаёт новый Process_Value, кладёт его как handle.
 	Receive, // Без операндов. Если mailbox текущего процесса пуст — .Suspended (ip не двигается). Иначе снимает первое сообщение (FIFO), кладёт на стек.
+	Int_Divide, // Целое/Целое: усечение к нулю (в отличие от .Divide — обычное деление). Выбор опкода — на компиляторе (ctx.tc.node_types), рантайм-представление то же f64.
+	Modulo, // Остаток от Int_Divide — тот же принцип усечения, знак следует делимому.
 }
 
 // Записать 1 байт в массив инструкций
@@ -334,6 +336,7 @@ compile_program :: proc(
 		case ^Import_Decl:
 		// Импорты не порождают исполняемый код.
 		case ^Function_Decl:
+			if len(d.type_param_bounds) > 0 do continue
 			hoist_compiled_function(res, tc, registry_ptr, res.decl_symbols[decl])
 		case ^Impl_Decl:
 			for m in d.methods {
@@ -342,10 +345,21 @@ compile_program :: proc(
 		}
 	}
 
+	// Bounded traits: ПОСЛЕ hoisting (клоны могут ссылаться указателем на
+	// Compiled_Function обычных методов/функций — сам skeleton уже
+	// существует, тело ещё нет, это не проблема, указатель стабилен), но
+	// ДО обычного ПРОХОД 2 — иначе call site'ы bounded generic-функций (см.
+	// ^Call_Expr-кейс в compile_expr) не найдут свою инстанциацию в
+	// registry. Сами bounded generic Function_Decl исключены из pass 1/2
+	// (len(d.type_param_bounds) > 0) — шаблон никогда не компилируется
+	// напрямую, только клоны (core/monomorphize.odin).
+	monomorphize_program(res, tc, registry_ptr)
+
 	// ПРОХОД 2: Компиляция тел функций
 	for decl in program.decls {
 		#partial switch d in decl {
 		case ^Function_Decl:
+			if len(d.type_param_bounds) > 0 do continue
 			compile_decl_body(registry_ptr, tc, res, res.decl_symbols[decl], decl, d.body)
 		case ^Impl_Decl:
 			for m in d.methods {
@@ -810,7 +824,16 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			case .Star:
 				emit_opcode(ctx, .Multiply)
 			case .Slash:
-				emit_opcode(ctx, .Divide)
+				// Опкод выбирает КОМПИЛЯТОР по статическому типу (typechecker
+				// уже решил Целое/Целое vs Число/Число, см. infer_binary_expr)
+				// — рантайм-представление обоих f64, VM отличить их не может.
+				if ctx.tc.node_types[e.left] == TY_INT {
+					emit_opcode(ctx, .Int_Divide)
+				} else {
+					emit_opcode(ctx, .Divide)
+				}
+			case .Percent:
+				emit_opcode(ctx, .Modulo)
 			case .Less:
 				emit_opcode(ctx, .Less)
 			case .Greater:
@@ -936,6 +959,25 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		compile_expr(ctx, e.value)
 		emit_opcode(ctx, .Try_Unwrap)
 	case ^Call_Expr:
+		// Bounded traits: вызов bounded generic-функции — НЕ обычный
+		// symbol_registry_key(sym_id) (шаблон никогда не компилируется,
+		// см. compile_program и core/monomorphize.odin), а ключ конкретной
+		// инстанциации, уже гарантированно скомпилированной monomorphize_
+		// program ДО этого места (см. compile_program — вызывается первым
+		// шагом).
+		if concrete_types, ok := ctx.tc.generic_call_instantiations[expr]; ok {
+			key := build_instantiation_key(ctx.res.symbol_store, ctx.res.node_symbols[e.callee], concrete_types)
+			if fn_ptr, found := ctx.registry^[key]; found {
+				emit_constant(ctx, Value(fn_ptr))
+			} else {
+				fmt.panicf("Compiler Error: инстанциация generic-функции '%s' не найдена", key)
+			}
+			for arg in e.args do compile_expr(ctx, arg)
+			emit_opcode(ctx, .Call)
+			emit_byte(ctx, u8(len(e.args)))
+			maybe_emit_interface_cast(ctx, expr)
+			return
+		}
 		if info, ok := ctx.tc.call_infos[expr]; ok {
 			switch info.kind {
 			case .Constructor_Variant:

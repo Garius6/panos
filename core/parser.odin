@@ -56,6 +56,12 @@ Function_Decl :: struct {
 	// Имена type-параметров из `[T, U]` после имени функции. Пусто для
 	// обычных (не-generic) функций.
 	type_params: [dynamic]string,
+	// Bounded traits: `[T: Сравниваемое + Печатаемое]` — имя type-параметра
+	// -> список имён интерфейсов-ограничений (пусто/нет ключа = без
+	// bound'а). ТОЛЬКО у функций — Struct_Decl/Interface_Decl.type_params
+	// это поле не имеют (см. ROADMAP — scope сознательно ограничен
+	// функциями). Заполняется в parse_function_type_params.
+	type_param_bounds: map[string][dynamic]string,
 	args:        [dynamic]Param_Decl,
 	return_type: Type_Node,
 	body:        [dynamic]Stmt,
@@ -916,7 +922,7 @@ parse_function :: proc(p: ^Parser, is_exported: bool) -> ^Function_Decl {
 	function.name = tok.data
 
 	if peek_token(p.stream).kind == .LBracket {
-		function.type_params = parse_type_params(p)
+		function.type_params, function.type_param_bounds = parse_function_type_params(p)
 	}
 
 	function.args = parse_param_list(p, true)
@@ -950,6 +956,50 @@ parse_type_params :: proc(p: ^Parser) -> [dynamic]string {
 	}
 	expect(p, .RBracket)
 	return names
+}
+
+// `[T]`, `[T, U]` или `[T: Интерфейс1 + Интерфейс2, U]` после имени
+// функции — bounded traits, ТОЛЬКО у функций (parse_type_params выше —
+// общий для Struct/Interface, где bound'ов нет, см. ROADMAP). После
+// имени type-параметра опциональный `: Интерфейс (+ Интерфейс)*` уходит
+// в bounds-карту; без `:` параметр остаётся unbounded, как раньше.
+parse_function_type_params :: proc(p: ^Parser) -> ([dynamic]string, map[string][dynamic]string) {
+	next_token(p.stream) // .LBracket
+	names := make([dynamic]string)
+	bounds := make(map[string][dynamic]string)
+	for {
+		name_tok := next_token(p.stream)
+		if name_tok.kind != .Ident {
+			report_parse(p, name_tok.span, "Синтаксическая ошибка: в списке type-параметров '[...]' ожидается идентификатор")
+		}
+		append(&names, name_tok.data)
+
+		if peek_token(p.stream).kind == .Colon {
+			next_token(p.stream) // .Colon
+			ifaces := make([dynamic]string)
+			for {
+				iface_tok := next_token(p.stream)
+				if iface_tok.kind != .Ident {
+					report_parse(p, iface_tok.span, "Синтаксическая ошибка: после ':' в bound'е type-параметра ожидается имя интерфейса")
+				}
+				append(&ifaces, iface_tok.data)
+				if peek_token(p.stream).kind == .Plus {
+					next_token(p.stream) // .Plus
+				} else {
+					break
+				}
+			}
+			bounds[name_tok.data] = ifaces
+		}
+
+		if peek_token(p.stream).kind == .Comma {
+			next_token(p.stream)
+		} else {
+			break
+		}
+	}
+	expect(p, .RBracket)
+	return names, bounds
 }
 
 // Read-only lookahead: НЕ потребляет токены (в отличие от parse_type_params).
@@ -1382,9 +1432,19 @@ parse_for_range_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt, start: Span, 
 
 	outer_body := make([dynamic]Stmt)
 	// пер <сч> = <start> - 1
-	append(&outer_body, mk_let(var_name, mk_bin(.Minus, start_expr, mk_num(1, span), span), span))
-	// пер __for_N_end = <end>
-	append(&outer_body, mk_let(end_name, end_expr, span))
+	// Аннотация Целое обязательна: без неё счётчик выводился бы как Число
+	// (голый литерал по умолчанию, см. Type_Kind.Integer) — а индексация
+	// массивов/строк требует именно Целое, `для i = A по B ... arr[i]` —
+	// основной паттерн индексного доступа в языке (см. std/коллекции.ps's
+	// отсортировать), должен работать без явной аннотации у пользователя.
+	counter_let := mk_let(var_name, mk_bin(.Minus, start_expr, mk_num(1, span), span), span)
+	counter_let.(^Let_Stmt).type_annotation = mk_type_ident_int(span)
+	append(&outer_body, counter_let)
+	// пер __for_N_end = <end> — тоже Целое, иначе `<сч> > __for_N_end`
+	// сравнивал бы Целое с Число.
+	end_let := mk_let(end_name, end_expr, span)
+	end_let.(^Let_Stmt).type_annotation = mk_type_ident_int(span)
+	append(&outer_body, end_let)
 	append(&outer_body, mk_while(mk_bool(true, span), inner_body, span))
 	append(&outer_body, mk_break(span))
 
@@ -1962,7 +2022,7 @@ infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 	#partial switch tok.kind {
 	case .Dot:
 		return 90, 91, true
-	case .Star, .Slash:
+	case .Star, .Slash, .Percent:
 		return 60, 61, true
 	case .Plus, .Minus:
 		return 50, 51, true
@@ -1999,6 +2059,13 @@ mk_ident :: proc(name: string, span: Span) -> Expr {
 	e.name = intern(name)
 	e.span = span
 	return e
+}
+
+mk_type_ident_int :: proc(span: Span) -> Type_Node {
+	t := new(Type_Ident)
+	t.name = "Целое"
+	t.span = span
+	return t
 }
 
 mk_num :: proc(v: f64, span: Span) -> Expr {

@@ -131,10 +131,14 @@ Enum_Decl :: struct {
 }
 
 Impl_Decl :: struct {
-	span:           Span,
-	interface_name: string,
-	target_type:    string,
-	methods:        [dynamic]^Function_Decl,
+	span:              Span,
+	// Стадия 40: непусто = "реализация Модуль.Интерфейс для Тип" —
+	// cross-module интерфейс. Пусто = старая форма (локальный интерфейс
+	// либо простой impl без интерфейса вовсе).
+	interface_module:  string,
+	interface_name:    string,
+	target_type:       string,
+	methods:           [dynamic]^Function_Decl,
 }
 
 // Placeholder-узел ("hole"): парсер не смог разобрать конструкцию на этом
@@ -884,15 +888,38 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 	first_ident := next_token(p.stream)
 	if first_ident.kind != .Ident do error(p, "Ожидалось имя типа или интерфейса")
 
+	// Стадия 40: "реализация Модуль.Интерфейс для Тип" — квалификация
+	// допустима ТОЛЬКО у имени интерфейса (первого идента), не у target_
+	// type (тот всегда локальная структура/перечисление того же файла).
+	interface_module := ""
+	interface_ident := first_ident
+	if peek_token(p.stream).kind == .Dot {
+		next_token(p.stream) // .Dot
+		qualified_tok := next_token(p.stream)
+		if qualified_tok.kind != .Ident {
+			report_parse(p, qualified_tok.span, "Синтаксическая ошибка: после '.' в имени интерфейса ожидается идентификатор")
+		}
+		interface_module = first_ident.data
+		interface_ident = qualified_tok
+	}
+
 	if peek_token(p.stream).kind == .For {
 		expect(p, .For)
 
 		target_tok := next_token(p.stream)
 		if target_tok.kind != .Ident do error(p, "Ожидалось имя целевой структуры")
 
-		decl.interface_name = first_ident.data
+		decl.interface_module = interface_module
+		decl.interface_name = interface_ident.data
 		decl.target_type = target_tok.data
 	} else {
+		if interface_module != "" {
+			report_parse(
+				p,
+				first_ident.span,
+				"Синтаксическая ошибка: квалифицированное имя допустимо только в форме 'реализация Модуль.Интерфейс для Тип'",
+			)
+		}
 		decl.target_type = first_ident.data
 	}
 

@@ -2215,7 +2215,37 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			// Строгая проверка интерфейсного контракта (только Struct — см.
 			// guard выше)
 			if d.interface_name != "" {
-				iface_sym := ctx.res.global_scope.symbols[intern(d.interface_name)]
+				iface_sym: Symbol_Id
+				if d.interface_module != "" {
+					// Стадия 40: "реализация Модуль.Интерфейс для Тип" —
+					// тот же путь резолва, что Type_Qualified для
+					// "модуль.Тип" в аннотациях типов (см. case
+					// ^Type_Qualified выше).
+					module_sym := lookup_symbol(ctx.res.global_scope, intern(d.interface_module))
+					if module_sym == INVALID_SYMBOL || symbol_at(ctx.res.symbol_store, module_sym).kind != .Module {
+						report(ctx, d.span, "Type Error: неизвестный модуль '%s'", d.interface_module)
+						continue
+					}
+					imported_module := symbol_at(ctx.res.symbol_store, module_sym).module
+					if imported_module == nil {
+						report(ctx, d.span, "Type Error: модуль '%s' не загружен", d.interface_module)
+						continue
+					}
+					export_sym, found := imported_module.exports[intern(d.interface_name)]
+					if !found {
+						report(
+							ctx,
+							d.span,
+							"Type Error: модуль '%s' не экспортирует '%s'",
+							d.interface_module,
+							d.interface_name,
+						)
+						continue
+					}
+					iface_sym = export_sym
+				} else {
+					iface_sym = ctx.res.global_scope.symbols[intern(d.interface_name)]
+				}
 				iface_type := ctx.res.symbol_types[iface_sym]
 
 				if iface_type == nil || iface_type.kind != .Interface {

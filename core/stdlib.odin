@@ -9,7 +9,8 @@ is_builtin_module_name :: proc(name: string) -> bool {
 		name == "ввод_вывод" ||
 		name == "строки" ||
 		name == "сеть" ||
-		name == "время" \
+		name == "время" ||
+		name == "сжатие" \
 	)
 }
 
@@ -122,6 +123,16 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_STRING, TY_STRING)
 	case "строки::сравнить":
 		return builtin_function_type_2(TY_STRING, TY_STRING, TY_NUM)
+	case "строки::байт":
+		return builtin_function_type_2(TY_STRING, TY_INT, TY_INT)
+	case "строки::длина_байт":
+		return builtin_function_type_1(TY_STRING, TY_INT)
+	case "строки::срез_байт":
+		return builtin_function_type_3(TY_STRING, TY_INT, TY_INT, TY_STRING)
+	case "строки::из_байтов":
+		return builtin_function_type_1(new_array_type(TY_INT), TY_STRING)
+	case "сжатие::разжать_gzip":
+		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_STRING, TY_ERROR))
 	case "сеть::подключиться":
 		return builtin_function_type_2(TY_STRING, TY_NUM, stdlib_result_type(graph, TY_CONNECTION, TY_ERROR))
 	case "сеть::кодировать_url":
@@ -259,6 +270,10 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			builtin_export_type(graph, "строки::нижний_регистр"),
 		)
 		add_builtin_export(graph, module, "сравнить", builtin_export_type(graph, "строки::сравнить"))
+		add_builtin_export(graph, module, "байт", builtin_export_type(graph, "строки::байт"))
+		add_builtin_export(graph, module, "длина_байт", builtin_export_type(graph, "строки::длина_байт"))
+		add_builtin_export(graph, module, "срез_байт", builtin_export_type(graph, "строки::срез_байт"))
+		add_builtin_export(graph, module, "из_байтов", builtin_export_type(graph, "строки::из_байтов"))
 	} else if name == "сеть" {
 		add_builtin_export(
 			graph,
@@ -284,6 +299,13 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"сейчас_мс",
 			builtin_export_type(graph, "время::сейчас_мс"),
+		)
+	} else if name == "сжатие" {
+		add_builtin_export(
+			graph,
+			module,
+			"разжать_gzip",
+			builtin_export_type(graph, "сжатие::разжать_gzip"),
 		)
 	}
 

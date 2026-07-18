@@ -114,6 +114,21 @@ test_flags_stdlib :: proc(t: ^testing.T) {
 	testing.expectf(t, result == Value(true), "флаги: ожидалось true, получено %v", result)
 }
 
+// std/архив.ps — чистый panos поверх строки::байт/длина_байт/срез_байт/
+// из_байтов (core builtin) — round-trip собрать→разобрать. Кросс-
+// совместимость с реальным tar (bsdtar на macOS с AppleDouble/PAX-
+// заголовками) и сжатие::разжать_gzip (core:compress/gzip) проверены
+// вручную — здесь только логика самого panos-кода, без внешних
+// тестовых бинарников в CI.
+@(test)
+test_archive_stdlib :: proc(t: ^testing.T) {
+	result, ok := run_module_file("fixtures/archive_fixture_main.ps")
+	testing.expectf(t, ok, "архив: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(true), "архив: ожидалось true, получено %v", result)
+}
+
 // Раньше module_loader.odin panicf'ал на "модуль не найден" — единственный
 // оставшийся panicking путь пайплайна (см. TASKS.md §Стадия 10 П6). Роняло
 // не только CLI (терпимо — main.odin гейтит и выходит), но и ВЕСЬ LSP-

@@ -911,6 +911,13 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	if result, ok, handled := call_builtin_io(vm, name, args); handled {
 		return result, ok
 	}
+	// сжатие::* — в vm_compress_native.odin/vm_compress_wasm.odin (#+build
+	// split, native тянет core:compress/gzip, который транзитивно импортирует
+	// core:os — падает compile-time panic'ом под js_wasm32, тот же урок,
+	// что и с фс/сеть выше).
+	if result, ok, handled := call_builtin_compress(vm, name, args); handled {
+		return result, ok
+	}
 	switch name {
 	case "Ошибка":
 		expect_arg_count(name, len(args), 2)
@@ -1325,6 +1332,58 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		a := expect_string_arg(name, args[0])
 		b := expect_string_arg(name, args[1])
 		return Value(f64(strings.compare(a, b))), true
+
+	case "строки::байт":
+		// Побайтовый (не рунный, в отличие от строки::срез/длина/индексации,
+		// см. core/utils.odin) доступ — нужен для бинарных форматов (tar и
+		// т.п.), где содержимое не обязано быть валидным UTF-8.
+		expect_arg_count(name, len(args), 2)
+		text := expect_string_arg(name, args[0])
+		idx := number_to_index(args[1])
+		if idx >= len(text) {
+			fmt.panicf(
+				"Runtime Error: байт[%d] выходит за границы строки длиной %d байт",
+				idx,
+				len(text),
+			)
+		}
+		return Value(f64(text[idx])), true
+
+	case "строки::длина_байт":
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		return Value(f64(len(text))), true
+
+	case "строки::срез_байт":
+		expect_arg_count(name, len(args), 3)
+		text := expect_string_arg(name, args[0])
+		start := number_to_index(args[1])
+		end := number_to_index(args[2])
+		if start > end || end > len(text) {
+			fmt.panicf(
+				"Runtime Error: срез_байт[%d:%d] выходит за границы строки длиной %d байт",
+				start,
+				end,
+				len(text),
+			)
+		}
+		return Value(gc_new_string(vm, text[start:end])), true
+
+	case "строки::из_байтов":
+		expect_arg_count(name, len(args), 1)
+		arr, is_arr := args[0].(^Array_Value)
+		if !is_arr {
+			fmt.panicf("Runtime Error: из_байтов ожидает Массив(Целое)")
+		}
+		buf := make([]u8, len(arr.elements), context.temp_allocator)
+		for el, i in arr.elements {
+			n, is_num := el.(f64)
+			if !is_num || n < 0 || n > 255 || f64(int(n)) != n {
+				fmt.panicf("Runtime Error: из_байтов ожидает значения 0-255, получено %v", el)
+			}
+			buf[i] = u8(n)
+		}
+		return Value(gc_new_string(vm, string(buf))), true
 	}
 
 	fmt.panicf(

@@ -135,6 +135,37 @@ Value :: union {
 	^Socket_Value,
 	^Process_Value,
 	^Foreign_Function,
+	^Closure_Value,
+	^Pointer_Value,
+}
+
+// Стадия 49 (FFI): рантайм-представление Указатель(T) — opaque raw
+// pointer из/в внешний код. `owned` — Стадия 49's default-safe владение:
+// true ТОЛЬКО если `внешний`-декларация явно пометила возврат `владеет_я`
+// (см. Foreign_Decl.return_owned, parser.odin) — pool_release (gc.odin)
+// вызывает libc free() лишь в этом случае. GC-managed (заголовок нужен
+// для finalizer-паттерна, тот же приём, что File_Value/Socket_Value) —
+// сам `ptr` panos не разыменовывает и не сканирует (T фантомный).
+Pointer_Value :: struct {
+	header: GC_Header,
+	ptr:    rawptr,
+	owned:  bool,
+}
+
+// Стадия 48 (замыкания, value-capture): лямбда + снапшот значений,
+// захваченных из окружающего scope в МОМЕНТ построения (.Build_Closure,
+// см. Opcode) — НЕ общая ячейка с внешней функцией, копия. GC-managed
+// (в отличие от ^Compiled_Function, который лежит в глобальном реестре
+// весь процесс) — captured может содержать heap-объекты (строки,
+// массивы и т.п.), GC обязан их видеть через mark_value (gc.odin).
+// `fn` — сама скомпилированная лямбда-функция (та же ^Compiled_Function,
+// что раньше клался на стек напрямую константой); `captured` — значения
+// в ПОРЯДКЕ ctx.res.lambda_captures[expr] — тот же порядок, что
+// .Get_Captured'овские индексы внутри тела `fn`.
+Closure_Value :: struct {
+	header:   GC_Header,
+	fn:       ^Compiled_Function,
+	captured: [dynamic]Value,
 }
 
 // Стадия 47 (FFI-B): описание одного `внешний`-объявления, готовое к
@@ -146,12 +177,15 @@ Value :: union {
 // odin (реальный Ffi_Cif) — #+build !js. Готовится ЛЕНИВО и ОДИН РАЗ при
 // первом реальном вызове (vm_ffi_native.odin), не на компиляции.
 Foreign_Function :: struct {
-	name:         string,
-	fn_ptr:       rawptr,
-	param_widths: []int,
-	return_width: int,
-	cif:          rawptr,
-	cif_ready:    bool,
+	name:          string,
+	fn_ptr:        rawptr,
+	param_kinds:   []Foreign_Marshal_Kind,
+	return_kind:   Foreign_Marshal_Kind,
+	// Стадия 49: только когда return_kind == .Pointer — см.
+	// Foreign_Decl.return_owned/`владеет_я` (parser.odin).
+	return_owned:  bool,
+	cif:           rawptr,
+	cif_ready:     bool,
 }
 
 Compiled_Function :: struct {
@@ -180,6 +214,41 @@ symbol_registry_key :: proc(store: ^Symbol_Store, id: Symbol_Id) -> string {
 	return resolve_interned(sym.name)
 }
 
+// Стадия 48 (замыкания): эмитит код, кладущий ТЕКУЩЕЕ значение символа
+// sym_id на стек. Общая логика для ДВУХ мест: (1) обычная компиляция
+// Ident_Expr внутри тела (ctx = тот l_ctx, что компилирует ЭТО тело —
+// может сам быть лямбдой со своими captures), и (2) построение
+// .Build_Closure ВО ВНЕШНЕМ контексте — получить значение символа
+// ПЕРЕД тем, как оно скопируется в captured (снапшот). Порядок
+// проверки: собственный локал (Get_Local) → собственный upvalue, если
+// ctx сам сейчас компилирует лямбду с captures (Get_Captured, случай
+// вложенной лямбда-в-лямбде — сам символ мог быть чужим upvalue) →
+// глобальная функция из реестра (константа, как раньше).
+compile_symbol_value_ref :: proc(ctx: ^Compiler, sym_id: Symbol_Id) {
+	#reverse for loc, i in ctx.locals {
+		if loc.symbol == sym_id {
+			emit_opcode(ctx, .Get_Local)
+			emit_byte(ctx, u8(i))
+			return
+		}
+	}
+	for cap_sym, i in ctx.captures {
+		if cap_sym == sym_id {
+			emit_opcode(ctx, .Get_Captured)
+			emit_byte(ctx, u8(i))
+			return
+		}
+	}
+	if fn_ptr, ok := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, sym_id)]; ok {
+		emit_constant(ctx, Value(fn_ptr))
+		return
+	}
+	fmt.panicf(
+		"Compiler Error: символ '%s' не найден",
+		resolve_interned(symbol_at(ctx.res.symbol_store, sym_id).name),
+	)
+}
+
 Compiler :: struct {
 	registry:         ^map[string]^Compiled_Function, // Указатель на глобальный реестр
 	current_function: ^Compiled_Function,
@@ -188,6 +257,11 @@ Compiler :: struct {
 	locals:           [dynamic]Local,
 	loops:            [dynamic]Loop_Context,
 	scope_depth:      int,
+	// Стадия 48 (замыкания): пусто для обычных функций/методов.
+	// Заполняется при построении l_ctx для лямбды — копия
+	// ctx.res.lambda_captures[expr] (тот же порядок, что .Get_Captured
+	// индексы внутри тела И .Build_Closure-пуш во внешнем контексте).
+	captures:         [dynamic]Symbol_Id,
 }
 
 new_compiler :: proc(res: ^Resolver_Ctx, name: string) -> Compiler {
@@ -240,6 +314,8 @@ Opcode :: enum u8 {
 	Modulo, // Остаток от Int_Divide — тот же принцип усечения, знак следует делимому.
 	Receive_Signal, // Стадия 38: без операндов. Если очередь сигналов текущего процесса пуста — .Suspended (ip не двигается). Иначе снимает первый сигнал (Целое, Опция(Строка)), кладёт на стек.
 	Call_Foreign, // Стадия 47 (FFI-B): операнды — 1 байт (индекс константы с ^Foreign_Function), 1 байт (arg_count). Стек: arg1..argN (без callee-значения, в отличие от .Call — ^Foreign_Function не пользовательское значение). Маршаллинг через libffi — см. vm_ffi_native.odin/vm_ffi_wasm.odin.
+	Build_Closure, // Стадия 48 (замыкания): операнды — 1 байт (индекс константы с ^Compiled_Function лямбды), 1 байт (capture_count). Снимает capture_count значений со стека (в порядке ctx.res.lambda_captures[expr]), строит ^Closure_Value, кладёт на стек.
+	Get_Captured, // Стадия 48: операнд — 1 байт (индекс в frame.closure.captured). Кладёт значение на стек. Валиден только внутри тела лямбды, скомпилированной с captures.
 }
 
 // Записать 1 байт в массив инструкций
@@ -261,16 +337,17 @@ get_or_build_foreign_function :: proc(d: ^Foreign_Decl) -> ^Foreign_Function {
 	if d.compiled_fn != nil {
 		return (^Foreign_Function)(d.compiled_fn)
 	}
-	widths := make([]int, len(d.params))
+	kinds := make([]Foreign_Marshal_Kind, len(d.params))
 	for p, i in d.params {
-		widths[i] = p.width
+		kinds[i] = p.marshal
 	}
 	ff := new(Foreign_Function)
 	ff^ = Foreign_Function {
 		name         = d.name,
 		fn_ptr       = d.fn_ptr,
-		param_widths = widths,
-		return_width = d.return_width,
+		param_kinds  = kinds,
+		return_kind  = d.return_marshal,
+		return_owned = d.return_owned,
 	}
 	d.compiled_fn = ff
 	return ff
@@ -742,12 +819,19 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		fn.instructions = make([dynamic]u8); fn.constants = make([dynamic]Value)
 		ctx.registry^[fn.name] = fn
 
+		// Стадия 48 (замыкания): захваты этой лямбды уже посчитаны
+		// резолвером (упорядоченный dedup-список, тот же порядок нужен
+		// И здесь для .Get_Captured-индексов внутри тела, И ниже для
+		// .Build_Closure-пуша во внешнем контексте).
+		captures := ctx.res.lambda_captures[expr]
+
 		l_ctx := Compiler {
 			registry         = ctx.registry,
 			current_function = fn,
 			tc               = ctx.tc,
 			res              = ctx.res,
 			locals           = make([dynamic]Local),
+			captures         = captures,
 		}
 		if args_syms, ok := ctx.res.lambda_args[expr]; ok {
 			for sym in args_syms do append(&l_ctx.locals, Local{symbol = sym, depth = 0})
@@ -756,7 +840,22 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		compile_block(&l_ctx, e.body, true)
 		emit_opcode(&l_ctx, .Return)
 
-		emit_constant(ctx, Value(fn))
+		if len(captures) == 0 {
+			// Некапчурящая лямбда — старое поведение без изменений
+			// (голая ^Compiled_Function-константа, обычный .Call).
+			emit_constant(ctx, Value(fn))
+		} else {
+			// Захватывающая лямбда: пушим ТЕКУЩЕЕ значение каждого
+			// захваченного символа ВО ВНЕШНЕМ (не l_ctx) контексте —
+			// снапшот на момент построения замыкания, до .Build_Closure.
+			for sym in captures {
+				compile_symbol_value_ref(ctx, sym)
+			}
+			fn_const := make_constant(ctx, Value(fn))
+			emit_opcode(ctx, .Build_Closure)
+			emit_byte(ctx, fn_const)
+			emit_byte(ctx, u8(len(captures)))
+		}
 	case ^Ident_Expr:
 		sym_id := ctx.res.node_symbols[expr]
 		sym := symbol_at(ctx.res.symbol_store, sym_id)
@@ -781,25 +880,7 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			)
 		}
 
-		slot_index := -1
-		#reverse for loc, i in ctx.locals {
-			if loc.symbol == sym_id {
-				slot_index = i
-				break
-			}
-		}
-
-		if slot_index != -1 {
-			emit_opcode(ctx, .Get_Local)
-			emit_byte(ctx, u8(slot_index))
-		} else {
-			// Не локальная — ищем в глобальном реестре функций, кладём как константу.
-			if fn_ptr, ok := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, sym_id)]; ok {
-				emit_constant(ctx, Value(fn_ptr))
-			} else {
-				fmt.panicf("Compiler Error: символ '%s' не найден", resolve_interned(sym.name))
-			}
-		}
+		compile_symbol_value_ref(ctx, sym_id)
 
 	case ^Binary_Expr:
 		if e.op == .Assign {
@@ -1631,6 +1712,16 @@ print_assembler :: proc(registry: map[string]^Compiled_Function) {
 			case .Call_Foreign:
 				idx += 2
 				command := fmt.tprintf("%sCALL_FOREIGN\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Build_Closure:
+				idx += 2
+				command := fmt.tprintf("%sBUILD_CLOSURE\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Get_Captured:
+				idx += 1
+				command := fmt.tprintf("%sGET_CAPTURED: %d\n", prefix, instructions[idx])
 				strings.write_string(&builder, command)
 
 			}

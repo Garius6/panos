@@ -353,6 +353,21 @@ new_symbol :: proc(
 	return id
 }
 
+// Стадия 48 (замыкания): один активный уровень вложенности лямбды на
+// время резолва её тела. `boundary` — Scope, созданный push_scope ПРИ
+// ВХОДЕ в эту лямбду (её "собственный" верхний scope, содержащий
+// параметры) — определяет границу: символ, найденный ВНУТРИ boundary
+// или в его потомках (вложенные блоки/циклы этой же лямбды), свой;
+// символ, найденный ЗА boundary.parent — захвачен снаружи. `captures`/
+// `capture_set` — накопитель (dedup по capture_set, порядок — по
+// capture_order) для итогового lambda_captures[expr].
+Lambda_Capture_Frame :: struct {
+	expr:          Expr,
+	boundary:      ^Scope,
+	capture_set:   map[Symbol_Id]bool,
+	capture_order: [dynamic]Symbol_Id,
+}
+
 Resolver_Ctx :: struct {
 	current_scope:   ^Scope,
 	global_scope:    ^Scope,
@@ -371,6 +386,15 @@ Resolver_Ctx :: struct {
 	node_symbols:    map[Expr]Symbol_Id,
 	func_args:       map[Decls][dynamic]Symbol_Id,
 	lambda_args:     map[Expr][dynamic]Symbol_Id,
+	// Стадия 48 (замыкания, value-capture): для каждой Lambda_Expr —
+	// упорядоченный dedup-список Symbol_Id, захваченных из ОКРУЖАЮЩЕГО
+	// (не своего) scope. Заполняется в case ^Lambda_Expr ниже через
+	// lambda_stack (рабочий стек, живёт только во время резолва одного
+	// module). Порядок здесь = порядок, в котором compiler.odin кладёт
+	// значения на стек при .Build_Closure И порядок .Get_Captured
+	// индексов внутри тела — эти два места ДОЛЖНЫ совпадать позиционно.
+	lambda_captures: map[Expr][dynamic]Symbol_Id,
+	lambda_stack:    [dynamic]Lambda_Capture_Frame,
 	// Стадия 23 (Итерируемое): For_In_Stmt.names — 1+ имён (одиночное
 	// или tuple-деструктуризация `для (к, з) в ...`), позиционно
 	// параллельно names. Та же форма, что func_args/lambda_args.
@@ -545,6 +569,45 @@ lookup_symbol :: proc(s: ^Scope, name: Interned) -> Symbol_Id {
 
 	if s.parent != nil {
 		return lookup_symbol(s.parent, name)
+	}
+
+	return INVALID_SYMBOL
+}
+
+// Стадия 48 (замыкания): та же логика поиска, что lookup_symbol, но
+// ПОПУТНО регистрирует захват в каждом активном Lambda_Capture_Frame,
+// границу которого пришлось пересечь, чтобы дойти до места объявления
+// символа. Стандартный upvalue-resolution walk (как в Lua) — работает
+// для произвольной глубины вложенности лямбда-в-лямбде: если символ
+// объявлен ВНЕ и внешней, и внутренней лямбды, ОБЕ лямбды получают его
+// в свой capture-список (внешняя — как обычный захват из ЕЁ
+// окружения, внутренняя — как захват из окружения внешней), что
+// симметрично тому, как compiler.odin будет эмитить код (внешняя
+// лямбда сама читает пойманное значение через .Get_Captured, прежде
+// чем передать его дальше во внутреннюю через .Build_Closure).
+lookup_symbol_tracking_captures :: proc(ctx: ^Resolver_Ctx, name: Interned) -> Symbol_Id {
+	s := ctx.current_scope
+	// Индекс верхнего ещё-не-пересечённого фрейма в ctx.lambda_stack.
+	li := len(ctx.lambda_stack) - 1
+	crossed: [dynamic]int
+	defer delete(crossed)
+
+	for s != nil {
+		if sym, found := s.symbols[name]; found {
+			for idx in crossed {
+				frame := &ctx.lambda_stack[idx]
+				if !frame.capture_set[sym] {
+					frame.capture_set[sym] = true
+					append(&frame.capture_order, sym)
+				}
+			}
+			return sym
+		}
+		if li >= 0 && s == ctx.lambda_stack[li].boundary {
+			append(&crossed, li)
+			li -= 1
+		}
+		s = s.parent
 	}
 
 	return INVALID_SYMBOL
@@ -925,7 +988,11 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 
 	switch e in expr {
 	case ^Ident_Expr:
-		sym := lookup_symbol(ctx.current_scope, e.name)
+		// Стадия 48: lookup_symbol_tracking_captures вместо голого
+		// lookup_symbol — попутно регистрирует захват в
+		// ctx.lambda_stack, если имя нашлось ЗА границей активной
+		// лямбды (см. Lambda_Capture_Frame).
+		sym := lookup_symbol_tracking_captures(ctx, e.name)
 		if sym == INVALID_SYMBOL {
 			report_resolve(ctx, e.span, "Resolve Error: undefined variable '%s'", resolve_interned(e.name))
 		}
@@ -1049,6 +1116,15 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		}
 	case ^Lambda_Expr:
 		push_scope(ctx)
+		// Стадия 48: boundary = СЕЙЧАС созданный scope лямбды (её
+		// параметры живут прямо в нём) — lookup_symbol_tracking_captures
+		// сравнивает с этим указателем, пока резолвит тело ниже.
+		append(&ctx.lambda_stack, Lambda_Capture_Frame{
+			expr = expr,
+			boundary = ctx.current_scope,
+			capture_set = make(map[Symbol_Id]bool),
+			capture_order = make([dynamic]Symbol_Id),
+		})
 		args_syms := make([dynamic]Symbol_Id)
 		for arg in e.args {
 			// Стадия 27 (расширение) — та же immutable-by-default политика,
@@ -1061,6 +1137,8 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		ctx.lambda_args[expr] = args_syms
 		for stmt in e.body do resolve_stmt(ctx, stmt)
 		pop_scope(ctx)
+		frame := pop(&ctx.lambda_stack)
+		ctx.lambda_captures[expr] = frame.capture_order
 	case ^Array_Expr:
 		for el in e.elements {
 			resolve_expr(ctx, el)

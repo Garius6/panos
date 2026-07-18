@@ -46,6 +46,15 @@ Type_Kind :: enum {
 	// цепочке (resolve_type_node), рядом с Массив/Соответствие. См.
 	// new_process_type.
 	Process,
+	// Стадия 49 (FFI): Указатель(T) — opaque handle для внешних C-
+	// указателей. Тот же приём, что Process выше — T в element_type,
+	// третья/четвёртая ветка Type_Generic-цепочки (resolve_type_node),
+	// БЕЗ Type_Scheme. T ЧИСТО фантомный — panos никогда не
+	// разыменовывает/не читает поля через Указатель(T) в этом срезе
+	// (нет ff_структура), T нужен только для типобезопасности
+	// (Указатель(Файл) ≠ Указатель(Сокет) для тайпчекера). См.
+	// new_pointer_type, core/vm_ffi_native.odin (Pointer_Value).
+	Pointer,
 	// Заглушка для узла, где уже была зарепорчена ошибка. Unify'ится с чем
 	// угодно (см. unify_types/types_are_equal) — не даёт одной первопричине
 	// расплодиться в десяток производных диагностик по всему выражению.
@@ -206,6 +215,16 @@ new_process_type :: proc(message_type: ^Type) -> ^Type {
 	t.kind = .Process
 	t.element_type = message_type
 	t.name = fmt.tprintf("Процесс(%s)", message_type.name)
+	return t
+}
+
+// Стадия 49 (FFI): Указатель(T) — тот же приём, что new_process_type
+// выше, T чисто фантомный (см. Type_Kind.Pointer).
+new_pointer_type :: proc(pointee_type: ^Type) -> ^Type {
+	t := new(Type)
+	t.kind = .Pointer
+	t.element_type = pointee_type
+	t.name = fmt.tprintf("Указатель(%s)", pointee_type.name)
 	return t
 }
 
@@ -820,6 +839,17 @@ Type_Ctx :: struct {
 	// переданная аргументом без ожидаемого типа, — для неё проверка
 	// остаётся строгой).
 	allow_unresolved_lambda: Expr,
+	// Стадия 48 (замыкания): стек АКТИВНЫХ (сейчас типизируемых) лямбд —
+	// push/pop в check_lambda_expr, тот же save/restore-паттерн, что
+	// allow_unresolved_lambda чуть выше. `case .Assign:` (infer_binary_
+	// expr) читает вершину стека, чтобы запретить присваивание
+	// захваченной переменной ВНУТРИ лямбды — см. ctx.res.lambda_captures.
+	// Проверять достаточно ТОЛЬКО вершину (самую внутреннюю активную
+	// лямбду): резолвер (lookup_symbol_tracking_captures) уже
+	// транзитивно прописывает символ в capture-список каждой
+	// пересечённой лямбды, так что lambda_captures[вершина] всегда
+	// содержит ВСЁ, что снаружи неё, независимо от глубины вложенности.
+	current_lambda_stack: [dynamic]Expr,
 	// Стадия 7 Phase B: имя→InferVar type-параметров ТЕКУЩЕЙ generic-функции,
 	// пока резолвится её сигнатура (ПРОХОД 2) или тело (ПРОХОД 4). nil вне
 	// generic-функции. Ambient-поле, тот же save/restore паттерн, что
@@ -1585,6 +1615,23 @@ function_type_from_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) -> ^Type {
 	return new_function_type(params, return_type)
 }
 
+// Стадия 49: panos-тип, соответствующий marshal-кинду `внешний`-
+// параметра/возврата (см. Foreign_Marshal_Kind, parser.odin). Int32/
+// Int64 — оба TY_INT (ширина чисто marshalling, не панос-тип, см. Стадия
+// 47). Pointer — реальный Указатель(T), T резолвится из pointee обычным
+// resolve_type_node (тем же путём, что параметр обычной функции).
+foreign_marshal_panos_type :: proc(ctx: ^Type_Ctx, marshal: Foreign_Marshal_Kind, pointee: Type_Node) -> ^Type {
+	switch marshal {
+	case .Int32, .Int64:
+		return TY_INT
+	case .CString:
+		return TY_STRING
+	case .Pointer:
+		return new_pointer_type(resolve_type_node(ctx, pointee))
+	}
+	return TY_INT
+}
+
 interface_method_type_from_signature :: proc(
 	ctx: ^Type_Ctx,
 	iface_type: ^Type,
@@ -1642,6 +1689,12 @@ check_lambda_expr :: proc(
 	lambda: ^Lambda_Expr,
 	expected: ^Type = nil,
 ) -> ^Type {
+	// Стадия 48: пушим ДО проверки тела (bind_lambda_args сама тело не
+	// трогает, но unify/check ниже могут рекурсивно уйти во вложенные
+	// лямбды — стек должен быть консистентен на всём протяжении).
+	append(&ctx.current_lambda_stack, expr)
+	defer pop(&ctx.current_lambda_stack)
+
 	expected_type := prune_type(expected)
 	params := infer_lambda_param_types(ctx, lambda.span, lambda.args, expected_type)
 	bind_lambda_args(ctx, expr, params)
@@ -2009,16 +2062,20 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			}
 
 		case ^Foreign_Decl:
-			// Стадия 47: `Целое(N)`-ширины — чисто marshalling-метаданные
-			// (см. Foreign_Param/Foreign_Decl, parser.odin), тайпчекеру
-			// невидимы — параметр/возврат всегда обычный TY_INT. Тела нет
-			// (ПРОХОД 4 её не касается, #partial switch там её пропускает).
+			// Стадия 47/49: marshal-кинд — чисто marshalling-метаданные
+			// (см. Foreign_Param/Foreign_Decl, parser.odin), но панос-ТИП
+			// параметра/возврата зависит от него напрямую (Целое(N) ->
+			// TY_INT, КСтрока -> TY_STRING, Указатель(T) -> реальный
+			// Указатель(T) через resolve_type_node на pointee) — см.
+			// foreign_marshal_panos_type ниже. Тела нет (ПРОХОД 4 её не
+			// касается, #partial switch там её пропускает).
 			foreign_sym := ctx.res.decl_symbols[decl]
 			foreign_params := make([dynamic]^Type)
-			for _ in d.params {
-				append(&foreign_params, TY_INT)
+			for param in d.params {
+				append(&foreign_params, foreign_marshal_panos_type(ctx, param.marshal, param.pointee))
 			}
-			ctx.res.symbol_types[foreign_sym] = new_function_type(foreign_params, TY_INT)
+			foreign_return := foreign_marshal_panos_type(ctx, d.return_marshal, d.return_pointee)
+			ctx.res.symbol_types[foreign_sym] = new_function_type(foreign_params, foreign_return)
 
 		case ^Interface_Decl:
 			iface_sym := ctx.res.decl_symbols[decl]
@@ -2446,6 +2503,9 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 		} else if n.name == "Процесс" {
 			if len(n.params) != 1 do return report(ctx, n.span, "Type Error: Процесс ожидает 1 параметр типа")
 			return new_process_type(resolve_type_node(ctx, n.params[0]))
+		} else if n.name == "Указатель" {
+			if len(n.params) != 1 do return report(ctx, n.span, "Type Error: Указатель ожидает 1 параметр типа")
+			return new_pointer_type(resolve_type_node(ctx, n.params[0]))
 		} else {
 			// Стадия 7 Phase C: пользовательский generic-тип (структура).
 			// Раньше здесь не было fallback'а вообще — неизвестное имя
@@ -4047,6 +4107,28 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 					"Type Error: попытка переприсвоить константу '%s'",
 					resolve_interned(ident.name),
 				)
+			}
+			// Стадия 48 (замыкания): захваченная переменная — снапшот на
+			// момент создания лямбды, не общая ячейка с внешней функцией.
+			// Присваивание ей внутри лямбды не сделало бы ничего
+			// осмысленного снаружи (тихий no-op) — явная ошибка вместо
+			// молчаливого сюрприза. Достаточно проверить ТОЛЬКО вершину
+			// current_lambda_stack — см. комментарий у поля.
+			if len(ctx.current_lambda_stack) > 0 {
+				current_lambda := ctx.current_lambda_stack[len(ctx.current_lambda_stack) - 1]
+				if sym_id := ctx.res.node_symbols[ident]; sym_id != INVALID_SYMBOL {
+					for captured_sym in ctx.res.lambda_captures[current_lambda] {
+						if captured_sym == sym_id {
+							report(
+								ctx,
+								e.span,
+								"Type Error: захваченная переменная '%s' неизменяема внутри лямбды",
+								resolve_interned(ident.name),
+							)
+							break
+						}
+					}
+				}
 			}
 		}
 		left_t := infer_expr(ctx, e.left)

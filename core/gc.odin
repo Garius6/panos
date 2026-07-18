@@ -94,6 +94,8 @@ GC_State :: struct {
 	free_files:      [dynamic]^File_Value,
 	free_sockets:    [dynamic]^Socket_Value,
 	free_processes:  [dynamic]^Process_Value,
+	free_closures:   [dynamic]^Closure_Value,
+	free_pointers:   [dynamic]^Pointer_Value,
 }
 
 // Не собираем, пока живой хип меньше этого — иначе на маленьких
@@ -118,6 +120,8 @@ new_gc_state :: proc() -> GC_State {
 		free_files = make([dynamic]^File_Value),
 		free_sockets = make([dynamic]^Socket_Value),
 		free_processes = make([dynamic]^Process_Value),
+		free_closures = make([dynamic]^Closure_Value),
+		free_pointers = make([dynamic]^Pointer_Value),
 	}
 }
 
@@ -181,6 +185,10 @@ gc_new :: proc(vm: ^VM, $T: typeid) -> ^T {
 		obj = pool_take(&vm.gc.free_sockets)
 	} else when T == Process_Value {
 		obj = pool_take(&vm.gc.free_processes)
+	} else when T == Closure_Value {
+		obj = pool_take(&vm.gc.free_closures)
+	} else when T == Pointer_Value {
+		obj = pool_take(&vm.gc.free_pointers)
 	}
 
 	if obj == nil {
@@ -243,6 +251,10 @@ get_header :: proc(v: Value) -> ^GC_Header {
 		return &val.header
 	case ^Process_Value:
 		return &val.header
+	case ^Closure_Value:
+		return &val.header
+	case ^Pointer_Value:
+		return &val.header
 	case f64, bool, ^Compiled_Function, ^Foreign_Function:
 		return nil
 	}
@@ -262,8 +274,8 @@ mark_value :: proc(v: Value) {
 	h.marked = true
 
 	switch val in v {
-	case f64, bool, ^Compiled_Function, ^Foreign_Function, ^Panos_String, ^File_Value, ^Socket_Value:
-	// листья — нечего обходить дальше
+	case f64, bool, ^Compiled_Function, ^Foreign_Function, ^Panos_String, ^File_Value, ^Socket_Value, ^Pointer_Value:
+	// листья — нечего обходить дальше (Pointer_Value.ptr — rawptr, не Value, T фантомный)
 	case ^Aggregate_Value:
 		for el in val.elements do mark_value(el)
 	case ^Array_Value:
@@ -308,6 +320,11 @@ mark_value :: proc(v: Value) {
 		// (никогда не свопается, читается напрямую через vm.processes),
 		// та же разметка.
 		for sig in val.signals do mark_value(sig)
+	case ^Closure_Value:
+		// Стадия 48: fn (^Compiled_Function) не GC-managed (глобальный
+		// реестр, get_header(Value(val.fn)) вернул бы nil) — только
+		// captured нуждается в обходе.
+		for c in val.captured do mark_value(c)
 	}
 }
 
@@ -376,6 +393,10 @@ value_size :: proc(v: Value) -> int {
 		return size_of(Socket_Value)
 	case ^Process_Value:
 		return size_of(Process_Value)
+	case ^Closure_Value:
+		return size_of(Closure_Value)
+	case ^Pointer_Value:
+		return size_of(Pointer_Value)
 	}
 	return 0
 }
@@ -448,6 +469,22 @@ pool_release :: proc(vm: ^VM, v: Value) {
 		val.is_alive = false
 		val.has_run = false
 		append(&vm.gc.free_processes, val)
+	case ^Closure_Value:
+		// fn не трогаем (не наш, живёт в глобальном реестре).
+		clear(&val.captured)
+		append(&vm.gc.free_closures, val)
+	case ^Pointer_Value:
+		// Стадия 49 (FFI): освобождаем ТОЛЬКО если panos реально владеет
+		// памятью (см. Foreign_Decl.return_owned/`владеет_я`, parser.odin
+		// — default `владеет_C`, НЕ освобождать чужое). pointer_free —
+		// платформенный (vm_ffi_native.odin/vm_ffi_wasm.odin), тот же
+		// принцип, что close_file_value выше.
+		if val.owned {
+			pointer_free(val.ptr)
+		}
+		val.ptr = nil
+		val.owned = false
+		append(&vm.gc.free_pointers, val)
 	}
 }
 

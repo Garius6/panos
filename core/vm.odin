@@ -15,6 +15,11 @@ CallFrame :: struct {
 	function:      ^Compiled_Function,
 	ip:            int, // Указатель текущей инструкции в ЭТОЙ функции
 	frame_pointer: int, // Индекс в vm.stack, где начинаются локальные переменные ЭТОЙ функции
+	// Стадия 48 (замыкания): nil для обычного вызова обычной функции.
+	// Если callee — ^Closure_Value (не голая ^Compiled_Function), сюда
+	// кладётся сам Closure_Value — .Get_Captured читает
+	// closure.captured[idx] напрямую отсюда.
+	closure:       ^Closure_Value,
 }
 
 // Стадия 24 (actor model): что вернул execute() — доработала ли текущая
@@ -407,10 +412,29 @@ message_deep_copy :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]Value) -> 
 			}
 		}
 		return Value(cp)
+	case ^Closure_Value:
+		// Стадия 48 (замыкания): captured сам может содержать heap-
+		// объекты (строки, массивы и т.п.) — глубокая копия по тому же
+		// принципу, что Array_Value/Map_Value выше, иначе отправка
+		// замыкания другому процессу шарила бы мутируемое состояние
+		// между процессами (нарушение copy-on-send). fn
+		// (^Compiled_Function) НЕ копируется — живёт в глобальном
+		// реестре весь процесс, как и голая функция без захвата.
+		if existing, ok := visited[val]; ok do return existing
+		cp := gc_new(vm, Closure_Value)
+		visited[val] = Value(cp)
+		cp.fn = val.fn
+		cp.captured = make([dynamic]Value, len(val.captured))
+		for c, i in val.captured do cp.captured[i] = message_deep_copy(vm, c, visited)
+		return Value(cp)
 	}
 	// f64/bool/^Panos_String/^Compiled_Function/^File_Value/^Socket_Value/
 	// ^Process_Value — без копии (иммутабельны либо намеренно небезопасны/
-	// бессмысленны для копирования).
+	// бессмысленны для копирования). ^Pointer_Value (Стадия 49) — та же
+	// категория, что File/Socket: дублирование wrapper'а вокруг ОДНОГО
+	// внешнего адреса с owned=true в ДВУХ независимых Pointer_Value дало
+	// бы double-free (каждый GC'nut wrapper звал бы free() независимо) —
+	// безопаснее делить ОДИН wrapper, чем гарантированно ломать владение.
 	return value
 }
 
@@ -1412,8 +1436,20 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			callee_index := len(vm.stack) - 1 - arg_count
 			callee_val := vm.stack[callee_index]
 
-			func_ptr, ok := callee_val.(^Compiled_Function)
-			if !ok {
+			// Стадия 48 (замыкания): callee — либо голая ^Compiled_Function
+			// (обычная функция/некапчурящая лямбда), либо ^Closure_Value
+			// (захватывающая лямбда, см. .Build_Closure) — в обоих
+			// случаях исполняется одна и та же ^Compiled_Function,
+			// разница только в том, доступен ли .Get_Captured.
+			func_ptr: ^Compiled_Function
+			closure: ^Closure_Value
+			#partial switch v in callee_val {
+			case ^Compiled_Function:
+				func_ptr = v
+			case ^Closure_Value:
+				func_ptr = v.fn
+				closure = v
+			case:
 				fmt.panicf(
 					"Runtime Error: попытка вызвать не функцию (получено: %v)",
 					callee_val,
@@ -1424,6 +1460,7 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 				function      = func_ptr,
 				ip            = 0,
 				frame_pointer = callee_index + 1, // локальные начинаются прямо с аргументов
+				closure       = closure,
 			}
 
 			// Дорезервируем слоты под остальные локальные (нулями)
@@ -1471,6 +1508,26 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			result := call_foreign(vm, ff, args)
 			resize(&vm.stack, args_start)
 			append(&vm.stack, result)
+
+		case .Build_Closure:
+			frame.ip += 1
+			fn_index := instructions[frame.ip]
+			frame.ip += 1
+			capture_count := int(instructions[frame.ip])
+
+			fn := frame.function.constants[fn_index].(^Compiled_Function)
+			captured_start := len(vm.stack) - capture_count
+			closure := gc_new(vm, Closure_Value)
+			closure.fn = fn
+			resize(&closure.captured, capture_count)
+			copy(closure.captured[:], vm.stack[captured_start:])
+			resize(&vm.stack, captured_start)
+			append(&vm.stack, Value(closure))
+
+		case .Get_Captured:
+			frame.ip += 1
+			idx := instructions[frame.ip]
+			append(&vm.stack, frame.closure.captured[idx])
 
 		case .Return:
 			result: Value = f64(0) // по умолчанию, если функция ничего не вернула

@@ -1653,6 +1653,76 @@ wasm чисто.
 
 ---
 
+## Стадия 49 ✅ — FFI: `КСтрока` + `Указатель(T)`
+
+Refs: [ROADMAP §Стадия 49](ROADMAP.md#стадия-49--ffi-кстрока--указательt).
+
+- [x] Грамматика: `parse_foreign_marshal_type` (обобщение `parse_
+      foreign_int_width`) — `Целое(32|64)`/`КСтрока`/`Указатель(T)`,
+      `Foreign_Marshal_Kind` enum; постфикс владения на возврате
+      (`владеет_я`/`владеет_C`, default `владеет_C`)
+- [x] `Type_Kind.Pointer` + `new_pointer_type` — настоящий panos-тип
+      (ветка `Type_Generic`-цепочки рядом с `Процесс(T)`), T фантомный
+- [x] `Pointer_Value` (Value-вариант, `ptr: rawptr, owned: bool`) + 5
+      GC-точек (тот же метод, что Foreign_Function/Closure_Value) +
+      `pointer_free` (libc `free()`, `vm_ffi_native.odin`/`vm_ffi_
+      wasm.odin`) — освобождает ТОЛЬКО если `owned == true`
+- [x] `message_deep_copy`: `Pointer_Value` НЕ дублируется при отправке
+      процессу (та же категория, что File/Socket — дублирование
+      wrapper'а с owned=true дало бы double-free)
+- [x] `Foreign_Function` обобщён на `param_kinds: []Foreign_Marshal_
+      Kind`/`return_kind`/`return_owned` (было `param_widths: []int`/
+      `return_width: int`)
+- [x] `ffi_type_pointer` binding + `ffi_type_for_marshal` (ffi_
+      bindings.odin) — общий дескриптор для КСтрока/Указатель(T)
+- [x] VM-маршаллинг (`vm_ffi_native.odin`): КСтрока — panos Строка ->
+      null-terminated C-буфер на время вызова (параметр), `char*` ->
+      НОВАЯ Panos_String всегда копией (возврат); Указатель(T) — прямой
+      passthrough rawptr
+- [x] 4 e2e-теста (strlen-параметр, strdup round-trip через кириллицу,
+      malloc+владеет_я не падает, getenv без владения не пытается
+      free())
+- [x] `docs/src/language/ffi.md` — новые секции КСтрока/Указатель(T),
+      обновлён список "явно не сделано"
+- [x] Build native/lsp/wasm чисто, `odin test ./core` — 205/205
+
+Объём сознательно сужен грилингом до "строки + указатели" — `ff_
+структура`/callback'и/SIGSEGV recovery/другие платформы остаются
+открытыми пунктами ROADMAP §Стадия 8.
+
+---
+
+## Стадия 48 ✅ — Замыкания (value-capture)
+
+Refs: [ROADMAP §Стадия 48](ROADMAP.md#стадия-48--замыкания-value-capture).
+
+- [x] Резолвер: `lookup_symbol_tracking_captures` (upvalue-resolution
+      walk через `lambda_stack`) + `lambda_captures` на Lambda_Expr
+- [x] `Type Error` на присваивании захваченной переменной внутри лямбды
+      (`current_lambda_stack`, рядом со Стадия 27 immutable-параметрами)
+- [x] `Closure_Value` (Value-вариант) + `.Build_Closure`/`.Get_Captured`
+      опкоды + `compile_symbol_value_ref` (общий хелпер для Ident_Expr
+      и построения замыкания)
+- [x] VM: `CallFrame.closure`, `.Call` принимает `^Closure_Value`,
+      `message_deep_copy` копирует `captured` при отправке процессу
+- [x] GC: 5 точек для `Closure_Value` (get_header/mark_value/
+      value_size/pool_release/gc_new), тот же метод, что Foreign_
+      Function/Process_Value
+- [x] `std/супервизор.ps`: докstring обновлён (снят устаревший
+      "нет захвата" workaround-комментарий), архитектура не менялась
+- [x] 6 e2e-тестов (базовый захват/snapshot-семантика/множественный
+      захват/mutation Type Error/вложенный захват/отправка процессу)
+- [x] `docs/src/language/functions.md` — новая секция "Замыкания"
+- [x] Build native/lsp/wasm чисто, `odin test ./core` — 201/201
+
+Некапчурящие лямбды (большинство существующего кода) компилируются БЕЗ
+изменений — новый путь активируется только при непустом capture-списке.
+Захват — по значению (снапшот на момент создания), не по ссылке —
+совместимо с copy-on-send actor-model философией без доп. решений про
+отправку замыкания между процессами.
+
+---
+
 ## Стадия 46 ✅ — Временное окно лимита рестартов (модуль `время` + sliding window)
 
 Refs: [ROADMAP §Стадия 46](ROADMAP.md#стадия-46--временное-окно-лимита-рестартов-модуль-время--sliding-window).

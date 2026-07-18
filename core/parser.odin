@@ -151,34 +151,55 @@ Error_Decl :: struct {
 }
 
 // Стадия 47 (FFI-B, первый срез): `внешний "libc" функ getpid() -> Целое(32)`.
-// Параметр/возврат — ВСЕГДА `Целое` с обязательным width-модификатором
-// `(32)`/`(64)` — синтаксис валиден ТОЛЬКО здесь (не общий `parse_type`,
-// см. parse_foreign_decl), поэтому не Type_Node, а свой узкий Foreign_
-// Param. Ширина — чисто marshalling-метаданные для libffi (ffi_type_
-// sint32 vs sint64), панос-типом параметра/возврата остаётся обычный
-// Целое — не новый Type_Kind. Ширины живут прямо на Foreign_Decl/
-// Foreign_Param (см. ниже), typecheck их не касается вообще.
+// Стадия 49 расширила поддержанные формы типа до `КСтрока`/`Указатель(T)`
+// (см. parse_foreign_marshal_type) — синтаксис ПО-ПРЕЖНЕМУ валиден
+// ТОЛЬКО здесь (не общий `parse_type`, кроме T внутри `Указатель(T)` —
+// та часть уже обычный `parse_type`), поэтому Foreign_Param остаётся
+// своим узким типом, не Type_Node напрямую. `marshal` — чисто
+// marshalling-метаданные для libffi (какой `ffi_type_*` использовать),
+// НЕ панос-тип: панос-типом параметра/возврата остаётся обычный
+// Целое/Строка/Указатель(T) — не новый способ типизации, просто выбор
+// СУЩЕСТВУЮЩЕГО типа по marshal (см. type_cheker.odin, case
+// ^Foreign_Decl).
+Foreign_Marshal_Kind :: enum {
+	Int32,
+	Int64,
+	CString,
+	Pointer,
+}
+
 Foreign_Param :: struct {
-	span:  Span,
-	name:  string,
-	width: int, // 32 или 64
+	span:    Span,
+	name:    string,
+	marshal: Foreign_Marshal_Kind,
+	// Заполнено ТОЛЬКО когда marshal == .Pointer — T внутри
+	// Указатель(T), обычный parse_type-путь (T сам может быть чем
+	// угодно, panos никогда не заглядывает внутрь — см. Type_Kind.Pointer).
+	pointee: Type_Node,
 }
 
 Foreign_Decl :: struct {
-	span:         Span,
-	library:      string, // "libc" — без платформенного расширения/пути, резолвер добавляет
-	name:         string, // "getpid"
-	params:       [dynamic]Foreign_Param,
-	return_width: int,
+	span:          Span,
+	library:       string, // "libc" — без платформенного расширения/пути, резолвер добавляет
+	name:          string, // "getpid"
+	params:        [dynamic]Foreign_Param,
+	return_marshal: Foreign_Marshal_Kind,
+	return_pointee: Type_Node, // как Foreign_Param.pointee, только для возврата
+	// Стадия 49: постфикс владения ПОСЛЕ возвращаемого Указатель(T) —
+	// `владеет_я` (panos аллоцирует/освобождает через pool_release,
+	// libc free()) vs `владеет_C` (default — НИКОГДА не освобождать
+	// чужую память). Смысл только когда return_marshal == .Pointer.
+	return_owned:  bool,
 	// Заполняется резолвером (dynlib.load_library + symbol_address) —
 	// компилятор читает напрямую отсюда при генерации Call_Foreign,
-	// отдельная Symbol_Id-карта не нужна: и адрес, и ширины уже здесь.
-	fn_ptr:       rawptr,
+	// отдельная Symbol_Id-карта не нужна: и адрес, и marshal-инфо уже
+	// здесь.
+	fn_ptr:        rawptr,
 	// Заполняется компилятором (core/compiler.odin) при первой компиляции
 	// вызова этой декларации — ^Foreign_Function, переиспользуется всеми
 	// последующими call-сайтами этой же decl (ffi_prep_cif внутри готовится
 	// ещё позже, лениво, при первом РЕАЛЬНОМ вызове в VM).
-	compiled_fn:  rawptr,
+	compiled_fn:   rawptr,
 }
 
 Decls :: union {
@@ -815,8 +836,8 @@ parse_foreign_decl :: proc(p: ^Parser) -> ^Foreign_Decl {
 				report_parse(p, param_name_tok.span, "Синтаксическая ошибка: ожидалось имя параметра, получено: %v", param_name_tok.kind)
 			}
 			expect(p, .Colon)
-			width := parse_foreign_int_width(p)
-			append(&decl.params, Foreign_Param{span = span_from(p, param_span), name = param_name_tok.data, width = width})
+			marshal, pointee := parse_foreign_marshal_type(p)
+			append(&decl.params, Foreign_Param{span = span_from(p, param_span), name = param_name_tok.data, marshal = marshal, pointee = pointee})
 			if peek_token(p.stream).kind == .Comma {
 				next_token(p.stream)
 			} else {
@@ -827,32 +848,78 @@ parse_foreign_decl :: proc(p: ^Parser) -> ^Foreign_Decl {
 	expect(p, .RParen)
 
 	expect(p, .Arrow)
-	decl.return_width = parse_foreign_int_width(p)
+	decl.return_marshal, decl.return_pointee = parse_foreign_marshal_type(p)
+	if decl.return_marshal == .Pointer {
+		decl.return_owned = parse_foreign_ownership_suffix(p)
+	}
 
 	consume_semicolon_or_newline(p)
 	decl.span = span_from(p, start)
 	return decl
 }
 
-// `Целое(32)`/`Целое(64)` — единственная поддержанная форма типа в
-// `внешний`-сигнатуре сейчас (см. Foreign_Decl докstring). Ширина —
-// marshalling-метаданные для libffi (ffi_type_sint32 vs sint64), не
-// часть панос-типа (остаётся Целое для остального языка).
-parse_foreign_int_width :: proc(p: ^Parser) -> int {
-	type_tok := next_token(p.stream)
-	if type_tok.kind != .Ident || type_tok.data != "Целое" {
-		report_parse(p, type_tok.span, "Синтаксическая ошибка: 'внешний' сейчас поддерживает только 'Целое(32)'/'Целое(64)', получено: %v", type_tok.kind)
-		return 32
+// Стадия 47/49: три поддержанные формы типа в `внешний`-сигнатуре —
+// `Целое(32)`/`Целое(64)` (marshalling-ширина libffi ffi_type_sint32/
+// 64), `КСтрока` (голый идентификатор без параметров — C char*,
+// marshalling ↔ panos Строка), `Указатель(T)` (T — обычный parse_type,
+// чисто фантомный на panos-стороне, marshalling — raw pointer). Ни одно
+// из имён — не keyword лексера, распознаются строковым сравнением
+// ТОЛЬКО в этом контексте (тот же приём, что уже был у 'Целое').
+parse_foreign_marshal_type :: proc(p: ^Parser) -> (marshal: Foreign_Marshal_Kind, pointee: Type_Node) {
+	type_tok := peek_token(p.stream)
+	if type_tok.kind != .Ident {
+		report_parse(p, type_tok.span, "Синтаксическая ошибка: во 'внешний' ожидался тип (Целое/КСтрока/Указатель), получено: %v", type_tok.kind)
+		next_token(p.stream)
+		return .Int32, nil
 	}
-	expect(p, .LParen)
-	width_tok := next_token(p.stream)
-	if width_tok.kind != .Number || (width_tok.data != "32" && width_tok.data != "64") {
-		report_parse(p, width_tok.span, "Синтаксическая ошибка: 'Целое(...)' в 'внешний' ожидает ширину 32 или 64, получено: %v", width_tok.data)
+
+	switch type_tok.data {
+	case "Целое":
+		next_token(p.stream)
+		expect(p, .LParen)
+		width_tok := next_token(p.stream)
+		if width_tok.kind != .Number || (width_tok.data != "32" && width_tok.data != "64") {
+			report_parse(p, width_tok.span, "Синтаксическая ошибка: 'Целое(...)' в 'внешний' ожидает ширину 32 или 64, получено: %v", width_tok.data)
+			expect(p, .RParen)
+			return .Int32, nil
+		}
 		expect(p, .RParen)
-		return 32
+		return (width_tok.data == "32" ? Foreign_Marshal_Kind.Int32 : Foreign_Marshal_Kind.Int64), nil
+	case "КСтрока":
+		next_token(p.stream)
+		return .CString, nil
+	case "Указатель":
+		next_token(p.stream)
+		expect(p, .LParen)
+		t := parse_type(p)
+		expect(p, .RParen)
+		return .Pointer, t
+	case:
+		report_parse(p, type_tok.span, "Синтаксическая ошибка: 'внешний' поддерживает 'Целое(32|64)'/'КСтрока'/'Указатель(T)', получено: %s", type_tok.data)
+		next_token(p.stream)
+		return .Int32, nil
 	}
-	expect(p, .RParen)
-	return width_tok.data == "32" ? 32 : 64
+}
+
+// Стадия 49: постфикс владения ПОСЛЕ Указатель(T) на возврате —
+// `владеет_я`/`владеет_C`, только строковое сравнение (не keyword),
+// тот же приём, что типы выше. Отсутствие суффикса — тоже валидно,
+// default `владеет_C` (безопасный: никогда не освобождать чужую
+// память).
+parse_foreign_ownership_suffix :: proc(p: ^Parser) -> bool {
+	tok := peek_token(p.stream)
+	if tok.kind != .Ident {
+		return false
+	}
+	switch tok.data {
+	case "владеет_я":
+		next_token(p.stream)
+		return true
+	case "владеет_C":
+		next_token(p.stream)
+		return false
+	}
+	return false
 }
 
 parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {

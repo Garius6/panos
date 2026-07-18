@@ -204,6 +204,13 @@ call_builtin_io :: proc(vm: ^VM, name: string, args: []Value) -> (result: Value,
 	return
 }
 
+// Общий guard "receiver уже закрыт" — тело идентично во всех 6 точках
+// invoke_io_method ниже (3 File_Value + 3 Socket_Value), отличался только
+// модуль/текст ошибки.
+io_closed_error :: proc(vm: ^VM, module: string, message: string) -> (Value, bool, bool) {
+	return make_error_result(vm, make_error_value(vm, module, message)), true, true
+}
+
 // File_Value/Socket_Value методы (.прочитать/.прочитать_строку/.записать/
 // .закрыть, .получить/.получить_строку/.отправить/.закрыть) — вынесены из
 // invoke_collection_method (vm.odin) целиком, трогают os.write/net.send_tcp.
@@ -223,21 +230,21 @@ invoke_io_method :: proc(
 		case "прочитать":
 			expect_arg_count(method_name, len(args), 0)
 			if !file.is_open {
-				return make_error_result(vm, make_error_value(vm, "фс", "файл уже закрыт")), true, true
+				return io_closed_error(vm, "фс", "файл уже закрыт")
 			}
 			content := read_all_from_reader(file_reader(vm, file))
 			return make_ok_result(vm, Value(gc_new_string(vm, content))), true, true
 		case "прочитать_строку":
 			expect_arg_count(method_name, len(args), 0)
 			if !file.is_open {
-				return make_error_result(vm, make_error_value(vm, "фс", "файл уже закрыт")), true, true
+				return io_closed_error(vm, "фс", "файл уже закрыт")
 			}
 			return read_line_from_reader(vm, file_reader(vm, file)), true, true
 		case "записать":
 			expect_arg_count(method_name, len(args), 1)
 			text := expect_string_arg(method_name, args[0])
 			if !file.is_open || file.is_stdin {
-				return make_error_result(vm, make_error_value(vm, "фс", "файл не открыт для записи")), true, true
+				return io_closed_error(vm, "фс", "файл не открыт для записи")
 			}
 			n, err := os.write(file.handle, transmute([]byte)text)
 			if err != nil {
@@ -258,21 +265,21 @@ invoke_io_method :: proc(
 		case "получить":
 			expect_arg_count(method_name, len(args), 0)
 			if !sock.is_open {
-				return make_error_result(vm, make_error_value(vm, "сеть", "соединение уже закрыто")), true, true
+				return io_closed_error(vm, "сеть", "соединение уже закрыто")
 			}
 			content := read_all_from_reader(&sock.reader)
 			return make_ok_result(vm, Value(gc_new_string(vm, content))), true, true
 		case "получить_строку":
 			expect_arg_count(method_name, len(args), 0)
 			if !sock.is_open {
-				return make_error_result(vm, make_error_value(vm, "сеть", "соединение уже закрыто")), true, true
+				return io_closed_error(vm, "сеть", "соединение уже закрыто")
 			}
 			return read_line_from_reader(vm, &sock.reader), true, true
 		case "отправить":
 			expect_arg_count(method_name, len(args), 1)
 			text := expect_string_arg(method_name, args[0])
 			if !sock.is_open {
-				return make_error_result(vm, make_error_value(vm, "сеть", "соединение уже закрыто")), true, true
+				return io_closed_error(vm, "сеть", "соединение уже закрыто")
 			}
 			n, err := net.send_tcp(sock.socket, transmute([]byte)text)
 			if err != nil {

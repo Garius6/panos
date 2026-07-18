@@ -2605,12 +2605,6 @@ infer_block_type :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 	return TY_VOID
 }
 
-// Проверка обычной функции против уже известной сигнатуры.
-check_func_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) {
-	func_type := ctx.res.symbol_types[ctx.res.decl_symbols[d]]
-	check_function_body(ctx, d.span, d.body, func_type.return_type)
-}
-
 // Сначала проверяем инструкции сверху вниз, затем сверяем фактический тип
 // блока и явные `return` с ожидаемым возвращаемым типом. `span` — span
 // объемлющей функции/лямбды/метода, используется для диагностик, у которых

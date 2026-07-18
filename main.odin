@@ -109,7 +109,7 @@ run_file :: proc(filename: string, program_args: []string = nil, verbose: bool =
 
 			fmt.println("COMPILATION")
 			fmt.printf("--------------------------\n")
-			core.print_assebler(module_registry)
+			core.print_assembler(module_registry)
 			fmt.printf("--------------------------\n\n")
 		}
 	}

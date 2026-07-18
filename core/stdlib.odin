@@ -161,25 +161,10 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 	graph.modules[name] = module
 
 	if name == "фс" {
-		add_builtin_export(graph, module, "есть", builtin_function_type_1(TY_STRING, TY_BOOL))
-		add_builtin_export(
-			graph,
-			module,
-			"прочитать",
-			builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_STRING, TY_ERROR)),
-		)
-		add_builtin_export(
-			graph,
-			module,
-			"записать",
-			builtin_function_type_2(TY_STRING, TY_STRING, stdlib_result_type(graph, TY_NUM, TY_ERROR)),
-		)
-		add_builtin_export(
-			graph,
-			module,
-			"открыть",
-			builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_FILE, TY_ERROR)),
-		)
+		add_builtin_export(graph, module, "есть", builtin_export_type(graph, "фс::есть"))
+		add_builtin_export(graph, module, "прочитать", builtin_export_type(graph, "фс::прочитать"))
+		add_builtin_export(graph, module, "записать", builtin_export_type(graph, "фс::записать"))
+		add_builtin_export(graph, module, "открыть", builtin_export_type(graph, "фс::открыть"))
 	} else if name == "ос" {
 		add_builtin_export(
 			graph,

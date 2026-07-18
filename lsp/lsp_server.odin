@@ -540,24 +540,41 @@ collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_de
 	return locations
 }
 
+// Общий первый шаг find-references/rename: позиция курсора -> документ +
+// Symbol_Id выражения под курсором. Оба хендлера делали этот же
+// 3-шаговый резолв (resolve_position -> find_expr_in_program ->
+// node_symbols-lookup) дословно.
+resolve_symbol_at_position :: proc(
+	server: ^LSP_Server,
+	params: json.Value,
+) -> (
+	doc: ^LSP_Document,
+	sym_id: core.Symbol_Id,
+	ok: bool,
+) {
+	found_doc, offset, pos_ok := resolve_position(server, params)
+	if !pos_ok {
+		return nil, core.INVALID_SYMBOL, false
+	}
+	expr := core.find_expr_in_program(found_doc.prog, found_doc.file_id, offset)
+	if expr == nil {
+		return nil, core.INVALID_SYMBOL, false
+	}
+	found_sym, has_sym := found_doc.res_ctx.node_symbols[expr]
+	if !has_sym || found_sym == core.INVALID_SYMBOL {
+		return nil, core.INVALID_SYMBOL, false
+	}
+	return found_doc, found_sym, true
+}
+
 // Известное ограничение MVP: find-references/rename сканируют usages
 // ТОЛЬКО в текущем открытом документе, не по всему графу импортов/
 // проекту — символ, объявленный в текущем файле и используемый в другом
 // открытом файле, найдётся не полностью. Определение символа (в т.ч. в
 // другом файле) резолвится корректно через общий symbol_store.
 handle_references :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
-	doc, offset, ok := resolve_position(server, params)
+	doc, sym_id, ok := resolve_symbol_at_position(server, params)
 	if !ok {
-		send_null_response(id)
-		return
-	}
-	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
-	if expr == nil {
-		send_null_response(id)
-		return
-	}
-	sym_id, has_sym := doc.res_ctx.node_symbols[expr]
-	if !has_sym || sym_id == core.INVALID_SYMBOL {
 		send_null_response(id)
 		return
 	}
@@ -572,23 +589,13 @@ handle_references :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 }
 
 handle_rename :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
-	doc, offset, ok := resolve_position(server, params)
+	doc, sym_id, ok := resolve_symbol_at_position(server, params)
 	if !ok {
 		send_null_response(id)
 		return
 	}
 	p, dok := decode_params(proto.RenameParams, params)
 	if !dok {
-		send_null_response(id)
-		return
-	}
-	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
-	if expr == nil {
-		send_null_response(id)
-		return
-	}
-	sym_id, has_sym := doc.res_ctx.node_symbols[expr]
-	if !has_sym || sym_id == core.INVALID_SYMBOL {
 		send_null_response(id)
 		return
 	}

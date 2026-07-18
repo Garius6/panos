@@ -50,10 +50,6 @@ run_source_with_args :: proc(
 	return 0.0, false, nil
 }
 
-run_source :: proc(source: string) -> (result: Value, has_result: bool, diags: [dynamic]Diagnostic) {
-	return run_source_with_args(source)
-}
-
 Check_Result :: struct {
 	prog:    Program,
 	res_ctx: Resolver_Ctx,

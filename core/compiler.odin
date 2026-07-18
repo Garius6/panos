@@ -1383,7 +1383,7 @@ compile_block :: proc(ctx: ^Compiler, body: [dynamic]Stmt, is_expr: bool) {
 	}
 }
 
-print_assebler :: proc(registry: map[string]^Compiled_Function) {
+print_assembler :: proc(registry: map[string]^Compiled_Function) {
 
 	builder: strings.Builder
 	strings.builder_init(&builder)
@@ -1399,7 +1399,11 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 		instructions := f.instructions
 		for idx := 0; idx < len(instructions); idx += 1 {
 			current_opcode := Opcode(instructions[idx])
-			#partial switch current_opcode {
+			// Не #partial — компилятор Odin сам укажет на недостающий case,
+			// если в Opcode добавится новый вариант (раньше 9 из 34 опкодов
+			// молча пропускались через #partial, включая все actor-model/
+			// match-опкоды: Spawn/Receive/Match_Tag и т.д.).
+			switch current_opcode {
 			case .Set_Property:
 				idx += 1
 				command := fmt.tprintf("%sSET_PROPERTY: %d\n", prefix, instructions[idx])
@@ -1439,7 +1443,7 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 				strings.write_string(&builder, command)
 
 			case .Divide:
-				command := fmt.tprintf("%sCONSTANT\n", prefix)
+				command := fmt.tprintf("%sDIVIDE\n", prefix)
 				strings.write_string(&builder, command)
 
 			case .Get_Local:
@@ -1522,6 +1526,46 @@ print_assebler :: proc(registry: map[string]^Compiled_Function) {
 
 			case .Try_Unwrap:
 				command := fmt.tprintf("%sTRY_UNWRAP\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Match_Tag:
+				idx += 1
+				command := fmt.tprintf("%sMATCH_TAG: %d\n", prefix, instructions[idx])
+				strings.write_string(&builder, command)
+
+			case .Get_Variant_Field:
+				idx += 1
+				command := fmt.tprintf("%sGET_VARIANT_FIELD: %d\n", prefix, instructions[idx])
+				strings.write_string(&builder, command)
+
+			case .Match_Fail:
+				command := fmt.tprintf("%sMATCH_FAIL\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Build_Variant:
+				idx += 3
+				command := fmt.tprintf("%sBUILD_VARIANT\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Spawn:
+				idx += 1
+				command := fmt.tprintf("%sSPAWN: %d\n", prefix, instructions[idx])
+				strings.write_string(&builder, command)
+
+			case .Receive:
+				command := fmt.tprintf("%sRECEIVE\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Int_Divide:
+				command := fmt.tprintf("%sINT_DIVIDE\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Modulo:
+				command := fmt.tprintf("%sMODULO\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Receive_Signal:
+				command := fmt.tprintf("%sRECEIVE_SIGNAL\n", prefix)
 				strings.write_string(&builder, command)
 
 			}

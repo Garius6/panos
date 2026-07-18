@@ -43,8 +43,17 @@ jobs:
       # здесь (см. `just build-wasm`). -o:size обязателен: дефолтный
       # -o:minimal даёт модуль, на JIT-компиляции которого падает
       # JavaScriptCore (Safari/WebKit) — см. комментарий в wasm/main.odin.
+      # mkdir обязателен: demo/ не содержит других отслеживаемых файлов
+      # (index.html/odin.js убраны из git) — git не хранит пустые
+      # директории, значит на чистом checkout'е demo/ физически не
+      # существует, и -out:demo/panos.wasm падает "LLVM Error: No such
+      # file or directory" на попытке открыть файл в несуществующей
+      # директории (локально не воспроизводится — рабочая копия просто
+      # физически хранит папку с прошлых сборок).
       - name: Собрать panos.wasm
-        run: odin build wasm -target:js_wasm32 -o:size -out:demo/panos.wasm
+        run: |
+          mkdir -p demo
+          odin build wasm -target:js_wasm32 -o:size -out:demo/panos.wasm
 
       # mdBook публикует готовые бинарники в своих GitHub Releases — проще
       # и надёжнее скачать напрямую, чем тянуть отдельный marketplace-экшен

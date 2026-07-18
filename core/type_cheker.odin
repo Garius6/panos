@@ -3525,6 +3525,37 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 			return new_tuple_type(id_and_reason)
 		},
 	},
+	{
+		// Строковая интерполяция (`"...\(x)..."`, десахаривается парсером
+		// в `+`-цепочку со вставками встроку(x), см. parse_interp_string
+		// в parser.odin) — но встроку() САМА по себе тоже обычный вызываемый
+		// bare-builtin, как длина/паника. Принимает ЛЮБОЙ Value (тот же
+		// принцип, что ввод_вывод.печать/.строка, Стадия 23): если arg —
+		// struct/enum с реализация Печатаемое, компилятор вызовет
+		// .вСтроку() (Call_Info.Print_Value — переиспользуем ЦЕЛИКОМ тот
+		// же Call_Kind и codegen, что печать/строка, только text_name
+		// указывает на нативный builtin "встроку" в vm.odin, который
+		// ВОЗВРАЩАЕТ Panos_String, а не печатает и возвращает Пусто).
+		// Иначе — runtime сам форматирует (value_to_display_string).
+		name = "встроку",
+		arity = 1,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
+			arg_type := prune_type(infer_expr(ctx, args[0]))
+			if arg_type.kind == .Poison do return TY_STRING
+			if (arg_type.kind == .Struct || arg_type.kind == .Enum) &&
+			   implements_prelude_interface(ctx, arg_type, ctx.res.prelude_printable_sym) {
+				method_sym, _ := method_lookup(ctx, arg_type, "вСтроку")
+				ctx.call_infos[call] = Call_Info {
+					kind       = .Print_Value,
+					symbol_ref = method_sym,
+					text_name  = "встроку",
+				}
+			} else {
+				ctx.call_infos[call] = Call_Info{kind = .Builtin, text_name = "встроку"}
+			}
+			return TY_STRING
+		},
+	},
 }
 
 builtin_constructor_type :: proc(

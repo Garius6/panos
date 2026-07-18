@@ -14,6 +14,15 @@ Lexer :: struct {
 	// Accumulate-not-panic, как в Parser/Resolver_Ctx/Type_Ctx: ошибочный
 	// символ не должен ронять весь процесс (в т.ч. LSP при live-typing).
 	diagnostics: [dynamic]Diagnostic,
+	// Строковая интерполяция (`\(...)`, см. TokenKind.InterpString*):
+	// стек глубины "(" ОТДЕЛЬНО на каждый активный уровень интерполяции
+	// (вложенная интерполяция — `\(f(\(x)))` — толкает свой элемент).
+	// top-of-stack == 0 и встретили ')' → это НЕ вложенная скобка
+	// выражения, а закрывающая для САМОГО `\(` — возобновляем сканирование
+	// строкового фрагмента вместо обычного .RParen. '(' внутри активной
+	// интерполяции инкрементирует top, свой же ')' декрементирует —
+	// нулевые/несбалансированные "(" не текущего уровня не видит.
+	interp_paren_depth: [dynamic]int,
 }
 
 new_lexer :: proc(input: string, file_id: u16 = 0) -> Lexer {
@@ -95,9 +104,21 @@ read_number :: proc(l: ^Lexer) -> string {
 	return l.input[start:l.pos - l.width]
 }
 
-read_string :: proc(l: ^Lexer) -> string {
-	advance(l) // Съедаем открывающую кавычку
+// Терминатор строкового фрагмента: закрывающая кавычка (конец литерала),
+// начало интерполяции `\(` (см. TokenKind.InterpString*), или EOF
+// (best-effort восстановление, как раньше).
+String_Fragment_End :: enum {
+	Quote,
+	Interp,
+	Eof,
+}
 
+// Сканирует текст строкового литерала ДО закрывающей '"', ДО '\(' (начало
+// интерполяции), либо до EOF. Не ест открывающую кавычку сама — вызывающий
+// код (next_token_lex, и снова после ')', закрывающей '\(...)') решает,
+// когда именно начинать фрагмент, поэтому один и тот же сканер переиспользуется
+// и для самого первого фрагмента, и для каждого следующего после `\(...)`.
+read_string_fragment :: proc(l: ^Lexer) -> (string, String_Fragment_End) {
 	builder: strings.Builder
 	strings.builder_init(&builder)
 
@@ -115,12 +136,21 @@ read_string :: proc(l: ^Lexer) -> string {
 				strings.write_byte(&builder, '"')
 			case '\\':
 				strings.write_byte(&builder, '\\')
+			case '(':
+				// Начало интерполяции (Swift-style `\(выражение)`) — сам
+				// '(' съедаем здесь (это не литеральный текст и не первый
+				// токен встраиваемого выражения), возвращаем накопленный
+				// ДО НЕГО фрагмент. next_token_lex продолжит обычной
+				// токенизацией выражения (см. interp_paren_depth в Lexer).
+				advance(l)
+				return strings.to_string(builder), .Interp
 			case 0:
 				// EOF сразу после '\' — строка обрывается прямо тут, дальше
 				// нечего съедать. report_lex + возврат накопленного (best
 				// effort), а не panic: следующий next_token_lex увидит
 				// l.ch == 0 и естественно закроет поток .EOF-токеном.
 				report_lex(l, current_char_span(l), "Лексическая ошибка: незакрытая строка")
+				return strings.to_string(builder), .Eof
 			case:
 				// Неизвестный escape — трактуем как литеральный символ
 				// (совпадает с типичным поведением строковых литералов при
@@ -142,14 +172,13 @@ read_string :: proc(l: ^Lexer) -> string {
 
 	if l.ch == '"' {
 		advance(l) // Съедаем закрывающую кавычку
-	} else {
-		// l.ch == 0 — дошли до EOF, не встретив закрывающую кавычку.
-		// Возвращаем накопленное как best-effort строковый токен вместо
-		// падения всего процесса на файле с одной незакрытой кавычкой.
-		report_lex(l, current_char_span(l), "Лексическая ошибка: незакрытая строка")
+		return strings.to_string(builder), .Quote
 	}
-
-	return strings.to_string(builder)
+	// l.ch == 0 — дошли до EOF, не встретив закрывающую кавычку.
+	// Возвращаем накопленное как best-effort строковый токен вместо
+	// падения всего процесса на файле с одной незакрытой кавычкой.
+	report_lex(l, current_char_span(l), "Лексическая ошибка: незакрытая строка")
+	return strings.to_string(builder), .Eof
 }
 
 lookup_ident :: proc(ident: string) -> TokenKind {
@@ -323,15 +352,41 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 				data = "%",
 			}; advance(l)
 		case '(':
+			// Внутри активной интерполяции (Lexer.interp_paren_depth) эта
+			// '(' принадлежит встраиваемому выражению — считаем её, чтобы
+			// СВОЯ ')' (не закрывающая \(...)) не спуталась со скобкой-
+			// терминатором интерполяции ниже.
+			if len(l.interp_paren_depth) > 0 {
+				l.interp_paren_depth[len(l.interp_paren_depth) - 1] += 1
+			}
 			tok = Token {
 				kind = .LParen,
 				data = "(",
 			}; advance(l)
 		case ')':
-			tok = Token {
-				kind = .RParen,
-				data = ")",
-			}; advance(l)
+			if len(l.interp_paren_depth) > 0 && l.interp_paren_depth[len(l.interp_paren_depth) - 1] == 0 {
+				// Глубина 0 на верхушке стека — эта ')' ничему внутри
+				// выражения не принадлежит, значит закрывает САМ `\(`.
+				// Возобновляем строковый фрагмент вместо .RParen.
+				pop(&l.interp_paren_depth)
+				advance(l) // съедаем ')'
+				text, term := read_string_fragment(l)
+				switch term {
+				case .Quote, .Eof:
+					tok = Token{kind = .InterpStringEnd, data = text}
+				case .Interp:
+					append(&l.interp_paren_depth, 0)
+					tok = Token{kind = .InterpStringMid, data = text}
+				}
+			} else {
+				if len(l.interp_paren_depth) > 0 {
+					l.interp_paren_depth[len(l.interp_paren_depth) - 1] -= 1
+				}
+				tok = Token {
+					kind = .RParen,
+					data = ")",
+				}; advance(l)
+			}
 		case '[':
 			tok = Token {
 				kind = .LBracket,
@@ -368,8 +423,15 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 				data = ";",
 			}; advance(l)
 		case '"':
-			str := read_string(l)
-			tok = Token{kind = .String, data = str}
+			advance(l) // Съедаем открывающую кавычку
+			text, term := read_string_fragment(l)
+			switch term {
+			case .Quote, .Eof:
+				tok = Token{kind = .String, data = text}
+			case .Interp:
+				append(&l.interp_paren_depth, 0)
+				tok = Token{kind = .InterpStringStart, data = text}
+			}
 		case:
 			if unicode.is_alpha(l.ch) || l.ch == '_' {
 				ident := read_identifier(l)

@@ -967,6 +967,17 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 			"Runtime Error: длина() ожидает строку, массив или соответствие",
 		)
 
+	case "встроку":
+		// Строковая интерполяция (`"...\(x)..."`, десахарена парсером в
+		// вызовы встроку(x), см. parser.odin) + прямой вызов встроку(x) —
+		// та же логика конверсии, что использует ввод_вывод.печать/.строка
+		// (value_to_display_string, Печатаемое-диспатч уже сделан
+		// компилятором ДО этого builtin'а, см. Call_Info.Print_Value в
+		// type_cheker.odin), только результат ВОЗВРАЩАЕТСЯ как Строка,
+		// а не печатается.
+		expect_arg_count(name, len(args), 1)
+		return Value(gc_new_string(vm, value_to_display_string(vm, args[0]))), true
+
 	case "паника":
 		// Стадия 38 (monitor): не fmt.panicf (ронял бы ВСЮ программу) —
 		// crash_message читается сразу после call_builtin() (.Call_Builtin

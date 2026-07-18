@@ -2184,6 +2184,9 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 		s.span = tok.span
 		return s
 
+	case .InterpStringStart:
+		return parse_interp_string(p, tok)
+
 	case .Ident:
 		return new_ident(tok)
 
@@ -2724,6 +2727,73 @@ new_boolean_lit :: proc(data: ^Token) -> Expr {
 	lit.value = data.data == "истина"
 	lit.span = data.span
 	return lit
+}
+
+// Строковая интерполяция (`"Привет, \(имя)!"`, Swift-style) — лексер уже
+// разбил литерал на InterpStringStart/Mid/End токены вокруг встраиваемых
+// выражений (см. lexer.odin: interp_paren_depth), здесь всё ДЕСАХАРИВАЕТСЯ
+// в обычную `+`-конкатенацию (String_Expr + Call_Expr(встроку, expr) +
+// ...) — резолверу/тайпчекеру/компилятору не нужно знать про
+// интерполяцию вообще, они видят то же дерево, что дал бы вручную
+// написанный `"a" + встроку(x) + "b"`. Каждое встраиваемое значение
+// оборачивается в builtin встроку() (BUILTIN_CTORS, type_cheker.odin) —
+// та же Печатаемое-конверсия, что использует ввод_вывод.печать, только
+// результат — Строка, а не побочный эффект печати.
+parse_interp_string :: proc(p: ^Parser, start_tok: ^Token) -> Expr {
+	result: Expr
+
+	if start_tok.data != "" {
+		lit := new(String_Expr)
+		lit.value = start_tok.data
+		lit.span = start_tok.span
+		result = lit
+	}
+
+	for {
+		embedded := parse_expr(p, 0)
+
+		name_tok := Token{kind = .Ident, data = "встроку", span = expr_span(embedded)}
+		callee := new_ident(&name_tok)
+		call := new(Call_Expr)
+		call.callee = callee
+		call.args = make([dynamic]Expr)
+		append(&call.args, embedded)
+		call.span = expr_span(embedded)
+
+		if result == nil {
+			result = call
+		} else {
+			result = new_bin_op(.Plus, result, call, expr_span(result))
+		}
+
+		next := next_token(p.stream)
+		#partial switch next.kind {
+		case .InterpStringMid:
+			if next.data != "" {
+				lit := new(String_Expr)
+				lit.value = next.data
+				lit.span = next.span
+				result = new_bin_op(.Plus, result, lit, expr_span(result))
+			}
+			continue
+		case .InterpStringEnd:
+			if next.data != "" {
+				lit := new(String_Expr)
+				lit.value = next.data
+				lit.span = next.span
+				result = new_bin_op(.Plus, result, lit, expr_span(result))
+			}
+			return result
+		case:
+			report_parse(
+				p,
+				next.span,
+				"Синтаксическая ошибка: ожидалось продолжение строковой интерполяции, получено %v",
+				next.kind,
+			)
+			return result
+		}
+	}
 }
 
 new_bin_op :: proc(kind: TokenKind, left: Expr, right: Expr, start: Span) -> Expr {

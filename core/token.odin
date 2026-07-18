@@ -61,6 +61,15 @@ TokenKind :: enum {
 	// (Vector2/Color-style), четвёртая форма тела `тип X = ...` рядом со
 	// Struct/Enum/Interface.
 	FFStruct,
+	// Строковая интерполяция (`"Привет, \(имя)!"`, Swift-style). Лексер
+	// эмитит эту тройку ТОЛЬКО если строка содержит хотя бы один `\(...)` —
+	// обычные строки без интерполяции по-прежнему дают единственный
+	// .String токен (см. lexer.odin read_string_fragment). data каждого
+	// токена — уже раскодированный (escape-processed) текстовый фрагмент
+	// ДО следующего `\(` (Start/Mid) или до закрывающей `"` (End).
+	InterpStringStart,
+	InterpStringMid,
+	InterpStringEnd,
 	EOF,
 }
 

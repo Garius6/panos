@@ -115,6 +115,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # publish-джоба не делает checkout (нужны только скачанные
+          # артефакты, не исходники) — без .git gh не может определить
+          # репозиторий сам ("fatal: not a git repository"). GH_REPO
+          # заставляет gh работать через API, не пытаясь трогать git.
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail

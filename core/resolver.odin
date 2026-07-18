@@ -3,6 +3,7 @@ package core
 
 import "core:dynlib"
 import "core:fmt"
+import "core:strings"
 
 Symbol_Kind :: enum {
 	Variable,
@@ -782,12 +783,20 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 // библиотеки. Сейчас реально проверено ЖИВЫМ вызовом только на
 // darwin-arm64 (см. external/libffi/README.md) — остальные ветки честно
 // выведены по стандартной ОС-конвенции, не протестированы отдельно.
+// Стадия 51: если logical_name уже ЗАКАНЧИВАЕТСЯ платформенным
+// расширением (полный путь, напр. "/opt/homebrew/opt/raylib/lib/
+// libraylib.dylib" — нужно для библиотек вроде raylib, которых нет на
+// стандартных путях поиска dyld/ld.so, в отличие от libc/libffi) —
+// расширение НЕ дублируется, путь используется как есть.
 foreign_library_filename :: proc(logical_name: string) -> string {
 	when ODIN_OS == .Darwin {
+		if strings.has_suffix(logical_name, ".dylib") do return logical_name
 		return fmt.tprintf("%s.dylib", logical_name)
 	} else when ODIN_OS == .Windows {
+		if strings.has_suffix(logical_name, ".dll") do return logical_name
 		return fmt.tprintf("%s.dll", logical_name)
 	} else {
+		if strings.has_suffix(logical_name, ".so") do return logical_name
 		return fmt.tprintf("%s.so", logical_name)
 	}
 }

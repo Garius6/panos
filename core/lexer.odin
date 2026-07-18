@@ -212,6 +212,8 @@ lookup_ident :: proc(ident: string) -> TokenKind {
 		return .In
 	case "внешний":
 		return .Foreign
+	case "ff_структура":
+		return .FFStruct
 	}
 	return .Ident
 }

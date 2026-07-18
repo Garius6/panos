@@ -57,6 +57,10 @@ TokenKind :: enum {
 	Percent,
 	In,
 	Foreign,
+	// Стадия 51: `ff_структура` — C ABI structs по значению для `внешний`
+	// (Vector2/Color-style), четвёртая форма тела `тип X = ...` рядом со
+	// Struct/Enum/Interface.
+	FFStruct,
 	EOF,
 }
 

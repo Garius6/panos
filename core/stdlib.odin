@@ -9,8 +9,7 @@ is_builtin_module_name :: proc(name: string) -> bool {
 		name == "ввод_вывод" ||
 		name == "строки" ||
 		name == "сеть" ||
-		name == "время" ||
-		name == "графика" \
+		name == "время" \
 	)
 }
 
@@ -59,28 +58,6 @@ stdlib_result_type :: proc(graph: ^Module_Graph, ok_type: ^Type, error_type: ^Ty
 		graph.prelude_generic_order[sym],
 		[]^Type{ok_type, error_type},
 	)
-}
-
-// Стадия 4 (FFI-A): raylib's Vector2 :: [2]f32 / Color :: distinct [4]u8
-// — на panos-стороне обычные тупы (Число, Число)/(Число, Число, Число,
-// Число), БЕЗ нового Type_Kind (тот же приём, что new_tuple_type уже
-// используют получить_сигнал()/for-in деструктуризация соответствия).
-// Свежий [dynamic]^Type на каждый вызов — new_tuple_type должен владеть
-// своим срезом, шарить между сигнатурами нельзя.
-raylib_vector2_type :: proc() -> ^Type {
-	fields := make([dynamic]^Type)
-	append(&fields, TY_NUM)
-	append(&fields, TY_NUM)
-	return new_tuple_type(fields)
-}
-
-raylib_color_type :: proc() -> ^Type {
-	fields := make([dynamic]^Type)
-	append(&fields, TY_NUM)
-	append(&fields, TY_NUM)
-	append(&fields, TY_NUM)
-	append(&fields, TY_NUM)
-	return new_tuple_type(fields)
 }
 
 builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
@@ -153,35 +130,6 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return new_function_type(make([dynamic]^Type), TY_NUM)
 	case "время::сейчас_мс":
 		return new_function_type(make([dynamic]^Type), TY_NUM)
-	case "графика::инициализировать_окно":
-		return builtin_function_type_3(TY_INT, TY_INT, TY_STRING, TY_VOID)
-	case "графика::окно_должно_закрыться":
-		return new_function_type(make([dynamic]^Type), TY_BOOL)
-	case "графика::закрыть_окно":
-		return new_function_type(make([dynamic]^Type), TY_VOID)
-	case "графика::начать_рисование":
-		return new_function_type(make([dynamic]^Type), TY_VOID)
-	case "графика::закончить_рисование":
-		return new_function_type(make([dynamic]^Type), TY_VOID)
-	case "графика::очистить_фон":
-		return builtin_function_type_1(raylib_color_type(), TY_VOID)
-	case "графика::нарисовать_прямоугольник":
-		return builtin_function_type_3(raylib_vector2_type(), raylib_vector2_type(), raylib_color_type(), TY_VOID)
-	case "графика::нарисовать_круг":
-		return builtin_function_type_3(raylib_vector2_type(), TY_NUM, raylib_color_type(), TY_VOID)
-	case "графика::клавиша_нажата":
-		return builtin_function_type_1(TY_INT, TY_BOOL)
-	case "графика::время_кадра":
-		return new_function_type(make([dynamic]^Type), TY_NUM)
-	case "графика::задать_fps":
-		return builtin_function_type_1(TY_INT, TY_VOID)
-	case "графика::клавиша_вверх",
-	     "графика::клавиша_вниз",
-	     "графика::клавиша_влево",
-	     "графика::клавиша_вправо",
-	     "графика::клавиша_пробел",
-	     "графика::клавиша_escape":
-		return new_function_type(make([dynamic]^Type), TY_INT)
 	}
 	return nil
 }
@@ -337,24 +285,6 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			"сейчас_мс",
 			builtin_export_type(graph, "время::сейчас_мс"),
 		)
-	} else if name == "графика" {
-		add_builtin_export(graph, module, "инициализировать_окно", builtin_export_type(graph, "графика::инициализировать_окно"))
-		add_builtin_export(graph, module, "окно_должно_закрыться", builtin_export_type(graph, "графика::окно_должно_закрыться"))
-		add_builtin_export(graph, module, "закрыть_окно", builtin_export_type(graph, "графика::закрыть_окно"))
-		add_builtin_export(graph, module, "начать_рисование", builtin_export_type(graph, "графика::начать_рисование"))
-		add_builtin_export(graph, module, "закончить_рисование", builtin_export_type(graph, "графика::закончить_рисование"))
-		add_builtin_export(graph, module, "очистить_фон", builtin_export_type(graph, "графика::очистить_фон"))
-		add_builtin_export(graph, module, "нарисовать_прямоугольник", builtin_export_type(graph, "графика::нарисовать_прямоугольник"))
-		add_builtin_export(graph, module, "нарисовать_круг", builtin_export_type(graph, "графика::нарисовать_круг"))
-		add_builtin_export(graph, module, "клавиша_нажата", builtin_export_type(graph, "графика::клавиша_нажата"))
-		add_builtin_export(graph, module, "время_кадра", builtin_export_type(graph, "графика::время_кадра"))
-		add_builtin_export(graph, module, "задать_fps", builtin_export_type(graph, "графика::задать_fps"))
-		add_builtin_export(graph, module, "клавиша_вверх", builtin_export_type(graph, "графика::клавиша_вверх"))
-		add_builtin_export(graph, module, "клавиша_вниз", builtin_export_type(graph, "графика::клавиша_вниз"))
-		add_builtin_export(graph, module, "клавиша_влево", builtin_export_type(graph, "графика::клавиша_влево"))
-		add_builtin_export(graph, module, "клавиша_вправо", builtin_export_type(graph, "графика::клавиша_вправо"))
-		add_builtin_export(graph, module, "клавиша_пробел", builtin_export_type(graph, "графика::клавиша_пробел"))
-		add_builtin_export(graph, module, "клавиша_escape", builtin_export_type(graph, "графика::клавиша_escape"))
 	}
 
 	return module

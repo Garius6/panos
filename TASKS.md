@@ -1653,6 +1653,80 @@ wasm чисто.
 
 ---
 
+## Стадия 51 ✅ — FFI-примитивы для raylib (`Число(N)`, `Целое(8)`, `ff_структура`) + удаление `графика`
+
+Refs: [ROADMAP §Стадия 51](ROADMAP.md#стадия-51--ffi-примитивы-для-raylib--удаление-графика-из-core).
+
+- [x] Проверить установку raylib + точный dylib-путь на машине разработки
+      (`brew --prefix raylib`) — `/opt/homebrew/opt/raylib/lib/libraylib.dylib`
+- [x] `Foreign_Marshal_Kind` расширен: `+ Void, Int8, Float32, Float64,
+      Struct` (было `Int32, Int64, CString, Pointer`) — грамматика
+      `parse_foreign_marshal_type` (`Число(32|64)`, `Целое(8)`, `Пусто`,
+      идентификатор вне known-набора → `.Struct` + `struct_type_name`)
+- [x] `ff_структура` — новый `TokenKind.FFStruct` + lexer keyword,
+      `Struct_Decl.is_ffi` + `parse_ffi_struct_decl` (поля только
+      `Целое(8|32|64)`/`Число(32|64)`)
+- [x] `Type.ffi_field_kinds`/`ffi_composite`/`ffi_offsets` + typecheck-
+      регистрация `ff_структура` (та же ветка `case ^Struct_Decl:`, что
+      обычные структуры — `Aggregate_Value` переиспользуется, ноль новых
+      GC-точек)
+- [x] `Foreign_Param`/`Foreign_Decl` struct-type резолв
+      (`resolve_foreign_struct_type_name` — Type Error на неизвестный
+      тип/не-`ff_структура`)
+- [x] `ffi_bindings.odin`: `ffi_type_void`/`ffi_type_uint8`/`ffi_type_
+      float`/`ffi_type_double` + `ffi_get_struct_offsets` binding
+- [x] `Foreign_Function.param_struct_types`/`return_struct_type` +
+      компилятор-вайринг (`get_or_build_foreign_function`)
+- [x] VM-маршаллинг (`vm_ffi_native.odin`): Int8/Float32/Float64/Struct
+      (упаковка в байтовый буфер по offset'ам, `pack_ffi_struct`/
+      `unpack_ffi_struct`) — **баг**: `Целое(8)` изначально маршаллился
+      как знаковый `i8`, дал неверный результат против настоящего raylib
+      (`Fade` — 126 вместо 382), исправлено на `u8` (raylib's `Color` —
+      `unsigned char`)
+- [x] Build native/lsp/wasm чисто (примитивы)
+- [x] 3 e2e-теста против настоящего raylib (`Vector2Add` — float-
+      структура, `Fade` — Целое(8)-структура, `SetTargetFPS` — void-
+      возврат) — 209/209 всего
+- [x] Удалить `графика` из core: `core/vm_graphics_native.odin`/`core/
+      vm_graphics_wasm.odin` удалены, регистрация в `stdlib.odin` и
+      диспетчинг в `vm.odin` убраны — подтверждено `otool -L`, raylib
+      больше не слинкована в бинарь `panos`
+- [x] `demos/raylib.ps` — обычная panos-библиотека поверх `внешний`/
+      `ff_структура`, точная замена API `графика` (12 функций + геттеры
+      клавиш); фикс `core/resolver.odin`'s `foreign_library_filename` —
+      не задваивать расширение для уже-полных путей
+- [x] `demos/pong.ps` портирован на `raylib.ps`, визуально проверен
+      (`./panos demos/pong.ps` — окно открывается, рендер идёт)
+- [x] `docs/src/language/ffi.md` — новая секция `ff_структура`,
+      обновлён список "явно не сделано"; `docs/src/language/graphics.md`
+      удалён, `SUMMARY.md` обновлён
+
+Грилинг (`AskUserQuestion`) выбрал максимальный объём — не просто
+добавить примитивы, а убрать `графика` из core полностью, заменив
+обычной библиотекой.
+
+---
+
+## Стадия 50 ✅ — Закрытие double-free риска у owned `Указатель(T)`
+
+Refs: [ROADMAP §Стадия 50](ROADMAP.md#стадия-50--закрытие-double-free-риска-у-owned-указательt).
+
+- [x] Расследование: panos-процессы — кооперативные green-thread'ы
+      внутри ОДНОГО `VM`/ОДНОГО `vm.gc`, не независимые OS-процессы с
+      раздельной памятью — расшаривание `Pointer_Value`-wrapper при
+      `отправить()` безопасно by construction (GC освобождает РОВНО ОДИН
+      РАЗ, когда недостижим из всех процессов сразу)
+- [x] Новый e2e-тест `test_ffi_pointer_owned_sent_to_process_no_double_
+      free` (`malloc` с `свой`, отправка процессу, `force_gc`/`gc_stats`
+      подтверждают `freed_last_run > 0` без паники)
+- [x] Комментарий в `core/vm.odin` (`message_deep_copy`) и формулировка
+      риска в ROADMAP.md скорректированы
+
+Риск закрыт документацией — код уже был корректен, "риск" был ложной
+тревогой из Стадии 49.
+
+---
+
 ## Стадия 49 ✅ — FFI: `КСтрока` + `Указатель(T)`
 
 Refs: [ROADMAP §Стадия 49](ROADMAP.md#стадия-49--ffi-кстрока--указательt).

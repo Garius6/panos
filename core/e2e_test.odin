@@ -6045,3 +6045,123 @@ test_ffi_pointer_default_borrowed_does_not_free :: proc(t: ^testing.T) {
 	f, is_num := result.(f64)
 	testing.expectf(t, is_num && f == 42.0, "pointer borrowed: ожидалось 42, получено %v", result)
 }
+
+// Стадия 50: отправка `свой`-указателя другому процессу НЕ дублирует
+// Pointer_Value (message_deep_copy не копирует его — та же категория,
+// что File_Value/Socket_Value) — оба процесса делят ОДИН Odin-объект.
+// Это безопасно, а не риск double-free: у panos ОДИН общий GC-хип на
+// весь VM (все "процессы" — зелёные нити внутри одного vm.gc, не
+// отдельные ОС-процессы с независимой памятью, см. VM.gc в vm.odin) —
+// pool_release вызывается РОВНО ОДИН РАЗ, когда объект недостижим ИЗ
+// ВСЕХ процессов сразу. force_gc ПОСЛЕ того, как оба процесса
+// закончились (указатель больше нигде не держится), должен освободить
+// его ровно один раз — реальный double-free уронил бы весь тестовый
+// бинарник (heap corruption abort), не просто провалил бы assertion.
+@(test)
+test_ffi_pointer_owned_sent_to_process_no_double_free :: proc(t: ^testing.T) {
+	vm := compile_and_run_for_gc(`
+		внешний "libc" функ malloc(размер: Целое(64)) -> Указатель(Целое) свой
+
+		тип Сообщение = перечисление
+			Данные(Указатель(Целое))
+		конец
+
+		функ получатель() -> Число
+			выбор получить()
+				Сообщение.Данные(p) -> 0
+			конец
+		конец
+
+		функ старт() -> Число
+			пер p = malloc(64)
+			пер proc = запусти получатель()
+			отправить(proc, Сообщение.Данные(p))
+			777
+		конец
+	`)
+
+	force_gc(vm)
+	stats := gc_stats(vm)
+	testing.expectf(
+		t,
+		stats.freed_last_run > 0,
+		"pointer send: ожидался хотя бы 1 освобождённый объект (Pointer_Value недостижим из обоих процессов), получено %d",
+		stats.freed_last_run,
+	)
+
+	// Второй force_gc — если бы pool_release как-то вызвался повторно на
+	// уже освобождённом объекте (double-free), это обычно проявляется
+	// именно на СЛЕДУЮЩЕМ цикле аллокации/сборки (heap corruption не
+	// всегда падает мгновенно) — доп. страховка, не строгая необходимость.
+	force_gc(vm)
+}
+
+// Стадия 51 (FFI: Число(N) + ff_структура): raylib уже требуется этой
+// сборкой (Стадия 4 — vendor:raylib, brew install raylib) — те же 3
+// теста ниже используют раylib через РЕАЛЬНЫЙ внешний-путь (dynlib +
+// libffi), не vendor-биндинги, доказывая struct-by-value/float-
+// маршаллинг живым вызовом. `Vector2Add`/`Fade` — чистые утилитные
+// функции raylib, НЕ требуют открытого окна (в отличие от отрисовки) —
+// детерминированно, без визуальной проверки.
+@(test)
+test_ffi_float_struct_vector2add :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Vector2 = ff_структура
+			x: Число(32)
+			y: Число(32)
+		конец
+
+		внешний "/opt/homebrew/opt/raylib/lib/libraylib.dylib" функ Vector2Add(a: Vector2, b: Vector2) -> Vector2
+
+		функ старт() -> Число
+			пер r = Vector2Add(Vector2(1.0, 2.0), Vector2(3.0, 4.0))
+			r.x + r.y
+		конец
+	`)
+	testing.expectf(t, ok, "Vector2Add: пустой стек")
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 10.0, "Vector2Add: ожидалось 10.0 ((1+3)+(2+4)), получено %v", result)
+}
+
+// Целое(8) — ОБЯЗАН быть беззнаковым (u8, не i8): raylib's Color-каналы
+// unsigned char 0-255. Fade(color, 0.5) умножает alpha-канал на 0.5,
+// RGB не трогает — Fade(Color(255,0,0,255), 0.5) = Color(255,0,0,127)
+// (255*0.5=127.5, усечение вниз).
+@(test)
+test_ffi_int8_struct_color_fade :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип Color = ff_структура
+			r: Целое(8)
+			g: Целое(8)
+			b: Целое(8)
+			a: Целое(8)
+		конец
+
+		внешний "/opt/homebrew/opt/raylib/lib/libraylib.dylib" функ Fade(color: Color, alpha: Число(32)) -> Color
+
+		функ старт() -> Целое
+			пер c = Fade(Color(255, 0, 0, 255), 0.5)
+			c.r + c.g + c.b + c.a
+		конец
+	`)
+	testing.expectf(t, ok, "Fade: пустой стек")
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 382.0, "Fade: ожидалось 382 (255+0+0+127), получено %v", result)
+}
+
+// Пусто (void) как возврат внешний-функции — SetTargetFPS ничего не
+// возвращает, не требует окна, безопасна для headless CI-прогона.
+@(test)
+test_ffi_void_return_does_not_crash :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		внешний "/opt/homebrew/opt/raylib/lib/libraylib.dylib" функ SetTargetFPS(fps: Целое(32)) -> Пусто
+
+		функ старт() -> Целое
+			SetTargetFPS(60)
+			42
+		конец
+	`)
+	testing.expectf(t, ok, "void return: пустой стек")
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 42.0, "void return: ожидалось 42, получено %v", result)
+}

@@ -435,6 +435,13 @@ message_deep_copy :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]Value) -> 
 	// внешнего адреса с owned=true в ДВУХ независимых Pointer_Value дало
 	// бы double-free (каждый GC'nut wrapper звал бы free() независимо) —
 	// безопаснее делить ОДИН wrapper, чем гарантированно ломать владение.
+	// Стадия 50: это НЕ открытый риск, а безопасный by-construction
+	// дизайн — у panos ОДИН общий vm.gc на весь VM (все "процессы" —
+	// зелёные нити внутри одного OS-процесса, не независимые адресные
+	// пространства), значит расшаренный ^Pointer_Value имеет РОВНО один
+	// Odin-объект и освобождается pool_release ровно один раз, когда
+	// недостижим из ВСЕХ процессов сразу — см. test_ffi_pointer_owned_
+	// sent_to_process_no_double_free (e2e_test.odin).
 	return value
 }
 
@@ -882,11 +889,6 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	// (в т.ч. ос::аргументы, ввод_вывод::печать/строка, сеть::кодировать_url
 	// — уже os/net-агностичны) остаются в общем switch ниже без изменений.
 	if result, ok, handled := call_builtin_io(vm, name, args); handled {
-		return result, ok
-	}
-	// Стадия 4 (FFI-A): графика::* — тот же #+build !js/js split, что
-	// call_builtin_io выше (vm_graphics_native.odin/vm_graphics_wasm.odin).
-	if result, ok, handled := call_builtin_graphics(vm, name, args); handled {
 		return result, ok
 	}
 	switch name {

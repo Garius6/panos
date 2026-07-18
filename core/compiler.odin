@@ -184,6 +184,12 @@ Foreign_Function :: struct {
 	// Стадия 49: только когда return_kind == .Pointer — см.
 	// Foreign_Decl.return_owned/`свой` (parser.odin).
 	return_owned:  bool,
+	// Стадия 51: nil-элемент, если соответствующий param_kinds[i] != .
+	// Struct; ^Type владеющей ff_структура иначе (несёт ffi_field_kinds/
+	// ffi_composite/ffi_offsets — см. type_cheker.odin). Аналогично
+	// return_struct_type для возврата.
+	param_struct_types: []^Type,
+	return_struct_type: ^Type,
 	cif:           rawptr,
 	cif_ready:     bool,
 }
@@ -338,16 +344,20 @@ get_or_build_foreign_function :: proc(d: ^Foreign_Decl) -> ^Foreign_Function {
 		return (^Foreign_Function)(d.compiled_fn)
 	}
 	kinds := make([]Foreign_Marshal_Kind, len(d.params))
+	struct_types := make([]^Type, len(d.params))
 	for p, i in d.params {
 		kinds[i] = p.marshal
+		struct_types[i] = p.resolved_struct_type
 	}
 	ff := new(Foreign_Function)
 	ff^ = Foreign_Function {
-		name         = d.name,
-		fn_ptr       = d.fn_ptr,
-		param_kinds  = kinds,
-		return_kind  = d.return_marshal,
-		return_owned = d.return_owned,
+		name               = d.name,
+		fn_ptr             = d.fn_ptr,
+		param_kinds        = kinds,
+		return_kind        = d.return_marshal,
+		return_owned       = d.return_owned,
+		param_struct_types = struct_types,
+		return_struct_type = d.return_resolved_struct_type,
 	}
 	d.compiled_fn = ff
 	return ff

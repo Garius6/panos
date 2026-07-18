@@ -96,6 +96,12 @@ Field_Decl :: struct {
 	span:            Span,
 	name:            string,
 	type_annotation: Type_Node,
+	// Стадия 51: заполнено ТОЛЬКО когда владеющий Struct_Decl.is_ffi ==
+	// true (ff_структура) — type_annotation в этом случае не парсится
+	// (см. parse_ffi_struct_decl), панос-тип поля вычисляется из
+	// marshal_kind на typecheck (Целое/Число, см. foreign_marshal_
+	// panos_type в type_cheker.odin).
+	marshal_kind:    Foreign_Marshal_Kind,
 }
 
 Struct_Decl :: struct {
@@ -106,6 +112,13 @@ Struct_Decl :: struct {
 	type_params: [dynamic]string,
 	fields:      [dynamic]Field_Decl,
 	is_exported: bool,
+	// Стадия 51: true для `тип X = ff_структура ... конец` — C ABI
+	// struct-by-value для `внешний` (Vector2/Color-style). Поля обязаны
+	// быть Целое(8|32|64)/Число(32|64) (см. field.marshal_kind) —
+	// вложенные структуры/строки/указатели не поддержаны в этом срезе
+	// (плоский layout). generics НЕ поддержаны для ff_структура (raylib
+	// не нуждается, упрощает marshalling).
+	is_ffi:      bool,
 }
 
 Import_Decl :: struct {
@@ -162,10 +175,27 @@ Error_Decl :: struct {
 // СУЩЕСТВУЮЩЕГО типа по marshal (см. type_cheker.odin, case
 // ^Foreign_Decl).
 Foreign_Marshal_Kind :: enum {
+	// Стадия 51: ТОЛЬКО как возврат ("Пусто") — libc/raylib функции без
+	// результата (SetTargetFPS, BeginDrawing и т.п.). Как тип параметра
+	// не встречается синтаксически (нет смысла передавать "ничего").
+	Void,
+	Int8,
 	Int32,
 	Int64,
+	// Стадия 51: float/double — raylib почти везде float. Панос-тип
+	// параметра/возврата — обычный Число (как Целое(N) остаётся Целое),
+	// ширина чисто marshalling-метаданные, см. докstring выше.
+	Float32,
+	Float64,
 	CString,
 	Pointer,
+	// Стадия 51: C-структура по значению (ff_структура) — raylib's
+	// Vector2/Color передаются В САМИХ функциях отрисовки по значению,
+	// не по указателю. struct_type_name (Foreign_Param)/return_struct_
+	// type_name (Foreign_Decl) — имя ff_структура-типа, резолвится в
+	// resolved_struct_type на typecheck (типы ещё не существуют на
+	// этапе парсинга, см. type_cheker.odin, case ^Foreign_Decl).
+	Struct,
 }
 
 Foreign_Param :: struct {
@@ -176,6 +206,11 @@ Foreign_Param :: struct {
 	// Указатель(T), обычный parse_type-путь (T сам может быть чем
 	// угодно, panos никогда не заглядывает внутрь — см. Type_Kind.Pointer).
 	pointee: Type_Node,
+	// Стадия 51: заполнено ТОЛЬКО когда marshal == .Struct — имя ff_
+	// структура-типа (напр. "Vector2"), резолвится в resolved_struct_
+	// type на typecheck.
+	struct_type_name: string,
+	resolved_struct_type: ^Type,
 }
 
 Foreign_Decl :: struct {
@@ -185,6 +220,10 @@ Foreign_Decl :: struct {
 	params:        [dynamic]Foreign_Param,
 	return_marshal: Foreign_Marshal_Kind,
 	return_pointee: Type_Node, // как Foreign_Param.pointee, только для возврата
+	// Стадия 51: как Foreign_Param.struct_type_name/resolved_struct_type,
+	// только для возврата.
+	return_struct_type_name: string,
+	return_resolved_struct_type: ^Type,
 	// Стадия 49: постфикс владения ПОСЛЕ возвращаемого Указатель(T) —
 	// `свой` (panos аллоцирует/освобождает через pool_release, libc
 	// free()) vs `чужой` (default — НИКОГДА не освобождать чужую
@@ -736,6 +775,9 @@ parse_program :: proc(p: ^Parser) -> Program {
 			} else if third_kind == .Interface {
 				decl := parse_interface_decl(p, is_exported)
 				append(&prog.decls, decl)
+			} else if third_kind == .FFStruct {
+				decl := parse_ffi_struct_decl(p, is_exported)
+				append(&prog.decls, decl)
 			} else {
 				// peek-only (третий токен вперёд не потреблён) — без skip
 				// следующая итерация увидит тот же .TypeDecl и зациклится.
@@ -743,7 +785,7 @@ parse_program :: proc(p: ^Parser) -> Program {
 				report_parse(
 					p,
 					bad_span,
-					"Синтаксическая ошибка: после 'тип X =' ожидалось 'структура', 'интерфейс' или 'перечисление', получено: %v",
+					"Синтаксическая ошибка: после 'тип X =' ожидалось 'структура', 'интерфейс', 'перечисление' или 'ff_структура', получено: %v",
 					third_kind,
 				)
 				next_token(p.stream)
@@ -836,8 +878,11 @@ parse_foreign_decl :: proc(p: ^Parser) -> ^Foreign_Decl {
 				report_parse(p, param_name_tok.span, "Синтаксическая ошибка: ожидалось имя параметра, получено: %v", param_name_tok.kind)
 			}
 			expect(p, .Colon)
-			marshal, pointee := parse_foreign_marshal_type(p)
-			append(&decl.params, Foreign_Param{span = span_from(p, param_span), name = param_name_tok.data, marshal = marshal, pointee = pointee})
+			marshal, pointee, struct_name := parse_foreign_marshal_type(p)
+			if marshal == .Void {
+				report_parse(p, param_span, "Синтаксическая ошибка: 'Пусто' допустим только как возвращаемый тип 'внешний', не как тип параметра")
+			}
+			append(&decl.params, Foreign_Param{span = span_from(p, param_span), name = param_name_tok.data, marshal = marshal, pointee = pointee, struct_type_name = struct_name})
 			if peek_token(p.stream).kind == .Comma {
 				next_token(p.stream)
 			} else {
@@ -848,7 +893,7 @@ parse_foreign_decl :: proc(p: ^Parser) -> ^Foreign_Decl {
 	expect(p, .RParen)
 
 	expect(p, .Arrow)
-	decl.return_marshal, decl.return_pointee = parse_foreign_marshal_type(p)
+	decl.return_marshal, decl.return_pointee, decl.return_struct_type_name = parse_foreign_marshal_type(p)
 	if decl.return_marshal == .Pointer {
 		decl.return_owned = parse_foreign_ownership_suffix(p)
 	}
@@ -858,46 +903,71 @@ parse_foreign_decl :: proc(p: ^Parser) -> ^Foreign_Decl {
 	return decl
 }
 
-// Стадия 47/49: три поддержанные формы типа в `внешний`-сигнатуре —
-// `Целое(32)`/`Целое(64)` (marshalling-ширина libffi ffi_type_sint32/
-// 64), `КСтрока` (голый идентификатор без параметров — C char*,
-// marshalling ↔ panos Строка), `Указатель(T)` (T — обычный parse_type,
-// чисто фантомный на panos-стороне, marshalling — raw pointer). Ни одно
+// Стадия 47/49/51: поддержанные формы типа в `внешний`-сигнатуре —
+// `Пусто` (ТОЛЬКО возврат, void), `Целое(8|32|64)` (marshalling-ширина
+// libffi ffi_type_[u]int8/sint32/64), `Число(32|64)` (float/double),
+// `КСтрока` (голый идентификатор без параметров — C char*, marshalling
+// ↔ panos Строка), `Указатель(T)` (T — обычный parse_type, чисто
+// фантомный на panos-стороне, marshalling — raw pointer), ЛЮБОЙ ДРУГОЙ
+// идентификатор — имя ff_структура-типа (marshalling — struct-by-
+// value, имя резолвится позже на typecheck, см. type_cheker.odin, case
+// ^Foreign_Decl — типов ещё не существует на этапе парсинга). Ни одно
 // из имён — не keyword лексера, распознаются строковым сравнением
 // ТОЛЬКО в этом контексте (тот же приём, что уже был у 'Целое').
-parse_foreign_marshal_type :: proc(p: ^Parser) -> (marshal: Foreign_Marshal_Kind, pointee: Type_Node) {
+parse_foreign_marshal_type :: proc(p: ^Parser) -> (marshal: Foreign_Marshal_Kind, pointee: Type_Node, struct_type_name: string) {
 	type_tok := peek_token(p.stream)
 	if type_tok.kind != .Ident {
-		report_parse(p, type_tok.span, "Синтаксическая ошибка: во 'внешний' ожидался тип (Целое/КСтрока/Указатель), получено: %v", type_tok.kind)
+		report_parse(p, type_tok.span, "Синтаксическая ошибка: во 'внешний' ожидался тип (Целое/Число/КСтрока/Указатель/Пусто), получено: %v", type_tok.kind)
 		next_token(p.stream)
-		return .Int32, nil
+		return .Int32, nil, ""
 	}
 
 	switch type_tok.data {
+	case "Пусто":
+		next_token(p.stream)
+		return .Void, nil, ""
 	case "Целое":
 		next_token(p.stream)
 		expect(p, .LParen)
 		width_tok := next_token(p.stream)
-		if width_tok.kind != .Number || (width_tok.data != "32" && width_tok.data != "64") {
-			report_parse(p, width_tok.span, "Синтаксическая ошибка: 'Целое(...)' в 'внешний' ожидает ширину 32 или 64, получено: %v", width_tok.data)
+		if width_tok.kind != .Number || (width_tok.data != "8" && width_tok.data != "32" && width_tok.data != "64") {
+			report_parse(p, width_tok.span, "Синтаксическая ошибка: 'Целое(...)' в 'внешний' ожидает ширину 8, 32 или 64, получено: %v", width_tok.data)
 			expect(p, .RParen)
-			return .Int32, nil
+			return .Int32, nil, ""
 		}
 		expect(p, .RParen)
-		return (width_tok.data == "32" ? Foreign_Marshal_Kind.Int32 : Foreign_Marshal_Kind.Int64), nil
+		width_kind: Foreign_Marshal_Kind
+		switch width_tok.data {
+		case "8": width_kind = .Int8
+		case "32": width_kind = .Int32
+		case: width_kind = .Int64
+		}
+		return width_kind, nil, ""
+	case "Число":
+		next_token(p.stream)
+		expect(p, .LParen)
+		width_tok := next_token(p.stream)
+		if width_tok.kind != .Number || (width_tok.data != "32" && width_tok.data != "64") {
+			report_parse(p, width_tok.span, "Синтаксическая ошибка: 'Число(...)' в 'внешний' ожидает ширину 32 или 64, получено: %v", width_tok.data)
+			expect(p, .RParen)
+			return .Float32, nil, ""
+		}
+		expect(p, .RParen)
+		return (width_tok.data == "32" ? Foreign_Marshal_Kind.Float32 : Foreign_Marshal_Kind.Float64), nil, ""
 	case "КСтрока":
 		next_token(p.stream)
-		return .CString, nil
+		return .CString, nil, ""
 	case "Указатель":
 		next_token(p.stream)
 		expect(p, .LParen)
 		t := parse_type(p)
 		expect(p, .RParen)
-		return .Pointer, t
+		return .Pointer, t, ""
 	case:
-		report_parse(p, type_tok.span, "Синтаксическая ошибка: 'внешний' поддерживает 'Целое(32|64)'/'КСтрока'/'Указатель(T)', получено: %s", type_tok.data)
+		// Стадия 51: любое другое имя — ссылка на ff_структура-тип,
+		// проверяется на typecheck (тип ещё не резолвится здесь).
 		next_token(p.stream)
-		return .Int32, nil
+		return .Struct, nil, type_tok.data
 	}
 }
 
@@ -1348,6 +1418,61 @@ parse_struct_decl :: proc(p: ^Parser, is_exported: bool) -> ^Struct_Decl {
 		expect(p, .Colon)
 
 		field.type_annotation = parse_type(p)
+		field.span = span_from(p, field_tok.span)
+		append(&decl.fields, field)
+
+		consume_semicolon_or_newline(p)
+	}
+
+	expect(p, .End)
+	decl.span = span_from(p, start)
+	return decl
+}
+
+// Стадия 51: `тип X = ff_структура поле: Целое(N)|Число(N) ... конец` —
+// C ABI struct-by-value для `внешний` (Vector2/Color-style). Поля через
+// parse_foreign_marshal_type (переиспользование ширины-парсинга), но
+// только Int8/Int32/Int64/Float32/Float64 допустимы — CString/Pointer/
+// Struct/Void внутри поля — Type Error (плоский layout, без вложенности
+// в этом срезе). Без generics (raylib не нуждается).
+parse_ffi_struct_decl :: proc(p: ^Parser, is_exported: bool) -> ^Struct_Decl {
+	start := peek_token(p.stream).span
+	expect(p, .TypeDecl)
+
+	decl := new(Struct_Decl)
+	decl.fields = make([dynamic]Field_Decl)
+	decl.is_exported = is_exported
+	decl.is_ffi = true
+
+	name_tok := next_token(p.stream)
+	if name_tok.kind != .Ident do error(p, "Ожидалось имя типа")
+	decl.name = name_tok.data
+
+	expect(p, .Assign)
+	expect(p, .FFStruct)
+
+	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
+		field := Field_Decl{}
+
+		field_tok := next_token(p.stream)
+		if field_tok.kind != .Ident do error(p, "Ожидалось имя поля ff_структура")
+		field.name = field_tok.data
+
+		expect(p, .Colon)
+
+		marshal, _, struct_name := parse_foreign_marshal_type(p)
+		#partial switch marshal {
+		case .Int8, .Int32, .Int64, .Float32, .Float64:
+			field.marshal_kind = marshal
+		case:
+			report_parse(
+				p,
+				field_tok.span,
+				"Синтаксическая ошибка: поле ff_структура поддерживает только Целое(8|32|64)/Число(32|64), получено %s",
+				struct_name != "" ? struct_name : fmt.tprintf("%v", marshal),
+			)
+			field.marshal_kind = .Int32
+		}
 		field.span = span_from(p, field_tok.span)
 		append(&decl.fields, field)
 

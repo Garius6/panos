@@ -120,6 +120,23 @@ Type :: struct {
 	// тип на этапе мономорфизации, см. core/monomorphize.odin) — только
 	// для type_satisfies_interface на этапе абстрактной проверки тела.
 	required_interfaces:   [dynamic]^Type,
+	// Стадия 51 (FFI, ff_структура): nil для ОБЫЧНЫХ структур — заполнено
+	// ТОЛЬКО для `тип X = ff_структура ... конец` (см. Struct_Decl.is_ffi,
+	// parser.odin), позиционно параллельно `fields` — marshal-кинд
+	// КАЖДОГО поля (Целое(N)/Число(N)), нужен VM-маршаллингу для упаковки/
+	// распаковки сырого C-буфера (core/vm_ffi_native.odin).
+	ffi_field_kinds:        []Foreign_Marshal_Kind,
+	// Составной ^Ffi_Type (libffi, FFI_TYPE_STRUCT + elements) для ЭТОЙ
+	// ff_структура — лениво строится и КЭШИРУЕТСЯ здесь при первом
+	// использовании в `внешний`-вызове (тот же паттерн, что Foreign_
+	// Decl.compiled_fn/Foreign_Function.cif) — opaque rawptr (не ^Ffi_
+	// Type напрямую): type_cheker.odin общий для native/wasm, а ffi_
+	// bindings.odin (реальный Ffi_Type) — #+build !js.
+	ffi_composite:          rawptr,
+	// Байтовые offset'ы полей внутри составного буфера (ffi_get_struct_
+	// offsets), тот же кэш-момент, что ffi_composite, позиционно
+	// параллельно fields/ffi_field_kinds.
+	ffi_offsets:            []uint,
 }
 
 // Ищет позицию варианта по имени в enum-типе (обычном или synth-view
@@ -1616,20 +1633,52 @@ function_type_from_decl :: proc(ctx: ^Type_Ctx, d: ^Function_Decl) -> ^Type {
 }
 
 // Стадия 49: panos-тип, соответствующий marshal-кинду `внешний`-
-// параметра/возврата (см. Foreign_Marshal_Kind, parser.odin). Int32/
-// Int64 — оба TY_INT (ширина чисто marshalling, не панос-тип, см. Стадия
-// 47). Pointer — реальный Указатель(T), T резолвится из pointee обычным
-// resolve_type_node (тем же путём, что параметр обычной функции).
-foreign_marshal_panos_type :: proc(ctx: ^Type_Ctx, marshal: Foreign_Marshal_Kind, pointee: Type_Node) -> ^Type {
+// параметра/возврата (см. Foreign_Marshal_Kind, parser.odin). Int8/
+// Int32/Int64 — все TY_INT (ширина чисто marshalling, не панос-тип, см.
+// Стадия 47). Float32/Float64 — TY_NUM (та же логика: Число(N) остаётся
+// обычным Число на panos-стороне). Pointer — реальный Указатель(T), T
+// резолвится из pointee обычным resolve_type_node (тем же путём, что
+// параметр обычной функции). Struct — resolved_struct_type уже должен
+// быть заполнен ВЫЗЫВАЮЩИМ (case ^Foreign_Decl ниже резолвит struct_
+// type_name ДО вызова этой функции) — тут просто читаем поле struct_
+// type (Type резолвится по имени в самом struct_type, не здесь).
+foreign_marshal_panos_type :: proc(ctx: ^Type_Ctx, marshal: Foreign_Marshal_Kind, pointee: Type_Node, resolved_struct_type: ^Type = nil) -> ^Type {
 	switch marshal {
-	case .Int32, .Int64:
+	case .Void:
+		return TY_VOID
+	case .Int8, .Int32, .Int64:
 		return TY_INT
+	case .Float32, .Float64:
+		return TY_NUM
 	case .CString:
 		return TY_STRING
 	case .Pointer:
 		return new_pointer_type(resolve_type_node(ctx, pointee))
+	case .Struct:
+		if resolved_struct_type != nil do return resolved_struct_type
+		return TY_INT
 	}
 	return TY_INT
+}
+
+// Стадия 51: резолвит имя ff_структура-типа (Foreign_Param.struct_type_
+// name/Foreign_Decl.return_struct_type_name) в её ^Type — та же логика,
+// что resolve_type_node's case ^Type_Ident (глобальный scope модуля),
+// но с доп. проверкой "это именно ff_структура" (ffi_field_kinds != nil),
+// не обычная структура/другой тип. Type Error, если имя не найдено ИЛИ
+// найдено, но не ff_структура.
+resolve_foreign_struct_type_name :: proc(ctx: ^Type_Ctx, name: string, span: Span) -> ^Type {
+	sym := lookup_symbol(ctx.res.global_scope, intern(name))
+	if sym == INVALID_SYMBOL {
+		report(ctx, span, "Type Error: неизвестный тип '%s' во 'внешний'-сигнатуре", name)
+		return TY_INT
+	}
+	typ, ok := ctx.res.symbol_types[sym]
+	if !ok || typ.kind != .Struct || typ.ffi_field_kinds == nil {
+		report(ctx, span, "Type Error: '%s' не является ff_структура — только ff_структура допустима как тип struct-by-value в 'внешний'", name)
+		return TY_INT
+	}
+	return typ
 }
 
 interface_method_type_from_signature :: proc(
@@ -1986,22 +2035,36 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			struct_type := ctx.res.symbol_types[sym]
 			struct_type.fields = make([dynamic]Struct_Field)
 
-			// Стадия 7 Phase C: generic-структура — резолвим поля с
-			// type-параметрами в scope (свежий InferVar на каждое имя),
-			// затем generalize в полиморфную схему (тот же механизм, что
-			// Phase A/B, см. symbol_schemes). decl_type_param_order хранит
-			// ordered-список для позиционной явной подстановки в
-			// Type_Generic (Пара(Число, Строка)) — заполняется всегда при
-			// непустом d.type_params, даже если конкретный параметр не
-			// встречается ни в одном поле.
-			//
-			// Стадия 7 Phase D: decl_type_params/decl_type_param_order и
-			// currently_declaring_generic выставляются ДО цикла резолва
-			// полей (не после, как было в Phase C) — иначе самоссылка
-			// (тип Список[T] = структура ... следующий: Опция(Список(T))
-			// конец) не распознаётся как generic вообще на момент, когда
-			// до неё доходит resolve_type_node.
-			if len(d.type_params) > 0 {
+			// Стадия 51 (ff_структура): без generics (parser не парсит
+			// [...] для ff_структура), поле-тип вычисляется из marshal_
+			// kind (Целое(N)/Число(N) → обычный Целое/Число), не через
+			// resolve_type_node (f.type_annotation здесь всегда nil —
+			// parse_ffi_struct_decl не парсит общий Type_Node). ffi_
+			// field_kinds — позиционно параллельно struct_type.fields,
+			// нужен VM-маршаллингу (vm_ffi_native.odin).
+			if d.is_ffi {
+				kinds := make([]Foreign_Marshal_Kind, len(d.fields))
+				for f, i in d.fields {
+					kinds[i] = f.marshal_kind
+					append(&struct_type.fields, Struct_Field{name = f.name, type = foreign_marshal_panos_type(ctx, f.marshal_kind, nil)})
+				}
+				struct_type.ffi_field_kinds = kinds
+			} else if len(d.type_params) > 0 {
+				// Стадия 7 Phase C: generic-структура — резолвим поля с
+				// type-параметрами в scope (свежий InferVar на каждое имя),
+				// затем generalize в полиморфную схему (тот же механизм, что
+				// Phase A/B, см. symbol_schemes). decl_type_param_order хранит
+				// ordered-список для позиционной явной подстановки в
+				// Type_Generic (Пара(Число, Строка)) — заполняется всегда при
+				// непустом d.type_params, даже если конкретный параметр не
+				// встречается ни в одном поле.
+				//
+				// Стадия 7 Phase D: decl_type_params/decl_type_param_order и
+				// currently_declaring_generic выставляются ДО цикла резолва
+				// полей (не после, как было в Phase C) — иначе самоссылка
+				// (тип Список[T] = структура ... следующий: Опция(Список(T))
+				// конец) не распознаётся как generic вообще на момент, когда
+				// до неё доходит resolve_type_node.
 				prev_params := ctx.current_type_params
 				prev_declaring := ctx.currently_declaring_generic
 				params_map := make(map[string]^Type)
@@ -2062,19 +2125,27 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			}
 
 		case ^Foreign_Decl:
-			// Стадия 47/49: marshal-кинд — чисто marshalling-метаданные
+			// Стадия 47/49/51: marshal-кинд — чисто marshalling-метаданные
 			// (см. Foreign_Param/Foreign_Decl, parser.odin), но панос-ТИП
 			// параметра/возврата зависит от него напрямую (Целое(N) ->
 			// TY_INT, КСтрока -> TY_STRING, Указатель(T) -> реальный
-			// Указатель(T) через resolve_type_node на pointee) — см.
+			// Указатель(T) через resolve_type_node на pointee, Struct ->
+			// resolved_struct_type через resolve_foreign_struct_type_name
+			// ПО ИМЕНИ, типы ещё не существовали на этапе парсинга) — см.
 			// foreign_marshal_panos_type ниже. Тела нет (ПРОХОД 4 её не
 			// касается, #partial switch там её пропускает).
 			foreign_sym := ctx.res.decl_symbols[decl]
 			foreign_params := make([dynamic]^Type)
-			for param in d.params {
-				append(&foreign_params, foreign_marshal_panos_type(ctx, param.marshal, param.pointee))
+			for &param in d.params {
+				if param.marshal == .Struct {
+					param.resolved_struct_type = resolve_foreign_struct_type_name(ctx, param.struct_type_name, param.span)
+				}
+				append(&foreign_params, foreign_marshal_panos_type(ctx, param.marshal, param.pointee, param.resolved_struct_type))
 			}
-			foreign_return := foreign_marshal_panos_type(ctx, d.return_marshal, d.return_pointee)
+			if d.return_marshal == .Struct {
+				d.return_resolved_struct_type = resolve_foreign_struct_type_name(ctx, d.return_struct_type_name, d.span)
+			}
+			foreign_return := foreign_marshal_panos_type(ctx, d.return_marshal, d.return_pointee, d.return_resolved_struct_type)
 			ctx.res.symbol_types[foreign_sym] = new_function_type(foreign_params, foreign_return)
 
 		case ^Interface_Decl:

@@ -24,6 +24,5 @@
 - [Процессы](./language/processes.md)
 - [Ввод-вывод и файловая система](./language/file-io.md)
 - [Сеть и HTTP](./language/networking.md)
-- [Графика (FFI фаза A)](./language/graphics.md)
-- [Внешние функции (FFI фаза B)](./language/ffi.md)
+- [Внешние функции (FFI)](./language/ffi.md)
 - [Стандартная библиотека](./language/standard-library.md)

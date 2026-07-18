@@ -3,3 +3,8 @@ dist
 node_modules
 .vscode-test/
 *.vsix
+**/.DS_Store
+*.dSYM
+docs/book/
+/wasm.wasm
+/demo/*.wasm

@@ -5764,3 +5764,69 @@ test_supervisor_narrow_window_never_exhausts_limit :: proc(t: ^testing.T) {
 	testing.expect_assert(t, "Runtime Error: все процессы заблокированы в ожидании сообщений (дедлок)")
 	run_module_file("fixtures/supervisor_narrow_window_fixture_main.ps")
 }
+
+// Стадия 47 (FFI-B, первый срез): VM исполняется В ТОМ ЖЕ ОС-процессе,
+// что и сам тест — getpid(), вызванный ИЗ панос-программы через
+// .Call_Foreign, обязан вернуть ТОТ ЖЕ PID, что и getpid(), вызванный
+// напрямую из Odin-кода теста (foreign import ниже, независимый от
+// core/ffi_bindings.odin/libffi путь) — строгая проверка, а не просто
+// "положительное число".
+foreign import ffi_test_libc "system:c"
+foreign ffi_test_libc {
+	getpid :: proc() -> i32 ---
+}
+
+@(test)
+test_ffi_getpid_matches_real_process_pid :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		внешний "libc" функ getpid() -> Целое(32)
+
+		функ старт() -> Целое
+			getpid()
+		конец
+	`)
+	testing.expectf(t, ok, "getpid: пустой стек")
+	f, is_num := result.(f64)
+	expected := f64(getpid())
+	testing.expectf(t, is_num && f == expected, "getpid: ожидался реальный PID %v, получено %v", expected, result)
+}
+
+// Доказывает маршаллинг АРГУМЕНТА (не только возврата) — abs() из libc,
+// и отрицательный, и уже-положительный вход.
+@(test)
+test_ffi_abs_marshals_argument_both_signs :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		внешний "libc" функ abs(x: Целое(32)) -> Целое(32)
+
+		функ старт() -> Целое
+			abs(0 - 12345) + abs(777)
+		конец
+	`)
+	testing.expectf(t, ok, "abs: пустой стек")
+	f, is_num := result.(f64)
+	testing.expectf(t, is_num && f == 13122.0, "abs: неверный результат: %v", result)
+}
+
+@(test)
+test_ffi_unknown_library_reports_resolve_error :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Resolve Error: библиотека 'libдефинитивнонесуществует123' не найдена (libдефинитивнонесуществует123.dylib)")
+	run_code(`
+		внешний "libдефинитивнонесуществует123" функ несуществующая() -> Целое(32)
+
+		функ старт() -> Целое
+			несуществующая()
+		конец
+	`)
+}
+
+@(test)
+test_ffi_unknown_symbol_reports_resolve_error :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Resolve Error: библиотека 'libc' не экспортирует символ 'definitely_not_a_real_libc_symbol_xyz'")
+	run_code(`
+		внешний "libc" функ definitely_not_a_real_libc_symbol_xyz() -> Целое(32)
+
+		функ старт() -> Целое
+			definitely_not_a_real_libc_symbol_xyz()
+		конец
+	`)
+}

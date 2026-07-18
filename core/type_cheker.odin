@@ -2008,6 +2008,18 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 				ctx.res.symbol_types[sym] = function_type_from_decl(ctx, d)
 			}
 
+		case ^Foreign_Decl:
+			// Стадия 47: `Целое(N)`-ширины — чисто marshalling-метаданные
+			// (см. Foreign_Param/Foreign_Decl, parser.odin), тайпчекеру
+			// невидимы — параметр/возврат всегда обычный TY_INT. Тела нет
+			// (ПРОХОД 4 её не касается, #partial switch там её пропускает).
+			foreign_sym := ctx.res.decl_symbols[decl]
+			foreign_params := make([dynamic]^Type)
+			for _ in d.params {
+				append(&foreign_params, TY_INT)
+			}
+			ctx.res.symbol_types[foreign_sym] = new_function_type(foreign_params, TY_INT)
+
 		case ^Interface_Decl:
 			iface_sym := ctx.res.decl_symbols[decl]
 			iface_type := ctx.res.symbol_types[iface_sym]

@@ -243,7 +243,7 @@ get_header :: proc(v: Value) -> ^GC_Header {
 		return &val.header
 	case ^Process_Value:
 		return &val.header
-	case f64, bool, ^Compiled_Function:
+	case f64, bool, ^Compiled_Function, ^Foreign_Function:
 		return nil
 	}
 	return nil
@@ -262,7 +262,7 @@ mark_value :: proc(v: Value) {
 	h.marked = true
 
 	switch val in v {
-	case f64, bool, ^Compiled_Function, ^Panos_String, ^File_Value, ^Socket_Value:
+	case f64, bool, ^Compiled_Function, ^Foreign_Function, ^Panos_String, ^File_Value, ^Socket_Value:
 	// листья — нечего обходить дальше
 	case ^Aggregate_Value:
 		for el in val.elements do mark_value(el)
@@ -350,7 +350,7 @@ mark_roots :: proc(vm: ^VM) {
 // расчёт не идёт, только сам заголовок структуры + байты строки).
 value_size :: proc(v: Value) -> int {
 	switch val in v {
-	case f64, bool, ^Compiled_Function:
+	case f64, bool, ^Compiled_Function, ^Foreign_Function:
 		return 0
 	case ^Panos_String:
 		return size_of(Panos_String) + len(val.data)
@@ -388,7 +388,7 @@ value_size :: proc(v: Value) -> int {
 pool_release :: proc(vm: ^VM, v: Value) {
 	context.allocator = vm_gc_allocator()
 	switch val in v {
-	case f64, bool, ^Compiled_Function:
+	case f64, bool, ^Compiled_Function, ^Foreign_Function:
 	// не GC-managed
 	case ^Panos_String:
 		append(&vm.gc.free_strings, val)

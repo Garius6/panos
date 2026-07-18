@@ -93,6 +93,8 @@ decl_span :: proc(d: Decls) -> Span {
 		return v.span
 	case ^Error_Decl:
 		return v.span
+	case ^Foreign_Decl:
+		return v.span
 	}
 	return Span{}
 }

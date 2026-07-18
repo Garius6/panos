@@ -150,6 +150,37 @@ Error_Decl :: struct {
 	span: Span,
 }
 
+// Стадия 47 (FFI-B, первый срез): `внешний "libc" функ getpid() -> Целое(32)`.
+// Параметр/возврат — ВСЕГДА `Целое` с обязательным width-модификатором
+// `(32)`/`(64)` — синтаксис валиден ТОЛЬКО здесь (не общий `parse_type`,
+// см. parse_foreign_decl), поэтому не Type_Node, а свой узкий Foreign_
+// Param. Ширина — чисто marshalling-метаданные для libffi (ffi_type_
+// sint32 vs sint64), панос-типом параметра/возврата остаётся обычный
+// Целое — не новый Type_Kind. Ширины живут прямо на Foreign_Decl/
+// Foreign_Param (см. ниже), typecheck их не касается вообще.
+Foreign_Param :: struct {
+	span:  Span,
+	name:  string,
+	width: int, // 32 или 64
+}
+
+Foreign_Decl :: struct {
+	span:         Span,
+	library:      string, // "libc" — без платформенного расширения/пути, резолвер добавляет
+	name:         string, // "getpid"
+	params:       [dynamic]Foreign_Param,
+	return_width: int,
+	// Заполняется резолвером (dynlib.load_library + symbol_address) —
+	// компилятор читает напрямую отсюда при генерации Call_Foreign,
+	// отдельная Symbol_Id-карта не нужна: и адрес, и ширины уже здесь.
+	fn_ptr:       rawptr,
+	// Заполняется компилятором (core/compiler.odin) при первой компиляции
+	// вызова этой декларации — ^Foreign_Function, переиспользуется всеми
+	// последующими call-сайтами этой же decl (ffi_prep_cif внутри готовится
+	// ещё позже, лениво, при первом РЕАЛЬНОМ вызове в VM).
+	compiled_fn:  rawptr,
+}
+
 Decls :: union {
 	^Import_Decl,
 	^Function_Decl,
@@ -158,6 +189,7 @@ Decls :: union {
 	^Interface_Decl,
 	^Enum_Decl,
 	^Error_Decl,
+	^Foreign_Decl,
 }
 
 Program :: struct {
@@ -705,6 +737,12 @@ parse_program :: proc(p: ^Parser) -> Program {
 			}
 			decl := parse_impl_decl(p)
 			append(&prog.decls, decl)
+		} else if tok_kind == .Foreign {
+			if is_exported {
+				report_parse(p, peek_token(p.stream).span, "Синтаксическая ошибка: 'внешний' не может быть экспортирован")
+			}
+			decl := parse_foreign_decl(p)
+			append(&prog.decls, decl)
 		} else {
 			// peek-only — без skip зациклится на том же токене.
 			bad_span := peek_token(p.stream).span
@@ -742,6 +780,79 @@ parse_import_decl :: proc(p: ^Parser) -> ^Import_Decl {
 	consume_semicolon_or_newline(p)
 	decl.span = span_from(p, start)
 	return decl
+}
+
+// `внешний "libc" функ getpid() -> Целое(32)` — не переиспользует
+// parse_param_list/parse_type (общий `Type_Node`-парсер): единственный
+// поддержанный тип параметра/возврата сейчас — `Целое` с ОБЯЗАТЕЛЬНЫМ
+// width-модификатором `(32)`/`(64)`, синтаксис валиден ТОЛЬКО здесь (см.
+// докstring у Foreign_Decl). Нет тела/`конец` — однострочная декларация.
+parse_foreign_decl :: proc(p: ^Parser) -> ^Foreign_Decl {
+	start := peek_token(p.stream).span
+	expect(p, .Foreign)
+
+	lib_tok := next_token(p.stream)
+	if lib_tok.kind != .String {
+		report_parse(p, lib_tok.span, "Синтаксическая ошибка: после 'внешний' ожидается имя библиотеки строкой, получено: %v", lib_tok.kind)
+	}
+	decl := new(Foreign_Decl)
+	decl.library = lib_tok.data
+
+	expect(p, .Function)
+	name_tok := next_token(p.stream)
+	if name_tok.kind != .Ident {
+		report_parse(p, name_tok.span, "Синтаксическая ошибка: ожидалось имя функции, получено: %v", name_tok.kind)
+	}
+	decl.name = name_tok.data
+
+	decl.params = make([dynamic]Foreign_Param)
+	expect(p, .LParen)
+	if peek_token(p.stream).kind != .RParen {
+		for {
+			param_span := peek_token(p.stream).span
+			param_name_tok := next_token(p.stream)
+			if param_name_tok.kind != .Ident {
+				report_parse(p, param_name_tok.span, "Синтаксическая ошибка: ожидалось имя параметра, получено: %v", param_name_tok.kind)
+			}
+			expect(p, .Colon)
+			width := parse_foreign_int_width(p)
+			append(&decl.params, Foreign_Param{span = span_from(p, param_span), name = param_name_tok.data, width = width})
+			if peek_token(p.stream).kind == .Comma {
+				next_token(p.stream)
+			} else {
+				break
+			}
+		}
+	}
+	expect(p, .RParen)
+
+	expect(p, .Arrow)
+	decl.return_width = parse_foreign_int_width(p)
+
+	consume_semicolon_or_newline(p)
+	decl.span = span_from(p, start)
+	return decl
+}
+
+// `Целое(32)`/`Целое(64)` — единственная поддержанная форма типа в
+// `внешний`-сигнатуре сейчас (см. Foreign_Decl докstring). Ширина —
+// marshalling-метаданные для libffi (ffi_type_sint32 vs sint64), не
+// часть панос-типа (остаётся Целое для остального языка).
+parse_foreign_int_width :: proc(p: ^Parser) -> int {
+	type_tok := next_token(p.stream)
+	if type_tok.kind != .Ident || type_tok.data != "Целое" {
+		report_parse(p, type_tok.span, "Синтаксическая ошибка: 'внешний' сейчас поддерживает только 'Целое(32)'/'Целое(64)', получено: %v", type_tok.kind)
+		return 32
+	}
+	expect(p, .LParen)
+	width_tok := next_token(p.stream)
+	if width_tok.kind != .Number || (width_tok.data != "32" && width_tok.data != "64") {
+		report_parse(p, width_tok.span, "Синтаксическая ошибка: 'Целое(...)' в 'внешний' ожидает ширину 32 или 64, получено: %v", width_tok.data)
+		expect(p, .RParen)
+		return 32
+	}
+	expect(p, .RParen)
+	return width_tok.data == "32" ? 32 : 64
 }
 
 parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {

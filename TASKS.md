@@ -546,22 +546,33 @@ hardcoded case по тому же образцу — новой инфрастр
 **Порядок работ** (полный список 16 шагов — см. ROADMAP, здесь только
 чеклист):
 
-- [ ] Грилинг вопросов 1-5 (архитектура — до кода)
-- [ ] Грамматика `внешний` (TokenKind/lexer/Decls/parser)
-- [ ] `core:dynlib`-based загрузка библиотек
-- [ ] libffi bindings в Odin
-- [ ] Type descriptor builder
-- [ ] Primitive marshalling
+- [x] Грилинг вопросов 1-5 (архитектура — до кода) — решения см. ROADMAP
+      §Стадия 8 "Стадия 47 (первый инкремент)"
+- [x] Грамматика `внешний` (TokenKind/lexer/Decls/parser) — `Целое(N)`
+      вместо `Число_32`, модификатор над существующим типом
+- [x] `core:dynlib`-based загрузка библиотек (core/resolver.odin)
+- [x] libffi bindings в Odin (core/ffi_bindings.odin, vendored
+      `external/libffi/`, только `darwin-arm64`)
+- [x] Type descriptor builder (`ffi_type_for_width`, только `Целое(32)`/
+      `Целое(64)`)
+- [x] Primitive marshalling (i32/i64 ↔ f64, core/vm_ffi_native.odin)
 - [ ] `Указатель(T)`/`Pointer_Value` + владение через `pool_release`
 - [ ] String marshalling (КСтрока ↔ Panos_String)
 - [ ] `ff_структура` marshalling
-- [ ] `Call_Foreign` opcode + VM handler
-- [ ] Тесты через libc (printf/getpid/open)
+- [x] `Call_Foreign` opcode + VM handler
+- [x] Тесты через libc (getpid/abs — printf/open ещё нет, нужен
+      строковый marshalling)
 - [ ] SIGSEGV recovery
 - [ ] Callback'и через ffi_closure
 - [ ] (опционально) Обёртка raylib на Panos-стороне (замена Стадии 4)
 - [ ] (опционально) Обёртка libc `фс` (миграция host stdlib)
-- [ ] Docs — новая глава `docs/src/language/ffi.md`
+- [x] Docs — новая глава `docs/src/language/ffi.md`
+
+Стадия 47 (первый инкремент, 18.07.2026) закрыла ROADMAP-checkpoint
+(`getpid()`/`abs(x)` через реальный dynamic FFI), но оставила
+незакрытыми: строки, указатели/владение, `ff_структура`, callback'и,
+SIGSEGV recovery, float-ширины, платформы кроме `darwin-arm64` — каждый
+пункт отдельный следующий инкремент.
 
 ---
 

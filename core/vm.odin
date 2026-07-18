@@ -1459,6 +1459,19 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 				append(&vm.stack, result)
 			}
 
+		case .Call_Foreign:
+			frame.ip += 1
+			ff_index := instructions[frame.ip]
+			frame.ip += 1
+			arg_count := int(instructions[frame.ip])
+
+			ff := frame.function.constants[ff_index].(^Foreign_Function)
+			args_start := len(vm.stack) - arg_count
+			args := vm.stack[args_start:]
+			result := call_foreign(vm, ff, args)
+			resize(&vm.stack, args_start)
+			append(&vm.stack, result)
+
 		case .Return:
 			result: Value = f64(0) // по умолчанию, если функция ничего не вернула
 

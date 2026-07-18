@@ -1,6 +1,7 @@
 // resolver.odin
 package core
 
+import "core:dynlib"
 import "core:fmt"
 
 Symbol_Kind :: enum {
@@ -178,6 +179,11 @@ Module_Graph :: struct {
 	// tc_ctx к тому моменту были бы недействительны на стеке).
 	prelude_res_ctx:       ^Resolver_Ctx,
 	prelude_tc_ctx:        ^Type_Ctx,
+	// Стадия 47 (FFI-B): кэш dynlib.load_library по "логическому" имени
+	// библиотеки ("libc") — несколько `внешний "libc" функ ...` в одном
+	// или разных модулях не должны грузить одну и ту же .dylib/.so
+	// повторно. Тот же приём, что graph.modules кэширует panos-модули.
+	foreign_libraries: map[string]dynlib.Library,
 }
 
 Scope :: struct {
@@ -682,6 +688,44 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 				module.exports[variant_name_id] = variant_sym
 			}
 		}
+
+	case ^Foreign_Decl:
+		lib, lib_cached := ctx.module_graph.foreign_libraries[d.library]
+		if !lib_cached {
+			filename := foreign_library_filename(d.library)
+			loaded, did_load := dynlib.load_library(filename)
+			if !did_load {
+				report_resolve(ctx, d.span, "Resolve Error: библиотека '%s' не найдена (%s)", d.library, filename)
+				return
+			}
+			if ctx.module_graph.foreign_libraries == nil {
+				ctx.module_graph.foreign_libraries = make(map[string]dynlib.Library)
+			}
+			ctx.module_graph.foreign_libraries[d.library] = loaded
+			lib = loaded
+		}
+
+		fn_ptr, found := dynlib.symbol_address(lib, d.name)
+		if !found {
+			report_resolve(ctx, d.span, "Resolve Error: библиотека '%s' не экспортирует символ '%s'", d.library, d.name)
+			return
+		}
+		d.fn_ptr = fn_ptr
+		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Function, decl, d.span, false)
+	}
+}
+
+// Стадия 47 (FFI-B): "libc" -> платформенное имя файла динамической
+// библиотеки. Сейчас реально проверено ЖИВЫМ вызовом только на
+// darwin-arm64 (см. external/libffi/README.md) — остальные ветки честно
+// выведены по стандартной ОС-конвенции, не протестированы отдельно.
+foreign_library_filename :: proc(logical_name: string) -> string {
+	when ODIN_OS == .Darwin {
+		return fmt.tprintf("%s.dylib", logical_name)
+	} else when ODIN_OS == .Windows {
+		return fmt.tprintf("%s.dll", logical_name)
+	} else {
+		return fmt.tprintf("%s.so", logical_name)
 	}
 }
 

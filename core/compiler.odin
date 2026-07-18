@@ -134,6 +134,24 @@ Value :: union {
 	^File_Value,
 	^Socket_Value,
 	^Process_Value,
+	^Foreign_Function,
+}
+
+// Стадия 47 (FFI-B): описание одного `внешний`-объявления, готовое к
+// вызову через libffi. Живёт как обычная константа в Compiled_Function.
+// constants (как и ^Compiled_Function для .Call), но САМ никогда не
+// оказывается на стеке панос-значением — только читается опкодом
+// .Call_Foreign напрямую из констант. cif — opaque rawptr (а не
+// ^Ffi_Cif): compiler.odin общий для native/wasm сборок, а ffi_bindings.
+// odin (реальный Ffi_Cif) — #+build !js. Готовится ЛЕНИВО и ОДИН РАЗ при
+// первом реальном вызове (vm_ffi_native.odin), не на компиляции.
+Foreign_Function :: struct {
+	name:         string,
+	fn_ptr:       rawptr,
+	param_widths: []int,
+	return_width: int,
+	cif:          rawptr,
+	cif_ready:    bool,
 }
 
 Compiled_Function :: struct {
@@ -221,6 +239,7 @@ Opcode :: enum u8 {
 	Int_Divide, // Целое/Целое: усечение к нулю (в отличие от .Divide — обычное деление). Выбор опкода — на компиляторе (ctx.tc.node_types), рантайм-представление то же f64.
 	Modulo, // Остаток от Int_Divide — тот же принцип усечения, знак следует делимому.
 	Receive_Signal, // Стадия 38: без операндов. Если очередь сигналов текущего процесса пуста — .Suspended (ip не двигается). Иначе снимает первый сигнал (Целое, Опция(Строка)), кладёт на стек.
+	Call_Foreign, // Стадия 47 (FFI-B): операнды — 1 байт (индекс константы с ^Foreign_Function), 1 байт (arg_count). Стек: arg1..argN (без callee-значения, в отличие от .Call — ^Foreign_Function не пользовательское значение). Маршаллинг через libffi — см. vm_ffi_native.odin/vm_ffi_wasm.odin.
 }
 
 // Записать 1 байт в массив инструкций
@@ -231,6 +250,30 @@ emit_byte :: proc(c: ^Compiler, byte: u8) {
 // Записать опкод
 emit_opcode :: proc(c: ^Compiler, op: Opcode) {
 	emit_byte(c, u8(op))
+}
+
+// Стадия 47 (FFI-B): ^Foreign_Function строится один раз на ^Foreign_Decl
+// (кэш в d.compiled_fn) — все call-сайты одной и той же decl переиспользуют
+// один и тот же дескриптор. ffi_prep_cif здесь НЕ вызывается (см.
+// Foreign_Function) — только на native-стороне, лениво, при первом
+// реальном .Call_Foreign в VM.
+get_or_build_foreign_function :: proc(d: ^Foreign_Decl) -> ^Foreign_Function {
+	if d.compiled_fn != nil {
+		return (^Foreign_Function)(d.compiled_fn)
+	}
+	widths := make([]int, len(d.params))
+	for p, i in d.params {
+		widths[i] = p.width
+	}
+	ff := new(Foreign_Function)
+	ff^ = Foreign_Function {
+		name         = d.name,
+		fn_ptr       = d.fn_ptr,
+		param_widths = widths,
+		return_width = d.return_width,
+	}
+	d.compiled_fn = ff
+	return ff
 }
 
 // Возвращает индекс константы в пуле (без генерации опкода .Constant)
@@ -1101,6 +1144,23 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			}
 		}
 		if ident, ok := e.callee.(^Ident_Expr); ok {
+			// Стадия 47 (FFI-B): `внешний`-функция — обычный .Function
+			// символ (не .Builtin), но decl — ^Foreign_Decl, не
+			// ^Function_Decl, поэтому обычный .Call (constant fn_ptr +
+			// .Call) не подходит: нет ^Compiled_Function, есть libffi-
+			// вызов. Проверяем ДО .Builtin-ветки ниже.
+			if sym_id := ctx.res.node_symbols[e.callee]; sym_id != INVALID_SYMBOL {
+				if foreign_decl, is_foreign := symbol_at(ctx.res.symbol_store, sym_id).decl.(^Foreign_Decl);
+				   is_foreign {
+					ff := get_or_build_foreign_function(foreign_decl)
+					for arg in e.args do compile_expr(ctx, arg)
+					emit_opcode(ctx, .Call_Foreign)
+					emit_byte(ctx, make_constant(ctx, Value(ff)))
+					emit_byte(ctx, u8(len(e.args)))
+					maybe_emit_interface_cast(ctx, expr)
+					return
+				}
+			}
 			if sym_id := ctx.res.node_symbols[e.callee];
 			   sym_id != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, sym_id).kind == .Builtin {
 				// Стадия 24 (actor model): получить() — единственный bare
@@ -1566,6 +1626,11 @@ print_assembler :: proc(registry: map[string]^Compiled_Function) {
 
 			case .Receive_Signal:
 				command := fmt.tprintf("%sRECEIVE_SIGNAL\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Call_Foreign:
+				idx += 2
+				command := fmt.tprintf("%sCALL_FOREIGN\n", prefix)
 				strings.write_string(&builder, command)
 
 			}

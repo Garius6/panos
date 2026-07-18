@@ -1,10 +1,10 @@
 # Panos — Задачи
 
-**Текущая стадия**: готовы 0, 1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16,
+**Текущая стадия**: готовы 0, 1, 2, 3, 4, 6, 7, 10, 11, 12, 13, 14, 15, 16,
 17, 18, 19, 20, 21, 22 (10-21 — вне очереди, 22 — Сравниваемое/
 Равнозначное operator sugar), 5 частично (Symbol_Id + LSP
-completions/references/rename; Type_Id отложен). Следующие
-разблокированные: 4 (FFI-A), 8 (FFI-B, требует 1 ✓ — finalizers теперь
+completions/references/rename; Type_Id отложен). Следующая
+разблокированная: 8 (FFI-B, требует 1 ✓ — finalizers теперь
 возможны). 23 ЗАКРЫТА ПОЛНОСТЬЮ ✅ (Печатаемое/Арифметика/Копируемое/
 Итерируемое; По-умолчанию и Хешируемое выброшены — см. ниже, обе без
 реального потребителя под интерфейсом). 28 (generic-интерфейсы) ✅.
@@ -324,47 +324,37 @@ diagnostics корректно пусты при валидном импорте
 
 ---
 
-## Стадия 4 — FFI фаза A: raylib demo
+## Стадия 4 ✅ — FFI фаза A: raylib demo (pong)
 
-Refs: [ROADMAP §Стадия 4](ROADMAP.md#стадия-4--ffi-фаза-a-raylib-demo-3-дня)
-— расширено 16.07.2026 конкретными touch-точками для самостоятельной
-реализации (не Explore-агентом, вручную).
+Refs: [ROADMAP §Стадия 4](ROADMAP.md#стадия-4--ffi-фаза-a-raylib-demo-pong).
 
-Prerequisite: нет содержательного, но полезно сначала прочитать
-`core/stdlib.odin`/`core/vm_io_native.odin` — эта стадия копирует их
-шаблон (`is_builtin_module_name`/`builtin_export_type`/
-`ensure_builtin_module` + `call_builtin_io`-подобная функция) почти
-без изменений, только для нового модуля `графика`.
+По запросу ("давай начнём FFI", грилинг выбрал Стадию 4 из двух FFI-
+этапов — Стадия 8 настоящий dynamic FFI, требует отдельного грилинга 5
+архитектурных вопросов, вне scope). Не настоящий FFI — статические
+Odin-биндинги через уже готовый `vendor:raylib` (не свой `foreign
+import`, investigation до кода сняла оба открытых вопроса плана —
+системный/vendored raylib и арность builtin-хелперов).
 
-Не настоящий FFI (см. Стадию 8) — статические Odin-биндинги, вручную
-завёрнутые в один модуль. **Решить перед стартом**: системный raylib
-(`brew install raylib` + `foreign import "system:raylib"`) vs vendored
-(`external/raylib/`, C-компилятор в пайплайне сборки) — raylib НЕ
-vendored в репозитории сейчас.
+- [x] `core/vm_graphics_native.odin`/`vm_graphics_wasm.odin` — точный
+      прецедент `vm_io_native.odin`/`vm_io_wasm.odin`
+- [x] `core/stdlib.odin` — модуль `графика`, 11 функций + 6 геттеров
+      кодов клавиш, `raylib_vector2_type`/`raylib_color_type` (тупы, без
+      нового Type_Kind)
+- [x] `demos/pong.ps` — весло игрока + ИИ-соперник + физика мяча + счёт
+- [x] `just build-wasm` не ломается (`#+build !js` исключает raylib)
 
-- [ ] `core/raylib_bindings.odin` (`#+build !js` — обязательно, иначе
-      WASM-сборка попытается слинковать raylib) — foreign import +
-      Odin-сигнатуры нужных функций (не все ~50 сразу — минимум для
-      pong: InitWindow/CloseWindow/WindowShouldClose/BeginDrawing/
-      EndDrawing/ClearBackground/DrawRectangle/DrawCircleV/IsKeyDown/
-      GetFrameTime)
-- [ ] `core/vm_graphics_native.odin` (`#+build !js`) — `call_builtin_
-      graphics`, по образцу `vm_io_native.odin:101`'s `call_builtin_io`,
-      подключить в `call_builtin` (vm.odin:753)
-- [ ] `core/stdlib.odin` — 4 точки: `is_builtin_module_name` (добавить
-      "графика"), `builtin_export_type` (case на каждую функцию),
-      `ensure_builtin_module` (новая ветка), готовые хелперы
-      `builtin_function_type_1/2/3` (для функций с 4+ параметрами
-      понадобится `_4`+ по аналогии)
-- [ ] Vector2/Color БЕЗ новых Type_Kind — Vector2 = обычный panos-тупл
-      `(Число, Число)`, распаковка через `.Get_Property` в
-      graphics-обёртке; Color — тупл `(Число×4)` или маленькая
-      panos-структура, объявленная прямо в демо-программе
-- [ ] Demo: pong / snake в новом каталоге `demos/` (сейчас не
-      существует)
-- [ ] Проверить `just build-wasm` не ломается (графика недоступна в
-      браузере, как `фс`/`ос`/`сеть` сейчас)
-- [ ] README gif с демо
+Найдено и задокументировано (не пофикшено, вне scope): графический
+цикл, если ни разу не вызывает `получить()`/`получить_сигнал()` с
+пустой очередью, монополизирует единственный OS-поток планировщика —
+остальные `запусти`-процессы не получают ни такта, пока окно не
+закроется. panos не имеет "yield без ожидания сообщения" — см.
+`docs/src/language/graphics.md`, раздел "Ограничение".
+
+`docs/src/language/graphics.md` (новый) + `SUMMARY.md`. `odin build .`/
+`./lsp`/`wasm` чисто, `odin test ./core` 191/191 (0 регрессий, графика
+не покрыта юнит-тестами — headless-раннер). Ручной прогон
+`demos/pong.ps` + doc-примеров — окно открывается/рисует/закрывается
+штатно.
 
 ---
 

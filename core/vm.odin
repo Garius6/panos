@@ -860,6 +860,11 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	if result, ok, handled := call_builtin_io(vm, name, args); handled {
 		return result, ok
 	}
+	// Стадия 4 (FFI-A): графика::* — тот же #+build !js/js split, что
+	// call_builtin_io выше (vm_graphics_native.odin/vm_graphics_wasm.odin).
+	if result, ok, handled := call_builtin_graphics(vm, name, args); handled {
+		return result, ok
+	}
 	switch name {
 	case "Ошибка":
 		expect_arg_count(name, len(args), 2)

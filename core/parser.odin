@@ -2,6 +2,7 @@ package core
 
 import "core:fmt"
 import "core:strconv"
+import "core:strings"
 
 Parser :: struct {
 	stream:      ^TokenStream,
@@ -2140,6 +2141,32 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 			prop_tok := next_token(p.stream)
 			if prop_tok.kind != .Ident && prop_tok.kind != .Number {
 				report_parse(p, prop_tok.span, "Ожидалось имя поля или индекс после '.', получено: %v", prop_tok.kind)
+			}
+			// Числовой токен сразу после '.' — ВСЕГДА индекс тупла (или два
+			// подряд), никогда не float-значение (нет такого понятия, как
+			// поле ".1.5"). Лексер не может отличить float-литерал от ДВУХ
+			// tuple-индексов без контекста ("вложенный.1.0" — сначала
+			// .1, потом .0 от результата, но "1.0" читается ОДНИМ числовым
+			// токеном, см. read_number в lexer.odin) — здесь, в property-
+			// доступе, контекст уже есть: если в тексте токена есть '.',
+			// разбиваем на два индекса и десахариваем в цепочку
+			// Property_Expr, как будто было написано ".1.0" явно двумя
+			// токенами.
+			if prop_tok.kind == .Number {
+				if dot_pos := strings.index_byte(prop_tok.data, '.'); dot_pos != -1 {
+					first_prop := new(Property_Expr)
+					first_prop.object = left
+					first_prop.property = prop_tok.data[:dot_pos]
+					first_prop.span = span_from(p, start)
+
+					second_prop := new(Property_Expr)
+					second_prop.object = first_prop
+					second_prop.property = prop_tok.data[dot_pos + 1:]
+					second_prop.span = span_from(p, start)
+
+					left = second_prop
+					continue
+				}
 			}
 			prop := new(Property_Expr)
 			prop.object = left

@@ -10,7 +10,7 @@ import "core:strings"
 // "вендорить всё": libc — платформенный C-рантайм, на который уже
 // неявно опирается сам Odin, не третьесторонняя библиотека. Вызывается
 // ТОЛЬКО из gc.odin's pool_release, ТОЛЬКО когда Pointer_Value.owned ==
-// true (см. Foreign_Decl.return_owned/`владеет_я`, parser.odin).
+// true (см. Foreign_Decl.return_owned/`свой`, parser.odin).
 foreign import libc_free "system:c"
 foreign libc_free {
 	free :: proc(ptr: rawptr) ---

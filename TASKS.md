@@ -488,7 +488,7 @@ prerequisite (см. ниже) и 5 непринятых архитектурны
 — такого общего механизма в Стадии 1 нет и не было (проверено —
 `core/gc.odin`, ~line 417-444: `pool_release`'s cleanup для `File_Value`/
 `Socket_Value` — два ЖЁСТКО ЗАШИТЫХ case'а, не generic-инфраструктура).
-Хорошая новость: `Указатель(T)` с `(владеет_я)` нужен ТРЕТИЙ такой же
+Хорошая новость: `Указатель(T)` с `(свой)` нужен ТРЕТИЙ такой же
 hardcoded case по тому же образцу — новой инфраструктуры строить не
 нужно. Реальный prerequisite — только Стадия 6 (✅, `Call_Info`/
 `Call_Kind`).
@@ -1660,7 +1660,7 @@ Refs: [ROADMAP §Стадия 49](ROADMAP.md#стадия-49--ffi-кстрока
 - [x] Грамматика: `parse_foreign_marshal_type` (обобщение `parse_
       foreign_int_width`) — `Целое(32|64)`/`КСтрока`/`Указатель(T)`,
       `Foreign_Marshal_Kind` enum; постфикс владения на возврате
-      (`владеет_я`/`владеет_C`, default `владеет_C`)
+      (`свой`/`чужой`, default `чужой`)
 - [x] `Type_Kind.Pointer` + `new_pointer_type` — настоящий panos-тип
       (ветка `Type_Generic`-цепочки рядом с `Процесс(T)`), T фантомный
 - [x] `Pointer_Value` (Value-вариант, `ptr: rawptr, owned: bool`) + 5
@@ -1680,7 +1680,7 @@ Refs: [ROADMAP §Стадия 49](ROADMAP.md#стадия-49--ffi-кстрока
       НОВАЯ Panos_String всегда копией (возврат); Указатель(T) — прямой
       passthrough rawptr
 - [x] 4 e2e-теста (strlen-параметр, strdup round-trip через кириллицу,
-      malloc+владеет_я не падает, getenv без владения не пытается
+      malloc+свой не падает, getenv без владения не пытается
       free())
 - [x] `docs/src/language/ffi.md` — новые секции КСтрока/Указатель(T),
       обновлён список "явно не сделано"

@@ -141,7 +141,7 @@ Value :: union {
 
 // Стадия 49 (FFI): рантайм-представление Указатель(T) — opaque raw
 // pointer из/в внешний код. `owned` — Стадия 49's default-safe владение:
-// true ТОЛЬКО если `внешний`-декларация явно пометила возврат `владеет_я`
+// true ТОЛЬКО если `внешний`-декларация явно пометила возврат `свой`
 // (см. Foreign_Decl.return_owned, parser.odin) — pool_release (gc.odin)
 // вызывает libc free() лишь в этом случае. GC-managed (заголовок нужен
 // для finalizer-паттерна, тот же приём, что File_Value/Socket_Value) —
@@ -182,7 +182,7 @@ Foreign_Function :: struct {
 	param_kinds:   []Foreign_Marshal_Kind,
 	return_kind:   Foreign_Marshal_Kind,
 	// Стадия 49: только когда return_kind == .Pointer — см.
-	// Foreign_Decl.return_owned/`владеет_я` (parser.odin).
+	// Foreign_Decl.return_owned/`свой` (parser.odin).
 	return_owned:  bool,
 	cif:           rawptr,
 	cif_ready:     bool,

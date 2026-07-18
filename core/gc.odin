@@ -475,8 +475,8 @@ pool_release :: proc(vm: ^VM, v: Value) {
 		append(&vm.gc.free_closures, val)
 	case ^Pointer_Value:
 		// Стадия 49 (FFI): освобождаем ТОЛЬКО если panos реально владеет
-		// памятью (см. Foreign_Decl.return_owned/`владеет_я`, parser.odin
-		// — default `владеет_C`, НЕ освобождать чужое). pointer_free —
+		// памятью (см. Foreign_Decl.return_owned/`свой`, parser.odin
+		// — default `чужой`, НЕ освобождать чужое). pointer_free —
 		// платформенный (vm_ffi_native.odin/vm_ffi_wasm.odin), тот же
 		// принцип, что close_file_value выше.
 		if val.owned {

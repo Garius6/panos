@@ -186,9 +186,9 @@ Foreign_Decl :: struct {
 	return_marshal: Foreign_Marshal_Kind,
 	return_pointee: Type_Node, // как Foreign_Param.pointee, только для возврата
 	// Стадия 49: постфикс владения ПОСЛЕ возвращаемого Указатель(T) —
-	// `владеет_я` (panos аллоцирует/освобождает через pool_release,
-	// libc free()) vs `владеет_C` (default — НИКОГДА не освобождать
-	// чужую память). Смысл только когда return_marshal == .Pointer.
+	// `свой` (panos аллоцирует/освобождает через pool_release, libc
+	// free()) vs `чужой` (default — НИКОГДА не освобождать чужую
+	// память). Смысл только когда return_marshal == .Pointer.
 	return_owned:  bool,
 	// Заполняется резолвером (dynlib.load_library + symbol_address) —
 	// компилятор читает напрямую отсюда при генерации Call_Foreign,
@@ -902,20 +902,19 @@ parse_foreign_marshal_type :: proc(p: ^Parser) -> (marshal: Foreign_Marshal_Kind
 }
 
 // Стадия 49: постфикс владения ПОСЛЕ Указатель(T) на возврате —
-// `владеет_я`/`владеет_C`, только строковое сравнение (не keyword),
-// тот же приём, что типы выше. Отсутствие суффикса — тоже валидно,
-// default `владеет_C` (безопасный: никогда не освобождать чужую
-// память).
+// `свой`/`чужой`, только строковое сравнение (не keyword), тот же
+// приём, что типы выше. Отсутствие суффикса — тоже валидно, default
+// `чужой` (безопасный: никогда не освобождать чужую память).
 parse_foreign_ownership_suffix :: proc(p: ^Parser) -> bool {
 	tok := peek_token(p.stream)
 	if tok.kind != .Ident {
 		return false
 	}
 	switch tok.data {
-	case "владеет_я":
+	case "свой":
 		next_token(p.stream)
 		return true
-	case "владеет_C":
+	case "чужой":
 		next_token(p.stream)
 		return false
 	}

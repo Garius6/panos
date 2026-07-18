@@ -6003,16 +6003,16 @@ test_ffi_cstring_return_strdup_round_trip :: proc(t: ^testing.T) {
 	testing.expectf(t, is_str && s.data == "привет мир", "cstring return: ожидалось 'привет мир', получено %v", result)
 }
 
-// Указатель(T) с владеет_я: malloc() возвращает опаковый handle,
+// Указатель(T) с постфиксом свой: malloc() возвращает опаковый handle,
 // хранится в переменной — не должно падать ни при построении
 // Pointer_Value, ни при GC-сборке (pool_release освобождает через libc
-// free(), т.к. владеет_я стоит явно). Несколько malloc подряд —
+// free(), т.к. свой стоит явно). Несколько malloc подряд —
 // проверяет, что пул/повторное использование объекта не портит новый
 // указатель.
 @(test)
 test_ffi_pointer_owned_malloc_does_not_crash :: proc(t: ^testing.T) {
 	result, ok := run_code(`
-		внешний "libc" функ malloc(размер: Целое(64)) -> Указатель(Целое) владеет_я
+		внешний "libc" функ malloc(размер: Целое(64)) -> Указатель(Целое) свой
 
 		функ старт() -> Целое
 			пер a = malloc(16)
@@ -6026,7 +6026,7 @@ test_ffi_pointer_owned_malloc_does_not_crash :: proc(t: ^testing.T) {
 	testing.expectf(t, is_num && f == 777.0, "pointer malloc: ожидалось 777, получено %v", result)
 }
 
-// Указатель(T) БЕЗ аннотации владения — default владеет_C, pool_release
+// Указатель(T) БЕЗ аннотации владения — default чужой, pool_release
 // НЕ должен пытаться free() чужую память (getenv() возвращает указатель
 // в область памяти окружения процесса, которую libc сама не ожидает
 // освобождённой вручную) — программа обязана завершиться штатно, а не

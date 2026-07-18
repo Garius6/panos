@@ -220,13 +220,22 @@ ensure_struct_offsets :: proc(struct_type: ^Type) {
 	if struct_type.ffi_offsets != nil {
 		return
 	}
+
 	context.allocator = vm_heap_allocator()
+
 	composite := (^Ffi_Type)(struct_type.ffi_composite)
 	offsets := make([]uint, len(struct_type.ffi_field_kinds))
-	status := ffi_get_struct_offsets(FFI_DEFAULT_ABI, composite, raw_data(offsets))
+
+	status := ffi_get_struct_offsets(ffi_default_abi(), composite, raw_data(offsets))
+
 	if status != FFI_OK {
-		fmt.panicf("Runtime Error: ffi_get_struct_offsets не удался для '%s' (status=%d)", struct_type.name, status)
+		fmt.panicf(
+			"Runtime Error: ffi_get_struct_offsets не удался для '%s' (status=%d)",
+			struct_type.name,
+			status,
+		)
 	}
+
 	struct_type.ffi_offsets = offsets
 }
 
@@ -236,7 +245,10 @@ ensure_struct_offsets :: proc(struct_type: ^Type) {
 // Function — но защищаемся от прямого вызова pack_ffi_struct в отрыве).
 ensure_struct_prepared :: proc(struct_type: ^Type) {
 	if struct_type.ffi_offsets == nil {
-		fmt.panicf("Compiler Error: ff_структура '%s' используется до prepare_foreign_cif", struct_type.name)
+		fmt.panicf(
+			"Compiler Error: ff_структура '%s' используется до prepare_foreign_cif",
+			struct_type.name,
+		)
 	}
 }
 
@@ -249,8 +261,14 @@ prepare_foreign_cif :: proc(ff: ^Foreign_Function) {
 	context.allocator = vm_heap_allocator()
 
 	cif := new(Ffi_Cif)
+
 	nargs := len(ff.param_kinds)
+
+	// ffi_cif хранит указатель на atypes, поэтому массив должен жить
+	// столько же, сколько Foreign_Function. Здесь используется
+	// постоянный heap, а не context.temp_allocator.
 	atypes := make([]^Ffi_Type, nargs)
+
 	for kind, i in ff.param_kinds {
 		if kind == .Struct {
 			atypes[i] = ensure_struct_composite(ff.param_struct_types[i])
@@ -258,26 +276,39 @@ prepare_foreign_cif :: proc(ff: ^Foreign_Function) {
 			atypes[i] = ffi_type_for_marshal(kind)
 		}
 	}
+
 	rtype: ^Ffi_Type
+
 	if ff.return_kind == .Struct {
 		rtype = ensure_struct_composite(ff.return_struct_type)
 	} else {
 		rtype = ffi_type_for_marshal(ff.return_kind)
 	}
-	status := ffi_prep_cif(cif, FFI_DEFAULT_ABI, u32(nargs), rtype, nargs > 0 ? raw_data(atypes) : nil)
+
+	abi := ffi_default_abi()
+
+	status := ffi_prep_cif(cif, abi, u32(nargs), rtype, nargs > 0 ? raw_data(atypes) : nil)
+
 	if status != FFI_OK {
-		fmt.panicf("Runtime Error: ffi_prep_cif не удался для '%s' (status=%d)", ff.name, status)
+		fmt.panicf(
+			"Runtime Error: ffi_prep_cif не удался для '%s' (abi=%d, status=%d)",
+			ff.name,
+			abi,
+			status,
+		)
 	}
+
 	ff.cif = rawptr(cif)
 	ff.cif_ready = true
 
-	// Стадия 51: offset'ы полей ТОЛЬКО ПОСЛЕ успешного ffi_prep_cif —
-	// size/alignment составных типов уже посчитаны libffi.
+	// После ffi_prep_cif libffi уже вычислила size/alignment
+	// составных типов.
 	for kind, i in ff.param_kinds {
 		if kind == .Struct {
 			ensure_struct_offsets(ff.param_struct_types[i])
 		}
 	}
+
 	if ff.return_kind == .Struct {
 		ensure_struct_offsets(ff.return_struct_type)
 	}

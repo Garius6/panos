@@ -1,66 +1,161 @@
-name: Собрать бинарники и приложить к релизу
+name: Собрать бинарники и создать релиз
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "*"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  verify-tag:
+    name: Проверить, что тег относится к main
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Получить репозиторий со всей историей
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Проверить tagged commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main:refs/remotes/origin/main
+
+          TAG_COMMIT="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then
+            echo "::error::Тег '$GITHUB_REF_NAME' указывает на commit $TAG_COMMIT, который не входит в ветку main."
+            exit 1
+          fi
+
+          echo "Тег '$GITHUB_REF_NAME' указывает на commit $TAG_COMMIT из ветки main."
+
   build:
+    name: Собрать ${{ matrix.suffix }}
+    needs: verify-tag
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || needs.verify-tag.result == 'success')
+
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             suffix: linux-amd64
             ext: ""
+
           - os: macos-14
             suffix: macos-arm64
             ext: ""
-          - os: windows-latest
+
+          - os: windows-2022
             suffix: windows-amd64
             ext: ".exe"
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
 
-      # Тот же тег релиза, что и в deploy-pages.yml — совпадает с локальным
-      # тулчейном, а не плавающий "nightly" (см. заметку там же про поломку
-      # из-за расхождения версий).
-      - uses: laytan/setup-odin@v2
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Установить Odin
+        uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           release: dev-2026-06
 
       - name: Собрать panos
-        run: odin build . -o:speed -out:panos${{ matrix.ext }}
-
-      - name: Собрать panos-lsp
-        run: odin build ./lsp -o:speed -out:panos-lsp${{ matrix.ext }}
-
-      - name: Упаковать бинарники под платформу
         shell: bash
         run: |
-          mkdir -p dist
-          cp panos${{ matrix.ext }} dist/panos-${{ matrix.suffix }}${{ matrix.ext }}
-          cp panos-lsp${{ matrix.ext }} dist/panos-lsp-${{ matrix.suffix }}${{ matrix.ext }}
+          set -euo pipefail
+          odin build . -o:speed -out:panos${{ matrix.ext }}
 
-      # workflow_dispatch (ручной прогон без реального релиза) — только
-      # для проверки, что сборка проходит на всех платформах; заливка
-      # в assets имеет смысл только когда есть реальный релиз-тег.
-      - name: Приложить к релизу
-        if: github.event_name == 'release'
+      - name: Собрать panos-lsp
         shell: bash
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          odin build ./lsp -o:speed -out:panos-lsp${{ matrix.ext }}
 
-      - name: Сохранить как build-артефакт (ручной прогон)
-        if: github.event_name != 'release'
+      - name: Подготовить файлы релиза
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          cp \
+            "panos${{ matrix.ext }}" \
+            "dist/panos-${{ matrix.suffix }}${{ matrix.ext }}"
+
+          cp \
+            "panos-lsp${{ matrix.ext }}" \
+            "dist/panos-lsp-${{ matrix.suffix }}${{ matrix.ext }}"
+
+      - name: Сохранить результат сборки
         uses: actions/upload-artifact@v4
         with:
           name: panos-${{ matrix.suffix }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Создать GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Скачать бинарники всех платформ
+        uses: actions/download-artifact@v4
+        with:
+          pattern: panos-*
+          path: dist
+          merge-multiple: true
+
+      - name: Проверить состав релиза
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f dist/panos-linux-amd64
+          test -f dist/panos-lsp-linux-amd64
+          test -f dist/panos-macos-arm64
+          test -f dist/panos-lsp-macos-arm64
+          test -f dist/panos-windows-amd64.exe
+          test -f dist/panos-lsp-windows-amd64.exe
+
+          find dist -maxdepth 1 -type f -print
+
+      - name: Создать релиз и приложить бинарники
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG"
+          fi         path: dist/*

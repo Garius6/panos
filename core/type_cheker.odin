@@ -1974,8 +1974,32 @@ ensure_body_checked :: proc(ctx: ^Type_Ctx, sym: Symbol_Id) {
 	check_decl_body(ctx, sym, d, func_type)
 }
 
+// Явные фазы typecheck_program. Раньше порядок 4 проходов был зафиксирован
+// только позицией функций в файле (см. type-checker review 2026-07-07,
+// P9: "порядок неявный, комментарии описывают его") — теперь порядок
+// задаёт ЭТОТ enum и цикл `for pass in Pass_Kind` в typecheck_program,
+// а не расположение typecheck_pass_*-процедур ниже.
+Pass_Kind :: enum {
+	Nominal,    // номинальные типы-заглушки для Struct/Interface/Enum
+	Signatures, // поля структур, сигнатуры функций/методов интерфейса, варианты enum
+	Impls,      // привязка `реализация`-блоков к структурам/перечислениям
+	Bodies,     // проверка тел функций и методов
+}
+
 typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
-	// ПРОХОД 1: создаем номинальные типы до разбора полей и сигнатур.
+	for pass in Pass_Kind {
+		switch pass {
+		case .Nominal:    typecheck_pass_nominal(ctx, prog)
+		case .Signatures: typecheck_pass_signatures(ctx, prog)
+		case .Impls:      typecheck_pass_impls(ctx, prog)
+		case .Bodies:     typecheck_pass_bodies(ctx, prog)
+		}
+	}
+}
+
+// ПРОХОД 1 (Pass_Kind.Nominal): создаём номинальные типы до разбора полей
+// и сигнатур.
+typecheck_pass_nominal :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Struct_Decl:
@@ -2026,8 +2050,11 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			ctx.res.symbol_types[enum_sym] = enum_type
 		}
 	}
+}
 
-	// ПРОХОД 2: заполняем структуры, интерфейсы и сигнатуры функций.
+// ПРОХОД 2 (Pass_Kind.Signatures): заполняем структуры, интерфейсы и
+// сигнатуры функций.
+typecheck_pass_signatures :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Struct_Decl:
@@ -2232,12 +2259,14 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			}
 		}
 	}
+}
 
-	// ПРОХОД 3: Привязка реализаций (методов и контрактов) к структурам и
-	// перечислениям. Интерфейсы перечисления реализовывать не могут —
-	// узкий scope, не design-ограничение языка (interface_method_types_match
-	// и остальной контрактный путь ниже писались и тестировались только
-	// под Struct-получатели).
+// ПРОХОД 3 (Pass_Kind.Impls): привязка реализаций (методов и контрактов) к
+// структурам и перечислениям. Интерфейсы перечисления реализовывать не
+// могут — узкий scope, не design-ограничение языка
+// (interface_method_types_match и остальной контрактный путь ниже писались
+// и тестировались только под Struct-получатели).
+typecheck_pass_impls :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Impl_Decl:
@@ -2453,8 +2482,10 @@ typecheck_program :: proc(ctx: ^Type_Ctx, prog: Program) {
 			}
 		}
 	}
+}
 
-	// ПРОХОД 4: Глубокая проверка тел всех функций и методов
+// ПРОХОД 4 (Pass_Kind.Bodies): глубокая проверка тел всех функций и методов.
+typecheck_pass_bodies :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Function_Decl:

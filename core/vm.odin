@@ -359,51 +359,68 @@ message_deep_copy :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]Value) -> 
 		if existing, ok := visited[val]; ok do return existing
 		cp := gc_new(vm, Option_Value)
 		visited[val] = Value(cp)
+		// cp ещё не привязан ни к одному корню (visited — обычная map, не
+		// GC-root, см. mark_roots) — protect'им перед рекурсией, которая
+		// сама может дернуть gc_new и триггернуть collect_garbage, пока
+		// cp наполовину заполнен.
+		gc_protect(vm, Value(cp))
 		cp.has_value = val.has_value
 		cp.value = message_deep_copy(vm, val.value, visited)
+		gc_unprotect(vm, 1)
 		return Value(cp)
 	case ^Result_Value:
 		if existing, ok := visited[val]; ok do return existing
 		cp := gc_new(vm, Result_Value)
 		visited[val] = Value(cp)
+		gc_protect(vm, Value(cp))
 		cp.is_ok = val.is_ok
 		cp.value = message_deep_copy(vm, val.value, visited)
 		cp.error = message_deep_copy(vm, val.error, visited)
+		gc_unprotect(vm, 1)
 		return Value(cp)
 	case ^Interface_Value:
 		if existing, ok := visited[val]; ok do return existing
 		cp := gc_new(vm, Interface_Value)
 		visited[val] = Value(cp)
+		gc_protect(vm, Value(cp))
 		cp.methods = val.methods
 		cp.data = message_deep_copy(vm, val.data, visited)
+		gc_unprotect(vm, 1)
 		return Value(cp)
 	case ^Variant_Value:
 		if existing, ok := visited[val]; ok do return existing
 		cp := gc_new(vm, Variant_Value)
 		visited[val] = Value(cp)
+		gc_protect(vm, Value(cp))
 		cp.type_name = val.type_name
 		cp.tag_index = val.tag_index
 		cp.fields = make([dynamic]Value, len(val.fields))
 		for f, i in val.fields do cp.fields[i] = message_deep_copy(vm, f, visited)
+		gc_unprotect(vm, 1)
 		return Value(cp)
 	case ^Aggregate_Value:
 		if existing, ok := visited[val]; ok do return existing
 		cp := gc_new(vm, Aggregate_Value)
 		visited[val] = Value(cp)
+		gc_protect(vm, Value(cp))
 		cp.elements = make([dynamic]Value, len(val.elements))
 		for el, i in val.elements do cp.elements[i] = message_deep_copy(vm, el, visited)
+		gc_unprotect(vm, 1)
 		return Value(cp)
 	case ^Array_Value:
 		if existing, ok := visited[val]; ok do return existing
 		cp := gc_new(vm, Array_Value)
 		visited[val] = Value(cp)
+		gc_protect(vm, Value(cp))
 		cp.elements = make([dynamic]Value, len(val.elements))
 		for el, i in val.elements do cp.elements[i] = message_deep_copy(vm, el, visited)
+		gc_unprotect(vm, 1)
 		return Value(cp)
 	case ^Map_Value:
 		if existing, ok := visited[val]; ok do return existing
 		cp := gc_new(vm, Map_Value)
 		visited[val] = Value(cp)
+		gc_protect(vm, Value(cp))
 		cp.entries = make([dynamic]Map_Entry_Value, len(val.entries))
 		for entry, i in val.entries {
 			cp.entries[i] = Map_Entry_Value {
@@ -411,6 +428,7 @@ message_deep_copy :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]Value) -> 
 				value = message_deep_copy(vm, entry.value, visited),
 			}
 		}
+		gc_unprotect(vm, 1)
 		return Value(cp)
 	case ^Closure_Value:
 		// Стадия 48 (замыкания): captured сам может содержать heap-
@@ -423,9 +441,11 @@ message_deep_copy :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]Value) -> 
 		if existing, ok := visited[val]; ok do return existing
 		cp := gc_new(vm, Closure_Value)
 		visited[val] = Value(cp)
+		gc_protect(vm, Value(cp))
 		cp.fn = val.fn
 		cp.captured = make([dynamic]Value, len(val.captured))
 		for c, i in val.captured do cp.captured[i] = message_deep_copy(vm, c, visited)
+		gc_unprotect(vm, 1)
 		return Value(cp)
 	}
 	// f64/bool/^Panos_String/^Compiled_Function/^File_Value/^Socket_Value/

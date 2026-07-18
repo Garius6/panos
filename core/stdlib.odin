@@ -41,6 +41,15 @@ builtin_function_type_3 :: proc(param_1: ^Type, param_2: ^Type, param_3: ^Type, 
 	return new_function_type(fn_params, return_type)
 }
 
+builtin_function_type_4 :: proc(param_1: ^Type, param_2: ^Type, param_3: ^Type, param_4: ^Type, return_type: ^Type) -> ^Type {
+	fn_params := make([dynamic]^Type)
+	append(&fn_params, param_1)
+	append(&fn_params, param_2)
+	append(&fn_params, param_3)
+	append(&fn_params, param_4)
+	return new_function_type(fn_params, return_type)
+}
+
 // Опция/Результат — обычные generic-enum'ы прелюдии, а не Type_Kind. Эти
 // два хелпера строят их напрямую через graph, а НЕ через ctx-based
 // new_option_type/new_result_type (type_cheker.odin): ensure_builtin_module
@@ -137,6 +146,24 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_2(TY_STRING, TY_NUM, stdlib_result_type(graph, TY_CONNECTION, TY_ERROR))
 	case "сеть::кодировать_url":
 		return builtin_function_type_1(TY_STRING, TY_STRING)
+	case "сеть::http_запрос":
+		// Настоящий HTTP(S)-клиент (external/odin-http, OpenSSL для https)
+		// вместо ручного сокет-парсинга в std/сеть/http.ps — корректно
+		// обрабатывает Content-Length/chunked encoding, поддерживает https.
+		// Результат: (статус, пары-заголовков, тело).
+		pair_fields := make([dynamic]^Type)
+		append(&pair_fields, TY_STRING, TY_STRING)
+		pair_type := new_tuple_type(pair_fields)
+		success_fields := make([dynamic]^Type)
+		append(&success_fields, TY_INT, new_array_type(pair_type), TY_STRING)
+		success_type := new_tuple_type(success_fields)
+		return builtin_function_type_4(
+			TY_STRING,
+			TY_STRING,
+			TY_STRING,
+			new_map_type(TY_STRING, TY_STRING),
+			stdlib_result_type(graph, success_type, TY_ERROR),
+		)
 	case "время::монотонно_мс":
 		return new_function_type(make([dynamic]^Type), TY_NUM)
 	case "время::сейчас_мс":
@@ -286,6 +313,12 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"кодировать_url",
 			builtin_export_type(graph, "сеть::кодировать_url"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"http_запрос",
+			builtin_export_type(graph, "сеть::http_запрос"),
 		)
 	} else if name == "время" {
 		add_builtin_export(

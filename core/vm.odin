@@ -918,6 +918,12 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	if result, ok, handled := call_builtin_compress(vm, name, args); handled {
 		return result, ok
 	}
+	// сеть::http_запрос — в vm_http_native.odin/vm_http_wasm.odin (#+build
+	// split, native тянет core:net + external/odin-http's openssl-биндинг,
+	// оба недоступны под js_wasm32).
+	if result, ok, handled := call_builtin_http(vm, name, args); handled {
+		return result, ok
+	}
 	switch name {
 	case "Ошибка":
 		expect_arg_count(name, len(args), 2)

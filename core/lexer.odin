@@ -96,10 +96,22 @@ read_identifier :: proc(l: ^Lexer) -> string {
 	return l.input[start:l.pos - l.width]
 }
 
+// Число: digits, опционально ".digits". '.' поглощается ТОЛЬКО если сразу
+// за ним идёт цифра — иначе это не десятичная точка, а начало ОТДЕЛЬНОГО
+// '.'-токена (property/tuple-index доступ). Без этой проверки `t.1.длина()`
+// (tuple-индекс 1, затем вызов метода) читался бы как один "числовой"
+// токен "1." — '.' перед 'длина' поглощался бы читалкой числа, вместо
+// того чтобы остаться отдельным Dot-токеном для парсера.
 read_number :: proc(l: ^Lexer) -> string {
 	start := l.pos - l.width
-	for unicode.is_digit(l.ch) || l.ch == '.' {
+	for unicode.is_digit(l.ch) {
 		advance(l)
+	}
+	if l.ch == '.' && unicode.is_digit(peek_char(l)) {
+		advance(l)
+		for unicode.is_digit(l.ch) {
+			advance(l)
+		}
 	}
 	return l.input[start:l.pos - l.width]
 }

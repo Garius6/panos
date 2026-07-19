@@ -183,6 +183,19 @@ resolve_and_typecheck_all :: proc(graph: ^Module_Graph) -> [dynamic]Module_Resul
 		for sym, scheme in last.tc_ctx.symbol_schemes {
 			graph.symbol_schemes[sym] = scheme
 		}
+		// Тот же мотив, что symbol_schemes выше — см. Module_Graph.decl_type_params.
+		if graph.decl_type_params == nil {
+			graph.decl_type_params = make(map[Symbol_Id]map[string]^Type)
+		}
+		for sym, params in last.tc_ctx.decl_type_params {
+			graph.decl_type_params[sym] = params
+		}
+		// См. Module_Graph.module_resolvers — &last.res_ctx стабилен
+		// (preallocated results, см. комментарий выше).
+		if graph.module_resolvers == nil {
+			graph.module_resolvers = make(map[^Module]^Resolver_Ctx)
+		}
+		graph.module_resolvers[module] = &last.res_ctx
 		// Стадия 45: тот же мотив/паттерн, что symbol_schemes выше — см.
 		// Module_Graph.process_message_types.
 		if graph.process_message_types == nil {

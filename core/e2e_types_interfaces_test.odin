@@ -1191,3 +1191,61 @@ test_bounded_generic_recursive_call_works :: proc(t: ^testing.T) {
 		testing.expectf(t, is_num && n == 9, "[bounded traits: рекурсия] ожидалось 9, получено %v", result)
 	}
 }
+
+// Bounded traits: произвольный МЕТОД пользовательского интерфейса (не
+// один из 5 built-in операторных — Сравниваемое/Складываемое/Вычитаемое/
+// Умножаемое/Делимое) через generic T. Раньше вызов a.метод() внутри
+// f[T: МойИнтерфейс] падал в type_cheker.odin с "попытка получить поле у
+// не-структуры" — obj_type.kind == .InferVar не имел своей ветки в
+// Property_Expr-диспетчеризации, только 5 built-in интерфейсов
+// проверялись напрямую в infer_binary_expr/infer_arithmetic_op.
+@(test)
+test_bounded_generic_custom_interface_method_call :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		тип МойИнтерфейс = интерфейс
+			функ значение() -> Целое
+		конец
+
+		тип Точка = структура
+			x: Целое
+		конец
+
+		реализация МойИнтерфейс для Точка
+			функ значение(это: Точка) -> Целое
+				это.x
+			конец
+		конец
+
+		функ вызвать[T: МойИнтерфейс](a: T) -> Целое
+			a.значение()
+		конец
+
+		функ старт() -> Целое
+			пер п = Точка(5)
+			вызвать(п)
+		конец
+	`)
+	testing.expectf(t, ok, "[bounded traits: свой метод] стек пуст")
+	if ok {
+		n, is_num := result.(f64)
+		testing.expectf(t, is_num && n == 5, "[bounded traits: свой метод] ожидалось 5, получено %v", result)
+	}
+}
+
+// Тот же произвольный интерфейсный метод через bounded generic, но САМА
+// generic-функция объявлена в ДРУГОМ модуле (module.f(...) вместо f(...))
+// — упражняет весь цепочка cross-module мономорфизации: Module_Graph.
+// decl_type_params/module_resolvers (см. resolver.odin/module_loader.
+// odin), generic_call_callee_sym (см. Type_Ctx, monomorphize.odin) и
+// monomorphize_one, использующий decl_res (резолвер МОДУЛЯ ОБЪЯВЛЕНИЯ
+// f), а не res (резолвер вызывающего модуля), для resolve_function_body/
+// comp.res/comp.locals клона.
+@(test)
+test_bounded_generic_interface_cross_module :: proc(t: ^testing.T) {
+	result, ok := run_module_file("fixtures/bounded_generic_iface_fixture_main.ps")
+	testing.expectf(t, ok, "[bounded traits: cross-module] стек пуст")
+	if ok {
+		n, is_num := result.(f64)
+		testing.expectf(t, is_num && n == 42, "[bounded traits: cross-module] ожидалось 42, получено %v", result)
+	}
+}

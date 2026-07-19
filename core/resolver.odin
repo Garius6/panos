@@ -104,6 +104,27 @@ Module_Graph :: struct {
 	// см. resolve_and_typecheck_all (module_loader.odin) и new_type_ctx
 	// (type_cheker.odin), тот же паттерн, что prelude_symbol_schemes.
 	symbol_schemes:   map[Symbol_Id]Type_Scheme,
+	// Тот же накопительный паттерн, что symbol_schemes выше — bounded
+	// generic-функция (`функ f[T: Интерфейс](...)`), вызванная через
+	// границу модуля (module.f(...)), нуждается в required_interfaces
+	// ИМЕННО ТОГО Type_Ctx, где f была объявлена (там required_
+	// interfaces резолвились по имени в ЕЁ global_scope, см.
+	// make_decl_type_params) — Type_Ctx.decl_type_params живёт в
+	// per-модульном tc_ctx (module_loader.odin создаёт свой на каждый
+	// модуль), без накопления здесь вызывающий модуль видел бы для f
+	// пустую decl_type_params[f] (nil map) и упал бы на nil-деréférence
+	// в infer_bounded_generic_call.
+	decl_type_params: map[Symbol_Id]map[string]^Type,
+	// Каждый модуль резолвится своим ОТДЕЛЬНЫМ Resolver_Ctx (module_loader.
+	// odin создаёт свежий на модуль) — monomorphize_one клонирует тело
+	// bounded generic-функции, объявленной МОГ БЫТЬ В ДРУГОМ модуле, чем
+	// вызывающий код (module.f(...)), и должен резолвить эту копию ТЕМ ЖЕ
+	// Resolver_Ctx, что и оригинал (иначе scope-цепочка ведёт не в тот
+	// модуль — идентификаторы вроде вызовов ДРУГИХ функций/типов ИЗ ТЕЛА f,
+	// которых нет в вызывающем модуле, не резолвятся). Указатели в
+	// resolve_and_typecheck_all стабильны (см. её комментарий про
+	// preallocated results) — можно смело хранить сюда &res_ctx.
+	module_resolvers: map[^Module]^Resolver_Ctx,
 	// Стадия 45: T процесса (см. Type_Ctx.process_message_types) каждой
 	// уже протипизированной функции графа — нужен для `запусти Модуль.
 	// функция(...)` (infer_spawn_expr): T процесса зависит только от

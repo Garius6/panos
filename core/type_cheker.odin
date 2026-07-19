@@ -942,6 +942,19 @@ Type_Ctx :: struct {
 	// инстанциации нужно скомпилировать, и compiler.odin — на call site
 	// нужен ключ инстанциации вместо обычного symbol_registry_key.
 	generic_call_instantiations: map[Expr][dynamic]^Type,
+	// callee_sym для КАЖДОГО ключа выше — monomorphize_program раньше
+	// заново выводил его из call_expr.callee через tc.res.node_symbols,
+	// что верно ТОЛЬКО для Ident_Expr callee (same-module вызов). У
+	// cross-module вызова (module.f(...)) callee — ^Property_Expr,
+	// node_symbols для него не заполняется (модульный доступ резолвится
+	// иначе, через imported_module.exports, см. infer_call_expr) —
+	// node_symbols дал бы INVALID_SYMBOL, и monomorphize_program тихо
+	// пропускал бы инстанциацию (симптом: "Compiler Error: инстанциация
+	// generic-функции ... не найдена"). infer_bounded_generic_call уже
+	// ПОЛУЧАЕТ верный callee_sym параметром (из обеих call-сайтов —
+	// same-module И cross-module) — сохраняем его здесь напрямую, вместо
+	// повторного вывода из AST.
+	generic_call_callee_sym:     map[Expr]Symbol_Id,
 	// true во время АБСТРАКТНОГО прохода тела generic-декларации
 	// (check_decl_body, T/E ещё decl-param InferVar) — см. пометку там.
 	// infer_bounded_generic_call читает: не удалось вывести конкретный тип
@@ -972,6 +985,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		symbol_to_func_decl = make(map[Symbol_Id]^Function_Decl),
 		checked_bodies = make(map[Symbol_Id]bool),
 		generic_call_instantiations = make(map[Expr][dynamic]^Type),
+		generic_call_callee_sym = make(map[Expr]Symbol_Id),
 		let_destructure_field_indices = make(map[Stmt][dynamic]int),
 	}
 	// Стадия 7 Phase F: см. Resolver_Ctx.prelude_generic_order — прелюдия
@@ -1000,6 +1014,10 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 	if res.module_graph != nil {
 		for sym, scheme in res.module_graph.symbol_schemes {
 			ctx.symbol_schemes[sym] = scheme
+		}
+		// Тот же мотив, что symbol_schemes выше — см. Module_Graph.decl_type_params.
+		for sym, params in res.module_graph.decl_type_params {
+			ctx.decl_type_params[sym] = params
 		}
 		// Стадия 45: T процессов уже протипизированных модулей графа —
 		// без этого `запусти Модуль.функция(...)`, где функция сама
@@ -3955,6 +3973,43 @@ type_satisfies_interface :: proc(ctx: ^Type_Ctx, t: ^Type, iface_sym: Symbol_Id)
 	return implements_prelude_interface(ctx, t, iface_sym)
 }
 
+// Тот же контракт, что type_satisfies_interface, но принимает УЖЕ
+// резолвленный ^Type интерфейса напрямую вместо Symbol_Id — нужен для
+// bounded generic вызовов через ГРАНИЦУ МОДУЛЯ (module.f(...) откуда f
+// bounded-generic), где имя интерфейса из fn_decl.type_param_bounds
+// резолвилось В МОДУЛЕ ОБЪЯВЛЕНИЯ f (см. required_interfaces у
+// template_var, make_decl_type_params) — повторный lookup_symbol(ctx.
+// res.global_scope, ...) в infer_bounded_generic_call искал бы имя в
+// ГЛОБАЛЬНОЙ ОБЛАСТИ ВЫЗЫВАЮЩЕГО модуля, где неквалифицированное имя
+// чужого интерфейса обычно не резолвится вовсе (виден только как
+// alias.Интерфейс). ^Type — тот же указатель независимо от модуля,
+// смотрящего на него (см. cross-module identity прелюдии, prelude.odin).
+type_satisfies_resolved_interface :: proc(ctx: ^Type_Ctx, t: ^Type, iface_type: ^Type) -> bool {
+	t := prune_type(t)
+	if iface_type == nil do return false
+	if t.kind == .InferVar && t.is_decl_param {
+		for req in t.required_interfaces {
+			if req == iface_type do return true
+		}
+		return false
+	}
+	if (t == TY_NUM || t == TY_INT || t == TY_STRING) &&
+	   (iface_type == ctx.res.symbol_types[ctx.res.prelude_comparable_sym] ||
+			   iface_type == ctx.res.symbol_types[ctx.res.prelude_addable_sym]) {
+		return true
+	}
+	if (t == TY_NUM || t == TY_INT) &&
+	   (iface_type == ctx.res.symbol_types[ctx.res.prelude_subtractable_sym] ||
+			   iface_type == ctx.res.symbol_types[ctx.res.prelude_multipliable_sym] ||
+			   iface_type == ctx.res.symbol_types[ctx.res.prelude_divisible_sym]) {
+		return true
+	}
+	for impl in t.implemented_interfaces {
+		if impl == iface_type do return true
+	}
+	return false
+}
+
 // Стадия 23: left_t уже подтверждён implements_prelude_interface(iface_sym)
 // — общий хвост для +/-/*// sugar: проверить, что right_t == left_t (та же
 // схема, что Стадия 22's Сравниваемое — оба операнда одного Self-типа),
@@ -4620,25 +4675,32 @@ infer_bounded_generic_call :: proc(
 				fn_decl.name,
 			)
 		}
-		if bound_names, has_bounds := fn_decl.type_param_bounds[name]; has_bounds {
-			for iface_name in bound_names {
-				iface_sym := lookup_symbol(ctx.res.global_scope, intern(iface_name))
-				if !type_satisfies_interface(ctx, concrete, iface_sym) {
-					report(
-						ctx,
-						e.span,
-						"Type Error: тип '%s' не реализует '%s', требуется для type-параметра '%s' функции '%s'",
-						concrete.name,
-						iface_name,
-						name,
-						fn_decl.name,
-					)
-				}
+		// required_interfaces у template_var — УЖЕ резолвленные ^Type
+		// (make_decl_type_params резолвила их именами В МОДУЛЕ ОБЪЯВЛЕНИЯ
+		// generic-функции, см. там же). Используем их напрямую, а не
+		// bound_names+lookup_symbol(ctx.res.global_scope, ...) — при
+		// cross-module вызове (toml.разобрать_в(...) откуда-то извне)
+		// ctx.res здесь — резолвер ВЫЗЫВАЮЩЕГО модуля, где голое имя
+		// интерфейса (без alias.) обычно не резолвится вообще (виден
+		// только квалифицированно). type_satisfies_resolved_interface
+		// ниже проверяет ^Type напрямую, без ре-резолва по имени.
+		for iface_type in template_var.required_interfaces {
+			if !type_satisfies_resolved_interface(ctx, concrete, iface_type) {
+				report(
+					ctx,
+					e.span,
+					"Type Error: тип '%s' не реализует '%s', требуется для type-параметра '%s' функции '%s'",
+					concrete.name,
+					iface_type.name,
+					name,
+					fn_decl.name,
+				)
 			}
 		}
 		append(&concrete_types, concrete)
 	}
 	ctx.generic_call_instantiations[expr] = concrete_types
+	ctx.generic_call_callee_sym[expr] = callee_sym
 	return prune_type(instantiated.return_type)
 }
 
@@ -4755,6 +4817,18 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				}
 				#partial switch export_type.kind {
 				case .Function:
+					// Bounded generic (`функ f[T: Интерфейс](...)`) экспортированная
+					// из ДРУГОГО модуля — тот же путь мономорфизации, что и
+					// same-file вызов (infer_bounded_generic_call), иначе ниже эта
+					// функция типизировалась бы как обычный (не-bounded) generic:
+					// bound не проверился бы вообще, а компилятор попытался бы
+					// впрямую сослаться на никогда-не-компилируемый generic-шаблон
+					// (см. monomorphize.odin) и упал бы с "нельзя использовать как
+					// значение".
+					if fn_decl, has_fn_decl := export_sym.decl.(^Function_Decl);
+					   has_fn_decl && len(fn_decl.type_param_bounds) > 0 {
+						return infer_bounded_generic_call(ctx, expr, e, export_sym_id, fn_decl)
+					}
 					if len(e.arg_names) > 0 {
 						fn_decl, has_fn_decl := export_sym.decl.(^Function_Decl)
 						if !has_fn_decl {
@@ -5039,6 +5113,49 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 					prop_expr.property,
 				)
 			}
+		} else if obj_type.kind == .InferVar && obj_type.is_decl_param {
+			// Bounded generic-параметр (`функ f[T: МойИнтерфейс](a: T)`) —
+			// произвольный метод, объявленный в ЛЮБОМ из required_
+			// interfaces, а не только у 5 спец-интерфейсов с operator-sugar
+			// (Сравниваемое и арифметика, см. type_satisfies_interface).
+			// Тот же .Method_Interface (динамическая диспетчеризация по
+			// имени, .Interface-ветка выше) — этот АБСТРАКТНЫЙ проход
+			// (T ещё InferVar) сам никогда не компилируется: реальный вызов
+			// живёт в клоне monomorphize_one, где T УЖЕ конкретный Struct/
+			// Enum и обычная .Struct/.Enum-ветка выше отрабатывает как для
+			// не-generic кода. Здесь важна только структурная валидность
+			// (аргументы/возврат), не кодогенерация.
+			found_method_type: ^Type
+			found_method := false
+			for iface in obj_type.required_interfaces {
+				if mt, exists := iface.interface_methods[prop_expr.property]; exists {
+					found_method_type = mt
+					found_method = true
+					break
+				}
+			}
+			if !found_method {
+				return report(
+					ctx,
+					e.span,
+					"Type Error: ни один из bound-интерфейсов type-параметра не объявляет метод '%s'",
+					prop_expr.property,
+				)
+			}
+			if len(e.arg_names) > 0 {
+				return report(
+					ctx,
+					e.span,
+					"Type Error: именованные аргументы не поддержаны для generic-интерфейсных вызовов",
+				)
+			}
+			if len(e.args) != len(found_method_type.params) - 1 {
+				return report(ctx, e.span, "Ожидалось %d аргументов", len(found_method_type.params) - 1)
+			}
+			for arg, i in e.args do check_expr(ctx, arg, found_method_type.params[i + 1])
+			ctx.call_infos[expr] = Call_Info{kind = .Method_Interface, text_name = prop_expr.property}
+			return prune_type(found_method_type.return_type)
+
 		} else if obj_type.kind == .Process {
 			// Стадия 38 (monitor): .номер() — единственный метод на
 			// Процесс(T) пока что, даёт id для сравнения с сигналами

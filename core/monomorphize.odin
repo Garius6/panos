@@ -48,18 +48,44 @@ monomorphize_one :: proc(
 	clone := clone_function_decl(fn_decl)
 	module := symbol_at(res.symbol_store, callee_sym).module
 
-	resolve_function_body(res, module, Decls(clone), clone.args[:], clone.body)
+	// Cross-module bounded generic (module.f(...), см. Module_Graph.
+	// module_resolvers): f объявлена в ДРУГОМ модуле, со СВОИМ
+	// Resolver_Ctx/global_scope — резолвить и типизировать клон нужно ТЕМ
+	// ЖЕ резолвером, что и оригинал f, иначе имена, живущие только в её
+	// модуле (другие функции/типы, которые f вызывает в своём теле), не
+	// найдутся через global_scope ВЫЗЫВАЮЩЕГО модуля. Для same-module
+	// вызова module_resolvers[module] == res, подмена — no-op.
+	decl_res := res
+	if res.module_graph != nil {
+		if found, ok := res.module_graph.module_resolvers[module]; ok {
+			decl_res = found
+		}
+		// decl_res мог быть "заморожен" resolve_module ДАВНО (TOML мог
+		// резолвиться одним из первых модулей графа) — его .symbol_types
+		// с тех пор мог отстать от текущего (Odin-карты не гарантированно
+		// аліасятся ПОСЛЕ реаллокации при росте, см. тот же мотив у
+		// method_lookup выше и в resolve_module). res.module_graph.
+		// symbol_types — единственный ГАРАНТИРОВАННО актуальный источник
+		// на момент компиляции (resolve_and_typecheck_all уже завершила
+		// ВСЕ модули, дальше карта не растёт).
+		decl_res.symbol_types = res.module_graph.symbol_types
+	}
+
+	resolve_function_body(decl_res, module, Decls(clone), clone.args[:], clone.body)
 
 	subst := make(map[string]^Type)
 	for name, i in fn_decl.type_params do subst[name] = concrete_types[i]
-	prev := tc.current_type_params
+	prev_params := tc.current_type_params
+	prev_res := tc.res
 	tc.current_type_params = subst
+	tc.res = decl_res
 
 	func_type := function_type_from_decl(tc, clone)
 	bind_function_args(tc, clone, func_type)
 	check_function_body(tc, clone.span, clone.body, func_type.return_type)
 
-	tc.current_type_params = prev
+	tc.current_type_params = prev_params
+	tc.res = prev_res
 
 	fn := new(Compiled_Function)
 	fn.name = key
@@ -72,10 +98,24 @@ monomorphize_one :: proc(
 		registry         = registry,
 		current_function = fn,
 		tc               = tc,
-		res              = res,
+		// decl_res, НЕ res — node_symbols (Ident_Expr -> Symbol_Id для
+		// каждого узла клона) писались resolve_function_body ВЫШЕ ИМЕННО
+		// В decl_res.node_symbols (per-Resolver_Ctx карта, см. Module_Graph.
+		// module_resolvers) — compile_expr читает через comp.res.
+		// node_symbols напрямую, а не через comp.tc.res, так что подмены
+		// tc.res=decl_res (выше, для typecheck) недостаточно САМОЙ ПО СЕБЕ:
+		// её restore (tc.res = prev_res сразу после check_function_body)
+		// произошёл бы ДО того, как comp вообще собран — без этого поля
+		// здесь compile_expr искал бы символы клона в res.node_symbols
+		// (карта ВЫЗЫВАЮЩЕГО модуля), находил бы INVALID_SYMBOL и падал
+		// "символ '' не найден" на первой же ссылке клона на ЧУЖОЕ ДЛЯ
+		// вызывающего модуля имя (напр. другую top-level функцию f).
+		res              = decl_res,
 		locals           = make([dynamic]Local),
 	}
-	if args_syms, ok := res.func_args[Decls(clone)]; ok {
+	// decl_res, НЕ res — тот же мотив, что у comp.res выше: func_args[key]
+	// писала resolve_function_body(decl_res, ...) В decl_res.func_args.
+	if args_syms, ok := decl_res.func_args[Decls(clone)]; ok {
 		for s in args_syms do append(&comp.locals, Local{symbol = s, depth = 0})
 	}
 	comp.current_function.frame_size = len(comp.locals)
@@ -103,10 +143,23 @@ monomorphize_program :: proc(res: ^Resolver_Ctx, tc: ^Type_Ctx, registry: ^map[s
 	for {
 		pending := make([dynamic]Pending)
 		for call_expr, concrete_types in tc.generic_call_instantiations {
-			call, is_call := call_expr.(^Call_Expr)
+			_, is_call := call_expr.(^Call_Expr)
 			if !is_call do continue
-			callee_sym := tc.res.node_symbols[call.callee]
-			fn_decl, has_decl := tc.symbol_to_func_decl[callee_sym]
+			// tc.res.node_symbols[call.callee] здесь раньше не находило бы
+			// callee_sym для cross-module вызова (module.f(...) — callee это
+			// ^Property_Expr, не резолвится через node_symbols вообще, см.
+			// Type_Ctx.generic_call_callee_sym) — саму инстанциацию тихо
+			// пропустили бы, а compiler.odin потом падал бы "инстанциация не
+			// найдена". generic_call_callee_sym пишется В ТОМ ЖЕ месте
+			// (infer_bounded_generic_call), что и generic_call_instantiations —
+			// гарантированно есть запись для любого ключа этой карты.
+			callee_sym := tc.generic_call_callee_sym[call_expr]
+			// tc.symbol_to_func_decl (per-модульная карта, см. Type_Ctx) не
+			// содержала бы cross-module callee_sym (объявлен в ДРУГОМ
+			// модуле, со СВОИМ tc_ctx, см. module_loader.odin) — Symbol.decl
+			// же выставляется на этапе resolve (единый symbol_store на весь
+			// граф), доступен независимо от того, чей это tc.
+			fn_decl, has_decl := symbol_at(tc.res.symbol_store, callee_sym).decl.(^Function_Decl)
 			if !has_decl do continue
 			key := build_instantiation_key(tc.res.symbol_store, callee_sym, concrete_types)
 			if processed[key] do continue

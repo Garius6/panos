@@ -97,6 +97,15 @@ test_json_stdlib :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_toml_stdlib :: proc(t: ^testing.T) {
+	result, ok := run_module_file("fixtures/toml_fixture_main.ps")
+	testing.expectf(t, ok, "toml: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(true), "toml: ожидалось true, получено %v", result)
+}
+
+@(test)
 test_test_stdlib :: proc(t: ^testing.T) {
 	result, ok := run_module_file("fixtures/test_fixture_main.ps")
 	testing.expectf(t, ok, "тест: стек пуст, нет результата")

@@ -308,9 +308,20 @@ handle_hover :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 		return
 	}
 
+	// Докстринг (`///`, см. Function_Decl.doc/decl_doc_comment) — тот же
+	// путь к декларации, что handle_definition (node_symbols -> Symbol.decl),
+	// добавляется под типом отдельным абзацем, если есть.
+	hover_text := core.prune_type(typ).name
+	if sym_id, has_sym := doc.res_ctx.node_symbols[expr]; has_sym && sym_id != core.INVALID_SYMBOL {
+		sym := core.symbol_at(doc.res_ctx.symbol_store, sym_id)
+		if doc_comment := core.decl_doc_comment(sym.decl); doc_comment != "" {
+			hover_text = fmt.tprintf("%s\n\n%s", hover_text, doc_comment)
+		}
+	}
+
 	sp := core.expr_span(expr)
 	result := proto.Hover {
-		contents = proto.MarkupContent{kind = proto.MarkupKind_PlainText, value = core.prune_type(typ).name},
+		contents = proto.MarkupContent{kind = proto.MarkupKind_PlainText, value = hover_text},
 		range = lsp_range(doc.source, sp.start, sp.end),
 	}
 	send_response(id, result)

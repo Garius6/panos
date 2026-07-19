@@ -54,6 +54,11 @@ Parser_Error :: enum {
 Function_Decl :: struct {
 	span:        Span,
 	name:        string,
+	// Текст `///`-докстринга непосредственно над декларацией (включая
+	// строку с `экспорт`, если она есть) — пусто, если его не было. См.
+	// Token.doc/skip_whitespace_and_comments (lexer.odin). Используется
+	// LSP hover'ом (lsp/), на компиляцию не влияет.
+	doc:         string,
 	// Имена type-параметров из `[T, U]` после имени функции. Пусто для
 	// обычных (не-generic) функций.
 	type_params: [dynamic]string,
@@ -85,6 +90,8 @@ Method_Signature :: struct {
 Interface_Decl :: struct {
 	span:        Span,
 	name:        string,
+	// См. Function_Decl.doc.
+	doc:         string,
 	// Стадия 28: имена type-параметров из `[T]` после имени интерфейса
 	// (та же форма, что Struct_Decl.type_params). Пусто для обычных
 	// (не-generic) интерфейсов.
@@ -108,6 +115,8 @@ Field_Decl :: struct {
 Struct_Decl :: struct {
 	span:        Span,
 	name:        string,
+	// См. Function_Decl.doc.
+	doc:         string,
 	// Имена type-параметров из `[A, B]` после имени структуры. Пусто для
 	// обычных (не-generic) структур.
 	type_params: [dynamic]string,
@@ -137,6 +146,8 @@ Variant_Decl :: struct {
 Enum_Decl :: struct {
 	span:        Span,
 	name:        string,
+	// См. Function_Decl.doc.
+	doc:         string,
 	// Имена type-параметров из `[T]` после имени enum'а. Пусто для обычных
 	// (не-generic) перечислений.
 	type_params: [dynamic]string,
@@ -251,6 +262,25 @@ Decls :: union {
 	^Enum_Decl,
 	^Error_Decl,
 	^Foreign_Decl,
+}
+
+// Докстринг декларации (см. Function_Decl.doc и т.п.) — "" для видов
+// декларации, у которых его нет (Import/Impl/Error/Foreign). Используется
+// LSP hover'ом (lsp/lsp_server.odin::handle_hover) через Symbol.decl.
+decl_doc_comment :: proc(d: Decls) -> string {
+	switch v in d {
+	case ^Function_Decl:
+		return v.doc
+	case ^Struct_Decl:
+		return v.doc
+	case ^Interface_Decl:
+		return v.doc
+	case ^Enum_Decl:
+		return v.doc
+	case ^Import_Decl, ^Impl_Decl, ^Error_Decl, ^Foreign_Decl:
+		return ""
+	}
+	return ""
 }
 
 Program :: struct {
@@ -728,6 +758,13 @@ parse_program :: proc(p: ^Parser) -> Program {
 	}
 
 	for peek_token(p.stream).kind != .EOF {
+		// Докстринг (см. Function_Decl.doc) висит на ПЕРВОМ токене всей
+		// декларации — им может быть сам `экспорт`, если он есть (докстринг
+		// пишется НАД `экспорт функ ...`, не между `экспорт` и `функ`), так
+		// что берём его ДО проверки .Export ниже, иначе для экспортированных
+		// деклараций он терялся бы (был бы виден только на уже съеденном
+		// .Export-токене).
+		doc := peek_token(p.stream).doc
 		is_exported := false
 		if peek_token(p.stream).kind == .Export {
 			next_token(p.stream)
@@ -742,7 +779,7 @@ parse_program :: proc(p: ^Parser) -> Program {
 			decl := parse_import_decl(p)
 			append(&prog.decls, decl)
 		} else if tok_kind == .Function {
-			decl := parse_function(p, is_exported)
+			decl := parse_function(p, is_exported, doc)
 			append(&prog.decls, decl)
 		} else if tok_kind == .TypeDecl {
 			// Бывает короче 4 токенов у оборванного файла ("тип X" в самом
@@ -768,13 +805,13 @@ parse_program :: proc(p: ^Parser) -> Program {
 			// токен сразу после него.
 			third_kind := peek_type_decl_body_kind(p)
 			if third_kind == .Struct {
-				decl := parse_struct_decl(p, is_exported)
+				decl := parse_struct_decl(p, is_exported, doc)
 				append(&prog.decls, decl)
 			} else if third_kind == .Enum {
-				decl := parse_enum_decl(p, is_exported)
+				decl := parse_enum_decl(p, is_exported, doc)
 				append(&prog.decls, decl)
 			} else if third_kind == .Interface {
-				decl := parse_interface_decl(p, is_exported)
+				decl := parse_interface_decl(p, is_exported, doc)
 				append(&prog.decls, decl)
 			} else if third_kind == .FFStruct {
 				decl := parse_ffi_struct_decl(p, is_exported)
@@ -992,7 +1029,7 @@ parse_foreign_ownership_suffix :: proc(p: ^Parser) -> bool {
 	return false
 }
 
-parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
+parse_enum_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Enum_Decl {
 	start := peek_token(p.stream).span
 	expect(p, .TypeDecl)
 
@@ -1008,6 +1045,7 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
 
 	decl := new(Enum_Decl)
 	decl.name = name_tok.data
+	decl.doc = doc
 	decl.is_exported = is_exported
 	decl.variants = make([dynamic]Variant_Decl)
 
@@ -1090,10 +1128,11 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool) -> ^Enum_Decl {
 	return decl
 }
 
-parse_interface_decl :: proc(p: ^Parser, is_exported: bool) -> ^Interface_Decl {
+parse_interface_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Interface_Decl {
 	start := peek_token(p.stream).span
 	expect(p, .TypeDecl)
 	decl := new(Interface_Decl)
+	decl.doc = doc
 	decl.methods = make([dynamic]Method_Signature)
 	decl.is_exported = is_exported
 
@@ -1183,7 +1222,8 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 			continue
 		}
 
-		method := parse_function(p, false)
+		method_doc := peek_token(p.stream).doc
+		method := parse_function(p, false, method_doc)
 		if len(method.args) == 0 || method.args[0].name != "это" {
 			report_parse(
 				p,
@@ -1207,10 +1247,11 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 	return decl
 }
 
-parse_function :: proc(p: ^Parser, is_exported: bool) -> ^Function_Decl {
+parse_function :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Function_Decl {
 	start := peek_token(p.stream).span
 	expect(p, .Function)
 	function := new(Function_Decl)
+	function.doc = doc
 	function.body = make([dynamic]Stmt)
 	function.is_exported = is_exported
 
@@ -1390,11 +1431,12 @@ parse_optional_return_type :: proc(p: ^Parser) -> Type_Node {
 	return parse_type(p)
 }
 
-parse_struct_decl :: proc(p: ^Parser, is_exported: bool) -> ^Struct_Decl {
+parse_struct_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Struct_Decl {
 	start := peek_token(p.stream).span
 	expect(p, .TypeDecl)
 
 	decl := new(Struct_Decl)
+	decl.doc = doc
 	decl.fields = make([dynamic]Field_Decl)
 	decl.is_exported = is_exported
 

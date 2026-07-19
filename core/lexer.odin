@@ -66,26 +66,49 @@ peek_char :: proc(l: ^Lexer) -> rune {
 	return r
 }
 
-// Возвращает true, если в пропущенном whitespace встретился перевод
-// строки — используется парсером для различения `Массив(Число)` (генерик)
-// от `(...)`, начинающего новый statement на следующей строке (см. Token.nl_before).
-skip_whitespace_and_comments :: proc(l: ^Lexer) -> bool {
-	saw_newline := false
+// Возвращает (saw_newline, doc) — saw_newline: true, если в пропущенном
+// whitespace встретился перевод строки (см. Token.nl_before). doc:
+// текст ближайшего НЕПРЕРЫВНОГО блока `///`-строк прямо перед следующим
+// токеном (docstring), пусто если такого блока не было.
+//
+// "Непрерывный" — ни одной пустой строки ни ВНУТРИ блока, ни МЕЖДУ его
+// последней строкой и следующим токеном; обычный `//`-комментарий или
+// пустая строка сбрасывают накопленное (см. newline_run). Разделение с
+// плоским счётчиком новых строк вместо стека/состояний — самая простая
+// схема, покрывающая нужный случай (docstring вплотную над декларацией),
+// без попытки поддержать более сложные разметки.
+skip_whitespace_and_comments :: proc(l: ^Lexer) -> (saw_newline: bool, doc: string) {
+	doc_lines: [dynamic]string
+	newline_run := 0
 	for {
 		if unicode.is_space(l.ch) {
-			if l.ch == '\n' do saw_newline = true
+			if l.ch == '\n' {
+				saw_newline = true
+				newline_run += 1
+				if newline_run >= 2 do clear(&doc_lines)
+			}
 			advance(l)
 		} else if l.ch == '/' && peek_char(l) == '/' {
 			advance(l)
 			advance(l)
+			is_doc := l.ch == '/'
+			if is_doc do advance(l)
+			start := l.pos - l.width
 			for l.ch != '\n' && l.ch != 0 {
 				advance(l)
 			}
+			if is_doc {
+				append(&doc_lines, strings.trim_space(l.input[start:l.pos - l.width]))
+			} else {
+				clear(&doc_lines)
+			}
+			newline_run = 0
 		} else {
 			break
 		}
 	}
-	return saw_newline
+	doc = strings.join(doc_lines[:], "\n")
+	return
 }
 
 read_identifier :: proc(l: ^Lexer) -> string {
@@ -269,7 +292,7 @@ lookup_ident :: proc(ident: string) -> TokenKind {
 // лексера "дыра" — это просто исчезновение символа из потока.
 next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 	for {
-	nl_before := skip_whitespace_and_comments(l)
+	nl_before, doc := skip_whitespace_and_comments(l)
 
 	start_pos := l.pos - l.width
 	tok: Token
@@ -462,6 +485,7 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 	end_pos := l.pos - l.width
 	tok.span = Span{file_id = file_id, start = u32(start_pos), end = u32(end_pos)}
 	tok.nl_before = nl_before
+	tok.doc = doc
 	return tok
 	}
 }

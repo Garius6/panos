@@ -75,7 +75,36 @@ lsp_write_message :: proc(v: $T) -> bool {
 		return false
 	}
 	defer delete(data)
-	fmt.printf("Content-Length: %d\r\n\r\n", len(data))
-	os.write(os.stdout, data)
+	// ОДНИМ os.write, а не fmt.printf(заголовок) + отдельный os.write(тело) —
+	// два раздельных вызова шли через разные пути (fmt.printf форматирует в
+	// context.temp_allocator и пишет через os.stdout своим путём, os.write
+	// ниже — напрямую в fd) и МОГЛИ физически попасть в pipe не в том
+	// порядке/не сразу: клиент получал первое уведомление, а следующие
+	// зависали в stdout, пока их не "проталкивал" следующий read/write цикл
+	// (напр. ещё один запрос от клиента) — см. commit message. Один вызов
+	// исключает и порядок, и любую частичную буферизацию между вызовами.
+	header := fmt.tprintf("Content-Length: %d\r\n\r\n", len(data))
+	message := make([]byte, len(header) + len(data), context.temp_allocator)
+	copy(message, header)
+	copy(message[len(header):], data)
+
+	// os.write — тонкая обёртка над write(2), одним вызовом пишет СКОЛЬКО
+	// УСПЕЕТ, не обязательно всё — на pipe для сообщений больше PIPE_BUF
+	// (512 байт на Darwin) это НЕ атомарно и может дать короткую запись
+	// без ошибки. Без цикла остаток кадра терялся бы молча: клиент считал
+	// бы Content-Length по обещанным N байтам, недополучал бы часть и
+	// зависал в ожидании остального — а все СЛЕДУЮЩИЕ сообщения на этом же
+	// stdout после такого обрыва уже никогда не распознавались бы как
+	// валидный кадр (см. commit message). Тот же приём, что уже есть на
+	// стороне чтения (lsp_read_message ниже, цикл "n_read < content_length").
+	written := 0
+	for written < len(message) {
+		n, werr := os.write(os.stdout, message[written:])
+		if werr != nil || n <= 0 {
+			fmt.eprintln("panos-lsp: ошибка записи сообщения:", werr)
+			return false
+		}
+		written += n
+	}
 	return true
 }

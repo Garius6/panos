@@ -83,8 +83,14 @@ lsp_write_message :: proc(v: $T) -> bool {
 	// зависали в stdout, пока их не "проталкивал" следующий read/write цикл
 	// (напр. ещё один запрос от клиента) — см. commit message. Один вызов
 	// исключает и порядок, и любую частичную буферизацию между вызовами.
-	header := fmt.tprintf("Content-Length: %d\r\n\r\n", len(data))
-	message := make([]byte, len(header) + len(data), context.temp_allocator)
+	// context.allocator (не temp_allocator) — сообщение публикуется ПОСЛЕ
+	// тяжёлого typecheck-прохода, который сам активно пользуется temp_
+	// allocator'ом (fmt.tprintf и т.п. по всему core); формировать кадр
+	// сообщения на том же арене сразу после такой нагрузки было ненадёжно.
+	header := fmt.aprintf("Content-Length: %d\r\n\r\n", len(data))
+	defer delete(header)
+	message := make([]byte, len(header) + len(data))
+	defer delete(message)
 	copy(message, header)
 	copy(message[len(header):], data)
 

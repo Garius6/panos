@@ -1410,6 +1410,64 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 			buf[i] = u8(n)
 		}
 		return Value(gc_new_string(vm, string(buf))), true
+
+	case "строки::в_байты":
+		// Обратное к из_байтов — все байты строки одним вызовом (Go
+		// `[]byte(s)`), а не по одному через строки.байт(s, i) в цикле.
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		arr := gc_new(vm, Array_Value)
+		gc_protect(vm, Value(arr))
+		arr.elements = make([dynamic]Value, 0, len(text))
+		for i := 0; i < len(text); i += 1 {
+			append(&arr.elements, Value(f64(text[i])))
+		}
+		gc_unprotect(vm, 1)
+		return Value(arr), true
+
+	case "строки::кодовая_точка":
+		// Codepoint-значение ПЕРВОЙ руны строки (Go: `rune(s[0])` при
+		// range по строке) — принимает как однорунные срезы (типичный
+		// вход: text[i]), так и многорунные (просто игнорирует остаток,
+		// как first_rune везде в этом файле).
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		return Value(f64(first_rune(text))), true
+
+	case "строки::в_руны":
+		// Строка -> Массив(Целое) codepoint-значений (Go `[]rune(s)`).
+		expect_arg_count(name, len(args), 1)
+		text := expect_string_arg(name, args[0])
+		arr := gc_new(vm, Array_Value)
+		gc_protect(vm, Value(arr))
+		arr.elements = make([dynamic]Value)
+		for i := 0; i < len(text); {
+			r, width := utf8.decode_rune_in_string(text[i:])
+			append(&arr.elements, Value(f64(r)))
+			i += width
+		}
+		gc_unprotect(vm, 1)
+		return Value(arr), true
+
+	case "строки::из_рун":
+		// Обратное к в_руны — Массив(Целое) codepoint'ов -> Строка (Go
+		// `string([]rune{...})`). Тот же UTF-8-энкодинг, что panos-код
+		// был вынужден писать руками (см. std/кодирование/toml.ps
+		// \u-эскейпы) — здесь через core:unicode/utf8 напрямую.
+		expect_arg_count(name, len(args), 1)
+		arr, is_arr := args[0].(^Array_Value)
+		if !is_arr {
+			fmt.panicf("Runtime Error: из_рун ожидает Массив(Целое)")
+		}
+		buf := strings.builder_make(context.temp_allocator)
+		for el in arr.elements {
+			n, is_num := el.(f64)
+			if !is_num || f64(i32(n)) != n {
+				fmt.panicf("Runtime Error: из_рун ожидает codepoint-значения (Целое), получено %v", el)
+			}
+			strings.write_rune(&buf, rune(i32(n)))
+		}
+		return Value(gc_new_string(vm, strings.to_string(buf))), true
 	}
 
 	fmt.panicf(

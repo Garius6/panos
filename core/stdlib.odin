@@ -140,6 +140,14 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_3(TY_STRING, TY_INT, TY_INT, TY_STRING)
 	case "строки::из_байтов":
 		return builtin_function_type_1(new_array_type(TY_INT), TY_STRING)
+	case "строки::в_байты":
+		return builtin_function_type_1(TY_STRING, new_array_type(TY_INT))
+	case "строки::кодовая_точка":
+		return builtin_function_type_1(TY_STRING, TY_INT)
+	case "строки::в_руны":
+		return builtin_function_type_1(TY_STRING, new_array_type(TY_INT))
+	case "строки::из_рун":
+		return builtin_function_type_1(new_array_type(TY_INT), TY_STRING)
 	case "сжатие::разжать_gzip":
 		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_STRING, TY_ERROR))
 	case "сеть::подключиться":
@@ -301,6 +309,15 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 		add_builtin_export(graph, module, "длина_байт", builtin_export_type(graph, "строки::длина_байт"))
 		add_builtin_export(graph, module, "срез_байт", builtin_export_type(graph, "строки::срез_байт"))
 		add_builtin_export(graph, module, "из_байтов", builtin_export_type(graph, "строки::из_байтов"))
+		add_builtin_export(graph, module, "в_байты", builtin_export_type(graph, "строки::в_байты"))
+		add_builtin_export(
+			graph,
+			module,
+			"кодовая_точка",
+			builtin_export_type(graph, "строки::кодовая_точка"),
+		)
+		add_builtin_export(graph, module, "в_руны", builtin_export_type(graph, "строки::в_руны"))
+		add_builtin_export(graph, module, "из_рун", builtin_export_type(graph, "строки::из_рун"))
 	} else if name == "сеть" {
 		add_builtin_export(
 			graph,

@@ -93,6 +93,12 @@ run_lsp_server :: proc() {
 			handle_semantic_tokens(&server, id_val, params)
 		case "textDocument/documentHighlight":
 			handle_document_highlight(&server, id_val, params)
+		case "textDocument/foldingRange":
+			handle_folding_range(&server, id_val, params)
+		case "textDocument/documentSymbol":
+			handle_document_symbol(&server, id_val, params)
+		case "textDocument/signatureHelp":
+			handle_signature_help(&server, id_val, params)
 		case:
 			if envelope.id != nil {
 				send_error_response(id_val, -32601, "method not found")
@@ -111,6 +117,9 @@ handle_initialize :: proc(id: json.Value) {
 			references_provider = true,
 			rename_provider = true,
 			document_highlight_provider = true,
+			folding_range_provider = true,
+			document_symbol_provider = true,
+			signature_help_provider = proto.SignatureHelpOptions{trigger_characters = []string{"(", ","}},
 			semantic_tokens_provider = proto.SemanticTokensOptions {
 				legend = proto.SemanticTokensLegend {
 					token_types = core.SEMANTIC_TOKEN_TYPE_NAMES[:],
@@ -756,6 +765,141 @@ handle_document_highlight :: proc(server: ^LSP_Server, id: json.Value, params: j
 // node_symbols (map — порядок случайный), поэтому здесь: перевод байтовых
 // Span в (line, char) через core.byte_offset_to_lsp_position, сортировка,
 // затем относительное кодирование.
+// textDocument/foldingRange — чисто синтаксическая: core.compute_folding_ranges
+// работает над doc.prog (Program текущего файла), резолвер/граф не нужны.
+// Отбрасываем однострочные "блоки" (start_line == end_line) — сворачивать
+// там нечего, клиент такие FoldingRange и сам бы проигнорировал (см.
+// комментарий в спеке), но не шлём их вовсе, а не полагаемся на клиента.
+handle_folding_range :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
+	p, ok := decode_params(proto.FoldingRangeParams, params)
+	if !ok {
+		send_null_response(id)
+		return
+	}
+	doc, found := server.documents[string(p.text_document.uri)]
+	if !found {
+		send_null_response(id)
+		return
+	}
+
+	raw := core.compute_folding_ranges(doc.prog)
+	defer delete(raw)
+
+	ranges := make([dynamic]proto.FoldingRange)
+	for fr in raw {
+		if fr.span.file_id != doc.file_id do continue
+		start_line, _ := core.byte_offset_to_lsp_position(doc.source, fr.span.start)
+		end_line, _ := core.byte_offset_to_lsp_position(doc.source, fr.span.end)
+		if end_line <= start_line do continue
+		append(&ranges, proto.FoldingRange{start_line = u32(start_line), end_line = u32(end_line)})
+	}
+
+	send_response(id, ranges[:])
+}
+
+// textDocument/documentSymbol — файловый outline, тоже чисто структурный
+// (core.compute_document_symbols над doc.prog, без резолвера). doc_symbol_kind_to_proto
+// маппит core.Doc_Symbol_Kind в proto.SymbolKind (см. комментарий у Doc_Symbol_Kind).
+doc_symbol_kind_to_proto :: proc(k: core.Doc_Symbol_Kind) -> proto.SymbolKind {
+	switch k {
+	case .Struct:
+		return .Struct
+	case .Enum:
+		return .Enum
+	case .Interface:
+		return .Interface
+	case .Function:
+		return .Function
+	case .Method:
+		return .Method
+	case .Field:
+		return .Field
+	case .EnumMember:
+		return .EnumMember
+	case .Impl:
+		return .Class
+	}
+	return .Object
+}
+
+to_proto_document_symbol :: proc(doc: ^LSP_Document, s: core.Doc_Symbol) -> proto.DocumentSymbol {
+	rng := lsp_range(doc.source, s.span.start, s.span.end)
+	children := make([dynamic]proto.DocumentSymbol, 0, len(s.children))
+	for c in s.children {
+		append(&children, to_proto_document_symbol(doc, c))
+	}
+	result := proto.DocumentSymbol {
+		name            = s.name,
+		kind            = doc_symbol_kind_to_proto(s.kind),
+		range           = rng,
+		selection_range = rng,
+	}
+	if len(children) > 0 {
+		result.children = children[:]
+	}
+	return result
+}
+
+handle_document_symbol :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
+	p, ok := decode_params(proto.DocumentSymbolParams, params)
+	if !ok {
+		send_null_response(id)
+		return
+	}
+	doc, found := server.documents[string(p.text_document.uri)]
+	if !found {
+		send_null_response(id)
+		return
+	}
+
+	raw := core.compute_document_symbols(doc.prog)
+	defer delete(raw)
+
+	symbols := make([dynamic]proto.DocumentSymbol, 0, len(raw))
+	for s in raw {
+		append(&symbols, to_proto_document_symbol(doc, s))
+	}
+	send_response(id, symbols[:])
+}
+
+// textDocument/signatureHelp — подсказка параметров текущего вызова. Как
+// hover, использует уже посчитанные тайпчекером типы (doc.tc_ctx.node_types),
+// плюс имена параметров через Symbol.decl (core.compute_signature_help).
+handle_signature_help :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
+	doc, offset, ok := resolve_position(server, params)
+	if !ok {
+		send_null_response(id)
+		return
+	}
+
+	info, has_info := core.compute_signature_help(&doc.res_ctx, &doc.tc_ctx, doc.prog, doc.file_id, offset)
+	if !has_info {
+		send_null_response(id)
+		return
+	}
+
+	proto_params := make([dynamic]proto.ParameterInformation, 0, len(info.params))
+	labels := make([dynamic]string, 0, len(info.params))
+	for p in info.params {
+		label := p.name != "" ? fmt.tprintf("%s: %s", p.name, p.type_name) : p.type_name
+		append(&labels, label)
+		append(&proto_params, proto.ParameterInformation{label = label})
+	}
+	label := fmt.tprintf("(%s) -> %s", strings.join(labels[:], ", "), info.return_type)
+
+	sig := proto.SignatureInformation {
+		label            = label,
+		parameters       = proto_params[:],
+		active_parameter = u32(info.active_param),
+	}
+	result := proto.SignatureHelp {
+		signatures        = []proto.SignatureInformation{sig},
+		active_signature  = 0,
+		active_parameter  = u32(info.active_param),
+	}
+	send_response(id, result)
+}
+
 handle_semantic_tokens :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	p, ok := decode_params(proto.SemanticTokensParams, params)
 	if !ok {

@@ -1005,3 +1005,87 @@ test_math_and_logic :: proc(t: ^testing.T) {
 		)
 	}
 }
+
+// Целое(x)/Число(x) — явное приведение (см. BUILTIN_CTORS в type_cheker.
+// odin, call_builtin в vm.odin). Число->Целое усекает к нулю (как деление),
+// Целое->Число точное, оба направления no-op на уже-своём типе.
+@(test)
+test_numeric_cast :: proc(t: ^testing.T) {
+	TestCase :: struct {
+		name:     string,
+		source:   string,
+		expected: Value,
+	}
+
+	tests := []TestCase {
+		{"Число->Целое усекает к нулю (положительное)", `функ старт() -> Целое  Целое(3.7) конец`, f64(3.0)},
+		{"Число->Целое усекает к нулю (отрицательное)", `функ старт() -> Целое  Целое(0.0 - 3.7) конец`, f64(-3.0)},
+		{"Целое->Число точное", `функ старт() -> Число  пер i: Целое = 5  Число(i) конец`, f64(5.0)},
+		{"Целое->Целое no-op", `функ старт() -> Целое  пер i: Целое = 5  Целое(i) конец`, f64(5.0)},
+		{"Число->Число no-op", `функ старт() -> Число  Число(5.5) конец`, f64(5.5)},
+	}
+
+	for tc in tests {
+		result, ok := run_code(tc.source)
+		testing.expectf(t, ok, "[%s] стек пуст", tc.name)
+		if ok {
+			testing.expectf(t, result == tc.expected, "[%s] ожидалось %v, получено %v", tc.name, tc.expected, result)
+		}
+	}
+}
+
+// Type Error, если Целое(x)/Число(x) получает не-число (не молчаливое
+// приведение чего попало).
+@(test)
+test_numeric_cast_rejects_non_number :: proc(t: ^testing.T) {
+	diags := typecheck_only(`функ старт() -> Целое  Целое("текст") конец`)
+	expect_diagnostic(t, diags, "Type Error: Целое(x) ожидает Число или Целое, получено 'Строка'")
+}
+
+// Битовые операторы (&, |, ^, ~, <<, >>) — только Целое (см.
+// infer_binary_expr/infer_unary_expr в type_cheker.odin, BitAnd/BitOr/
+// BitXor/BitNot/ShiftLeft/ShiftRight в vm.odin). Рантайм — конвертация
+// f64<->i64 вокруг обычной битовой операции.
+@(test)
+test_bitwise_operators :: proc(t: ^testing.T) {
+	TestCase :: struct {
+		name:     string,
+		source:   string,
+		expected: Value,
+	}
+
+	tests := []TestCase {
+		{"AND", `функ старт() -> Целое  пер a: Целое = 12  пер b: Целое = 10  a & b конец`, f64(8.0)},
+		{"OR", `функ старт() -> Целое  пер a: Целое = 12  пер b: Целое = 10  a | b конец`, f64(14.0)},
+		{"XOR", `функ старт() -> Целое  пер a: Целое = 12  пер b: Целое = 10  a ^ b конец`, f64(6.0)},
+		{"NOT", `функ старт() -> Целое  пер a: Целое = 0  ~a конец`, f64(-1.0)},
+		{"SHL", `функ старт() -> Целое  пер a: Целое = 1  пер n: Целое = 4  a << n конец`, f64(16.0)},
+		{"SHR", `функ старт() -> Целое  пер a: Целое = 256  пер n: Целое = 4  a >> n конец`, f64(16.0)},
+		{
+			"Комбинация флагов через | и <<",
+			`функ старт() -> Целое
+				пер ноль: Целое = 0
+				пер четыре: Целое = 4
+				пер один: Целое = 1
+				(один << ноль) | (один << четыре)
+			конец`,
+			f64(17.0),
+		},
+	}
+
+	for tc in tests {
+		result, ok := run_code(tc.source)
+		testing.expectf(t, ok, "[bitwise: %s] стек пуст", tc.name)
+		if ok {
+			testing.expectf(t, result == tc.expected, "[bitwise: %s] ожидалось %v, получено %v", tc.name, tc.expected, result)
+		}
+	}
+}
+
+// Битовые операторы не работают на Число (не только на Целое) — та же
+// политика, что у '%'.
+@(test)
+test_bitwise_operators_reject_number :: proc(t: ^testing.T) {
+	diags := typecheck_only(`функ старт() -> Число  5.0 & 3.0 конец`)
+	expect_diagnostic(t, diags, "Type Error: битовый оператор '&' поддержан только для Целое, получено 'Число' и 'Число'")
+}

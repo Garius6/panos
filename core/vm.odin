@@ -1003,6 +1003,26 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		vm.crash_message = fmt.tprintf("Runtime Panic: %s", message)
 		return Value(f64(0)), false
 
+	case "Целое":
+		// Целое и Число на рантайме — один и тот же f64 (см. type_cheker.
+		// odin: "На РАНТАЙМЕ представлен ТЕМ ЖЕ f64"), так что приведение —
+		// это усечение к нулю значения, а не смена представления.
+		expect_arg_count(name, len(args), 1)
+		n, ok := args[0].(f64)
+		if !ok {
+			fmt.panicf("Runtime Error: Целое() ожидает число")
+		}
+		return Value(math.trunc(n)), true
+
+	case "Число":
+		// Целое->Число: то же f64-значение как есть, не-op.
+		expect_arg_count(name, len(args), 1)
+		n, ok := args[0].(f64)
+		if !ok {
+			fmt.panicf("Runtime Error: Число() ожидает число")
+		}
+		return Value(n), true
+
 	case "себя":
 		expect_arg_count(name, len(args), 0)
 		return Value(vm.processes[vm.current_process]), true
@@ -1508,6 +1528,33 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 				return .Crashed
 			}
 			append(&vm.stack, math.mod(l, r))
+
+		case .BitAnd:
+			// Целое на рантайме — f64 (см. .Int_Divide выше) — конвертируем
+			// в i64, делаем битовую операцию, конвертируем назад. typechecker
+			// уже гарантировал Целое с обеих сторон (infer_binary_expr).
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
+			append(&vm.stack, f64(i64(l) & i64(r)))
+
+		case .BitOr:
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
+			append(&vm.stack, f64(i64(l) | i64(r)))
+
+		case .BitXor:
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
+			append(&vm.stack, f64(i64(l) ~ i64(r)))
+
+		case .BitNot:
+			v := pop(&vm.stack).(f64)
+			append(&vm.stack, f64(~i64(v)))
+
+		case .ShiftLeft:
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
+			append(&vm.stack, f64(i64(l) << uint(i64(r))))
+
+		case .ShiftRight:
+			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)
+			append(&vm.stack, f64(i64(l) >> uint(i64(r))))
 
 		case .Less:
 			r := pop(&vm.stack).(f64); l := pop(&vm.stack).(f64)

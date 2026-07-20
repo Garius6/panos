@@ -316,6 +316,13 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 					kind = .LessEqual,
 					data = "<=",
 				}
+			} else if peek_char(l) == '<' {
+				advance(l)
+				advance(l)
+				tok = Token {
+					kind = .LessLess,
+					data = "<<",
+				}
 			} else {
 				tok = Token {
 					kind = .Less,
@@ -330,6 +337,13 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 				tok = Token {
 					kind = .GreaterEqual,
 					data = ">=",
+				}
+			} else if peek_char(l) == '>' {
+				advance(l)
+				advance(l)
+				tok = Token {
+					kind = .GreaterGreater,
+					data = ">>",
 				}
 			} else {
 				tok = Token {
@@ -385,6 +399,26 @@ next_token_lex :: proc(l: ^Lexer, file_id: u16) -> Token {
 			tok = Token {
 				kind = .Percent,
 				data = "%",
+			}; advance(l)
+		case '&':
+			tok = Token {
+				kind = .Ampersand,
+				data = "&",
+			}; advance(l)
+		case '|':
+			tok = Token {
+				kind = .Pipe,
+				data = "|",
+			}; advance(l)
+		case '^':
+			tok = Token {
+				kind = .Caret,
+				data = "^",
+			}; advance(l)
+		case '~':
+			tok = Token {
+				kind = .Tilde,
+				data = "~",
 			}; advance(l)
 		case '(':
 			// Внутри активной интерполяции (Lexer.interp_paren_depth) эта

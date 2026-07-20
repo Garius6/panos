@@ -512,6 +512,13 @@ RESERVED_BUILTIN_NAMES := [?]string {
 	// только ВОЗВРАЩАЕТ Строку вместо побочного эффекта печати (см.
 	// BUILTIN_CTORS в type_cheker.odin и "встроку" в vm.odin).
 	"встроку",
+	// Целое(x)/Число(x) — явное приведение (не путать с "Целое"/"Число" в
+	// ПОЗИЦИИ ТИПА: там они резолвятся отдельной таблицей BASE_TYPES в
+	// type_cheker.odin, полностью независимой от этого символьного scope —
+	// конфликта нет, см. BUILTIN_CTORS/call_builtin для семантики самого
+	// приведения).
+	"Целое",
+	"Число",
 }
 
 install_standard_symbols :: proc(ctx: ^Resolver_Ctx) {

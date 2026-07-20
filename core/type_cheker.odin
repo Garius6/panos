@@ -3389,6 +3389,46 @@ BUILTIN_CTORS := [?]Builtin_Ctor_Sig {
 		},
 	},
 	{
+		// Явное приведение Число->Целое — усечение к нулю (та же семантика,
+		// что у Целое/Целое-деления и '%'), Целое->Целое/Число->Число —
+		// no-op (на рантайме оба представлены f64, см. call_builtin "Целое"
+		// в vm.odin).
+		name = "Целое",
+		arity = 1,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
+			arg_t := prune_type(infer_expr(ctx, args[0]))
+			if arg_t.kind == .Poison do return TY_POISON
+			if arg_t != TY_NUM && arg_t != TY_INT {
+				return report(
+					ctx,
+					expr_span(call),
+					"Type Error: Целое(x) ожидает Число или Целое, получено '%s'",
+					arg_t.name,
+				)
+			}
+			return TY_INT
+		},
+	},
+	{
+		// Обратное — Целое->Число всегда точное (f64 представляет любое
+		// Целое-значение без потерь в рабочем диапазоне), Число->Число no-op.
+		name = "Число",
+		arity = 1,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, args: [dynamic]Expr) -> ^Type {
+			arg_t := prune_type(infer_expr(ctx, args[0]))
+			if arg_t.kind == .Poison do return TY_POISON
+			if arg_t != TY_NUM && arg_t != TY_INT {
+				return report(
+					ctx,
+					expr_span(call),
+					"Type Error: Число(x) ожидает Число или Целое, получено '%s'",
+					arg_t.name,
+				)
+			}
+			return TY_NUM
+		},
+	},
+	{
 		// Стадия 24 (actor model): получить() — bare builtin (как длина/
 		// паника), но БЕЗ фиксированного типа результата. Первый вызов В
 		// ТЕЛЕ ТЕКУЩЕЙ функции заводит свежий InferVar (ctx.current_
@@ -4106,6 +4146,27 @@ infer_arithmetic_op :: proc(
 	return TY_NUM
 }
 
+// Текст оператора для diagnostic-сообщений битовых операций — TokenKind
+// сам по себе %v-форматируется как имя варианта (".Ampersand"), не как
+// реальный символ исходника.
+bitwise_op_symbol :: proc(op: TokenKind) -> string {
+	#partial switch op {
+	case .Ampersand:
+		return "&"
+	case .Pipe:
+		return "|"
+	case .Caret:
+		return "^"
+	case .LessLess:
+		return "<<"
+	case .GreaterGreater:
+		return ">>"
+	case .Tilde:
+		return "~"
+	}
+	return "?"
+}
+
 infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type {
 	t: ^Type
 	#partial switch e.op {
@@ -4198,6 +4259,30 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 				ctx,
 				e.span,
 				"Type Error: оператор '%%' поддержан только для Целое, получено '%s' и '%s'",
+				left_t.name,
+				right_t.name,
+			)
+		}
+
+	case .Ampersand, .Pipe, .Caret, .LessLess, .GreaterGreater:
+		// Битовые операторы — только Целое (та же мотивация, что у '%'
+		// выше): нет смысла в поразрядных операциях над f64-дробным Число,
+		// а поддержка "битов мантиссы/экспоненты" не запрашивалась и не
+		// нужна ни одному сценарию использования этих операторов.
+		left_t := prune_type(infer_expr(ctx, e.left))
+		right_t := prune_type(infer_expr(ctx, e.right))
+		left_t = widen_num_literal_to_int(ctx, e.left, left_t, right_t)
+		right_t = widen_num_literal_to_int(ctx, e.right, right_t, left_t)
+		if left_t == TY_INT && right_t == TY_INT {
+			t = TY_INT
+		} else if left_t.kind == .Poison || right_t.kind == .Poison {
+			t = TY_POISON
+		} else {
+			t = report(
+				ctx,
+				e.span,
+				"Type Error: битовый оператор '%s' поддержан только для Целое, получено '%s' и '%s'",
+				bitwise_op_symbol(e.op),
 				left_t.name,
 				right_t.name,
 			)
@@ -4352,6 +4437,21 @@ infer_unary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Unary_Expr) -> ^Type {
 	case .Negate:
 		check_expr(ctx, e.right, TY_BOOL)
 		t = TY_BOOL
+	case .Tilde:
+		// Побитовое НЕ — только Целое, тот же мотив, что у &/|/^/<</>>.
+		operand_t := prune_type(infer_expr(ctx, e.right))
+		if operand_t == TY_INT {
+			t = TY_INT
+		} else if operand_t.kind == .Poison {
+			t = TY_POISON
+		} else {
+			t = report(
+				ctx,
+				e.span,
+				"Type Error: битовый оператор '~' поддержан только для Целое, получено '%s'",
+				operand_t.name,
+			)
+		}
 	}
 	return t
 }

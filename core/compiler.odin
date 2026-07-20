@@ -322,6 +322,16 @@ Opcode :: enum u8 {
 	Call_Foreign, // Стадия 47 (FFI-B): операнды — 1 байт (индекс константы с ^Foreign_Function), 1 байт (arg_count). Стек: arg1..argN (без callee-значения, в отличие от .Call — ^Foreign_Function не пользовательское значение). Маршаллинг через libffi — см. vm_ffi_native.odin/vm_ffi_wasm.odin.
 	Build_Closure, // Стадия 48 (замыкания): операнды — 1 байт (индекс константы с ^Compiled_Function лямбды), 1 байт (capture_count). Снимает capture_count значений со стека (в порядке ctx.res.lambda_captures[expr]), строит ^Closure_Value, кладёт на стек.
 	Get_Captured, // Стадия 48: операнд — 1 байт (индекс в frame.closure.captured). Кладёт значение на стек. Валиден только внутри тела лямбды, скомпилированной с captures.
+	// Битовые операторы — только Целое (typechecker уже проверил, см.
+	// infer_binary_expr/infer_unary_expr в type_cheker.odin), рантайм-
+	// представление то же f64: VM конвертирует в i64, делает битовую
+	// операцию, конвертирует обратно (см. vm.odin).
+	BitAnd,
+	BitOr,
+	BitXor,
+	BitNot,
+	ShiftLeft,
+	ShiftRight,
 }
 
 // Записать 1 байт в массив инструкций
@@ -811,6 +821,8 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			emit_opcode(ctx, .Multiply)
 		case .Negate:
 			emit_opcode(ctx, .Negate)
+		case .Tilde:
+			emit_opcode(ctx, .BitNot)
 		}
 
 	case ^String_Expr:
@@ -987,6 +999,16 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				}
 			case .Percent:
 				emit_opcode(ctx, .Modulo)
+			case .Ampersand:
+				emit_opcode(ctx, .BitAnd)
+			case .Pipe:
+				emit_opcode(ctx, .BitOr)
+			case .Caret:
+				emit_opcode(ctx, .BitXor)
+			case .LessLess:
+				emit_opcode(ctx, .ShiftLeft)
+			case .GreaterGreater:
+				emit_opcode(ctx, .ShiftRight)
 			case .Less:
 				emit_opcode(ctx, .Less)
 			case .Greater:
@@ -1713,6 +1735,30 @@ print_assembler :: proc(registry: map[string]^Compiled_Function) {
 
 			case .Modulo:
 				command := fmt.tprintf("%sMODULO\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .BitAnd:
+				command := fmt.tprintf("%sBIT_AND\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .BitOr:
+				command := fmt.tprintf("%sBIT_OR\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .BitXor:
+				command := fmt.tprintf("%sBIT_XOR\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .BitNot:
+				command := fmt.tprintf("%sBIT_NOT\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .ShiftLeft:
+				command := fmt.tprintf("%sSHIFT_LEFT\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .ShiftRight:
+				command := fmt.tprintf("%sSHIFT_RIGHT\n", prefix)
 				strings.write_string(&builder, command)
 
 			case .Receive_Signal:

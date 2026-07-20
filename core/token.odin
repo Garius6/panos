@@ -70,6 +70,14 @@ TokenKind :: enum {
 	InterpStringStart,
 	InterpStringMid,
 	InterpStringEnd,
+	// Битовые операторы (только для Целое, см. type_cheker.odin) — '&'/'|'
+	// не конфликтуют с 'и'/'или' (те keyword-токены, не символы).
+	Ampersand,
+	Pipe,
+	Caret,
+	Tilde,
+	LessLess,
+	GreaterGreater,
 	EOF,
 }
 

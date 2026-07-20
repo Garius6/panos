@@ -2066,7 +2066,7 @@ parse_map_literal_after_lparen :: proc(p: ^Parser, start: Span) -> Expr {
 		for {
 			entry := Map_Entry_Expr{}
 			entry_start := peek_token(p.stream).span
-			entry.key = parse_expr(p, 11)
+			entry.key = parse_expr(p, 101)
 			expect(p, .Assign)
 			entry.value = parse_expr(p, 0)
 			entry.span = span_from(p, entry_start)
@@ -2317,6 +2317,11 @@ nud :: proc(p: ^Parser, tok: ^Token) -> Expr {
 		rhs := parse_expr(p, rbp)
 		return new_unary(tok, rhs)
 
+	case .Tilde:
+		rbp := prefix_bp(tok)
+		rhs := parse_expr(p, rbp)
+		return new_unary(tok, rhs)
+
 	case .If:
 		return parse_if_expr(p)
 
@@ -2532,36 +2537,53 @@ parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
 // Unary_Expr в вызывающем цикле.
 prefix_bp :: proc(token: ^Token) -> int {
 	#partial switch token.kind {
-	case .Minus, .Negate:
-		return 70
+	case .Minus, .Negate, .Tilde:
+		return 700
 	}
 	return 0
 }
 
+// Числа x10 от исходных (Dot=90 -> 900 и т.д.), с запасом между ярусами —
+// освобождает место под битовые операторы БЕЗ пересчёта остальных:
+// сдвиг (<</>>) между аддитивными и реляционными, &/^/| между равенством
+// и логическими и/или — тот же относительный порядок, что в C (сдвиг >
+// реляционных > равенства > & > ^ > | > логическое и > логическое или),
+// сознательно НЕ повторяя саму путаницу C (там & связывает слабее ==,
+// частый источник ошибок без скобок) — здесь порядок такой же, но раз уж
+// переразмечаем с нуля, разрывы между ярусами щедрые, чтобы дальнейшие
+// вставки не требовали очередного пересчёта всей таблицы.
 infix_bp :: proc(tok: ^Token) -> (lbp, rbp: int, ok: bool) {
 	#partial switch tok.kind {
 	case .Dot:
-		return 90, 91, true
+		return 900, 910, true
 	case .Star, .Slash, .Percent:
-		return 60, 61, true
+		return 600, 610, true
 	case .Plus, .Minus:
-		return 50, 51, true
+		return 500, 510, true
+	case .LessLess, .GreaterGreater:
+		return 460, 470, true
 	case .Less, .Greater, .LessEqual, .GreaterEqual:
-		return 40, 41, true
+		return 400, 410, true
 	case .Equal, .NotEqual:
-		return 30, 31, true
+		return 300, 310, true
+	case .Ampersand:
+		return 260, 270, true
+	case .Caret:
+		return 240, 250, true
+	case .Pipe:
+		return 220, 230, true
 	case .And:
-		return 28, 29, true
+		return 180, 190, true
 	case .Or:
-		return 26, 27, true
+		return 160, 170, true
 	case .Assign:
-		return 10, 9, true
+		return 100, 90, true
 	case .LParen:
-		return 80, 0, true
+		return 800, 0, true
 	case .LBracket:
-		return 80, 0, true
+		return 800, 0, true
 	case .Question:
-		return 90, 91, true
+		return 900, 910, true
 	}
 	return 0, 0, false
 }

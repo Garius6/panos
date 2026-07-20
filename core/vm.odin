@@ -5,6 +5,8 @@ import "core:fmt"
 import "core:math"
 import "core:strconv"
 import "core:strings"
+import "core:sync/chan"
+import "core:thread"
 import "core:time"
 import "core:unicode"
 import "core:unicode/utf8"
@@ -72,6 +74,17 @@ VM :: struct {
 	// — иммунна к переводу системных часов, то же обоснование, что у
 	// sliding-window лимита рестартов в std/супервизор.ps.
 	monotonic_epoch:    time.Tick,
+	// Неблокирующий I/O: воркер-пул + канал завершений. Тип thread.Pool/
+	// chan.Chan компилируется на ВСЕХ платформах (core:thread/core:sync/chan
+	// без #+build-тегов на сами типы), но core:thread НЕ поддержан на
+	// js/wasi/orca (thread.IS_SUPPORTED — compile-time константа) —
+	// реальная инициализация/использование этих полей — ТОЛЬКО под
+	// `when thread.IS_SUPPORTED` (new_vm) и из #+build !js файлов
+	// (vm_async_io_native.odin). Воркер пишет сюда ТОЛЬКО простые Odin-
+	// типы (Async_Result — см. vm_async.odin), никогда Value/GC-указатели.
+	async_pool:         thread.Pool,
+	async_completions:  chan.Chan(Async_Result),
+	next_ticket_id:     int,
 }
 
 // get_stdin_reader — в vm_io_native.odin/vm_io_wasm.odin (#+build split,
@@ -87,6 +100,22 @@ new_vm :: proc(
 	vm.monotonic_epoch = time.tick_now()
 
 	vm.compiled_functions = compiled_functions
+
+	// Неблокирующий I/O: пул воркеров + канал завершений. thread.IS_SUPPORTED
+	// — compile-time константа (false на js/wasi/orca, core/thread/
+	// thread_other.odin) — под wasm эта ветка целиком выкидывается на этапе
+	// компиляции, поля остаются нулевыми (никогда не читаются — submit_
+	// async_io существует только в #+build !js файле, а сеть::http_запрос
+	// и так безусловно паникует на wasm, vm_http_wasm.odin).
+	when thread.IS_SUPPORTED {
+		thread.pool_init(&vm.async_pool, context.allocator, 4)
+		thread.pool_start(&vm.async_pool)
+		completions, chan_err := chan.create_buffered(chan.Chan(Async_Result), 256, context.allocator)
+		if chan_err != nil {
+			fmt.panicf("VM Error: не удалось создать канал асинхронного I/O: %v", chan_err)
+		}
+		vm.async_completions = completions
+	}
 
 	main_func, ok := vm.compiled_functions[Main_Function_Name]
 	if !ok {
@@ -1699,6 +1728,42 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 				append(&vm.stack, result)
 			}
 
+		case .Call_Builtin_Async:
+			// Неблокирующий I/O: та же операнд-форма/извлечение args, что
+			// .Call_Builtin выше, но вместо синхронного call_builtin —
+			// submit_async_io (vm_async_io_native.odin/_wasm.odin, #+build
+			// split — как vm_http_native.odin) кладёт задачу в воркер-пул
+			// и возвращается СРАЗУ (submit не блокирует). ip продолжает
+			// как обычно на следующую инструкцию — компилятор ВСЕГДА
+			// эмитит .Await_Async сразу после (см. compiler.odin, case
+			// .Builtin), которая и делает настоящий suspend/resume.
+			frame.ip += 1
+			name_index := instructions[frame.ip]
+			frame.ip += 1
+			arg_count := int(instructions[frame.ip])
+
+			name := frame.function.constants[name_index].(^Panos_String).data
+			args_start := len(vm.stack) - arg_count
+			args := vm.stack[args_start:]
+			target_id := vm.processes[vm.current_process].id
+			submit_async_io(vm, name, args, target_id)
+			resize(&vm.stack, args_start)
+
+		case .Await_Async:
+			// Неблокирующий I/O: тот же suspend/resume паттерн, что
+			// .Receive_Signal, но над process.async_results — ОТДЕЛЬНАЯ от
+			// mailbox очередь (см. Process_Value.async_results,
+			// compiler.odin) специально чтобы результат async-вызова не
+			// перепутался с обычным пользовательским сообщением,
+			// пришедшим, пока процесс ждал.
+			process := vm.processes[vm.current_process]
+			if len(process.async_results) == 0 {
+				return .Suspended
+			}
+			result := process.async_results[0]
+			ordered_remove(&process.async_results, 0)
+			append(&vm.stack, result)
+
 		case .Call_Foreign:
 			frame.ip += 1
 			ff_index := instructions[frame.ip]
@@ -2221,6 +2286,83 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 	return .Completed
 }
 
+// Неблокирующий I/O: превращает плоские данные Async_Result (см.
+// vm_async.odin) в настоящий Результат-Value — ЕДИНСТВЕННОЕ место, где эта
+// граница пересекается, и делает это ТОЛЬКО главный поток (вызывается из
+// run_scheduler, никогда из воркера — см. core/gc.odin, gc_new/gc_new_string
+// не потокобезопасны). Молча дропает результат, если процесс-получатель
+// больше не жив — тот же прецедент, что у отправить() на мёртвый процесс.
+deliver_async_result :: proc(vm: ^VM, comp: Async_Result) {
+	target: ^Process_Value
+	for p in vm.processes {
+		if p.id == comp.target_id {
+			target = p
+			break
+		}
+	}
+
+	// payload — обычная Odin-память (strings.clone/context.allocator в
+	// воркере, НЕ GC-managed) — должна быть освобождена ЗДЕСЬ независимо от
+	// того, жив ли ещё процесс-получатель (мёртвый процесс — тот же
+	// silent-drop, что у отправить(), но утечка памяти это не оправдывает).
+	switch payload in comp.payload {
+	case Http_Result_Data:
+		// Явный vm_heap_allocator() — main.odin делает ambient context.
+		// allocator этой функции mem.Dynamic_Arena (не потокобезопасна,
+		// НЕ та память, на которой воркер (vm_async_io_native.odin)
+		// реально аллоцировал payload через vm_heap_allocator()) — delete()
+		// без явного allocator'а тут был бы delete через ЧУЖОЙ аллокатор.
+		heap := vm_heap_allocator()
+		defer {
+			for kv in payload.headers {
+				delete(kv[0], heap)
+				delete(kv[1], heap)
+			}
+			delete(payload.headers)
+			delete(payload.body, heap)
+			if err, has_err := payload.err.(string); has_err do delete(err, heap)
+		}
+
+		if target == nil || !target.is_alive do return
+
+		value: Value
+		if err, has_err := payload.err.(string); has_err {
+			value = make_error_result(vm, make_error_value(vm, "сеть", err))
+		} else {
+			header_pairs := gc_new(vm, Array_Value)
+			gc_protect(vm, Value(header_pairs))
+			for kv in payload.headers {
+				pair := gc_new(vm, Aggregate_Value)
+				resize(&pair.elements, 2)
+				pair.elements[0] = Value(gc_new_string(vm, kv[0]))
+				pair.elements[1] = Value(gc_new_string(vm, kv[1]))
+				append(&header_pairs.elements, Value(pair))
+			}
+			result_tuple := gc_new(vm, Aggregate_Value)
+			resize(&result_tuple.elements, 3)
+			result_tuple.elements[0] = Value(f64(payload.status))
+			result_tuple.elements[1] = Value(header_pairs)
+			result_tuple.elements[2] = Value(gc_new_string(vm, payload.body))
+			gc_unprotect(vm, 1)
+			value = make_ok_result(vm, Value(result_tuple))
+		}
+		append(&target.async_results, value)
+	}
+}
+
+// Неблокирующий I/O: неблокирующий дренаж всего, что успело накопиться в
+// канале завершений — вызывается оппортунистически из run_scheduler между
+// проходами по процессам (не только в idle-ветке дедлок-guard'а).
+drain_async_completions :: proc(vm: ^VM) {
+	when thread.IS_SUPPORTED {
+		for {
+			comp, ok := chan.try_recv(vm.async_completions)
+			if !ok do break
+			deliver_async_result(vm, comp)
+		}
+	}
+}
+
 // Стадия 24 (actor model): единственная точка входа для запуска VM —
 // раньше был один вызов execute(vm) (Value 1 старт()), теперь execute()
 // нужно вызывать МНОГО раз (по одному на процесс за тик), round-robin
@@ -2238,17 +2380,20 @@ run_scheduler :: proc(vm: ^VM) {
 		for i < len(vm.processes) {
 			process := vm.processes[i]
 
-			// Пустые mailbox И signals у УЖЕ хоть раз запущенного процесса
-			// — нечего делать, пропускаем без входа в execute() (deadlock-
-			// guard: если так для ВСЕХ процессов подряд — некому никого
-			// разбудить, см. ниже). Свежеспавненный (has_run=false)
-			// обязан получить хотя бы один прогон, даже с пустыми обеими
-			// очередями — тело процесса не обязано начинаться с получить()/
-			// получить_сигнал(). Стадия 38: signals — та же логика, что
-			// mailbox, иначе процесс, приостановленный на получить_
-			// сигнал(), никогда не получит второй шанс исполниться после
-			// прихода сигнала (deadlock-guard ложно сработал бы первым).
-			if process.has_run && len(process.mailbox) == 0 && len(process.signals) == 0 {
+			// Пустые mailbox И signals И async_results у УЖЕ хоть раз
+			// запущенного процесса — нечего делать, пропускаем без входа в
+			// execute() (deadlock-guard: если так для ВСЕХ процессов
+			// подряд — некому никого разбудить, см. ниже). Свежеспавненный
+			// (has_run=false) обязан получить хотя бы один прогон, даже с
+			// пустыми всеми тремя очередями — тело процесса не обязано
+			// начинаться с получить()/получить_сигнал(). Стадия 38:
+			// signals — та же логика, что mailbox, иначе процесс,
+			// приостановленный на получить_сигнал(), никогда не получит
+			// второй шанс исполниться после прихода сигнала (deadlock-guard
+			// ложно сработал бы первым). Неблокирующий I/O: async_results —
+			// та же логика — процесс на .Await_Async не должен считаться
+			// "нечего делать" только пока ждёт результат.
+			if process.has_run && len(process.mailbox) == 0 && len(process.signals) == 0 && len(process.async_results) == 0 {
 				i += 1
 				continue
 			}
@@ -2270,6 +2415,14 @@ run_scheduler :: proc(vm: ^VM) {
 					// старт() завершился — программа выходит немедленно,
 					// vm.frames/vm.stack уже отражают его финальное
 					// состояние (ничего дополнительно свопать не нужно).
+					// Неблокирующий I/O: воркер-потоки пула ЖИВЫ (ждут на
+					// семафоре) до явного pool_join — без него процесс
+					// падает с SIGABRT при выходе (незавершённые потоки на
+					// момент завершения main). pool_join сам безопасен на
+					// никогда не стартовавшем пуле (пустой pool.threads).
+					when thread.IS_SUPPORTED {
+						thread.pool_join(&vm.async_pool)
+					}
 					return
 				}
 				// Стадия 38: штатное завершение — наблюдатели видят
@@ -2299,10 +2452,39 @@ run_scheduler :: proc(vm: ^VM) {
 			i += 1
 		}
 
+		drain_async_completions(vm)
+
 		if !any_ran {
-			// Ни один процесс не выполнялся за целый круг — никто не
-			// сможет никого разбудить (отправить() вызывается ТОЛЬКО из
-			// исполняющегося кода). Настоящий дедлок, не приближение.
+			// Неблокирующий I/O: "никто не выполнялся" больше не
+			// автоматически значит дедлок — если есть I/O в полёте
+			// (воркер-пул ещё не закончил, ИЛИ результат уже лежит в
+			// канале, но drain выше не успел его забрать в ту же
+			// итерацию), это настоящий idle-wait, а не тупик: блокируемся
+			// на канале (НЕ busy-spin), затем дренируем и пересканируем.
+			// pool_num_outstanding — атомарный счётчик пула
+			// (waiting+in_processing), не дублируем отдельным полем — он
+			// НЕ может ложно показать 0, пока воркер ещё не отправил
+			// результат в канал: pool_do_work (thread_pool.odin) снимает
+			// счётчик СТРОГО ПОСЛЕ возврата task-процедуры, а наши задачи
+			// (http_task_proc) делают chan.send ПОСЛЕДНИМ действием перед
+			// возвратом — порядок "send, потом декремент" гарантирован
+			// библиотекой, не только соглашением здесь.
+			has_pending_io := false
+			when thread.IS_SUPPORTED {
+				has_pending_io = thread.pool_num_outstanding(&vm.async_pool) > 0 || chan.len(vm.async_completions) > 0
+			}
+			if has_pending_io {
+				when thread.IS_SUPPORTED {
+					comp, ok := chan.recv(vm.async_completions)
+					if ok do deliver_async_result(vm, comp)
+					drain_async_completions(vm)
+				}
+				continue
+			}
+			// Ни один процесс не выполнялся за целый круг, и никакого I/O
+			// в полёте нет — никто не сможет никого разбудить (отправить()
+			// вызывается ТОЛЬКО из исполняющегося кода). Настоящий дедлок,
+			// не приближение.
 			fmt.panicf(
 				"Runtime Error: все процессы заблокированы в ожидании сообщений (дедлок)",
 			)

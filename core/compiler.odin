@@ -116,6 +116,13 @@ Process_Value :: struct {
 	// уведомление), крах ЛЮБОЙ стороны (не штатное завершение — см.
 	// terminate_process, vm.odin) каскадно завершает и другую.
 	links:    [dynamic]^Process_Value,
+	// Неблокирующий I/O: результаты асинхронных builtin-вызовов (см.
+	// .Await_Async, vm.odin). ОТДЕЛЬНАЯ от mailbox очередь — тот же мотив,
+	// что у signals выше (Стадия 38): пока процесс ждёт результат СВОЕГО
+	// сеть.http_запрос(...), ДРУГОЙ процесс может легально отправить() ему
+	// обычное сообщение — если бы оба шли в один mailbox, .Await_Async мог
+	// бы забрать чужое сообщение вместо результата I/O (или наоборот).
+	async_results: [dynamic]Value,
 }
 
 Value :: union {
@@ -332,6 +339,20 @@ Opcode :: enum u8 {
 	BitNot,
 	ShiftLeft,
 	ShiftRight,
+	// Неблокирующий I/O: пара опкодов вместо одного .Call_Builtin — та же
+	// операнд-форма (1 байт имя-константа, 1 байт arg_count), но НЕ
+	// блокирует поток VM. .Call_Builtin_Async снимает args, передаёт их
+	// воркер-пулу (submit_async_io, vm.odin) и СРАЗУ идёт дальше (submit
+	// не блокирует — просто кладёт задачу в очередь); ip естественно
+	// сдвигается на следующую инструкцию — ВСЕГДА .Await_Async сразу
+	// после (компилятор эмитит их парой, см. compile_expr case .Builtin).
+	// .Await_Async — suspend/resume механика как у .Receive_Signal, но
+	// над process.async_results, а НЕ над mailbox: пока процесс ждёт
+	// результат СВОЕГО async-вызова, другой процесс может легально
+	// отправить() ему обычное сообщение — общая очередь дала бы гонку
+	// между чужим сообщением и результатом I/O.
+	Call_Builtin_Async,
+	Await_Async,
 }
 
 // Записать 1 байт в массив инструкций
@@ -1167,6 +1188,22 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 
 			case .Builtin:
 				for arg in e.args do compile_expr(ctx, arg)
+				// Неблокирующий I/O: небольшой allowlist async-совместимых
+				// builtin'ов — эмитим .Call_Builtin_Async+.Await_Async
+				// ВМЕСТО одного .Call_Builtin (та же операнд-форма).
+				// submit не блокирует (кладёт задачу в воркер-пул и идёт
+				// дальше), .Await_Async сразу за ним suspend'ится/resume'ится
+				// над process.async_results (см. Opcode-комментарий) — с
+				// точки зрения остального кодогена (maybe_emit_interface_cast
+				// ниже читает тот же по форме результат) ничего не меняется.
+				if info.text_name == "сеть::http_запрос" {
+					emit_opcode(ctx, .Call_Builtin_Async)
+					emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
+					emit_byte(ctx, u8(len(e.args)))
+					emit_opcode(ctx, .Await_Async)
+					maybe_emit_interface_cast(ctx, expr)
+					return
+				}
 				emit_opcode(ctx, .Call_Builtin)
 				emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
 				emit_byte(ctx, u8(len(e.args)))
@@ -1778,6 +1815,15 @@ print_assembler :: proc(registry: map[string]^Compiled_Function) {
 			case .Get_Captured:
 				idx += 1
 				command := fmt.tprintf("%sGET_CAPTURED: %d\n", prefix, instructions[idx])
+				strings.write_string(&builder, command)
+
+			case .Call_Builtin_Async:
+				idx += 2
+				command := fmt.tprintf("%sCALL_BUILTIN_ASYNC\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Await_Async:
+				command := fmt.tprintf("%sAWAIT_ASYNC\n", prefix)
 				strings.write_string(&builder, command)
 
 			}

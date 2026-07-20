@@ -320,6 +320,9 @@ mark_value :: proc(v: Value) {
 		// (никогда не свопается, читается напрямую через vm.processes),
 		// та же разметка.
 		for sig in val.signals do mark_value(sig)
+		// Неблокирующий I/O: async_results — та же природа, что signals
+		// (отдельная очередь, никогда не свопается), та же разметка.
+		for res in val.async_results do mark_value(res)
 	case ^Closure_Value:
 		// Стадия 48: fn (^Compiled_Function) не GC-managed (глобальный
 		// реестр, get_header(Value(val.fn)) вернул бы nil) — только
@@ -354,6 +357,8 @@ mark_roots :: proc(vm: ^VM) {
 		for v in process.mailbox do mark_value(v)
 		// Стадия 38: signals — та же логика, что mailbox выше.
 		for v in process.signals do mark_value(v)
+		// Неблокирующий I/O: async_results — та же логика, что signals.
+		for v in process.async_results do mark_value(v)
 		if i == vm.current_process do continue
 		for v in process.stack do mark_value(v)
 	}
@@ -466,6 +471,7 @@ pool_release :: proc(vm: ^VM, v: Value) {
 		clear(&val.mailbox)
 		clear(&val.frames)
 		clear(&val.stack)
+		clear(&val.async_results)
 		val.is_alive = false
 		val.has_run = false
 		append(&vm.gc.free_processes, val)

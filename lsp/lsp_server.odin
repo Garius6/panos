@@ -4,6 +4,7 @@ import core "../core"
 import proto "protocol"
 import "core:encoding/json"
 import "core:fmt"
+import "core:slice"
 import "core:strings"
 
 // Каждый открытый в редакторе документ разбирается вместе со своим графом
@@ -88,6 +89,8 @@ run_lsp_server :: proc() {
 			handle_references(&server, id_val, params)
 		case "textDocument/rename":
 			handle_rename(&server, id_val, params)
+		case "textDocument/semanticTokens/full":
+			handle_semantic_tokens(&server, id_val, params)
 		case:
 			if envelope.id != nil {
 				send_error_response(id_val, -32601, "method not found")
@@ -105,6 +108,13 @@ handle_initialize :: proc(id: json.Value) {
 			completion_provider = proto.CompletionOptions{},
 			references_provider = true,
 			rename_provider = true,
+			semantic_tokens_provider = proto.SemanticTokensOptions {
+				legend = proto.SemanticTokensLegend {
+					token_types = core.SEMANTIC_TOKEN_TYPE_NAMES[:],
+					token_modifiers = []string{},
+				},
+				full = true,
+			},
 		},
 	}
 	send_response(id, result)
@@ -627,4 +637,60 @@ handle_rename :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	}
 	result := proto.WorkspaceEdit{changes = changes}
 	send_response(id, result)
+}
+
+// LSP semantic tokens: относительное кодирование (line-delta, char-delta,
+// length, token_type, modifiers) — 5 u32 на токен, СТРОГО в порядке
+// документа (см. спеку). core.compute_semantic_tokens отдаёт токены из
+// node_symbols (map — порядок случайный), поэтому здесь: перевод байтовых
+// Span в (line, char) через core.byte_offset_to_lsp_position, сортировка,
+// затем относительное кодирование.
+handle_semantic_tokens :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
+	p, ok := decode_params(proto.SemanticTokensParams, params)
+	if !ok {
+		send_null_response(id)
+		return
+	}
+	doc, found := server.documents[string(p.text_document.uri)]
+	if !found {
+		send_null_response(id)
+		return
+	}
+
+	raw := core.compute_semantic_tokens(&doc.res_ctx)
+	defer delete(raw)
+
+	Positioned_Token :: struct {
+		line, char, length, token_type: int,
+	}
+	items := make([dynamic]Positioned_Token, 0, len(raw), context.temp_allocator)
+	for tok in raw {
+		line, char := core.byte_offset_to_lsp_position(doc.source, tok.span.start)
+		end_line, end_char := core.byte_offset_to_lsp_position(doc.source, tok.span.end)
+		if end_line != line || end_char <= char {
+			// Идентификаторы в panos однострочные — сюда попасть не должно,
+			// но лучше молча пропустить, чем прислать клиенту кадр,
+			// нарушающий инвариант спеки (semantic token не может занимать
+			// больше одной строки).
+			continue
+		}
+		append(&items, Positioned_Token{line, char, end_char - char, int(tok.token_type)})
+	}
+	slice.sort_by(items[:], proc(a, b: Positioned_Token) -> bool {
+		if a.line != b.line do return a.line < b.line
+		return a.char < b.char
+	})
+
+	data := make([dynamic]u32, 0, len(items) * 5, context.temp_allocator)
+	prev_line := 0
+	prev_char := 0
+	for it in items {
+		delta_line := it.line - prev_line
+		delta_char := it.char - prev_char if delta_line == 0 else it.char
+		append(&data, u32(delta_line), u32(delta_char), u32(it.length), u32(it.token_type), u32(0))
+		prev_line = it.line
+		prev_char = it.char
+	}
+
+	send_response(id, proto.SemanticTokens{data = data[:]})
 }

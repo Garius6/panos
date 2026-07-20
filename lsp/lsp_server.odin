@@ -91,6 +91,8 @@ run_lsp_server :: proc() {
 			handle_rename(&server, id_val, params)
 		case "textDocument/semanticTokens/full":
 			handle_semantic_tokens(&server, id_val, params)
+		case "textDocument/documentHighlight":
+			handle_document_highlight(&server, id_val, params)
 		case:
 			if envelope.id != nil {
 				send_error_response(id_val, -32601, "method not found")
@@ -108,6 +110,7 @@ handle_initialize :: proc(id: json.Value) {
 			completion_provider = proto.CompletionOptions{},
 			references_provider = true,
 			rename_provider = true,
+			document_highlight_provider = true,
 			semantic_tokens_provider = proto.SemanticTokensOptions {
 				legend = proto.SemanticTokensLegend {
 					token_types = core.SEMANTIC_TOKEN_TYPE_NAMES[:],
@@ -637,6 +640,30 @@ handle_rename :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	}
 	result := proto.WorkspaceEdit{changes = changes}
 	send_response(id, result)
+}
+
+// textDocument/documentHighlight — как references, но только В ТЕКУЩЕМ
+// документе (спека этого метода не предполагает межфайловый scope, в
+// отличие от rename/references) — фильтруем doc.usages[sym_id] и decl_span
+// по file_id, а не отдаём как есть.
+handle_document_highlight :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
+	doc, sym_id, ok := resolve_symbol_at_position(server, params)
+	if !ok {
+		send_null_response(id)
+		return
+	}
+
+	highlights := make([dynamic]proto.DocumentHighlight)
+	decl_span := core.symbol_at(doc.res_ctx.symbol_store, sym_id).span
+	if decl_span.file_id == doc.file_id {
+		append(&highlights, proto.DocumentHighlight{range = lsp_range(doc.source, decl_span.start, decl_span.end)})
+	}
+	for sp in doc.usages[sym_id] {
+		if sp.file_id != doc.file_id do continue
+		append(&highlights, proto.DocumentHighlight{range = lsp_range(doc.source, sp.start, sp.end)})
+	}
+
+	send_response(id, highlights[:])
 }
 
 // LSP semantic tokens: относительное кодирование (line-delta, char-delta,

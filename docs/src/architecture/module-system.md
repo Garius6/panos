@@ -1,0 +1,84 @@
+# Модульная система
+
+## Что
+
+**`Module_Graph`** (`core/resolver.odin:88`) — `modules: map[string]^Module`,
+`order: [dynamic]^Module` (порядок загрузки), `loading: map[string]bool`
+(защита от циклических импортов во время загрузки), `symbol_types`,
+`symbol_store: ^Symbol_Store` (ОДИН на весь граф — см.
+[резолвер](./resolver.md)), `file_paths`/`file_sources: map[u16]string`
+(байтовый `Span.file_id` → путь/исходник, межмодульные diagnostics и
+LSP go-to-definition читают исходник ЛЮБОГО модуля графа отсюда).
+
+**`load_module_recursive`** (`core/module_loader.odin:17`) —
+`(graph: ^Module_Graph, file_path: string, is_entry: bool, importer_span: Span) -> ^Module` —
+рекурсивно загружает модуль и все его импорты, кэшируя по `module_key`
+(`resolve_import_path(file_path, "")`) в `graph.modules`, чтобы один и тот
+же файл не парсился дважды при множественном импорте.
+
+**`load_module_graph_with_overrides`** (`core/module_loader.odin:125`) —
+`(entry_path: string, overrides: map[string]string) -> Module_Graph` —
+точка входа для полного графа с диска; `overrides` подставляет ТЕКСТ
+вместо чтения файла (используется LSP для несохранённых правок открытых
+документов, см. [LSP-сервер](./lsp.md)).
+
+**Разрешение пути импорта — `resolve_existing_import_path`**
+(`core/resolver_import_native.odin`, `#+build !js`) пробует ПО ПОРЯДКУ:
+(1) путь относительно директории импортирующего файла, (2) поддиректория
+`модули`, (3) переменная окружения `PANOS_STDLIB` (если задана), (4)
+директория `std` (стандартная библиотека, `.ps`-исходники). Первое
+совпадение побеждает.
+
+**Встроенные (native) vs файловые модули**: `ensure_builtin_module`
+(`core/stdlib.odin:183`) — для модулей вроде `строки`/`фс`/`ввод_вывод`,
+которые НЕ имеют `.ps`-файла на диске (реализованы нативно в VM/компиляторе)
+— создаёт `^Module` "на лету", без чтения файла, и регистрирует экспорты
+программно (`add_builtin_export`). Файловые модули (`std/*.ps` вроде
+`математика`/`коллекции`/`json`/`toml`) грузятся обычным
+`load_module_recursive` — реальный панос-исходник, парсится/резолвится/
+типизируется как любой другой модуль.
+
+## Зачем
+
+Отдельная модель графа (а не "слить все импортированные модули в единый
+общий scope") нужна, потому что panos СОЗНАТЕЛЬНО не сливает имена
+импортированного модуля в scope импортирующего — `модуль.имя`, не голое
+`имя` (единственное исключение — прелюдия, `core/prelude.odin`, неявно
+доступная КАЖДОМУ модулю без `импорт`, ровно чтобы `Опция`/`Результат`
+были "всегда под рукой"). Явная квалификация требует явной модели графа с
+разрешением путей, а не плоского merge.
+
+`ensure_builtin_module` существует отдельно от `load_module_recursive`,
+потому что часть стандартной функциональности (строковые операции,
+файловый ввод-вывод) реализована НАТИВНО в VM (как `Call_Builtin`-opcode,
+см. [компилятор и VM](./compiler-and-vm.md)), а не как panos-код — для
+таких модулей физически нет `.ps`-файла, который можно было бы распарсить.
+
+## Почему так, а не иначе
+
+**`ensure_builtin_module` вызывает `ensure_prelude(graph)` ПЕРВЫМ ДЕЛОМ**
+(комментарий, `stdlib.odin:194-200`): некоторые встроенные экспорты (`фс.прочитать`
+и т.п.) возвращают `Результат(...)`, которому нужны
+`graph.prelude_result_sym`/`symbol_types`/`prelude_generic_order` —
+обычно их выставляет `resolve_module`, но `load_module_recursive` вызывает
+`ensure_builtin_module` ЕЩЁ РАНЬШЕ, на этапе сканирования импортов, ДО
+единого `resolve_module` для графа. Без явного вызова `ensure_prelude`
+здесь прелюдия ещё не существовала бы, и self-мемоизация модуля (кэш по
+имени в `graph.modules`) закэшировала бы модуль с nil-типами НАВСЕГДА —
+`ensure_prelude` сама мемоизирована, повторный вызов ниже по стеку — no-op.
+
+**Известное следствие для тестов** (см.
+[тулчейн и тестирование](./toolchain-and-testing.md)): изолированный
+тестовый путь БЕЗ `Module_Graph` не грузит файловые `std/*.ps`-модули с
+диска (нет вызова `load_module_recursive`) — только `ensure_builtin_module`-
+модули резолвятся в таком контексте, т.к. они не требуют файлового I/O.
+
+## Точки входа для типичной правки
+
+| Изменение | Файл/функция |
+|---|---|
+| Новый встроенный (native) модуль/экспорт | `ensure_builtin_module`/`add_builtin_export` (`core/stdlib.odin`) |
+| Новый файловый stdlib-модуль | см. [рецепт](./recipes/new-stdlib-module.md) |
+| Новая экспортируемая функция в существующем `std/*.ps`-модуле | см. [рецепт](./recipes/new-stdlib-function.md) |
+| Изменить порядок поиска пути импорта | `resolve_existing_import_path` (`core/resolver_import_native.odin`/`resolver_import_wasm.odin` — платформенная пара, см. [platform-split](./platform-split.md)) |
+| Изменить, как резолвится путь импорта (конкатенация/суффикс `.ps`) | `resolve_import_path` (`core/resolver.odin:309`) |

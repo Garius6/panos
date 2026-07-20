@@ -528,19 +528,26 @@ handle_completion :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 }
 
 // Собирает Location[] по Symbol_Id: объявление (в этом или другом файле
-// графа — symbol_store общий) + все usages ИЗ ЭТОГО документа (doc.usages
-// не сканирует другие открытые файлы — см. ограничение в
-// handle_references).
-collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_decl: bool) -> [dynamic]proto.Location {
+// графа — symbol_store общий) + все usages ИЗ ЭТОГО документа, ПЛЮС usages
+// из других открытых документов, чей граф ЭТУ декларацию не видит "снизу
+// вверх" — см. merge_cross_document_usages.
+collect_locations :: proc(
+	server: ^LSP_Server,
+	doc: ^LSP_Document,
+	sym_id: core.Symbol_Id,
+	include_decl: bool,
+) -> [dynamic]proto.Location {
 	locations := make([dynamic]proto.Location)
+	decl_span := core.symbol_at(doc.res_ctx.symbol_store, sym_id).span
+	decl_source := doc.source
+	decl_uri := doc.uri
+	decl_path := doc.path
+	if decl_span.file_id != doc.file_id {
+		decl_source = doc.graph.file_sources[decl_span.file_id]
+		decl_uri = path_to_uri(doc.graph.file_paths[decl_span.file_id])
+		decl_path = doc.graph.file_paths[decl_span.file_id]
+	}
 	if include_decl {
-		decl_span := core.symbol_at(doc.res_ctx.symbol_store, sym_id).span
-		decl_source := doc.source
-		decl_uri := doc.uri
-		if decl_span.file_id != doc.file_id {
-			decl_source = doc.graph.file_sources[decl_span.file_id]
-			decl_uri = path_to_uri(doc.graph.file_paths[decl_span.file_id])
-		}
 		append(
 			&locations,
 			proto.Location{uri = proto.DocumentUri(decl_uri), range = lsp_range(decl_source, decl_span.start, decl_span.end)},
@@ -561,7 +568,85 @@ collect_locations :: proc(doc: ^LSP_Document, sym_id: core.Symbol_Id, include_de
 			proto.Location{uri = proto.DocumentUri(usage_uri), range = lsp_range(usage_source, sp.start, sp.end)},
 		)
 	}
+	merge_cross_document_usages(server, doc, decl_path, decl_span, &locations)
 	return locations
+}
+
+// Известное ограничение (частично снятое здесь): doc.graph рождён из
+// load_module_graph_with_overrides(doc.path, ...) — ТОЛЬКО прямые импорты
+// doc, не "кто импортирует doc" (reverse-dependents). Если декларация лежит
+// в файле X и вызывается из файла Y (Y импортирует X), вызов rename/references
+// ИЗ Y видит оба места (граф Y включает X), но вызов ИЗ X саму декларацию
+// в Y не увидит — граф X не включает Y. Каждый другой открытый документ уже
+// посчитал СВОЙ граф независимо (свой Symbol_Store — Symbol_Id НЕ сравним
+// между графами напрямую), поэтому матчим декларацию по (путь файла, byte
+// span объявления) вместо Symbol_Id: если у другого документа в его графе
+// есть файл с тем же путём и в нём символ с тем же span — это та же
+// декларация, просто с другим Symbol_Id в другом Symbol_Store. Покрывает
+// только СЕЙЧАС ОТКРЫТЫЕ документы — reverse-dependents, которые не открыты
+// в редакторе, всё ещё не увидим (нужен был бы project-wide индекс, не MVP).
+merge_cross_document_usages :: proc(
+	server: ^LSP_Server,
+	origin_doc: ^LSP_Document,
+	decl_path: string,
+	decl_span: core.Span,
+	locations: ^[dynamic]proto.Location,
+) {
+	for _, other_doc in server.documents {
+		if other_doc == origin_doc do continue
+		matched_sym, found := find_symbol_by_decl_location(other_doc, decl_path, decl_span)
+		if !found do continue
+		for sp in other_doc.usages[matched_sym] {
+			usage_source := other_doc.source
+			usage_uri := other_doc.uri
+			if sp.file_id != other_doc.file_id {
+				usage_source = other_doc.graph.file_sources[sp.file_id]
+				usage_uri = path_to_uri(other_doc.graph.file_paths[sp.file_id])
+			}
+			loc := proto.Location{uri = proto.DocumentUri(usage_uri), range = lsp_range(usage_source, sp.start, sp.end)}
+			already_present := false
+			for existing in locations {
+				if existing == loc {
+					already_present = true
+					break
+				}
+			}
+			if !already_present do append(locations, loc)
+		}
+	}
+}
+
+// Ищет в графе other_doc файл с путём decl_path, а затем — символ, чей span
+// объявления байт-в-байт совпадает с decl_span. Совпадение по (путь, span)
+// вместо Symbol_Id, т.к. other_doc резолвился в СВОЁМ отдельном графе со
+// своим Symbol_Store (см. merge_cross_document_usages).
+find_symbol_by_decl_location :: proc(
+	other_doc: ^LSP_Document,
+	decl_path: string,
+	decl_span: core.Span,
+) -> (
+	sym_id: core.Symbol_Id,
+	found: bool,
+) {
+	target_file_id: u16
+	found_file := false
+	for fid, path in other_doc.graph.file_paths {
+		if path == decl_path {
+			target_file_id = fid
+			found_file = true
+			break
+		}
+	}
+	if !found_file do return core.INVALID_SYMBOL, false
+
+	store := other_doc.res_ctx.symbol_store
+	for i in 1 ..< len(store.symbols) {
+		sym := store.symbols[i]
+		if sym.span.file_id == target_file_id && sym.span.start == decl_span.start && sym.span.end == decl_span.end {
+			return core.Symbol_Id(i), true
+		}
+	}
+	return core.INVALID_SYMBOL, false
 }
 
 // Общий первый шаг find-references/rename: позиция курсора -> документ +
@@ -591,11 +676,10 @@ resolve_symbol_at_position :: proc(
 	return found_doc, found_sym, true
 }
 
-// Известное ограничение MVP: find-references/rename сканируют usages
-// ТОЛЬКО в текущем открытом документе, не по всему графу импортов/
-// проекту — символ, объявленный в текущем файле и используемый в другом
-// открытом файле, найдётся не полностью. Определение символа (в т.ч. в
-// другом файле) резолвится корректно через общий symbol_store.
+// Известное оставшееся ограничение: find-references/rename видят usages по
+// всему графу импортов doc + по всем ДРУГИМ ОТКРЫТЫМ документам (см.
+// merge_cross_document_usages). Reverse-dependents, которые не открыты в
+// редакторе, всё ещё не найдутся — не сканируем весь проект на диске.
 handle_references :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	doc, sym_id, ok := resolve_symbol_at_position(server, params)
 	if !ok {
@@ -608,7 +692,7 @@ handle_references :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 		send_null_response(id)
 		return
 	}
-	locations := collect_locations(doc, sym_id, p.context_.include_declaration)
+	locations := collect_locations(server, doc, sym_id, p.context_.include_declaration)
 	send_response(id, locations[:])
 }
 
@@ -624,7 +708,7 @@ handle_rename :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 		return
 	}
 
-	locations := collect_locations(doc, sym_id, true)
+	locations := collect_locations(server, doc, sym_id, true)
 	// changes сгруппирован по uri — declaration может лежать в ДРУГОМ
 	// файле (импортированном модуле), чем usages.
 	changes_dyn := make(map[proto.DocumentUri][dynamic]proto.TextEdit, allocator = context.temp_allocator)

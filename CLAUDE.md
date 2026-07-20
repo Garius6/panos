@@ -1,9 +1,9 @@
 # panos Development Guidelines
 
-Auto-generated from feature plans. Last updated: 2026-07-18.
+Auto-generated from feature plans. Last updated: 2026-07-20.
 
 ## Active Technologies
-
+- mdBook (docs/) — internal architecture documentation, no new dependency (002-interpreter-architecture-docs)
 - Odin (toolchain pinned via `Justfile`), stdlib packages `core:fmt`, `core:strings`, `core:strconv`.
 
 ## Project Structure
@@ -34,7 +34,9 @@ Follow `AGENTS.md` and existing file conventions. No unrequested refactors
 (see constitution, Principle III — Surgical Changes).
 
 ## Recent Changes
-
+- 002-interpreter-architecture-docs: New mdBook section `docs/src/architecture/`
+  documenting interpreter internals (pipeline, runtime, LSP, known pitfalls,
+  toolchain, recipes) for maintainers editing without LLM help.
 - 001-adt-pattern-matching: Added ADT + pattern matching using
   `core:fmt`, `core:strings`, `core:strconv`.
 

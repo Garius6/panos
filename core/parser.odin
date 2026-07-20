@@ -54,6 +54,11 @@ Parser_Error :: enum {
 Function_Decl :: struct {
 	span:        Span,
 	name:        string,
+	// Span одного имени (без "функ"/аргументов/тела) — в отличие от span
+	// (вся декларация целиком), нужен для точных LSP-диапазонов (hover/
+	// document symbol selection_range/rename на самой декларации), где
+	// подсвечивать нужно только имя, не весь блок до "конец".
+	name_span:   Span,
 	// Текст `///`-докстринга непосредственно над декларацией (включая
 	// строку с `экспорт`, если она есть) — пусто, если его не было. См.
 	// Token.doc/skip_whitespace_and_comments (lexer.odin). Используется
@@ -1258,6 +1263,7 @@ parse_function :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Function_
 	tok := next_token(p.stream)
 	if tok.kind != .Ident do report_parse(p, tok.span, "Синтаксическая ошибка: ожидалось имя функции, получено: %v", tok.kind)
 	function.name = tok.data
+	function.name_span = tok.span
 
 	if peek_token(p.stream).kind == .LBracket {
 		function.type_params, function.type_param_bounds = parse_function_type_params(p)

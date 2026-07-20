@@ -289,6 +289,7 @@ clone_function_decl :: proc(d: ^Function_Decl) -> ^Function_Decl {
 	c := new(Function_Decl)
 	c.span = d.span
 	c.name = d.name
+	c.name_span = d.name_span
 	c.args = clone_param_list(d.args)
 	c.return_type = clone_type_node(d.return_type)
 	c.body = make([dynamic]Stmt)

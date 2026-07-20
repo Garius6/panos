@@ -87,6 +87,8 @@ run_lsp_server :: proc() {
 			handle_completion(&server, id_val, params)
 		case "textDocument/references":
 			handle_references(&server, id_val, params)
+		case "textDocument/prepareRename":
+			handle_prepare_rename(&server, id_val, params)
 		case "textDocument/rename":
 			handle_rename(&server, id_val, params)
 		case "textDocument/semanticTokens/full":
@@ -99,6 +101,8 @@ run_lsp_server :: proc() {
 			handle_document_symbol(&server, id_val, params)
 		case "textDocument/signatureHelp":
 			handle_signature_help(&server, id_val, params)
+		case "workspace/symbol":
+			handle_workspace_symbol(&server, id_val, params)
 		case:
 			if envelope.id != nil {
 				send_error_response(id_val, -32601, "method not found")
@@ -115,11 +119,12 @@ handle_initialize :: proc(id: json.Value) {
 			definition_provider = true,
 			completion_provider = proto.CompletionOptions{},
 			references_provider = true,
-			rename_provider = true,
+			rename_provider = proto.RenameOptions{prepare_provider = true},
 			document_highlight_provider = true,
 			folding_range_provider = true,
 			document_symbol_provider = true,
 			signature_help_provider = proto.SignatureHelpOptions{trigger_characters = []string{"(", ","}},
+			workspace_symbol_provider = true,
 			semantic_tokens_provider = proto.SemanticTokensOptions {
 				legend = proto.SemanticTokensLegend {
 					token_types = core.SEMANTIC_TOKEN_TYPE_NAMES[:],
@@ -705,6 +710,36 @@ handle_references :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 	send_response(id, locations[:])
 }
 
+// textDocument/prepareRename — подтверждает, что символ под курсором вообще
+// переименовываем, и отдаёт точный range+placeholder ДО того, как клиент
+// покажет пользователю поле ввода (иначе rename слепой — правит что попало
+// под курсором, даже если там не идентификатор). Тот же find_expr_in_program,
+// что и hover (handle_hover), не resolve_symbol_at_position — тому не нужен
+// span самого выражения, только Symbol_Id.
+handle_prepare_rename :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
+	doc, offset, ok := resolve_position(server, params)
+	if !ok {
+		send_null_response(id)
+		return
+	}
+	expr := core.find_expr_in_program(doc.prog, doc.file_id, offset)
+	if expr == nil {
+		send_null_response(id)
+		return
+	}
+	sym_id, has_sym := doc.res_ctx.node_symbols[expr]
+	if !has_sym || sym_id == core.INVALID_SYMBOL {
+		send_null_response(id)
+		return
+	}
+	sp := core.expr_span(expr)
+	result := proto.PrepareRenameResultVariant1 {
+		range       = lsp_range(doc.source, sp.start, sp.end),
+		placeholder = doc.source[sp.start:sp.end],
+	}
+	send_response(id, result)
+}
+
 handle_rename :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	doc, sym_id, ok := resolve_symbol_at_position(server, params)
 	if !ok {
@@ -860,6 +895,50 @@ handle_document_symbol :: proc(server: ^LSP_Server, id: json.Value, params: json
 		append(&symbols, to_proto_document_symbol(doc, s))
 	}
 	send_response(id, symbols[:])
+}
+
+// workspace/symbol — известное ограничение: только по СЕЙЧАС ОТКРЫТЫМ
+// документам (переиспользует compute_document_symbols на каждый из них),
+// не по всему проекту на диске — тот же MVP-компромисс, что и у
+// find-references/rename до project-wide индекса (см. merge_cross_document_
+// usages). Пустой query — все символы всех открытых документов.
+handle_workspace_symbol :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
+	p, ok := decode_params(proto.WorkspaceSymbolParams, params)
+	if !ok {
+		send_null_response(id)
+		return
+	}
+
+	results := make([dynamic]proto.SymbolInformation)
+	for _, doc in server.documents {
+		raw := core.compute_document_symbols(doc.prog)
+		defer delete(raw)
+		for s in raw {
+			collect_workspace_symbols(doc, s, "", p.query, &results)
+		}
+	}
+	send_response(id, results[:])
+}
+
+collect_workspace_symbols :: proc(
+	doc: ^LSP_Document,
+	s: core.Doc_Symbol,
+	container: string,
+	query: string,
+	out: ^[dynamic]proto.SymbolInformation,
+) {
+	if query == "" || strings.contains(s.name, query) {
+		info := proto.SymbolInformation {
+			name     = s.name,
+			kind     = doc_symbol_kind_to_proto(s.kind),
+			location = proto.Location{uri = proto.DocumentUri(doc.uri), range = lsp_range(doc.source, s.span.start, s.span.end)},
+		}
+		if container != "" do info.container_name = container
+		append(out, info)
+	}
+	for c in s.children {
+		collect_workspace_symbols(doc, c, s.name, query, out)
+	}
 }
 
 // textDocument/signatureHelp — подсказка параметров текущего вызова. Как

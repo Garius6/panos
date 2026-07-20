@@ -103,6 +103,10 @@ run_lsp_server :: proc() {
 			handle_signature_help(&server, id_val, params)
 		case "workspace/symbol":
 			handle_workspace_symbol(&server, id_val, params)
+		case "textDocument/codeLens":
+			handle_code_lens(&server, id_val, params)
+		case "textDocument/selectionRange":
+			handle_selection_range(&server, id_val, params)
 		case:
 			if envelope.id != nil {
 				send_error_response(id_val, -32601, "method not found")
@@ -125,6 +129,8 @@ handle_initialize :: proc(id: json.Value) {
 			document_symbol_provider = true,
 			signature_help_provider = proto.SignatureHelpOptions{trigger_characters = []string{"(", ","}},
 			workspace_symbol_provider = true,
+			code_lens_provider = proto.CodeLensOptions{},
+			selection_range_provider = true,
 			semantic_tokens_provider = proto.SemanticTokensOptions {
 				legend = proto.SemanticTokensLegend {
 					token_types = core.SEMANTIC_TOKEN_TYPE_NAMES[:],
@@ -335,12 +341,41 @@ handle_hover :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 		return
 	}
 
+	sym_id, has_sym := doc.res_ctx.node_symbols[expr]
+	sym: core.Symbol
+	if has_sym && sym_id != core.INVALID_SYMBOL {
+		sym = core.symbol_at(doc.res_ctx.symbol_store, sym_id)
+	}
+
+	// Type.name у Function-типа — просто константа "Function" (см.
+	// new_function_type в type_cheker.odin), бесполезно для hover'а.
+	// Собираем читаемую сигнатуру из typ.params/typ.return_type (уже
+	// вычислены тайпчекером) + имена параметров через Symbol.decl — тот же
+	// приём, что compute_signature_help в signature_help.odin.
+	pruned := core.prune_type(typ)
+	hover_text: string
+	if pruned.kind == .Function {
+		param_names: [dynamic]string
+		if has_sym {
+			if fd, is_fn := sym.decl.(^core.Function_Decl); is_fn {
+				for a in fd.args do append(&param_names, a.name)
+			}
+		}
+		parts := make([dynamic]string, 0, len(pruned.params), context.temp_allocator)
+		for pt, i in pruned.params {
+			name := i < len(param_names) ? param_names[i] : ""
+			label := name != "" ? fmt.tprintf("%s: %s", name, core.prune_type(pt).name) : core.prune_type(pt).name
+			append(&parts, label)
+		}
+		hover_text = fmt.tprintf("(%s) -> %s", strings.join(parts[:], ", "), core.prune_type(pruned.return_type).name)
+	} else {
+		hover_text = pruned.name
+	}
+
 	// Докстринг (`///`, см. Function_Decl.doc/decl_doc_comment) — тот же
 	// путь к декларации, что handle_definition (node_symbols -> Symbol.decl),
 	// добавляется под типом отдельным абзацем, если есть.
-	hover_text := core.prune_type(typ).name
-	if sym_id, has_sym := doc.res_ctx.node_symbols[expr]; has_sym && sym_id != core.INVALID_SYMBOL {
-		sym := core.symbol_at(doc.res_ctx.symbol_store, sym_id)
+	if has_sym {
 		if doc_comment := core.decl_doc_comment(sym.decl); doc_comment != "" {
 			hover_text = fmt.tprintf("%s\n\n%s", hover_text, doc_comment)
 		}
@@ -390,9 +425,17 @@ handle_definition :: proc(server: ^LSP_Server, id: json.Value, params: json.Valu
 		target_uri = path_to_uri(doc.graph.file_paths[sym.span.file_id])
 	}
 
+	// Function_Decl.name_span — прыгаем точно на имя, не на всю декларацию
+	// (сейчас есть только у функций — Struct/Enum/Interface своего
+	// name_span не имеют, там по-прежнему весь span).
+	jump_span := sym.span
+	if fd, is_fn := sym.decl.(^core.Function_Decl); is_fn && fd.name_span.end > fd.name_span.start {
+		jump_span = fd.name_span
+	}
+
 	result := proto.Location {
 		uri   = proto.DocumentUri(target_uri),
-		range = lsp_range(target_source, sym.span.start, sym.span.end),
+		range = lsp_range(target_source, jump_span.start, jump_span.end),
 	}
 	send_response(id, result)
 }
@@ -567,7 +610,17 @@ collect_locations :: proc(
 			proto.Location{uri = proto.DocumentUri(decl_uri), range = lsp_range(decl_source, decl_span.start, decl_span.end)},
 		)
 	}
-	for sp in doc.usages[sym_id] {
+	// Двойной доступ по ключу (len(doc.usages[sym_id]) отдельно от for-range
+	// по doc.usages[sym_id]) на ОТСУТСТВУЮЩЕМ ключе — реальный сегфолт (см.
+	// codeLens: единственный вызывающий, дающий sym_id БЕЗ единого usage —
+	// references/rename всегда резолвят sym_id по клику на существующее
+	// использование, там ключ гарантированно есть). Один map-lookup через
+	// (value, ok) вместо двух разных обращений — тот же паттерн ниже,
+	// merge_cross_document_usages задел не пришлось трогать: там за раз для
+	// каждого other_doc максимум одно совпадение по span, накопления с
+	// частым отсутствием ключа не было.
+	usages_for_sym, has_usages := doc.usages[sym_id]
+	for sp in usages_for_sym {
 		// sp может лежать в ЛЮБОМ модуле графа (build_usages теперь
 		// сканирует все) — тот же file_id-aware выбор источника/uri, что
 		// уже используется для decl_span выше, а не всегда doc.uri/doc.source.
@@ -610,7 +663,13 @@ merge_cross_document_usages :: proc(
 		if other_doc == origin_doc do continue
 		matched_sym, found := find_symbol_by_decl_location(other_doc, decl_path, decl_span)
 		if !found do continue
-		for sp in other_doc.usages[matched_sym] {
+		// Прямая индексация map'ы внутри for-range на ОТСУТСТВУЮЩЕМ ключе —
+		// сегфолт (см. комментарий в collect_locations выше, где это же
+		// нашли живым тестом): matched_sym гарантированно существует как
+		// декларация (find_symbol_by_decl_location совпал по span), но НЕ
+		// гарантированно имеет хоть один usage В ЭТОМ other_doc.
+		matched_usages, _ := other_doc.usages[matched_sym]
+		for sp in matched_usages {
 			usage_source := other_doc.source
 			usage_uri := other_doc.uri
 			if sp.file_id != other_doc.file_id {
@@ -786,7 +845,13 @@ handle_document_highlight :: proc(server: ^LSP_Server, id: json.Value, params: j
 	if decl_span.file_id == doc.file_id {
 		append(&highlights, proto.DocumentHighlight{range = lsp_range(doc.source, decl_span.start, decl_span.end)})
 	}
-	for sp in doc.usages[sym_id] {
+	// Прямая индексация map'ы в for-range на отсутствующем ключе — сегфолт
+	// (см. collect_locations); здесь sym_id всегда приходит через
+	// resolve_symbol_at_position (клик на реальное usage), так что ключ
+	// гарантированно есть, но паттерн копирует безопасную форму на всякий
+	// случай — дешёво, а не разбираться с этим инвариантом при следующей правке.
+	usages_for_sym, _ := doc.usages[sym_id]
+	for sp in usages_for_sym {
 		if sp.file_id != doc.file_id do continue
 		append(&highlights, proto.DocumentHighlight{range = lsp_range(doc.source, sp.start, sp.end)})
 	}
@@ -859,6 +924,13 @@ doc_symbol_kind_to_proto :: proc(k: core.Doc_Symbol_Kind) -> proto.SymbolKind {
 
 to_proto_document_symbol :: proc(doc: ^LSP_Document, s: core.Doc_Symbol) -> proto.DocumentSymbol {
 	rng := lsp_range(doc.source, s.span.start, s.span.end)
+	// name_span (Function_Decl) — точный диапазон одного имени, если он есть
+	// (только у функций, см. Doc_Symbol.name_span); иначе selection_range
+	// падает обратно на весь span, как раньше.
+	selection_rng := rng
+	if s.name_span.end > s.name_span.start {
+		selection_rng = lsp_range(doc.source, s.name_span.start, s.name_span.end)
+	}
 	children := make([dynamic]proto.DocumentSymbol, 0, len(s.children))
 	for c in s.children {
 		append(&children, to_proto_document_symbol(doc, c))
@@ -867,7 +939,7 @@ to_proto_document_symbol :: proc(doc: ^LSP_Document, s: core.Doc_Symbol) -> prot
 		name            = s.name,
 		kind            = doc_symbol_kind_to_proto(s.kind),
 		range           = rng,
-		selection_range = rng,
+		selection_range = selection_rng,
 	}
 	if len(children) > 0 {
 		result.children = children[:]
@@ -895,6 +967,147 @@ handle_document_symbol :: proc(server: ^LSP_Server, id: json.Value, params: json
 		append(&symbols, to_proto_document_symbol(doc, s))
 	}
 	send_response(id, symbols[:])
+}
+
+// textDocument/codeLens — "N использований" над каждой функцией, объявленной
+// В ЭТОМ файле. Переиспользует collect_locations (тот же счётчик, что
+// references/rename) — include_decl=false, считаем только usages, не саму
+// декларацию. Command.command оставлен пустым (не resolve-lens, просто
+// надпись — клиентам вроде Neovim не из коробки есть куда вести клик по
+// произвольной command-строке без своего клиентского маппинга).
+handle_code_lens :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
+	p, ok := decode_params(proto.CodeLensParams, params)
+	if !ok {
+		send_null_response(id)
+		return
+	}
+	doc, found := server.documents[string(p.text_document.uri)]
+	if !found {
+		send_null_response(id)
+		return
+	}
+
+	lenses := make([dynamic]proto.CodeLens)
+	store := doc.res_ctx.symbol_store
+	for i in 1 ..< len(store.symbols) {
+		sym := store.symbols[i]
+		if sym.kind != .Function do continue
+		if sym.span.file_id != doc.file_id do continue
+
+		sym_id := core.Symbol_Id(i)
+		locations := collect_locations(server, doc, sym_id, false)
+		count := len(locations)
+		delete(locations)
+
+		rng: proto.Range
+		if fd, is_fn := sym.decl.(^core.Function_Decl); is_fn {
+			rng = lsp_range(doc.source, fd.name_span.start, fd.name_span.end)
+		} else {
+			line, char := core.byte_offset_to_lsp_position(doc.source, sym.span.start)
+			pos := proto.Position{line = u32(line), character = u32(char)}
+			rng = proto.Range{start = pos, end = pos}
+		}
+		append(&lenses, proto.CodeLens{range = rng, command = proto.Command{title = code_lens_title(count), command = ""}})
+	}
+	send_response(id, lenses[:])
+}
+
+// Русское склонение числительного при слове "использование" — 11-14 всегда
+// "использований" (искл. из общего mod-10 правила), иначе mod-10: 1 -> ед.
+// число, 2-4 -> "использования", остальное -> "использований".
+code_lens_title :: proc(count: int) -> string {
+	n := count % 100
+	form: string
+	if n >= 11 && n <= 14 {
+		form = "использований"
+	} else {
+		switch n % 10 {
+		case 1:
+			form = "использование"
+		case 2, 3, 4:
+			form = "использования"
+		case:
+			form = "использований"
+		}
+	}
+	return fmt.tprintf("%d %s", count, form)
+}
+
+// textDocument/selectionRange — "Expand/Shrink Selection". Клиент шлёт
+// несколько позиций (мультикурсор) — по одной цепочке SelectionRange на
+// каждую. core.collect_selection_spans отдаёт span'ы СНАРУЖИ ВНУТРЬ,
+// возвращаемая цепочка должна идти ИЗНУТРИ НАРУЖУ (0 = самый глубокий span,
+// .parent — на уровень крупнее) — разворачиваем и попутно схлопываем
+// соседние идентичные span'ы (Expr_Stmt часто занимает ТОТ ЖЕ диапазон, что
+// его единственное выражение — без схлопывания "расширение выделения" на
+// этом шаге выглядело бы так, будто ничего не изменилось).
+//
+// proto.SelectionRange.parent — единственное поле-указатель (^SelectionRange)
+// во ВСЁМ автогенерированном protocol-пакете; core:encoding/json.marshal его
+// не поддерживает (Unsupported_Type, живой тест это подтвердил) — struct
+// целиком тут не годится. Собираем ответ вручную как дерево json.Value
+// (Object/Array), в обход marshal-через-struct.
+handle_selection_range :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
+	p, ok := decode_params(proto.SelectionRangeParams, params)
+	if !ok {
+		send_null_response(id)
+		return
+	}
+	doc, found := server.documents[string(p.text_document.uri)]
+	if !found {
+		send_null_response(id)
+		return
+	}
+
+	results := make([dynamic]json.Value, 0, len(p.positions))
+	for pos in p.positions {
+		offset := core.lsp_position_to_byte_offset(doc.source, int(pos.line), int(pos.character))
+		spans := core.collect_selection_spans(doc.prog, doc.file_id, offset)
+		defer delete(spans)
+
+		deduped := make([dynamic]core.Span, 0, len(spans), context.temp_allocator)
+		for i := len(spans) - 1; i >= 0; i -= 1 {
+			sp := spans[i]
+			if len(deduped) > 0 {
+				last := deduped[len(deduped) - 1]
+				if last.start == sp.start && last.end == sp.end do continue
+			}
+			append(&deduped, sp)
+		}
+
+		if len(deduped) == 0 {
+			fallback := make(json.Object)
+			fallback["range"] = range_to_json_value(proto.Range{start = pos, end = pos})
+			append(&results, json.Value(fallback))
+		} else {
+			append(&results, selection_range_chain_to_json(doc, deduped[:], 0))
+		}
+	}
+	send_response(id, results[:])
+}
+
+selection_range_chain_to_json :: proc(doc: ^LSP_Document, deduped: []core.Span, idx: int) -> json.Value {
+	sp := deduped[idx]
+	obj := make(json.Object)
+	obj["range"] = range_to_json_value(lsp_range(doc.source, sp.start, sp.end))
+	if idx + 1 < len(deduped) {
+		obj["parent"] = selection_range_chain_to_json(doc, deduped, idx + 1)
+	}
+	return obj
+}
+
+range_to_json_value :: proc(r: proto.Range) -> json.Value {
+	obj := make(json.Object)
+	obj["start"] = position_to_json_value(r.start)
+	obj["end"] = position_to_json_value(r.end)
+	return obj
+}
+
+position_to_json_value :: proc(p: proto.Position) -> json.Value {
+	obj := make(json.Object)
+	obj["line"] = json.Value(json.Integer(p.line))
+	obj["character"] = json.Value(json.Integer(p.character))
+	return obj
 }
 
 // workspace/symbol — известное ограничение: только по СЕЙЧАС ОТКРЫТЫМ

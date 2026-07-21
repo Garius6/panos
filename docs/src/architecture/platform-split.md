@@ -2,14 +2,16 @@
 
 ## Что
 
-Семь пар файлов в `core/`, каждая пара реализует ОДНУ и ту же функциональность
-двумя разными способами — нативно (`#+build !js`) и под wasm (`#+build js`):
+Восемь пар файлов в `core/`, каждая пара реализует ОДНУ и ту же
+функциональность двумя разными способами — нативно (`#+build !js`) и под
+wasm (`#+build js`):
 
 | Нативная часть | WASM-часть | Что реализует |
 |---|---|---|
 | `file_value_native.odin` | `file_value_wasm.odin` | Файловые значения (`File_Value`) |
 | `module_loader_native.odin` | `module_loader_wasm.odin` | Чтение файла модуля с диска |
 | `resolver_import_native.odin` | `resolver_import_wasm.odin` | Разрешение пути импорта (`resolve_existing_import_path`) |
+| `vm_async_io_native.odin` | `vm_async_io_wasm.odin` | Submit-сторона неблокирующего I/O (`submit_async_io`/`submit_async_io_method` — см. [компилятор и VM](./compiler-and-vm.md)) |
 | `vm_compress_native.odin` | `vm_compress_wasm.odin` | Архивация/сжатие (tar/gz) |
 | `vm_ffi_native.odin` | `vm_ffi_wasm.odin` | FFI (вызов внешних C-функций через libffi) |
 | `vm_http_native.odin` | `vm_http_wasm.odin` | HTTP(S)-клиент |

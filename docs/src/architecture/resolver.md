@@ -5,7 +5,7 @@
 Резолвер (`core/resolver.odin`) связывает идентификаторы в AST с
 конкретными объявлениями (переменная/функция/тип/модуль). Главная точка
 входа — `resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program)`
-(`resolver.odin:890`).
+(`resolver.odin:913`).
 
 Центральные структуры:
 
@@ -24,7 +24,7 @@
 - **`Module_Graph`** (`resolver.odin:88`) — `modules: map[string]^Module`,
   `order` (порядок загрузки), `symbol_types`, **`symbol_store: ^Symbol_Store`
   — ОДИН общий Symbol_Store на ВЕСЬ граф импортов**, не по одному на модуль.
-- **`Resolver_Ctx`** (`resolver.odin:393`) — рабочий контекст одного прохода
+- **`Resolver_Ctx`** (`resolver.odin:416`) — рабочий контекст одного прохода
   резолва: `current_scope`/`global_scope` (`^Scope`), `current_module`,
   `module_graph`, `symbol_store`, `symbol_types: map[Symbol_Id]^Type`,
   плюс side-table'ы: `decl_symbols: map[Decls]Symbol_Id`,
@@ -67,7 +67,7 @@ go-to-definition используют ТОЛЬКО `node_symbols`/`Symbol_Store`
 byte-span объявления), см. [LSP-сервер](./lsp.md).
 
 **`module := new(Module)` в `resolve_program`, а НЕ стековый композитный
-литерал** (`resolver.odin:901`, комментарий на месте) — каждый созданный
+литерал** (`resolver.odin:914`, комментарий на месте) — каждый созданный
 здесь `Symbol` хранит `Symbol.module` (`^Module`) и переживает саму
 `resolve_program` (читается вплоть до `compile_program`/
 `monomorphize_program`, см. `core/monomorphize.odin`). Стековая версия
@@ -88,7 +88,7 @@ byte-span объявления), см. [LSP-сервер](./lsp.md).
 
 | Изменение | Файл/функция |
 |---|---|
-| Новая diagnostic-проверка при резолве (например запрет использования зарезервированного имени) | `report_resolve` (`resolver.odin:466`) — репортит `Diagnostic` в `ctx.diagnostics`, не паникует (accumulate-not-panic, тот же паттерн, что в парсере/тайпчекере) |
+| Новая diagnostic-проверка при резолве (например запрет использования зарезервированного имени) | `report_resolve` (`resolver.odin:489`) — репортит `Diagnostic` в `ctx.diagnostics`, не паникует (accumulate-not-panic, тот же паттерн, что в парсере/тайпчекере) |
 | Новый вид объявления, которое резолвер должен видеть на верхнем уровне модуля | `resolve_program`/место обхода `prog.decls` — нужно добавить ветку `#partial switch` |
 | Изменить, как резолвится путь импорта | `resolve_import_path` (`resolver.odin:309`) — конкатенация `importer_dir`+`import_spec`, добавление `.ps`-суффикса, нормализация пути |
 | Изменить, что попадает в `node_symbols` (для LSP-фич вроде semantic tokens/rename) | места вызова `ctx.node_symbols[expr] = sym_id` внутри резолва `Ident_Expr`/`Property_Expr` |

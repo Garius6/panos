@@ -20,7 +20,7 @@
    [лексер](../lexer.md) → "Точки входа для типичной правки". Если
    оператор собирается из уже существующих токенов — этот шаг не нужен.
 
-2. **Добавить precedence** в `infix_bp` (`core/parser.odin:2561`, см.
+2. **Добавить precedence** в `infix_bp` (`core/parser.odin:2770`, см.
    [парсер](../parser.md)): выбрать пару `(lbp, rbp)` согласно таблице
    существующих ярусов — **не менять существующие значения**, разрывы
    между ярусами оставлены щедрыми специально для таких вставок. Право-
@@ -35,18 +35,18 @@
    (например `Целое`/`Число` по аналогии с существующими арифметическими
    операторами), при несовместимости — `report(ctx, e.span, ...)`.
 
-4. **Объявить opcode**: `Opcode :: enum u8` (`core/compiler.odin:284`, см.
+4. **Объявить opcode**: `Opcode :: enum u8` (`core/compiler.odin:291`, см.
    [компилятор и VM](../compiler-and-vm.md)) — новый вариант, например
    `Power`.
 
 5. **Эмиссия компилятора**: `compile_expr`, кейс `^Binary_Expr`
-   (`core/compiler.odin:907`, внутренний `#partial switch e.op` начиная
+   (`core/compiler.odin:973`, внутренний `#partial switch e.op` начиная
    со строки ~984) — `case .НовыйToken: emit_opcode(ctx, .Power)`. Если
    выбор opcode зависит от статического типа (как `Int_Divide`/`Divide`) —
    проверка `ctx.tc.node_types[e.left] == TY_INT`.
 
 6. **Обработчик VM**: `execute`, `#partial switch opcode`
-   (`core/vm.odin:1485`+) — новый `case .Power:`, снять операнды со
+   (`core/vm.odin:1542`+) — новый `case .Power:`, снять операнды со
    `vm.stack` через `pop`, вычислить, положить результат через `append`.
 
 ## Проверка

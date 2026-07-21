@@ -54,7 +54,7 @@ resolve/typecheck/compile это неотличимо от обычной non-ge
 в начале `core/ast_clone.odin`).
 
 **Почему cross-module bounded generic резолвится ЧЕРЕЗ резолвер модуля
-объявления, а не вызывающего** (`monomorphize_one`, `core/monomorphize.odin:58`):
+объявления, а не вызывающего** (`monomorphize_one`, `core/monomorphize.odin:51`):
 функция `f`, объявленная в другом модуле, резолвилась и типизировалась СВОИМ
 `Resolver_Ctx`/`global_scope` — если резолвить клон через резолвер
 ВЫЗЫВАЮЩЕГО модуля, имена, которые `f` использует внутри своего тела

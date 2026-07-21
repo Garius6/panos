@@ -22,7 +22,7 @@
 2. **В резолвере**: найти подходящее место обхода (`resolve_expr`/
    `resolve_stmt`/место резолва конкретной декларации), добавить условие,
    вызвать `report_resolve(ctx, span, format, ..args)`
-   (`core/resolver.odin:466`) — repортит `Diagnostic` в `ctx.diagnostics`,
+   (`core/resolver.odin:489`) — repортит `Diagnostic` в `ctx.diagnostics`,
    НЕ паникует (accumulate-not-panic — резолв продолжается после ошибки,
    собирая максимум диагностик за один проход).
 

@@ -22,11 +22,11 @@ Mark-and-sweep, non-moving (не двигает объекты в памяти) 
 `core/gc.odin:103`); (2) явный — `force_gc(vm)` (публичный хук для
 детерминированных тестов "было N объектов, стало M").
 
-**`collect_garbage`** (`core/gc.odin:511`) — `mark_roots(vm)` (пометить
+**`collect_garbage`** (`core/gc.odin:541`) — `mark_roots(vm)` (пометить
 достижимое от корней), `sweep(vm)` (уплотнить `all_objects`, отправить
 непомеченное в пул), пересчитать `next_threshold = max(bytes_allocated*2, GC_MIN_THRESHOLD)`.
 
-**Корни сборки** (`mark_roots`, `core/gc.odin:339`): `vm.stack`,
+**Корни сборки** (`mark_roots`, `core/gc.odin:363`): `vm.stack`,
 `vm.gc.protect_stack` (включая `gc_pin`'нутые значения, см. ниже),
 константы всех `Compiled_Function` в реестре, почтовые ящики (`mailbox`),
 очереди сигналов (`signals`) и очереди результатов асинхронного I/O
@@ -111,8 +111,8 @@ panic'ом при первом вызове) — там `runtime.default_wasm_al
 | 1. Struct с `GC_Header` первым полем | `core/compiler.odin` (рядом с остальными `*_Value`-структурами) |
 | 2. Добавить вариант в `Value` union | `core/compiler.odin` |
 | 3. Free-list в `GC_State` + инициализация | `core/gc.odin:61` (`GC_State`), `new_gc_state` |
-| 4. Диспетч в `gc_new` | `core/gc.odin:158` |
-| 5. Case в `get_header` | `core/gc.odin:228` — возвращает `&val.header` |
-| 6. Case в `mark_value` | `core/gc.odin:270` — рекурсивно пометить вложенные `Value`-поля |
+| 4. Диспетч в `gc_new` | `core/gc.odin:182` |
+| 5. Case в `get_header` | `core/gc.odin:252` — возвращает `&val.header` |
+| 6. Case в `mark_value` | `core/gc.odin:294` — рекурсивно пометить вложенные `Value`-поля |
 | 7. Case в `value_size` | учёт байт при `bytes_allocated` |
 | 8. Case в `pool_release` | очистка/финализация (закрыть файл/сокет, если внешний ресурс) + `append` в свой free-list |

@@ -2,7 +2,7 @@
 
 ## Что
 
-Восемь пар файлов в `core/`, каждая пара реализует ОДНУ и ту же
+Десять пар файлов в `core/`, каждая пара реализует ОДНУ и ту же
 функциональность двумя разными способами — нативно (`#+build !js`) и под
 wasm (`#+build js`):
 
@@ -16,6 +16,8 @@ wasm (`#+build js`):
 | `vm_ffi_native.odin` | `vm_ffi_wasm.odin` | FFI (вызов внешних C-функций через libffi) |
 | `vm_http_native.odin` | `vm_http_wasm.odin` | HTTP(S)-клиент |
 | `vm_io_native.odin` | `vm_io_wasm.odin` | Файловый ввод-вывод |
+| `vm_process_native.odin` | `vm_process_wasm.odin` | `ос.выполнить`/`ос.завершить` (спавн процесса, exit-with-code) — wasm-заглушка паникует, браузер не может управлять процессами |
+| `vm_syntax_native.odin` | `vm_syntax_wasm.odin` | `синтаксис.*` (compile-time АСТ-интроспекция ДРУГОГО `.ps` файла для codegen-инструментов) — wasm-заглушка паникует, нет файловой системы для чтения чужого файла |
 
 Точка входа wasm-сборки — `wasm/main.odin`, экспортирует `panos_run "c"`
 (и `panos_check`/`panos_hover`/`panos_complete` для интерактивного демо —
@@ -54,6 +56,6 @@ wasm (`#+build js`):
 | Изменение | Файл/функция |
 |---|---|
 | Изменить поведение файлового I/O | ОБЕ части пары: `vm_io_native.odin` И `vm_io_wasm.odin` — забыть wasm-часть означает молчаливое расхождение поведения между нативной сборкой и демо в браузере |
-| Добавить новую platform-specific возможность | новая пара файлов `имя_native.odin`/`имя_wasm.odin` с соответствующими `#+build`-тегами — по образцу существующих 7 пар |
+| Добавить новую platform-specific возможность | новая пара файлов `имя_native.odin`/`имя_wasm.odin` с соответствующими `#+build`-тегами — по образцу существующих 10 пар |
 | Изменить точку входа wasm-демо | `wasm/main.odin` — `panos_run`/`panos_check`/`panos_hover`/`panos_complete` |
 | Проверить, что новый код не тянет `core:os` под wasm | `just build-wasm` (см. [тулчейн и тестирование](./toolchain-and-testing.md)) — единственный надёжный способ проверить: сборка просто упадёт compile-time, если platform-контракт нарушен |

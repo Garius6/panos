@@ -2,15 +2,15 @@
 
 ## Что
 
-Точка входа — `parse_program :: proc(p: ^Parser) -> Program` (`core/parser.odin:760`),
+Точка входа — `parse_program :: proc(p: ^Parser) -> Program` (`core/parser.odin:945`),
 возвращает `Program{decls: [dynamic]Decls}`.
 
-**`Decls`** (`parser.odin:261`) — union верхнеуровневых объявлений:
+**`Decls`** (`parser.odin:307`) — union верхнеуровневых объявлений:
 `^Import_Decl`, `^Function_Decl`, `^Struct_Decl`, `^Impl_Decl`,
 `^Interface_Decl`, `^Enum_Decl`, `^Error_Decl` (placeholder при ошибке
 парсинга), `^Foreign_Decl` (FFI).
 
-**`Expr`** (`parser.odin:571`) — union выражений: `Number_Expr`,
+**`Expr`** (`parser.odin:680`) — union выражений: `Number_Expr`,
 `Boolean_Expr`, `String_Expr`, `Binary_Expr`, `Unary_Expr`, `Ident_Expr`
 (`name: Interned`, не `string` — см. `core/interner.odin`), `Call_Expr`
 (`args`+`arg_names` для именованных аргументов), `While_Expr`, `If_Expr`
@@ -19,24 +19,40 @@
 `Array_Expr`, `Map_Expr`, `Index_Expr`, `Try_Expr` (постфиксный `?`),
 `Match_Expr`, `Error_Expr`, `Spawn_Expr` (`запусти <вызов>`).
 
-**`Stmt`** (`parser.odin:340`) — union: `Return_Stmt`, `Let_Stmt`
+**`Stmt`** (`parser.odin:449`) — union: `Return_Stmt`, `Let_Stmt`
 (`пер`/`конст`, включая деструктуризацию — `names`/`destructure_type`/
 `destructure_field_names`), `Expr_Stmt`, `Continue_Stmt`, `Break_Stmt`,
 `Error_Stmt`, `For_In_Stmt` (`для x в expr цикл`).
 
 **`Span`** (`core/token.odin:86`) — `{file_id: u16, start: u32, end: u32}`.
 Каждый AST-узел получает span по паттерну: `start := peek_token(...).span`
-ДО парсинга содержимого, `node.span = span_from(p, start)` (`parser.odin:2739`)
-ПОСЛЕ. `expr_span(e: Expr) -> Span` (`parser.odin:2746`) — извлекает span
+ДО парсинга содержимого, `node.span = span_from(p, start)` (`parser.odin:2948`)
+ПОСЛЕ. `expr_span(e: Expr) -> Span` (`parser.odin:2955`) — извлекает span
 из любого варианта `Expr` через exhaustive switch.
 
-**`Function_Decl.name_span`** (`parser.odin:60`) — span ТОЛЬКО имени функции
+**`Function_Decl.name_span`** (`parser.odin:92`) — span ТОЛЬКО имени функции
 (без `функ`/аргументов/тела), в отличие от `span` (вся декларация целиком).
-Заполняется в `parse_function` (`parser.odin:1258-1260`):
+Заполняется в `parse_function` (`parser.odin:1459-1471`):
 `function.name_span = tok.span`, где `tok` — токен имени, СРАЗУ после
 ключевого слова `функ`. Нужен для точных LSP-диапазонов (hover/rename/
 document symbol `selectionRange` — см. [LSP-сервер](./lsp.md)), где
 подсвечивать нужно только имя, не весь блок.
+
+**`Annotation`** (`parser.odin:79`, плюс `Annotation_Arg`/`Annotation_Value`
+на строках `70`/`65`) — `&Имя` или `&Имя(арг1, имя2 = арг2, ...)` перед
+top-level декларацией или полем структуры. Сигил намеренно `&` (не `@`),
+переиспользует уже существующий токен `.Ampersand` (битовое И) —
+конфликта нет, т.к. `parse_annotations` (`parser.odin:881`) вызывается
+ТОЛЬКО в позициях, где выражение начаться не может (первый токен
+top-level декларации/строки поля структуры), а битовый оператор — только
+внутри Pratt-парсера тела функции. Компилятор аннотации только парсит и
+прикрепляет к AST-узлу (`Struct_Decl.annotations`/`Function_Decl.
+annotations`/`Field_Decl.annotations`/...) — резолвер/тайпчекер/VM их не
+читают, смысл целиком на совести внешнего инструмента (см.
+`decl_annotations`, `parser.odin:342` — общий доступ к аннотациям любого
+вида `Decls`, аналог `decl_doc_comment`; `find_annotation`/
+`annotation_string_arg`, `parser.odin:362`/`372` — поиск по имени и
+извлечение первого позиционного строкового аргумента).
 
 ## Зачем
 
@@ -50,7 +66,7 @@ document symbol `selectionRange` — см. [LSP-сервер](./lsp.md)), где
 невозможным без дублирования логики парсинга.
 
 Сложные конструкции (`для` — for-in) десахариваются В AST на этапе
-парсинга, а не позже: `парсер.odin:1707-1766` разворачивает `для x в expr
+парсинга, а не позже: `parser.odin:1882-1949` разворачивает `для x в expr
 цикл ... конец` в канонические узлы (`Let_Stmt`+`While_Expr`), и все
 последующие стадии никогда не видят синтаксический сахар — только
 единообразное представление.
@@ -58,8 +74,8 @@ document symbol `selectionRange` — см. [LSP-сервер](./lsp.md)), где
 ## Почему так, а не иначе
 
 **Pratt-parser (precedence climbing)** — `parse_expr :: proc(p: ^Parser,
-min_bp: int) -> Expr` (`parser.odin:2096`), таблицы связывающей силы —
-`prefix_bp`/`infix_bp` (`parser.odin:2544`/`2561`):
+min_bp: int) -> Expr` (`parser.odin:2305`), таблицы связывающей силы —
+`prefix_bp`/`infix_bp` (`parser.odin:2753`/`2770`):
 
 ```text
 Dot            900, 910   (наивысший — доступ к полю/tuple-индексу)
@@ -79,7 +95,7 @@ Plus/Minus      500, 510  (аддитивные)
 ```
 
 Значения — **×10 от исходных** (было `Dot=90` и т.д.), с намеренно щедрыми
-разрывами между ярусами (комментарий, `parser.odin:2552-2560`): освобождает
+разрывами между ярусами (комментарий, `parser.odin:2761-2769`): освобождает
 место под битовые операторы БЕЗ пересчёта остальной таблицы. Сдвиг вставлен
 между аддитивными и реляционными, `&`/`^`/`|` — между равенством и
 логическими и/или — тот же ОТНОСИТЕЛЬНЫЙ порядок, что в C (сдвиг >
@@ -100,7 +116,7 @@ Plus/Minus      500, 510  (аддитивные)
 `Ident`, `.Dot`, `Number("1.0")` — числовой токен ПОСЛЕ точки лексер читает
 как единый float-литерал `read_number` (см. [лексер](./lexer.md)), потому
 что у лексера нет понятия "предыдущий токен был `.`". Контекст есть у
-ПАРСЕРА в обработке property-доступа (`parser.odin:2188-2223`): если
+ПАРСЕРА в обработке property-доступа (`parser.odin:2397-2426`): если
 числовой токен сразу после `.` сам содержит `.` в своём тексте (`"1.0"`),
 парсер разбивает его на ДВА `Property_Expr` (`.1` затем `.0`), как если бы
 исходный текст содержал `.1.0` явно тремя токенами.
@@ -109,8 +125,8 @@ Plus/Minus      500, 510  (аддитивные)
 
 | Изменение | Файл/функция |
 |---|---|
-| Новый бинарный оператор | **Только парсерная часть — этого одного недостаточно, см. [рецепт целиком](./recipes/new-binary-operator.md).** Здесь: `infix_bp` (`parser.odin:2561`) — добавить `case` с парой binding power; диспетчеризация в `parse_expr` (строки ~2239-2243) автоматическая, отдельной функции парсинга не нужно. Дальше по pipeline ОБЯЗАТЕЛЬНО трогать: `infer_binary_expr` в `type_cheker.odin` (см. [тайпчекер](./type-checker.md)) — вывод типа результата; новый `Opcode` + `compile_expr`/`execute` в `compiler.odin`+`vm.odin` (см. [компилятор и VM](./compiler-and-vm.md)) — кодогенерация и исполнение |
-| Новый унарный оператор | `prefix_bp` (`parser.odin:2544`) |
-| Новый вид `Expr`/`Stmt` (AST-узел) | 1) добавить вариант в union (`Expr` строка 571 / `Stmt` строка 340); 2) описать struct с полем `span`; 3) написать `parse_*`-функцию; 4) диспетчеризация в `nud`/`parse_stmt`; 5) добавить кейс в `expr_span` (`parser.odin:2746`); 6) добавить кейс в `print_ast` (debug-печать AST) — см. [рецепт](./recipes/new-ast-node.md) |
+| Новый бинарный оператор | **Только парсерная часть — этого одного недостаточно, см. [рецепт целиком](./recipes/new-binary-operator.md).** Здесь: `infix_bp` (`parser.odin:2770`) — добавить `case` с парой binding power; диспетчеризация в `parse_expr` (строки ~2320-2324) автоматическая, отдельной функции парсинга не нужно. Дальше по pipeline ОБЯЗАТЕЛЬНО трогать: `infer_binary_expr` в `type_cheker.odin` (см. [тайпчекер](./type-checker.md)) — вывод типа результата; новый `Opcode` + `compile_expr`/`execute` в `compiler.odin`+`vm.odin` (см. [компилятор и VM](./compiler-and-vm.md)) — кодогенерация и исполнение |
+| Новый унарный оператор | `prefix_bp` (`parser.odin:2753`) |
+| Новый вид `Expr`/`Stmt` (AST-узел) | 1) добавить вариант в union (`Expr` строка 680 / `Stmt` строка 449); 2) описать struct с полем `span`; 3) написать `parse_*`-функцию; 4) диспетчеризация в `nud`/`parse_stmt`; 5) добавить кейс в `expr_span` (`parser.odin:2955`); 6) добавить кейс в `print_ast` (debug-печать AST) — см. [рецепт](./recipes/new-ast-node.md) |
 | Изменить формат докстрингов (`///`) | `Token.doc`/`skip_whitespace_and_comments` (лексер), `decl_doc_comment` |
 | Изменить precedence существующего оператора | значение в `infix_bp` — **менять с осторожностью**: разрывы между ярусами щедрые специально, не сдвигать соседние яруса без необходимости |

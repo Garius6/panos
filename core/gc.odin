@@ -133,6 +133,30 @@ gc_unprotect :: proc(vm: ^VM, n: int) {
 	resize(&vm.gc.protect_stack, len(vm.gc.protect_stack) - n)
 }
 
+// Долгоживущая, порядконезависимая защита — в отличие от gc_protect/
+// gc_unprotect (LIFO по СЧЁТЧИКУ, безопасно только в пределах одного
+// вызова без чужого кода между push/pop), gc_pin переживает МНОГО
+// execute()-вызовов (весь стриминговый I/O в полёте держит объект
+// pinned, core/vm_async_io_native.odin) — снимается gc_unpin по
+// ЗНАЧЕНИЮ (поиск+unordered_remove), а не по позиции в стеке, поэтому
+// произвольно чередующиеся короткие gc_protect/gc_unprotect от ДРУГИХ
+// вызовов не мешают: они добавляют И убирают СВОИ записи целиком внутри
+// одного вызова, не трогая чужие, сидящие в списке дольше. Переиспользует
+// тот же vm.gc.protect_stack, который mark_roots уже обходит — новое
+// поле GC_State не нужно.
+gc_pin :: proc(vm: ^VM, v: Value) {
+	append(&vm.gc.protect_stack, v)
+}
+
+gc_unpin :: proc(vm: ^VM, v: Value) {
+	for i := 0; i < len(vm.gc.protect_stack); i += 1 {
+		if vm.gc.protect_stack[i] == v {
+			unordered_remove(&vm.gc.protect_stack, i)
+			return
+		}
+	}
+}
+
 pool_take :: proc(pool: ^[dynamic]^$T) -> ^T {
 	if len(pool) == 0 do return nil
 	obj := pool[len(pool) - 1]

@@ -156,3 +156,180 @@ test_async_tcp_connect_then_send_recv :: proc(t: ^testing.T) {
 	)
 }
 
+// Фаза 4: ключевой тест для СТРИМИНГОВОГО чтения — тот же принцип, что
+// test_async_http_does_not_block_other_processes, но для .получить_строку()
+// на УЖЕ открытом Соединении (а не для одноразового сеть.подключиться из
+// Фазы 3). До этой фичи .получить_строку() шёл через invoke_io_method
+// синхронно, блокируя ВЕСЬ планировщик на все 150мс серверной задержки.
+@(test)
+test_async_stream_read_does_not_block_other_processes :: proc(t: ^testing.T) {
+	listener, listen_err := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	testing.expectf(t, listen_err == nil, "[async stream read] не удалось запустить тестовый listener: %v", listen_err)
+	if listen_err != nil do return
+	defer net.close(listener)
+
+	bound, bound_err := net.bound_endpoint(listener)
+	testing.expectf(t, bound_err == nil, "[async stream read] не удалось узнать порт listener'а: %v", bound_err)
+	if bound_err != nil do return
+
+	server_thread := thread.create_and_start_with_poly_data(listener, run_slow_test_http_server)
+	defer thread.destroy(server_thread)
+
+	source := fmt.tprintf(`
+		импорт ввод_вывод
+		импорт сеть
+
+		функ ребёнок() -> Пусто
+			ввод_вывод.печать("child:RAN")
+		конец
+
+		функ старт() -> Строка
+			пер соединение = сеть.подключиться("127.0.0.1", %d).ожидать("не удалось подключиться")
+			соединение.отправить("GET / HTTP/1.1\r\n\r\n")
+			запусти ребёнок()
+			ввод_вывод.печать("read:START")
+			пер строка = соединение.получить_строку().ожидать("нет строки")
+			ввод_вывод.печать("read:DONE")
+			строка
+		конец
+	`, bound.port)
+
+	result, ok, output := run_code_capture_stdout(source)
+	thread.join(server_thread)
+
+	testing.expectf(t, ok, "[async stream read] пустой стек")
+	if !ok do return
+	testing.expectf(
+		t,
+		value_str_eq(result, "HTTP/1.1 200 OK"),
+		"[async stream read] ожидалась первая строка ответа, получено %v",
+		result,
+	)
+
+	start_idx := strings.index(output, "read:START")
+	child_idx := strings.index(output, "child:RAN")
+	done_idx := strings.index(output, "read:DONE")
+	testing.expectf(t, start_idx >= 0 && child_idx >= 0 && done_idx >= 0, "[async stream read] не все три строки найдены в выводе: %q", output)
+	testing.expectf(
+		t,
+		start_idx < child_idx && child_idx < done_idx,
+		"[async stream read] ожидался порядок START < child:RAN < DONE (дочерний процесс должен успеть выполниться, пока планировщик ждёт ответ сервера) — получено: %q",
+		output,
+	)
+}
+
+// Фаза 4: два процесса делят один Socket_Value (передан аргументом при
+// запусти — та же ссылка, не копия) и оба пытаются читать одновременно —
+// submit_async_io_method выставляет in_flight СИНХРОННО (до того, как
+// планировщик вообще может переключиться на другой процесс), так что
+// второй читатель детерминированно получает "чтение уже выполняется", а
+// не гонку на общем bufio.Reader.
+@(test)
+test_async_stream_concurrent_read_is_busy_error :: proc(t: ^testing.T) {
+	listener, listen_err := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	testing.expectf(t, listen_err == nil, "[async stream busy] не удалось запустить тестовый listener: %v", listen_err)
+	if listen_err != nil do return
+	defer net.close(listener)
+
+	bound, bound_err := net.bound_endpoint(listener)
+	testing.expectf(t, bound_err == nil, "[async stream busy] не удалось узнать порт listener'а: %v", bound_err)
+	if bound_err != nil do return
+
+	server_thread := thread.create_and_start_with_poly_data(listener, run_slow_test_http_server)
+	defer thread.destroy(server_thread)
+
+	source := fmt.tprintf(`
+		импорт ввод_вывод
+		импорт сеть
+
+		функ второй_читатель(соединение: Соединение) -> Пусто
+			пер р = соединение.получить_строку()
+			если р.ошибка() тогда
+				ввод_вывод.печать("second:" + р.причина().сообщение)
+			иначе
+				ввод_вывод.печать("second:NO_ERROR")
+			конец
+		конец
+
+		функ старт() -> Строка
+			пер соединение = сеть.подключиться("127.0.0.1", %d).ожидать("не удалось подключиться")
+			соединение.отправить("GET / HTTP/1.1\r\n\r\n")
+			запусти второй_читатель(соединение)
+			соединение.получить_строку().ожидать("нет строки")
+		конец
+	`, bound.port)
+
+	result, ok, output := run_code_capture_stdout(source)
+	thread.join(server_thread)
+
+	testing.expectf(t, ok, "[async stream busy] пустой стек")
+	if !ok do return
+	testing.expectf(
+		t,
+		value_str_eq(result, "HTTP/1.1 200 OK"),
+		"[async stream busy] первый читатель должен получить настоящий ответ, получено %v",
+		result,
+	)
+	testing.expectf(
+		t,
+		strings.contains(output, "second:чтение уже выполняется"),
+		"[async stream busy] второй читатель должен получить ошибку 'чтение уже выполняется', вывод: %q",
+		output,
+	)
+}
+
+// Фаза 4: .закрыть() вызван, пока другой держатель того же Socket_Value
+// ещё читает (in_flight) — закрытие должно вернуться немедленно без
+// ошибки (close_requested — реальный close_socket_value откладывается),
+// а уже идущее чтение всё равно обязано доставить результат тому, кто его
+// начал (submit случился ДО close_requested).
+@(test)
+test_async_stream_close_while_in_flight_defers_real_close :: proc(t: ^testing.T) {
+	listener, listen_err := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	testing.expectf(t, listen_err == nil, "[async stream close] не удалось запустить тестовый listener: %v", listen_err)
+	if listen_err != nil do return
+	defer net.close(listener)
+
+	bound, bound_err := net.bound_endpoint(listener)
+	testing.expectf(t, bound_err == nil, "[async stream close] не удалось узнать порт listener'а: %v", bound_err)
+	if bound_err != nil do return
+
+	server_thread := thread.create_and_start_with_poly_data(listener, run_slow_test_http_server)
+	defer thread.destroy(server_thread)
+
+	source := fmt.tprintf(`
+		импорт ввод_вывод
+		импорт сеть
+
+		функ закрывающий(соединение: Соединение) -> Пусто
+			соединение.закрыть()
+			ввод_вывод.печать("closed:NO_ERROR")
+		конец
+
+		функ старт() -> Строка
+			пер соединение = сеть.подключиться("127.0.0.1", %d).ожидать("не удалось подключиться")
+			соединение.отправить("GET / HTTP/1.1\r\n\r\n")
+			запусти закрывающий(соединение)
+			соединение.получить_строку().ожидать("нет строки")
+		конец
+	`, bound.port)
+
+	result, ok, output := run_code_capture_stdout(source)
+	thread.join(server_thread)
+
+	testing.expectf(t, ok, "[async stream close] пустой стек")
+	if !ok do return
+	testing.expectf(
+		t,
+		value_str_eq(result, "HTTP/1.1 200 OK"),
+		"[async stream close] чтение, начатое ДО закрытия, должно доставить результат, получено %v",
+		result,
+	)
+	testing.expectf(
+		t,
+		strings.contains(output, "closed:NO_ERROR"),
+		"[async stream close] .закрыть() пока in_flight должен вернуться немедленно без ошибки, вывод: %q",
+		output,
+	)
+}
+

@@ -253,6 +253,18 @@ invoke_io_method :: proc(
 			return make_ok_result(vm, Value(f64(n))), true, true
 		case "закрыть":
 			expect_arg_count(method_name, len(args), 0)
+			// Фаза 4: если сейчас идёт фоновое стриминговое чтение
+			// (in_flight — воркер физически держит &file.reader/handle),
+			// настоящий os.close/bufio.reader_destroy отложен до его
+			// завершения (deliver_async_result, vm.odin) — иначе гонка
+			// с воркером на том же хендле. is_open НЕ трогаем здесь —
+			// close_file_value сам его выставит, когда реально сработает;
+			// тронуть его сейчас сделало бы отложенный close_file_value
+			// молчаливым no-op по его же идемпотентному гейту.
+			if file.in_flight {
+				file.close_requested = true
+				return Value(f64(0)), false, true
+			}
 			close_file_value(file)
 			return Value(f64(0)), false, true
 		}
@@ -288,6 +300,11 @@ invoke_io_method :: proc(
 			return make_ok_result(vm, Value(f64(n))), true, true
 		case "закрыть":
 			expect_arg_count(method_name, len(args), 0)
+			// Фаза 4: симметрично File_Value.закрыть выше.
+			if sock.in_flight {
+				sock.close_requested = true
+				return Value(f64(0)), false, true
+			}
 			close_socket_value(sock)
 			return Value(f64(0)), false, true
 		}

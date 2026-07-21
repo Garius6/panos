@@ -8,18 +8,25 @@ import "core:bufio"
 // сам ИМПОРТ core:os/core:net падает под js_wasm32. фс::открыть/
 // сеть::подключиться (vm_io_wasm.odin) паникуют раньше, чем эти поля
 // понадобились бы, так что тип-заглушка достаточна.
+// in_flight/close_requested — недостижимо на практике (см. комментарий
+// выше), но поля должны совпадать с native-стороной (file_value_native.
+// odin), т.к. deliver_async_result (vm.odin, безусловный) читает их.
 File_Value :: struct {
-	header:   GC_Header,
-	handle:   rawptr,
-	reader:   bufio.Reader,
-	path:     string,
-	is_open:  bool,
-	is_stdin: bool,
+	header:          GC_Header,
+	handle:          rawptr,
+	reader:          bufio.Reader,
+	path:            string,
+	is_open:         bool,
+	is_stdin:        bool,
+	in_flight:       bool,
+	close_requested: bool,
 }
 
 Socket_Value :: struct {
-	header:  GC_Header,
-	socket:  rawptr,
-	reader:  bufio.Reader,
-	is_open: bool,
+	header:          GC_Header,
+	socket:          rawptr,
+	reader:          bufio.Reader,
+	is_open:         bool,
+	in_flight:       bool,
+	close_requested: bool,
 }

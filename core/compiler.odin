@@ -353,6 +353,18 @@ Opcode :: enum u8 {
 	// между чужим сообщением и результатом I/O.
 	Call_Builtin_Async,
 	Await_Async,
+	// Фаза 4 (стриминговый I/O): пара с .Await_Async, та же операнд-форма,
+	// что .Invoke_Collection (1 байт имя-константа, 1 байт arg_count), но
+	// receiver дополнительно снимается со стека (см. execute(), vm.odin).
+	// Эмитится ТОЛЬКО для File_Value.прочитать/прочитать_строку и
+	// Socket_Value.получить/получить_строку (is_async_stream_method ниже) —
+	// эти методы читают через УЖЕ открытый bufio.Reader, встроенный полем
+	// в GC-managed объект (в отличие от Call_Builtin_Async, где воркер
+	// получает только копии простых данных) — владение хендлом между
+	// потоками решено через gc_pin/in_flight (см. gc.odin/file_value_
+	// native.odin), а не переносом семантики suspend/resume, которая тут
+	// та же самая.
+	Invoke_Collection_Async,
 }
 
 // Неблокирующий I/O: allowlist builtin'ов, для которых компилятор эмитит
@@ -365,6 +377,25 @@ is_async_builtin_name :: proc(name: string) -> bool {
 	switch name {
 	case "сеть::http_запрос", "фс::прочитать", "фс::записать", "сеть::подключиться":
 		return true
+	}
+	return false
+}
+
+// Фаза 4: та же роль, что is_async_builtin_name выше, но для МЕТОД-вызовов
+// (case .Method_Collection ниже) — сравнение по СТАТИЧЕСКОМУ типу receiver'а
+// (TY_FILE/TY_CONNECTION, type_cheker.odin), а не только по имени метода:
+// "получить" — метод одновременно у Option/Result/Array/Map (чистый
+// get-with-default) И у Socket_Value (блокирующий сетевой read) —
+// invoke_collection_method диспетчит их рантайм-типом, так что без
+// проверки receiver_type компилятор не отличил бы Соединение.получить()
+// от Массив(Т).получить(). .закрыть()/.записать()/.отправить() сознательно
+// вне списка (см. план — стриминговая ЗАПИСЬ отложена).
+is_async_stream_method :: proc(receiver_type: ^Type, method_name: string) -> bool {
+	if receiver_type == TY_FILE {
+		return method_name == "прочитать" || method_name == "прочитать_строку"
+	}
+	if receiver_type == TY_CONNECTION {
+		return method_name == "получить" || method_name == "получить_строку"
 	}
 	return false
 }
@@ -1229,6 +1260,19 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 				prop_expr := e.callee.(^Property_Expr)
 				compile_expr(ctx, prop_expr.object)
 				for arg in e.args do compile_expr(ctx, arg)
+				// Фаза 4: та же submit+await пара, что .Call_Builtin_Async
+				// выше, для стримингового чтения через уже открытый хендл
+				// (is_async_stream_method — allowlist по (receiver_type,
+				// method_name), см. комментарий там же).
+				receiver_type := ctx.tc.node_types[prop_expr.object]
+				if is_async_stream_method(receiver_type, info.text_name) {
+					emit_opcode(ctx, .Invoke_Collection_Async)
+					emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
+					emit_byte(ctx, u8(len(e.args)))
+					emit_opcode(ctx, .Await_Async)
+					maybe_emit_interface_cast(ctx, expr)
+					return
+				}
 				emit_opcode(ctx, .Invoke_Collection)
 				emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
 				emit_byte(ctx, u8(len(e.args)))
@@ -1839,6 +1883,11 @@ print_assembler :: proc(registry: map[string]^Compiled_Function) {
 
 			case .Await_Async:
 				command := fmt.tprintf("%sAWAIT_ASYNC\n", prefix)
+				strings.write_string(&builder, command)
+
+			case .Invoke_Collection_Async:
+				idx += 2
+				command := fmt.tprintf("%sINVOKE_COLLECTION_ASYNC\n", prefix)
 				strings.write_string(&builder, command)
 
 			}

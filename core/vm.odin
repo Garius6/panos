@@ -968,6 +968,19 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	if result, ok, handled := call_builtin_http(vm, name, args); handled {
 		return result, ok
 	}
+	// ос::выполнить — в vm_process_native.odin/vm_process_wasm.odin (#+build
+	// split, native тянет platform-specific process_*.odin из core:os,
+	// недоступные под js_wasm32).
+	if result, ok, handled := call_builtin_process(vm, name, args); handled {
+		return result, ok
+	}
+	// синтаксис::* — в vm_syntax_native.odin/vm_syntax_wasm.odin (#+build
+	// split, native тянет read_file_text/tokenize/parse_program для ЧУЖОГО
+	// .ps файла — codegen-инструменты на panos, не связано с рантаймом
+	// текущей программы).
+	if result, ok, handled := call_builtin_syntax(vm, name, args); handled {
+		return result, ok
+	}
 	switch name {
 	case "Ошибка":
 		expect_arg_count(name, len(args), 2)

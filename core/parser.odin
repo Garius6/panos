@@ -51,6 +51,37 @@ Parser_Error :: enum {
 	Cannot,
 }
 
+// Значение аргумента аннотации — только простой литерал, не произвольное
+// Expr: аннотации компилятором НЕ вычисляются (см. parse_annotations), это
+// чисто метаданные для внешних инструментов (кодогенератор, линтер, pan),
+// поэтому достаточно сырого текста токена + его вида для их декодирования.
+Annotation_Value_Kind :: enum {
+	String,
+	Number,
+	Boolean,
+	Ident,
+}
+
+Annotation_Value :: struct {
+	kind: Annotation_Value_Kind,
+	text: string,
+}
+
+Annotation_Arg :: struct {
+	// "" — позиционный аргумент, иначе имя перед '=' (`@Json(name = "id")`).
+	name:  string,
+	value: Annotation_Value,
+}
+
+// `&Имя` или `&Имя(арг1, имя2 = арг2, ...)` перед декларацией/полем.
+// Компилятор только парсит и прикрепляет её к AST-узлу — резолвер,
+// тайпчекер и VM её не читают и на компиляцию она не влияет.
+Annotation :: struct {
+	span: Span,
+	name: string,
+	args: [dynamic]Annotation_Arg,
+}
+
 Function_Decl :: struct {
 	span:        Span,
 	name:        string,
@@ -77,6 +108,9 @@ Function_Decl :: struct {
 	return_type: Type_Node,
 	body:        [dynamic]Stmt,
 	is_exported: bool,
+	// `&Имя(...)`, стоящие непосредственно над декларацией. Пусто, если их
+	// не было. См. Annotation.
+	annotations: [dynamic]Annotation,
 }
 
 Param_Decl :: struct {
@@ -103,6 +137,9 @@ Interface_Decl :: struct {
 	type_params: [dynamic]string,
 	methods:     [dynamic]Method_Signature,
 	is_exported: bool,
+	// `&Имя(...)`, стоящие непосредственно над декларацией. Пусто, если их
+	// не было.
+	annotations: [dynamic]Annotation,
 }
 
 Field_Decl :: struct {
@@ -115,6 +152,9 @@ Field_Decl :: struct {
 	// marshal_kind на typecheck (Целое/Число, см. foreign_marshal_
 	// panos_type в type_cheker.odin).
 	marshal_kind:    Foreign_Marshal_Kind,
+	// `&Имя(...)`, стоящие непосредственно над полем структуры (обычной,
+	// не ff_структура — см. parse_struct_decl). Пусто, если их не было.
+	annotations:     [dynamic]Annotation,
 }
 
 Struct_Decl :: struct {
@@ -127,6 +167,9 @@ Struct_Decl :: struct {
 	type_params: [dynamic]string,
 	fields:      [dynamic]Field_Decl,
 	is_exported: bool,
+	// `&Имя(...)`, стоящие непосредственно над декларацией. Пусто, если их
+	// не было.
+	annotations: [dynamic]Annotation,
 	// Стадия 51: true для `тип X = ff_структура ... конец` — C ABI
 	// struct-by-value для `внешний` (Vector2/Color-style). Поля обязаны
 	// быть Целое(8|32|64)/Число(32|64) (см. field.marshal_kind) —
@@ -158,6 +201,9 @@ Enum_Decl :: struct {
 	type_params: [dynamic]string,
 	variants:    [dynamic]Variant_Decl,
 	is_exported: bool,
+	// `&Имя(...)`, стоящие непосредственно над декларацией. Пусто, если их
+	// не было.
+	annotations: [dynamic]Annotation,
 }
 
 Impl_Decl :: struct {
@@ -286,6 +332,69 @@ decl_doc_comment :: proc(d: Decls) -> string {
 		return ""
 	}
 	return ""
+}
+
+// `&Имя(...)` (см. Annotation), стоящие непосредственно над декларацией —
+// nil для видов декларации, у которых их не бывает (Import/Impl/Error/
+// Foreign). Тот же side-table паттерн, что decl_doc_comment выше;
+// используется внешними инструментами (codegen/, LSP), не резолвером/
+// тайпчекером — компилятор аннотации не читает.
+decl_annotations :: proc(d: Decls) -> [dynamic]Annotation {
+	switch v in d {
+	case ^Function_Decl:
+		return v.annotations
+	case ^Struct_Decl:
+		return v.annotations
+	case ^Interface_Decl:
+		return v.annotations
+	case ^Enum_Decl:
+		return v.annotations
+	case ^Import_Decl, ^Impl_Decl, ^Error_Decl, ^Foreign_Decl:
+		return nil
+	}
+	return nil
+}
+
+// Первая аннотация с именем name в срезе, nil если такой нет. Используется
+// и codegen-инструментами, и синтаксис::* native builtin'ом (см.
+// core/vm_syntax_native.odin) — оба находят нужную аннотацию по имени,
+// а не перебирают срез вручную.
+find_annotation :: proc(annotations: [dynamic]Annotation, name: string) -> ^Annotation {
+	for i := 0; i < len(annotations); i += 1 {
+		if annotations[i].name == name do return &annotations[i]
+	}
+	return nil
+}
+
+// Первый позиционный строковый аргумент аннотации (`&Json("ключ")`), если
+// он есть. ann == nil — тоже валидный вход (аннотация отсутствует), просто
+// возвращает false — вызывающему не нужен отдельный nil-чек.
+annotation_string_arg :: proc(ann: ^Annotation) -> (string, bool) {
+	if ann == nil || len(ann.args) == 0 do return "", false
+	arg := ann.args[0]
+	if arg.name != "" || arg.value.kind != .String do return "", false
+	return arg.value.text, true
+}
+
+// Текстовое имя типа для человекочитаемого вывода (диагностики, codegen) —
+// НЕ канонический вид типа тайпчекера (^Type, см. type_cheker.odin), просто
+// печатает синтаксис Type_Node как есть, до какой-либо резолюции.
+type_node_to_string :: proc(t: Type_Node) -> string {
+	switch v in t {
+	case ^Type_Ident:
+		return v.name
+	case ^Type_Generic:
+		return fmt.tprintf("%s(...)", v.name)
+	case ^Type_Qualified:
+		return fmt.tprintf("%s.%s", v.module_name, v.name)
+	case ^Type_Tuple:
+		return "(кортеж)"
+	case ^Type_Function:
+		return "(тип функции)"
+	case ^Error_Type_Node:
+		return "<ошибка типа>"
+	}
+	return "<неизвестный тип>"
 }
 
 Program :: struct {
@@ -757,6 +866,82 @@ print_ast :: proc(expr: Expr, prefix: string = "", is_last: bool = true) {
 
 // --- ПАРСИНГ ВЕРХНЕГО УРОВНЯ ---
 
+// `&Имя` или `&Имя(арг1, имя2 = арг2, ...)`, один или несколько подряд, каждая
+// на своей строке над декларацией/полем — синтаксис намеренно совпадает с
+// директивами 1С (`&НаКлиенте`/`&НаСервере`), не Kotlin-style '@'. '&' уже
+// занят как токен .Ampersand (битовое И, см. lexer.odin) — конфликта нет:
+// аннотации разбираются только в позициях, где выражение начаться не может
+// (первый токен top-level декларации / первый токен строки поля структуры),
+// а битовый оператор — только внутри Pratt-парсера выражений тела функции;
+// эти два разбора никогда не конкурируют за один и тот же токен на одной
+// и той же позиции. Значения аргументов — только простые литералы (см.
+// Annotation_Value): аннотации не Expr и не вычисляются компилятором,
+// дальнейший смысл им придаёт внешний инструмент (кодогенератор/линтер),
+// не сам panos.
+parse_annotations :: proc(p: ^Parser) -> [dynamic]Annotation {
+	annotations := make([dynamic]Annotation)
+	for peek_token(p.stream).kind == .Ampersand {
+		start := peek_token(p.stream).span
+		next_token(p.stream) // '&'
+
+		name_tok := next_token(p.stream)
+		if name_tok.kind != .Ident {
+			report_parse(p, name_tok.span, "Синтаксическая ошибка: после '&' ожидается имя аннотации, получено: %v", name_tok.kind)
+			continue
+		}
+
+		ann := Annotation {
+			name = name_tok.data,
+			args = make([dynamic]Annotation_Arg),
+		}
+
+		if peek_token(p.stream).kind == .LParen {
+			next_token(p.stream) // '('
+			for peek_token(p.stream).kind != .RParen && peek_token(p.stream).kind != .EOF {
+				append(&ann.args, parse_annotation_arg(p))
+				if peek_token(p.stream).kind == .Comma {
+					next_token(p.stream)
+				} else {
+					break
+				}
+			}
+			expect(p, .RParen)
+		}
+
+		ann.span = span_from(p, start)
+		append(&annotations, ann)
+	}
+	return annotations
+}
+
+// Один аргумент аннотации: `значение` (позиционный) или `имя = значение`
+// (именованный) — различаются двухтокенным lookahead (Ident сразу за
+// которым '=', иначе Ident сам по себе — позиционное значение вида Ident,
+// см. Annotation_Value_Kind.Ident).
+parse_annotation_arg :: proc(p: ^Parser) -> Annotation_Arg {
+	arg := Annotation_Arg{}
+	if peek_token(p.stream).kind == .Ident && peek_second_token(p.stream).kind == .Assign {
+		name_tok := next_token(p.stream)
+		arg.name = name_tok.data
+		next_token(p.stream) // '='
+	}
+
+	val_tok := next_token(p.stream)
+	#partial switch val_tok.kind {
+	case .String:
+		arg.value = Annotation_Value{kind = .String, text = val_tok.data}
+	case .Number:
+		arg.value = Annotation_Value{kind = .Number, text = val_tok.data}
+	case .Boolean:
+		arg.value = Annotation_Value{kind = .Boolean, text = val_tok.data}
+	case .Ident:
+		arg.value = Annotation_Value{kind = .Ident, text = val_tok.data}
+	case:
+		report_parse(p, val_tok.span, "Синтаксическая ошибка: недопустимое значение аргумента аннотации, получено: %v", val_tok.kind)
+	}
+	return arg
+}
+
 parse_program :: proc(p: ^Parser) -> Program {
 	prog := Program {
 		decls = make([dynamic]Decls),
@@ -770,6 +955,11 @@ parse_program :: proc(p: ^Parser) -> Program {
 		// деклараций он терялся бы (был бы виден только на уже съеденном
 		// .Export-токене).
 		doc := peek_token(p.stream).doc
+		// Аннотации (см. parse_annotations) висят на том же первом токене
+		// декларации, что и докстринг выше — забираем их ДО `экспорт` по
+		// той же причине: `&Имя\nэкспорт функ ...` не должен потерять
+		// аннотацию, будь она привязана только к уже съеденному `экспорт`.
+		annotations := parse_annotations(p)
 		is_exported := false
 		if peek_token(p.stream).kind == .Export {
 			next_token(p.stream)
@@ -781,10 +971,13 @@ parse_program :: proc(p: ^Parser) -> Program {
 			if is_exported {
 				report_parse(p, peek_token(p.stream).span, "Синтаксическая ошибка: нельзя экспортировать импорт")
 			}
+			if len(annotations) > 0 {
+				report_parse(p, annotations[0].span, "Синтаксическая ошибка: аннотации недопустимы для импорта")
+			}
 			decl := parse_import_decl(p)
 			append(&prog.decls, decl)
 		} else if tok_kind == .Function {
-			decl := parse_function(p, is_exported, doc)
+			decl := parse_function(p, is_exported, doc, annotations)
 			append(&prog.decls, decl)
 		} else if tok_kind == .TypeDecl {
 			// Бывает короче 4 токенов у оборванного файла ("тип X" в самом
@@ -810,15 +1003,18 @@ parse_program :: proc(p: ^Parser) -> Program {
 			// токен сразу после него.
 			third_kind := peek_type_decl_body_kind(p)
 			if third_kind == .Struct {
-				decl := parse_struct_decl(p, is_exported, doc)
+				decl := parse_struct_decl(p, is_exported, doc, annotations)
 				append(&prog.decls, decl)
 			} else if third_kind == .Enum {
-				decl := parse_enum_decl(p, is_exported, doc)
+				decl := parse_enum_decl(p, is_exported, doc, annotations)
 				append(&prog.decls, decl)
 			} else if third_kind == .Interface {
-				decl := parse_interface_decl(p, is_exported, doc)
+				decl := parse_interface_decl(p, is_exported, doc, annotations)
 				append(&prog.decls, decl)
 			} else if third_kind == .FFStruct {
+				if len(annotations) > 0 {
+					report_parse(p, annotations[0].span, "Синтаксическая ошибка: аннотации недопустимы для ff_структура")
+				}
 				decl := parse_ffi_struct_decl(p, is_exported)
 				append(&prog.decls, decl)
 			} else {
@@ -841,11 +1037,17 @@ parse_program :: proc(p: ^Parser) -> Program {
 			if is_exported {
 				report_parse(p, peek_token(p.stream).span, "Синтаксическая ошибка: реализация не может быть экспортирована")
 			}
+			if len(annotations) > 0 {
+				report_parse(p, annotations[0].span, "Синтаксическая ошибка: аннотации недопустимы для реализации")
+			}
 			decl := parse_impl_decl(p)
 			append(&prog.decls, decl)
 		} else if tok_kind == .Foreign {
 			if is_exported {
 				report_parse(p, peek_token(p.stream).span, "Синтаксическая ошибка: 'внешний' не может быть экспортирован")
+			}
+			if len(annotations) > 0 {
+				report_parse(p, annotations[0].span, "Синтаксическая ошибка: аннотации недопустимы для 'внешний'")
 			}
 			decl := parse_foreign_decl(p)
 			append(&prog.decls, decl)
@@ -1034,7 +1236,7 @@ parse_foreign_ownership_suffix :: proc(p: ^Parser) -> bool {
 	return false
 }
 
-parse_enum_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Enum_Decl {
+parse_enum_decl :: proc(p: ^Parser, is_exported: bool, doc: string, annotations: [dynamic]Annotation = nil) -> ^Enum_Decl {
 	start := peek_token(p.stream).span
 	expect(p, .TypeDecl)
 
@@ -1052,6 +1254,7 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Enum_Dec
 	decl.name = name_tok.data
 	decl.doc = doc
 	decl.is_exported = is_exported
+	decl.annotations = annotations
 	decl.variants = make([dynamic]Variant_Decl)
 
 	if peek_token(p.stream).kind == .LBracket {
@@ -1133,13 +1336,14 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Enum_Dec
 	return decl
 }
 
-parse_interface_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Interface_Decl {
+parse_interface_decl :: proc(p: ^Parser, is_exported: bool, doc: string, annotations: [dynamic]Annotation = nil) -> ^Interface_Decl {
 	start := peek_token(p.stream).span
 	expect(p, .TypeDecl)
 	decl := new(Interface_Decl)
 	decl.doc = doc
 	decl.methods = make([dynamic]Method_Signature)
 	decl.is_exported = is_exported
+	decl.annotations = annotations
 
 	name_tok := next_token(p.stream)
 	decl.name = name_tok.data
@@ -1252,13 +1456,14 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 	return decl
 }
 
-parse_function :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Function_Decl {
+parse_function :: proc(p: ^Parser, is_exported: bool, doc: string, annotations: [dynamic]Annotation = nil) -> ^Function_Decl {
 	start := peek_token(p.stream).span
 	expect(p, .Function)
 	function := new(Function_Decl)
 	function.doc = doc
 	function.body = make([dynamic]Stmt)
 	function.is_exported = is_exported
+	function.annotations = annotations
 
 	tok := next_token(p.stream)
 	if tok.kind != .Ident do report_parse(p, tok.span, "Синтаксическая ошибка: ожидалось имя функции, получено: %v", tok.kind)
@@ -1437,7 +1642,7 @@ parse_optional_return_type :: proc(p: ^Parser) -> Type_Node {
 	return parse_type(p)
 }
 
-parse_struct_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Struct_Decl {
+parse_struct_decl :: proc(p: ^Parser, is_exported: bool, doc: string, annotations: [dynamic]Annotation = nil) -> ^Struct_Decl {
 	start := peek_token(p.stream).span
 	expect(p, .TypeDecl)
 
@@ -1445,6 +1650,7 @@ parse_struct_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Struct
 	decl.doc = doc
 	decl.fields = make([dynamic]Field_Decl)
 	decl.is_exported = is_exported
+	decl.annotations = annotations
 
 	name_tok := next_token(p.stream)
 	if name_tok.kind != .Ident do error(p, "Ожидалось имя типа")
@@ -1459,6 +1665,9 @@ parse_struct_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Struct
 
 	for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
 		field := Field_Decl{}
+		// Аннотации над полем (`&Json("id")\nполе: Тип`) — тот же разбор,
+		// что у top-level деклараций (parse_annotations).
+		field.annotations = parse_annotations(p)
 
 		field_tok := next_token(p.stream)
 		if field_tok.kind != .Ident do error(p, "Ожидалось имя поля структуры")

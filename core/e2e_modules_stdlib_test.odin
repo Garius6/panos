@@ -78,6 +78,18 @@ test_math_stdlib :: proc(t: ^testing.T) {
 	testing.expectf(t, result == Value(true), "математика: ожидалось true, получено %v", result)
 }
 
+// std/слог.ps — тот же файловый std-модуль, что math_fixture_main.ps выше:
+// импорт без builtin-регистрации, резолвится только через load_module_graph
+// (run_module_file), не run_code.
+@(test)
+test_слог_stdlib :: proc(t: ^testing.T) {
+	result, ok := run_module_file("fixtures/слог_fixture_main.ps")
+	testing.expectf(t, ok, "слог: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(true), "слог: ожидалось true, получено %v", result)
+}
+
 @(test)
 test_collections_stdlib :: proc(t: ^testing.T) {
 	result, ok := run_module_file("fixtures/collections_fixture_main.ps")

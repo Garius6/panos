@@ -10,7 +10,8 @@ is_builtin_module_name :: proc(name: string) -> bool {
 		name == "строки" ||
 		name == "сеть" ||
 		name == "время" ||
-		name == "сжатие" \
+		name == "сжатие" ||
+		name == "синтаксис" \
 	)
 }
 
@@ -74,12 +75,20 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 	switch full_name {
 	case "фс::есть":
 		return builtin_function_type_1(TY_STRING, TY_BOOL)
+	case "фс::это_директория":
+		return builtin_function_type_1(TY_STRING, TY_BOOL)
 	case "фс::прочитать":
 		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_STRING, TY_ERROR))
 	case "фс::записать":
 		return builtin_function_type_2(TY_STRING, TY_STRING, stdlib_result_type(graph, TY_NUM, TY_ERROR))
 	case "фс::открыть":
 		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_FILE, TY_ERROR))
+	case "фс::создать_директорию":
+		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_NUM, TY_ERROR))
+	case "фс::список_директории":
+		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, new_array_type(TY_STRING), TY_ERROR))
+	case "фс::удалить_директорию":
+		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_NUM, TY_ERROR))
 	case "ос::аргументы":
 		return new_function_type(make([dynamic]^Type), new_array_type(TY_STRING))
 	case "ос::окружение":
@@ -88,6 +97,26 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_2(TY_STRING, TY_STRING, stdlib_result_type(graph, TY_NUM, TY_ERROR))
 	case "ос::удалить_окружение":
 		return builtin_function_type_1(TY_STRING, TY_BOOL)
+	case "ос::выполнить":
+		// (код_завершения, stdout, stderr) — сырой tuple, тот же паттерн, что
+		// у сеть::http_запрос (успех — (статус, заголовки, тело)) выше:
+		// core-builtin возвращает плоские данные, удобная обёртка (если
+		// понадобится) пишется поверх на panos, а не как именованная
+		// структура в системе типов.
+		exec_fields := make([dynamic]^Type)
+		append(&exec_fields, TY_NUM, TY_STRING, TY_STRING)
+		exec_result_type := new_tuple_type(exec_fields)
+		return builtin_function_type_3(
+			TY_STRING,
+			new_array_type(TY_STRING),
+			TY_STRING,
+			stdlib_result_type(graph, exec_result_type, TY_ERROR),
+		)
+	case "ос::завершить":
+		// Как "паника" — TY_NEVER (не возвращается, os.exit ниже по стеку
+		// действительно терминирует процесс), можно использовать как
+		// значение любой ветки/tail-выражения независимо от ожидаемого типа.
+		return builtin_function_type_1(TY_NUM, TY_NEVER)
 	case "ввод_вывод::печать":
 		return builtin_function_type_1(TY_STRING, TY_VOID)
 	case "ввод_вывод::строка":
@@ -176,6 +205,47 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return new_function_type(make([dynamic]^Type), TY_NUM)
 	case "время::сейчас_мс":
 		return new_function_type(make([dynamic]^Type), TY_NUM)
+	// синтаксис::* — compile-time АСТ-интроспекция ДРУГОГО .ps файла (не
+	// текущего рантайма) для codegen-инструментов (см. core/vm_syntax_
+	// native.odin) — каждый вызов заново парсит путь, стейта между
+	// вызовами не хранится (см. докstring там же), поэтому все сигнатуры
+	// принимают путь как обычный Строка-аргумент, а не хендл-тип (в
+	// отличие от Файл/Соединение).
+	case "синтаксис::структуры":
+		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, new_array_type(TY_STRING), TY_ERROR))
+	case "синтаксис::поля":
+		field_pair_fields := make([dynamic]^Type)
+		append(&field_pair_fields, TY_STRING, TY_STRING)
+		field_pair_type := new_tuple_type(field_pair_fields)
+		return builtin_function_type_2(
+			TY_STRING,
+			TY_STRING,
+			stdlib_result_type(graph, new_array_type(field_pair_type), TY_ERROR),
+		)
+	case "синтаксис::аннотации":
+		return builtin_function_type_2(TY_STRING, TY_STRING, stdlib_result_type(graph, new_array_type(TY_STRING), TY_ERROR))
+	case "синтаксис::аргумент_аннотации":
+		return builtin_function_type_3(
+			TY_STRING,
+			TY_STRING,
+			TY_STRING,
+			stdlib_result_type(graph, stdlib_option_type(graph, TY_STRING), TY_ERROR),
+		)
+	case "синтаксис::аннотации_поля":
+		return builtin_function_type_3(
+			TY_STRING,
+			TY_STRING,
+			TY_STRING,
+			stdlib_result_type(graph, new_array_type(TY_STRING), TY_ERROR),
+		)
+	case "синтаксис::аргумент_аннотации_поля":
+		return builtin_function_type_4(
+			TY_STRING,
+			TY_STRING,
+			TY_STRING,
+			TY_STRING,
+			stdlib_result_type(graph, stdlib_option_type(graph, TY_STRING), TY_ERROR),
+		)
 	}
 	return nil
 }
@@ -208,9 +278,13 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 
 	if name == "фс" {
 		add_builtin_export(graph, module, "есть", builtin_export_type(graph, "фс::есть"))
+		add_builtin_export(graph, module, "это_директория", builtin_export_type(graph, "фс::это_директория"))
 		add_builtin_export(graph, module, "прочитать", builtin_export_type(graph, "фс::прочитать"))
 		add_builtin_export(graph, module, "записать", builtin_export_type(graph, "фс::записать"))
 		add_builtin_export(graph, module, "открыть", builtin_export_type(graph, "фс::открыть"))
+		add_builtin_export(graph, module, "создать_директорию", builtin_export_type(graph, "фс::создать_директорию"))
+		add_builtin_export(graph, module, "список_директории", builtin_export_type(graph, "фс::список_директории"))
+		add_builtin_export(graph, module, "удалить_директорию", builtin_export_type(graph, "фс::удалить_директорию"))
 	} else if name == "ос" {
 		add_builtin_export(
 			graph,
@@ -235,6 +309,18 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"удалить_окружение",
 			builtin_export_type(graph, "ос::удалить_окружение"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"выполнить",
+			builtin_export_type(graph, "ос::выполнить"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"завершить",
+			builtin_export_type(graph, "ос::завершить"),
 		)
 	} else if name == "ввод_вывод" {
 		add_builtin_export(
@@ -356,6 +442,28 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"разжать_gzip",
 			builtin_export_type(graph, "сжатие::разжать_gzip"),
+		)
+	} else if name == "синтаксис" {
+		add_builtin_export(graph, module, "структуры", builtin_export_type(graph, "синтаксис::структуры"))
+		add_builtin_export(graph, module, "поля", builtin_export_type(graph, "синтаксис::поля"))
+		add_builtin_export(graph, module, "аннотации", builtin_export_type(graph, "синтаксис::аннотации"))
+		add_builtin_export(
+			graph,
+			module,
+			"аргумент_аннотации",
+			builtin_export_type(graph, "синтаксис::аргумент_аннотации"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"аннотации_поля",
+			builtin_export_type(graph, "синтаксис::аннотации_поля"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"аргумент_аннотации_поля",
+			builtin_export_type(graph, "синтаксис::аргумент_аннотации_поля"),
 		)
 	}
 

@@ -105,6 +105,11 @@ call_builtin_io :: proc(vm: ^VM, name: string, args: []Value) -> (result: Value,
 		path := expect_string_arg(name, args[0])
 		return Value(os.exists(path)), true, true
 
+	case "фс::это_директория":
+		expect_arg_count(name, len(args), 1)
+		path := expect_string_arg(name, args[0])
+		return Value(os.is_dir(path)), true, true
+
 	case "фс::прочитать":
 		expect_arg_count(name, len(args), 1)
 		path := expect_string_arg(name, args[0])
@@ -139,6 +144,55 @@ call_builtin_io :: proc(vm: ^VM, name: string, args: []Value) -> (result: Value,
 		file.path = strings.clone(path)
 		bufio.reader_init(&file.reader, os.to_stream(handle))
 		return make_ok_result(vm, Value(file)), true, true
+
+	case "фс::создать_директорию":
+		expect_arg_count(name, len(args), 1)
+		path := expect_string_arg(name, args[0])
+		// make_directory_all не идемпотентен как mkdir -p — возвращает
+		// .Exist, если путь уже существует целиком (core/os/path_posix.odin),
+		// вместо молчаливого успеха. Нормализуем сюда: уже существует —
+		// не ошибка для нашего контракта "создать_директорию".
+		err := os.make_directory_all(path)
+		if err == os.General_Error.Exist {
+			err = nil
+		}
+		if err != nil {
+			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true, true
+		}
+		return make_ok_result(vm, Value(f64(0))), true, true
+
+	case "фс::список_директории":
+		expect_arg_count(name, len(args), 1)
+		path := expect_string_arg(name, args[0])
+		infos, err := os.read_directory_by_path(path, 0, context.allocator)
+		if err != nil {
+			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true, true
+		}
+		defer os.file_info_slice_delete(infos, context.allocator)
+		arr := gc_new(vm, Array_Value)
+		gc_protect(vm, Value(arr))
+		arr.elements = make([dynamic]Value)
+		for info in infos {
+			append(&arr.elements, Value(gc_new_string(vm, info.name)))
+		}
+		gc_unprotect(vm, 1)
+		return make_ok_result(vm, Value(arr)), true, true
+
+	case "фс::удалить_директорию":
+		expect_arg_count(name, len(args), 1)
+		path := expect_string_arg(name, args[0])
+		// remove_all ожидает директорию (ENOTDIR на обычном файле) — фс
+		// не различает "удалить файл"/"удалить дерево". Пробуем remove
+		// (файл или уже пустая директория) первым; remove_all — только
+		// если он не справился (путь — непустая директория).
+		err := os.remove(path)
+		if err != nil {
+			err = os.remove_all(path)
+		}
+		if err != nil {
+			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true, true
+		}
+		return make_ok_result(vm, Value(f64(0))), true, true
 
 	case "ос::окружение":
 		expect_arg_count(name, len(args), 1)

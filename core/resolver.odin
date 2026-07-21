@@ -317,6 +317,29 @@ resolve_import_path :: proc(import_spec: string, importer_dir: string) -> string
 	return normalize_path(spec)
 }
 
+// Пакет-как-директория: когда <importer_dir>/<spec>.ps не файл, а
+// <importer_dir>/<spec>/ — директория, пробуем канонический "индекс.ps"
+// внутри неё (как index.js/__init__.py в других экосистемах). Чисто
+// файловая конвенция, не завязанная на pan.toml/манифест — резолвер
+// остаётся agnostic к pan (см. resolve_existing_import_path). Нужно
+// многофайловым зависимостям (../panosiki/pan/кэш.ps::разложить_запись
+// кладёт целое дерево в модули/<имя>/) — файл точки входа внутри такого
+// дерева видит СВОИ СОБСТВЕННЫЕ относительные импорты (`./помощник`)
+// резолвящимися относительно модули/<имя>/ (его module.dir, см.
+// module_loader.odin), а не относительно модули/ — соседи там физически
+// присутствуют, только если "имя" резолвится ВНУТРЬ дерева, а не в
+// отдельно скопированный плоский файл вне его.
+resolve_import_dir_index_path :: proc(import_spec: string, importer_dir: string) -> string {
+	spec := import_spec
+	if path_has_ps_suffix(spec) {
+		spec = spec[:len(spec) - 3]
+	}
+	if !is_absolute_path(spec) && len(importer_dir) > 0 {
+		spec = fmt.tprintf("%s/%s", importer_dir, spec)
+	}
+	return normalize_path(fmt.tprintf("%s/индекс.ps", spec))
+}
+
 is_bare_import_spec :: proc(import_spec: string) -> bool {
 	if is_absolute_path(import_spec) {
 		return false

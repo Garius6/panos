@@ -14,6 +14,24 @@ Http_Result_Data :: struct {
 	err:     Maybe(string),
 }
 
+File_Read_Result_Data :: struct {
+	content: string,
+	err:     Maybe(string),
+}
+
+File_Write_Result_Data :: struct {
+	bytes_written: int,
+	err:           Maybe(string),
+}
+
+// Tcp_Connect_Result_Data — ЕДИНСТВЕННЫЙ payload-вариант, тип которого
+// отличается по платформе (поле socket: net.TCP_Socket на native, rawptr-
+// заглушка на wasm — сам импорт core:net падает под js_wasm32, см.
+// file_value_wasm.odin) — объявлен в vm_async_io_native.odin/
+// vm_async_io_wasm.odin (та же пара, что File_Value/Socket_Value), а не
+// здесь, чтобы этот файл (без #+build) не тянул core:net ни для одной
+// платформы. Ссылка на имя типа ниже разрешается тем определением, которое
+// реально попало в сборку для текущей цели.
 Async_Result :: struct {
 	ticket_id: int,
 	// id процесса-получателя, НЕ указатель — процесс мог завершиться/быть
@@ -22,5 +40,8 @@ Async_Result :: struct {
 	target_id: int,
 	payload:   union {
 		Http_Result_Data,
+		File_Read_Result_Data,
+		File_Write_Result_Data,
+		Tcp_Connect_Result_Data,
 	},
 }

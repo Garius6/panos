@@ -2347,6 +2347,43 @@ deliver_async_result :: proc(vm: ^VM, comp: Async_Result) {
 			value = make_ok_result(vm, Value(result_tuple))
 		}
 		append(&target.async_results, value)
+
+	case File_Read_Result_Data:
+		heap := vm_heap_allocator()
+		defer if err, has_err := payload.err.(string); has_err do delete(err, heap)
+		defer delete(payload.content, heap)
+
+		if target == nil || !target.is_alive do return
+
+		value: Value
+		if err, has_err := payload.err.(string); has_err {
+			value = make_error_result(vm, make_error_value(vm, "фс", err))
+		} else {
+			value = make_ok_result(vm, Value(gc_new_string(vm, payload.content)))
+		}
+		append(&target.async_results, value)
+
+	case File_Write_Result_Data:
+		heap := vm_heap_allocator()
+		defer if err, has_err := payload.err.(string); has_err do delete(err, heap)
+
+		if target == nil || !target.is_alive do return
+
+		value: Value
+		if err, has_err := payload.err.(string); has_err {
+			value = make_error_result(vm, make_error_value(vm, "фс", err))
+		} else {
+			value = make_ok_result(vm, Value(f64(payload.bytes_written)))
+		}
+		append(&target.async_results, value)
+
+	case Tcp_Connect_Result_Data:
+		// Единственный payload с платформозависимым полем (net.TCP_Socket
+		// на native, rawptr-заглушка на wasm — см. vm_async.odin) — само
+		// построение Value (Socket_Value/bufio.reader_init) вынесено в
+		// deliver_tcp_connect_result (vm_async_io_native.odin/_wasm.odin),
+		// т.к. этот файл (vm.odin) намеренно не импортирует core:net.
+		deliver_tcp_connect_result(vm, target, payload)
 	}
 }
 

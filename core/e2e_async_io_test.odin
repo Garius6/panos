@@ -93,3 +93,66 @@ test_async_http_does_not_block_other_processes :: proc(t: ^testing.T) {
 	)
 }
 
+// Фаза 3: фс::прочитать через новый асинхронный путь (Call_Builtin_Async/
+// Await_Async, submit_async_io) должен давать ТОТ ЖЕ Результат.Неудача, что
+// раньше давал call_builtin_io синхронно, для несуществующего файла —
+// доказывает, что File_Read_Result_Data.err корректно долетает через канал
+// и deliver_async_result строит правильный Ошибка(...).
+@(test)
+test_async_file_read_missing_file_is_error :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт фс
+
+		функ старт() -> Булево
+			пер р = фс.прочитать("/tmp/panos_e2e_async_missing_zzz.txt")
+			р.ошибка()
+		конец
+	`)
+	testing.expectf(t, ok, "[async фс.прочитать] пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(true), "[async фс.прочитать] ожидался Ошибка(...) для несуществующего файла, получено %v", result)
+}
+
+// Фаза 3: сеть::подключиться через асинхронный путь — единственный новый
+// payload-вариант (Tcp_Connect_Result_Data) с платформозависимым полем
+// (net.TCP_Socket пересекает канал воркер->главный поток) — проверяет, что
+// сокет, установленный НА ВОРКЕРЕ, реально пригоден для .отправить()/
+// .получить_строку() на главном потоке после deliver_tcp_connect_result
+// (bufio.reader_init/tcp_to_stream, vm_async_io_native.odin).
+@(test)
+test_async_tcp_connect_then_send_recv :: proc(t: ^testing.T) {
+	listener, listen_err := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	testing.expectf(t, listen_err == nil, "[async tcp] не удалось запустить тестовый listener: %v", listen_err)
+	if listen_err != nil do return
+	defer net.close(listener)
+
+	bound, bound_err := net.bound_endpoint(listener)
+	testing.expectf(t, bound_err == nil, "[async tcp] не удалось узнать порт listener'а: %v", bound_err)
+	if bound_err != nil do return
+
+	server_thread := thread.create_and_start_with_poly_data(listener, run_slow_test_http_server)
+	defer thread.destroy(server_thread)
+
+	source := fmt.tprintf(`
+		импорт сеть
+
+		функ старт() -> Строка
+			пер соединение = сеть.подключиться("127.0.0.1", %d).ожидать("не удалось подключиться")
+			соединение.отправить("GET / HTTP/1.1\r\n\r\n")
+			соединение.получить_строку().ожидать("нет строки")
+		конец
+	`, bound.port)
+
+	result, ok := run_code(source)
+	thread.join(server_thread)
+
+	testing.expectf(t, ok, "[async tcp] пустой стек")
+	if !ok do return
+	testing.expectf(
+		t,
+		value_str_eq(result, "HTTP/1.1 200 OK"),
+		"[async tcp] ожидалась первая строка ответа сервера, получено %v",
+		result,
+	)
+}
+

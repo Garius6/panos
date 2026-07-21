@@ -355,6 +355,20 @@ Opcode :: enum u8 {
 	Await_Async,
 }
 
+// Неблокирующий I/O: allowlist builtin'ов, для которых компилятор эмитит
+// Call_Builtin_Async+Await_Async вместо Call_Builtin (см. case .Builtin
+// выше). Тот же паттерн, что is_builtin_module_name (core/stdlib.odin) —
+// список маленький, растёт по одному имени за фазу (см. план "Неблокирующий
+// I/O для actor model panos" — фаза 3+: одноразовые файловые/сокетные
+// операции добавятся сюда так же).
+is_async_builtin_name :: proc(name: string) -> bool {
+	switch name {
+	case "сеть::http_запрос", "фс::прочитать", "фс::записать", "сеть::подключиться":
+		return true
+	}
+	return false
+}
+
 // Записать 1 байт в массив инструкций
 emit_byte :: proc(c: ^Compiler, byte: u8) {
 	append(&c.current_function.instructions, byte)
@@ -1189,14 +1203,15 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			case .Builtin:
 				for arg in e.args do compile_expr(ctx, arg)
 				// Неблокирующий I/O: небольшой allowlist async-совместимых
-				// builtin'ов — эмитим .Call_Builtin_Async+.Await_Async
-				// ВМЕСТО одного .Call_Builtin (та же операнд-форма).
-				// submit не блокирует (кладёт задачу в воркер-пул и идёт
-				// дальше), .Await_Async сразу за ним suspend'ится/resume'ится
-				// над process.async_results (см. Opcode-комментарий) — с
-				// точки зрения остального кодогена (maybe_emit_interface_cast
+				// builtin'ов (is_async_builtin_name ниже) — эмитим
+				// .Call_Builtin_Async+.Await_Async ВМЕСТО одного
+				// .Call_Builtin (та же операнд-форма). submit не блокирует
+				// (кладёт задачу в воркер-пул и идёт дальше), .Await_Async
+				// сразу за ним suspend'ится/resume'ится над
+				// process.async_results (см. Opcode-комментарий) — с точки
+				// зрения остального кодогена (maybe_emit_interface_cast
 				// ниже читает тот же по форме результат) ничего не меняется.
-				if info.text_name == "сеть::http_запрос" {
+				if is_async_builtin_name(info.text_name) {
 					emit_opcode(ctx, .Call_Builtin_Async)
 					emit_byte(ctx, make_constant(ctx, Value(perm_string(info.text_name))))
 					emit_byte(ctx, u8(len(e.args)))

@@ -1,14 +1,26 @@
 #+build !js
 package core
 
+import "core:bufio"
 import "core:bytes"
 import "core:fmt"
 import "core:mem"
+import "core:net"
+import "core:os"
 import "core:strings"
 import "core:sync/chan"
 import "core:thread"
 import http "../external/odin-http"
 import client "../external/odin-http/client"
+
+// Tcp_Connect_Result_Data — единственный payload с платформозависимым полем
+// (см. vm_async.odin) — здесь socket настоящий net.TCP_Socket. wasm-пара
+// (vm_async_io_wasm.odin) объявляет тот же ИМЯ типа с rawptr-заглушкой (тот
+// же приём, что File_Value/Socket_Value, см. file_value_native/wasm.odin).
+Tcp_Connect_Result_Data :: struct {
+	socket: net.TCP_Socket,
+	err:    Maybe(string),
+}
 
 // Неблокирующий I/O: submit-сторона для сеть::http_запрос — извлекает
 // ПРОСТЫЕ Odin-типы из Value-аргументов (та же логика, что раньше была
@@ -63,7 +75,175 @@ submit_async_io :: proc(vm: ^VM, name: string, args: []Value, target_id: int) {
 		task_data.request_headers = headers
 
 		thread.pool_add_task(&vm.async_pool, heap, http_task_proc, task_data)
+
+	case "фс::прочитать":
+		expect_arg_count(name, len(args), 1)
+		path := expect_string_arg(name, args[0])
+
+		heap := vm_heap_allocator()
+		vm.next_ticket_id += 1
+		task_data := new(File_Read_Task_Data, heap)
+		task_data.completions = vm.async_completions
+		task_data.target_id = target_id
+		task_data.ticket_id = vm.next_ticket_id
+		task_data.path = strings.clone(path, heap)
+
+		thread.pool_add_task(&vm.async_pool, heap, file_read_task_proc, task_data)
+
+	case "фс::записать":
+		expect_arg_count(name, len(args), 2)
+		path := expect_string_arg(name, args[0])
+		content := expect_string_arg(name, args[1])
+
+		heap := vm_heap_allocator()
+		vm.next_ticket_id += 1
+		task_data := new(File_Write_Task_Data, heap)
+		task_data.completions = vm.async_completions
+		task_data.target_id = target_id
+		task_data.ticket_id = vm.next_ticket_id
+		task_data.path = strings.clone(path, heap)
+		task_data.content = strings.clone(content, heap)
+
+		thread.pool_add_task(&vm.async_pool, heap, file_write_task_proc, task_data)
+
+	case "сеть::подключиться":
+		expect_arg_count(name, len(args), 2)
+		host := expect_string_arg(name, args[0])
+		port_num, ok_port := args[1].(f64)
+		if !ok_port {
+			fmt.panicf("Runtime Error: сеть.подключиться() ожидает номер порта числом")
+		}
+
+		heap := vm_heap_allocator()
+		vm.next_ticket_id += 1
+		task_data := new(Tcp_Connect_Task_Data, heap)
+		task_data.completions = vm.async_completions
+		task_data.target_id = target_id
+		task_data.ticket_id = vm.next_ticket_id
+		task_data.host = strings.clone(host, heap)
+		task_data.port = int(port_num)
+
+		thread.pool_add_task(&vm.async_pool, heap, tcp_connect_task_proc, task_data)
 	}
+}
+
+File_Read_Task_Data :: struct {
+	completions: chan.Chan(Async_Result),
+	target_id:   int,
+	ticket_id:   int,
+	path:        string,
+}
+
+file_read_task_proc :: proc(task: thread.Task) {
+	heap := vm_heap_allocator()
+	data := cast(^File_Read_Task_Data)task.data
+	defer {
+		delete(data.path, heap)
+		mem.free(data, heap)
+	}
+
+	result := Async_Result {
+		ticket_id = data.ticket_id,
+		target_id = data.target_id,
+	}
+
+	content, err := os.read_entire_file(data.path, heap)
+	if err != nil {
+		result.payload = File_Read_Result_Data{err = fmt.aprintf("%v", err, allocator = heap)}
+	} else {
+		result.payload = File_Read_Result_Data{content = string(content)}
+	}
+	chan.send(data.completions, result)
+}
+
+File_Write_Task_Data :: struct {
+	completions: chan.Chan(Async_Result),
+	target_id:   int,
+	ticket_id:   int,
+	path:        string,
+	content:     string,
+}
+
+file_write_task_proc :: proc(task: thread.Task) {
+	heap := vm_heap_allocator()
+	data := cast(^File_Write_Task_Data)task.data
+	defer {
+		delete(data.path, heap)
+		delete(data.content, heap)
+		mem.free(data, heap)
+	}
+
+	result := Async_Result {
+		ticket_id = data.ticket_id,
+		target_id = data.target_id,
+	}
+
+	err := os.write_entire_file(data.path, data.content)
+	if err != nil {
+		result.payload = File_Write_Result_Data{err = fmt.aprintf("%v", err, allocator = heap)}
+	} else {
+		result.payload = File_Write_Result_Data{bytes_written = len(data.content)}
+	}
+	chan.send(data.completions, result)
+}
+
+Tcp_Connect_Task_Data :: struct {
+	completions: chan.Chan(Async_Result),
+	target_id:   int,
+	ticket_id:   int,
+	host:        string,
+	port:        int,
+}
+
+tcp_connect_task_proc :: proc(task: thread.Task) {
+	heap := vm_heap_allocator()
+	data := cast(^Tcp_Connect_Task_Data)task.data
+	defer {
+		delete(data.host, heap)
+		mem.free(data, heap)
+	}
+
+	result := Async_Result {
+		ticket_id = data.ticket_id,
+		target_id = data.target_id,
+	}
+
+	socket, dial_err := net.dial_tcp_from_hostname_with_port_override(data.host, data.port)
+	if dial_err != nil {
+		result.payload = Tcp_Connect_Result_Data{err = fmt.aprintf("%v", dial_err, allocator = heap)}
+	} else {
+		result.payload = Tcp_Connect_Result_Data{socket = socket}
+	}
+	chan.send(data.completions, result)
+}
+
+// Строит Socket_Value из TCP-соединения, установленного воркером
+// (tcp_connect_task_proc выше) — вынесено из deliver_async_result (vm.odin)
+// в этот файл, т.к. требует core:net/bufio.reader_init над
+// tcp_to_stream (vm_io_native.odin) — vm.odin намеренно не импортирует
+// core:net (компилируется на обеих платформах).
+deliver_tcp_connect_result :: proc(vm: ^VM, target: ^Process_Value, payload: Tcp_Connect_Result_Data) {
+	heap := vm_heap_allocator()
+	if err, has_err := payload.err.(string); has_err {
+		defer delete(err, heap)
+		if target == nil || !target.is_alive do return
+		value := make_error_result(vm, make_error_value(vm, "сеть", err))
+		append(&target.async_results, value)
+		return
+	}
+
+	if target == nil || !target.is_alive {
+		net.close(payload.socket)
+		return
+	}
+
+	conn := gc_new(vm, Socket_Value)
+	conn.socket = payload.socket
+	conn.is_open = true
+	context.allocator = heap
+	bufio.reader_init(&conn.reader, tcp_to_stream(&conn.socket))
+	value := make_ok_result(vm, Value(conn))
+	append(&target.async_results, value)
 }
 
 // Владение: все поля здесь — обычные Odin-аллокации (context.allocator),

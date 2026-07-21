@@ -253,9 +253,10 @@ invoke_io_method :: proc(
 			return make_ok_result(vm, Value(f64(n))), true, true
 		case "закрыть":
 			expect_arg_count(method_name, len(args), 0)
-			// Фаза 4: если сейчас идёт фоновое стриминговое чтение
-			// (in_flight — воркер физически держит &file.reader/handle),
-			// настоящий os.close/bufio.reader_destroy отложен до его
+			// Фаза 4/5: если сейчас идёт фоновая стриминговая операция
+			// (in_flight — воркер физически держит &file.reader/handle,
+			// чтение ИЛИ запись — один общий флаг), настоящий os.close/
+			// bufio.reader_destroy отложен до его
 			// завершения (deliver_async_result, vm.odin) — иначе гонка
 			// с воркером на том же хендле. is_open НЕ трогаем здесь —
 			// close_file_value сам его выставит, когда реально сработает;

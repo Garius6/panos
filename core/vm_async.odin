@@ -54,6 +54,24 @@ Socket_Stream_Read_Result_Data :: struct {
 	err:     Maybe(string),
 }
 
+// Фаза 5: стриминговая ЗАПИСЬ через уже открытый хендл (File_Value.записать/
+// Socket_Value.отправить) — та же дисциплина, что *_Stream_Read_Result_Data
+// выше (receiver-указатель нужен delivery, чтобы снять in_flight/gc_unpin/
+// довести отложенный close_file_value/close_socket_value). НЕ путать с
+// File_Write_Result_Data выше — тот принадлежит одноразовому фс::записать
+// (путь+содержимое, нет существующего хендла, нечего pin'ить).
+File_Stream_Write_Result_Data :: struct {
+	file:          ^File_Value,
+	bytes_written: int,
+	err:           Maybe(string),
+}
+
+Socket_Stream_Write_Result_Data :: struct {
+	sock:          ^Socket_Value,
+	bytes_written: int,
+	err:           Maybe(string),
+}
+
 Async_Result :: struct {
 	ticket_id: int,
 	// id процесса-получателя, НЕ указатель — процесс мог завершиться/быть
@@ -67,5 +85,7 @@ Async_Result :: struct {
 		Tcp_Connect_Result_Data,
 		File_Stream_Read_Result_Data,
 		Socket_Stream_Read_Result_Data,
+		File_Stream_Write_Result_Data,
+		Socket_Stream_Write_Result_Data,
 	},
 }

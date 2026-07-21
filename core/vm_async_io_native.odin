@@ -345,32 +345,42 @@ http_task_proc :: proc(task: thread.Task) {
 	chan.send(data.completions, result)
 }
 
-// Фаза 4 (стриминговый I/O над уже открытым хендлом): submit-сторона для
-// File_Value.прочитать/прочитать_строку и Socket_Value.получить/
-// получить_строку — ЕДИНСТВЕННОЕ место, где воркеру передаётся сырой
-// указатель на GC-managed объект (а не копия простых данных, как во всех
-// остальных submit_* выше): reader нужно читать IN PLACE, чтобы курсор
-// чтения сохранялся между последовательными вызовами (см.
-// test_file_handle_read_line_then_read_rest, e2e_runtime_gc_test.odin).
-// Безопасно ТОЛЬКО благодаря паре gc_pin (gc.odin — объект гарантированно
-// ROOT весь полёт, GC не может его закрыть/переиспользовать) + in_flight
-// (блокирует ВТОРОЕ конкурентное чтение и откладывает .закрыть(), см.
-// invoke_io_method's "закрыть"-ветки). Быстрые отказы ("уже закрыт"/"уже
-// читается") и is_stdin (см. ниже) обрабатываются СИНХРОННО здесь же —
-// Value кладётся в async_results напрямую, никакого похода в воркер-пул.
-submit_async_io_method :: proc(vm: ^VM, receiver: Value, method_name: string, target_id: int) {
+// Фаза 4/5 (стриминговый I/O над уже открытым хендлом): submit-сторона для
+// File_Value.прочитать/прочитать_строку/записать и Socket_Value.получить/
+// получить_строку/отправить — ЕДИНСТВЕННОЕ место, где воркеру передаётся
+// сырой указатель на GC-managed объект (а не копия простых данных, как во
+// всех остальных submit_* выше): чтение — через reader IN PLACE, чтобы
+// курсор сохранялся между последовательными вызовами (см.
+// test_file_handle_read_line_then_read_rest, e2e_runtime_gc_test.odin);
+// запись — через сам handle/socket. Безопасно ТОЛЬКО благодаря паре gc_pin
+// (gc.odin — объект гарантированно ROOT весь полёт, GC не может его
+// закрыть/переиспользовать) + in_flight (ОДИН флаг на любую операцию —
+// read ИЛИ write, — блокирует ВТОРУЮ конкурентную попытку и откладывает
+// .закрыть(), см. invoke_io_method's "закрыть"-ветки). Быстрые отказы
+// ("уже закрыт"/"уже выполняется") и is_stdin (см. ниже) обрабатываются
+// СИНХРОННО здесь же — Value кладётся в async_results напрямую, никакого
+// похода в воркер-пул.
+submit_async_io_method :: proc(vm: ^VM, receiver: Value, method_name: string, args: []Value, target_id: int) {
 	target := vm.processes[vm.current_process] // submit всегда от имени текущего процесса
 
 	if file, ok_file := receiver.(^File_Value); ok_file {
+		is_write := method_name == "записать"
+
+		if is_write && file.is_stdin {
+			// Та же проверка, что была в invoke_io_method's "записать"
+			// синхронно — стдин никогда не открыт для записи.
+			append(&target.async_results, make_error_result(vm, make_error_value(vm, "фс", "файл не открыт для записи")))
+			return
+		}
 		if !file.is_open || file.close_requested {
 			append(&target.async_results, make_error_result(vm, make_error_value(vm, "фс", "файл уже закрыт")))
 			return
 		}
 		if file.in_flight {
-			append(&target.async_results, make_error_result(vm, make_error_value(vm, "фс", "чтение уже выполняется")))
+			append(&target.async_results, make_error_result(vm, make_error_value(vm, "фс", "операция ввода-вывода уже выполняется")))
 			return
 		}
-		if file.is_stdin {
+		if !is_write && file.is_stdin {
 			// vm.stdin_reader — общий VM-владеемый (НЕ per-object) ресурс
 			// (get_stdin_reader/file_reader выше) — небезопасно передавать
 			// воркеру: разные Файл-обёртки над стдин (несколько вызовов
@@ -395,6 +405,20 @@ submit_async_io_method :: proc(vm: ^VM, receiver: Value, method_name: string, ta
 
 		heap := vm_heap_allocator()
 		vm.next_ticket_id += 1
+
+		if is_write {
+			text := expect_string_arg(method_name, args[0])
+			task_data := new(File_Write_Stream_Task_Data, heap)
+			task_data.completions = vm.async_completions
+			task_data.target_id = target_id
+			task_data.ticket_id = vm.next_ticket_id
+			task_data.file = file
+			task_data.content = strings.clone(text, heap)
+
+			thread.pool_add_task(&vm.async_pool, heap, file_write_stream_task_proc, task_data)
+			return
+		}
+
 		task_data := new(File_Stream_Task_Data, heap)
 		task_data.completions = vm.async_completions
 		task_data.target_id = target_id
@@ -407,12 +431,14 @@ submit_async_io_method :: proc(vm: ^VM, receiver: Value, method_name: string, ta
 	}
 
 	if sock, ok_sock := receiver.(^Socket_Value); ok_sock {
+		is_write := method_name == "отправить"
+
 		if !sock.is_open || sock.close_requested {
 			append(&target.async_results, make_error_result(vm, make_error_value(vm, "сеть", "соединение уже закрыто")))
 			return
 		}
 		if sock.in_flight {
-			append(&target.async_results, make_error_result(vm, make_error_value(vm, "сеть", "чтение уже выполняется")))
+			append(&target.async_results, make_error_result(vm, make_error_value(vm, "сеть", "операция ввода-вывода уже выполняется")))
 			return
 		}
 
@@ -421,6 +447,20 @@ submit_async_io_method :: proc(vm: ^VM, receiver: Value, method_name: string, ta
 
 		heap := vm_heap_allocator()
 		vm.next_ticket_id += 1
+
+		if is_write {
+			text := expect_string_arg(method_name, args[0])
+			task_data := new(Socket_Write_Stream_Task_Data, heap)
+			task_data.completions = vm.async_completions
+			task_data.target_id = target_id
+			task_data.ticket_id = vm.next_ticket_id
+			task_data.sock = sock
+			task_data.content = strings.clone(text, heap)
+
+			thread.pool_add_task(&vm.async_pool, heap, socket_write_stream_task_proc, task_data)
+			return
+		}
+
 		task_data := new(Socket_Stream_Task_Data, heap)
 		task_data.completions = vm.async_completions
 		task_data.target_id = target_id
@@ -491,5 +531,70 @@ socket_stream_task_proc :: proc(task: thread.Task) {
 		content = strings.clone(read_all_from_reader(&data.sock.reader), heap)
 	}
 	result.payload = Socket_Stream_Read_Result_Data{sock = data.sock, content = content, err = err}
+	chan.send(data.completions, result)
+}
+
+// Фаза 5 (стриминговая запись): симметрично File_Stream_Task_Data/
+// Socket_Stream_Task_Data выше, но воркер трогает НЕ .reader, а сам
+// handle/socket (os.write/net.send_tcp) — content уже склонирован на heap
+// в submit_async_io_method (текст-аргумент — GC-managed Panos_String.data,
+// не переживёт возврата из execute()).
+File_Write_Stream_Task_Data :: struct {
+	completions: chan.Chan(Async_Result),
+	target_id:   int,
+	ticket_id:   int,
+	file:        ^File_Value,
+	content:     string,
+}
+
+file_write_stream_task_proc :: proc(task: thread.Task) {
+	heap := vm_heap_allocator()
+	data := cast(^File_Write_Stream_Task_Data)task.data
+	defer {
+		delete(data.content, heap)
+		mem.free(data, heap)
+	}
+
+	result := Async_Result{ticket_id = data.ticket_id, target_id = data.target_id}
+
+	n, err := os.write(data.file.handle, transmute([]byte)data.content)
+	if err != nil {
+		result.payload = File_Stream_Write_Result_Data {
+			file = data.file,
+			err  = fmt.aprintf("%v", err, allocator = heap),
+		}
+	} else {
+		result.payload = File_Stream_Write_Result_Data{file = data.file, bytes_written = n}
+	}
+	chan.send(data.completions, result)
+}
+
+Socket_Write_Stream_Task_Data :: struct {
+	completions: chan.Chan(Async_Result),
+	target_id:   int,
+	ticket_id:   int,
+	sock:        ^Socket_Value,
+	content:     string,
+}
+
+socket_write_stream_task_proc :: proc(task: thread.Task) {
+	heap := vm_heap_allocator()
+	data := cast(^Socket_Write_Stream_Task_Data)task.data
+	defer {
+		delete(data.content, heap)
+		mem.free(data, heap)
+	}
+
+	result := Async_Result{ticket_id = data.ticket_id, target_id = data.target_id}
+
+	n, err := net.send_tcp(data.sock.socket, transmute([]byte)data.content)
+	if err != nil {
+		result.payload = Socket_Stream_Write_Result_Data {
+			sock = data.sock,
+			err  = fmt.aprintf("%v", err, allocator = heap),
+		}
+	} else {
+		result.payload = Socket_Stream_Write_Result_Data{sock = data.sock, bytes_written = n}
+	}
 	chan.send(data.completions, result)
 }

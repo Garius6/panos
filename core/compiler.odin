@@ -353,17 +353,17 @@ Opcode :: enum u8 {
 	// между чужим сообщением и результатом I/O.
 	Call_Builtin_Async,
 	Await_Async,
-	// Фаза 4 (стриминговый I/O): пара с .Await_Async, та же операнд-форма,
+	// Фаза 4/5 (стриминговый I/O): пара с .Await_Async, та же операнд-форма,
 	// что .Invoke_Collection (1 байт имя-константа, 1 байт arg_count), но
 	// receiver дополнительно снимается со стека (см. execute(), vm.odin).
-	// Эмитится ТОЛЬКО для File_Value.прочитать/прочитать_строку и
-	// Socket_Value.получить/получить_строку (is_async_stream_method ниже) —
-	// эти методы читают через УЖЕ открытый bufio.Reader, встроенный полем
-	// в GC-managed объект (в отличие от Call_Builtin_Async, где воркер
-	// получает только копии простых данных) — владение хендлом между
-	// потоками решено через gc_pin/in_flight (см. gc.odin/file_value_
-	// native.odin), а не переносом семантики suspend/resume, которая тут
-	// та же самая.
+	// Эмитится ТОЛЬКО для File_Value.прочитать/прочитать_строку/записать и
+	// Socket_Value.получить/получить_строку/отправить (is_async_stream_
+	// method ниже) — эти методы читают/пишут через УЖЕ открытый хендл
+	// (bufio.Reader или сам handle/socket), встроенный полем в GC-managed
+	// объект (в отличие от Call_Builtin_Async, где воркер получает только
+	// копии простых данных) — владение хендлом между потоками решено через
+	// gc_pin/in_flight (см. gc.odin/file_value_native.odin), а не
+	// переносом семантики suspend/resume, которая тут та же самая.
 	Invoke_Collection_Async,
 }
 
@@ -381,21 +381,21 @@ is_async_builtin_name :: proc(name: string) -> bool {
 	return false
 }
 
-// Фаза 4: та же роль, что is_async_builtin_name выше, но для МЕТОД-вызовов
+// Фаза 4/5: та же роль, что is_async_builtin_name выше, но для МЕТОД-вызовов
 // (case .Method_Collection ниже) — сравнение по СТАТИЧЕСКОМУ типу receiver'а
 // (TY_FILE/TY_CONNECTION, type_cheker.odin), а не только по имени метода:
 // "получить" — метод одновременно у Option/Result/Array/Map (чистый
 // get-with-default) И у Socket_Value (блокирующий сетевой read) —
 // invoke_collection_method диспетчит их рантайм-типом, так что без
 // проверки receiver_type компилятор не отличил бы Соединение.получить()
-// от Массив(Т).получить(). .закрыть()/.записать()/.отправить() сознательно
-// вне списка (см. план — стриминговая ЗАПИСЬ отложена).
+// от Массив(Т).получить(). .закрыть() сознательно вне списка — остаётся
+// синхронным (immediate/deferred close, см. invoke_io_method).
 is_async_stream_method :: proc(receiver_type: ^Type, method_name: string) -> bool {
 	if receiver_type == TY_FILE {
-		return method_name == "прочитать" || method_name == "прочитать_строку"
+		return method_name == "прочитать" || method_name == "прочитать_строку" || method_name == "записать"
 	}
 	if receiver_type == TY_CONNECTION {
-		return method_name == "получить" || method_name == "получить_строку"
+		return method_name == "получить" || method_name == "получить_строку" || method_name == "отправить"
 	}
 	return false
 }

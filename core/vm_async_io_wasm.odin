@@ -35,13 +35,14 @@ submit_async_io :: proc(vm: ^VM, name: string, args: []Value, target_id: int) {
 // deliver_async_result (vm.odin) компилировался на wasm-цели.
 deliver_tcp_connect_result :: proc(vm: ^VM, target: ^Process_Value, payload: Tcp_Connect_Result_Data) {}
 
-// Фаза 4: File_Value/Socket_Value никогда реально не конструируются на
+// Фаза 4/5: File_Value/Socket_Value никогда реально не конструируются на
 // wasm (call_builtin_io паникует раньше — vm_io_wasm.odin), поэтому
-// .прочитать_строку()/.получить() и т.п. недостижимы на практике — эта
-// функция существует только чтобы .Invoke_Collection_Async компилировался
-// на wasm-цели (компилятор эмитит его одинаково на всех платформах, см.
-// compiler.odin, is_async_stream_method/case .Method_Collection). Тот же
-// panic-паттерн, что submit_async_io выше.
-submit_async_io_method :: proc(vm: ^VM, receiver: Value, method_name: string, target_id: int) {
+// .прочитать_строку()/.получить()/.записать()/.отправить() и т.п.
+// недостижимы на практике — эта функция существует только чтобы
+// .Invoke_Collection_Async компилировался на wasm-цели (компилятор эмитит
+// его одинаково на всех платформах, см. compiler.odin, is_async_stream_
+// method/case .Method_Collection). Тот же panic-паттерн, что submit_async_
+// io выше. args не нужен — недостижимая ветка.
+submit_async_io_method :: proc(vm: ^VM, receiver: Value, method_name: string, args: []Value, target_id: int) {
 	fmt.panicf("Runtime Panic: '%s' недоступно в браузере (WASM-демо не имеет файловой системы/сети)", method_name)
 }

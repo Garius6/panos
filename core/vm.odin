@@ -2228,13 +2228,15 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			}
 
 		case .Invoke_Collection_Async:
-			// Фаза 4: та же операнд-форма, что .Invoke_Collection выше, но
+			// Фаза 4/5: та же операнд-форма, что .Invoke_Collection выше, но
 			// submit вместо синхронного invoke_collection_method —
 			// submit_async_io_method (vm_async_io_native.odin/_wasm.odin)
-			// либо кладёт задачу в воркер-пул (реальный стриминговый read),
-			// либо (файл уже закрыт/занят) сразу синхронно кладёт готовый
-			// Value в process.async_results — оба случая .Await_Async сразу
-			// после видит одинаково.
+			// либо кладёт задачу в воркер-пул (реальный стриминговый
+			// read/write), либо (файл уже закрыт/занят) сразу синхронно
+			// кладёт готовый Value в process.async_results — оба случая
+			// .Await_Async сразу после видит одинаково. args нужны только
+			// записи/отправить (1 строка) — read-методы (0 аргументов)
+			// получат пустой срез, submit_async_io_method их игнорирует.
 			frame.ip += 1
 			method_name_index := instructions[frame.ip]
 			frame.ip += 1
@@ -2243,8 +2245,9 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			method_name := frame.function.constants[method_name_index].(^Panos_String).data
 			receiver_index := len(vm.stack) - 1 - arg_count
 			receiver := vm.stack[receiver_index]
+			args := vm.stack[receiver_index + 1:]
 			target_id := vm.processes[vm.current_process].id
-			submit_async_io_method(vm, receiver, method_name, target_id)
+			submit_async_io_method(vm, receiver, method_name, args, target_id)
 			resize(&vm.stack, receiver_index)
 
 		case .Spawn:
@@ -2469,6 +2472,53 @@ deliver_async_result :: proc(vm: ^VM, comp: Async_Result) {
 			value = make_error_result(vm, make_error_value(vm, "сеть", err))
 		} else {
 			value = make_ok_result(vm, Value(gc_new_string(vm, payload.content)))
+		}
+		append(&target.async_results, value)
+
+	case File_Stream_Write_Result_Data:
+		// Фаза 5: симметрично File_Stream_Read_Result_Data — unpin/
+		// deferred-close ДО проверки живости получателя, но здесь
+		// результат — Результат(Число, Ошибка) (байт записано), не строка.
+		file := payload.file
+		file.in_flight = false
+		gc_unpin(vm, Value(file))
+		if file.close_requested {
+			close_file_value(file)
+		}
+
+		heap := vm_heap_allocator()
+		defer if err, has_err := payload.err.(string); has_err do delete(err, heap)
+
+		if target == nil || !target.is_alive do return
+
+		value: Value
+		if err, has_err := payload.err.(string); has_err {
+			value = make_error_result(vm, make_error_value(vm, "фс", err))
+		} else {
+			value = make_ok_result(vm, Value(f64(payload.bytes_written)))
+		}
+		append(&target.async_results, value)
+
+	case Socket_Stream_Write_Result_Data:
+		// Симметрично File_Stream_Write_Result_Data выше, close_socket_value/
+		// модуль "сеть".
+		sock := payload.sock
+		sock.in_flight = false
+		gc_unpin(vm, Value(sock))
+		if sock.close_requested {
+			close_socket_value(sock)
+		}
+
+		heap := vm_heap_allocator()
+		defer if err, has_err := payload.err.(string); has_err do delete(err, heap)
+
+		if target == nil || !target.is_alive do return
+
+		value: Value
+		if err, has_err := payload.err.(string); has_err {
+			value = make_error_result(vm, make_error_value(vm, "сеть", err))
+		} else {
+			value = make_ok_result(vm, Value(f64(payload.bytes_written)))
 		}
 		append(&target.async_results, value)
 	}

@@ -5,6 +5,7 @@ import proto "protocol"
 import "core:encoding/json"
 import "core:fmt"
 import "core:net"
+import "core:os"
 import "core:slice"
 import "core:strings"
 
@@ -41,7 +42,12 @@ LSP_Document :: struct {
 }
 
 LSP_Server :: struct {
-	documents: map[string]^LSP_Document,
+	documents:      map[string]^LSP_Document,
+	// Абсолютный путь корня воркспейса — из initialize (rootUri/rootPath/
+	// workspaceFolders, см. handle_initialize). "" если клиент не прислал
+	// ничего (тогда project-wide rename/references ограничены уже
+	// открытыми документами, как раньше — см. project_wide_ps_files).
+	workspace_root: string,
 }
 
 run_lsp_server :: proc() {
@@ -67,7 +73,7 @@ run_lsp_server :: proc() {
 
 		switch envelope.method {
 		case "initialize":
-			handle_initialize(id_val)
+			handle_initialize(&server, id_val, params)
 		case "initialized":
 		// notification от клиента после инициализации — квитировать нечем
 		case "shutdown":
@@ -116,7 +122,22 @@ run_lsp_server :: proc() {
 	}
 }
 
-handle_initialize :: proc(id: json.Value) {
+// Достаёт корень воркспейса из initialize (rootUri -> rootPath ->
+// workspaceFolders[0], в порядке предпочтения клиента per LSP-спека) для
+// project_wide_ps_files (rename/references по всему проекту, не только
+// открытым документам).
+handle_initialize :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
+	p, ok := decode_params(proto.InitializeParams, params)
+	if ok {
+		if root_uri, has_root_uri := p.root_uri.?; has_root_uri {
+			server.workspace_root = uri_to_path(string(root_uri))
+		} else if root_path, has_root_path := p.root_path.?; has_root_path {
+			server.workspace_root = root_path
+		} else if folders, has_folders := p.workspace_folders.?; has_folders && len(folders) > 0 {
+			server.workspace_root = uri_to_path(string(folders[0].uri))
+		}
+	}
+
 	result := proto.InitializeResult {
 		capabilities = proto.ServerCapabilities {
 			text_document_sync = proto.TextDocumentSyncKind.Full, // клиент шлёт весь текст, не incremental-дельты
@@ -661,19 +682,18 @@ collect_locations :: proc(
 	return locations
 }
 
-// Известное ограничение (частично снятое здесь): doc.graph рождён из
-// load_module_graph_with_overrides(doc.path, ...) — ТОЛЬКО прямые импорты
-// doc, не "кто импортирует doc" (reverse-dependents). Если декларация лежит
-// в файле X и вызывается из файла Y (Y импортирует X), вызов rename/references
-// ИЗ Y видит оба места (граф Y включает X), но вызов ИЗ X саму декларацию
-// в Y не увидит — граф X не включает Y. Каждый другой открытый документ уже
+// Ранее известное ограничение (СНЯТО ниже через project_wide_ps_files):
+// doc.graph рождён из load_module_graph_with_overrides(doc.path, ...) —
+// ТОЛЬКО прямые импорты doc, не "кто импортирует doc" (reverse-dependents).
+// Если декларация лежит в файле X и вызывается из файла Y (Y импортирует
+// X), вызов rename/references ИЗ Y видит оба места (граф Y включает X), но
+// вызов ИЗ X саму декларацию в Y не увидит — граф X не включает Y. Каждый
+// другой документ (открытый ИЛИ теневой — см. build_shadow_document) уже
 // посчитал СВОЙ граф независимо (свой Symbol_Store — Symbol_Id НЕ сравним
 // между графами напрямую), поэтому матчим декларацию по (путь файла, byte
 // span объявления) вместо Symbol_Id: если у другого документа в его графе
 // есть файл с тем же путём и в нём символ с тем же span — это та же
-// декларация, просто с другим Symbol_Id в другом Symbol_Store. Покрывает
-// только СЕЙЧАС ОТКРЫТЫЕ документы — reverse-dependents, которые не открыты
-// в редакторе, всё ещё не увидим (нужен был бы project-wide индекс, не MVP).
+// декларация, просто с другим Symbol_Id в другом Symbol_Store.
 merge_cross_document_usages :: proc(
 	server: ^LSP_Server,
 	origin_doc: ^LSP_Document,
@@ -683,32 +703,135 @@ merge_cross_document_usages :: proc(
 ) {
 	for _, other_doc in server.documents {
 		if other_doc == origin_doc do continue
-		matched_sym, found := find_symbol_by_decl_location(other_doc, decl_path, decl_span)
-		if !found do continue
-		// Прямая индексация map'ы внутри for-range на ОТСУТСТВУЮЩЕМ ключе —
-		// сегфолт (см. комментарий в collect_locations выше, где это же
-		// нашли живым тестом): matched_sym гарантированно существует как
-		// декларация (find_symbol_by_decl_location совпал по span), но НЕ
-		// гарантированно имеет хоть один usage В ЭТОМ other_doc.
-		matched_usages, _ := other_doc.usages[matched_sym]
-		for sp in matched_usages {
-			usage_source := other_doc.source
-			usage_uri := other_doc.uri
-			if sp.file_id != other_doc.file_id {
-				usage_source = other_doc.graph.file_sources[sp.file_id]
-				usage_uri = path_to_uri(other_doc.graph.file_paths[sp.file_id])
+		merge_doc_usages_by_decl_location(other_doc, decl_path, decl_span, locations)
+	}
+
+	// Открытые документы покрыты выше — здесь ТОЛЬКО файлы на диске, ещё не
+	// открытые в редакторе (reverse-dependents, которых открытые графы не
+	// видят). Каждый строится и сразу отбрасывается (build_shadow_document,
+	// temp_allocator) — простой, не кэширующий project-wide скан по всем
+	// *.ps под workspace_root на КАЖДЫЙ rename/references (см. заголовок
+	// build_shadow_document) — приемлемо для размеров проектов на panos
+	// сейчас, не для монорепозиториев с тысячами файлов.
+	already_open := make(map[string]bool, allocator = context.temp_allocator)
+	for _, doc in server.documents {
+		already_open[doc.path] = true
+	}
+	for path in project_wide_ps_files(server.workspace_root) {
+		if path in already_open do continue
+		shadow, ok := build_shadow_document(server, path)
+		if !ok do continue
+		merge_doc_usages_by_decl_location(shadow, decl_path, decl_span, locations)
+	}
+}
+
+// Общая часть merge_cross_document_usages для ОДНОГО другого документа
+// (открытого или теневого) — вынесено, чтобы не дублировать между циклом
+// по server.documents и циклом по project_wide_ps_files.
+merge_doc_usages_by_decl_location :: proc(
+	other_doc: ^LSP_Document,
+	decl_path: string,
+	decl_span: core.Span,
+	locations: ^[dynamic]proto.Location,
+) {
+	matched_sym, found := find_symbol_by_decl_location(other_doc, decl_path, decl_span)
+	if !found do return
+	// Прямая индексация map'ы внутри for-range на ОТСУТСТВУЮЩЕМ ключе —
+	// сегфолт (см. комментарий в collect_locations выше, где это же
+	// нашли живым тестом): matched_sym гарантированно существует как
+	// декларация (find_symbol_by_decl_location совпал по span), но НЕ
+	// гарантированно имеет хоть один usage В ЭТОМ other_doc.
+	matched_usages, _ := other_doc.usages[matched_sym]
+	for sp in matched_usages {
+		usage_source := other_doc.source
+		usage_uri := other_doc.uri
+		if sp.file_id != other_doc.file_id {
+			usage_source = other_doc.graph.file_sources[sp.file_id]
+			usage_uri = path_to_uri(other_doc.graph.file_paths[sp.file_id])
+		}
+		loc := proto.Location{uri = proto.DocumentUri(usage_uri), range = lsp_range(usage_source, sp.start, sp.end)}
+		already_present := false
+		for existing in locations {
+			if existing == loc {
+				already_present = true
+				break
 			}
-			loc := proto.Location{uri = proto.DocumentUri(usage_uri), range = lsp_range(usage_source, sp.start, sp.end)}
-			already_present := false
-			for existing in locations {
-				if existing == loc {
-					already_present = true
-					break
-				}
-			}
-			if !already_present do append(locations, loc)
+		}
+		if !already_present do append(locations, loc)
+	}
+}
+
+// Рекурсивно перечисляет все *.ps файлы под root ("" — клиент не прислал
+// workspace root в initialize, project-wide скан просто не находит ничего
+// и rename/references остаются ограничены открытыми документами, как
+// раньше). Пропускает ".git" — единственная директория, которую есть
+// смысл не обходить всегда, не специфично для panos-проектов.
+project_wide_ps_files :: proc(root: string) -> [dynamic]string {
+	result := make([dynamic]string, allocator = context.temp_allocator)
+	if root == "" do return result
+	collect_ps_files_recursive(root, &result)
+	return result
+}
+
+// Строим путь сами (dir + "/" + info.name), НЕ используем info.fullpath —
+// os.read_directory_by_path резолвит симлинки в fullpath (на macOS /tmp
+// -> /private/tmp), а doc.path из редактора (uri_to_path) — нет. Разные
+// строковые представления ОДНОГО файла ломают find_symbol_by_decl_location
+// (точное сравнение путей строкой) — usages в файлах, найденных через
+// project_wide_ps_files, молча не матчились бы с декларацией из открытого
+// документа.
+collect_ps_files_recursive :: proc(dir: string, result: ^[dynamic]string) {
+	infos, err := os.read_directory_by_path(dir, 0, context.temp_allocator)
+	if err != nil do return
+	for info in infos {
+		child := fmt.tprintf("%s/%s", dir, info.name)
+		if info.type == .Directory {
+			if info.name == ".git" do continue
+			collect_ps_files_recursive(child, result)
+		} else if strings.has_suffix(info.name, ".ps") {
+			append(result, child)
 		}
 	}
+}
+
+// Строит "теневой" документ для файла, НЕ открытого в редакторе — нужен
+// только чтобы найти его usages символа при project-wide rename/references
+// (merge_cross_document_usages). Не сохраняется в server.documents, не
+// публикует диагностики — целиком на temp_allocator, живёт до конца
+// текущего LSP-запроса. Те же overrides, что revalidate_document даёт
+// открытым документам — если этот файл на диске импортирует открытый, но
+// НЕСОХРАНЁННЫЙ документ, видит его актуальный текст, не версию с диска.
+build_shadow_document :: proc(server: ^LSP_Server, path: string) -> (^LSP_Document, bool) {
+	overrides := make(map[string]string, allocator = context.temp_allocator)
+	for _, other_doc in server.documents {
+		key := core.resolve_import_path(other_doc.path, "")
+		overrides[key] = other_doc.source
+	}
+
+	graph := core.load_module_graph_with_overrides(path, overrides)
+	entry_key := core.resolve_import_path(path, "")
+	entry_module := graph.modules[entry_key]
+	if entry_module == nil do return nil, false
+
+	doc := new(LSP_Document, context.temp_allocator)
+	doc.uri = path_to_uri(path)
+	doc.path = path
+	doc.source = entry_module.source
+	doc.graph = graph
+	doc.prog = entry_module.ast
+	doc.file_id = entry_module.file_id
+
+	results := core.resolve_and_typecheck_all(&graph)
+	for i in 0 ..< len(results) {
+		r := &results[i]
+		if r.module == entry_module {
+			doc.res_ctx = r.res_ctx
+			doc.tc_ctx = r.tc_ctx
+		}
+	}
+	doc.results = results
+	build_usages(doc)
+	return doc, true
 }
 
 // Ищет в графе other_doc файл с путём decl_path, а затем — символ, чей span

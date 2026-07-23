@@ -70,8 +70,26 @@ not source comments.
   clones of a shared local bare repo as the "remote" — no fake binaries
   needed here (this part isn't 1C-specific), including a genuine
   divergent-history scenario to verify the abort-before-any-progress
-  guarantee. See `specs/008-gitsync-auto-push-pull/` (plan/research/
-  data-model/quickstart).
+  guarantee. Three real bugs surfaced only by this feature (never visible
+  before, because 006/007 never inspected committed git state via a real
+  push+clone, only ever read files off the one continuously-existing
+  local disk): (1) `gitrunner.получить_текущую_ветку()` (`rev-parse
+  --abbrev-ref HEAD`) fails on an unborn HEAD — normal for a freshly
+  `gitsync init`-ed repo, since `repo_init.ps` writes `VERSION`/`AUTHORS`
+  without ever committing — fixed with a `symbolic-ref --short HEAD`
+  escape-hatch call inside `sync.ps` itself, not a `gitrunner` change; (2)
+  unborn HEAD + a remote branch that already has commits — the untracked
+  `VERSION`/`AUTHORS` files block a normal `git pull` ("Please move or
+  remove them before you merge") — fixed with `git fetch` + `git
+  checkout -B <branch> -f <remote>/<branch>` in that one specific case
+  only (safe because there are zero local commits to lose); (3) `VERSION`
+  was written to disk AFTER each version's commit, not before — so it
+  landed in git history one version behind, and the very last version's
+  `VERSION` was never committed at all, staying as an uncommitted
+  working-tree change forever — invisible previously since
+  `vf.прочитать_версию()` always read the live disk file directly, never
+  the git-committed content. See `specs/008-gitsync-auto-push-pull/`
+  (plan/research/data-model/quickstart).
 - 007-gitsync-per-version-author: Extends `panosiki/v8storage` with
   `отчёт_по_версиям` (wraps `/ConfigurationRepositoryReport`, same
   `ос.выполнить` pattern as every other `v8storage` method) and adds a new

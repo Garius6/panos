@@ -10,6 +10,9 @@ Auto-generated from feature plans. Last updated: 2026-07-23.
 - gitsync dependency scaffolding (004-gitsync-dependency-packages): 7 new independent git repos under `../panosiki/` (each `pan init`-ed) for gitsync's oscript-library dependencies that need porting; one new panos stdlib module `std/слог.ps` (logging, replaces `logos`); no `core/` changes. See `specs/004-gitsync-dependency-packages/`.
 - panos metaprogramming (not a speckit feature — see Recent Changes): `&`-annotations (parser-only AST metadata, no runtime effect — `core/parser.odin`) + `синтаксис.*` compile-time-only AST-introspection native builtin (`core/vm_syntax_native.odin`/`_wasm.odin`), no new dependency. Generic codegen driver self-hosted in `../panosiki/codegen/` (separate repo, not bundled in `std/`), invoked via `pan task`.
 - panos language fixes (005-language-fixes): three compiler-only grammar/typechecker fixes found while porting gitsync deps — no new dependency, touches only `core/parser.odin` + `core/type_cheker.odin`.
+- gitsync dependency packages (not a speckit feature — built via plan-mode, see 004): the 6 "new package" dependencies (gitrunner/tempfiles/configor/cli-selector/v8runner/v8storage) plus `cli` all have real implementations (not just scaffolding) with e2e tests, in `../panosiki/`.
+- gitsync core port (006-gitsync-port): new `../panosiki/gitsync/` package — the actual sync-loop application, composing the 7 dependency packages above with zero changes to any of them. See `specs/006-gitsync-port/`.
+- gitsync per-version authorship (007-gitsync-per-version-author): extends `panosiki/v8storage` with a method wrapping `/ConfigurationRepositoryReport` (CLI, `ос.выполнить` — no COM), plus a new `panosiki/скобки` package (bracket-format 1C text parser, narrow port of `oscript-library/yabr`, MPL-2.0) to extract per-version author from the resulting MXL report; wires into `panosiki/gitsync/sync.ps` to replace 006's single-author-per-run simplification. See `specs/007-gitsync-per-version-author/`.
 
 ## Project Structure
 
@@ -45,6 +48,60 @@ history of how the code came to exist — that belongs in commit messages,
 not source comments.
 
 ## Recent Changes
+- 007-gitsync-per-version-author: Extends `panosiki/v8storage` with
+  `отчёт_по_версиям` (wraps `/ConfigurationRepositoryReport`, same
+  `ос.выполнить` pattern as every other `v8storage` method) and adds a new
+  package `panosiki/скобки` — a panos port of a NARROW slice of
+  `oscript-library/yabr` (MPL-2.0): a generic recursive parser for 1C's
+  "bracket format" (`{...}`-nested text serialization — used across many
+  1C file types: registration logs, cluster settings, MXL tabular
+  documents) plus the specific MXL-cell-addressing logic (verbatim-ported
+  "magic offset" constants from `yabr`'s `ПолучитьОписаниеЯчейки`/
+  `ЭтоЯчейкаТаблицы` — empirically reverse-engineered, not documented by
+  1C, deliberately NOT re-derived) needed to read a storage-version report
+  (`"Версия:"`/`"Пользователь:"`/`"Дата создания:"`/`"Комментарий:"` per
+  version). This REVERSES 006's conclusion that per-version commit
+  authorship needs MXL/COM-interop — the MXL report turns out to be plain
+  bracket-format text, not OLE-binary, readable via the same
+  `ос.выполнить`-plus-text-parser pattern as everything else in this
+  project, no COM/native layer needed, cross-platform. Wired into
+  `panosiki/gitsync/sync.ps`, replacing 006's single-author-per-run
+  simplification with per-version lookup (falling back to the 006
+  behavior — single run-wide author — if the report is unavailable or a
+  specific version is missing from it, so `sync` never hard-fails on
+  this). Test fixtures are a SYNTHETIC bracket-format sample (matching the
+  structure confirmed via `yabr`'s real example `CR_versions_small.mxl`),
+  not a copy of that MPL-2.0 file itself — avoids vendoring third-party
+  Covered Software when an equivalent-structure fixture is enough. See
+  `specs/007-gitsync-per-version-author/` (plan/research/data-model/
+  quickstart).
+- 006-gitsync-port: New `../panosiki/gitsync/` package (own git repo, same
+  pattern as the 7 dependency packages) — the actual gitsync sync-loop
+  application (git-based 1C infobase config storage sync), composing
+  `gitrunner`/`v8runner`/`v8storage`/`cli`/`std/кодирование/toml.ps` with
+  ZERO changes to any of them. Two things that looked like gaps in the
+  already-built dependencies turned out to need no extension at all: (1)
+  no "list storage versions" method on `v8storage` — resolved by
+  sequentially probing `версию_в_файл(N, ...)` from last-synced+1 until
+  the first failure, reusing the existing method as-is (deliberately not
+  extending v8storage with output-parsing for a version list — same
+  unverifiable-without-real-1C risk that excluded this from v8storage the
+  first time, spec 004); (2) no per-commit author parameter on
+  `gitrunner`'s `закоммитить` — resolved by calling
+  `установить_настройку("user.name"/"user.email", ...)` immediately
+  before each commit (git reads the local config at commit time, so this
+  gives correct per-version authorship without touching gitrunner).
+  `VERSION` file is plain text (a single number, not the original's XML)
+  and `AUTHORS` is TOML (not the original's INI) — both already decided
+  in specs/004's scope discussion, reused here. Scope deliberately
+  excludes (see spec.md Assumptions): the plugin/event-subscription
+  system (separate `gitsync-plugins` repo in the original), automatic git
+  push/pull (call `gitrunner` directly instead), http/tcp storage
+  protocols (`v8storage` is file-path-only), and multi-storage sync
+  (`all` command — unsupported even in the original). NOTE: 007 above
+  supersedes this feature's Assumption that per-version commit authorship
+  is infeasible without COM. See `specs/006-gitsync-port/` (plan/
+  research/data-model/contracts/quickstart).
 - 005-language-fixes: Three compiler-only grammar/typechecker fixes found while
   porting gitsync deps (specs/004) — no new dependency, `core/parser.odin` +
   `core/type_cheker.odin` only. (1) Qualified generic type as a type-annotation
@@ -68,8 +125,13 @@ not source comments.
   function-type-params, NOT safe (confirmed bug, not just missing feature) in
   call args/enum variant types/pattern-constructor args/generic type-args/
   tuple-type elements — mechanical fix applied to the unsafe sites, matching
-  the already-established safe pattern in the same file. See
-  `specs/005-language-fixes/` (plan/research/data-model/contracts).
+  the already-established safe pattern in the same file. Also added top-level
+  `[экспорт] конст ИМЯ = <литерал>` (Число/Строка/Булево, compiled by
+  substitution, no runtime storage — panos deliberately has no top-level
+  mutable state) and `математика.Генератор` (stateful PRNG wrapper over the
+  pre-existing Lehmer/Park-Miller `следующее`/`дробь`/`диапазон`, auto-seeded
+  from `время.сейчас_мс()` with warm-up iterations to decorrelate close-in-time
+  seeds). See `specs/005-language-fixes/` (plan/research/data-model/contracts).
 - codegen-and-pan-task (not a speckit feature — built via plan-mode):
   generic annotation-driven codegen driver, self-hosted in panos, living
   in `../panosiki/codegen/` (separate git repo, own `v0.3.0`+ tags, NOT

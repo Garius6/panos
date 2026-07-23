@@ -18,7 +18,7 @@ Main_Function_Name :: "старт"
 // `git tag` в корне репозитория) — единственный источник версии тулчейна
 // для скриптов (ос.версия_паноса()), у паноса нет автоматической привязки
 // версии сборки к git.
-PANOS_VERSION :: "0.2.5"
+PANOS_VERSION :: "0.2.6"
 
 CallFrame :: struct {
 	function:      ^Compiled_Function,

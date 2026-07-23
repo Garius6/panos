@@ -252,6 +252,12 @@ compile_symbol_value_ref :: proc(ctx: ^Compiler, sym_id: Symbol_Id) {
 			return
 		}
 	}
+	sym := symbol_at(ctx.res.symbol_store, sym_id)
+	if sym.kind == .Constant {
+		const_decl := sym.decl.(^Const_Decl)
+		compile_expr(ctx, const_decl.value)
+		return
+	}
 	if fn_ptr, ok := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, sym_id)]; ok {
 		emit_constant(ctx, Value(fn_ptr))
 		return
@@ -1148,6 +1154,11 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 					resolve_interned(sym.name),
 				)
 			}
+			if sym.kind == .Constant {
+				const_decl := sym.decl.(^Const_Decl)
+				compile_expr(ctx, const_decl.value)
+				return
+			}
 			if fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, sym_id)]; found {
 				emit_constant(ctx, Value(fn_ptr))
 				return
@@ -1168,6 +1179,11 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 					)
 				}
 				if export_sym, found := imported_module.exports[intern(e.property)]; found {
+					if symbol_at(ctx.res.symbol_store, export_sym).kind == .Constant {
+						const_decl := symbol_at(ctx.res.symbol_store, export_sym).decl.(^Const_Decl)
+						compile_expr(ctx, const_decl.value)
+						return
+					}
 					if fn_ptr, found_fn := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, export_sym)];
 					   found_fn {
 						emit_constant(ctx, Value(fn_ptr))

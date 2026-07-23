@@ -1019,6 +1019,10 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		for sym, params in res.module_graph.decl_type_params {
 			ctx.decl_type_params[sym] = params
 		}
+		// Тот же мотив — см. Module_Graph.decl_type_param_order.
+		for sym, ordered in res.module_graph.decl_type_param_order {
+			ctx.decl_type_param_order[sym] = ordered
+		}
 		// Стадия 45: T процессов уже протипизированных модулей графа —
 		// без этого `запусти Модуль.функция(...)`, где функция сама
 		// вызывает получить() в своём теле, не видело бы её T (см.
@@ -2075,6 +2079,23 @@ typecheck_pass_nominal :: proc(ctx: ^Type_Ctx, prog: Program) {
 typecheck_pass_signatures :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
+		case ^Const_Decl:
+			// value уже проверен парсером (is_valid_const_value) — только
+			// Число/Строка/Булево литерал (либо унарный минус перед числом),
+			// так что тип виден напрямую по форме AST-узла, без общего
+			// infer_expr.
+			sym := ctx.res.decl_symbols[decl]
+			#partial switch v in d.value {
+			case ^Number_Expr:
+				ctx.res.symbol_types[sym] = TY_NUM
+			case ^String_Expr:
+				ctx.res.symbol_types[sym] = TY_STRING
+			case ^Boolean_Expr:
+				ctx.res.symbol_types[sym] = TY_BOOL
+			case ^Unary_Expr:
+				ctx.res.symbol_types[sym] = TY_NUM
+			}
+
 		case ^Struct_Decl:
 			sym := ctx.res.decl_symbols[decl]
 			struct_type := ctx.res.symbol_types[sym]
@@ -2587,7 +2608,41 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 		}
 		if export_sym, found := imported_module.exports[intern(n.name)]; found {
 			if typ, found_type := ctx.res.symbol_types[export_sym]; found_type {
-				return typ
+				if len(n.params) == 0 {
+					return typ
+				}
+				// Квалифицированный generic-тип (модуль.Тип(Аргумент, ...)) —
+				// тот же инстанцирующий путь, что уже написан для локального
+				// Type_Generic ниже (пользовательский generic-тип): найти
+				// порядок type-параметров экспортируемого типа, проверить
+				// количество аргументов, подставить и инстанцировать.
+				ordered, is_generic := ctx.decl_type_param_order[export_sym]
+				if !is_generic {
+					return report(ctx, n.span, "Type Error: '%s' не является generic-типом", n.name)
+				}
+				if len(n.params) != len(ordered) {
+					return report(
+						ctx,
+						n.span,
+						"Type Error: '%s' ожидает %d параметров типа, получено %d",
+						n.name,
+						len(ordered),
+						len(n.params),
+					)
+				}
+				args := make([dynamic]^Type)
+				for p in n.params do append(&args, resolve_type_node(ctx, p))
+
+				subst := make(map[int]^Type)
+				for tv, i in ordered do subst[tv.infer_id] = args[i]
+				instance := instantiate_type(ctx, typ, &subst)
+
+				canon_args := make([dynamic]^Type)
+				collect_instance_args(instance, &canon_args)
+				key := generic_instance_key(export_sym, canon_args)
+				if cached, cache_found := ctx.generic_instance_cache[key]; cache_found do return cached
+				ctx.generic_instance_cache[key] = instance
+				return instance
 			}
 			return report(
 				ctx,

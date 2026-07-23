@@ -12,6 +12,10 @@ Symbol_Kind :: enum {
 	Module,
 	Builtin,
 	Enum_Variant,
+	// Top-level "конст ИМЯ = <литерал>" — компилируется подстановкой
+	// литерала на месте использования (см. compile_symbol_value_ref/
+	// Property_Expr в compiler.odin), не читает никакой рантайм-ячейки.
+	Constant,
 }
 
 // Семантическая сущность: локальная переменная, функция, тип или модуль-алиас.
@@ -115,6 +119,15 @@ Module_Graph :: struct {
 	// пустую decl_type_params[f] (nil map) и упал бы на nil-деréférence
 	// в infer_bounded_generic_call.
 	decl_type_params: map[Symbol_Id]map[string]^Type,
+	// Тот же накопительный паттерн, что symbol_schemes/decl_type_params
+	// выше — квалифицированный generic-тип через границу модуля
+	// (модуль.Тип(Аргумент)) нуждается в ordered type-параметрах ИМЕННО
+	// ТОГО Type_Ctx, где Тип была объявлена (Type_Ctx.decl_type_param_order
+	// живёт в per-модульном tc_ctx, module_loader.odin создаёт свой на
+	// каждый модуль) — без накопления здесь вызывающий модуль видел бы
+	// для Тип пустую decl_type_param_order (не generic-тип) и падал бы с
+	// ложной ошибкой "не является generic-типом".
+	decl_type_param_order: map[Symbol_Id][dynamic]^Type,
 	// Каждый модуль резолвится своим ОТДЕЛЬНЫМ Resolver_Ctx (module_loader.
 	// odin создаёт свежий на модуль) — monomorphize_one клонирует тело
 	// bounded generic-функции, объявленной МОГ БЫТЬ В ДРУГОМ модуле, чем
@@ -698,8 +711,9 @@ register_named_symbol :: proc(
 	decl: Decls,
 	span: Span,
 	is_exported: bool,
+	is_const: bool = false,
 ) -> Symbol_Id {
-	sym := new_symbol(ctx.symbol_store, name, kind, module, is_exported, decl, span)
+	sym := new_symbol(ctx.symbol_store, name, kind, module, is_exported, decl, span, is_const = is_const)
 	name_id := intern(name)
 	// Единая hard-reserved политика (см. RESERVED_BUILTIN_NAMES выше):
 	// install_standard_symbols заранее кладёт builtin'ы ("получить" и
@@ -776,6 +790,9 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 
 	case ^Function_Decl:
 		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Function, decl, d.span, d.is_exported)
+
+	case ^Const_Decl:
+		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Constant, decl, d.span, d.is_exported, is_const = true)
 
 	case ^Struct_Decl:
 		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Type, decl, d.span, d.is_exported)

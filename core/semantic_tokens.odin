@@ -56,6 +56,8 @@ compute_semantic_tokens :: proc(res: ^Resolver_Ctx) -> [dynamic]Semantic_Token {
 			tok_type = .Namespace
 		case .Variable:
 			tok_type = .Parameter if is_parameter_symbol(res, sym_id) else .Variable
+		case .Constant:
+			tok_type = .Variable
 		case .Builtin:
 			classified = false
 		case:

@@ -33,7 +33,7 @@ report_parse :: proc(p: ^Parser, span: Span, format: string, args: ..any) {
 // См. места вызова.
 is_sync_token :: proc(kind: TokenKind) -> bool {
 	#partial switch kind {
-	case .Function, .TypeDecl, .Impl, .Import, .Export, .End, .EOF:
+	case .Function, .TypeDecl, .Impl, .Import, .Export, .Const, .End, .EOF:
 		return true
 	}
 	return false
@@ -313,6 +313,22 @@ Decls :: union {
 	^Enum_Decl,
 	^Error_Decl,
 	^Foreign_Decl,
+	^Const_Decl,
+}
+
+// Top-level "[экспорт] конст ИМЯ = <литерал>" — value ВСЕГДА один из
+// Number_Expr/String_Expr/Boolean_Expr (либо Unary_Expr{Minus, Number_Expr}
+// для отрицательных чисел), проверяется в parse_const_decl. Компилируется
+// подстановкой литерала на месте использования (см. compiler.odin) — язык
+// сознательно не даёт top-level изменяемого состояния (AGENTS.md), поэтому
+// value не может быть произвольным выражением, вычисляемым при старте.
+Const_Decl :: struct {
+	span:        Span,
+	name:        string,
+	name_span:   Span,
+	doc:         string,
+	value:       Expr,
+	is_exported: bool,
 }
 
 // Докстринг декларации (см. Function_Decl.doc и т.п.) — "" для видов
@@ -327,6 +343,8 @@ decl_doc_comment :: proc(d: Decls) -> string {
 	case ^Interface_Decl:
 		return v.doc
 	case ^Enum_Decl:
+		return v.doc
+	case ^Const_Decl:
 		return v.doc
 	case ^Import_Decl, ^Impl_Decl, ^Error_Decl, ^Foreign_Decl:
 		return ""
@@ -349,7 +367,7 @@ decl_annotations :: proc(d: Decls) -> [dynamic]Annotation {
 		return v.annotations
 	case ^Enum_Decl:
 		return v.annotations
-	case ^Import_Decl, ^Impl_Decl, ^Error_Decl, ^Foreign_Decl:
+	case ^Import_Decl, ^Impl_Decl, ^Error_Decl, ^Foreign_Decl, ^Const_Decl:
 		return nil
 	}
 	return nil
@@ -411,6 +429,7 @@ Type_Qualified :: struct {
 	span:        Span,
 	module_name: string,
 	name:        string,
+	params:      [dynamic]Type_Node,
 }
 
 Error_Type_Node :: struct {
@@ -1051,6 +1070,12 @@ parse_program :: proc(p: ^Parser) -> Program {
 			}
 			decl := parse_foreign_decl(p)
 			append(&prog.decls, decl)
+		} else if tok_kind == .Const {
+			if len(annotations) > 0 {
+				report_parse(p, annotations[0].span, "Синтаксическая ошибка: аннотации недопустимы для константы")
+			}
+			decl := parse_const_decl(p, is_exported, doc)
+			append(&prog.decls, decl)
 		} else {
 			// peek-only — без skip зациклится на том же токене.
 			bad_span := peek_token(p.stream).span
@@ -1063,6 +1088,52 @@ parse_program :: proc(p: ^Parser) -> Program {
 		}
 	}
 	return prog
+}
+
+// Value MUST быть Число/Строка/Булево литералом (либо унарный минус перед
+// числом — "конст X = -5") — компилятор подставляет это выражение
+// напрямую на месте использования (см. compiler.odin), без рантайм-
+// вычисления, так что произвольное выражение (вызов функции и т.п.)
+// не имело бы смысла компилировать.
+is_valid_const_value :: proc(e: Expr) -> bool {
+	#partial switch v in e {
+	case ^Number_Expr, ^String_Expr, ^Boolean_Expr:
+		return true
+	case ^Unary_Expr:
+		if v.op != .Minus do return false
+		_, is_num := v.right.(^Number_Expr)
+		return is_num
+	}
+	return false
+}
+
+parse_const_decl :: proc(p: ^Parser, is_exported: bool, doc: string) -> ^Const_Decl {
+	start := peek_token(p.stream).span
+	expect(p, .Const)
+	decl := new(Const_Decl)
+	decl.doc = doc
+	decl.is_exported = is_exported
+
+	name_tok := next_token(p.stream)
+	if name_tok.kind != .Ident {
+		report_parse(p, name_tok.span, "Синтаксическая ошибка: после 'конст' ожидается имя")
+	}
+	decl.name = name_tok.data
+	decl.name_span = name_tok.span
+
+	expect(p, .Assign)
+	decl.value = parse_expr(p, 0)
+	if !is_valid_const_value(decl.value) {
+		report_parse(
+			p,
+			expr_span(decl.value),
+			"Синтаксическая ошибка: значение 'конст' должно быть числовым/строковым/булевым литералом",
+		)
+	}
+
+	consume_semicolon_or_newline(p)
+	decl.span = span_from(p, start)
+	return decl
 }
 
 parse_import_decl :: proc(p: ^Parser) -> ^Import_Decl {
@@ -1130,6 +1201,9 @@ parse_foreign_decl :: proc(p: ^Parser) -> ^Foreign_Decl {
 			append(&decl.params, Foreign_Param{span = span_from(p, param_span), name = param_name_tok.data, marshal = marshal, pointee = pointee, struct_type_name = struct_name})
 			if peek_token(p.stream).kind == .Comma {
 				next_token(p.stream)
+				if peek_token(p.stream).kind == .RParen {
+					break
+				}
 			} else {
 				break
 			}
@@ -1309,6 +1383,9 @@ parse_enum_decl :: proc(p: ^Parser, is_exported: bool, doc: string, annotations:
 				append(&variant.types, parse_type(p))
 				if peek_token(p.stream).kind == .Comma {
 					next_token(p.stream)
+					if peek_token(p.stream).kind == .RParen {
+						break
+					}
 					continue
 				}
 				break
@@ -1499,6 +1576,9 @@ parse_type_params :: proc(p: ^Parser) -> [dynamic]string {
 		append(&names, name_tok.data)
 		if peek_token(p.stream).kind == .Comma {
 			next_token(p.stream)
+			if peek_token(p.stream).kind == .RBracket {
+				break
+			}
 		} else {
 			break
 		}
@@ -1543,6 +1623,9 @@ parse_function_type_params :: proc(p: ^Parser) -> ([dynamic]string, map[string][
 
 		if peek_token(p.stream).kind == .Comma {
 			next_token(p.stream)
+			if peek_token(p.stream).kind == .RBracket {
+				break
+			}
 		} else {
 			break
 		}
@@ -1783,6 +1866,31 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 			t := new(Type_Qualified)
 			t.module_name = tok.data
 			t.name = member_tok.data
+			t.params = make([dynamic]Type_Node)
+
+			// Квалифицированный generic-тип (модуль.Тип(Аргумент, ...)) —
+			// тот же LParen+nl_before guard, что и у локального
+			// Type_Generic ниже: без него `-> модуль.Тип\n\t(1 + 2)` (тело
+			// функции, начинающееся с выражения в скобках) ошибочно
+			// читалось бы как generic-аргументы типа.
+			if peek_token(p.stream).kind == .LParen && !peek_token(p.stream).nl_before {
+				next_token(p.stream) // съедаем (
+				if peek_token(p.stream).kind != .RParen {
+					for {
+						append(&t.params, parse_type(p))
+						if peek_token(p.stream).kind == .Comma {
+							next_token(p.stream)
+							if peek_token(p.stream).kind == .RParen {
+								break
+							}
+						} else {
+							break
+						}
+					}
+				}
+				expect(p, .RParen)
+			}
+
 			t.span = span_from(p, start)
 			return t
 		}
@@ -1804,6 +1912,9 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 					append(&t.params, parse_type(p))
 					if peek_token(p.stream).kind == .Comma {
 						next_token(p.stream)
+						if peek_token(p.stream).kind == .RParen {
+							break
+						}
 					} else {
 						break
 					}
@@ -1830,6 +1941,9 @@ parse_type :: proc(p: ^Parser) -> Type_Node {
 				append(&t.elements, parse_type(p))
 				if peek_token(p.stream).kind == .Comma {
 					next_token(p.stream)
+					if peek_token(p.stream).kind == .RParen {
+						break
+					}
 				} else {
 					break
 				}
@@ -1928,6 +2042,9 @@ parse_for_stmt_into :: proc(p: ^Parser, out: ^[dynamic]Stmt) {
 			append(&names, name_tok.data)
 			if peek_token(p.stream).kind == .Comma {
 				next_token(p.stream)
+				if peek_token(p.stream).kind == .RParen {
+					break
+				}
 			} else {
 				break
 			}
@@ -2182,6 +2299,9 @@ parse_destructure_names :: proc(p: ^Parser, allow_named: bool) -> (names: [dynam
 		append(&names, name_tok.data)
 		if peek_token(p.stream).kind == .Comma {
 			next_token(p.stream)
+			if peek_token(p.stream).kind == .RParen {
+				break
+			}
 		} else {
 			break
 		}
@@ -2385,6 +2505,9 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 					append(&call.args, parse_expr(p, 0))
 					if peek_token(p.stream).kind == .Comma {
 						next_token(p.stream)
+						if peek_token(p.stream).kind == .RParen {
+							break
+						}
 					} else {
 						break
 					}
@@ -2653,6 +2776,9 @@ parse_pattern :: proc(p: ^Parser) -> Pattern {
 				append(&pat.args, parse_pattern(p))
 				if peek_token(p.stream).kind == .Comma {
 					next_token(p.stream)
+					if peek_token(p.stream).kind == .RParen {
+						break
+					}
 					continue
 				}
 				break
@@ -2720,17 +2846,33 @@ parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
 			body = make([dynamic]Stmt),
 		}
 		arm.pattern = parse_pattern(p)
-		expect(p, .Arrow)
-		// Тело ветки — один statement (ветки в одну строку); `;` после него
-		// опционален, следующая ветка начинается со своего Pattern.
-		for {
-			parse_stmt_into(p, &arm.body)
-			if peek_token(p.stream).kind == .Semicolon {
-				next_token(p.stream)
+		// Два варианта тела ветки: `-> выражение` (один statement, как
+		// раньше) или `тогда ... конец` (блок из нескольких statement'ов,
+		// тот же цикл, что используют then_branch/else_branch в
+		// parse_if_expr и body в parse_while_expr) — шаблон-паттерн
+		// синтаксически неотличим от вызова-statement'а (`a.b(...)`
+		// валиден и как шаблон, и как метод-вызов), поэтому парсер БЕЗ
+		// backtracking не может честно продолжать читать statement'ы
+		// текущей ветки до бесконечности — маркер после шаблона обязателен.
+		if peek_token(p.stream).kind == .Then {
+			next_token(p.stream)
+			for peek_token(p.stream).kind != .End && peek_token(p.stream).kind != .EOF {
+				parse_stmt_into(p, &arm.body)
 			}
-			nxt := peek_token(p.stream).kind
-			if nxt == .End || nxt == .EOF do break
-			break
+			expect(p, .End)
+		} else {
+			expect(p, .Arrow)
+			// Тело ветки — один statement (ветки в одну строку); `;` после него
+			// опционален, следующая ветка начинается со своего Pattern.
+			for {
+				parse_stmt_into(p, &arm.body)
+				if peek_token(p.stream).kind == .Semicolon {
+					next_token(p.stream)
+				}
+				nxt := peek_token(p.stream).kind
+				if nxt == .End || nxt == .EOF do break
+				break
+			}
 		}
 		arm.span = span_from(p, arm_start)
 		append(&m.arms, arm)

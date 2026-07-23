@@ -190,6 +190,13 @@ resolve_and_typecheck_all :: proc(graph: ^Module_Graph) -> [dynamic]Module_Resul
 		for sym, params in last.tc_ctx.decl_type_params {
 			graph.decl_type_params[sym] = params
 		}
+		// Тот же мотив, что decl_type_params выше — см. Module_Graph.decl_type_param_order.
+		if graph.decl_type_param_order == nil {
+			graph.decl_type_param_order = make(map[Symbol_Id][dynamic]^Type)
+		}
+		for sym, ordered in last.tc_ctx.decl_type_param_order {
+			graph.decl_type_param_order[sym] = ordered
+		}
 		// См. Module_Graph.module_resolvers — &last.res_ctx стабилен
 		// (preallocated results, см. комментарий выше).
 		if graph.module_resolvers == nil {

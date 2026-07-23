@@ -1,6 +1,6 @@
 # panos Development Guidelines
 
-Auto-generated from feature plans. Last updated: 2026-07-21.
+Auto-generated from feature plans. Last updated: 2026-07-23.
 
 ## Active Technologies
 - mdBook (docs/) — internal architecture documentation, no new dependency (002-interpreter-architecture-docs)
@@ -9,6 +9,7 @@ Auto-generated from feature plans. Last updated: 2026-07-21.
 - pan package manager (003-pan-package-manager): panos itself (self-hosted, `../panosiki/pan/`) using `std/кодирование/toml.ps` for manifest/lock; three new native-only core builtins (`ос.выполнить` process spawn, `ос.завершить` exit-with-code, `фс` directory-ops) as prerequisite, see `specs/003-pan-package-manager/`.
 - gitsync dependency scaffolding (004-gitsync-dependency-packages): 7 new independent git repos under `../panosiki/` (each `pan init`-ed) for gitsync's oscript-library dependencies that need porting; one new panos stdlib module `std/слог.ps` (logging, replaces `logos`); no `core/` changes. See `specs/004-gitsync-dependency-packages/`.
 - panos metaprogramming (not a speckit feature — see Recent Changes): `&`-annotations (parser-only AST metadata, no runtime effect — `core/parser.odin`) + `синтаксис.*` compile-time-only AST-introspection native builtin (`core/vm_syntax_native.odin`/`_wasm.odin`), no new dependency. Generic codegen driver self-hosted in `../panosiki/codegen/` (separate repo, not bundled in `std/`), invoked via `pan task`.
+- panos language fixes (005-language-fixes): three compiler-only grammar/typechecker fixes found while porting gitsync deps — no new dependency, touches only `core/parser.odin` + `core/type_cheker.odin`.
 
 ## Project Structure
 
@@ -44,6 +45,31 @@ history of how the code came to exist — that belongs in commit messages,
 not source comments.
 
 ## Recent Changes
+- 005-language-fixes: Three compiler-only grammar/typechecker fixes found while
+  porting gitsync deps (specs/004) — no new dependency, `core/parser.odin` +
+  `core/type_cheker.odin` only. (1) Qualified generic type as a type-annotation
+  across a module boundary (`модуль.Тип(Аргумент)`) — `Type_Qualified` gains a
+  `params []Type_Node` field, parsed the same way as local `Type_Generic`;
+  `type_cheker.odin`'s `Type_Qualified` case instantiates via the same
+  `instantiate_type`/`decl_type_param_order`/`generic_instance_cache` path
+  already used for local generics. (2) Multi-statement `выбор` arm bodies —
+  `Match_Arm.body` was already `[dynamic]Stmt` and both `infer_match_expr`
+  (type_cheker.odin) and `compile_match_expr` (compiler.odin) already handle
+  arbitrary-length bodies generically; only `parse_match_expr` hard-capped at
+  one statement. Fix reuses the existing `тогда`/`конец` tokens (already used
+  by `если`) as an explicit multi-statement marker — `Шаблон -> выражение`
+  (unchanged single-line form) vs `Шаблон тогда стейтмент1 \n стейтмент2 \n
+  конец` — deliberately NOT parser backtracking (pattern grammar `a.b(...)` is
+  syntactically identical to a method-call statement, so "just keep parsing
+  statements until the next arm" can't be disambiguated without either a
+  marker token or true backtracking; this parser has zero backtracking
+  infrastructure anywhere — checked). (3) Trailing comma in comma-separated
+  lists — already safe in `parse_param_list`/array-literal/map-literal/
+  function-type-params, NOT safe (confirmed bug, not just missing feature) in
+  call args/enum variant types/pattern-constructor args/generic type-args/
+  tuple-type elements — mechanical fix applied to the unsafe sites, matching
+  the already-established safe pattern in the same file. See
+  `specs/005-language-fixes/` (plan/research/data-model/contracts).
 - codegen-and-pan-task (not a speckit feature — built via plan-mode):
   generic annotation-driven codegen driver, self-hosted in panos, living
   in `../panosiki/codegen/` (separate git repo, own `v0.3.0`+ tags, NOT

@@ -14,6 +14,7 @@ Auto-generated from feature plans. Last updated: 2026-07-23.
 - gitsync core port (006-gitsync-port): new `../panosiki/gitsync/` package — the actual sync-loop application, composing the 7 dependency packages above with zero changes to any of them. See `specs/006-gitsync-port/`.
 - gitsync per-version authorship (007-gitsync-per-version-author): extends `panosiki/v8storage` with a method wrapping `/ConfigurationRepositoryReport` (CLI, `ос.выполнить` — no COM), plus a new `panosiki/скобки` package (bracket-format 1C text parser, narrow port of `oscript-library/yabr`, MPL-2.0) to extract per-version author from the resulting MXL report; wires into `panosiki/gitsync/sync.ps` to replace 006's single-author-per-run simplification. All 9 `panosiki/*` packages now live on `github.com/Garius6/*` (public, tagged) instead of local file paths. See `specs/007-gitsync-per-version-author/`.
 - gitsync auto push/pull (008-gitsync-auto-push-pull): optional `--remote <name>` flag on `gitsync sync` — `git pull --ff-only` before the version loop (abort with no progress on divergence), `git push` after only if new commits were made. Uses `panosiki/gitrunner`'s existing escape hatch (`выполнить_команду`) and `получить_текущую_ветку` — no changes to gitrunner itself. See `specs/008-gitsync-auto-push-pull/`.
+- HTTP server language capability (009-http-server): bridges the already-vendored (but previously client-only) `external/odin-http/server.odin` to the single-threaded panos VM. New opaque types `Слушатель`/`Запрос`, `.принять_запрос()` as an ordinary `Await_Async` builtin reusing the existing worker pool, `Запрос.ответить(...)` as a sync builtin delivering the response over a per-request channel that the odin-http thread is synchronously blocked on (`http.respond()` is thread-affine — can't be deferred to another thread). See `specs/009-http-server/`.
 
 ## Project Structure
 
@@ -49,6 +50,39 @@ history of how the code came to exist — that belongs in commit messages,
 not source comments.
 
 ## Recent Changes
+- 009-http-server: Bridges the already-vendored (previously client-only)
+  `external/odin-http/server.odin` to panos's single-threaded VM/GC.
+  Three hard constraints discovered by reading the vendored library's
+  actual code (not assumed) drove the whole design: (1) `http.serve`/
+  `listen_and_serve` BLOCK the calling thread forever (runs its own
+  `nbio.tick()` loop until shutdown) — can't submit to the existing
+  `vm.async_pool` (4 short-lived workers would be exhausted permanently)
+  — needs its own dedicated `thread.create_and_start` per listener; (2)
+  `http.respond()` asserts it's called from the SAME odin-http server
+  thread that invoked the Handler (thread-local state) — ruling out a
+  "return immediately, respond asynchronously from elsewhere" design;
+  the Handler must synchronously block (on a channel) until panos code
+  supplies an answer, then call `respond()`, then return; (3) request
+  bodies are read via odin-http's OWN callback-based `http.body(...)`
+  inside its own event loop, not synchronously — so the bridge's
+  synchronous wait can only start INSIDE that body-read callback, not
+  in the Handler itself. Panos-facing: `сеть.http_сервер_слушать(порт)`
+  returns an opaque `Слушатель` (same category as `Соединение`/`Файл` —
+  carries a live resource); `.принять_запрос()` is an ordinary
+  `Await_Async` builtin reusing the existing worker pool (a worker just
+  does a blocking `chan.recv` on the listener's incoming-request
+  channel — exactly the kind of wait the pool exists for);
+  `Запрос.ответить(статус, тип, тело)` is a SYNC builtin (like
+  `.закрыть()` on sockets) that delivers the answer over a per-request
+  channel the odin-http thread is already blocked on. Concurrency is
+  bounded by the vendored library's own `Server_Opts.thread_count`
+  (default cores-1) — not something this feature works around (Simplicity
+  First: no forking/patching the vendored library). New file pair
+  `core/vm_http_server_{native,wasm}.odin` (wasm side panics at call time,
+  same pattern as `vm_http_wasm.odin` — server sockets are meaningless in
+  a browser sandbox), one new `Async_Result` variant in `vm_async.odin`,
+  one new `is_async_builtin_name` entry. See `specs/009-http-server/`
+  (plan/research/data-model/quickstart).
 - 008-gitsync-auto-push-pull: Optional `--remote`/`-r` flag on `gitsync
   sync`: `Контекст_Синхронизации` gains a `remote: Опция(Строка)` field
   (`Нет()` = unchanged 007 behavior, no network calls at all). When set:

@@ -91,6 +91,8 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_NUM, TY_ERROR))
 	case "ос::аргументы":
 		return new_function_type(make([dynamic]^Type), new_array_type(TY_STRING))
+	case "ос::версия_паноса":
+		return new_function_type(make([dynamic]^Type), TY_STRING)
 	case "ос::окружение":
 		return builtin_function_type_1(TY_STRING, stdlib_option_type(graph, TY_STRING))
 	case "ос::установить_окружение":
@@ -291,6 +293,12 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"аргументы",
 			builtin_export_type(graph, "ос::аргументы"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"версия_паноса",
+			builtin_export_type(graph, "ос::версия_паноса"),
 		)
 		add_builtin_export(
 			graph,

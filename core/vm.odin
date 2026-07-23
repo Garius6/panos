@@ -14,6 +14,12 @@ import "core:unicode/utf8"
 
 Main_Function_Name :: "старт"
 
+// Ручной semver, синхронизировать с последним git-тегом при релизе (см.
+// `git tag` в корне репозитория) — единственный источник версии тулчейна
+// для скриптов (ос.версия_паноса()), у паноса нет автоматической привязки
+// версии сборки к git.
+PANOS_VERSION :: "0.2.5"
+
 CallFrame :: struct {
 	function:      ^Compiled_Function,
 	ip:            int, // Указатель текущей инструкции в ЭТОЙ функции
@@ -1243,6 +1249,10 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		}
 		gc_unprotect(vm, 1)
 		return Value(arr), true
+
+	case "ос::версия_паноса":
+		expect_arg_count(name, len(args), 0)
+		return Value(gc_new_string(vm, PANOS_VERSION)), true
 
 	case "время::монотонно_мс":
 		// Стадия 46: тики с момента старта VM (vm.monotonic_epoch,

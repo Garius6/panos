@@ -652,11 +652,23 @@ lookup_symbol_tracking_captures :: proc(ctx: ^Resolver_Ctx, name: Interned) -> S
 
 	for s != nil {
 		if sym, found := s.symbols[name]; found {
-			for idx in crossed {
-				frame := &ctx.lambda_stack[idx]
-				if !frame.capture_set[sym] {
-					frame.capture_set[sym] = true
-					append(&frame.capture_order, sym)
+			// Захватывать (переносить через .Build_Closure/.Get_Captured)
+			// имеет смысл ТОЛЬКО Variable/Function — только они несут
+			// рантайм-Value. Module/Type/Builtin/Enum_Variant — чисто
+			// compile-time имена (квалификатор перед `.член`, имя типа у
+			// конструктора, встроенная функция) без какого-либо рантайм-
+			// представления; попытка их "захватить" не даёт compile_symbol_
+			// value_ref (compiler.odin) что вернуть — падает "символ не
+			// найден", хотя резолв самого имени (`sym`, возвращается ниже)
+			// целиком корректен и нужен вызывающему коду как обычно.
+			kind := symbol_at(ctx.symbol_store, sym).kind
+			if kind == .Variable || kind == .Function {
+				for idx in crossed {
+					frame := &ctx.lambda_stack[idx]
+					if !frame.capture_set[sym] {
+						frame.capture_set[sym] = true
+						append(&frame.capture_order, sym)
+					}
 				}
 			}
 			return sym

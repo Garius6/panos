@@ -5048,6 +5048,12 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				check_expr(ctx, e.args[0], obj_type.element_type)
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
 				return TY_BOOL
+			case "срез":
+				if len(e.args) != 2 do return report(ctx, e.span, "Type Error: массив.срез() ожидает начало и конец")
+				check_expr(ctx, e.args[0], TY_INT)
+				check_expr(ctx, e.args[1], TY_INT)
+				ctx.call_infos[expr] = Call_Info{kind = .Method_Collection, text_name = prop_expr.property}
+				return obj_type
 			case:
 				return report(
 					ctx,

@@ -881,6 +881,32 @@ invoke_collection_method :: proc(
 				if value_equals(el, args[0]) do return Value(true), true
 			}
 			return Value(false), true
+		case "срез":
+			// [начало:конец) — та же половинчато-открытая конвенция, что
+			// строки::срез, для единообразия между Строка/Массив.
+			expect_arg_count(method_name, len(args), 2)
+			start := number_to_index(args[0])
+			end := number_to_index(args[1])
+			if start < 0 || end < start || end > len(arr.elements) {
+				fmt.panicf(
+					"Runtime Error: срез [%d:%d] выходит за границы массива длиной %d",
+					start,
+					end,
+					len(arr.elements),
+				)
+			}
+			// arr (receiver) уже снят с vm.stack к этому моменту (см.
+			// Invoke_Collection) — протектим явно, тот же мотив, что у
+			// "записи" (Map) выше: аллокация ниже иначе может собрать arr
+			// как мусор посреди чтения arr.elements.
+			gc_protect(vm, Value(arr))
+			result := gc_new(vm, Array_Value)
+			gc_protect(vm, Value(result))
+			for i := start; i < end; i += 1 {
+				append(&result.elements, arr.elements[i])
+			}
+			gc_unprotect(vm, 2)
+			return Value(result), true
 		}
 	}
 

@@ -42,7 +42,7 @@ type_completion_members :: proc(t: ^Type) -> [dynamic]Completion_Member {
 			append(&items, Completion_Member{name = name, kind = .Method})
 		}
 	case .Array:
-		array_methods := [?]string{"длина", "добавить", "получить", "есть", "содержит"}
+		array_methods := [?]string{"длина", "добавить", "получить", "есть", "содержит", "срез"}
 		for name in array_methods {
 			append(&items, Completion_Member{name = name, kind = .Method})
 		}

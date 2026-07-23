@@ -4,6 +4,7 @@ import core "../core"
 import proto "protocol"
 import "core:encoding/json"
 import "core:fmt"
+import "core:net"
 import "core:slice"
 import "core:strings"
 
@@ -175,19 +176,38 @@ handle_did_close :: proc(server: ^LSP_Server, params: json.Value) {
 	delete_key(&server.documents, string(p.text_document.uri))
 }
 
-// file:///abs/path -> /abs/path. Не декодирует %XX-escape'ы — для
-// локальных путей без пробелов/юникода в самом пути этого достаточно
-// (MVP, как и остальные LSP-хелперы здесь).
+// file:///abs/path -> /abs/path. Декодирует %XX-escape'ы (core:net.
+// percent_decode) — клиенты (VS Code и другие) percent-кодируют non-ASCII
+// байты в file://-URI по RFC 3986, а весь этот проект (std/слог.ps,
+// std/математика.ps, panosiki/скобки/ и т.д.) держит кириллицу прямо в
+// именах файлов/каталогов — без декодирования doc.path получал буквальные
+// "%D1%81..." вместо "с..." и резолвер закономерно не находил такой файл
+// на диске (ложные "Resolve Error: модуль не найден" для обычных, ничем
+// не примечательных локальных импортов).
 uri_to_path :: proc(uri: string) -> string {
 	prefix :: "file://"
 	if strings.has_prefix(uri, prefix) {
-		return uri[len(prefix):]
+		raw := uri[len(prefix):]
+		decoded, ok := net.percent_decode(raw)
+		if ok {
+			return decoded
+		}
+		return raw
 	}
 	return uri
 }
 
+// Обратное направление — кодируем ПОКОМПОНЕНТНО (split по "/", percent_
+// encode каждого сегмента отдельно, join обратно), иначе percent_encode
+// всей строки закодировал бы и сами "/" (не входят в unreserved-набор
+// RFC 3986), ломая структуру пути.
 path_to_uri :: proc(path: string) -> string {
-	return strings.concatenate({"file://", path})
+	segments := strings.split(path, "/")
+	for seg, i in segments {
+		segments[i] = net.percent_encode(seg)
+	}
+	joined := strings.join(segments, "/")
+	return strings.concatenate({"file://", joined})
 }
 
 update_document :: proc(server: ^LSP_Server, uri: string, text: string) {
@@ -475,6 +495,8 @@ completion_kind :: proc(kind: core.Symbol_Kind) -> proto.CompletionItemKind {
 		return .Function
 	case .Enum_Variant:
 		return .EnumMember
+	case .Constant:
+		return .Constant
 	}
 	return .Text
 }

@@ -12,7 +12,8 @@ Auto-generated from feature plans. Last updated: 2026-07-23.
 - panos language fixes (005-language-fixes): three compiler-only grammar/typechecker fixes found while porting gitsync deps — no new dependency, touches only `core/parser.odin` + `core/type_cheker.odin`.
 - gitsync dependency packages (not a speckit feature — built via plan-mode, see 004): the 6 "new package" dependencies (gitrunner/tempfiles/configor/cli-selector/v8runner/v8storage) plus `cli` all have real implementations (not just scaffolding) with e2e tests, in `../panosiki/`.
 - gitsync core port (006-gitsync-port): new `../panosiki/gitsync/` package — the actual sync-loop application, composing the 7 dependency packages above with zero changes to any of them. See `specs/006-gitsync-port/`.
-- gitsync per-version authorship (007-gitsync-per-version-author): extends `panosiki/v8storage` with a method wrapping `/ConfigurationRepositoryReport` (CLI, `ос.выполнить` — no COM), plus a new `panosiki/скобки` package (bracket-format 1C text parser, narrow port of `oscript-library/yabr`, MPL-2.0) to extract per-version author from the resulting MXL report; wires into `panosiki/gitsync/sync.ps` to replace 006's single-author-per-run simplification. See `specs/007-gitsync-per-version-author/`.
+- gitsync per-version authorship (007-gitsync-per-version-author): extends `panosiki/v8storage` with a method wrapping `/ConfigurationRepositoryReport` (CLI, `ос.выполнить` — no COM), plus a new `panosiki/скобки` package (bracket-format 1C text parser, narrow port of `oscript-library/yabr`, MPL-2.0) to extract per-version author from the resulting MXL report; wires into `panosiki/gitsync/sync.ps` to replace 006's single-author-per-run simplification. All 9 `panosiki/*` packages now live on `github.com/Garius6/*` (public, tagged) instead of local file paths. See `specs/007-gitsync-per-version-author/`.
+- gitsync auto push/pull (008-gitsync-auto-push-pull): optional `--remote <name>` flag on `gitsync sync` — `git pull --ff-only` before the version loop (abort with no progress on divergence), `git push` after only if new commits were made. Uses `panosiki/gitrunner`'s existing escape hatch (`выполнить_команду`) and `получить_текущую_ветку` — no changes to gitrunner itself. See `specs/008-gitsync-auto-push-pull/`.
 
 ## Project Structure
 
@@ -48,6 +49,47 @@ history of how the code came to exist — that belongs in commit messages,
 not source comments.
 
 ## Recent Changes
+- 008-gitsync-auto-push-pull: Optional `--remote`/`-r` flag on `gitsync
+  sync`: `Контекст_Синхронизации` gains a `remote: Опция(Строка)` field
+  (`Нет()` = unchanged 007 behavior, no network calls at all). When set:
+  `git pull --ff-only <remote> <current branch>` runs BEFORE the version
+  loop (current branch always via `gitrunner.получить_текущую_ветку`,
+  never hardcoded) — any failure (including divergence/non-fast-forward)
+  aborts `sync` immediately, before touching any storage version or
+  `VERSION` file (no partial progress). `git push <remote> <branch>` (no
+  `--force`) runs AFTER the loop, only if at least one new commit was
+  made this run (reuses the existing `синхронизировано` counter — no new
+  git query needed). A push failure surfaces as an overall
+  `Результат.Неудача` for the CLI's exit code, but does NOT roll back the
+  local commits/VERSION already written — the local sync against 1C
+  storage already genuinely succeeded by that point; only the network
+  step failed, and a retry later just repeats the (now no-op) push.
+  `--ff-only` is a direct escape-hatch call through `Репозиторий.
+  выполнить_команду`, deliberately NOT a new named `gitrunner` method
+  (not common/general enough to justify one). Tested with two real local
+  clones of a shared local bare repo as the "remote" — no fake binaries
+  needed here (this part isn't 1C-specific), including a genuine
+  divergent-history scenario to verify the abort-before-any-progress
+  guarantee. Three real bugs surfaced only by this feature (never visible
+  before, because 006/007 never inspected committed git state via a real
+  push+clone, only ever read files off the one continuously-existing
+  local disk): (1) `gitrunner.получить_текущую_ветку()` (`rev-parse
+  --abbrev-ref HEAD`) fails on an unborn HEAD — normal for a freshly
+  `gitsync init`-ed repo, since `repo_init.ps` writes `VERSION`/`AUTHORS`
+  without ever committing — fixed with a `symbolic-ref --short HEAD`
+  escape-hatch call inside `sync.ps` itself, not a `gitrunner` change; (2)
+  unborn HEAD + a remote branch that already has commits — the untracked
+  `VERSION`/`AUTHORS` files block a normal `git pull` ("Please move or
+  remove them before you merge") — fixed with `git fetch` + `git
+  checkout -B <branch> -f <remote>/<branch>` in that one specific case
+  only (safe because there are zero local commits to lose); (3) `VERSION`
+  was written to disk AFTER each version's commit, not before — so it
+  landed in git history one version behind, and the very last version's
+  `VERSION` was never committed at all, staying as an uncommitted
+  working-tree change forever — invisible previously since
+  `vf.прочитать_версию()` always read the live disk file directly, never
+  the git-committed content. See `specs/008-gitsync-auto-push-pull/`
+  (plan/research/data-model/quickstart).
 - 007-gitsync-per-version-author: Extends `panosiki/v8storage` with
   `отчёт_по_версиям` (wraps `/ConfigurationRepositoryReport`, same
   `ос.выполнить` pattern as every other `v8storage` method) and adds a new
@@ -72,7 +114,13 @@ not source comments.
   this). Test fixtures are a SYNTHETIC bracket-format sample (matching the
   structure confirmed via `yabr`'s real example `CR_versions_small.mxl`),
   not a copy of that MPL-2.0 file itself — avoids vendoring third-party
-  Covered Software when an equivalent-structure fixture is enough. See
+  Covered Software when an equivalent-structure fixture is enough. All 9
+  `panosiki/*` packages (the 7 from 004 + `gitsync` + `скобки`) were
+  pushed to real public GitHub repos under `github.com/Garius6/*` (with
+  tags) during this feature — `pan.toml` sources across the ecosystem now
+  point at GitHub URLs instead of local absolute file paths (`pan`'s
+  clone step is a plain `git clone`, so both were always supported
+  equally; only the actual repos existing remotely was new). See
   `specs/007-gitsync-per-version-author/` (plan/research/data-model/
   quickstart).
 - 006-gitsync-port: New `../panosiki/gitsync/` package (own git repo, same
@@ -96,12 +144,13 @@ not source comments.
   in specs/004's scope discussion, reused here. Scope deliberately
   excludes (see spec.md Assumptions): the plugin/event-subscription
   system (separate `gitsync-plugins` repo in the original), automatic git
-  push/pull (call `gitrunner` directly instead), http/tcp storage
-  protocols (`v8storage` is file-path-only), and multi-storage sync
-  (`all` command — unsupported even in the original). NOTE: 007 above
-  supersedes this feature's Assumption that per-version commit authorship
-  is infeasible without COM. See `specs/006-gitsync-port/` (plan/
-  research/data-model/contracts/quickstart).
+  push/pull (call `gitrunner` directly instead — NOTE: 008 above adds
+  this, opt-in), http/tcp storage protocols (`v8storage` is
+  file-path-only), and multi-storage sync (`all` command — unsupported
+  even in the original). NOTE: 007 above supersedes this feature's
+  Assumption that per-version commit authorship is infeasible without
+  COM. See `specs/006-gitsync-port/` (plan/research/data-model/contracts/
+  quickstart).
 - 005-language-fixes: Three compiler-only grammar/typechecker fixes found while
   porting gitsync deps (specs/004) — no new dependency, `core/parser.odin` +
   `core/type_cheker.odin` only. (1) Qualified generic type as a type-annotation

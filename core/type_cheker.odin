@@ -974,6 +974,12 @@ Type_Ctx :: struct {
 	// (monomorphize_one зовёт check_function_body напрямую, не через
 	// check_decl_body).
 	in_abstract_generic_body:    bool,
+	// Guard от циклических алиасов (`тип A = B; тип B = A`) в
+	// resolve_symbol_type — Symbol_Id алиаса, который СЕЙЧАС в процессе
+	// резолва своего aliased_type; повторное попадание того же символа
+	// сюда до завершения — цикл, репортим Type Error вместо бесконечной
+	// рекурсии.
+	resolving_aliases:           map[Symbol_Id]bool,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -997,6 +1003,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		generic_call_instantiations = make(map[Expr][dynamic]^Type),
 		generic_call_callee_sym = make(map[Expr]Symbol_Id),
 		let_destructure_field_indices = make(map[Stmt][dynamic]int),
+		resolving_aliases = make(map[Symbol_Id]bool),
 	}
 	// Стадия 7 Phase F: см. Resolver_Ctx.prelude_generic_order — прелюдия
 	// типизируется в СВОЁМ отдельном tc_ctx (ensure_prelude), любой другой
@@ -2089,6 +2096,17 @@ typecheck_pass_nominal :: proc(ctx: ^Type_Ctx, prog: Program) {
 typecheck_pass_signatures :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
+		case ^Type_Alias_Decl:
+			// Эагерно, даже если алиас никем не используется — та же
+			// причина, что поля структуры проверяются вне зависимости от
+			// использования: ошибка в объявлении должна репортиться сразу,
+			// не только при первом реальном обращении к имени. Идемпотентно
+			// (resolve_symbol_type сам кэширует) — безопасно, если другой
+			// алиас, объявленный РАНЬШЕ в этом же проходе, уже потянул этот
+			// через свой aliased_type.
+			sym := ctx.res.decl_symbols[decl]
+			resolve_symbol_type(ctx, sym)
+
 		case ^Const_Decl:
 			// value уже проверен парсером (is_valid_const_value) — только
 			// Число/Строка/Булево литерал (либо унарный минус перед числом),
@@ -2566,6 +2584,38 @@ typecheck_pass_bodies :: proc(ctx: ^Type_Ctx, prog: Program) {
 	}
 }
 
+// Тип символа, ленивая точка входа — единственное место, где Type_Alias_
+// Decl фактически превращается в ^Type. Struct/Interface/Enum кладут свой
+// ^Type в ctx.res.symbol_types заранее (ПРОХОД 1, typecheck_pass_nominal),
+// поэтому обычное `ctx.res.symbol_types[sym]` для них уже всегда попадание.
+// Алиас никакого номинального типа не заводит — при первом обращении
+// (bare-имя в Type_Ident, ниже, ИЛИ качественное module.Имя в Type_Qualified)
+// рекурсивно резолвит aliased_type и КЭШИРУЕТ результат в ТУ ЖЕ мапу, так
+// что второе обращение — снова простое попадание, без разницы для
+// остального тайпчекера (тот же ^Type-объект, что у прямого упоминания
+// цели). resolving_aliases — guard от `тип A = B; тип B = A`: без него
+// цикл ушёл бы в бесконечную рекурсию вместо Type Error.
+resolve_symbol_type :: proc(ctx: ^Type_Ctx, sym: Symbol_Id) -> (typ: ^Type, ok: bool) {
+	if typ, found := ctx.res.symbol_types[sym]; found do return typ, true
+
+	symbol := symbol_at(ctx.res.symbol_store, sym)
+	alias_decl, is_alias := symbol.decl.(^Type_Alias_Decl)
+	if !is_alias do return nil, false
+
+	if ctx.resolving_aliases[sym] {
+		report(ctx, alias_decl.span, "Type Error: циклический алиас типа '%s'", alias_decl.name)
+		ctx.res.symbol_types[sym] = TY_POISON
+		return TY_POISON, true
+	}
+
+	ctx.resolving_aliases[sym] = true
+	resolved := resolve_type_node(ctx, alias_decl.aliased_type)
+	delete_key(&ctx.resolving_aliases, sym)
+
+	ctx.res.symbol_types[sym] = resolved
+	return resolved, true
+}
+
 // Преобразует синтаксический узел типа в внутреннее представление.
 // Здесь же проверяются ограничения на generic-конструкторы.
 resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
@@ -2589,7 +2639,7 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 					n.name,
 				)
 			}
-			if typ, ok := ctx.res.symbol_types[sym]; ok do return typ
+			if typ, ok := resolve_symbol_type(ctx, sym); ok do return typ
 		}
 		return report(ctx, n.span, "Type Error: неизвестный тип '%s'", n.name)
 
@@ -2617,7 +2667,7 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 			return report(ctx, n.span, "Type Error: модуль '%s' не загружен", n.module_name)
 		}
 		if export_sym, found := imported_module.exports[intern(n.name)]; found {
-			if typ, found_type := ctx.res.symbol_types[export_sym]; found_type {
+			if typ, found_type := resolve_symbol_type(ctx, export_sym); found_type {
 				if len(n.params) == 0 {
 					return typ
 				}

@@ -616,6 +616,12 @@ compile_decl :: proc(c: ^Compiler, decl: Decls) {
 	// зарегистрированы. Байткод для конструкторов эмитится в местах
 	// вызова (T016/T017), не здесь.
 
+	case ^Type_Alias_Decl:
+	// Не номинальный тип — resolve_symbol_type (type_cheker.odin) уже
+	// подставил aliased_type всюду, где имя алиаса встречалось в
+	// type-позиции. Собственного рантайм-представления не существует —
+	// нечего компилировать, само имя нигде не появляется в байткоде.
+
 	case ^Function_Decl:
 		function := new(Compiled_Function)
 		function.name = d.name

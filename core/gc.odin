@@ -96,6 +96,8 @@ GC_State :: struct {
 	free_processes:  [dynamic]^Process_Value,
 	free_closures:   [dynamic]^Closure_Value,
 	free_pointers:   [dynamic]^Pointer_Value,
+	free_http_listeners: [dynamic]^Http_Listener_Value,
+	free_http_requests:  [dynamic]^Http_Request_Value,
 }
 
 // Не собираем, пока живой хип меньше этого — иначе на маленьких
@@ -122,6 +124,8 @@ new_gc_state :: proc() -> GC_State {
 		free_processes = make([dynamic]^Process_Value),
 		free_closures = make([dynamic]^Closure_Value),
 		free_pointers = make([dynamic]^Pointer_Value),
+		free_http_listeners = make([dynamic]^Http_Listener_Value),
+		free_http_requests = make([dynamic]^Http_Request_Value),
 	}
 }
 
@@ -213,6 +217,10 @@ gc_new :: proc(vm: ^VM, $T: typeid) -> ^T {
 		obj = pool_take(&vm.gc.free_closures)
 	} else when T == Pointer_Value {
 		obj = pool_take(&vm.gc.free_pointers)
+	} else when T == Http_Listener_Value {
+		obj = pool_take(&vm.gc.free_http_listeners)
+	} else when T == Http_Request_Value {
+		obj = pool_take(&vm.gc.free_http_requests)
 	}
 
 	if obj == nil {
@@ -279,6 +287,10 @@ get_header :: proc(v: Value) -> ^GC_Header {
 		return &val.header
 	case ^Pointer_Value:
 		return &val.header
+	case ^Http_Listener_Value:
+		return &val.header
+	case ^Http_Request_Value:
+		return &val.header
 	case f64, bool, ^Compiled_Function, ^Foreign_Function:
 		return nil
 	}
@@ -298,8 +310,9 @@ mark_value :: proc(v: Value) {
 	h.marked = true
 
 	switch val in v {
-	case f64, bool, ^Compiled_Function, ^Foreign_Function, ^Panos_String, ^File_Value, ^Socket_Value, ^Pointer_Value:
-	// листья — нечего обходить дальше (Pointer_Value.ptr — rawptr, не Value, T фантомный)
+	case f64, bool, ^Compiled_Function, ^Foreign_Function, ^Panos_String, ^File_Value, ^Socket_Value, ^Pointer_Value, ^Http_Listener_Value, ^Http_Request_Value:
+	// листья — нечего обходить дальше (Pointer_Value.ptr — rawptr, не Value, T фантомный;
+	// Http_Listener_Value/Http_Request_Value — только плоские строки/каналы, ни одного Value-поля)
 	case ^Aggregate_Value:
 		for el in val.elements do mark_value(el)
 	case ^Array_Value:
@@ -426,6 +439,10 @@ value_size :: proc(v: Value) -> int {
 		return size_of(Closure_Value)
 	case ^Pointer_Value:
 		return size_of(Pointer_Value)
+	case ^Http_Listener_Value:
+		return size_of(Http_Listener_Value)
+	case ^Http_Request_Value:
+		return size_of(Http_Request_Value)
 	}
 	return 0
 }
@@ -515,6 +532,20 @@ pool_release :: proc(vm: ^VM, v: Value) {
 		val.ptr = nil
 		val.owned = false
 		append(&vm.gc.free_pointers, val)
+	case ^Http_Listener_Value:
+		// Тот же finalizer-принцип, что File_Value/Socket_Value — недостижимый,
+		// но не закрытый явно слушатель освобождается здесь (см.
+		// close_http_listener_value, vm_http_server_native.odin/_wasm.odin).
+		close_http_listener_value(val)
+		append(&vm.gc.free_http_listeners, val)
+	case ^Http_Request_Value:
+		// Недостижимый, но НИ РАЗУ не отвеченный запрос — odin-http-поток,
+		// заблокированный на response_chan, иначе ждал бы вечно. Fallback-
+		// ответ 500, best-effort (chan.try_send — если получателя уже нет,
+		// например TCP-соединение и так уже разорвано, промах безопасно
+		// игнорируется, см. close_http_request_value).
+		close_http_request_value(val)
+		append(&vm.gc.free_http_requests, val)
 	}
 }
 

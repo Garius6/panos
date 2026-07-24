@@ -471,6 +471,25 @@ submit_async_io_method :: proc(vm: ^VM, receiver: Value, method_name: string, ar
 		thread.pool_add_task(&vm.async_pool, heap, socket_stream_task_proc, task_data)
 		return
 	}
+
+	if listener, ok_listener := receiver.(^Http_Listener_Value); ok_listener {
+		// Слушатель.принять_запрос() — единственный async-метод здесь
+		// (specs/009-http-server, research.md §3). НЕ pin'ится: воркер
+		// копирует только chan.Chan(rawptr) — плоское значение, не
+		// трогает сам GC-объект Http_Listener_Value (в отличие от File/
+		// Socket-стриминга выше, где воркер держит указатель НА объект).
+		heap := vm_heap_allocator()
+		vm.next_ticket_id += 1
+
+		task_data := new(Http_Accept_Task_Data, heap)
+		task_data.completions = vm.async_completions
+		task_data.target_id = target_id
+		task_data.ticket_id = vm.next_ticket_id
+		task_data.incoming = listener.incoming
+
+		thread.pool_add_task(&vm.async_pool, heap, http_accept_task_proc, task_data)
+		return
+	}
 }
 
 File_Stream_Task_Data :: struct {

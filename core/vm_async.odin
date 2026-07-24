@@ -87,5 +87,6 @@ Async_Result :: struct {
 		Socket_Stream_Read_Result_Data,
 		File_Stream_Write_Result_Data,
 		Socket_Stream_Write_Result_Data,
+		Http_Accept_Result_Data,
 	},
 }

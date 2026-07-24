@@ -797,6 +797,14 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 	case ^Struct_Decl:
 		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Type, decl, d.span, d.is_exported)
 
+	case ^Type_Alias_Decl:
+		// Тот же .Type kind, что Struct/Interface/Enum — резолвится
+		// bare-именем И через qualified module.Имя тем же путём. Сама
+		// подстановка на aliased_type (не номинальный ^Type) — в
+		// resolve_symbol_type (type_cheker.odin), не здесь: резолвер не
+		// знает про ^Type вообще.
+		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Type, decl, d.span, d.is_exported)
+
 	case ^Interface_Decl:
 		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Type, decl, d.span, d.is_exported)
 
@@ -1291,6 +1299,8 @@ print_resolver_ctx :: proc(ctx: ^Resolver_Ctx) {
 			fmt.printf("  [STRUCT] '%s' -> %s (#%d)\n", d.name, resolve_interned(sym.full_name), sym_id)
 		case ^Interface_Decl:
 			fmt.printf("  [INTERFACE] '%s' -> %s (#%d)\n", d.name, resolve_interned(sym.full_name), sym_id)
+		case ^Type_Alias_Decl:
+			fmt.printf("  [ALIAS] '%s' -> %s (#%d)\n", d.name, resolve_interned(sym.full_name), sym_id)
 		case ^Function_Decl:
 			fmt.printf("  [FUNC] '%s' -> %s (#%d)\n", d.name, resolve_interned(sym.full_name), sym_id)
 		}

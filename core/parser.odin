@@ -314,6 +314,27 @@ Decls :: union {
 	^Error_Decl,
 	^Foreign_Decl,
 	^Const_Decl,
+	^Type_Alias_Decl,
+}
+
+// `тип Имя = <тип-выражение>` (Go-style `type X = Y`), где выражение НЕ
+// структура/перечисление/интерфейс/ff_структура (те парсятся отдельными
+// путями — см. parse_struct_decl/parse_enum_decl/parse_interface_decl/
+// parse_ffi_struct_decl, дифференцируются по peek_type_decl_body_kind).
+// НЕ номинальный тип — Имя разрешается в resolve_symbol_type (type_cheker.
+// odin) в САМ aliased_type, тот же ^Type-объект, что и прямое упоминание
+// цели; поэтому не участвует в instantiate_type/generic_instance_cache и
+// намеренно НЕ поддерживает свои собственные type-параметры (`тип
+// Имя[T] = ...`) — см. parse_type_alias_decl. Главный мотив — читаемые
+// имена для функциональных типов (`тип Обработчик = функ(Запрос) ->
+// (Число, Строка, Строка)`), но выражение справа может быть любым Type_Node.
+Type_Alias_Decl :: struct {
+	span:         Span,
+	name:         string,
+	doc:          string,
+	is_exported:  bool,
+	annotations:  [dynamic]Annotation,
+	aliased_type: Type_Node,
 }
 
 // Top-level "[экспорт] конст ИМЯ = <литерал>" — value ВСЕГДА один из
@@ -346,6 +367,8 @@ decl_doc_comment :: proc(d: Decls) -> string {
 		return v.doc
 	case ^Const_Decl:
 		return v.doc
+	case ^Type_Alias_Decl:
+		return v.doc
 	case ^Import_Decl, ^Impl_Decl, ^Error_Decl, ^Foreign_Decl:
 		return ""
 	}
@@ -366,6 +389,8 @@ decl_annotations :: proc(d: Decls) -> [dynamic]Annotation {
 	case ^Interface_Decl:
 		return v.annotations
 	case ^Enum_Decl:
+		return v.annotations
+	case ^Type_Alias_Decl:
 		return v.annotations
 	case ^Import_Decl, ^Impl_Decl, ^Error_Decl, ^Foreign_Decl, ^Const_Decl:
 		return nil
@@ -1036,21 +1061,24 @@ parse_program :: proc(p: ^Parser) -> Program {
 				}
 				decl := parse_ffi_struct_decl(p, is_exported)
 				append(&prog.decls, decl)
-			} else {
+			} else if third_kind == .EOF {
 				// peek-only (третий токен вперёд не потреблён) — без skip
 				// следующая итерация увидит тот же .TypeDecl и зациклится.
 				bad_span := peek_token(p.stream).span
-				report_parse(
-					p,
-					bad_span,
-					"Синтаксическая ошибка: после 'тип X =' ожидалось 'структура', 'интерфейс', 'перечисление' или 'ff_структура', получено: %v",
-					third_kind,
-				)
+				report_parse(p, bad_span, "Синтаксическая ошибка: неполное объявление типа")
 				next_token(p.stream)
 				skip_to_sync(p)
 				err_decl := new(Error_Decl)
 				err_decl.span = span_from(p, bad_span)
 				append(&prog.decls, err_decl)
+			} else {
+				// Не одно из зарезервированных слов выше — обычный алиас
+				// (`тип Имя = <тип-выражение>`, см. Type_Alias_Decl).
+				// Дальнейшая валидация (неизвестное имя типа и т.п.) —
+				// parse_type, тот же путь, что и везде (параметры функций,
+				// поля структур).
+				decl := parse_type_alias_decl(p, is_exported, doc, annotations)
+				append(&prog.decls, decl)
 			}
 		} else if tok_kind == .Impl {
 			if is_exported {
@@ -1766,6 +1794,39 @@ parse_struct_decl :: proc(p: ^Parser, is_exported: bool, doc: string, annotation
 	}
 
 	expect(p, .End)
+	decl.span = span_from(p, start)
+	return decl
+}
+
+// `тип Имя = <тип-выражение>` — вызывается, когда peek_type_decl_body_kind
+// вернул НЕ структура/перечисление/интерфейс/ff_структура (те — отдельные
+// пути выше), т.е. после '=' стоит начало обычного type-выражения
+// (parse_type). Намеренно НЕ поддерживает свои собственные type-параметры
+// (`тип Имя[T] = ...`) — см. Type_Alias_Decl докstring — `[` сразу после
+// имени репортится как ошибка, но токены всё равно потребляются
+// (parse_type_params), чтобы не десинхронизировать поток для остального
+// файла.
+parse_type_alias_decl :: proc(p: ^Parser, is_exported: bool, doc: string, annotations: [dynamic]Annotation = nil) -> ^Type_Alias_Decl {
+	start := peek_token(p.stream).span
+	expect(p, .TypeDecl)
+
+	decl := new(Type_Alias_Decl)
+	decl.doc = doc
+	decl.is_exported = is_exported
+	decl.annotations = annotations
+
+	name_tok := next_token(p.stream)
+	if name_tok.kind != .Ident do error(p, "Ожидалось имя типа")
+	decl.name = name_tok.data
+
+	if peek_token(p.stream).kind == .LBracket {
+		bad_span := peek_token(p.stream).span
+		report_parse(p, bad_span, "Синтаксическая ошибка: алиас типа '%s' не может иметь свои type-параметры", decl.name)
+		parse_type_params(p)
+	}
+
+	expect(p, .Assign)
+	decl.aliased_type = parse_type(p)
 	decl.span = span_from(p, start)
 	return decl
 }

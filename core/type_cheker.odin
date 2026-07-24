@@ -40,6 +40,12 @@ Type_Kind :: enum {
 	// TCP-соединение (сеть.подключиться) — непараметрический тип, методы
 	// см. CONNECTION_METHODS.
 	Connection,
+	// Слушающий HTTP-сокет (сеть.http_сервер_слушать) — непараметрический
+	// тип, методы см. HTTP_LISTENER_METHODS.
+	Http_Listener,
+	// Принятый HTTP-запрос (Слушатель.принять_запрос()) — непараметрический
+	// тип, методы см. HTTP_REQUEST_METHODS.
+	Http_Request,
 	// Стадия 24 (actor model): Процесс(T) — T хранится в element_type
 	// (тот же приём, что .Array), НЕ через Type_Scheme/instantiate_scheme
 	// (Struct/Enum generics) — резолвится третьей веткой в Type_Generic-
@@ -161,6 +167,8 @@ TY_STRING := &Type{kind = .String, name = "Строка"}
 TY_ERROR := &Type{kind = .Error, name = "Ошибка"}
 TY_FILE := &Type{kind = .File, name = "Файл"}
 TY_CONNECTION := &Type{kind = .Connection, name = "Соединение"}
+TY_HTTP_LISTENER := &Type{kind = .Http_Listener, name = "Слушатель"}
+TY_HTTP_REQUEST := &Type{kind = .Http_Request, name = "Запрос"}
 TY_POISON := &Type{kind = .Poison, name = "?ошибка?"}
 
 // Имя базового типа в аннотации → интернированный Type. Fixed-size array
@@ -181,6 +189,8 @@ BASE_TYPES := [?]Base_Type_Entry {
 	{"Никогда", TY_NEVER},
 	{"Файл", TY_FILE},
 	{"Соединение", TY_CONNECTION},
+	{"Слушатель", TY_HTTP_LISTENER},
+	{"Запрос", TY_HTTP_REQUEST},
 }
 
 lookup_base_type :: proc(name: string) -> (^Type, bool) {
@@ -964,6 +974,12 @@ Type_Ctx :: struct {
 	// (monomorphize_one зовёт check_function_body напрямую, не через
 	// check_decl_body).
 	in_abstract_generic_body:    bool,
+	// Guard от циклических алиасов (`тип A = B; тип B = A`) в
+	// resolve_symbol_type — Symbol_Id алиаса, который СЕЙЧАС в процессе
+	// резолва своего aliased_type; повторное попадание того же символа
+	// сюда до завершения — цикл, репортим Type Error вместо бесконечной
+	// рекурсии.
+	resolving_aliases:           map[Symbol_Id]bool,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -987,6 +1003,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		generic_call_instantiations = make(map[Expr][dynamic]^Type),
 		generic_call_callee_sym = make(map[Expr]Symbol_Id),
 		let_destructure_field_indices = make(map[Stmt][dynamic]int),
+		resolving_aliases = make(map[Symbol_Id]bool),
 	}
 	// Стадия 7 Phase F: см. Resolver_Ctx.prelude_generic_order — прелюдия
 	// типизируется в СВОЁМ отдельном tc_ctx (ensure_prelude), любой другой
@@ -2079,6 +2096,17 @@ typecheck_pass_nominal :: proc(ctx: ^Type_Ctx, prog: Program) {
 typecheck_pass_signatures :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
+		case ^Type_Alias_Decl:
+			// Эагерно, даже если алиас никем не используется — та же
+			// причина, что поля структуры проверяются вне зависимости от
+			// использования: ошибка в объявлении должна репортиться сразу,
+			// не только при первом реальном обращении к имени. Идемпотентно
+			// (resolve_symbol_type сам кэширует) — безопасно, если другой
+			// алиас, объявленный РАНЬШЕ в этом же проходе, уже потянул этот
+			// через свой aliased_type.
+			sym := ctx.res.decl_symbols[decl]
+			resolve_symbol_type(ctx, sym)
+
 		case ^Const_Decl:
 			// value уже проверен парсером (is_valid_const_value) — только
 			// Число/Строка/Булево литерал (либо унарный минус перед числом),
@@ -2556,6 +2584,38 @@ typecheck_pass_bodies :: proc(ctx: ^Type_Ctx, prog: Program) {
 	}
 }
 
+// Тип символа, ленивая точка входа — единственное место, где Type_Alias_
+// Decl фактически превращается в ^Type. Struct/Interface/Enum кладут свой
+// ^Type в ctx.res.symbol_types заранее (ПРОХОД 1, typecheck_pass_nominal),
+// поэтому обычное `ctx.res.symbol_types[sym]` для них уже всегда попадание.
+// Алиас никакого номинального типа не заводит — при первом обращении
+// (bare-имя в Type_Ident, ниже, ИЛИ качественное module.Имя в Type_Qualified)
+// рекурсивно резолвит aliased_type и КЭШИРУЕТ результат в ТУ ЖЕ мапу, так
+// что второе обращение — снова простое попадание, без разницы для
+// остального тайпчекера (тот же ^Type-объект, что у прямого упоминания
+// цели). resolving_aliases — guard от `тип A = B; тип B = A`: без него
+// цикл ушёл бы в бесконечную рекурсию вместо Type Error.
+resolve_symbol_type :: proc(ctx: ^Type_Ctx, sym: Symbol_Id) -> (typ: ^Type, ok: bool) {
+	if typ, found := ctx.res.symbol_types[sym]; found do return typ, true
+
+	symbol := symbol_at(ctx.res.symbol_store, sym)
+	alias_decl, is_alias := symbol.decl.(^Type_Alias_Decl)
+	if !is_alias do return nil, false
+
+	if ctx.resolving_aliases[sym] {
+		report(ctx, alias_decl.span, "Type Error: циклический алиас типа '%s'", alias_decl.name)
+		ctx.res.symbol_types[sym] = TY_POISON
+		return TY_POISON, true
+	}
+
+	ctx.resolving_aliases[sym] = true
+	resolved := resolve_type_node(ctx, alias_decl.aliased_type)
+	delete_key(&ctx.resolving_aliases, sym)
+
+	ctx.res.symbol_types[sym] = resolved
+	return resolved, true
+}
+
 // Преобразует синтаксический узел типа в внутреннее представление.
 // Здесь же проверяются ограничения на generic-конструкторы.
 resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
@@ -2579,7 +2639,7 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 					n.name,
 				)
 			}
-			if typ, ok := ctx.res.symbol_types[sym]; ok do return typ
+			if typ, ok := resolve_symbol_type(ctx, sym); ok do return typ
 		}
 		return report(ctx, n.span, "Type Error: неизвестный тип '%s'", n.name)
 
@@ -2607,7 +2667,7 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 			return report(ctx, n.span, "Type Error: модуль '%s' не загружен", n.module_name)
 		}
 		if export_sym, found := imported_module.exports[intern(n.name)]; found {
-			if typ, found_type := ctx.res.symbol_types[export_sym]; found_type {
+			if typ, found_type := resolve_symbol_type(ctx, export_sym); found_type {
 				if len(n.params) == 0 {
 					return typ
 				}
@@ -3799,9 +3859,59 @@ CONNECTION_METHODS := [?]Method_Sig {
 	},
 }
 
-// Диспетчер методов Опции/Результата/Файла/Соединения: одна карта вместо
-// повторяющихся case'ов (arity-check + collection_calls-запись + return).
-// Handler'ы хранят только уникальную логику.
+HTTP_LISTENER_METHODS := [?]Method_Sig {
+	{
+		name = "принять_запрос",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			return new_result_type(ctx, TY_HTTP_REQUEST, TY_ERROR)
+		},
+	},
+	{
+		name = "закрыть",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_VOID},
+	},
+}
+
+HTTP_REQUEST_METHODS := [?]Method_Sig {
+	{
+		name = "метод",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_STRING},
+	},
+	{
+		name = "путь",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_STRING},
+	},
+	{
+		name = "заголовки",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			return new_map_type(TY_STRING, TY_STRING)
+		},
+	},
+	{
+		name = "тело",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_STRING},
+	},
+	{
+		name = "ответить",
+		arity = 3,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			check_expr(ctx, args[0], TY_NUM)
+			check_expr(ctx, args[1], TY_STRING)
+			check_expr(ctx, args[2], TY_STRING)
+			return new_result_type(ctx, TY_VOID, TY_ERROR)
+		},
+	},
+}
+
+// Диспетчер методов Опции/Результата/Файла/Соединения/Слушателя/Запроса:
+// одна карта вместо повторяющихся case'ов (arity-check + collection_calls-
+// запись + return). Handler'ы хранят только уникальную логику.
 standard_method_type :: proc(
 	ctx: ^Type_Ctx,
 	call: Expr,
@@ -3818,6 +3928,10 @@ standard_method_type :: proc(
 		method_list = FILE_METHODS[:]
 	case .Connection:
 		method_list = CONNECTION_METHODS[:]
+	case .Http_Listener:
+		method_list = HTTP_LISTENER_METHODS[:]
+	case .Http_Request:
+		method_list = HTTP_REQUEST_METHODS[:]
 	case:
 		return nil, false
 	}

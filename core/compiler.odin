@@ -144,6 +144,8 @@ Value :: union {
 	^Foreign_Function,
 	^Closure_Value,
 	^Pointer_Value,
+	^Http_Listener_Value,
+	^Http_Request_Value,
 }
 
 // Стадия 49 (FFI): рантайм-представление Указатель(T) — opaque raw
@@ -403,6 +405,12 @@ is_async_stream_method :: proc(receiver_type: ^Type, method_name: string) -> boo
 	if receiver_type == TY_CONNECTION {
 		return method_name == "получить" || method_name == "получить_строку" || method_name == "отправить"
 	}
+	if receiver_type == TY_HTTP_LISTENER {
+		// Единственный async-метод здесь — блокирующий chan.recv на входящий
+		// запрос (research.md §3, specs/009-http-server). .закрыть() —
+		// синхронный, как и везде (graceful shutdown не ждёт изнутри вызова).
+		return method_name == "принять_запрос"
+	}
 	return false
 }
 
@@ -607,6 +615,12 @@ compile_decl :: proc(c: ^Compiler, decl: Decls) {
 	// Компиляция уже произошла в type checker'е: тип и варианты
 	// зарегистрированы. Байткод для конструкторов эмитится в местах
 	// вызова (T016/T017), не здесь.
+
+	case ^Type_Alias_Decl:
+	// Не номинальный тип — resolve_symbol_type (type_cheker.odin) уже
+	// подставил aliased_type всюду, где имя алиаса встречалось в
+	// type-позиции. Собственного рантайм-представления не существует —
+	// нечего компилировать, само имя нигде не появляется в байткоде.
 
 	case ^Function_Decl:
 		function := new(Compiled_Function)

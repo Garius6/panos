@@ -40,6 +40,12 @@ Type_Kind :: enum {
 	// TCP-соединение (сеть.подключиться) — непараметрический тип, методы
 	// см. CONNECTION_METHODS.
 	Connection,
+	// Слушающий HTTP-сокет (сеть.http_сервер_слушать) — непараметрический
+	// тип, методы см. HTTP_LISTENER_METHODS.
+	Http_Listener,
+	// Принятый HTTP-запрос (Слушатель.принять_запрос()) — непараметрический
+	// тип, методы см. HTTP_REQUEST_METHODS.
+	Http_Request,
 	// Стадия 24 (actor model): Процесс(T) — T хранится в element_type
 	// (тот же приём, что .Array), НЕ через Type_Scheme/instantiate_scheme
 	// (Struct/Enum generics) — резолвится третьей веткой в Type_Generic-
@@ -161,6 +167,8 @@ TY_STRING := &Type{kind = .String, name = "Строка"}
 TY_ERROR := &Type{kind = .Error, name = "Ошибка"}
 TY_FILE := &Type{kind = .File, name = "Файл"}
 TY_CONNECTION := &Type{kind = .Connection, name = "Соединение"}
+TY_HTTP_LISTENER := &Type{kind = .Http_Listener, name = "Слушатель"}
+TY_HTTP_REQUEST := &Type{kind = .Http_Request, name = "Запрос"}
 TY_POISON := &Type{kind = .Poison, name = "?ошибка?"}
 
 // Имя базового типа в аннотации → интернированный Type. Fixed-size array
@@ -181,6 +189,8 @@ BASE_TYPES := [?]Base_Type_Entry {
 	{"Никогда", TY_NEVER},
 	{"Файл", TY_FILE},
 	{"Соединение", TY_CONNECTION},
+	{"Слушатель", TY_HTTP_LISTENER},
+	{"Запрос", TY_HTTP_REQUEST},
 }
 
 lookup_base_type :: proc(name: string) -> (^Type, bool) {
@@ -3799,9 +3809,59 @@ CONNECTION_METHODS := [?]Method_Sig {
 	},
 }
 
-// Диспетчер методов Опции/Результата/Файла/Соединения: одна карта вместо
-// повторяющихся case'ов (arity-check + collection_calls-запись + return).
-// Handler'ы хранят только уникальную логику.
+HTTP_LISTENER_METHODS := [?]Method_Sig {
+	{
+		name = "принять_запрос",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			return new_result_type(ctx, TY_HTTP_REQUEST, TY_ERROR)
+		},
+	},
+	{
+		name = "закрыть",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_VOID},
+	},
+}
+
+HTTP_REQUEST_METHODS := [?]Method_Sig {
+	{
+		name = "метод",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_STRING},
+	},
+	{
+		name = "путь",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_STRING},
+	},
+	{
+		name = "заголовки",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			return new_map_type(TY_STRING, TY_STRING)
+		},
+	},
+	{
+		name = "тело",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_STRING},
+	},
+	{
+		name = "ответить",
+		arity = 3,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			check_expr(ctx, args[0], TY_NUM)
+			check_expr(ctx, args[1], TY_STRING)
+			check_expr(ctx, args[2], TY_STRING)
+			return new_result_type(ctx, TY_VOID, TY_ERROR)
+		},
+	},
+}
+
+// Диспетчер методов Опции/Результата/Файла/Соединения/Слушателя/Запроса:
+// одна карта вместо повторяющихся case'ов (arity-check + collection_calls-
+// запись + return). Handler'ы хранят только уникальную логику.
 standard_method_type :: proc(
 	ctx: ^Type_Ctx,
 	call: Expr,
@@ -3818,6 +3878,10 @@ standard_method_type :: proc(
 		method_list = FILE_METHODS[:]
 	case .Connection:
 		method_list = CONNECTION_METHODS[:]
+	case .Http_Listener:
+		method_list = HTTP_LISTENER_METHODS[:]
+	case .Http_Request:
+		method_list = HTTP_REQUEST_METHODS[:]
 	case:
 		return nil, false
 	}

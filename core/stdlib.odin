@@ -203,6 +203,11 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 			new_map_type(TY_STRING, TY_STRING),
 			stdlib_result_type(graph, success_type, TY_ERROR),
 		)
+	case "сеть::http_сервер_слушать":
+		// Слушатель/Запрос — непараметрические opaque-типы (TY_HTTP_LISTENER/
+		// TY_HTTP_REQUEST, type_cheker.odin), методы см. HTTP_LISTENER_METHODS/
+		// HTTP_REQUEST_METHODS там же (тот же паттерн, что Соединение/Файл).
+		return builtin_function_type_1(TY_NUM, stdlib_result_type(graph, TY_HTTP_LISTENER, TY_ERROR))
 	case "время::монотонно_мс":
 		return new_function_type(make([dynamic]^Type), TY_NUM)
 	case "время::сейчас_мс":
@@ -430,6 +435,12 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"http_запрос",
 			builtin_export_type(graph, "сеть::http_запрос"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"http_сервер_слушать",
+			builtin_export_type(graph, "сеть::http_сервер_слушать"),
 		)
 	} else if name == "время" {
 		add_builtin_export(

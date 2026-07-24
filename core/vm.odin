@@ -971,6 +971,14 @@ invoke_collection_method :: proc(
 	if result, ok, handled := invoke_io_method(vm, receiver, method_name, args); handled {
 		return result, ok
 	}
+	// Слушатель/Запрос методы (.принять_запрос — async, обрабатывается
+	// отдельно через submit_async_io_method/deliver_async_result; здесь
+	// только синхронные .закрыть/.метод/.путь/.заголовки/.тело/.ответить)
+	// — в vm_http_server_native.odin/vm_http_server_wasm.odin (#+build
+	// split, native тянет external/odin-http/server + core:thread).
+	if result, ok, handled := invoke_http_server_method(vm, receiver, method_name, args); handled {
+		return result, ok
+	}
 
 	fmt.panicf(
 		"Runtime Error: метод '%s' не найден у коллекции",
@@ -998,6 +1006,13 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	// split, native тянет core:net + external/odin-http's openssl-биндинг,
 	// оба недоступны под js_wasm32).
 	if result, ok, handled := call_builtin_http(vm, name, args); handled {
+		return result, ok
+	}
+	// сеть::http_сервер_слушать — в vm_http_server_native.odin/
+	// vm_http_server_wasm.odin (#+build split, native тянет
+	// external/odin-http/server + core:thread — свой поток на слушателя,
+	// см. specs/009-http-server/research.md §1).
+	if result, ok, handled := call_builtin_http_server(vm, name, args); handled {
 		return result, ok
 	}
 	// ос::выполнить — в vm_process_native.odin/vm_process_wasm.odin (#+build
@@ -2471,6 +2486,13 @@ deliver_async_result :: proc(vm: ^VM, comp: Async_Result) {
 		// deliver_tcp_connect_result (vm_async_io_native.odin/_wasm.odin),
 		// т.к. этот файл (vm.odin) намеренно не импортирует core:net.
 		deliver_tcp_connect_result(vm, target, payload)
+
+	case Http_Accept_Result_Data:
+		// Http_Request_Value строится в deliver_http_accept_result
+		// (vm_http_server_native.odin/_wasm.odin) — тот же приём, что
+		// deliver_tcp_connect_result, чтобы этот файл не тянул
+		// внутренние типы odin-http.
+		deliver_http_accept_result(vm, target, payload)
 
 	case File_Stream_Read_Result_Data:
 		// Фаза 4: unpin/deferred-close — ДО проверки живости получателя

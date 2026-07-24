@@ -326,3 +326,60 @@ test_http_server_port_already_in_use :: proc(t: ^testing.T) {
 		result,
 	)
 }
+
+// std/сеть/http.ps's обслуживать() — сахарная обёртка над accept-loop API.
+// Никогда не возвращается при успехе, поэтому панос-СЕРВЕР запускается на
+// СВОЁМ потоке (инверсия обычного паттерна этого файла), а главный поток
+// теста — реальный HTTP-клиент; серверный поток намеренно НЕ join'ится
+// (leaked, паркуется навсегда — тот же класс, что незакрытый Http_Listener_
+// Value в других тестах). init_context = context ЯВНО (не оставляем nil) —
+// без этого спавненный поток стартует с чистого runtime.default_context(),
+// а НЕ с context'ом odin test'а (memory-tracking allocator и т.п.),
+// вызывавшим test-функцию — тот же класс бага, что уже задокументирован
+// для run_http_listener_thread (vm_http_server_native.odin) и
+// Server_Opts.thread_count-под-потоков odin-http, найденный ЭМПИРИЧЕСКИ:
+// без явной передачи compile-пайплайн на новом потоке падал EXC_BAD_ACCESS
+// в hoist_compiled_function (nil symbol_types) под нагрузкой параллельного
+// odin test.
+@(test)
+test_http_serve_sugar_basic :: proc(t: ^testing.T) {
+	port := 18190
+
+	thread.create_and_start(proc() {
+		run_module_file("fixtures/http_serve_sugar_fixture_main.ps")
+	}, context)
+
+	// dial_with_retry's default (50 * 10ms = 500ms) предполагает уже
+	// скомпилированный сервер (инлайн-source в других тестах этого файла —
+	// считанные строки). Здесь сервер сам грузит и компилирует std/сеть/
+	// http.ps (+ транзитивно кодирование/json.ps, строки и т.п.) с нуля НА
+	// СВОЁМ потоке — заметно дольше, особенно под 10-параллельными odin
+	// test потоками; больший бюджет ретраев дешевле и надёжнее
+	// фиксированного sleep.
+	sock, dial_ok := dial_with_retry(port, 500)
+	testing.expectf(t, dial_ok, "[http serve sugar] не удалось подключиться")
+	if !dial_ok do return
+	defer net.close(sock)
+
+	req := "GET /sweet HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+	_, send_err := net.send_tcp(sock, transmute([]byte)req)
+	testing.expectf(t, send_err == nil, "[http serve sugar] не удалось отправить запрос: %v", send_err)
+
+	buf: [8192]byte
+	total := strings.builder_make()
+	for {
+		n, recv_err := net.recv_tcp(sock, buf[:])
+		if n <= 0 || recv_err != nil do break
+		strings.write_bytes(&total, buf[:n])
+	}
+	resp := strings.to_string(total)
+	ok := len(resp) > 0
+	testing.expectf(t, ok, "[http serve sugar] пустой ответ")
+	testing.expectf(t, strings.contains(resp, "HTTP/1.1 200"), "[http serve sugar] ожидался код 200, получено: %q", resp)
+	testing.expectf(
+		t,
+		strings.contains(resp, "sugar:/sweet"),
+		"[http serve sugar] ожидалось тело с путём, получено: %q",
+		resp,
+	)
+}

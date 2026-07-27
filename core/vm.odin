@@ -2193,14 +2193,16 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 		case .Cast_Interface:
 			frame.ip += 1
 			struct_name_index := instructions[frame.ip]
-			struct_name := frame.function.constants[struct_name_index].(^Panos_String).data
+			_ = frame.function.constants[struct_name_index].(^Panos_String).data // только для панике ниже
+			frame.ip += 1
+			method_count := int(instructions[frame.ip])
 
 			val := pop(&vm.stack)
-			// Стадия 25: структура ИЛИ перечисление — vtable-механизм ниже
-			// ищет методы по имени "ИмяТипа::метод" среди vm.compiled_
-			// functions, ему всё равно, Aggregate_Value это или
-			// Variant_Value (то же самое, что уже верно для обычного
-			// вызова метода на структуре/enum — см. infer_property_expr).
+			// Стадия 25: структура ИЛИ перечисление — vtable-пары ниже
+			// (имя, ^Compiled_Function) уже резолвлены КОМПИЛЯТОРОМ
+			// (maybe_emit_interface_cast, compiler.odin) точным Symbol_Id —
+			// то же самое верно для обычного вызова метода на структуре/
+			// enum, см. infer_property_expr.
 			_, is_agg := val.(^Aggregate_Value)
 			_, is_variant := val.(^Variant_Value)
 			if !is_agg && !is_variant {
@@ -2216,11 +2218,21 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			iface.data = val
 			iface.methods = make(map[string]^Compiled_Function)
 
-			prefix := fmt.tprintf("%s::", struct_name)
-			for name, fn in vm.compiled_functions {
-				if len(name) > len(prefix) && name[:len(prefix)] == prefix {
-					iface.methods[name[len(prefix):]] = fn
-				}
+			// Раньше здесь был рантайм-скан vm.compiled_functions по
+			// префиксу "ИмяТипа::" — ломался для ЛЮБОГО метода, объявленного
+			// не в entry-файле (full_name методов файлового модуля несёт
+			// module.path-префикс, resolver.odin:401-402, скан по голому
+			// имени типа никогда не совпадал с такими ключами). Теперь
+			// компилятор кладёт готовые (имя, function-константа) пары —
+			// здесь только читаем их, без строкового сопоставления вообще.
+			for i in 0 ..< method_count {
+				frame.ip += 1
+				method_name_const := instructions[frame.ip]
+				frame.ip += 1
+				fn_const := instructions[frame.ip]
+				method_name := frame.function.constants[method_name_const].(^Panos_String).data
+				fn_ptr := frame.function.constants[fn_const].(^Compiled_Function)
+				iface.methods[method_name] = fn_ptr
 			}
 
 			gc_unprotect(vm, 1)

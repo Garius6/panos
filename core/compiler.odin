@@ -885,10 +885,45 @@ compile_for_in_stmt :: proc(ctx: ^Compiler, statement: Stmt, s: ^For_In_Stmt) {
 // вызываться перед КАЖДЫМ ранним return в case ^Call_Expr: (они выходят из
 // compile_expr целиком, минуя общую развязку внизу), плюс один раз в самой
 // развязке для всех прочих видов expr.
+//
+// Vtable резолвится ЗДЕСЬ, на этапе компиляции, точным Symbol_Id через
+// struct_type.methods — тот же принцип, что case .Method_Struct выше уже
+// использует для обычных вызовов методов (symbol_registry_key + registry
+// lookup по конкретному символу), а НЕ рантайм-скан compiled_functions по
+// имени с префиксом "ИмяТипа::" (было раньше здесь). full_name методов,
+// объявленных в ЛЮБОМ файловом модуле, кроме entry-файла, содержит
+// module.path-префикс (resolver.odin:401-402, "модуль::ИмяТипа::метод") —
+// рантайм-скан по голому struct_type.name НИКОГДА не совпадал бы с такими
+// ключами. Баг был скрыт, пока `реализация Интерфейс для Т` жила в самом
+// entry-файле (там module.path == "", префиксы случайно совпадали);
+// найден эмпирически на слог.Логгер — интерфейс, реализованный в
+// std/слог.ps (всегда импортируемый модуль, никогда не entry-файл),
+// стабильно падал "метод не найден в vtable интерфейса" при вызове через
+// интерфейсное значение.
 maybe_emit_interface_cast :: proc(ctx: ^Compiler, expr: Expr) {
 	if struct_type, needs_cast := ctx.tc.interface_casts[expr]; needs_cast {
 		emit_opcode(ctx, .Cast_Interface)
 		emit_byte(ctx, make_constant(ctx, Value(perm_string(struct_type.name))))
+		if len(struct_type.methods) > 255 {
+			fmt.panicf(
+				"Compiler Error: у типа '%s' слишком много методов для интерфейсной vtable (%d, максимум 255)",
+				struct_type.name,
+				len(struct_type.methods),
+			)
+		}
+		emit_byte(ctx, u8(len(struct_type.methods)))
+		for method_name, method_sym in struct_type.methods {
+			fn_ptr, found := ctx.registry^[symbol_registry_key(ctx.res.symbol_store, method_sym)]
+			if !found {
+				fmt.panicf(
+					"Compiler Error: метод '%s' типа '%s' не найден в registry при построении vtable интерфейса",
+					method_name,
+					struct_type.name,
+				)
+			}
+			emit_byte(ctx, make_constant(ctx, Value(perm_string(method_name))))
+			emit_byte(ctx, make_constant(ctx, Value(fn_ptr)))
+		}
 	}
 }
 
@@ -1786,8 +1821,12 @@ print_assembler :: proc(registry: map[string]^Compiled_Function) {
 				command := fmt.tprintf("%sGET_PROPERTY\n", prefix)
 				strings.write_string(&builder, command)
 			case .Cast_Interface:
-				idx += 1
-				command := fmt.tprintf("%sCAST_INTERFACE\n", prefix)
+				// Переменная длина: struct_name_idx (1 байт) + method_count
+				// (1 байт) + method_count пар (имя-константа, fn-константа)
+				// — см. maybe_emit_interface_cast.
+				method_count := int(instructions[idx + 1])
+				idx += 1 + 1 + method_count * 2
+				command := fmt.tprintf("%sCAST_INTERFACE (%d methods)\n", prefix, method_count)
 				strings.write_string(&builder, command)
 
 			case .Invoke_Interface:

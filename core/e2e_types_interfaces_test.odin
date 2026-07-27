@@ -1484,3 +1484,25 @@ test_break_inside_loop_still_allowed_when_nested_in_if :: proc(t: ^testing.T) {
 	`)
 	testing.expectf(t, len(diags) == 0, "ожидалось 0 diagnostic'ов, получено %d: %v", len(diags), diags)
 }
+
+// Регрессия: интерфейс, реализованный в НЕ-entry файловом модуле,
+// вызванный полиморфно через интерфейсный параметр в ДРУГОМ модуле —
+// раньше стабильно панило "метод не найден в vtable интерфейса"
+// (см. fixtures/interface_cross_module_lib.ps, core/compiler.odin
+// maybe_emit_interface_cast). Единственная существовавшая ДО этого фикса
+// проверка интерфейсов (test_comparable_interface_gives_ord_operators и
+// прочие в этом файле) шла через run_code — inline-источник, у которого
+// module.path == "" — маскировала баг: entry-файл случайно совпадает по
+// префиксу, реальный многофайловый импорт (run_module_file) — нет.
+@(test)
+test_interface_impl_in_non_entry_module_works_polymorphically :: proc(t: ^testing.T) {
+	result, ok := run_module_file("fixtures/interface_cross_module_main.ps")
+	testing.expectf(t, ok, "[interface cross-module] стек пуст")
+	if !ok do return
+	testing.expectf(
+		t,
+		value_str_eq(result, "точка"),
+		"[interface cross-module] ожидалось 'точка', получено %v",
+		result,
+	)
+}

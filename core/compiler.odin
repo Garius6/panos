@@ -6,8 +6,16 @@ import "core:strings"
 // Все heap-managed варианты Value (кроме f64/bool/^Compiled_Function —
 // см. GC_State в gc.odin) встраивают GC_Header первым полем.
 Aggregate_Value :: struct {
-	header:   GC_Header,
-	elements: [dynamic]Value, // В реальном продакшене лучше использовать фиксированный срез (slice)
+	header:    GC_Header,
+	elements:  [dynamic]Value, // В реальном продакшене лучше использовать фиксированный срез (slice)
+	// "" для анонимных туплов (Tuple_Expr, `.Build_Aggregate` — включая
+	// tuple-возвраты из нативных builtin'ов через gc_new, см. vm_*_native.
+	// odin) — у тупла структурно нет имени. Непустое только для реального
+	// `Тип(...)` struct-литерала (`.Build_Aggregate_Named`, тот же приём,
+	// что у Variant_Value.type_name для enum'ов — константа из пула,
+	// известна компилятору статически). value_to_display_string (vm.odin)
+	// печатает "Тип(...)" если непусто, иначе голый "(...)" — как раньше.
+	type_name: string,
 }
 
 Array_Value :: struct {
@@ -63,10 +71,17 @@ Interface_Value :: struct {
 // диагностики и печати), числовой индекс варианта (порядок объявления) и
 // поля варианта.
 Variant_Value :: struct {
-	header:    GC_Header,
-	type_name: string,
-	tag_index: int,
-	fields:    [dynamic]Value,
+	header:       GC_Header,
+	type_name:    string, // имя типа-перечисления (напр. "Фигура")
+	// Имя КОНКРЕТНОГО варианта (напр. "Круг") — отдельно от type_name,
+	// нужно value_to_display_string (vm.odin), чтобы structural-дамп
+	// печатал полное "Фигура.Круг(5)", а не голое "Круг(5)" и не старое
+	// ошибочное "Фигура(5)". До этого поля variant_name не было вовсе —
+	// дефолтный дамп ЛЮБОГО варианта с полями ошибочно печатал только имя
+	// ТИПА вместо имени варианта.
+	variant_name: string,
+	tag_index:    int,
+	fields:       [dynamic]Value,
 }
 
 // File_Value/Socket_Value (фс/сеть builtin'ы) — определены в
@@ -313,7 +328,8 @@ Opcode :: enum u8 {
 	Pop, // Удалить вершину стека
 	Return, // Возврат из функции
 	Call,
-	Build_Aggregate, // Операнд: 1 байт (количество элементов)
+	Build_Aggregate, // Операнд: 1 байт (количество элементов) — АНОНИМНЫЙ (тупл, без имени типа)
+	Build_Aggregate_Named, // Операнды: 2 байта (type_name_const, количество элементов) — реальный struct-литерал
 	Set_Property,
 	Get_Property, // Операнд: 1 байт (индекс поля)
 	Cast_Interface,
@@ -328,7 +344,7 @@ Opcode :: enum u8 {
 	Match_Tag, // Операнд: 1 байт (индекс константы с int-тегом). Читает вершину без снятия, кладёт bool.
 	Get_Variant_Field, // Операнд: 1 байт (индекс поля). Снимает variant, кладёт значение поля.
 	Match_Fail, // Без операнда. Runtime-трап при недостижимом промахе `выбор`.
-	Build_Variant, // Операнды: 3 байта (type_name_const, tag, arity). Снимает arity полей, кладёт ^Variant_Value.
+	Build_Variant, // Операнды: 4 байта (type_name_const, variant_name_const, tag, arity). Снимает arity полей, кладёт ^Variant_Value.
 	Spawn, // Операнд: 1 байт (arg_count). Стек: fn, arg1..argN (как .Call). Не выполняет callee — создаёт новый Process_Value, кладёт его как handle.
 	Receive, // Без операндов. Если mailbox текущего процесса пуст — .Suspended (ip не двигается). Иначе снимает первое сообщение (FIFO), кладёт на стек.
 	Int_Divide, // Целое/Целое: усечение к нулю (в отличие от .Divide — обычное деление). Выбор опкода — на компиляторе (ctx.tc.node_types), рантайм-представление то же f64.
@@ -1010,8 +1026,13 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 		}
 		if info, ok := ctx.tc.call_infos[expr]; ok && info.kind == .Constructor_Variant {
 			name_const := make_constant(ctx, Value(perm_string(info.variant.owner_type.name)))
+			variant_name_const := make_constant(
+				ctx,
+				Value(perm_string(info.variant.owner_type.variants[info.variant.tag_index].name)),
+			)
 			emit_opcode(ctx, .Build_Variant)
 			emit_byte(ctx, name_const)
+			emit_byte(ctx, variant_name_const)
 			emit_byte(ctx, u8(info.variant.tag_index))
 			emit_byte(ctx, 0)
 			return
@@ -1181,8 +1202,13 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 	case ^Property_Expr:
 		if info, ok := ctx.tc.call_infos[expr]; ok && info.kind == .Constructor_Variant {
 			name_const := make_constant(ctx, Value(perm_string(info.variant.owner_type.name)))
+			variant_name_const := make_constant(
+				ctx,
+				Value(perm_string(info.variant.owner_type.variants[info.variant.tag_index].name)),
+			)
 			emit_opcode(ctx, .Build_Variant)
 			emit_byte(ctx, name_const)
+			emit_byte(ctx, variant_name_const)
 			emit_byte(ctx, u8(info.variant.tag_index))
 			emit_byte(ctx, 0)
 			// Стадия 25: раньше не нужно было (enum'ы не реализовывали
@@ -1289,8 +1315,13 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 			case .Constructor_Variant:
 				for arg in e.args do compile_expr(ctx, arg)
 				name_const := make_constant(ctx, Value(perm_string(info.variant.owner_type.name)))
+				variant_name_const := make_constant(
+					ctx,
+					Value(perm_string(info.variant.owner_type.variants[info.variant.tag_index].name)),
+				)
 				emit_opcode(ctx, .Build_Variant)
 				emit_byte(ctx, name_const)
+				emit_byte(ctx, variant_name_const)
 				emit_byte(ctx, u8(info.variant.tag_index))
 				emit_byte(ctx, u8(len(e.args)))
 				maybe_emit_interface_cast(ctx, expr)
@@ -1370,7 +1401,14 @@ compile_expr :: proc(ctx: ^Compiler, expr: Expr) {
 
 			case .Constructor_Struct:
 				for arg in e.args do compile_expr(ctx, arg)
-				emit_opcode(ctx, .Build_Aggregate)
+				// Имя типа — константой из пула, тот же приём, что
+				// .Build_Variant у enum'ов (см. .Constructor_Variant выше):
+				// известно статически (тип самого call-выражения — струк-
+				// тура, которую конструируем), не требует рантайм-RTTI.
+				struct_type := ctx.tc.node_types[expr]
+				name_const := make_constant(ctx, Value(perm_string(struct_type.name)))
+				emit_opcode(ctx, .Build_Aggregate_Named)
+				emit_byte(ctx, name_const)
 				emit_byte(ctx, u8(len(e.args)))
 				maybe_emit_interface_cast(ctx, expr)
 				return
@@ -1816,6 +1854,10 @@ print_assembler :: proc(registry: map[string]^Compiled_Function) {
 				idx += 1
 				command := fmt.tprintf("%sBUILD_AGGREGATE\n", prefix)
 				strings.write_string(&builder, command)
+			case .Build_Aggregate_Named:
+				idx += 2
+				command := fmt.tprintf("%sBUILD_AGGREGATE_NAMED\n", prefix)
+				strings.write_string(&builder, command)
 			case .Get_Property:
 				idx += 1
 				command := fmt.tprintf("%sGET_PROPERTY\n", prefix)
@@ -1881,7 +1923,7 @@ print_assembler :: proc(registry: map[string]^Compiled_Function) {
 				strings.write_string(&builder, command)
 
 			case .Build_Variant:
-				idx += 3
+				idx += 4
 				command := fmt.tprintf("%sBUILD_VARIANT\n", prefix)
 				strings.write_string(&builder, command)
 

@@ -278,11 +278,15 @@ value_equals :: proc(a: Value, b: Value, visited: ^map[[2]rawptr]bool = nil) -> 
 // печатает вместо сравнивает. Вызывается ТОЛЬКО когда компилятор НЕ
 // вставил Print_Value-путь (реализация Печатаемое для struct'а) — см.
 // infer_call_expr (type_cheker.odin) и compiler.odin's .Print_Value.
-// Aggregate_Value (struct) не хранит имя типа в рантайме (нет RTTI,
-// см. компиляторную заметку у самой структуры) — дамп позиционный,
-// "(поле1, поле2)", без имени типа/полей. Variant_Value хранит type_name,
-// но НЕ имя конкретного варианта (только tag_index) — тоже позиционный
-// дамп после имени типа.
+// Aggregate_Value обслуживает и анонимные туплы (Tuple_Expr, .Build_
+// Aggregate — type_name == ""), и реальные `Тип(...)` struct-литералы
+// (.Build_Aggregate_Named — type_name из константы, тот же приём, что у
+// Variant_Value ниже) — дамп позиционный, "Тип(поле1, поле2)" с именем
+// или голый "(поле1, поле2)" без него, если тупл. Variant_Value хранит и
+// type_name (имя перечисления), и variant_name (имя конкретного варианта,
+// оба — константы из пула, известны компилятору статически) — дамп
+// позиционный после полного "Тип.Вариант" ("Фигура.Круг(5)", не голое
+// "Круг(5)" и не старое ошибочное "Фигура(5)").
 value_to_display_string :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]bool = nil) -> string {
 	v := visited
 	local_v: map[rawptr]bool
@@ -315,12 +319,12 @@ value_to_display_string :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]bool
 	case ^Socket_Value:
 		return "<сокет>"
 	case ^Variant_Value:
-		if v[val] do return fmt.tprintf("%s(...)", val.type_name)
+		if v[val] do return fmt.tprintf("%s.%s(...)", val.type_name, val.variant_name)
 		v[val] = true
-		if len(val.fields) == 0 do return val.type_name
+		if len(val.fields) == 0 do return fmt.tprintf("%s.%s", val.type_name, val.variant_name)
 		builder: strings.Builder
 		strings.builder_init(&builder, context.temp_allocator)
-		fmt.sbprintf(&builder, "%s(", val.type_name)
+		fmt.sbprintf(&builder, "%s.%s(", val.type_name, val.variant_name)
 		for field, i in val.fields {
 			if i > 0 do strings.write_string(&builder, ", ")
 			strings.write_string(&builder, value_to_display_string(vm, field, v))
@@ -328,10 +332,11 @@ value_to_display_string :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]bool
 		strings.write_string(&builder, ")")
 		return strings.to_string(builder)
 	case ^Aggregate_Value:
-		if v[val] do return "(...)"
+		if v[val] do return val.type_name != "" ? fmt.tprintf("%s(...)", val.type_name) : "(...)"
 		v[val] = true
 		builder: strings.Builder
 		strings.builder_init(&builder, context.temp_allocator)
+		if val.type_name != "" do strings.write_string(&builder, val.type_name)
 		strings.write_string(&builder, "(")
 		for el, i in val.elements {
 			if i > 0 do strings.write_string(&builder, ", ")
@@ -429,6 +434,7 @@ message_deep_copy :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]Value) -> 
 		visited[val] = Value(cp)
 		gc_protect(vm, Value(cp))
 		cp.type_name = val.type_name
+		cp.variant_name = val.variant_name
 		cp.tag_index = val.tag_index
 		cp.fields = make([dynamic]Value, len(val.fields))
 		for f, i in val.fields do cp.fields[i] = message_deep_copy(vm, f, visited)
@@ -439,6 +445,7 @@ message_deep_copy :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]Value) -> 
 		cp := gc_new(vm, Aggregate_Value)
 		visited[val] = Value(cp)
 		gc_protect(vm, Value(cp))
+		cp.type_name = val.type_name
 		cp.elements = make([dynamic]Value, len(val.elements))
 		for el, i in val.elements do cp.elements[i] = message_deep_copy(vm, el, visited)
 		gc_unprotect(vm, 1)
@@ -1963,18 +1970,45 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 
 			append(&vm.stack, Value(agg))
 
+		case .Build_Aggregate_Named:
+			// Реальный `Тип(...)` struct-литерал (см. .Constructor_Struct,
+			// compiler.odin) — та же механика, что .Build_Aggregate, плюс
+			// имя типа константой (тот же приём, что .Build_Variant у
+			// enum'ов), чтобы value_to_display_string (структ-дамп) мог
+			// печатать "Тип(...)" вместо голого "(...)".
+			frame.ip += 1
+			name_index := int(instructions[frame.ip])
+			frame.ip += 1
+			count := int(instructions[frame.ip])
+
+			type_name := frame.function.constants[name_index].(^Panos_String).data
+
+			agg := gc_new(vm, Aggregate_Value)
+			agg.type_name = type_name
+			resize(&agg.elements, count)
+
+			for i := count - 1; i >= 0; i -= 1 {
+				agg.elements[i] = pop(&vm.stack)
+			}
+
+			append(&vm.stack, Value(agg))
+
 		case .Build_Variant:
 			frame.ip += 1
 			name_index := int(instructions[frame.ip])
+			frame.ip += 1
+			variant_name_index := int(instructions[frame.ip])
 			frame.ip += 1
 			tag := int(instructions[frame.ip])
 			frame.ip += 1
 			arity := int(instructions[frame.ip])
 
 			type_name := frame.function.constants[name_index].(^Panos_String).data
+			variant_name := frame.function.constants[variant_name_index].(^Panos_String).data
 
 			variant := gc_new(vm, Variant_Value)
 			variant.type_name = type_name
+			variant.variant_name = variant_name
 			variant.tag_index = tag
 			resize(&variant.fields, arity)
 			for i := arity - 1; i >= 0; i -= 1 {
@@ -2011,13 +2045,13 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 
 		case .Match_Fail:
 			subject := vm.stack[len(vm.stack) - 1]
-			variant_name := "?"
+			variant_display := "?"
 			if v, is_variant := subject.(^Variant_Value); is_variant {
-				variant_name = v.type_name
+				variant_display = fmt.tprintf("%s.%s", v.type_name, v.variant_name)
 			}
 			fmt.panicf(
 				"Runtime Error: значение варианта '%s' не покрыто ни одной веткой выбора",
-				variant_name,
+				variant_display,
 			)
 
 		case .Build_Array:

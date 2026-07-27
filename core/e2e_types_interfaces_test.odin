@@ -588,7 +588,7 @@ test_non_printable_struct_falls_back_to_structural_dump :: proc(t: ^testing.T) {
 		конец
 	`)
 	testing.expectf(t, ok, "[Печатаемое: fallback] стек пуст")
-	testing.expectf(t, output == "(3, 4)", "[Печатаемое: fallback] ожидалось '(3, 4)', получено %q", output)
+	testing.expectf(t, output == "Точка(3, 4)", "[Печатаемое: fallback] ожидалось 'Точка(3, 4)', получено %q", output)
 }
 
 // value_to_display_string покрывает Число/Булево/Массив/Соответствие/

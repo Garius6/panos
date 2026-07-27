@@ -63,6 +63,19 @@ test_http_url_parsing :: proc(t: ^testing.T) {
 	testing.expectf(t, result == Value(true), "http url parsing: ожидалось true, получено %v", result)
 }
 
+// Чистая логика роутера (сопоставить_путь/скомпилировать_путь) — тоже без
+// сокета, Маршрутизатор.обработать() требует реальный Запрос (нативный
+// opaque-тип, конструируется только через реальный accept-loop) — та
+// часть покрыта отдельным сокет-тестом ниже (test_http_router_dispatch).
+@(test)
+test_http_router_path_matching :: proc(t: ^testing.T) {
+	result, ok := run_module_file("fixtures/http_router_fixture_main.ps")
+	testing.expectf(t, ok, "http router path matching: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(true), "http router path matching: ожидалось true, получено %v", result)
+}
+
 // std/математика.ps — файловый std-модуль, а не builtin: run_code (inline-
 // исходник, module.dir == "") никогда не грузит реальные .ps-зависимости
 // через load_module_recursive, только builtin-модули (см. resolver.odin:

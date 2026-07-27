@@ -383,3 +383,41 @@ test_http_serve_sugar_basic :: proc(t: ^testing.T) {
 		resp,
 	)
 }
+
+// Маршрутизатор.как_обработчик() через реальный accept-loop: :param
+// извлекается и доходит до обработчика (совпавший маршрут), неизвестный
+// путь и неверный метод оба падают на встроенный 404-фоллбек
+// Маршрутизатор.обработать (см. std/сеть/http.ps) — Соответствие для
+// параметров каждый раз честно аллоцируется заново самой VM, здесь
+// проверяем результат снаружи, не внутреннее устройство.
+@(test)
+test_http_router_dispatch :: proc(t: ^testing.T) {
+	port := 18191
+
+	thread.create_and_start(proc() {
+		run_module_file("fixtures/http_router_serve_fixture_main.ps")
+	}, context)
+
+	// Как и test_http_serve_sugar_basic: сервер сам грузит и компилирует
+	// std/сеть/http.ps с нуля на своём потоке (теперь ещё и с роутером) —
+	// заметно дольше, чем инлайн-source других тестов файла. Разогрев
+	// подключением с большим бюджетом ретраев, дальше send_http_request
+	// со стандартным бюджетом уже не должен упираться в это.
+	warmup_sock, warmup_ok := dial_with_retry(port, 500)
+	testing.expectf(t, warmup_ok, "[router dispatch] не удалось подключиться")
+	if !warmup_ok do return
+	net.close(warmup_sock)
+
+	matched, matched_ok := send_http_request(port, "GET", "/пользователи/42", "")
+	testing.expectf(t, matched_ok, "[router dispatch] не удалось отправить запрос (matched)")
+	testing.expectf(t, strings.contains(matched, "HTTP/1.1 200"), "[router dispatch] ожидался 200 для совпавшего маршрута, получено: %q", matched)
+	testing.expectf(t, strings.contains(matched, "пользователь:42"), "[router dispatch] ожидался извлечённый id=42 в теле, получено: %q", matched)
+
+	unknown_path, unknown_ok := send_http_request(port, "GET", "/неизвестный", "")
+	testing.expectf(t, unknown_ok, "[router dispatch] не удалось отправить запрос (unknown path)")
+	testing.expectf(t, strings.contains(unknown_path, "HTTP/1.1 404"), "[router dispatch] ожидался 404 для незарегистрированного пути, получено: %q", unknown_path)
+
+	wrong_method, wrong_method_ok := send_http_request(port, "POST", "/пользователи/42", "")
+	testing.expectf(t, wrong_method_ok, "[router dispatch] не удалось отправить запрос (wrong method)")
+	testing.expectf(t, strings.contains(wrong_method, "HTTP/1.1 404"), "[router dispatch] ожидался 404 для несовпавшего метода, получено: %q", wrong_method)
+}

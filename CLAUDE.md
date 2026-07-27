@@ -16,6 +16,7 @@ Auto-generated from feature plans. Last updated: 2026-07-27.
 - gitsync auto push/pull (008-gitsync-auto-push-pull): optional `--remote <name>` flag on `gitsync sync` — `git pull --ff-only` before the version loop (abort with no progress on divergence), `git push` after only if new commits were made. Uses `panosiki/gitrunner`'s existing escape hatch (`выполнить_команду`) and `получить_текущую_ветку` — no changes to gitrunner itself. See `specs/008-gitsync-auto-push-pull/`.
 - HTTP server language capability (009-http-server): bridges the already-vendored (but previously client-only) `external/odin-http/server.odin` to the single-threaded panos VM. New opaque types `Слушатель`/`Запрос`, `.принять_запрос()` as an ordinary `Await_Async` builtin reusing the existing worker pool, `Запрос.ответить(...)` as a sync builtin delivering the response over a per-request channel that the odin-http thread is synchronously blocked on (`http.respond()` is thread-affine — can't be deferred to another thread). See `specs/009-http-server/`.
 - interface vtables (not a speckit feature — see Recent Changes): `Cast_Interface` (`core/vm.odin`) now resolves the method vtable at COMPILE TIME via exact `Symbol_Id` lookups, not a runtime name-prefix scan — the old scan silently produced an empty vtable for any `реализация Интерфейс для Т` declared outside the entry file (100% broken for real multi-module programs, not an edge case). No new dependency, `core/compiler.odin` + `core/vm.odin` only.
+- время.спать_мс (not a speckit feature — see Recent Changes): new native-only builtin, `core:time.sleep` (cross-platform) — sole motivation was `../panosiki/codegen`'s new `--watch` mode needing a poll interval; panos had no sleep primitive at all before this.
 
 ## Project Structure
 
@@ -51,6 +52,30 @@ history of how the code came to exist — that belongs in commit messages,
 not source comments.
 
 ## Recent Changes
+- время.спать_мс + codegen --check/--watch (not a speckit feature —
+  built via plan-mode, motivated by designing a build_runner-style
+  workflow for `../panosiki/codegen`, see that repo's own commits): new
+  native builtin `время.спать_мс(мс) -> Число` (`core/vm_io_native.odin`,
+  `core:time.sleep` — genuinely cross-platform, unlike an earlier draft
+  that shelled out to `/bin/sleep` via `ос.выполнить` and would have
+  silently failed on Windows; caught by the user before committing).
+  Native-only, panics in WASM (`core/vm_io_wasm.odin`) — a blocking sleep
+  on a browser tab's single thread would freeze the whole UI, same
+  rationale as the rest of that panic-list. Existed for exactly one
+  reason: `../panosiki/codegen`'s new `--watch` mode (continuous
+  regeneration during development, Dart `build_runner watch`-shaped)
+  needs SOME way to pause between polls, and panos had no sleep
+  primitive at all before this. Also added `--check` (CI mode: compares
+  what codegen WOULD generate against what's on disk, exits non-zero on
+  any mismatch without writing — same principle as `go generate ./... &&
+  git diff --exit-code`) and made the default (no-flag) directory mode
+  diff-aware too (skips writing files whose content didn't actually
+  change, not just skipping on `--check`/`--watch`). `pan run` was
+  deliberately left untouched — codegen stays a separate, explicit step,
+  not something that runs as a side effect of executing a program (see
+  the design discussion that led here: mutating source files as a side
+  effect of "running" doesn't belong in `pan run`, and would break on
+  read-only/CI filesystems).
 - cross-module-interface-vtable-fix + слог-Логгер (not a speckit feature
   — built via plan-mode, discovered while extending `std/слог.ps` with a
   `Логгер` interface): a real, previously-unknown correctness bug in
@@ -364,10 +389,12 @@ not source comments.
   pre-existing Lehmer/Park-Miller `следующее`/`дробь`/`диапазон`, auto-seeded
   from `время.сейчас_мс()` with warm-up iterations to decorrelate close-in-time
   seeds). See `specs/005-language-fixes/` (plan/research/data-model/contracts).
-- codegen-and-pan-task (not a speckit feature — built via plan-mode):
-  generic annotation-driven codegen driver, self-hosted in panos, living
-  in `../panosiki/codegen/` (separate git repo, own `v0.3.0`+ tags, NOT
-  bundled in `std/`) — Dart's `build_runner`/`source_gen` pattern, not
+- codegen-and-pan-task (not a speckit feature — built via plan-mode; see
+  "время.спать_мс" above for the follow-up that added `--check`/`--watch`
+  to this driver): generic annotation-driven codegen driver, self-hosted
+  in panos, living in `../panosiki/codegen/` (separate git repo, own
+  `v0.3.0`+ tags, NOT bundled in `std/`) — Dart's `build_runner`/`source_gen`
+  pattern, not
   JSON-specific: walks every decl's `&Имя(...)` annotations via
   `синтаксис.*`, dispatches to whichever generator function is
   registered under that annotation name in a

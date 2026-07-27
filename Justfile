@@ -26,8 +26,14 @@ sync-lsp-protocol:
 		| sed 's/^package lsp$/package lsp_protocol/' \
 		> lsp/protocol/lsp_types.odin
 
+# track-memory=false: компилятор (parser/resolver/type_cheker/compiler)
+# нигде не освобождает свои AST/Type-графы — тем же образом, что и
+# рантайм-бинарь panos, рассчитанный на однократный процесс, память
+# которого забирает ОС при выходе. Без этого флага тест-раннер репортит
+# КАЖДЫЙ такой alloc как "+++ leak" (не баг, не влияет на память
+# реального бинаря) — только шум в выводе `just test`.
 test:
-	odin test ./core
+	odin test ./core -define:ODIN_TEST_TRACK_MEMORY=false
 
 # Обновляет PANOS_VERSION (core/vm.odin), собирает+тестирует, коммитит
 # "chore: версия X.Y.Z", тегирует vX.Y.Z, пушит main и тег — тот же

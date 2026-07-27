@@ -1101,31 +1101,67 @@ prune_type :: proc(t: ^Type) -> ^Type {
 }
 
 // Нужна для защиты от циклических связываний вида `?T = (... ?T ...)`.
-type_contains_infer_var :: proc(t: ^Type, needle: ^Type) -> bool {
+//
+// visited — та же защита, что у collect_free_infer_vars/unify_types:
+// рекурсивные Struct/Enum (тип Список[T] = структура следующий: Опция(
+// Список(T)) конец) ссылаются сами на себя структурно — без visited обход
+// зациклился бы навсегда на этой self-ссылке, а не только на реальном
+// InferVar-цикле, который эта функция обязана ловить (`α ~ Опция(α)`).
+// Раньше свитч был #partial без case'ов для Struct/Enum/Process/Pointer —
+// occurs check молча проваливался в `return false` для них, то есть
+// `α = Список(α)` не ловился вовсе (зависание/переполнение стека при
+// последующей подстановке).
+type_contains_infer_var :: proc(t: ^Type, needle: ^Type, visited: ^map[^Type]bool = nil) -> bool {
 	typ := prune_type(t)
 	if typ == nil do return false
 	if typ == needle do return true
 
+	v := visited
+	local_v: map[^Type]bool
+	if v == nil {
+		local_v = make(map[^Type]bool)
+		v = &local_v
+	}
+	if typ.kind == .Struct || typ.kind == .Enum {
+		if v[typ] do return false // уже обходим эту структуру выше по стеку — self-ссылка, не InferVar-цикл
+		v[typ] = true
+	}
+
 	#partial switch typ.kind {
 	case .Function:
 		for param in typ.params {
-			if type_contains_infer_var(param, needle) do return true
+			if type_contains_infer_var(param, needle, v) do return true
 		}
-		return type_contains_infer_var(typ.return_type, needle)
+		return type_contains_infer_var(typ.return_type, needle, v)
 
 	case .Tuple:
 		for el in typ.elements {
-			if type_contains_infer_var(el, needle) do return true
+			if type_contains_infer_var(el, needle, v) do return true
 		}
 
 	case .Array:
-		return type_contains_infer_var(typ.element_type, needle)
+		return type_contains_infer_var(typ.element_type, needle, v)
 
 	case .Map:
 		return(
-			type_contains_infer_var(typ.key_type, needle) ||
-			type_contains_infer_var(typ.value_type, needle) \
+			type_contains_infer_var(typ.key_type, needle, v) ||
+			type_contains_infer_var(typ.value_type, needle, v) \
 		)
+
+	case .Process, .Pointer:
+		return type_contains_infer_var(typ.element_type, needle, v)
+
+	case .Struct:
+		for f in typ.fields {
+			if type_contains_infer_var(f.type, needle, v) do return true
+		}
+
+	case .Enum:
+		for variant in typ.variants {
+			for f in variant.fields {
+				if type_contains_infer_var(f, needle, v) do return true
+			}
+		}
 	}
 
 	return false
@@ -1486,6 +1522,28 @@ unify_types :: proc(a: ^Type, b: ^Type, visited: ^map[[2]^Type]bool = nil) -> bo
 	return true
 }
 
+// Направленная совместимость: можно ли использовать значение типа actual
+// там, где ожидается expected. В отличие от unify_types (симметричный
+// join двух УЖЕ ВЫВЕДЕННЫХ ветвей — если/иначе, элементы массива, match —
+// где Никогда с любой стороны обязан слиться с другим типом, потому что
+// join сам решает результат ветки-Никогда отдельно ПОСЛЕ unify), здесь
+// Никогда допустим ТОЛЬКО со стороны actual: bottom-type — значение,
+// которое никогда не будет предъявлено, поэтому годится везде. Обратное —
+// обычное значение там, где заявлено Никогда — баг, который эта функция
+// закрывает (`функ ошибка() -> Никогда \n 42 \n конец` не должен
+// проходить, хотя unify_types(Число, Никогда) исторически возвращал true
+// симметрично). Используется только в actual-vs-expected позициях
+// (аргументы вызова, return, var-декларации, тело функции/лямбды) — НЕ в
+// join-точках, у тех остаётся unify_types.
+is_assignable_to :: proc(actual: ^Type, expected: ^Type, visited: ^map[[2]^Type]bool = nil) -> bool {
+	a := prune_type(actual)
+	e := prune_type(expected)
+	if a == nil || e == nil do return false
+	if a.kind == .Never do return true
+	if e.kind == .Never do return a.kind == .Never
+	return unify_types(a, e, visited)
+}
+
 // Стадия 7: constraint-based inference (generate → solve), см. ROADMAP
 // §Стадия 7 "Архитектурное решение". Применяется ТОЛЬКО к join-точкам
 // (если/иначе, выбор-ветки, элементы массива/соответствия-литералов) —
@@ -1790,7 +1848,7 @@ check_lambda_expr :: proc(
 	return_type: ^Type
 	if lambda.return_type != nil {
 		return_type = resolve_type_node(ctx, lambda.return_type)
-		if expected_type != nil && !unify_types(return_type, expected_type.return_type) {
+		if expected_type != nil && !is_assignable_to(return_type, expected_type.return_type) {
 			report(
 				ctx,
 				lambda.span,
@@ -1822,7 +1880,7 @@ check_lambda_expr :: proc(
 		check_function_body(ctx, lambda.span, lambda.body, return_type)
 	} else {
 		body_type := infer_callable_body_type(ctx, lambda.body)
-		if !unify_types(body_type, return_type) {
+		if !is_assignable_to(body_type, return_type) {
 			report(
 				ctx,
 				lambda.span,
@@ -2912,6 +2970,137 @@ infer_block_type :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> ^Type {
 	return TY_VOID
 }
 
+// Проверяет, гарантированно ли блок расходится (либо `вернуть`, либо
+// выражение типа Никогда, либо если/выбор, где РАСХОДЯТСЯ ВСЕ ветки) —
+// раньше единственной проверкой был infer_function_body: он ищет ПЕРВЫЙ
+// `вернуть` ПО ТЕКСТУ где угодно в теле, а не "возвращает ли функция на
+// ВСЕХ путях" — из-за этого
+//
+//     функ ф() -> Целое
+//         если условие
+//             вернуть 1
+//         конец
+//     конец
+//
+// (без `иначе` — путь при ложном условии падает сквозь функцию без
+// значения) ложно проходил typecheck. Останавливается на ПЕРВОМ найденном
+// stmt, который гарантированно расходится — код после него (dead code)
+// сюда не влияет, отдельная недостижимость-диагностика не входит в объём
+// этой проверки.
+//
+// НЕ обходит циклы (`пока`) — консервативно считает их "может не
+// расходиться" независимо от условия/наличия break: даже `пока истина`
+// с `вернуть` внутри без внешнего `иначе` будет ошибочно потребовать
+// return после цикла. Дешёвое расширение (см. Loop_Context в ревью) не
+// сделано намеренно — не хотелось рисковать ложным ПРИНЯТИЕМ (`пока x < n
+// ...` с недостижимым `break`) ради этого прохода; безопаснее ложно
+// ТРЕБОВАТЬ return, чем ложно его не потребовать.
+block_always_diverges :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) -> bool {
+	for stmt in body {
+		if stmt_always_diverges(ctx, stmt) do return true
+	}
+	return false
+}
+
+stmt_always_diverges :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> bool {
+	#partial switch s in stmt {
+	case ^Return_Stmt:
+		return true
+	case ^Expr_Stmt:
+		return expr_always_diverges(ctx, s.expr)
+	}
+	return false
+}
+
+expr_always_diverges :: proc(ctx: ^Type_Ctx, expr: Expr) -> bool {
+	#partial switch e in expr {
+	case ^If_Expr:
+		// Без `иначе` путь при ложном условии всегда падает сквозь —
+		// ветка "ничего не делать" никогда не расходится.
+		if len(e.else_branch) == 0 do return false
+		return(
+			block_always_diverges(ctx, e.then_branch) &&
+			block_always_diverges(ctx, e.else_branch) \
+		)
+	case ^Match_Expr:
+		if len(e.arms) == 0 do return false
+		for arm in e.arms {
+			if !block_always_diverges(ctx, arm.body) do return false
+		}
+		return true
+	}
+	// Остальные выражения (панике/бесконечная рекурсия и т.п.) уже
+	// типизированы как Никогда обычным механизмом Never-propagation —
+	// node_types заполнен предыдущим check_stmt-проходом по всему телу.
+	if t, ok := ctx.node_types[expr]; ok do return prune_type(t) == TY_NEVER
+	return false
+}
+
+// check_stmt (см. check_function_body) сверяет с expected_return ТОЛЬКО
+// 'возврат' на самом верхнем уровне тела функции/лямбды — для 'возврат',
+// вложенного в если/выбор/пока/для, check_stmt делегирует в infer_stmt
+// (обычный вывод типа), который значение ВЫЧИСЛЯЕТ, но НИКОГДА не
+// сверяет с объявленным возвратом функции. Раньше это означало, что
+//
+//     функ ф() -> Целое
+//         если x тогда возврат "текст" иначе возврат 1 конец
+//     конец
+//
+// молча проходило typecheck — обе ветки типизировались независимо, ни с
+// чем не сверяясь. check_nested_returns закрывает это: рекурсивно
+// спускается в if/match/while/for (на любую глубину) и сверяет КАЖДЫЙ
+// найденный там 'возврат' через check_expr. НЕ включает 'возврат' самого
+// body верхнего уровня (тот уже проверен вызывающим check_stmt-циклом) —
+// только то, что спрятано глубже.
+check_nested_returns :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return: ^Type) {
+	for stmt in body {
+		#partial switch s in stmt {
+		case ^Expr_Stmt:
+			check_nested_returns_expr(ctx, s.expr, expected_return)
+		case ^For_In_Stmt:
+			check_returns_in_block(ctx, s.body, expected_return)
+		}
+	}
+}
+
+check_nested_returns_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected_return: ^Type) {
+	#partial switch e in expr {
+	case ^If_Expr:
+		check_returns_in_block(ctx, e.then_branch, expected_return)
+		check_returns_in_block(ctx, e.else_branch, expected_return)
+	case ^Match_Expr:
+		for arm in e.arms do check_returns_in_block(ctx, arm.body, expected_return)
+	case ^While_Expr:
+		check_returns_in_block(ctx, e.body, expected_return)
+	}
+}
+
+// Как check_nested_returns, но на ЭТОМ уровне 'возврат' сам по себе тоже
+// ещё никем не проверен (в отличие от самого верхнего body — того уже
+// проверил вызывающий check_stmt-цикл) — поэтому здесь, в отличие от
+// check_nested_returns, есть case ^Return_Stmt.
+check_returns_in_block :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return: ^Type) {
+	for stmt in body {
+		#partial switch s in stmt {
+		case ^Return_Stmt:
+			if s.value != nil {
+				check_expr(ctx, s.value, expected_return)
+			} else if expected_return != TY_VOID {
+				report(
+					ctx,
+					s.span,
+					"Type Error: ожидался возврат %s, но return пустой",
+					expected_return.name,
+				)
+			}
+		case ^Expr_Stmt:
+			check_nested_returns_expr(ctx, s.expr, expected_return)
+		case ^For_In_Stmt:
+			check_returns_in_block(ctx, s.body, expected_return)
+		}
+	}
+}
+
 // Сначала проверяем инструкции сверху вниз, затем сверяем фактический тип
 // блока и явные `return` с ожидаемым возвращаемым типом. `span` — span
 // объемлющей функции/лямбды/метода, используется для диагностик, у которых
@@ -2924,6 +3113,11 @@ check_function_body :: proc(ctx: ^Type_Ctx, span: Span, body: [dynamic]Stmt, exp
 	for stmt in body {
 		check_stmt(ctx, stmt, expected_return_type)
 	}
+	// check_stmt (цикл выше) сверяет с expected_return ТОЛЬКО 'возврат' на
+	// самом верхнем уровне body — вложенный в если/выбор/пока/для 'возврат'
+	// раньше вообще не сверялся (только типизировался через infer_stmt),
+	// см. комментарий у check_nested_returns.
+	check_nested_returns(ctx, body, expected_return_type)
 
 	body_type := prune_type(infer_block_type(ctx, body))
 	// Implicit return (последнее выражение блока без `возврат`) идёт через
@@ -2936,7 +3130,6 @@ check_function_body :: proc(ctx: ^Type_Ctx, span: Span, body: [dynamic]Stmt, exp
 			body_type = widen_num_literal_to_int(ctx, last, body_type, TY_INT)
 		}
 	}
-	explicit_return_type := prune_type(infer_function_body(ctx, body))
 
 	if expected_return_type == TY_VOID {
 		// Пусто-функция не обязана заканчиваться Пусто-выражением: последний
@@ -2955,7 +3148,7 @@ check_function_body :: proc(ctx: ^Type_Ctx, span: Span, body: [dynamic]Stmt, exp
 	}
 
 	if body_type != TY_VOID {
-		if !unify_types(body_type, expected_return_type) {
+		if !is_assignable_to(body_type, expected_return_type) {
 			report(
 				ctx,
 				span,
@@ -2968,27 +3161,20 @@ check_function_body :: proc(ctx: ^Type_Ctx, span: Span, body: [dynamic]Stmt, exp
 		return
 	}
 
-	if explicit_return_type != nil && explicit_return_type != TY_VOID {
-		if !unify_types(explicit_return_type, expected_return_type) {
-			report(
-				ctx,
-				span,
-				"Type Error: функция должна возвращать '%s', но return имеет тип '%s'",
-				prune_type(expected_return_type).name,
-				prune_type(explicit_return_type).name,
-			)
-		}
-		ctx.current_return = prev_return
-		return
+	// body_type == TY_VOID: тело не заканчивается trailing-значением —
+	// функция обязана расходиться на ВСЕХ путях (гарантированный 'возврат'
+	// где-то внутри если/выбор/пока/для, или Никогда-выражение вроде
+	// паники). Типы всех вложенных 'возврат' уже сверены выше через
+	// check_nested_returns — здесь остаётся только exhaustiveness.
+	if !block_always_diverges(ctx, body) {
+		report(
+			ctx,
+			span,
+			"Type Error: функция должна возвращать '%s', но не по всем путям выполнения есть 'вернуть'",
+			prune_type(expected_return_type).name,
+		)
 	}
-
 	ctx.current_return = prev_return
-	report(
-		ctx,
-		span,
-		"Type Error: функция должна возвращать '%s', но тело не возвращает значение",
-		prune_type(expected_return_type).name,
-	)
 }
 
 // Ищет первый явный `return` в теле callable-выражения.
@@ -3445,7 +3631,7 @@ check_expr :: proc(ctx: ^Type_Ctx, expr: Expr, expected: ^Type) {
 		}
 	}
 
-	if !unify_types(actual, expected_type) {
+	if !is_assignable_to(actual, expected_type) {
 		report(
 			ctx,
 			expr_span(expr),
@@ -4049,7 +4235,7 @@ resolve_variant_ctor :: proc(
 				continue
 			}
 		}
-		if !unify_types(actual, field_type) {
+		if !is_assignable_to(actual, field_type) {
 			report(
 				ctx,
 				expr_span(arg),

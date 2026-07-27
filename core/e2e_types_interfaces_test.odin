@@ -1249,3 +1249,164 @@ test_bounded_generic_interface_cross_module :: proc(t: ^testing.T) {
 		testing.expectf(t, is_num && n == 42, "[bounded traits: cross-module] ожидалось 42, получено %v", result)
 	}
 }
+
+// Раньше unify_types трактовал Никогда симметрично (либо сторона —
+// Никогда — unify успешен), из-за чего тело этой функции ложно проходило
+// типизацию, хотя '42' явно НЕ Никогда. Никогда обязан быть направленным:
+// значение типа Никогда годится где угодно, но обычное значение НЕ годится
+// там, где заявлен Никогда.
+@(test)
+test_never_return_type_rejects_non_never_body :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ ошибка() -> Никогда
+			42
+		конец
+
+		функ старт() -> Пусто
+			ошибка()
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: функция должна возвращать 'Никогда', но последнее выражение имеет тип 'Число'")
+}
+
+// Обратное направление продолжает работать: Никогда (авария/паника)
+// допустим везде, где ожидается конкретный тип.
+@(test)
+test_never_value_assignable_to_any_type :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ авария() -> Никогда
+			паника("ошибка")
+		конец
+
+		функ старт() -> Целое
+			пер x: Целое = авария()
+			x
+		конец
+	`)
+	testing.expectf(t, len(diags) == 0, "ожидалось 0 diagnostic'ов, получено %d: %v", len(diags), diags)
+}
+
+// type_contains_infer_var раньше был #partial switch без case'ов для
+// Struct/Enum/Process/Pointer — occurs check молча проваливался в `return
+// false` для них. Белый ящик: строим цикл ?T = Массив(?T) напрямую через
+// bind_infer_var, минуя парсер (естественный panos-источник для этого
+// случая не пишется — occurs check защищает саму инференцию, а не то, что
+// пользователь может выразить синтаксисом).
+@(test)
+test_occurs_check_catches_array_cycle :: proc(t: ^testing.T) {
+	res_ctx := new_resolver_ctx()
+	type_ctx := new_type_ctx(&res_ctx)
+	v := new_infer_var(&type_ctx)
+	cyclic := new_array_type(v)
+	testing.expect(t, !bind_infer_var(v, cyclic), "?T = Массив(?T) должен быть отклонён occurs check'ом")
+}
+
+@(test)
+test_occurs_check_catches_process_cycle :: proc(t: ^testing.T) {
+	res_ctx := new_resolver_ctx()
+	type_ctx := new_type_ctx(&res_ctx)
+	v := new_infer_var(&type_ctx)
+	cyclic := new_process_type(v)
+	testing.expect(t, !bind_infer_var(v, cyclic), "?T = Процесс(?T) должен быть отклонён occurs check'ом")
+}
+
+// Struct раньше не обходился ВООБЩЕ — ?T = Структура{значение: ?T} не
+// ловился occurs check'ом ни разу, что вело к зависанию/переполнению стека
+// при последующей рекурсивной подстановке через prune_type.
+@(test)
+test_occurs_check_catches_struct_field_cycle :: proc(t: ^testing.T) {
+	res_ctx := new_resolver_ctx()
+	type_ctx := new_type_ctx(&res_ctx)
+	v := new_infer_var(&type_ctx)
+	cyclic := new(Type)
+	cyclic.kind = .Struct
+	cyclic.name = "Узел"
+	cyclic.generic_origin = INVALID_SYMBOL
+	append(&cyclic.fields, Struct_Field{name = "значение", type = v})
+	testing.expect(t, !bind_infer_var(v, cyclic), "?T = Узел{значение: ?T} должен быть отклонён occurs check'ом")
+}
+
+// Раньше infer_function_body (ищет ПЕРВЫЙ 'возврат' ПО ТЕКСТУ где угодно в
+// теле) считала функцию корректной, если нашла хоть один 'возврат' —
+// не проверяя, достижим ли он на ВСЕХ путях. 'если' без 'иначе' как
+// последний statement тела всегда оставляет путь (условие ложно), где
+// функция ничего не возвращает.
+@(test)
+test_if_without_else_as_last_stmt_is_not_exhaustive :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ ф(условие: Булево) -> Целое
+			если условие тогда
+				возврат 1
+			конец
+		конец
+
+		функ старт() -> Пусто
+			ф(истина)
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: функция должна возвращать 'Целое', но не по всем путям выполнения есть 'вернуть'")
+}
+
+// Обратный случай: если/иначе, ГДЕ ОБЕ ветки возвращают — раньше тоже
+// ложно отклонялось той же причине (infer_function_body не спускается во
+// вложенные если/иначе вообще, находила TY_VOID и требовала return,
+// хотя он там ЕСТЬ, просто вложен).
+@(test)
+test_if_else_both_branches_return_is_exhaustive :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ ф(условие: Булево) -> Целое
+			если условие тогда
+				возврат 1
+			иначе
+				возврат 2
+			конец
+		конец
+
+		функ старт() -> Пусто
+			ф(истина)
+		конец
+	`)
+	testing.expectf(t, len(diags) == 0, "ожидалось 0 diagnostic'ов, получено %d: %v", len(diags), diags)
+}
+
+// check_stmt (верхнеуровневый цикл в check_function_body) раньше сверял с
+// expected_return ТОЛЬКО 'возврат' на самом верхнем уровне — вложенный в
+// если/иначе 'возврат' лишь ТИПИЗИРОВАЛСЯ (infer_stmt/infer_expr), но
+// никогда не СВЕРЯЛСЯ с объявленным типом возврата функции.
+@(test)
+test_nested_return_type_mismatch_is_caught :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ ф(условие: Булево) -> Целое
+			если условие тогда
+				возврат "текст"
+			иначе
+				возврат 1
+			конец
+		конец
+
+		функ старт() -> Пусто
+			ф(истина)
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: ожидался 'Целое', получен 'Строка'")
+}
+
+// Та же проверка, но 'возврат' спрятан ещё глубже — внутри 'для' внутри
+// 'если'. check_nested_returns обязана спускаться рекурсивно на любую
+// глубину, не только на один уровень.
+@(test)
+test_return_nested_in_for_in_loop_type_checked :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ ф(п: Массив(Число)) -> Целое
+			для x в п цикл
+				возврат "не то"
+			конец
+			0
+		конец
+
+		функ старт() -> Пусто
+			ф(массив(1, 2, 3))
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: ожидался 'Целое', получен 'Строка'")
+}

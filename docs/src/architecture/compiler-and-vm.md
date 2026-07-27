@@ -102,7 +102,7 @@ single-OS-thread, кооперативный round-robin по `vm.processes`. Р
 
 **HTTP-сервер** (`core/vm_http_server_native.odin`/`_wasm.odin`,
 specs/009-http-server): мост между уже вендоренным (раньше только
-клиентским) `external/odin-http/server.odin` и однопоточным VM/GC. Три
+клиентским) `external/odin-http/server.odin` и однопоточным VM/GC. Четыре
 ограничения вендоренной библиотеки (найдены чтением её реального кода, не
 предположены) определяют весь дизайн:
 

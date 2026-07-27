@@ -1458,9 +1458,18 @@ unify_types :: proc(a: ^Type, b: ^Type, visited: ^map[[2]^Type]bool = nil) -> bo
 
 	// Стадия 25: перечисления тоже могут реализовывать интерфейсы —
 	// implemented_interfaces теперь заполняется и для .Enum (ПРОХОД 1/3).
+	// Симметрично: join-точка (если/иначе, выбор) не гарантирует, какая
+	// из двух сторон типизирована интерфейсом раньше другой — порядок
+	// веток произвольный (напр. `тогда` — интерфейс, `иначе` — структура).
 	if right.kind == .Interface && (left.kind == .Struct || left.kind == .Enum) {
 		for iface in left.implemented_interfaces {
 			if iface == right do return true
+		}
+		return false
+	}
+	if left.kind == .Interface && (right.kind == .Struct || right.kind == .Enum) {
+		for iface in right.implemented_interfaces {
+			if iface == left do return true
 		}
 		return false
 	}
@@ -1559,6 +1568,31 @@ is_assignable_to :: proc(actual: ^Type, expected: ^Type, visited: ^map[[2]^Type]
 	if a.kind == .Never do return true
 	if e.kind == .Never do return a.kind == .Never
 	return unify_types(a, e, visited)
+}
+
+// Регистрирует ctx.interface_casts[expr] = actual, если actual (Struct/
+// Enum) реализует интерфейс expected — та же проверка, что check_expr
+// уже делает инлайн для СВОЕГО общего actual-vs-expected fallback'а
+// (case ^Array_Expr/^Map_Expr выше и общая развязка). Вынесена в общую
+// функцию, потому что is_assignable_to (структурная проверка, БЕЗ
+// побочного эффекта регистрации каста) вызывается ещё в НЕСКОЛЬКИХ
+// других actual-vs-expected местах (тело функции/лямбды против
+// объявленного возврата, поле enum-варианта) — там тайпчек проходил
+// (unify_types корректно считает Struct~Interface совместимыми
+// структурно), но Cast_Interface никогда не эмитился, потому что
+// регистрация каста жила ТОЛЬКО внутри check_expr: рантайм получал
+// "сырое" Struct/Enum-значение там, где ожидался Interface_Value,
+// Invoke_Interface падал "попытка вызвать интерфейсный метод у
+// не-интерфейса". Вызывать ПОСЛЕ подтверждения совместимости
+// (is_assignable_to/unify_types), не вместо.
+maybe_register_interface_cast :: proc(ctx: ^Type_Ctx, expr: Expr, actual: ^Type, expected: ^Type) {
+	if expr == nil do return
+	a := prune_type(actual)
+	e := prune_type(expected)
+	if a == nil || e == nil do return
+	if e.kind == .Interface && (a.kind == .Struct || a.kind == .Enum) && unify_types(a, e) {
+		ctx.interface_casts[expr] = a
+	}
 }
 
 // Стадия 7: constraint-based inference (generate → solve), см. ROADMAP
@@ -3173,6 +3207,8 @@ check_function_body :: proc(ctx: ^Type_Ctx, span: Span, body: [dynamic]Stmt, exp
 				prune_type(expected_return_type).name,
 				prune_type(body_type).name,
 			)
+		} else if trailing := last_block_expr(body); trailing != nil {
+			maybe_register_interface_cast(ctx, trailing, body_type, expected_return_type)
 		}
 		ctx.current_return = prev_return
 		return
@@ -5763,10 +5799,29 @@ infer_if_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^If_Expr) -> ^Type {
 			),
 		)
 		solve_constraints(ctx)
-		if prune_type(then_type) == TY_NEVER {
-			t = prune_type(else_type)
+		then_type = prune_type(then_type)
+		else_type = prune_type(else_type)
+		if then_type == TY_NEVER {
+			t = else_type
+		} else if else_type == TY_NEVER {
+			t = then_type
+		} else if then_type.kind == .Interface && (else_type.kind == .Struct || else_type.kind == .Enum) {
+			// Одна ветка УЖЕ интерфейс, другая — совместимый Struct/Enum
+			// (unify_types выше это уже подтвердил, иначе emit_constraint
+			// репортнул бы Type Error) — результат если/иначе становится
+			// интерфейсом, конкретная ветка кастуется НА СВОЁМ trailing-
+			// выражении. НЕ применяется к ДВУМ РАЗНЫМ конкретным типам без
+			// общего интерфейсного "якоря" уже в одной из веток — panos
+			// намеренно не делает LUB через интерфейсы (Кошка/Собака без
+			// явного dyn-подобного контекста unify_types отклонил бы ещё
+			// на emit_constraint, до этой точки).
+			maybe_register_interface_cast(ctx, last_block_expr(e.else_branch), else_type, then_type)
+			t = then_type
+		} else if else_type.kind == .Interface && (then_type.kind == .Struct || then_type.kind == .Enum) {
+			maybe_register_interface_cast(ctx, last_block_expr(e.then_branch), then_type, else_type)
+			t = else_type
 		} else {
-			t = prune_type(then_type)
+			t = then_type
 		}
 	}
 	return t
@@ -5979,6 +6034,7 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 	arm_infos := make([dynamic]Pattern_Info)
 	result_t: ^Type
 	result_expr: Expr
+	reachable_arms := make([dynamic]Match_Arm_Result)
 	for arm in e.arms {
 		pi := classify_pattern(ctx, arm.pattern, subject_type_actual)
 		append(&arm_infos, pi)
@@ -6030,13 +6086,42 @@ infer_match_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Match_Expr) -> ^Type {
 					),
 				)
 			}
+			append(&reachable_arms, Match_Arm_Result{t = body_t, expr = body_expr})
 		}
 	}
 	solve_constraints(ctx)
 	if result_t == nil do result_t = TY_NEVER
+
+	// join-каст (аналогично infer_if_expr): одна ветка уже типа интерфейс,
+	// остальные достижимые — совместимые Struct/Enum, реализующие его —
+	// результат выбора типизируется интерфейсом, каждая такая ветка
+	// получает Cast_Interface при компиляции (см. ctx.interface_casts).
+	interface_t: ^Type
+	for ra in reachable_arms {
+		pruned := prune_type(ra.t)
+		if pruned != nil && pruned.kind == .Interface {
+			interface_t = pruned
+			break
+		}
+	}
+	if interface_t != nil {
+		for ra in reachable_arms {
+			pruned := prune_type(ra.t)
+			if pruned != nil && pruned != interface_t && (pruned.kind == .Struct || pruned.kind == .Enum) {
+				maybe_register_interface_cast(ctx, ra.expr, pruned, interface_t)
+			}
+		}
+		result_t = interface_t
+	}
+
 	ctx.match_arm_infos[e] = arm_infos
 	check_match_coverage(ctx, e.span, subject_type, arm_infos)
 	return prune_type(result_t)
+}
+
+Match_Arm_Result :: struct {
+	t:    ^Type,
+	expr: Expr,
 }
 
 // Стадия 7 Phase F: Опция/Результат больше не Type_Kind — обычные enum'ы

@@ -1,6 +1,6 @@
 # panos Development Guidelines
 
-Auto-generated from feature plans. Last updated: 2026-07-23.
+Auto-generated from feature plans. Last updated: 2026-07-27.
 
 ## Active Technologies
 - mdBook (docs/) — internal architecture documentation, no new dependency (002-interpreter-architecture-docs)
@@ -50,6 +50,99 @@ history of how the code came to exist — that belongs in commit messages,
 not source comments.
 
 ## Recent Changes
+- http-router (not a speckit feature — built via plan-mode): `Маршрутизатор`
+  in `std/сеть/http.ps` — Go-style route registration
+  (`.получить`/`.отправить_пост`/`.отправить_put`/`.отправить_patch`/
+  `.удалить(шаблон, обработчик)`) + `.как_обработчик()` producing an
+  `Обработчик` compatible with the existing `обслуживать`/
+  `обслуживать_слушатель` (009-http-server) — the accept-loop itself is
+  unchanged. Two-layer design: `сопоставить_путь`/`скомпилировать_путь`
+  are exported standalone (for manual `выбор`-based dispatch without the
+  router), and `Маршрутизатор` is built on top of the same primitive
+  rather than duplicating matching logic. Path compiled to a
+  `Сегмент_Шаблона` ADT (`Литерал`/`Параметр`) once at `.получить(...)`
+  registration time, not re-parsed per request; incoming request path
+  split into segments once per request and reused across all candidate
+  routes (not re-split per candidate); HTTP method (cheap string compare)
+  filters candidates before the more expensive per-segment comparison;
+  the params `Соответствие` is allocated only once a candidate is
+  confirmed matching, not for every failed candidate scanned. This is not
+  stylistic — verified empirically before implementing: runtime strings
+  in this VM are NOT interned (every slice/concat allocates a new
+  `Panos_String`, `vm.odin:220`), GC is stop-the-world mark-and-sweep
+  (`gc.odin:42-45`, a pause stops ALL cooperatively-scheduled processes,
+  not just the request being matched), and `Соответствие` itself is a
+  linear-scan association list (`vm.odin:519-524`, not a hash table — so
+  there's no asymptotic win from using it as the route table either,
+  `Массив(Маршрут)` + linear scan is the actually-correct choice given
+  what's available). `Маршрутизатор` is a struct — a heap reference type
+  in this VM (`vm.odin:1623` `Set_Local` copies the pointer, not fields)
+  — so `.как_обработчик()`'s closure captures a pointer to the same live
+  object; registration order relative to that call doesn't affect
+  correctness (field writes are visible through any holder of the
+  pointer), and no locking is needed for concurrent reads across
+  `процессов > 1` (single OS thread, cooperative scheduling, no true
+  parallelism exists to race). Tests: `fixtures/http_router_fixture_main.
+  ps` (pure matching logic, no socket) + `fixtures/
+  http_router_serve_fixture_main.ps` with a real socket e2e test
+  (`test_http_router_dispatch`) — `:param` extraction reaches the
+  handler, unknown path and wrong method both fall through to the
+  router's built-in 404.
+- type-checker-hardening (not a speckit feature — built via plan-mode,
+  triggered by reviewing an external design-review doc of panos's type
+  system): three real, independently-found bugs in `core/type_cheker.
+  odin`, all confirmed via the actual pre-fix binary before fixing (not
+  just by reading code — the third one especially would have been missed
+  by static reading alone). (1) `unify_types` treated `Никогда`
+  symmetrically (`Никогда ~ T` and `T ~ Никогда` both `true`) — a
+  function declared `-> Никогда` whose body was an ordinary value (e.g.
+  `42`) wrongly passed typecheck. New `is_assignable_to(actual,
+  expected)` is directional (`Никогда` valid only on the `actual` side,
+  matching Rust `!`/Kotlin `Nothing`) and replaces `unify_types` at the
+  handful of genuine actual-vs-expected call sites (function/lambda
+  return checks, `check_expr`'s general fallback, enum-variant field
+  check); `unify_types` itself is untouched and stays symmetric — it's
+  still correct for join-points (если/иначе, match, array/map literal
+  elements), which resolve the Never-branch separately AFTER unify
+  succeeds, and would break if made directional. (2) `type_contains_infer_var`
+  (occurs check) was a `#partial switch` with no cases for
+  Struct/Enum/Process/Pointer — `?T = Узел{значение: ?T}` was never
+  caught, risking infinite recursion/stack overflow on subsequent
+  substitution; added the missing cases plus a `visited` map (same
+  pattern as the sibling `collect_free_infer_vars`) so recursive generic
+  types (`Список[T]`) don't false-positive as cycles. (3) Deepest one:
+  `возврат`/return-exhaustiveness. `check_function_body`'s old check
+  (`infer_function_body`) only scanned the TOP LEVEL of a function body
+  for a `return` — `если x тогда возврат 1 конец` (no `иначе`) as the
+  LAST top-level statement wrongly passed (missing-return path never
+  detected), while `если x тогда возврат 1 иначе возврат 2 конец`
+  (fully exhaustive) wrongly FAILED (nested returns invisible to the
+  shallow scan) — confirmed both directions via a binary built before
+  the fix, not just reasoning about the code. Deeper and separate: nested
+  `возврат` (inside если/выбор/пока/для, any depth) was only ever
+  type-INFERRED (`infer_stmt`/`infer_expr`), never CHECKED against the
+  function's declared return type at all — `функ ф() -> Целое \n если x
+  тогда возврат "текст" иначе возврат 1 конец \n конец` silently passed.
+  New `block_always_diverges`/`stmt_always_diverges`/`expr_always_diverges`
+  (recursive exhaustiveness over если/выбор — deliberately NOT over
+  циклы: loops never count as guaranteed-diverging, a conservative choice
+  that trades some false "must return" rejections for zero risk of
+  false acceptance) replaces the old shallow scan as the gate; new
+  `check_nested_returns`/`check_nested_returns_expr`/
+  `check_returns_in_block` recursively calls `check_expr` on every
+  reachable `возврат` (any depth, если/выбор/пока/для) against the
+  function's expected return type. Deliberately did NOT extend this
+  pattern to `?`/Try_Expr or `прервать`/`продолжить` — both already read
+  ambient `Type_Ctx` fields (`ctx.current_return`/`ctx.loop_depth`) rather
+  than a threaded parameter, and are reached via `infer_expr` (called
+  unconditionally regardless of the check/infer dispatch split that
+  caused the `возврат` bug) — confirmed by new tests
+  (`test_try_operator_error_type_checked_when_nested_in_if`,
+  `test_break_outside_loop_still_rejected_when_nested_in_if`,
+  `test_break_inside_loop_still_allowed_when_nested_in_if`) rather than
+  by reading alone. 8 new regression tests total in `core/
+  e2e_types_interfaces_test.odin`. 300/300 (`odin test ./core`), up from
+  286 at the start of this work.
 - 009-http-server: Bridges the already-vendored (previously client-only)
   `external/odin-http/server.odin` to panos's single-threaded VM/GC.
   Three hard constraints discovered by reading the vendored library's

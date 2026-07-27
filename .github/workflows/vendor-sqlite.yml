@@ -1,0 +1,231 @@
+name: Собрать vendored SQLite
+
+on:
+  workflow_dispatch:
+    inputs:
+      sqlite_version:
+        description: Версия SQLite в формате amalgamation-файла (напр. 3530400 для 3.53.4)
+        required: true
+        default: "3530400"
+        type: string
+      sqlite_year:
+        description: Год в пути загрузки на sqlite.org (см. https://sqlite.org/download.html)
+        required: true
+        default: "2026"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vendor-sqlite
+  cancel-in-progress: false
+
+env:
+  SQLITE_VERSION: ${{ inputs.sqlite_version }}
+  SQLITE_YEAR: ${{ inputs.sqlite_year }}
+  # Флаги сборки — общие для всех платформ (см. core/sqlite3_bindings.
+  # odin и обоснование в plan/CLAUDE.md): SQLITE_THREADSAFE=1 —
+  # belt-and-suspenders поверх собственной сериализации panos через
+  # in_flight (vm_sql_native.odin); SQLITE_OMIT_LOAD_EXTENSION — не
+  # грузим .so/.dll расширения в рантайме (self-contained policy);
+  # SQLITE_OMIT_DEPRECATED/SQLITE_DQS=0 — чистое ужесточение, меньше
+  # бинарь, никакого устаревшего API panos никогда не вызовет.
+  SQLITE_CFLAGS: >-
+    -DSQLITE_THREADSAFE=1
+    -DSQLITE_OMIT_LOAD_EXTENSION
+    -DSQLITE_OMIT_DEPRECATED
+    -DSQLITE_DQS=0
+
+jobs:
+  fetch-amalgamation:
+    name: Скачать amalgamation-исходники
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Скачать sqlite-amalgamation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p _deps
+          curl -sL -o _deps/sqlite-amalgamation.zip \
+            "https://sqlite.org/${SQLITE_YEAR}/sqlite-amalgamation-${SQLITE_VERSION}.zip"
+          unzip -q _deps/sqlite-amalgamation.zip -d _deps
+          dir="_deps/sqlite-amalgamation-${SQLITE_VERSION}"
+          test -f "$dir/sqlite3.c"
+          test -f "$dir/sqlite3.h"
+
+          mkdir -p out/external/sqlite3/include
+          cp "$dir/sqlite3.c" out/external/sqlite3/sqlite3.c
+          cp "$dir/sqlite3.h" out/external/sqlite3/include/sqlite3.h
+
+      - name: Сохранить исходники для остальных job'ов
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-amalgamation-source
+          path: out
+          if-no-files-found: error
+          retention-days: 1
+
+  build-unix:
+    name: SQLite ${{ matrix.platform }}
+    needs: fetch-amalgamation
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-amd64
+          - runner: macos-15
+            platform: darwin-arm64
+
+    steps:
+      - name: Получить panos
+        uses: actions/checkout@v4
+
+      - name: Скачать amalgamation-исходники
+        uses: actions/download-artifact@v4
+        with:
+          name: sqlite-amalgamation-source
+          path: _deps
+
+      - name: Собрать статическую libsqlite3
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          out="$GITHUB_WORKSPACE/out/external/sqlite3"
+          mkdir -p "$out/lib/${{ matrix.platform }}"
+
+          cc -c "_deps/external/sqlite3/sqlite3.c" $SQLITE_CFLAGS -O2 \
+            -o "$RUNNER_TEMP/sqlite3.o"
+          ar rcs "$out/lib/${{ matrix.platform }}/libsqlite3.a" "$RUNNER_TEMP/sqlite3.o"
+          ar -t "$out/lib/${{ matrix.platform }}/libsqlite3.a"
+
+      - name: Подставить библиотеку в рабочую копию panos
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p external/sqlite3/lib/${{ matrix.platform }} external/sqlite3/include
+          cp out/external/sqlite3/lib/${{ matrix.platform }}/libsqlite3.a \
+            external/sqlite3/lib/${{ matrix.platform }}/libsqlite3.a
+          cp _deps/external/sqlite3/sqlite3.c external/sqlite3/sqlite3.c
+          cp _deps/external/sqlite3/include/sqlite3.h external/sqlite3/include/sqlite3.h
+
+      - name: Установить Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-06
+
+      - name: Проверить линковку с panos
+        shell: bash
+        run: odin build . -o:speed -out:panos-smoke
+
+      - name: Сохранить платформенный архив
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-${{ matrix.platform }}
+          path: out
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: SQLite windows-amd64
+    needs: fetch-amalgamation
+    runs-on: windows-2022
+
+    steps:
+      - name: Получить panos
+        uses: actions/checkout@v4
+
+      - name: Скачать amalgamation-исходники
+        uses: actions/download-artifact@v4
+        with:
+          name: sqlite-amalgamation-source
+          path: _deps
+
+      - name: Активировать MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: amd64
+
+      - name: Собрать статическую libsqlite3 через MSVC
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out/external/sqlite3/lib/windows-amd64 | Out-Null
+
+          $flags = "-DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_DQS=0"
+          cl /c _deps/external/sqlite3/sqlite3.c /O2 $flags.Split(" ") /Fo"$env:RUNNER_TEMP\sqlite3.obj"
+          if ($LASTEXITCODE -ne 0) { throw "cl.exe завершился с кодом $LASTEXITCODE" }
+
+          lib.exe /nologo /out:out/external/sqlite3/lib/windows-amd64/libsqlite3.lib "$env:RUNNER_TEMP\sqlite3.obj"
+          if ($LASTEXITCODE -ne 0) { throw "lib.exe завершился с кодом $LASTEXITCODE" }
+
+          lib.exe /nologo /list out/external/sqlite3/lib/windows-amd64/libsqlite3.lib | Select-Object -First 20
+
+      - name: Подставить библиотеку в рабочую копию panos
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force external/sqlite3/lib/windows-amd64 | Out-Null
+          New-Item -ItemType Directory -Force external/sqlite3/include | Out-Null
+
+          Copy-Item out/external/sqlite3/lib/windows-amd64/libsqlite3.lib external/sqlite3/lib/windows-amd64/libsqlite3.lib -Force
+          Copy-Item _deps/external/sqlite3/sqlite3.c external/sqlite3/sqlite3.c -Force
+          Copy-Item _deps/external/sqlite3/include/sqlite3.h external/sqlite3/include/sqlite3.h -Force
+
+      - name: Установить Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-06
+
+      - name: Проверить линковку с panos
+        shell: pwsh
+        run: odin build . -o:speed -out:panos-smoke.exe
+
+      - name: Сохранить платформенный архив
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-windows-amd64
+          path: out
+          if-no-files-found: error
+          retention-days: 7
+
+  collect:
+    name: Собрать единый vendored-пакет
+    needs:
+      - fetch-amalgamation
+      - build-unix
+      - build-windows
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Скачать результаты всех платформ
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sqlite-*
+          path: bundle
+          merge-multiple: true
+
+      - name: Проверить структуру пакета
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -f bundle/external/sqlite3/sqlite3.c
+          test -f bundle/external/sqlite3/include/sqlite3.h
+          test -f bundle/external/sqlite3/lib/linux-amd64/libsqlite3.a
+          test -f bundle/external/sqlite3/lib/darwin-arm64/libsqlite3.a
+          test -f bundle/external/sqlite3/lib/windows-amd64/libsqlite3.lib
+
+          find bundle -type f -print | sort
+
+      - name: Сохранить единый пакет
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-v${{ inputs.sqlite_version }}-vendored
+          path: bundle
+          if-no-files-found: error
+          retention-days: 30

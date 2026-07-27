@@ -98,6 +98,7 @@ GC_State :: struct {
 	free_pointers:   [dynamic]^Pointer_Value,
 	free_http_listeners: [dynamic]^Http_Listener_Value,
 	free_http_requests:  [dynamic]^Http_Request_Value,
+	free_sql_connections: [dynamic]^Sql_Connection_Value,
 }
 
 // Не собираем, пока живой хип меньше этого — иначе на маленьких
@@ -126,6 +127,7 @@ new_gc_state :: proc() -> GC_State {
 		free_pointers = make([dynamic]^Pointer_Value),
 		free_http_listeners = make([dynamic]^Http_Listener_Value),
 		free_http_requests = make([dynamic]^Http_Request_Value),
+		free_sql_connections = make([dynamic]^Sql_Connection_Value),
 	}
 }
 
@@ -221,6 +223,8 @@ gc_new :: proc(vm: ^VM, $T: typeid) -> ^T {
 		obj = pool_take(&vm.gc.free_http_listeners)
 	} else when T == Http_Request_Value {
 		obj = pool_take(&vm.gc.free_http_requests)
+	} else when T == Sql_Connection_Value {
+		obj = pool_take(&vm.gc.free_sql_connections)
 	}
 
 	if obj == nil {
@@ -291,6 +295,8 @@ get_header :: proc(v: Value) -> ^GC_Header {
 		return &val.header
 	case ^Http_Request_Value:
 		return &val.header
+	case ^Sql_Connection_Value:
+		return &val.header
 	case f64, bool, ^Compiled_Function, ^Foreign_Function:
 		return nil
 	}
@@ -310,9 +316,10 @@ mark_value :: proc(v: Value) {
 	h.marked = true
 
 	switch val in v {
-	case f64, bool, ^Compiled_Function, ^Foreign_Function, ^Panos_String, ^File_Value, ^Socket_Value, ^Pointer_Value, ^Http_Listener_Value, ^Http_Request_Value:
+	case f64, bool, ^Compiled_Function, ^Foreign_Function, ^Panos_String, ^File_Value, ^Socket_Value, ^Pointer_Value, ^Http_Listener_Value, ^Http_Request_Value, ^Sql_Connection_Value:
 	// листья — нечего обходить дальше (Pointer_Value.ptr — rawptr, не Value, T фантомный;
-	// Http_Listener_Value/Http_Request_Value — только плоские строки/каналы, ни одного Value-поля)
+	// Http_Listener_Value/Http_Request_Value/Sql_Connection_Value — только плоские строки/
+	// каналы/C-указатели, ни одного Value-поля)
 	case ^Aggregate_Value:
 		for el in val.elements do mark_value(el)
 	case ^Array_Value:
@@ -443,6 +450,8 @@ value_size :: proc(v: Value) -> int {
 		return size_of(Http_Listener_Value)
 	case ^Http_Request_Value:
 		return size_of(Http_Request_Value)
+	case ^Sql_Connection_Value:
+		return size_of(Sql_Connection_Value)
 	}
 	return 0
 }
@@ -546,6 +555,11 @@ pool_release :: proc(vm: ^VM, v: Value) {
 		// игнорируется, см. close_http_request_value).
 		close_http_request_value(val)
 		append(&vm.gc.free_http_requests, val)
+	case ^Sql_Connection_Value:
+		// Тот же finalizer-принцип, что File_Value/Http_Listener_Value —
+		// недостижимое, но не закрытое явно соединение освобождается здесь.
+		close_sql_connection(val)
+		append(&vm.gc.free_sql_connections, val)
 	}
 }
 

@@ -61,6 +61,9 @@ Type_Kind :: enum {
 	// (Указатель(Файл) ≠ Указатель(Сокет) для тайпчекера). См.
 	// new_pointer_type, core/vm_ffi_native.odin (Pointer_Value).
 	Pointer,
+	// Соединение с SQLite-базой (бд.открыть) — непараметрический тип,
+	// методы см. SQL_CONNECTION_METHODS.
+	Sql_Connection,
 	// Заглушка для узла, где уже была зарепорчена ошибка. Unify'ится с чем
 	// угодно (см. unify_types/types_are_equal) — не даёт одной первопричине
 	// расплодиться в десяток производных диагностик по всему выражению.
@@ -169,6 +172,7 @@ TY_FILE := &Type{kind = .File, name = "Файл"}
 TY_CONNECTION := &Type{kind = .Connection, name = "Соединение"}
 TY_HTTP_LISTENER := &Type{kind = .Http_Listener, name = "Слушатель"}
 TY_HTTP_REQUEST := &Type{kind = .Http_Request, name = "Запрос"}
+TY_SQL_CONNECTION := &Type{kind = .Sql_Connection, name = "Соединение_БД"}
 TY_POISON := &Type{kind = .Poison, name = "?ошибка?"}
 
 // Имя базового типа в аннотации → интернированный Type. Fixed-size array
@@ -191,6 +195,7 @@ BASE_TYPES := [?]Base_Type_Entry {
 	{"Соединение", TY_CONNECTION},
 	{"Слушатель", TY_HTTP_LISTENER},
 	{"Запрос", TY_HTTP_REQUEST},
+	{"Соединение_БД", TY_SQL_CONNECTION},
 }
 
 lookup_base_type :: proc(name: string) -> (^Type, bool) {
@@ -4163,7 +4168,35 @@ HTTP_REQUEST_METHODS := [?]Method_Sig {
 	},
 }
 
-// Диспетчер методов Опции/Результата/Файла/Соединения/Слушателя/Запроса:
+SQL_CONNECTION_METHODS := [?]Method_Sig {
+	{
+		name = "выполнить",
+		arity = 2,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			check_expr(ctx, args[0], TY_STRING)
+			check_expr(ctx, args[1], new_array_type(TY_STRING))
+			return new_result_type(ctx, TY_NUM, TY_ERROR)
+		},
+	},
+	{
+		name = "запрос",
+		arity = 2,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {
+			check_expr(ctx, args[0], TY_STRING)
+			check_expr(ctx, args[1], new_array_type(TY_STRING))
+			row_type := new_map_type(TY_STRING, TY_STRING)
+			return new_result_type(ctx, new_array_type(row_type), TY_ERROR)
+		},
+	},
+	{
+		name = "закрыть",
+		arity = 0,
+		handler = proc(ctx: ^Type_Ctx, call: Expr, receiver_type: ^Type, args: [dynamic]Expr) -> ^Type {return TY_VOID},
+	},
+}
+
+// Диспетчер методов Опции/Результата/Файла/Соединения/Слушателя/Запроса/
+// Соединения_БД:
 // одна карта вместо повторяющихся case'ов (arity-check + collection_calls-
 // запись + return). Handler'ы хранят только уникальную логику.
 standard_method_type :: proc(
@@ -4186,6 +4219,8 @@ standard_method_type :: proc(
 		method_list = HTTP_LISTENER_METHODS[:]
 	case .Http_Request:
 		method_list = HTTP_REQUEST_METHODS[:]
+	case .Sql_Connection:
+		method_list = SQL_CONNECTION_METHODS[:]
 	case:
 		return nil, false
 	}

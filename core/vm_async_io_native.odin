@@ -490,6 +490,58 @@ submit_async_io_method :: proc(vm: ^VM, receiver: Value, method_name: string, ar
 		thread.pool_add_task(&vm.async_pool, heap, http_accept_task_proc, task_data)
 		return
 	}
+
+	if conn, ok_conn := receiver.(^Sql_Connection_Value); ok_conn {
+		if !conn.is_open || conn.close_requested {
+			append(&target.async_results, make_error_result(vm, make_error_value(vm, "бд", "соединение уже закрыто")))
+			return
+		}
+		if conn.in_flight {
+			append(&target.async_results, make_error_result(vm, make_error_value(vm, "бд", "операция уже выполняется")))
+			return
+		}
+
+		params_arr, ok_arr := args[1].(^Array_Value)
+		if !ok_arr {
+			fmt.panicf("Runtime Error: %s ожидает массив строк параметрами", method_name)
+		}
+
+		conn.in_flight = true
+		gc_pin(vm, receiver)
+
+		heap := vm_heap_allocator()
+		vm.next_ticket_id += 1
+
+		sql_text := expect_string_arg(method_name, args[0])
+		params := make([]string, len(params_arr.elements), heap)
+		for elem, i in params_arr.elements {
+			params[i] = strings.clone(expect_string_arg(method_name, elem), heap)
+		}
+
+		if method_name == "выполнить" {
+			task_data := new(Sql_Exec_Task_Data, heap)
+			task_data.completions = vm.async_completions
+			task_data.target_id = target_id
+			task_data.ticket_id = vm.next_ticket_id
+			task_data.conn = conn
+			task_data.sql = strings.clone(sql_text, heap)
+			task_data.params = params
+
+			thread.pool_add_task(&vm.async_pool, heap, sql_exec_task_proc, task_data)
+			return
+		}
+
+		task_data := new(Sql_Query_Task_Data, heap)
+		task_data.completions = vm.async_completions
+		task_data.target_id = target_id
+		task_data.ticket_id = vm.next_ticket_id
+		task_data.conn = conn
+		task_data.sql = strings.clone(sql_text, heap)
+		task_data.params = params
+
+		thread.pool_add_task(&vm.async_pool, heap, sql_query_task_proc, task_data)
+		return
+	}
 }
 
 File_Stream_Task_Data :: struct {
@@ -615,5 +667,149 @@ socket_write_stream_task_proc :: proc(task: thread.Task) {
 	} else {
 		result.payload = Socket_Stream_Write_Result_Data{sock = data.sock, bytes_written = n}
 	}
+	chan.send(data.completions, result)
+}
+
+// Соединение_БД.выполнить()/.запрос() — симметрично File_Stream_Task_Data
+// выше: сырой указатель на GC-объект, безопасно ТОЛЬКО пока conn.
+// in_flight держит его pinned (submit_async_io_method ниже). params уже
+// склонированы на heap в submit_async_io_method (Panos_String.data — GC-
+// managed, не переживёт возврата из execute()).
+Sql_Exec_Task_Data :: struct {
+	completions: chan.Chan(Async_Result),
+	target_id:   int,
+	ticket_id:   int,
+	conn:        ^Sql_Connection_Value,
+	sql:         string,
+	params:      []string,
+}
+
+sql_exec_task_proc :: proc(task: thread.Task) {
+	heap := vm_heap_allocator()
+	data := cast(^Sql_Exec_Task_Data)task.data
+	defer {
+		delete(data.sql, heap)
+		for p in data.params do delete(p, heap)
+		delete(data.params, heap)
+		mem.free(data, heap)
+	}
+
+	result := Async_Result{ticket_id = data.ticket_id, target_id = data.target_id}
+
+	sql_cstr := strings.clone_to_cstring(data.sql, heap)
+	defer delete(sql_cstr, heap)
+
+	stmt: ^sqlite3_stmt
+	rc := sqlite3_prepare_v2(data.conn.db, sql_cstr, -1, &stmt, nil)
+	if rc != SQLITE_OK {
+		result.payload = Sql_Exec_Result_Data{conn = data.conn, err = strings.clone(sql_error_message(data.conn.db), heap)}
+		chan.send(data.completions, result)
+		return
+	}
+
+	if bind_ok, bind_rc := sql_bind_params(stmt, data.params); !bind_ok {
+		sqlite3_finalize(stmt)
+		_ = bind_rc
+		result.payload = Sql_Exec_Result_Data{conn = data.conn, err = strings.clone(sql_error_message(data.conn.db), heap)}
+		chan.send(data.completions, result)
+		return
+	}
+
+	step_rc := sqlite3_step(stmt)
+	if step_rc != SQLITE_DONE && step_rc != SQLITE_ROW {
+		err_msg := strings.clone(sql_error_message(data.conn.db), heap)
+		sqlite3_finalize(stmt)
+		result.payload = Sql_Exec_Result_Data{conn = data.conn, err = err_msg}
+		chan.send(data.completions, result)
+		return
+	}
+
+	rows_affected := int(sqlite3_changes(data.conn.db))
+	sqlite3_finalize(stmt)
+	result.payload = Sql_Exec_Result_Data{conn = data.conn, rows_affected = rows_affected}
+	chan.send(data.completions, result)
+}
+
+Sql_Query_Task_Data :: struct {
+	completions: chan.Chan(Async_Result),
+	target_id:   int,
+	ticket_id:   int,
+	conn:        ^Sql_Connection_Value,
+	sql:         string,
+	params:      []string,
+}
+
+sql_query_task_proc :: proc(task: thread.Task) {
+	heap := vm_heap_allocator()
+	data := cast(^Sql_Query_Task_Data)task.data
+	defer {
+		delete(data.sql, heap)
+		for p in data.params do delete(p, heap)
+		delete(data.params, heap)
+		mem.free(data, heap)
+	}
+
+	result := Async_Result{ticket_id = data.ticket_id, target_id = data.target_id}
+
+	sql_cstr := strings.clone_to_cstring(data.sql, heap)
+	defer delete(sql_cstr, heap)
+
+	stmt: ^sqlite3_stmt
+	rc := sqlite3_prepare_v2(data.conn.db, sql_cstr, -1, &stmt, nil)
+	if rc != SQLITE_OK {
+		result.payload = Sql_Query_Result_Data{conn = data.conn, err = strings.clone(sql_error_message(data.conn.db), heap)}
+		chan.send(data.completions, result)
+		return
+	}
+
+	if bind_ok, bind_rc := sql_bind_params(stmt, data.params); !bind_ok {
+		sqlite3_finalize(stmt)
+		_ = bind_rc
+		result.payload = Sql_Query_Result_Data{conn = data.conn, err = strings.clone(sql_error_message(data.conn.db), heap)}
+		chan.send(data.completions, result)
+		return
+	}
+
+	column_names := sql_column_names(stmt)
+	rows: [dynamic][dynamic]Maybe(string)
+
+	step_loop: for {
+		step_rc := sqlite3_step(stmt)
+		switch step_rc {
+		case SQLITE_ROW:
+			// BLOB-колонки не поддержаны в v1 (см. план фичи) — вся text-
+			// коэрсия sqlite3_column_text молчаливо портит бинарные байты,
+			// ошибка честнее, чем незаметная потеря данных.
+			count := sqlite3_column_count(stmt)
+			has_blob := false
+			for i in 0 ..< count {
+				if sqlite3_column_type(stmt, i) == SQLITE_BLOB {
+					has_blob = true
+					break
+				}
+			}
+			if has_blob {
+				sqlite3_finalize(stmt)
+				result.payload = Sql_Query_Result_Data {
+					conn = data.conn,
+					err  = strings.clone("BLOB-колонки не поддержаны в этой версии", heap),
+				}
+				chan.send(data.completions, result)
+				return
+			}
+			append(&rows, sql_read_row(stmt))
+		case SQLITE_DONE:
+			break step_loop
+		case:
+			err_msg := strings.clone(sql_error_message(data.conn.db), heap)
+			sqlite3_finalize(stmt)
+			result.payload = Sql_Query_Result_Data{conn = data.conn, err = err_msg}
+			chan.send(data.completions, result)
+			return
+		}
+	}
+
+	sqlite3_finalize(stmt)
+	result.payload = Sql_Query_Result_Data{conn = data.conn, column_names = column_names, rows = rows}
 	chan.send(data.completions, result)
 }

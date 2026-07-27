@@ -161,6 +161,7 @@ Value :: union {
 	^Pointer_Value,
 	^Http_Listener_Value,
 	^Http_Request_Value,
+	^Sql_Connection_Value,
 }
 
 // Стадия 49 (FFI): рантайм-представление Указатель(T) — opaque raw
@@ -426,6 +427,12 @@ is_async_stream_method :: proc(receiver_type: ^Type, method_name: string) -> boo
 		// запрос (research.md §3, specs/009-http-server). .закрыть() —
 		// синхронный, как и везде (graceful shutdown не ждёт изнутри вызова).
 		return method_name == "принять_запрос"
+	}
+	if receiver_type == TY_SQL_CONNECTION {
+		// sqlite3_step может блокироваться на дисковом I/O — оба метода,
+		// меняющие данные (выполнить) и читающие (запрос), идут через
+		// воркер-пул. .закрыть() — синхронный, как и везде.
+		return method_name == "выполнить" || method_name == "запрос"
 	}
 	return false
 }

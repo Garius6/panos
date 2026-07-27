@@ -72,6 +72,27 @@ Socket_Stream_Write_Result_Data :: struct {
 	err:           Maybe(string),
 }
 
+// бд.Соединение_БД.выполнить()/.запрос() — та же дисциплина, что File_
+// Stream_*_Result_Data выше (conn-указатель нужен delivery, чтобы снять
+// in_flight/gc_unpin/довести отложенный close_sql_connection). ^Sql_
+// Connection_Value как ИМЯ ТИПА существует на обеих платформах
+// (vm_sql_native.odin/vm_sql_wasm.odin), этот файл ничего платформенного
+// не импортирует — тот же приём, что у File_Stream_Read_Result_Data.
+// Значения колонок — плоские Строка/nil (nil == SQL NULL, см. план фичи —
+// весь v1 представляет SQL-значения текстом, без отдельного типа).
+Sql_Exec_Result_Data :: struct {
+	conn:          ^Sql_Connection_Value,
+	rows_affected: int,
+	err:           Maybe(string),
+}
+
+Sql_Query_Result_Data :: struct {
+	conn:         ^Sql_Connection_Value,
+	column_names: [dynamic]string,
+	rows:         [dynamic][dynamic]Maybe(string),
+	err:          Maybe(string),
+}
+
 Async_Result :: struct {
 	ticket_id: int,
 	// id процесса-получателя, НЕ указатель — процесс мог завершиться/быть
@@ -88,5 +109,7 @@ Async_Result :: struct {
 		File_Stream_Write_Result_Data,
 		Socket_Stream_Write_Result_Data,
 		Http_Accept_Result_Data,
+		Sql_Exec_Result_Data,
+		Sql_Query_Result_Data,
 	},
 }

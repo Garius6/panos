@@ -986,6 +986,12 @@ invoke_collection_method :: proc(
 	if result, ok, handled := invoke_http_server_method(vm, receiver, method_name, args); handled {
 		return result, ok
 	}
+	// Соединение_БД.закрыть() — синхронный (выполнить/запрос — async,
+	// см. submit_async_io_method/deliver_async_result) — в
+	// vm_sql_native.odin/vm_sql_wasm.odin (#+build split).
+	if result, ok, handled := invoke_sql_connection_method(vm, receiver, method_name, args); handled {
+		return result, ok
+	}
 
 	fmt.panicf(
 		"Runtime Error: метод '%s' не найден у коллекции",
@@ -1062,6 +1068,12 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	// .ps файла — codegen-инструменты на panos, не связано с рантаймом
 	// текущей программы).
 	if result, ok, handled := call_builtin_syntax(vm, name, args); handled {
+		return result, ok
+	}
+	// бд::открыть — в vm_sql_native.odin/vm_sql_wasm.odin (#+build split,
+	// native тянет sqlite3_bindings.odin — вендоренный статик libsqlite3,
+	// недоступен под js_wasm32 — нет файловой системы в браузере).
+	if result, ok, handled := call_builtin_sql(vm, name, args); handled {
 		return result, ok
 	}
 	switch name {
@@ -2620,6 +2632,85 @@ deliver_async_result :: proc(vm: ^VM, comp: Async_Result) {
 			value = make_error_result(vm, make_error_value(vm, "фс", err))
 		} else {
 			value = make_ok_result(vm, Value(gc_new_string(vm, payload.content)))
+		}
+		append(&target.async_results, value)
+
+	case Sql_Exec_Result_Data:
+		// Симметрично File_Stream_Read_Result_Data выше — unpin/deferred-
+		// close ДО проверки живости получателя.
+		conn := payload.conn
+		conn.in_flight = false
+		gc_unpin(vm, Value(conn))
+		if conn.close_requested {
+			close_sql_connection(conn)
+		}
+
+		heap := vm_heap_allocator()
+		defer if err, has_err := payload.err.(string); has_err do delete(err, heap)
+
+		if target == nil || !target.is_alive do return
+
+		value: Value
+		if err, has_err := payload.err.(string); has_err {
+			value = make_error_result(vm, make_error_value(vm, "бд", err))
+		} else {
+			value = make_ok_result(vm, Value(f64(payload.rows_affected)))
+		}
+		append(&target.async_results, value)
+
+	case Sql_Query_Result_Data:
+		conn := payload.conn
+		conn.in_flight = false
+		gc_unpin(vm, Value(conn))
+		if conn.close_requested {
+			close_sql_connection(conn)
+		}
+
+		heap := vm_heap_allocator()
+		defer {
+			for name in payload.column_names do delete(name, heap)
+			delete(payload.column_names)
+			for row in payload.rows {
+				for cell in row {
+					if text, has_text := cell.(string); has_text do delete(text, heap)
+				}
+				delete(row)
+			}
+			delete(payload.rows)
+			if err, has_err := payload.err.(string); has_err do delete(err, heap)
+		}
+
+		if target == nil || !target.is_alive do return
+
+		value: Value
+		if err, has_err := payload.err.(string); has_err {
+			value = make_error_result(vm, make_error_value(vm, "бд", err))
+		} else {
+			result_rows := gc_new(vm, Array_Value)
+			gc_protect(vm, Value(result_rows))
+			for row in payload.rows {
+				row_map := gc_new(vm, Map_Value)
+				gc_protect(vm, Value(row_map))
+				for cell, i in row {
+					// NULL-колонки (cell == nil) не попадают в итоговую
+					// Соответствие вовсе — .есть("колонка")/.получить(...,
+					// запасное) отличают NULL от пустой строки без
+					// отдельного типа (см. план фичи).
+					if text, has_text := cell.(string); has_text {
+						append(
+							&row_map.entries,
+							Map_Entry_Value{
+								key = Value(gc_new_string(vm, payload.column_names[i])),
+								value = Value(gc_new_string(vm, text)),
+							},
+						)
+					}
+				}
+				gc_unprotect(vm, 1)
+				append(&result_rows.elements, Value(row_map))
+			}
+			gc_unprotect(vm, 1)
+			value = make_ok_result(vm, Value(result_rows))
 		}
 		append(&target.async_results, value)
 

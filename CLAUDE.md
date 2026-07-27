@@ -53,6 +53,31 @@ history of how the code came to exist — that belongs in commit messages,
 not source comments.
 
 ## Recent Changes
+- qualified impl target (not a speckit feature — found while fixing a
+  `../panosiki/codegen` bug, built via plan-mode): `реализация Интерфейс
+  для Модуль.Тип` — the TARGET side of an impl block can now be
+  qualified with a module name, symmetric to the interface side (already
+  supported, "Стадия 40"). `core/parser.odin` (`Impl_Decl.target_module`,
+  parsed the same optional-dot way as `interface_module`) + `core/
+  type_cheker.odin` (`typecheck_pass_impls` resolves a qualified target
+  via the imported module's `exports` map — same lookup already used for
+  `interface_module`, no new mechanism). What looked at first like a
+  trivial "codegen forgot to import its source file" bug turned out to
+  be a real, previously-unencountered language gap: a driver-generated
+  `*_gen.ps` file is a SEPARATE module from the struct it's generating
+  code for, and panos's module system never merges names into scope
+  (`имя_модуля.Имя` always required) — so even with the missing import
+  added, `реализация json.ВJSON для Тип` still couldn't resolve `Тип`
+  because `реализация ... для ...` only accepted a bare identifier for
+  the target, full stop. New regression fixtures
+  `fixtures/impl_qualified_target_{lib,gen,main}.ps` (mirrors the
+  existing `interface_cross_module_*` fixture shape, target side
+  qualified instead of/in addition to interface side) +
+  `test_impl_qualified_target_type_resolves_cross_module` (`core/
+  e2e_types_interfaces_test.odin`). `docs/src/language/interfaces.md`
+  updated — the old doc explicitly claimed target-side qualification was
+  unsupported ("целевой тип всегда объявляется в том же файле"), now
+  corrected with a verified example.
 - SQLite support (not a speckit feature — built via plan-mode): new `бд`
   module (`бд.открыть(путь) -> Результат(Соединение_БД, Ошибка)`,
   `Соединение_БД.выполнить(sql, параметры)` / `.запрос(sql, параметры)` /

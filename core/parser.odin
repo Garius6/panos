@@ -213,6 +213,12 @@ Impl_Decl :: struct {
 	// либо простой impl без интерфейса вовсе).
 	interface_module:  string,
 	interface_name:    string,
+	// непусто = "реализация Интерфейс для Модуль.Тип" — target-структура/
+	// перечисление объявлены в ДРУГОМ модуле (напр. codegen-сгенерированный
+	// файл реализует интерфейс для типа из файла-источника). Тот же
+	// синтаксис-паттерн, что interface_module выше, симметрично применённый
+	// к target-стороне.
+	target_module:     string,
 	target_type:       string,
 	methods:           [dynamic]^Function_Decl,
 }
@@ -1510,9 +1516,25 @@ parse_impl_decl :: proc(p: ^Parser) -> ^Impl_Decl {
 		target_tok := next_token(p.stream)
 		if target_tok.kind != .Ident do error(p, "Ожидалось имя целевой структуры")
 
+		// "реализация Интерфейс для Модуль.Тип" — симметрично квалификации
+		// интерфейса выше (interface_module), target_module непуст только
+		// когда встречена точка.
+		target_module := ""
+		target_ident := target_tok
+		if peek_token(p.stream).kind == .Dot {
+			next_token(p.stream) // .Dot
+			qualified_target_tok := next_token(p.stream)
+			if qualified_target_tok.kind != .Ident {
+				report_parse(p, qualified_target_tok.span, "Синтаксическая ошибка: после '.' в имени целевого типа ожидается идентификатор")
+			}
+			target_module = target_tok.data
+			target_ident = qualified_target_tok
+		}
+
 		decl.interface_module = interface_module
 		decl.interface_name = interface_ident.data
-		decl.target_type = target_tok.data
+		decl.target_module = target_module
+		decl.target_type = target_ident.data
 	} else {
 		if interface_module != "" {
 			report_parse(

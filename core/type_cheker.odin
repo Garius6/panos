@@ -2451,7 +2451,31 @@ typecheck_pass_impls :: proc(ctx: ^Type_Ctx, prog: Program) {
 	for decl in prog.decls {
 		#partial switch d in decl {
 		case ^Impl_Decl:
-			target_sym := ctx.res.global_scope.symbols[intern(d.target_type)]
+			target_sym: Symbol_Id
+			if d.target_module != "" {
+				// "реализация Интерфейс для Модуль.Тип" — тот же путь
+				// резолва, что d.interface_module выше (и Type_Qualified
+				// для "модуль.Тип" в аннотациях типов): найти символ
+				// модуля, взять его экспорт по имени.
+				module_sym := lookup_symbol(ctx.res.global_scope, intern(d.target_module))
+				if module_sym == INVALID_SYMBOL || symbol_at(ctx.res.symbol_store, module_sym).kind != .Module {
+					report(ctx, d.span, "Type Error: неизвестный модуль '%s'", d.target_module)
+					continue
+				}
+				imported_module := symbol_at(ctx.res.symbol_store, module_sym).module
+				if imported_module == nil {
+					report(ctx, d.span, "Type Error: модуль '%s' не загружен", d.target_module)
+					continue
+				}
+				found_sym, found := imported_module.exports[intern(d.target_type)]
+				if !found {
+					report(ctx, d.span, "Type Error: модуль '%s' не экспортирует '%s'", d.target_module, d.target_type)
+					continue
+				}
+				target_sym = found_sym
+			} else {
+				target_sym = ctx.res.global_scope.symbols[intern(d.target_type)]
+			}
 			target_type := ctx.res.symbol_types[target_sym]
 			if target_type == nil || (target_type.kind != .Struct && target_type.kind != .Enum) {
 				report(

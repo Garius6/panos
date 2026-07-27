@@ -1543,6 +1543,25 @@ test_interface_impl_in_non_entry_module_works_polymorphically :: proc(t: ^testin
 	)
 }
 
+// Регрессия: "реализация Интерфейс для Модуль.Тип" — target-сторона
+// квалифицирована именем модуля, симметрично уже поддержанной
+// квалификации интерфейс-стороны (Стадия 40). Найдено при тестировании
+// codegen-driver'а (../panosiki/codegen) — сгенерированный *_gen.ps
+// реализует интерфейс для структуры из файла-источника, объявленной в
+// ДРУГОМ модуле, и bare-имя типа без квалификации не резолвилось.
+@(test)
+test_impl_qualified_target_type_resolves_cross_module :: proc(t: ^testing.T) {
+	result, ok := run_module_file("fixtures/impl_qualified_target_main.ps")
+	testing.expectf(t, ok, "[impl qualified target] стек пуст")
+	if !ok do return
+	testing.expectf(
+		t,
+		value_str_eq(result, "точка"),
+		"[impl qualified target] ожидалось 'точка', получено %v",
+		result,
+	)
+}
+
 // Регрессия: если/иначе и выбор join-точки типизировали ветку интерфейсом
 // (когда одна ветка уже интерфейс, другая — совместимая структура/enum),
 // но не регистрировали ctx.interface_casts для НЕ-интерфейсной ветки —

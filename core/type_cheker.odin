@@ -2738,7 +2738,21 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 		if ctx.current_type_params != nil {
 			if tv, ok := ctx.current_type_params[n.name]; ok do return tv
 		}
-		if base_type, ok := lookup_base_type(n.name); ok do return base_type
+		// Пользовательский тип ПЕРЕД lookup_base_type — не наоборот. Только
+		// "Целое"/"Число"/"Ошибка" из BASE_TYPES жёстко зарезервированы на
+		// уровне резолвера (RESERVED_BUILTIN_NAMES, resolver.odin) — для них
+		// user-объявление того же имени уже отвергнуто как "уже объявлен"
+		// раньше, чем дело доходит сюда, так что здесь для них lookup_symbol
+		// гарантированно не найдёт ничего и код всё равно упадёт на
+		// lookup_base_type ниже. Остальные BASE_TYPES-имена (Файл/
+		// Соединение/Слушатель/Запрос/Булево/Строка/Пусто/Никогда) резолвер
+		// НЕ резервирует вовсе — при старом порядке (base_type первым)
+		// `тип Запрос = ...` пользователя молча резолвился резолвером, но
+		// был НАВСЕГДА невидим именно в позиции типа (`пер x: Запрос`,
+		// сигнатуры функций, generic-аргументы) — оба типа печатались
+		// одинаковым именем "Запрос" в diagnostic'е ("ожидался 'Запрос',
+		// получен 'Запрос'"), хотя это два разных типа. Живой баг — ломал
+		// собственный пример из docs/src/language/processes.md.
 		if sym := lookup_symbol(ctx.res.global_scope, intern(n.name)); sym != INVALID_SYMBOL {
 			if symbol_at(ctx.res.symbol_store, sym).kind == .Module {
 				return report(
@@ -2750,6 +2764,7 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 			}
 			if typ, ok := resolve_symbol_type(ctx, sym); ok do return typ
 		}
+		if base_type, ok := lookup_base_type(n.name); ok do return base_type
 		return report(ctx, n.span, "Type Error: неизвестный тип '%s'", n.name)
 
 	case ^Type_Tuple:

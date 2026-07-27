@@ -28,3 +28,19 @@ sync-lsp-protocol:
 
 test:
 	odin test ./core
+
+# Обновляет PANOS_VERSION (core/vm.odin), собирает+тестирует, коммитит
+# "chore: версия X.Y.Z", тегирует vX.Y.Z, пушит main и тег — тот же
+# ручной semver, что описан в комментарии у PANOS_VERSION. Версию
+# передавать БЕЗ "v": just bump-and-push 0.2.9
+# odin test ./core падает ненулевым кодом на провале — just останавливает
+# рецепт на первой упавшей строке, коммит/тег/push не происходят.
+bump-and-push version:
+	sed -i '' 's/PANOS_VERSION :: "[^"]*"/PANOS_VERSION :: "{{version}}"/' core/vm.odin
+	odin build . -out:panos
+	odin test ./core
+	git add core/vm.odin
+	git commit -m "chore: версия {{version}}"
+	git tag v{{version}}
+	git push origin main
+	git push origin v{{version}}

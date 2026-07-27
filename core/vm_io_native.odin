@@ -8,6 +8,7 @@ import "core:io"
 import "core:net"
 import "core:os"
 import "core:strings"
+import "core:time"
 
 // Ленивая инициализация общего reader'а над os.stdin. Аллокатор буфера
 // закреплён на runtime.heap_allocator(), а не на context.allocator в точке
@@ -207,6 +208,22 @@ call_builtin_io :: proc(vm: ^VM, name: string, args: []Value) -> (result: Value,
 			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true, true
 		}
 		return make_ok_result(vm, Value(f64(0))), true, true
+
+	case "время::спать_мс":
+		// Блокирующий сон — намеренно НЕ в общем switch vm.odin рядом с
+		// время::сейчас_мс/монотонно_мс (те безопасны и в браузере, читают
+		// часы не блокируя): в single-threaded браузерной вкладке
+		// блокирующий сон повесил бы UI целиком — тот же принцип, что и у
+		// остальных панике-листнутых в vm_io_wasm.odin вещей. core:time.
+		// sleep сам кросс-платформенный (macOS/Linux/Windows) — никакого
+		// шелл-аута на системный `sleep`, который есть не везде (Windows).
+		expect_arg_count(name, len(args), 1)
+		ms, ok_ms := args[0].(f64)
+		if !ok_ms {
+			fmt.panicf("Runtime Error: время.спать_мс() ожидает число")
+		}
+		time.sleep(time.Duration(ms * f64(time.Millisecond)))
+		return Value(f64(0)), true, true
 
 	case "ос::окружение":
 		expect_arg_count(name, len(args), 1)

@@ -214,6 +214,8 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return new_function_type(make([dynamic]^Type), TY_NUM)
 	case "время::сейчас_мс":
 		return new_function_type(make([dynamic]^Type), TY_NUM)
+	case "время::спать_мс":
+		return builtin_function_type_1(TY_NUM, TY_NUM)
 	// синтаксис::* — compile-time АСТ-интроспекция ДРУГОГО .ps файла (не
 	// текущего рантайма) для codegen-инструментов (см. core/vm_syntax_
 	// native.odin) — каждый вызов заново парсит путь, стейта между
@@ -457,6 +459,12 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 			module,
 			"сейчас_мс",
 			builtin_export_type(graph, "время::сейчас_мс"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"спать_мс",
+			builtin_export_type(graph, "время::спать_мс"),
 		)
 	} else if name == "сжатие" {
 		add_builtin_export(

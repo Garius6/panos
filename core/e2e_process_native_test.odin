@@ -142,3 +142,27 @@ test_os_terminate_sets_child_process_exit_code :: proc(t: ^testing.T) {
 	if err != nil do return
 	testing.expectf(t, state.exit_code == 42, "[ос.завершить] ожидался exit code 42, получен %d", state.exit_code)
 }
+
+// core:time.sleep — кросс-платформенно (macOS/Linux/Windows), не шелл-аут
+// на системный `sleep` (нет на Windows) — нужно для codegen --watch
+// (../panosiki/codegen) в качестве поллинг-интервала, раз в самом panos
+// нет другого способа приостановить выполнение. Проверяем только нижнюю
+// границу (>= запрошенного), не точное совпадение — точный тайминг
+// планировщика ОС не гарантирован, а тест не должен флакать под нагрузкой
+// параллельных odin test потоков.
+@(test)
+test_time_sleep_ms_blocks_at_least_requested_duration :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт время
+
+		функ старт() -> Булево
+			пер до = время.монотонно_мс()
+			время.спать_мс(50)
+			пер после = время.монотонно_мс()
+			после - до >= 50
+		конец
+	`)
+	testing.expectf(t, ok, "[время.спать_мс] пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(true), "[время.спать_мс] прошедшее время должно быть >= 50мс, получено %v", result)
+}

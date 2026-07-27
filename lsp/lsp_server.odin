@@ -4,6 +4,7 @@ import core "../core"
 import proto "protocol"
 import "core:encoding/json"
 import "core:fmt"
+import "core:mem/virtual"
 import "core:net"
 import "core:os"
 import "core:slice"
@@ -39,6 +40,20 @@ LSP_Document :: struct {
 	// напрямую из symbol_at(...).span. Span несёт свой file_id —
 	// межмодульность бесплатна, отдельной группировки по файлам не нужно.
 	usages:  map[core.Symbol_Id][dynamic]core.Span,
+	// Владеет ВСЕЙ памятью graph/prog/res_ctx/tc_ctx/results/usages текущего
+	// поколения — parser/resolver/type_cheker/compiler (core/) нигде ничего
+	// не освобождают (см. CLAUDE.md), а revalidate_document пересчитывает
+	// граф ЦЕЛИКОМ на каждый keystroke/save. Без явного free каждое
+	// поколение оставалось бы недостижимым, но неосвобождённым мусором —
+	// долгая сессия редактирования копила бы их без ограничения. Вместо
+	// точечного free по каждому узлу (пришлось бы дописывать деструкторы по
+	// всему core/ — там их нет вообще нигде) revalidate_document считает
+	// новое поколение целиком в СВЕЖЕЙ арене, и только ПОСЛЕ успешного
+	// пересчёта уничтожает старую одним arena_destroy — безопасно, т.к.
+	// цикл сообщений однопоточный и синхронный (см. run_lsp_server): ни
+	// один in-flight запрос не может держать указатель на предыдущее
+	// поколение, пока пересчитывается следующее.
+	arena:   virtual.Arena,
 }
 
 LSP_Server :: struct {
@@ -194,7 +209,15 @@ handle_did_change :: proc(server: ^LSP_Server, params: json.Value) {
 handle_did_close :: proc(server: ^LSP_Server, params: json.Value) {
 	p, ok := decode_params(proto.DidCloseTextDocumentParams, params)
 	if !ok do return
-	delete_key(&server.documents, string(p.text_document.uri))
+	uri := string(p.text_document.uri)
+	// Закрытие — конец жизни ЭТОГО LSP_Document: последнее поколение (см.
+	// revalidate_document) и сам doc (new(LSP_Document) в update_document,
+	// обычный хип) больше никому не нужны.
+	if doc, existed := server.documents[uri]; existed {
+		virtual.arena_destroy(&doc.arena)
+		free(doc)
+	}
+	delete_key(&server.documents, uri)
 }
 
 // file:///abs/path -> /abs/path. Декодирует %XX-escape'ы (core:net.
@@ -239,6 +262,11 @@ update_document :: proc(server: ^LSP_Server, uri: string, text: string) {
 		doc.path = uri_to_path(uri)
 		server.documents[uri] = doc
 	}
+	// Каждый keystroke/save клонирует новый текст (see строка ниже) —
+	// предыдущий клон больше никому не нужен (revalidate_document READ'ит
+	// doc.source ПОСЛЕ этого присваивания, значит уже видит новый) и
+	// иначе копился бы по одному клону на правку до конца сессии.
+	if existed do delete(doc.source)
 	doc.source = strings.clone(text)
 
 	// Изменившийся документ может быть чьей-то зависимостью: если util.ps
@@ -253,8 +281,25 @@ update_document :: proc(server: ^LSP_Server, uri: string, text: string) {
 }
 
 revalidate_document :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
+	// Новое поколение считается в СВОЕЙ арене (см. LSP_Document.arena) —
+	// context.allocator подменяется на неё до конца функции, так что
+	// load_module_graph_with_overrides/resolve_and_typecheck_all/
+	// build_usages (и всё, что они вызывают) ничего не узнают о подмене:
+	// им достаточно обычного mem.Allocator интерфейса. Подмена живёт
+	// только в ЛОКАЛЬНОМ context этого вызова — вызывающий (update_document)
+	// её не увидит.
+	new_arena: virtual.Arena
+	if err := virtual.arena_init_growing(&new_arena); err != nil {
+		// Не должно случиться в реальности (виртуальная память кончилась
+		// бы раньше на что-то другое) — оставляем doc как есть, не падаем.
+		return
+	}
+	context.allocator = virtual.arena_allocator(&new_arena)
+
 	// Открытые документы подставляются вместо чтения с диска — включая
-	// сам doc (его .source уже актуален на момент вызова).
+	// сам doc (его .source уже актуален на момент вызова). .source живёт
+	// на обычном хипе (strings.clone в update_document, ДО этой подмены
+	// аллокатора) — переживает уничтожение арены следующего поколения.
 	overrides := make(map[string]string)
 	for _, other_doc in server.documents {
 		key := core.resolve_import_path(other_doc.path, "")
@@ -267,12 +312,11 @@ revalidate_document :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
 	if entry_module == nil {
 		// Не должно случиться (entry всегда грузится первым в
 		// load_module_recursive), но на всякий случай не падаем молча.
+		// Новое поколение уже нечем использовать — уничтожаем сразу, doc
+		// остаётся на предыдущем (валидном) поколении.
+		virtual.arena_destroy(&new_arena)
 		return
 	}
-
-	doc.graph = graph
-	doc.prog = entry_module.ast
-	doc.file_id = entry_module.file_id
 
 	results := core.resolve_and_typecheck_all(&graph)
 	all_diagnostics := make([dynamic]core.Diagnostic)
@@ -285,6 +329,17 @@ revalidate_document :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
 			doc.tc_ctx = r.tc_ctx
 		}
 	}
+
+	// Новое поколение полностью посчитано и ГОТОВО — только теперь можно
+	// безопасно снести предыдущее. arena_destroy на нулевой (ещё ни разу
+	// не инициализированной) Arena — безопасный no-op (curr_block == nil,
+	// см. core:mem/virtual/arena.odin), так что отдельная проверка "это
+	// первое поколение?" не нужна.
+	virtual.arena_destroy(&doc.arena)
+	doc.arena = new_arena
+	doc.graph = graph
+	doc.prog = entry_module.ast
+	doc.file_id = entry_module.file_id
 	doc.all_diagnostics = all_diagnostics
 	doc.results = results
 

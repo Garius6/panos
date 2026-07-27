@@ -4,6 +4,7 @@ import core "../core"
 import proto "protocol"
 import "core:encoding/json"
 import "core:fmt"
+import "core:mem"
 import "core:mem/virtual"
 import "core:net"
 import "core:os"
@@ -63,78 +64,115 @@ LSP_Server :: struct {
 	// ничего (тогда project-wide rename/references ограничены уже
 	// открытыми документами, как раньше — см. project_wide_ps_files).
 	workspace_root: string,
+	// Настоящий хип-аллокатор процесса, захваченный ДО первой подмены
+	// context.allocator на msg_arena (см. handle_one_message) — единственный
+	// безопасный allocator для всего, что обязано пережить текущее
+	// сообщение (server.documents, doc.uri/.path/.source, workspace_root).
+	heap_allocator: mem.Allocator,
+	// Одна арена на ВСЕ сообщения, а не одна на каждое: envelope +
+	// decode_params(...) для каждого хендлера (JSON-разбор params, включая
+	// полный текст документа на didOpen/didChange) нигде не освобождались —
+	// подтверждено измерением (см. commit message), это ОТДЕЛЬНАЯ утечка от
+	// уже исправленной doc.graph/prog/res_ctx/tc_ctx в revalidate_document
+	// (та арена — на ПОКОЛЕНИЕ документа, эта — на СООБЩЕНИЕ). free_all
+	// (не destroy) в конце каждого сообщения — дешевле сбросить, чем
+	// destroy+init_growing заново: arena_free_all не возвращает
+	// зарезервированные блоки ОС, а переиспользует их для следующего
+	// сообщения.
+	msg_arena:      virtual.Arena,
 }
 
 run_lsp_server :: proc() {
 	server: LSP_Server
 	server.documents = make(map[string]^LSP_Document)
+	server.heap_allocator = context.allocator
+	if err := virtual.arena_init_growing(&server.msg_arena); err != nil {
+		fmt.eprintln("panos-lsp: не смог создать арену сообщений:", err)
+		return
+	}
 
 	reader: LSP_Reader
 	lsp_reader_init(&reader)
 
 	for {
-		data, ok := lsp_read_message(&reader)
-		if !ok do return // stdin закрыт клиентом — выходим тихо
+		should_continue := handle_one_message(&server, &reader)
+		if !should_continue do return
+	}
+}
 
-		envelope: RPC_Envelope
-		if uerr := json.unmarshal(data, &envelope); uerr != nil {
-			fmt.eprintln("panos-lsp: не смог разобрать envelope:", uerr, "raw:", string(data))
-			continue
-		}
-		if envelope.method == "" do continue // это ответ НА НАШ запрос — мы запросов клиенту не шлём
+// Один цикл сообщения: чтение + разбор envelope + диспатч — целиком под
+// msg_arena (см. LSP_Server.msg_arena), сброшенной ОДНИМ free_all в defer
+// независимо от того, каким путём функция вышла (return/continue-эквивалент
+// через switch/if). Единственное, что обязано пережить эту функцию —
+// server.documents/doc.uri/.path/.source/workspace_root — те явно
+// клонируются на server.heap_allocator внутри update_document/
+// handle_initialize, а не полагаются на текущий (арена) context.allocator.
+handle_one_message :: proc(server: ^LSP_Server, reader: ^LSP_Reader) -> (should_continue: bool) {
+	context.allocator = virtual.arena_allocator(&server.msg_arena)
+	defer virtual.arena_free_all(&server.msg_arena)
 
-		id_val := envelope.id
-		params := envelope.params
+	data, ok := lsp_read_message(reader)
+	if !ok do return false // stdin закрыт клиентом — выходим тихо
 
-		switch envelope.method {
-		case "initialize":
-			handle_initialize(&server, id_val, params)
-		case "initialized":
-		// notification от клиента после инициализации — квитировать нечем
-		case "shutdown":
-			send_null_response(id_val)
-		case "exit":
-			return
-		case "textDocument/didOpen":
-			handle_did_open(&server, params)
-		case "textDocument/didChange":
-			handle_did_change(&server, params)
-		case "textDocument/didClose":
-			handle_did_close(&server, params)
-		case "textDocument/hover":
-			handle_hover(&server, id_val, params)
-		case "textDocument/definition":
-			handle_definition(&server, id_val, params)
-		case "textDocument/completion":
-			handle_completion(&server, id_val, params)
-		case "textDocument/references":
-			handle_references(&server, id_val, params)
-		case "textDocument/prepareRename":
-			handle_prepare_rename(&server, id_val, params)
-		case "textDocument/rename":
-			handle_rename(&server, id_val, params)
-		case "textDocument/semanticTokens/full":
-			handle_semantic_tokens(&server, id_val, params)
-		case "textDocument/documentHighlight":
-			handle_document_highlight(&server, id_val, params)
-		case "textDocument/foldingRange":
-			handle_folding_range(&server, id_val, params)
-		case "textDocument/documentSymbol":
-			handle_document_symbol(&server, id_val, params)
-		case "textDocument/signatureHelp":
-			handle_signature_help(&server, id_val, params)
-		case "workspace/symbol":
-			handle_workspace_symbol(&server, id_val, params)
-		case "textDocument/codeLens":
-			handle_code_lens(&server, id_val, params)
-		case "textDocument/selectionRange":
-			handle_selection_range(&server, id_val, params)
-		case:
-			if envelope.id != nil {
-				send_error_response(id_val, -32601, "method not found")
-			}
+	envelope: RPC_Envelope
+	if uerr := json.unmarshal(data, &envelope); uerr != nil {
+		fmt.eprintln("panos-lsp: не смог разобрать envelope:", uerr, "raw:", string(data))
+		return true
+	}
+	if envelope.method == "" do return true // это ответ НА НАШ запрос — мы запросов клиенту не шлём
+
+	id_val := envelope.id
+	params := envelope.params
+
+	switch envelope.method {
+	case "initialize":
+		handle_initialize(server, id_val, params)
+	case "initialized":
+	// notification от клиента после инициализации — квитировать нечем
+	case "shutdown":
+		send_null_response(id_val)
+	case "exit":
+		return false
+	case "textDocument/didOpen":
+		handle_did_open(server, params)
+	case "textDocument/didChange":
+		handle_did_change(server, params)
+	case "textDocument/didClose":
+		handle_did_close(server, params)
+	case "textDocument/hover":
+		handle_hover(server, id_val, params)
+	case "textDocument/definition":
+		handle_definition(server, id_val, params)
+	case "textDocument/completion":
+		handle_completion(server, id_val, params)
+	case "textDocument/references":
+		handle_references(server, id_val, params)
+	case "textDocument/prepareRename":
+		handle_prepare_rename(server, id_val, params)
+	case "textDocument/rename":
+		handle_rename(server, id_val, params)
+	case "textDocument/semanticTokens/full":
+		handle_semantic_tokens(server, id_val, params)
+	case "textDocument/documentHighlight":
+		handle_document_highlight(server, id_val, params)
+	case "textDocument/foldingRange":
+		handle_folding_range(server, id_val, params)
+	case "textDocument/documentSymbol":
+		handle_document_symbol(server, id_val, params)
+	case "textDocument/signatureHelp":
+		handle_signature_help(server, id_val, params)
+	case "workspace/symbol":
+		handle_workspace_symbol(server, id_val, params)
+	case "textDocument/codeLens":
+		handle_code_lens(server, id_val, params)
+	case "textDocument/selectionRange":
+		handle_selection_range(server, id_val, params)
+	case:
+		if envelope.id != nil {
+			send_error_response(id_val, -32601, "method not found")
 		}
 	}
+	return true
 }
 
 // Достаёт корень воркспейса из initialize (rootUri -> rootPath ->
@@ -144,10 +182,17 @@ run_lsp_server :: proc() {
 handle_initialize :: proc(server: ^LSP_Server, id: json.Value, params: json.Value) {
 	p, ok := decode_params(proto.InitializeParams, params)
 	if ok {
+		// p — результат decode_params, живёт в msg_arena этого сообщения
+		// (см. handle_one_message). workspace_root переживает сообщение —
+		// временно возвращаем context.allocator на настоящий хип.
+		saved_allocator := context.allocator
+		context.allocator = server.heap_allocator
+		defer context.allocator = saved_allocator
+
 		if root_uri, has_root_uri := p.root_uri.?; has_root_uri {
 			server.workspace_root = uri_to_path(string(root_uri))
 		} else if root_path, has_root_path := p.root_path.?; has_root_path {
-			server.workspace_root = root_path
+			server.workspace_root = strings.clone(root_path)
 		} else if folders, has_folders := p.workspace_folders.?; has_folders && len(folders) > 0 {
 			server.workspace_root = uri_to_path(string(folders[0].uri))
 		}
@@ -255,12 +300,22 @@ path_to_uri :: proc(path: string) -> string {
 }
 
 update_document :: proc(server: ^LSP_Server, uri: string, text: string) {
+	// uri/text приходят из decode_params результата вызывающего handler'а —
+	// живут в msg_arena этого сообщения (см. handle_one_message).
+	// server.documents (ключ и *LSP_Document) и doc.uri/.path/.source
+	// обязаны пережить сообщение — временно возвращаем context.allocator
+	// на настоящий хип на время ИХ аллокации; revalidate_document ниже
+	// сама переключит его на арену поколения документа, так что
+	// восстанавливать вручную перед вызовом не нужно.
+	saved_allocator := context.allocator
+	context.allocator = server.heap_allocator
+
 	doc, existed := server.documents[uri]
 	if !existed {
 		doc = new(LSP_Document)
-		doc.uri = uri
+		doc.uri = strings.clone(uri)
 		doc.path = uri_to_path(uri)
-		server.documents[uri] = doc
+		server.documents[doc.uri] = doc
 	}
 	// Каждый keystroke/save клонирует новый текст (see строка ниже) —
 	// предыдущий клон больше никому не нужен (revalidate_document READ'ит
@@ -268,6 +323,8 @@ update_document :: proc(server: ^LSP_Server, uri: string, text: string) {
 	// иначе копился бы по одному клону на правку до конца сессии.
 	if existed do delete(doc.source)
 	doc.source = strings.clone(text)
+
+	context.allocator = saved_allocator
 
 	// Изменившийся документ может быть чьей-то зависимостью: если util.ps
 	// редактируется (ещё не сохранён), импортирующий его main.ps должен

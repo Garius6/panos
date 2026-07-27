@@ -103,6 +103,19 @@ test_слог_stdlib :: proc(t: ^testing.T) {
 	testing.expectf(t, result == Value(true), "слог: ожидалось true, получено %v", result)
 }
 
+// Логгер (фильтрация по уровню/тег/структурные поля/несколько приёмников)
+// — проверяется через файловый приёмник + фс.прочитать обратно, не через
+// перехват stdout (тот же принцип, что остальные fixture-тесты этого
+// файла: сравниваем возвращённое panos-значение, не побочный вывод).
+@(test)
+test_логгер_stdlib :: proc(t: ^testing.T) {
+	result, ok := run_module_file("fixtures/логгер_fixture_main.ps")
+	testing.expectf(t, ok, "логгер: стек пуст, нет результата")
+	if !ok do return
+
+	testing.expectf(t, result == Value(true), "логгер: ожидалось true, получено %v", result)
+}
+
 @(test)
 test_collections_stdlib :: proc(t: ^testing.T) {
 	result, ok := run_module_file("fixtures/collections_fixture_main.ps")

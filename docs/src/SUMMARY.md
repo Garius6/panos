@@ -24,6 +24,7 @@
 - [Процессы](./language/processes.md)
 - [Ввод-вывод и файловая система](./language/file-io.md)
 - [Сеть и HTTP](./language/networking.md)
+- [База данных (SQLite)](./language/database.md)
 - [Внешние функции (FFI)](./language/ffi.md)
 - [Стандартная библиотека](./language/standard-library.md)
 

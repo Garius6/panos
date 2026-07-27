@@ -17,6 +17,7 @@ Auto-generated from feature plans. Last updated: 2026-07-27.
 - HTTP server language capability (009-http-server): bridges the already-vendored (but previously client-only) `external/odin-http/server.odin` to the single-threaded panos VM. New opaque types `Слушатель`/`Запрос`, `.принять_запрос()` as an ordinary `Await_Async` builtin reusing the existing worker pool, `Запрос.ответить(...)` as a sync builtin delivering the response over a per-request channel that the odin-http thread is synchronously blocked on (`http.respond()` is thread-affine — can't be deferred to another thread). See `specs/009-http-server/`.
 - interface vtables (not a speckit feature — see Recent Changes): `Cast_Interface` (`core/vm.odin`) now resolves the method vtable at COMPILE TIME via exact `Symbol_Id` lookups, not a runtime name-prefix scan — the old scan silently produced an empty vtable for any `реализация Интерфейс для Т` declared outside the entry file (100% broken for real multi-module programs, not an edge case). No new dependency, `core/compiler.odin` + `core/vm.odin` only.
 - время.спать_мс (not a speckit feature — see Recent Changes): new native-only builtin, `core:time.sleep` (cross-platform) — sole motivation was `../panosiki/codegen`'s new `--watch` mode needing a poll interval; panos had no sleep primitive at all before this.
+- SQLite support (not a speckit feature — built via plan-mode, see Recent Changes): vendored, statically-linked `external/sqlite3/` amalgamation (same pattern as `external/libffi/`), new native-only `бд` module (`бд.открыть`/`Соединение_БД.выполнить`/`.запрос`/`.закрыть`), query rows returned as `Массив(Соответствие(Строка, Строка))` — no typed-value or BLOB support in v1.
 
 ## Project Structure
 
@@ -52,6 +53,43 @@ history of how the code came to exist — that belongs in commit messages,
 not source comments.
 
 ## Recent Changes
+- SQLite support (not a speckit feature — built via plan-mode): new `бд`
+  module (`бд.открыть(путь) -> Результат(Соединение_БД, Ошибка)`,
+  `Соединение_БД.выполнить(sql, параметры)` / `.запрос(sql, параметры)` /
+  `.закрыть()`), backed by vendored, statically-linked SQLite (amalgamation
+  `sqlite3.c`/`sqlite3.h`, public domain) — `external/sqlite3/`, same
+  vendoring shape as `external/libffi/` (per-platform prebuilt
+  `libsqlite3.{a,lib}`, `foreign import` in `core/sqlite3_bindings.odin`),
+  matching the standing "vendor everything, static link" policy. Three
+  design decisions made explicit before implementation: (1) native core
+  builtin (`core/vm_sql_native.odin`/`_wasm.odin`, same tier as
+  `фс`/`сеть`), not user-level FFI — query execution reuses the existing
+  non-blocking actor-I/O path (`vm.async_pool` + `Await_Async`), following
+  the `File_Value`/`in_flight`/`gc_pin` pattern streaming file/socket I/O
+  already established; (2) every column value comes back as plain
+  `Строка` (`sqlite3_column_text`) — no typed-value ADT, sidestepping an
+  unresolved "where would a new enum type live" question for a v1 that
+  doesn't need it; callers convert via `строки.в_число(...)` themselves.
+  (3) a `NULL` column is omitted from the row's `Соответствие` entirely
+  (not `""`, which would be ambiguous with a real empty string) —
+  detected via the already-idiomatic `.есть("колонка")`/`.получить(
+  "колонка", запасное)`. `параметры` bind ONLY positionally via `?`
+  placeholders (`sqlite3_bind_text`) — no string-concatenation SQL path
+  exists at all, forcing safe parameterized queries by construction, not
+  by convention. A `BLOB` column in a `.запрос()` result set fails the
+  whole call with `Ошибка("бд", "BLOB-колонки не поддержаны в этой
+  версии")` rather than silently lossy-stringifying binary data. New
+  `.github/workflows/vendor-sqlite.yml` (structural sibling of
+  `vendor-libffi.yml`, simpler — no autotools, just `cc -c sqlite3.c` +
+  `ar rcs` per platform, MSVC `cl`/`lib.exe` on Windows) rebuilds the
+  vendored archives on `workflow_dispatch`. New `core/e2e_sql_test.odin`
+  (6 tests: basic CRUD round-trip, NULL-omission, BLOB-rejection,
+  bad-SQL-syntax error, operation-on-closed-connection error,
+  invalid-open-path error — a "closed connection" test deliberately
+  substitutes for a flaky timing-dependent concurrent-in-flight test).
+  `docs/src/language/database.md` — every code example verified against
+  the real binary before being considered complete (same practice as the
+  rest of this doc set).
 - время.спать_мс + codegen --check/--watch (not a speckit feature —
   built via plan-mode, motivated by designing a build_runner-style
   workflow for `../panosiki/codegen`, see that repo's own commits): new

@@ -919,7 +919,6 @@ compile_for_in_stmt :: proc(ctx: ^Compiler, statement: Stmt, s: ^For_In_Stmt) {
 maybe_emit_interface_cast :: proc(ctx: ^Compiler, expr: Expr) {
 	if struct_type, needs_cast := ctx.tc.interface_casts[expr]; needs_cast {
 		emit_opcode(ctx, .Cast_Interface)
-		emit_byte(ctx, make_constant(ctx, Value(perm_string(struct_type.name))))
 		if len(struct_type.methods) > 255 {
 			fmt.panicf(
 				"Compiler Error: у типа '%s' слишком много методов для интерфейсной vtable (%d, максимум 255)",
@@ -1863,11 +1862,10 @@ print_assembler :: proc(registry: map[string]^Compiled_Function) {
 				command := fmt.tprintf("%sGET_PROPERTY\n", prefix)
 				strings.write_string(&builder, command)
 			case .Cast_Interface:
-				// Переменная длина: struct_name_idx (1 байт) + method_count
-				// (1 байт) + method_count пар (имя-константа, fn-константа)
-				// — см. maybe_emit_interface_cast.
+				// Переменная длина: method_count (1 байт) + method_count пар
+				// (имя-константа, fn-константа) — см. maybe_emit_interface_cast.
 				method_count := int(instructions[idx + 1])
-				idx += 1 + 1 + method_count * 2
+				idx += 1 + method_count * 2
 				command := fmt.tprintf("%sCAST_INTERFACE (%d methods)\n", prefix, method_count)
 				strings.write_string(&builder, command)
 

@@ -297,7 +297,7 @@ value_to_display_string :: proc(vm: ^VM, value: Value, visited: ^map[rawptr]bool
 
 	#partial switch val in value {
 	case f64:
-		return fmt.tprintf("%v", val)
+		return format_number(val)
 	case bool:
 		return val ? "истина" : "ложь"
 	case ^Panos_String:
@@ -993,6 +993,35 @@ invoke_collection_method :: proc(
 	)
 }
 
+// fmt.tprintf("%v", f64) (Go/Odin default float formatting) переключается
+// на scientific notation выше ~6-7 значащих цифр — живой баг, найден при
+// аудите техдолга 2026-07-27: строки.из_числа(1234567.0) давало
+// "1.234567e+06" вместо "1234567" (см. CLAUDE.md — раньше обходили ЛОКАЛЬНО
+// в каждом вызывающем месте, где могли гарантировать малую величину, не
+// фиксили здесь). strconv.generic_ftoa с fmt='f' и precision=-1 (shortest
+// round-trip — тот же приём, что Go's strconv.FormatFloat(f, 'f', -1, 64))
+// даёт фиксированно-точечный формат без экспоненты для ЛЮБОЙ величины —
+// компромисс: для экстремальных значений (1e300) строка станет длинной
+// вместо компактной, но это несравнимо реже, чем обычные "большие, но не
+// астрономические" числа (ID, размеры файлов, epoch-мс), которые ломались
+// раньше. buf — стек-локальный, возвращаем клон на context.temp_allocator
+// (та же lifetime-конвенция, что и остальные fmt.tprintf-результаты в этом
+// файле — потребитель либо копирует НЕМЕДЛЕННО через gc_new_string, либо
+// сам живёт в temp_allocator-скоупе, см. value_to_display_string).
+format_number :: proc(num: f64) -> string {
+	buf: [400]byte
+	// generic_ftoa всегда добавляет знак ('+' для неотрицательных) — %v
+	// (прежнее форматирование) знак для положительных не печатал, так что
+	// срезаем ведущий '+', чтобы не поменять видимый формат для всей
+	// остальной массы обычных (неотрицательных) чисел.
+	formatted := strconv.generic_ftoa(buf[:], num, 'f', -1, 64)
+	text := string(formatted)
+	if len(text) > 0 && text[0] == '+' {
+		text = text[1:]
+	}
+	return strings.clone(text, context.temp_allocator)
+}
+
 call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	// фс::*/ос::окружение*/ввод_вывод::прочитать_строку/поток/сеть::подключиться
 	// — в vm_io_native.odin/vm_io_wasm.odin (#+build split, трогают
@@ -1381,7 +1410,7 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 		if !ok_num {
 			fmt.panicf("Runtime Error: строки.из_числа() ожидает число")
 		}
-		return Value(gc_new_string(vm, fmt.tprintf("%v", num))), true
+		return Value(gc_new_string(vm, format_number(num))), true
 
 	case "строки::из_целого":
 		expect_arg_count(name, len(args), 1)
@@ -1897,22 +1926,51 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			continue
 
 		case .Try_Unwrap:
-			// Опция/Результат — обычные Variant_Value (как любой user-enum),
-			// построенные через Build_Variant. Тег-порядок (Нет=0/Есть=1,
-			// Успех=0/Неудача=1) зафиксирован в prelude.odin.
+			// Опция/Результат, построенные ПОЛЬЗОВАТЕЛЬСКИМ кодом (через
+			// Build_Variant — user function, возвращающая Результат(...),
+			// компилируется тем же .Constructor_Variant путём, что любой
+			// enum) — обычные Variant_Value. Но нативные builtin'ы
+			// (фс.прочитать, сеть.http_запрос и т.д., make_ok_result/
+			// make_error_result в этом файле) кладут на стек НАПРЯМУЮ
+			// ^Option_Value/^Result_Value — отдельное, более дешёвое
+			// представление, без похода через bytecode Build_Variant. Раньше
+			// здесь проверялся ТОЛЬКО Variant_Value — `фс.прочитать(путь)?`
+			// (ровно то, как `?` описан в docs/src/language/option-and-
+			// result.md) падало паникой "оператор '?' ожидал Опцию или
+			// Результат", хотя тип-чекер это пропускал: живой баг, найден
+			// при аудите техдолга 2026-07-27. variant_tag/variant_field
+			// (выше) уже нормализуют оба Option_Value/Result_Value под тот
+			// же тег-порядок, что и Variant_Value (Нет=0/Есть=1,
+			// Успех=0/Неудача=1, см. prelude.odin) — тут делаем то же самое
+			// напрямую через их родные has_value/is_ok поля.
 			value := pop(&vm.stack)
-			if variant, ok := value.(^Variant_Value); ok {
-				switch variant.type_name {
+			#partial switch v in value {
+			case ^Option_Value:
+				if v.has_value {
+					append(&vm.stack, v.value)
+				} else {
+					return_from_current_frame(vm, value)
+					continue
+				}
+			case ^Result_Value:
+				if v.is_ok {
+					append(&vm.stack, v.value)
+				} else {
+					return_from_current_frame(vm, value)
+					continue
+				}
+			case ^Variant_Value:
+				switch v.type_name {
 				case "Опция":
-					if variant.tag_index == 1 { 	// Есть
-						append(&vm.stack, variant.fields[0])
+					if v.tag_index == 1 { 	// Есть
+						append(&vm.stack, v.fields[0])
 					} else { 	// Нет
 						return_from_current_frame(vm, value)
 						continue
 					}
 				case "Результат":
-					if variant.tag_index == 0 { 	// Успех
-						append(&vm.stack, variant.fields[0])
+					if v.tag_index == 0 { 	// Успех
+						append(&vm.stack, v.fields[0])
 					} else { 	// Неудача
 						return_from_current_frame(vm, value)
 						continue
@@ -1922,7 +1980,7 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 						"Runtime Error: оператор '?' ожидал Опцию или Результат",
 					)
 				}
-			} else {
+			case:
 				fmt.panicf(
 					"Runtime Error: оператор '?' ожидал Опцию или Результат",
 				)
@@ -2225,9 +2283,6 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			}
 
 		case .Cast_Interface:
-			frame.ip += 1
-			struct_name_index := instructions[frame.ip]
-			_ = frame.function.constants[struct_name_index].(^Panos_String).data // только для панике ниже
 			frame.ip += 1
 			method_count := int(instructions[frame.ip])
 

@@ -176,6 +176,41 @@ test_archive_stdlib :: proc(t: ^testing.T) {
 	testing.expectf(t, result == Value(true), "архив: ожидалось true, получено %v", result)
 }
 
+// Регрессия: строки.из_числа (vm.odin, теперь format_number) звало
+// fmt.tprintf("%v", f64) — Go/Odin default float formatting переключается
+// на scientific notation выше ~6-7 значащих цифр: из_числа(1234567.0)
+// давало "1.234567e+06" вместо "1234567". Раньше обходили ЛОКАЛЬНО в
+// каждом вызывающем месте (std/дата.ps и т.д., см. CLAUDE.md), не
+// исправляя на источнике. Найдено при аудите техдолга 2026-07-27, теперь
+// строки.из_числа сама даёт фиксированно-точечный формат для любой
+// величины (strconv.generic_ftoa, fmt='f', precision=-1 — shortest
+// round-trip). Отдельно проверяет, что value_to_display_string (встроку/
+// печать/строка/интерполяция) тоже больше не бьётся — там был ТОТ ЖЕ
+// fmt.tprintf("%v", ...) паттерн, независимо исправленный тем же
+// приёмом.
+@(test)
+test_string_from_number_avoids_scientific_notation :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт строки
+
+		функ старт() -> Строка
+			пер a = строки.из_числа(1234567.0)
+			пер b = строки.из_числа(1000000000000.0)
+			пер c = встроку(9999999)
+			"\(a) \(b) \(c)"
+		конец
+	`)
+	testing.expectf(t, ok, "[из_числа: scientific notation] стек пуст")
+	if ok {
+		testing.expectf(
+			t,
+			value_str_eq(result, "1234567 1000000000000 9999999"),
+			"[из_числа: scientific notation] ожидалось '1234567 1000000000000 9999999', получено %v",
+			result,
+		)
+	}
+}
+
 // Раньше module_loader.odin panicf'ал на "модуль не найден" — единственный
 // оставшийся panicking путь пайплайна (см. TASKS.md §Стадия 10 П6). Роняло
 // не только CLI (терпимо — main.odin гейтит и выходит), но и ВЕСЬ LSP-

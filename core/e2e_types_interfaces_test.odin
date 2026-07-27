@@ -1450,6 +1450,42 @@ test_try_operator_error_type_checked_when_nested_in_if :: proc(t: ^testing.T) {
 	expect_diagnostic(t, diags, "Type Error: оператор '?' возвращает ошибку типа 'ОшибкаБ', но функция ожидает 'ОшибкаА'")
 }
 
+// Регрессия: `?` раньше проверял ТОЛЬКО ^Variant_Value (пользовательские
+// Опция/Результат, построенные через Build_Variant) — нативные builtin'ы
+// (фс.прочитать и т.д., vm.odin's make_ok_result/make_error_result) кладут
+// на стек ^Result_Value/^Option_Value напрямую, отдельное представление
+// без похода через bytecode. `фс.прочитать(путь)?` — ровно то, как `?`
+// показан в docs/src/language/option-and-result.md/file-io.md — падал
+// рантайм-паникой "оператор '?' ожидал Опцию или Результат", хотя
+// тайпчекер это пропускал. Найдено при аудите техдолга, не тестами.
+@(test)
+test_try_operator_works_on_native_builtin_result_directly :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт фс
+
+		функ читать(путь: Строка) -> Результат(Строка, Ошибка)
+			пер текст = фс.прочитать(путь)?
+			Результат.Успех(текст)
+		конец
+
+		функ старт() -> Строка
+			выбор читать("/no/such/panos_e2e_missing_file_zzz.txt")
+				Результат.Успех(_) -> "неожиданно успех"
+				Результат.Неудача(ош) -> "провалилось"
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "[? на нативном Результат] стек пуст")
+	if ok {
+		testing.expectf(
+			t,
+			value_str_eq(result, "провалилось"),
+			"[? на нативном Результат] ожидалось 'провалилось', получено %v",
+			result,
+		)
+	}
+}
+
 @(test)
 test_break_outside_loop_still_rejected_when_nested_in_if :: proc(t: ^testing.T) {
 	diags := typecheck_only(`

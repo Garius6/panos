@@ -76,6 +76,45 @@ test_fs_directory_ops_create_list_remove :: proc(t: ^testing.T) {
 	testing.expectf(t, result == Value(true), "[фс directory-ops] create/list/remove не сошлись, получено %v", result)
 }
 
+// фс.удалить — отдельно от удалить_директорию (та уже умела и файл, и
+// дерево, но с обманчивым именем для одного файла): os.remove БЕЗ
+// remove_all-фоллбека — падает Ошибкой на непустой директории вместо
+// молчаливого рекурсивного удаления.
+@(test)
+test_fs_remove_file :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт фс
+
+		функ старт() -> Булево
+			фс.записать("/tmp/panos_e2e_remove_file_test.txt", "содержимое")
+			пер существовал = фс.есть("/tmp/panos_e2e_remove_file_test.txt")
+			пер р = фс.удалить("/tmp/panos_e2e_remove_file_test.txt")
+			существовал и р.успех() и не фс.есть("/tmp/panos_e2e_remove_file_test.txt")
+		конец
+	`)
+	testing.expectf(t, ok, "[фс.удалить] пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(true), "[фс.удалить] файл должен был существовать и затем исчезнуть, получено %v", result)
+}
+
+@(test)
+test_fs_remove_nonempty_directory_is_error :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		импорт фс
+
+		функ старт() -> Булево
+			фс.создать_директорию("/tmp/panos_e2e_remove_nonempty_test")
+			фс.записать("/tmp/panos_e2e_remove_nonempty_test/файл.txt", "x")
+			пер р = фс.удалить("/tmp/panos_e2e_remove_nonempty_test")
+			фс.удалить_директорию("/tmp/panos_e2e_remove_nonempty_test") // подчистить за собой
+			р.ошибка()
+		конец
+	`)
+	testing.expectf(t, ok, "[фс.удалить непустая директория] пустой стек")
+	if !ok do return
+	testing.expectf(t, result == Value(true), "[фс.удалить непустая директория] ожидалась Ошибка, не тихое рекурсивное удаление, получено %v", result)
+}
+
 // ос::завершить реально терминирует ТЕКУЩИЙ процесс (os.exit -> !) — вызвать
 // его в этом же тестовом процессе означало бы убить сам `odin test`.
 // Единственный честный способ проверить exit code — спавнить настоящий

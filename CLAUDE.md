@@ -15,6 +15,7 @@ Auto-generated from feature plans. Last updated: 2026-07-27.
 - gitsync per-version authorship (007-gitsync-per-version-author): extends `panosiki/v8storage` with a method wrapping `/ConfigurationRepositoryReport` (CLI, `ос.выполнить` — no COM), plus a new `panosiki/скобки` package (bracket-format 1C text parser, narrow port of `oscript-library/yabr`, MPL-2.0) to extract per-version author from the resulting MXL report; wires into `panosiki/gitsync/sync.ps` to replace 006's single-author-per-run simplification. All 9 `panosiki/*` packages now live on `github.com/Garius6/*` (public, tagged) instead of local file paths. See `specs/007-gitsync-per-version-author/`.
 - gitsync auto push/pull (008-gitsync-auto-push-pull): optional `--remote <name>` flag on `gitsync sync` — `git pull --ff-only` before the version loop (abort with no progress on divergence), `git push` after only if new commits were made. Uses `panosiki/gitrunner`'s existing escape hatch (`выполнить_команду`) and `получить_текущую_ветку` — no changes to gitrunner itself. See `specs/008-gitsync-auto-push-pull/`.
 - HTTP server language capability (009-http-server): bridges the already-vendored (but previously client-only) `external/odin-http/server.odin` to the single-threaded panos VM. New opaque types `Слушатель`/`Запрос`, `.принять_запрос()` as an ordinary `Await_Async` builtin reusing the existing worker pool, `Запрос.ответить(...)` as a sync builtin delivering the response over a per-request channel that the odin-http thread is synchronously blocked on (`http.respond()` is thread-affine — can't be deferred to another thread). See `specs/009-http-server/`.
+- interface vtables (not a speckit feature — see Recent Changes): `Cast_Interface` (`core/vm.odin`) now resolves the method vtable at COMPILE TIME via exact `Symbol_Id` lookups, not a runtime name-prefix scan — the old scan silently produced an empty vtable for any `реализация Интерфейс для Т` declared outside the entry file (100% broken for real multi-module programs, not an edge case). No new dependency, `core/compiler.odin` + `core/vm.odin` only.
 
 ## Project Structure
 
@@ -50,6 +51,61 @@ history of how the code came to exist — that belongs in commit messages,
 not source comments.
 
 ## Recent Changes
+- cross-module-interface-vtable-fix + слог-Логгер (not a speckit feature
+  — built via plan-mode, discovered while extending `std/слог.ps` with a
+  `Логгер` interface): a real, previously-unknown correctness bug in
+  `Cast_Interface` (`core/vm.odin`) — the interface vtable was built by a
+  RUNTIME scan of the global `vm.compiled_functions` map for keys with
+  prefix `"<StructName>::"`, but method compiled-function names use
+  `symbol_registry_key` → `sym.full_name`, which is
+  `"<module.path>::<name>"` for any symbol whose declaring module has a
+  non-empty path (`core/resolver.odin:401-402`) — i.e. any FILE module
+  except the entry script. So a struct's `реализация Интерфейс для Т`
+  declared in any imported file (not the entry file) produced a vtable
+  scan that could never match, and casting/calling through the interface
+  panicked "метод не найден в vtable интерфейса" — 100% reproducible,
+  not an edge case, for the exact scenario `слог.Логгер` was built for
+  (implement an interface in a library module, use it polymorphically
+  from the caller). Silent until now because the ONLY existing interface
+  tests (`Печатаемое`/`Сравниваемое`/`Складываемое` in
+  `e2e_types_interfaces_test.odin`) all go through `run_code` (inline
+  source, module.path == "" — entry-file-shaped by construction), never
+  through `run_module_file` (real multi-file `импорт`). Fix: resolve the
+  vtable at COMPILE TIME instead, via `struct_type.methods` (exact
+  `Symbol_Id` → `symbol_registry_key` → registry lookup) — the same
+  mechanism `.Method_Struct` (ordinary method calls) already used
+  correctly for cross-module dispatch; `Cast_Interface`'s bytecode now
+  carries pre-resolved (method-name-constant, function-pointer-constant)
+  pairs instead of a bare struct name, so `Invoke_Interface` at runtime
+  is a direct map read, not a name-based guess. Relies on `graph.order`
+  (module_loader.odin) being dependency-before-dependent — an invariant
+  `.Method_Struct` already relied on, verified before assuming it.
+  New regression fixtures `fixtures/interface_cross_module_{lib,main}.ps`
+  (interface + impl in a non-entry module, invoked polymorphically from
+  another) — this is the test shape that was completely missing before.
+  Separately: `std/слог.ps` — `Логгер` is now an INTERFACE (5 methods:
+  отладка/инфо/предупреждение/ошибка/критично), `СтандартныйЛоггер` the
+  concrete builtin implementation (builder chain `.с_уровнем/.с_тегом/
+  .с_приёмником` stays on the concrete type — an interface-typed value
+  only exposes the interface's own declared methods, not the builder's).
+  New `std/дата.ps` — `форматировать_utc(epoch_мс)`, Howard Hinnant's
+  civil_from_days algorithm (positive-epoch-only, no pre-1970 branch —
+  the only caller is `время.сейчас_мс()`), verified against `date -u`
+  across several boundaries including a leap day. New core builtin
+  `фс::удалить` (`core/vm_io_native.odin`, wasm panic-listed, `core/
+  stdlib.odin` registration) — plain `os.remove`, deliberately NO
+  `remove_all` fallback unlike `фс::удалить_директорию` (that one already
+  silently handled both file and non-empty-dir cases — reusing it under
+  a "delete a file" name risked an unexpected recursive delete). Two
+  real bugs found only by running code, not by reading it: `для` as a
+  method name is a parse error (reserved keyword, for-loops) — renamed to
+  `с_тегом`; a `Уровень` variant named `Ошибка` collides with the builtin
+  `Ошибка` type used everywhere in `Результат(T, Ошибка)` — renamed to
+  `Сбой` (display string stays `"[ОШИБКА]"`). Also: `строки.из_числа`
+  switches to scientific notation above ~6-7 significant digits
+  (`fmt.tprintf("%v", f64)` in Odin, `core/vm.odin:1377`) — worked around
+  locally with a digit-by-digit formatter, not fixed at the source (not
+  in scope of this work).
 - http-router (not a speckit feature — built via plan-mode): `Маршрутизатор`
   in `std/сеть/http.ps` — Go-style route registration
   (`.получить`/`.отправить_пост`/`.отправить_put`/`.отправить_patch`/

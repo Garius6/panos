@@ -89,6 +89,8 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, new_array_type(TY_STRING), TY_ERROR))
 	case "фс::удалить_директорию":
 		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_NUM, TY_ERROR))
+	case "фс::удалить":
+		return builtin_function_type_1(TY_STRING, stdlib_result_type(graph, TY_NUM, TY_ERROR))
 	case "ос::аргументы":
 		return new_function_type(make([dynamic]^Type), new_array_type(TY_STRING))
 	case "ос::версия_паноса":
@@ -292,6 +294,7 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 		add_builtin_export(graph, module, "создать_директорию", builtin_export_type(graph, "фс::создать_директорию"))
 		add_builtin_export(graph, module, "список_директории", builtin_export_type(graph, "фс::список_директории"))
 		add_builtin_export(graph, module, "удалить_директорию", builtin_export_type(graph, "фс::удалить_директорию"))
+		add_builtin_export(graph, module, "удалить", builtin_export_type(graph, "фс::удалить"))
 	} else if name == "ос" {
 		add_builtin_export(
 			graph,

@@ -194,6 +194,20 @@ call_builtin_io :: proc(vm: ^VM, name: string, args: []Value) -> (result: Value,
 		}
 		return make_ok_result(vm, Value(f64(0))), true, true
 
+	case "фс::удалить":
+		expect_arg_count(name, len(args), 1)
+		path := expect_string_arg(name, args[0])
+		// Намеренно ТОЛЬКО os.remove — без remove_all-фоллбека, в отличие
+		// от удалить_директорию выше: "удалить" звучит как единственный
+		// файл, случайно указать сюда непустую директорию и рекурсивно её
+		// стереть было бы небезопасным сюрпризом. Падает Ошибкой на
+		// непустой директории — тогда используйте удалить_директорию явно.
+		err := os.remove(path)
+		if err != nil {
+			return make_error_result(vm, make_error_value(vm, "фс", fmt.tprintf("%v", err))), true, true
+		}
+		return make_ok_result(vm, Value(f64(0))), true, true
+
 	case "ос::окружение":
 		expect_arg_count(name, len(args), 1)
 		key := expect_string_arg(name, args[0])

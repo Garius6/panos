@@ -1,11 +1,10 @@
-package mir
+package core
 
-import core "../"
 
 // Отдельный Odin-пакет (не часть package core) — намеренное отступление
 // от плоской конвенции core/*.odin, только для этой новой подсистемы (см.
 // план в момент создания файла). Типы резолвера/тайпчекера (Symbol_Id,
-// ^Type, Span) переиспользуются напрямую через core. — вся семантическая
+// ^Type, Span) переиспользуются напрямую через  — вся семантическая
 // информация (типы, резолв имён) уже посчитана резолвером/тайпчекером
 // ДО lowering; MIR её не пересчитывает, только читает (core/mir/lowering.
 // odin).
@@ -20,9 +19,9 @@ INVALID_BLOCK :: max(Block_Id)
 
 Mir_Local :: struct {
 	id:     Local_Id,
-	symbol: core.Symbol_Id,
+	symbol: Symbol_Id,
 	name:   string, // для print.odin — не читать имя обратно через symbol/resolver
-	type:   ^core.Type,
+	type:   ^Type,
 }
 
 Bin_Op :: enum {
@@ -169,9 +168,9 @@ Call_Foreign_Instr :: struct {
 	// Внешние (`внешний`) функции — НЕ Mir_Function (нет MIR-тела, они
 	// маршаллятся через libffi, см. core/vm_ffi_native.odin) — Function_Id
 	// был бы типовым враньём (индексировал бы module.functions, где их
-	// нет). Несём резолвенный ^core.Foreign_Function напрямую, как
+	// нет). Несём резолвенный ^Foreign_Function напрямую, как
 	// сегодняшний байткод несёт его через constants-пул.
-	fn:   ^core.Foreign_Function,
+	fn:   ^Foreign_Function,
 	args: []Value_Id,
 }
 
@@ -276,9 +275,13 @@ Function_Ref_Instr :: struct {
 	fn:  Function_Id,
 }
 
+// callee: Value_Id (не Function_Id) — та же причина, что Call_Value_Instr:
+// core/vm.odin's .Spawn читает callee СО СТЕКА строго ПОД аргументами,
+// значение должно быть эмитировано (обычно через Function_Ref_Instr)
+// ДО лоуринга аргументов, см. emit_fn_ref (core/mir/lowering.odin).
 Spawn_Instr :: struct {
 	dst:    Value_Id,
-	callee: Function_Id,
+	callee: Value_Id,
 	args:   []Value_Id,
 }
 
@@ -400,13 +403,13 @@ Mir_Block :: struct {
 	id:           Block_Id,
 	instructions: [dynamic]Mir_Instruction,
 	terminator:   Mir_Terminator, // nil, пока блок не завершён — см. builder.odin
-	span:         core.Span,
+	span:         Span,
 }
 
 Mir_Function :: struct {
 	id:          Function_Id,
 	name:        string, // тот же registry-ключ, что Compiled_Function.name сегодня
-	symbol:      core.Symbol_Id,
+	symbol:      Symbol_Id,
 	parameters:  []Local_Id,
 	locals:      [dynamic]Mir_Local,
 	// value_types[i] — статический тип Value_Id(i); индекс == Value_Id,
@@ -415,11 +418,11 @@ Mir_Function :: struct {
 	// небезопасно, поэтому везде id, не ^Mir_Block/^Mir_Local, то же
 	// решение, что vm.stack: [dynamic]Value + frame_pointer-индекс вместо
 	// сырых указателей, см. core/vm.odin).
-	value_types: [dynamic]^core.Type,
+	value_types: [dynamic]^Type,
 	blocks:      [dynamic]Mir_Block,
 	entry:       Block_Id,
-	result_type: ^core.Type,
-	span:        core.Span,
+	result_type: ^Type,
+	span:        Span,
 }
 
 Mir_Module :: struct {

@@ -1,6 +1,5 @@
-package mir
+package core
 
-import core "../"
 
 // Mir_Builder — тонкая обёртка над ОДНОЙ функцией модуля, накапливающая
 // инструкции в "текущий" блок. Ссылается на функцию через module+fn_id
@@ -38,9 +37,9 @@ new_module :: proc() -> Mir_Module {
 new_function :: proc(
 	module: ^Mir_Module,
 	name: string,
-	symbol: core.Symbol_Id,
-	result_type: ^core.Type,
-	span: core.Span,
+	symbol: Symbol_Id,
+	result_type: ^Type,
+	span: Span,
 ) -> Function_Id {
 	id := Function_Id(len(module.functions))
 	append(
@@ -50,7 +49,7 @@ new_function :: proc(
 			name = name,
 			symbol = symbol,
 			locals = make([dynamic]Mir_Local),
-			value_types = make([dynamic]^core.Type),
+			value_types = make([dynamic]^Type),
 			blocks = make([dynamic]Mir_Block),
 			entry = INVALID_BLOCK,
 			result_type = result_type,
@@ -94,9 +93,9 @@ set_current_block :: proc(b: ^Mir_Builder, id: Block_Id) {
 
 new_local :: proc(
 	b: ^Mir_Builder,
-	symbol: core.Symbol_Id,
+	symbol: Symbol_Id,
 	name: string,
-	type: ^core.Type,
+	type: ^Type,
 ) -> Local_Id {
 	fn := current_function(b)
 	id := Local_Id(len(fn.locals))
@@ -104,14 +103,14 @@ new_local :: proc(
 	return id
 }
 
-new_value :: proc(b: ^Mir_Builder, type: ^core.Type) -> Value_Id {
+new_value :: proc(b: ^Mir_Builder, type: ^Type) -> Value_Id {
 	fn := current_function(b)
 	id := Value_Id(len(fn.value_types))
 	append(&fn.value_types, type)
 	return id
 }
 
-value_type :: proc(b: ^Mir_Builder, v: Value_Id) -> ^core.Type {
+value_type :: proc(b: ^Mir_Builder, v: Value_Id) -> ^Type {
 	return current_function(b).value_types[int(v)]
 }
 
@@ -126,7 +125,7 @@ current_block :: proc(b: ^Mir_Builder) -> ^Mir_Block {
 // emit/terminate дальше, эта паника — второй, defensive рубеж).
 emit :: proc(b: ^Mir_Builder, instr: Mir_Instruction) {
 	if b.terminated {
-		panic("mir.emit: текущий блок уже завершён terminator'ом")
+		panic("mir_emit: текущий блок уже завершён terminator'ом")
 	}
 	blk := current_block(b)
 	append(&blk.instructions, instr)
@@ -134,7 +133,7 @@ emit :: proc(b: ^Mir_Builder, instr: Mir_Instruction) {
 
 terminate :: proc(b: ^Mir_Builder, term: Mir_Terminator) {
 	if b.terminated {
-		panic("mir.terminate: текущий блок уже завершён terminator'ом")
+		panic("mir_terminate: текущий блок уже завершён terminator'ом")
 	}
 	blk := current_block(b)
 	blk.terminator = term

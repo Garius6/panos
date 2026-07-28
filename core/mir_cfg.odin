@@ -1,4 +1,4 @@
-package mir
+package core
 
 // Cfg_Info — вычисляется НА ЛЕТУ из terminator'ов блоков функции, не
 // хранится как отдельный синхронизируемый граф (см. mir.odin: terminator

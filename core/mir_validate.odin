@@ -1,6 +1,5 @@
-package mir
+package core
 
-import core "../"
 import "core:fmt"
 
 Validation_Issue :: struct {
@@ -133,7 +132,7 @@ validate_function :: proc(
 				)
 			}
 		case ^Return_Term:
-			returns_value := core.prune_type(fn.result_type) != core.TY_VOID
+			returns_value := prune_type(fn.result_type) != TY_VOID
 			has_value := t.value != nil
 			if returns_value && !has_value {
 				append(
@@ -425,6 +424,7 @@ instr_refs :: proc(
 		dst = v.dst
 	case ^Spawn_Instr:
 		dst = v.dst
+		append(&operands, v.callee)
 		for a in v.args do append(&operands, a)
 	case ^Send_Instr:
 		append(&operands, v.process, v.message)

@@ -1,6 +1,6 @@
-package mir
+#+build !js
+package core
 
-import core "../"
 import "core:strings"
 import "core:testing"
 
@@ -15,7 +15,7 @@ import "core:testing"
 
 @(private = "file")
 lower_source :: proc(t: ^testing.T, source: string) -> (Mir_Module, ^Mir_Function) {
-	result := core.check_source(source)
+	result := check_source(source)
 	testing.expectf(t, len(result.diags) == 0, "check_source diagnostics: %v", result.diags)
 
 	module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
@@ -123,7 +123,8 @@ test_mir_function_call :: proc(t: ^testing.T) {
 	)
 	expect_valid(t, &module, fn)
 	dump := print_function(fn)
-	testing.expectf(t, strings.contains(dump, "= call fn_"), "ожидался call: %s", dump)
+	testing.expectf(t, strings.contains(dump, "fn_ref fn_"), "ожидался fn_ref: %s", dump)
+	testing.expectf(t, strings.contains(dump, "call_value"), "ожидался call_value: %s", dump)
 	found_helper := false
 	for &f in module.functions do if f.name == "помощник" do found_helper = true
 	testing.expectf(t, found_helper, "ожидалась функция 'помощник' в модуле")
@@ -400,7 +401,7 @@ test_mir_struct_construct_and_method_call :: proc(t: ^testing.T) {
 	expect_valid(t, &module, fn)
 	dump := print_function(fn)
 	testing.expectf(t, strings.contains(dump, "new_aggregate"), "ожидался new_aggregate: %s", dump)
-	testing.expectf(t, strings.contains(dump, "call fn_"), "ожидался call fn_: %s", dump)
+	testing.expectf(t, strings.contains(dump, "call_value"), "ожидался call_value: %s", dump)
 	found_method := false
 	for &f in module.functions do if f.name == "Точка::сумма" do found_method = true
 	testing.expectf(t, found_method, "ожидался метод 'Точка::сумма' в модуле")
@@ -521,7 +522,7 @@ test_mir_spawn_and_receive :: proc(t: ^testing.T) {
 	)
 	expect_valid(t, &module, fn)
 	dump := print_function(fn)
-	testing.expectf(t, strings.contains(dump, "spawn fn_"), "ожидался spawn: %s", dump)
+	testing.expectf(t, strings.contains(dump, "= spawn v"), "ожидался spawn: %s", dump)
 
 	found_worker := false
 	for &f in module.functions {
@@ -719,4 +720,211 @@ test_mir_bounded_generic_decl_is_skipped :: proc(t: ^testing.T) {
 	found_generic := false
 	for &f in module.functions do if f.name == "макс" do found_generic = true
 	testing.expectf(t, !found_generic, "bounded generic-функция НЕ должна лоуриться напрямую (шаблон)")
+}
+
+// --- Стадия 2.4: end-to-end через РЕАЛЬНЫЙ VM (не только print+validate)
+// --- lower_module -> lower_module_to_bytecode -> new_vm -> 
+// run_scheduler -> читаем vm.stack — тот же пайплайн, что core/pipeline.
+// odin's run_source_with_args, только вместо compile_program используется
+// MIR-based backend.
+
+@(private = "file")
+run_via_mir :: proc(t: ^testing.T, source: string) -> (Value, bool) {
+	result := check_source(source)
+	testing.expectf(t, len(result.diags) == 0, "check_source diagnostics: %v", result.diags)
+	module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
+	registry := lower_module_to_bytecode(&module)
+	vm := new_vm(registry)
+	run_scheduler(vm)
+	if len(vm.stack) > 0 {
+		return vm.stack[len(vm.stack) - 1], true
+	}
+	return nil, false
+}
+
+@(test)
+test_bytecode_arithmetic :: proc(t: ^testing.T) {
+	v, ok := run_via_mir(t, `
+		функ старт() -> Число
+			1 + 2 * 3
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	testing.expect_value(t, v, Value(f64(7)))
+}
+
+@(test)
+test_bytecode_if_else :: proc(t: ^testing.T) {
+	v, ok := run_via_mir(t, `
+		функ старт() -> Число
+			если 5 > 3 тогда
+				1
+			иначе
+				2
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	testing.expect_value(t, v, Value(f64(1)))
+}
+
+@(test)
+test_bytecode_while_loop :: proc(t: ^testing.T) {
+	v, ok := run_via_mir(t, `
+		функ старт() -> Число
+			пер i = 0
+			пер сумма = 0
+			пока i < 10 цикл
+				сумма = сумма + i
+				i = i + 1
+			конец
+			сумма
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	testing.expect_value(t, v, Value(f64(45)))
+}
+
+@(test)
+test_bytecode_function_call :: proc(t: ^testing.T) {
+	v, ok := run_via_mir(t, `
+		функ квадрат(x: Число) -> Число
+			x * x
+		конец
+
+		функ старт() -> Число
+			квадрат(7)
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	testing.expect_value(t, v, Value(f64(49)))
+}
+
+@(test)
+test_bytecode_match_adt :: proc(t: ^testing.T) {
+	v, ok := run_via_mir(t, `
+		тип Фигура = перечисление
+			Круг(Число)
+			Квадрат(Число)
+		конец
+
+		функ старт() -> Число
+			пер ф = Фигура.Квадрат(9)
+			выбор ф
+				Фигура.Круг(r) -> r
+				Фигура.Квадрат(s) -> s
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	testing.expect_value(t, v, Value(f64(9)))
+}
+
+@(test)
+test_bytecode_match_adt_hot_loop :: proc(t: ^testing.T) {
+	// Регрессия: Match_Tag peek-без-снятия (core/vm.odin) не должен
+	// накапливать мусор на стеке между попытками армов — см. докстринг
+	// в начале core/mir/bytecode.odin. Много итераций, худший случай
+	// (последний арм из трёх, т.е. 2 неудачные попытки на итерацию).
+	v, ok := run_via_mir(t, `
+		тип Фигура = перечисление
+			Круг(Число)
+			Квадрат(Число)
+			Треугольник(Число)
+		конец
+
+		функ классифицировать(ф: Фигура) -> Число
+			выбор ф
+				Фигура.Круг(r) -> r
+				Фигура.Квадрат(s) -> s
+				Фигура.Треугольник(t) -> t
+			конец
+		конец
+
+		функ старт() -> Число
+			пер сумма = 0
+			пер i = 0
+			пока i < 50000 цикл
+				сумма = сумма + классифицировать(Фигура.Треугольник(1))
+				i = i + 1
+			конец
+			сумма
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	testing.expect_value(t, v, Value(f64(50000)))
+}
+
+@(test)
+test_bytecode_closure_with_capture :: proc(t: ^testing.T) {
+	v, ok := run_via_mir(t, `
+		функ старт() -> Число
+			пер base = 10
+			пер f = функ(x: Число) -> Число
+				x + base
+			конец
+			f(5)
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	testing.expect_value(t, v, Value(f64(15)))
+}
+
+@(test)
+test_bytecode_interface_dispatch :: proc(t: ^testing.T) {
+	v, ok := run_via_mir(t, `
+		тип Печатаемый = интерфейс
+			функ вСтроку() -> Строка
+		конец
+
+		тип Точка = структура
+			x: Число
+		конец
+
+		реализация Печатаемый для Точка
+			функ вСтроку(это: Точка) -> Строка
+				"точка"
+			конец
+		конец
+
+		функ показать(п: Печатаемый) -> Строка
+			п.вСтроку()
+		конец
+
+		функ старт() -> Строка
+			показать(Точка(1))
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	str, is_str := v.(^Panos_String)
+	testing.expectf(t, is_str, "ожидалась строка, получено %v", v)
+	if is_str do testing.expect_value(t, str.data, "точка")
+}
+
+@(test)
+test_bytecode_for_in_array :: proc(t: ^testing.T) {
+	v, ok := run_via_mir(t, `
+		функ старт() -> Число
+			пер значения = массив(1, 2, 3, 4, 5)
+			пер сумма = 0
+			для x в значения цикл
+				сумма = сумма + x
+			конец
+			сумма
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	testing.expect_value(t, v, Value(f64(15)))
+}
+
+@(test)
+test_bytecode_option_prelude_methods :: proc(t: ^testing.T) {
+	v, ok := run_via_mir(t, `
+		функ старт() -> Число
+			пер o = Опция.Есть(42)
+			o.получить(0)
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	testing.expect_value(t, v, Value(f64(42)))
 }

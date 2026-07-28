@@ -1,6 +1,5 @@
-package mir
+package core
 
-import core "../"
 import "core:fmt"
 
 // AST (после резолва+тайпчека) -> MIR. Работает в ТОЙ ЖЕ точке пайплайна,
@@ -32,18 +31,18 @@ Loop_Targets :: struct {
 }
 
 Lowering_Context :: struct {
-	res:                ^core.Resolver_Ctx,
-	tc:                 ^core.Type_Ctx,
+	res:                ^Resolver_Ctx,
+	tc:                 ^Type_Ctx,
 	module:             ^Mir_Module,
 	b:                  Mir_Builder,
-	symbol_to_local:    map[core.Symbol_Id]Local_Id,
-	symbol_to_function: map[core.Symbol_Id]Function_Id,
+	symbol_to_local:    map[Symbol_Id]Local_Id,
+	symbol_to_function: map[Symbol_Id]Function_Id,
 	// Непусто ТОЛЬКО при лоуринге ТЕЛА лямбды — индекс символа в
 	// Closure_Value.captured (порядок = ctx.res.lambda_captures[expr],
 	// тот же, что Get_Captured сегодня). Проверяется ПОСЛЕ symbol_to_local
 	// в Ident_Expr — тот же порядок приоритета, что compile_symbol_value_
 	// ref сегодня (locals, потом captures, потом global function).
-	symbol_to_capture:  map[core.Symbol_Id]int,
+	symbol_to_capture:  map[Symbol_Id]int,
 	loops:              [dynamic]Loop_Targets,
 }
 
@@ -78,12 +77,12 @@ prefix_concat :: proc(a, b: string) -> string {
 // тельской программой — иначе любой вызов .получить(запасное) и т.п. не
 // резолвился бы (прелюдийные декларации не входят в program.decls).
 lower_module :: proc(
-	res: ^core.Resolver_Ctx,
-	tc: ^core.Type_Ctx,
-	program: ^core.Program,
+	res: ^Resolver_Ctx,
+	tc: ^Type_Ctx,
+	program: ^Program,
 ) -> Mir_Module {
 	module := new_module()
-	symbol_to_function := make(map[core.Symbol_Id]Function_Id)
+	symbol_to_function := make(map[Symbol_Id]Function_Id)
 
 	if res.prelude_res_ctx != nil && res.prelude_tc_ctx != nil {
 		hoist_decls(res.prelude_res_ctx, &module, &symbol_to_function, res.prelude_res_ctx.current_module.ast.decls)
@@ -98,20 +97,20 @@ lower_module :: proc(
 
 @(private = "file")
 hoist_decls :: proc(
-	res: ^core.Resolver_Ctx,
+	res: ^Resolver_Ctx,
 	module: ^Mir_Module,
-	symbol_to_function: ^map[core.Symbol_Id]Function_Id,
-	decls: [dynamic]core.Decls,
+	symbol_to_function: ^map[Symbol_Id]Function_Id,
+	decls: [dynamic]Decls,
 ) {
 	for decl in decls {
 		#partial switch d in decl {
-		case ^core.Function_Decl:
+		case ^Function_Decl:
 			if len(d.type_param_bounds) > 0 do continue // дженерики — Фаза 2, тот же фильтр, что compile_program сегодня
 			sym := res.decl_symbols[decl]
 			result_type := function_return_type(res, sym)
 			fn_id := new_function(module, d.name, sym, result_type, d.span)
 			symbol_to_function[sym] = fn_id
-		case ^core.Impl_Decl:
+		case ^Impl_Decl:
 			// Методы структур/интерфейсов — та же двухпроходная логика,
 			// что compile_program's Impl_Decl case (hoist ВСЕХ методов ДО
 			// лоуринга любого тела, forward references/рекурсия между
@@ -128,20 +127,20 @@ hoist_decls :: proc(
 
 @(private = "file")
 lower_decls :: proc(
-	res: ^core.Resolver_Ctx,
-	tc: ^core.Type_Ctx,
+	res: ^Resolver_Ctx,
+	tc: ^Type_Ctx,
 	module: ^Mir_Module,
-	symbol_to_function: ^map[core.Symbol_Id]Function_Id,
-	decls: [dynamic]core.Decls,
+	symbol_to_function: ^map[Symbol_Id]Function_Id,
+	decls: [dynamic]Decls,
 ) {
 	for decl in decls {
 		#partial switch d in decl {
-		case ^core.Function_Decl:
+		case ^Function_Decl:
 			if len(d.type_param_bounds) > 0 do continue
 			sym := res.decl_symbols[decl]
 			fn_id := symbol_to_function[sym]
 			lower_function_body(res, tc, module, fn_id, decl, d.args, d.body, symbol_to_function^)
-		case ^core.Impl_Decl:
+		case ^Impl_Decl:
 			for m in d.methods {
 				sym := res.decl_symbols[m]
 				fn_id := symbol_to_function[sym]
@@ -152,28 +151,28 @@ lower_decls :: proc(
 }
 
 @(private = "file")
-function_return_type :: proc(res: ^core.Resolver_Ctx, sym: core.Symbol_Id) -> ^core.Type {
+function_return_type :: proc(res: ^Resolver_Ctx, sym: Symbol_Id) -> ^Type {
 	func_type := res.symbol_types[sym]
-	if func_type == nil do return core.TY_VOID
+	if func_type == nil do return TY_VOID
 	return func_type.return_type
 }
 
 @(private = "file")
 lower_function_body :: proc(
-	res: ^core.Resolver_Ctx,
-	tc: ^core.Type_Ctx,
+	res: ^Resolver_Ctx,
+	tc: ^Type_Ctx,
 	module: ^Mir_Module,
 	fn_id: Function_Id,
-	key: core.Decls,
-	params: [dynamic]core.Param_Decl,
-	body: [dynamic]core.Stmt,
-	symbol_to_function: map[core.Symbol_Id]Function_Id,
+	key: Decls,
+	params: [dynamic]Param_Decl,
+	body: [dynamic]Stmt,
+	symbol_to_function: map[Symbol_Id]Function_Id,
 ) {
 	ctx := Lowering_Context {
 		res                = res,
 		tc                 = tc,
 		module             = module,
-		symbol_to_local    = make(map[core.Symbol_Id]Local_Id),
+		symbol_to_local    = make(map[Symbol_Id]Local_Id),
 		symbol_to_function = symbol_to_function,
 		loops              = make([dynamic]Loop_Targets),
 	}
@@ -192,7 +191,7 @@ lower_function_body :: proc(
 	}
 	current_function(&ctx.b).parameters = param_locals[:]
 
-	want_value := prune_type_or_self(current_function(&ctx.b).result_type) != core.TY_VOID
+	want_value := prune_type_or_self(current_function(&ctx.b).result_type) != TY_VOID
 	result, flow := lower_block(&ctx, body, want_value)
 	if flow == .Continues {
 		if want_value {
@@ -204,9 +203,9 @@ lower_function_body :: proc(
 }
 
 @(private = "file")
-prune_type_or_self :: proc(t: ^core.Type) -> ^core.Type {
-	if t == nil do return core.TY_VOID
-	return core.prune_type(t)
+prune_type_or_self :: proc(t: ^Type) -> ^Type {
+	if t == nil do return TY_VOID
+	return prune_type(t)
 }
 
 INVALID_VALUE_AS_NIL :: INVALID_VALUE
@@ -230,7 +229,7 @@ new_return_term :: proc(v: Value_Id) -> ^Return_Term {
 
 lower_block :: proc(
 	ctx: ^Lowering_Context,
-	stmts: [dynamic]core.Stmt,
+	stmts: [dynamic]Stmt,
 	want_value: bool,
 ) -> (
 	result: Value_Id,
@@ -251,7 +250,7 @@ lower_block :: proc(
 		is_last := i == len(stmts) - 1
 
 		if is_last && want_value {
-			if expr_stmt, ok := stmt.(^core.Expr_Stmt); ok {
+			if expr_stmt, ok := stmt.(^Expr_Stmt); ok {
 				result, flow = lower_expr(ctx, expr_stmt.expr)
 			} else {
 				flow = lower_stmt(ctx, stmt)
@@ -270,7 +269,7 @@ lower_block :: proc(
 
 @(private = "file")
 emit_const_number :: proc(ctx: ^Lowering_Context, n: f64) -> Value_Id {
-	v := new_value(&ctx.b, core.TY_NUM)
+	v := new_value(&ctx.b, TY_NUM)
 	emit(&ctx.b, new_const_instr(v, n))
 	return v
 }
@@ -285,9 +284,9 @@ new_const_instr :: proc(dst: Value_Id, value: Const_Value) -> ^Const_Instr {
 
 // --- Statements ---
 
-lower_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt) -> Flow_Result {
+lower_stmt :: proc(ctx: ^Lowering_Context, stmt: Stmt) -> Flow_Result {
 	switch s in stmt {
-	case ^core.Let_Stmt:
+	case ^Let_Stmt:
 		if len(s.names) > 0 {
 			// Деструктуризация (тупл или структура — оба Aggregate_Value,
 			// Get_Property по числовому индексу работает одинаково для
@@ -298,7 +297,7 @@ lower_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt) -> Flow_Result {
 			// на каждое имя.
 			v, flow := lower_expr(ctx, s.value)
 			if flow == .Terminates do return .Terminates
-			value_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$destructure", ctx.tc.node_types[s.value])
+			value_local := new_local(&ctx.b, INVALID_SYMBOL, "$destructure", ctx.tc.node_types[s.value])
 			emit(&ctx.b, new_store_local(value_local, v))
 
 			syms := ctx.res.let_destructure_syms[stmt]
@@ -332,7 +331,7 @@ lower_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt) -> Flow_Result {
 		emit(&ctx.b, new_store_local(local, v))
 		return .Continues
 
-	case ^core.Return_Stmt:
+	case ^Return_Stmt:
 		if s.value != nil {
 			v, flow := lower_expr(ctx, s.value)
 			if flow == .Terminates do return .Terminates
@@ -342,11 +341,25 @@ lower_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt) -> Flow_Result {
 		}
 		return .Terminates
 
-	case ^core.Expr_Stmt:
+	case ^Expr_Stmt:
+		// If_Expr — особый случай: lower_expr's If_Expr-ветка всегда
+		// лоурит с want_value=true (нужно для if-как-значения в value-
+		// контексте), но здесь (Expr_Stmt — значение ВСЕГДА отбрасывается)
+		// это создавало бы синтетическую merge-ячейку и пыталось Store_
+		// Local в неё INVALID_VALUE для веток без реального значения
+		// (напр. `если ... тогда сумма = сумма + i конец` — присваивание
+		// не производит значения) — реальный баг, найденный дифференциальным
+		// тестированием (Фаза 2.5): падение "Index out of range" в VM —
+		// Store_Local с несуществующим src портил стек. Явно лоурим с
+		// want_value=false, минуя lower_expr's жёстко закодированный true.
+		if if_expr, is_if := s.expr.(^If_Expr); is_if {
+			_, flow := lower_if_expr(ctx, s.expr, if_expr, false)
+			return flow
+		}
 		_, flow := lower_expr(ctx, s.expr)
 		return flow
 
-	case ^core.Continue_Stmt:
+	case ^Continue_Stmt:
 		if len(ctx.loops) == 0 {
 			lower_unsupported("продолжить вне цикла")
 		}
@@ -354,7 +367,7 @@ lower_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt) -> Flow_Result {
 		terminate(&ctx.b, new_jump_term(target))
 		return .Terminates
 
-	case ^core.Break_Stmt:
+	case ^Break_Stmt:
 		if len(ctx.loops) == 0 {
 			lower_unsupported("прервать вне цикла")
 		}
@@ -362,9 +375,9 @@ lower_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt) -> Flow_Result {
 		terminate(&ctx.b, new_jump_term(target))
 		return .Terminates
 
-	case ^core.For_In_Stmt:
+	case ^For_In_Stmt:
 		return lower_for_in_stmt(ctx, stmt, s)
-	case ^core.Error_Stmt:
+	case ^Error_Stmt:
 		lower_unsupported("Error_Stmt (парсер уже отрапортовал ошибку)")
 	}
 	lower_unsupported("неизвестный вид statement")
@@ -389,7 +402,7 @@ new_jump_term :: proc(target: Block_Id) -> ^Jump_Term {
 
 lower_expr :: proc(
 	ctx: ^Lowering_Context,
-	expr: core.Expr,
+	expr: Expr,
 ) -> (
 	result: Value_Id,
 	flow: Flow_Result,
@@ -397,45 +410,45 @@ lower_expr :: proc(
 	flow = .Continues
 
 	switch e in expr {
-	case ^core.Number_Expr:
+	case ^Number_Expr:
 		result = emit_const_number(ctx, e.value)
 		return
 
-	case ^core.Boolean_Expr:
-		v := new_value(&ctx.b, core.TY_BOOL)
+	case ^Boolean_Expr:
+		v := new_value(&ctx.b, TY_BOOL)
 		emit(&ctx.b, new_const_instr(v, e.value))
 		result = v
 		return
 
-	case ^core.String_Expr:
-		v := new_value(&ctx.b, core.TY_STRING)
+	case ^String_Expr:
+		v := new_value(&ctx.b, TY_STRING)
 		emit(&ctx.b, new_const_instr(v, e.value))
 		result = v
 		return
 
-	case ^core.Ident_Expr:
+	case ^Ident_Expr:
 		sym := ctx.res.node_symbols[expr]
 		result = lower_symbol_value_ref(ctx, sym, ctx.tc.node_types[expr])
 		return
 
-	case ^core.Unary_Expr:
+	case ^Unary_Expr:
 		return lower_unary_expr(ctx, expr, e)
 
-	case ^core.Binary_Expr:
+	case ^Binary_Expr:
 		return lower_binary_expr(ctx, expr, e)
 
-	case ^core.Call_Expr:
+	case ^Call_Expr:
 		return lower_call_expr(ctx, expr, e)
 
-	case ^core.If_Expr:
+	case ^If_Expr:
 		return lower_if_expr(ctx, expr, e, true)
 
-	case ^core.While_Expr:
+	case ^While_Expr:
 		lower_while_expr(ctx, e)
 		result = emit_const_number(ctx, 0)
 		return
 
-	case ^core.Tuple_Expr:
+	case ^Tuple_Expr:
 		elements := make([dynamic]Value_Id, 0, len(e.elements))
 		for el in e.elements {
 			v, eflow := lower_expr(ctx, el)
@@ -450,7 +463,7 @@ lower_expr :: proc(
 		emit(&ctx.b, i)
 		return dst, .Continues
 
-	case ^core.Array_Expr:
+	case ^Array_Expr:
 		elements := make([dynamic]Value_Id, 0, len(e.elements))
 		for el in e.elements {
 			v, eflow := lower_expr(ctx, el)
@@ -464,7 +477,7 @@ lower_expr :: proc(
 		emit(&ctx.b, i)
 		return dst, .Continues
 
-	case ^core.Map_Expr:
+	case ^Map_Expr:
 		keys := make([dynamic]Value_Id, 0, len(e.entries))
 		vals := make([dynamic]Value_Id, 0, len(e.entries))
 		for entry in e.entries {
@@ -483,7 +496,7 @@ lower_expr :: proc(
 		emit(&ctx.b, i)
 		return dst, .Continues
 
-	case ^core.Index_Expr:
+	case ^Index_Expr:
 		obj, oflow := lower_expr(ctx, e.object)
 		if oflow == .Terminates do return INVALID_VALUE, .Terminates
 		idx, iflow := lower_expr(ctx, e.index)
@@ -496,12 +509,12 @@ lower_expr :: proc(
 		emit(&ctx.b, i)
 		return dst, .Continues
 
-	case ^core.Property_Expr:
+	case ^Property_Expr:
 		// Constructor_Variant через голое свойство (0-арный enum-вариант
 		// без ()) — та же спец-ветка, что core/compiler.odin's case
 		// ^Property_Expr (call_infos[expr].kind == .Constructor_Variant),
 		// не обычное чтение поля.
-		if info, ok := ctx.tc.call_infos[expr]; ok && info.kind == core.Call_Kind.Constructor_Variant {
+		if info, ok := ctx.tc.call_infos[expr]; ok && info.kind == Call_Kind.Constructor_Variant {
 			dst := new_value(&ctx.b, ctx.tc.node_types[expr])
 			bv := new(Build_Variant_Instr)
 			bv.dst = dst
@@ -523,7 +536,7 @@ lower_expr :: proc(
 		emit(&ctx.b, i)
 		return dst, .Continues
 
-	case ^core.Try_Expr:
+	case ^Try_Expr:
 		src, sflow := lower_expr(ctx, e.value)
 		if sflow == .Terminates do return INVALID_VALUE, .Terminates
 		dst := new_value(&ctx.b, ctx.tc.node_types[expr])
@@ -533,19 +546,19 @@ lower_expr :: proc(
 		emit(&ctx.b, i)
 		return dst, .Continues
 
-	case ^core.Match_Expr:
+	case ^Match_Expr:
 		return lower_match_expr(ctx, expr, e)
 
-	case ^core.Error_Expr:
+	case ^Error_Expr:
 		// Компилятор запускается только после typecheck_program с нулём
 		// diagnostics — Error_Expr сюда дойти не должен (см. core/
 		// compiler.odin's тот же комментарий на этом кейсе).
 		lower_unsupported("Error_Expr дошёл до lowering — типизация должна была отклонить программу раньше")
 
-	case ^core.Spawn_Expr:
+	case ^Spawn_Expr:
 		return lower_spawn_expr(ctx, expr, e)
 
-	case ^core.Lambda_Expr:
+	case ^Lambda_Expr:
 		return lower_lambda_expr(ctx, expr, e)
 	}
 	lower_unsupported("неизвестный вид выражения")
@@ -558,8 +571,8 @@ lower_expr :: proc(
 // вход, как и compile_program) сегодня не делает ни для чего (не
 // специфично для Spawn) — известное ограничение, не блокер для этой фазы.
 @(private = "file")
-lower_spawn_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, e: ^core.Spawn_Expr) -> (Value_Id, Flow_Result) {
-	if _, is_prop := e.call.callee.(^core.Property_Expr); is_prop {
+lower_spawn_expr :: proc(ctx: ^Lowering_Context, expr: Expr, e: ^Spawn_Expr) -> (Value_Id, Flow_Result) {
+	if _, is_prop := e.call.callee.(^Property_Expr); is_prop {
 		lower_unsupported("запусти через cross-module callee (Модуль.функция) — Фаза 3+")
 	}
 	callee_sym := ctx.res.node_symbols[e.call.callee]
@@ -567,12 +580,13 @@ lower_spawn_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, e: ^core.Spawn
 	if !found {
 		lower_unsupported("запусти: функция не найдена в symbol_to_function")
 	}
+	fn_ref := emit_fn_ref(ctx, fn_id, nil)
 	args, aflow := lower_call_args(ctx, e.call.args)
 	if aflow == .Terminates do return INVALID_VALUE, .Terminates
 	dst := new_value(&ctx.b, ctx.tc.node_types[expr])
 	i := new(Spawn_Instr)
 	i.dst = dst
-	i.callee = fn_id
+	i.callee = fn_ref
 	i.args = args
 	emit(&ctx.b, i)
 	return dst, .Continues
@@ -589,8 +603,8 @@ new_load_local :: proc(dst: Value_Id, local: Local_Id) -> ^Load_Local_Instr {
 @(private = "file")
 lower_unary_expr :: proc(
 	ctx: ^Lowering_Context,
-	expr: core.Expr,
-	e: ^core.Unary_Expr,
+	expr: Expr,
+	e: ^Unary_Expr,
 ) -> (
 	Value_Id,
 	Flow_Result,
@@ -626,8 +640,8 @@ lower_unary_expr :: proc(
 @(private = "file")
 lower_binary_expr :: proc(
 	ctx: ^Lowering_Context,
-	expr: core.Expr,
-	e: ^core.Binary_Expr,
+	expr: Expr,
+	e: ^Binary_Expr,
 ) -> (
 	Value_Id,
 	Flow_Result,
@@ -635,7 +649,7 @@ lower_binary_expr :: proc(
 	if e.op == .Assign {
 		return lower_assign(ctx, e)
 	}
-	if info, has_sugar := ctx.tc.call_infos[expr]; has_sugar && info.kind == core.Call_Kind.Method_Struct {
+	if info, has_sugar := ctx.tc.call_infos[expr]; has_sugar && info.kind == Call_Kind.Method_Struct {
 		// Сравниваемое/Арифметика sugar — реюз Method_Struct-кодогена
 		// (сравнить()/сложить()/... возвращают либо Число (3-way compare,
 		// нормализуется ниже до Булево через сравнение с 0), либо Self
@@ -665,7 +679,7 @@ lower_binary_expr :: proc(
 		// Int_Divide vs Divide — тот же выбор по статическому типу ЛЕВОГО
 		// операнда, что и сегодняшний compile_expr (core/compiler.odin,
 		// case .Slash), не рантайм-решение.
-		if ctx.tc.node_types[e.left] == core.TY_INT {
+		if ctx.tc.node_types[e.left] == TY_INT {
 			return emit_binary(ctx, .Int_Divide, lhs, rhs, result_type), .Continues
 		}
 		return emit_binary(ctx, .Divide, lhs, rhs, result_type), .Continues
@@ -700,9 +714,9 @@ lower_binary_expr :: proc(
 @(private = "file")
 lower_operator_sugar :: proc(
 	ctx: ^Lowering_Context,
-	expr: core.Expr,
-	e: ^core.Binary_Expr,
-	info: core.Call_Info,
+	expr: Expr,
+	e: ^Binary_Expr,
+	info: Call_Info,
 ) -> (
 	Value_Id,
 	Flow_Result,
@@ -711,12 +725,13 @@ lower_operator_sugar :: proc(
 	if !found {
 		lower_unsupported("метод сравнить/сложить/... не найден в symbol_to_function")
 	}
+	fn_ref := emit_fn_ref(ctx, fn_id, nil)
 	lhs, lflow := lower_expr(ctx, e.left)
 	if lflow == .Terminates do return INVALID_VALUE, .Terminates
 	rhs, rflow := lower_expr(ctx, e.right)
 	if rflow == .Terminates do return INVALID_VALUE, .Terminates
 
-	raw := emit_call(ctx, fn_id, value_slice(lhs, rhs), ctx.tc.node_types[expr])
+	raw := emit_call_value(ctx, fn_ref, value_slice(lhs, rhs), ctx.tc.node_types[expr])
 
 	#partial switch e.op {
 	case .Less:
@@ -728,13 +743,13 @@ lower_operator_sugar :: proc(
 	case .LessEqual:
 		zero := emit_const_number(ctx, 0)
 		gt := emit_compare(ctx, .Greater, raw, zero)
-		return emit_unary(ctx, .Negate_Bool, gt, core.TY_BOOL), .Continues
+		return emit_unary(ctx, .Negate_Bool, gt, TY_BOOL), .Continues
 	case .GreaterEqual:
 		zero := emit_const_number(ctx, 0)
 		lt := emit_compare(ctx, .Less, raw, zero)
-		return emit_unary(ctx, .Negate_Bool, lt, core.TY_BOOL), .Continues
+		return emit_unary(ctx, .Negate_Bool, lt, TY_BOOL), .Continues
 	case .NotEqual:
-		return emit_unary(ctx, .Negate_Bool, raw, core.TY_BOOL), .Continues
+		return emit_unary(ctx, .Negate_Bool, raw, TY_BOOL), .Continues
 	case .Equal, .Plus, .Minus, .Star, .Slash:
 		// равно() уже Булево; сложить/вычесть/умножить/разделить уже Self —
 		// raw и есть ответ, без пост-обработки.
@@ -744,7 +759,7 @@ lower_operator_sugar :: proc(
 }
 
 @(private = "file")
-emit_unary :: proc(ctx: ^Lowering_Context, op: Un_Op, src: Value_Id, result_type: ^core.Type) -> Value_Id {
+emit_unary :: proc(ctx: ^Lowering_Context, op: Un_Op, src: Value_Id, result_type: ^Type) -> Value_Id {
 	dst := new_value(&ctx.b, result_type)
 	i := new(Unary_Instr)
 	i.dst = dst
@@ -759,9 +774,9 @@ emit_unary :: proc(ctx: ^Lowering_Context, op: Un_Op, src: Value_Id, result_type
 // (для Property_Place/Index_Place это значит лоурить object/index как
 // ОБЫЧНЫЕ выражения, они читаются, а не пишутся).
 @(private = "file")
-lower_place :: proc(ctx: ^Lowering_Context, expr: core.Expr) -> (Place, Flow_Result) {
+lower_place :: proc(ctx: ^Lowering_Context, expr: Expr) -> (Place, Flow_Result) {
 	#partial switch e in expr {
-	case ^core.Ident_Expr:
+	case ^Ident_Expr:
 		sym := ctx.res.node_symbols[expr]
 		local, ok := ctx.symbol_to_local[sym]
 		if !ok {
@@ -771,7 +786,7 @@ lower_place :: proc(ctx: ^Lowering_Context, expr: core.Expr) -> (Place, Flow_Res
 		p.local = local
 		return p, .Continues
 
-	case ^core.Property_Expr:
+	case ^Property_Expr:
 		obj, flow := lower_expr(ctx, e.object)
 		if flow == .Terminates do return nil, .Terminates
 		p := new(Property_Place)
@@ -779,7 +794,7 @@ lower_place :: proc(ctx: ^Lowering_Context, expr: core.Expr) -> (Place, Flow_Res
 		p.field_index = ctx.tc.property_indices[expr]
 		return p, .Continues
 
-	case ^core.Index_Expr:
+	case ^Index_Expr:
 		obj, flow := lower_expr(ctx, e.object)
 		if flow == .Terminates do return nil, .Terminates
 		idx, idx_flow := lower_expr(ctx, e.index)
@@ -792,20 +807,26 @@ lower_place :: proc(ctx: ^Lowering_Context, expr: core.Expr) -> (Place, Flow_Res
 	lower_unsupported("недопустимая цель присваивания")
 }
 
-// lower_assign — Binary_Expr{op=.Assign}. Тот же порядок вычисления
-// (RHS, потом место назначения), что core/compiler.odin's Assign-ветка,
-// И то же самое отсутствие результирующего значения — Set_Local/
-// Set_Property/Set_Index сегодня НЕ оставляют значение на стеке
-// (см. core/vm.odin case .Set_Local: pop, не peek), присваивание как
-// выражение (`y = (x = 1)`) не поддержано ни сегодняшним компилятором,
-// ни этим — сохраняем то же поведение, не чиним предсуществующий пробел.
+// lower_assign — Binary_Expr{op=.Assign}. ПОРЯДОК ВЫЧИСЛЕНИЯ ВАЖЕН и
+// ОТЛИЧАЕТСЯ от наивного "RHS потом место": core/compiler.odin's Assign-
+// ветка для Property/Index вычисляет МЕСТО (object[, index]) ПЕРВЫМ, RHS
+// ПОСЛЕДНИМ — потому что core/vm.odin's .Set_Property/.Set_Index
+// ожидают строго [..., object[, index], value] на стеке (снимают value
+// первым, object/index — глубже). lower_place emit'ит инструкции
+// ТОЛЬКО для Property/Index (Local — чистый lookup без побочных
+// инструкций, порядок для него не важен), поэтому безусловный
+// "место, потом RHS" корректен для ВСЕХ трёх случаев разом. Значения
+// присваивание НЕ производит (Set_Local/Set_Property/Set_Index сегодня
+// НЕ оставляют значение на стеке — см. core/vm.odin case .Set_Local: pop,
+// не peek) — `y = (x = 1)` не поддержано ни сегодняшним компилятором, ни
+// этим, сохраняем то же поведение.
 @(private = "file")
-lower_assign :: proc(ctx: ^Lowering_Context, e: ^core.Binary_Expr) -> (Value_Id, Flow_Result) {
-	rhs, rhs_flow := lower_expr(ctx, e.right)
-	if rhs_flow == .Terminates do return INVALID_VALUE, .Terminates
-
+lower_assign :: proc(ctx: ^Lowering_Context, e: ^Binary_Expr) -> (Value_Id, Flow_Result) {
 	place, place_flow := lower_place(ctx, e.left)
 	if place_flow == .Terminates do return INVALID_VALUE, .Terminates
+
+	rhs, rhs_flow := lower_expr(ctx, e.right)
+	if rhs_flow == .Terminates do return INVALID_VALUE, .Terminates
 
 	switch p in place {
 	case ^Local_Place:
@@ -831,7 +852,7 @@ emit_binary :: proc(
 	ctx: ^Lowering_Context,
 	op: Bin_Op,
 	lhs, rhs: Value_Id,
-	result_type: ^core.Type,
+	result_type: ^Type,
 ) -> Value_Id {
 	dst := new_value(&ctx.b, result_type)
 	i := new(Binary_Instr)
@@ -845,7 +866,7 @@ emit_binary :: proc(
 
 @(private = "file")
 emit_compare :: proc(ctx: ^Lowering_Context, op: Cmp_Op, lhs, rhs: Value_Id) -> Value_Id {
-	dst := new_value(&ctx.b, core.TY_BOOL)
+	dst := new_value(&ctx.b, TY_BOOL)
 	i := new(Compare_Instr)
 	i.dst = dst
 	i.op = op
@@ -864,13 +885,13 @@ emit_compare :: proc(ctx: ^Lowering_Context, op: Cmp_Op, lhs, rhs: Value_Id) -> 
 @(private = "file")
 lower_short_circuit :: proc(
 	ctx: ^Lowering_Context,
-	expr: core.Expr,
-	e: ^core.Binary_Expr,
+	expr: Expr,
+	e: ^Binary_Expr,
 ) -> (
 	Value_Id,
 	Flow_Result,
 ) {
-	result_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$logic", core.TY_BOOL)
+	result_local := new_local(&ctx.b, INVALID_SYMBOL, "$logic", TY_BOOL)
 
 	rhs_block := new_block(&ctx.b)
 	short_block := new_block(&ctx.b)
@@ -885,7 +906,7 @@ lower_short_circuit :: proc(
 	}
 
 	set_current_block(&ctx.b, short_block)
-	sv := new_value(&ctx.b, core.TY_BOOL)
+	sv := new_value(&ctx.b, TY_BOOL)
 	emit(&ctx.b, new_const_instr(sv, short_value))
 	emit(&ctx.b, new_store_local(result_local, sv))
 	terminate(&ctx.b, new_jump_term(merge_block))
@@ -898,7 +919,7 @@ lower_short_circuit :: proc(
 	}
 
 	set_current_block(&ctx.b, merge_block)
-	result := new_value(&ctx.b, core.TY_BOOL)
+	result := new_value(&ctx.b, TY_BOOL)
 	emit(&ctx.b, new_load_local(result, result_local))
 	return result, .Continues
 }
@@ -910,10 +931,10 @@ lower_short_circuit :: proc(
 // true_target, false_target); a || b — симметрично.
 lower_condition :: proc(
 	ctx: ^Lowering_Context,
-	expr: core.Expr,
+	expr: Expr,
 	true_target, false_target: Block_Id,
 ) {
-	if bin, ok := expr.(^core.Binary_Expr); ok {
+	if bin, ok := expr.(^Binary_Expr); ok {
 		if bin.op == .And {
 			rhs_block := new_block(&ctx.b)
 			lower_condition(ctx, bin.left, rhs_block, false_target)
@@ -956,7 +977,7 @@ new_branch_term :: proc(cond: Value_Id, then_block, else_block: Block_Id) -> ^Br
 // (Build_Variant/все call_infos.kind-ветки/foreign/актор-примитивы/
 // финальный fallback) плюс голый Property_Expr-конструктор варианта.
 @(private = "file")
-maybe_wrap_interface_cast :: proc(ctx: ^Lowering_Context, expr: core.Expr, value: Value_Id) -> Value_Id {
+maybe_wrap_interface_cast :: proc(ctx: ^Lowering_Context, expr: Expr, value: Value_Id) -> Value_Id {
 	struct_type, needs_cast := ctx.tc.interface_casts[expr]
 	if !needs_cast do return value
 
@@ -984,7 +1005,7 @@ maybe_wrap_interface_cast :: proc(ctx: ^Lowering_Context, expr: core.Expr, value
 // список call site'ов maybe_emit_interface_cast в core/compiler.odin) —
 // эквивалентно (interface_casts ключуется по САМОМУ Call_Expr-узлу,
 // одному на все внутренние ветки).
-lower_call_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, e: ^core.Call_Expr) -> (Value_Id, Flow_Result) {
+lower_call_expr :: proc(ctx: ^Lowering_Context, expr: Expr, e: ^Call_Expr) -> (Value_Id, Flow_Result) {
 	v, flow := lower_call_expr_inner(ctx, expr, e)
 	if flow == .Terminates do return v, flow
 	return maybe_wrap_interface_cast(ctx, expr, v), flow
@@ -993,8 +1014,8 @@ lower_call_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, e: ^core.Call_E
 @(private = "file")
 lower_call_expr_inner :: proc(
 	ctx: ^Lowering_Context,
-	expr: core.Expr,
-	e: ^core.Call_Expr,
+	expr: Expr,
+	e: ^Call_Expr,
 ) -> (
 	Value_Id,
 	Flow_Result,
@@ -1006,14 +1027,15 @@ lower_call_expr_inner :: proc(
 	// ДО этой точки (см. 2.3k).
 	if concrete_types, ok := ctx.tc.generic_call_instantiations[expr]; ok {
 		callee_sym := ctx.res.node_symbols[e.callee]
-		key := core.build_instantiation_key(ctx.res.symbol_store, callee_sym, concrete_types)
+		key := build_instantiation_key(ctx.res.symbol_store, callee_sym, concrete_types)
 		fn_id, found := ctx.module.generic_instantiations[key]
 		if !found {
 			lower_unsupported("инстанциация generic-функции не найдена")
 		}
+		fn_ref := emit_fn_ref(ctx, fn_id, nil)
 		args, aflow := lower_call_args(ctx, e.args)
 		if aflow == .Terminates do return INVALID_VALUE, .Terminates
-		return emit_call(ctx, fn_id, args, result_type), .Continues
+		return emit_call_value(ctx, fn_ref, args, result_type), .Continues
 	}
 
 	if info, ok := ctx.tc.call_infos[expr]; ok {
@@ -1034,19 +1056,19 @@ lower_call_expr_inner :: proc(
 		case .Builtin:
 			args, aflow := lower_call_args(ctx, e.args)
 			if aflow == .Terminates do return INVALID_VALUE, .Terminates
-			if core.is_async_builtin_name(info.text_name) {
+			if is_async_builtin_name(info.text_name) {
 				return emit_call_builtin_async(ctx, info.text_name, args, result_type), .Continues
 			}
 			return emit_call_builtin(ctx, info.text_name, args, result_type), .Continues
 
 		case .Method_Collection:
-			prop_expr := e.callee.(^core.Property_Expr)
+			prop_expr := e.callee.(^Property_Expr)
 			obj, oflow := lower_expr(ctx, prop_expr.object)
 			if oflow == .Terminates do return INVALID_VALUE, .Terminates
 			args, aflow := lower_call_args(ctx, e.args)
 			if aflow == .Terminates do return INVALID_VALUE, .Terminates
 			receiver_type := ctx.tc.node_types[prop_expr.object]
-			if core.is_async_stream_method(receiver_type, info.text_name) {
+			if is_async_stream_method(receiver_type, info.text_name) {
 				dst := new_value(&ctx.b, result_type)
 				i := new(Call_Async_Instr)
 				i.dst = dst
@@ -1059,7 +1081,7 @@ lower_call_expr_inner :: proc(
 			return emit_call_method(ctx, obj, info.text_name, args, result_type), .Continues
 
 		case .Method_Interface:
-			prop_expr := e.callee.(^core.Property_Expr)
+			prop_expr := e.callee.(^Property_Expr)
 			obj, oflow := lower_expr(ctx, prop_expr.object)
 			if oflow == .Terminates do return INVALID_VALUE, .Terminates
 			args, aflow := lower_call_args(ctx, e.args)
@@ -1078,7 +1100,8 @@ lower_call_expr_inner :: proc(
 			if !found {
 				lower_unsupported("метод не найден в symbol_to_function")
 			}
-			prop_expr := e.callee.(^core.Property_Expr)
+			fn_ref := emit_fn_ref(ctx, fn_id, nil)
+			prop_expr := e.callee.(^Property_Expr)
 			obj, oflow := lower_expr(ctx, prop_expr.object)
 			if oflow == .Terminates do return INVALID_VALUE, .Terminates
 			args, aflow := lower_call_args(ctx, e.args)
@@ -1086,7 +1109,7 @@ lower_call_expr_inner :: proc(
 			full_args := make([dynamic]Value_Id, 0, len(args) + 1)
 			append(&full_args, obj)
 			for a in args do append(&full_args, a)
-			return emit_call(ctx, fn_id, full_args[:], result_type), .Continues
+			return emit_call_value(ctx, fn_ref, full_args[:], result_type), .Continues
 
 		case .Constructor_Struct:
 			args, aflow := lower_call_args(ctx, e.args)
@@ -1104,9 +1127,10 @@ lower_call_expr_inner :: proc(
 			if !found {
 				lower_unsupported("метод вСтроку не найден в symbol_to_function")
 			}
+			fn_ref := emit_fn_ref(ctx, fn_id, nil)
 			arg0, aflow := lower_expr(ctx, e.args[0])
 			if aflow == .Terminates do return INVALID_VALUE, .Terminates
-			str_v := emit_call(ctx, fn_id, value_slice(arg0), core.TY_STRING)
+			str_v := emit_call_value(ctx, fn_ref, value_slice(arg0), TY_STRING)
 			return emit_call_builtin(ctx, info.text_name, value_slice(str_v), result_type), .Continues
 
 		case .Send_Copy:
@@ -1116,18 +1140,19 @@ lower_call_expr_inner :: proc(
 			if !found {
 				lower_unsupported("метод клонировать не найден в symbol_to_function")
 			}
+			fn_ref := emit_fn_ref(ctx, fn_id, nil)
 			msg_v, mflow := lower_expr(ctx, e.args[1])
 			if mflow == .Terminates do return INVALID_VALUE, .Terminates
-			cloned_v := emit_call(ctx, fn_id, value_slice(msg_v), ctx.tc.node_types[e.args[1]])
+			cloned_v := emit_call_value(ctx, fn_ref, value_slice(msg_v), ctx.tc.node_types[e.args[1]])
 			return emit_call_builtin(ctx, "отправить_без_копии", value_slice(proc_v, cloned_v), result_type), .Continues
 		}
 	}
 
-	if ident, ok := e.callee.(^core.Ident_Expr); ok {
+	if ident, ok := e.callee.(^Ident_Expr); ok {
 		sym_id := ctx.res.node_symbols[e.callee]
-		if sym_id != core.INVALID_SYMBOL {
-			if foreign_decl, is_foreign := core.symbol_at(ctx.res.symbol_store, sym_id).decl.(^core.Foreign_Decl); is_foreign {
-				ff := core.get_or_build_foreign_function(foreign_decl)
+		if sym_id != INVALID_SYMBOL {
+			if foreign_decl, is_foreign := symbol_at(ctx.res.symbol_store, sym_id).decl.(^Foreign_Decl); is_foreign {
+				ff := get_or_build_foreign_function(foreign_decl)
 				args, aflow := lower_call_args(ctx, e.args)
 				if aflow == .Terminates do return INVALID_VALUE, .Terminates
 				dst := new_value(&ctx.b, result_type)
@@ -1139,8 +1164,8 @@ lower_call_expr_inner :: proc(
 				return dst, .Continues
 			}
 		}
-		if sym_id != core.INVALID_SYMBOL && core.symbol_at(ctx.res.symbol_store, sym_id).kind == .Builtin {
-			name := core.resolve_interned(ident.name)
+		if sym_id != INVALID_SYMBOL && symbol_at(ctx.res.symbol_store, sym_id).kind == .Builtin {
+			name := resolve_interned(ident.name)
 			if name == "получить" {
 				dst := new_value(&ctx.b, result_type)
 				ri := new(Receive_Instr)
@@ -1157,7 +1182,7 @@ lower_call_expr_inner :: proc(
 			}
 			args, aflow := lower_call_args(ctx, e.args)
 			if aflow == .Terminates do return INVALID_VALUE, .Terminates
-			if core.is_async_builtin_name(name) {
+			if is_async_builtin_name(name) {
 				return emit_call_builtin_async(ctx, name, args, result_type), .Continues
 			}
 			return emit_call_builtin(ctx, name, args, result_type), .Continues
@@ -1165,13 +1190,15 @@ lower_call_expr_inner :: proc(
 	}
 
 	// Статически известная top-level функция по голому идентификатору —
-	// быстрый путь (Call_Instr, Function_Id известен на этапе лоуринга).
-	if callee_ident, ok := e.callee.(^core.Ident_Expr); ok {
+	// быстрый путь (Function_Id известен на этапе лоуринга, callee всё
+	// равно эмитится ЗНАЧЕНИЕМ через emit_fn_ref — см. её докстринг).
+	if callee_ident, ok := e.callee.(^Ident_Expr); ok {
 		callee_sym := ctx.res.node_symbols[callee_ident]
 		if fn_id, found := ctx.symbol_to_function[callee_sym]; found {
+			fn_ref := emit_fn_ref(ctx, fn_id, nil)
 			args, aflow := lower_call_args(ctx, e.args)
 			if aflow == .Terminates do return INVALID_VALUE, .Terminates
-			return emit_call(ctx, fn_id, args, result_type), .Continues
+			return emit_call_value(ctx, fn_ref, args, result_type), .Continues
 		}
 	}
 
@@ -1189,7 +1216,7 @@ lower_call_expr_inner :: proc(
 	i := new(Call_Value_Instr)
 	i.callee = callee_v
 	i.args = args
-	if result_type != nil && core.prune_type(result_type) != core.TY_VOID {
+	if result_type != nil && prune_type(result_type) != TY_VOID {
 		dst := new_value(&ctx.b, result_type)
 		i.dst = dst
 		emit(&ctx.b, i)
@@ -1216,7 +1243,7 @@ value_slice :: proc(vs: ..Value_Id) -> []Value_Id {
 }
 
 @(private = "file")
-lower_call_args :: proc(ctx: ^Lowering_Context, exprs: [dynamic]core.Expr) -> ([]Value_Id, Flow_Result) {
+lower_call_args :: proc(ctx: ^Lowering_Context, exprs: [dynamic]Expr) -> ([]Value_Id, Flow_Result) {
 	args := make([dynamic]Value_Id, 0, len(exprs))
 	for a in exprs {
 		v, flow := lower_expr(ctx, a)
@@ -1226,12 +1253,34 @@ lower_call_args :: proc(ctx: ^Lowering_Context, exprs: [dynamic]core.Expr) -> ([
 	return args[:], .Continues
 }
 
+// emit_fn_ref — Function_Ref_Instr для статически известного Function_Id.
+// ВАЖНО: должен эмититься ДО лоуринга receiver/аргументов вызова, НЕ
+// после — core/vm.odin's .Call/.Spawn читают callee СО СТЕКА строго ПОД
+// всеми аргументами (`callee_index := len(vm.stack) - 1 - arg_count`,
+// см. case .Call), а backend (2.4) реплеит инструкции блока в их
+// естественном MIR-порядке без реордеринга — если бы Function_Ref шёл
+// ПОСЛЕ аргументов, callee оказался бы НАД ними на стеке, а не под.
+// Тот же порядок, что core/compiler.odin уже соблюдает сегодня
+// (emit_constant(fn_ptr) ПЕРЕД compile_expr(receiver)/args).
 @(private = "file")
-emit_call :: proc(ctx: ^Lowering_Context, fn_id: Function_Id, args: []Value_Id, result_type: ^core.Type) -> Value_Id {
-	i := new(Call_Instr)
-	i.callee = fn_id
+emit_fn_ref :: proc(ctx: ^Lowering_Context, fn_id: Function_Id, fn_type: ^Type) -> Value_Id {
+	v := new_value(&ctx.b, fn_type)
+	i := new(Function_Ref_Instr)
+	i.dst = v
+	i.fn = fn_id
+	emit(&ctx.b, i)
+	return v
+}
+
+// emit_call_value — Call_Value_Instr через УЖЕ вычисленный callee
+// (обычно свежий Function_Ref_Instr, эмитированный emit_fn_ref ДО
+// аргументов — см. её докстринг).
+@(private = "file")
+emit_call_value :: proc(ctx: ^Lowering_Context, callee: Value_Id, args: []Value_Id, result_type: ^Type) -> Value_Id {
+	i := new(Call_Value_Instr)
+	i.callee = callee
 	i.args = args
-	if result_type != nil && core.prune_type(result_type) != core.TY_VOID {
+	if result_type != nil && prune_type(result_type) != TY_VOID {
 		dst := new_value(&ctx.b, result_type)
 		i.dst = dst
 		emit(&ctx.b, i)
@@ -1242,11 +1291,11 @@ emit_call :: proc(ctx: ^Lowering_Context, fn_id: Function_Id, args: []Value_Id, 
 }
 
 @(private = "file")
-emit_call_builtin :: proc(ctx: ^Lowering_Context, name: string, args: []Value_Id, result_type: ^core.Type) -> Value_Id {
+emit_call_builtin :: proc(ctx: ^Lowering_Context, name: string, args: []Value_Id, result_type: ^Type) -> Value_Id {
 	i := new(Call_Builtin_Instr)
 	i.name = name
 	i.args = args
-	if result_type != nil && core.prune_type(result_type) != core.TY_VOID {
+	if result_type != nil && prune_type(result_type) != TY_VOID {
 		dst := new_value(&ctx.b, result_type)
 		i.dst = dst
 		emit(&ctx.b, i)
@@ -1257,12 +1306,12 @@ emit_call_builtin :: proc(ctx: ^Lowering_Context, name: string, args: []Value_Id
 }
 
 @(private = "file")
-emit_call_builtin_async :: proc(ctx: ^Lowering_Context, name: string, args: []Value_Id, result_type: ^core.Type) -> Value_Id {
+emit_call_builtin_async :: proc(ctx: ^Lowering_Context, name: string, args: []Value_Id, result_type: ^Type) -> Value_Id {
 	i := new(Call_Async_Instr)
 	i.receiver = nil
 	i.name = name
 	i.args = args
-	if result_type != nil && core.prune_type(result_type) != core.TY_VOID {
+	if result_type != nil && prune_type(result_type) != TY_VOID {
 		dst := new_value(&ctx.b, result_type)
 		i.dst = dst
 		emit(&ctx.b, i)
@@ -1282,8 +1331,8 @@ emit_call_builtin_async :: proc(ctx: ^Lowering_Context, name: string, args: []Va
 @(private = "file")
 lower_if_expr :: proc(
 	ctx: ^Lowering_Context,
-	expr: core.Expr,
-	e: ^core.If_Expr,
+	expr: Expr,
+	e: ^If_Expr,
 	want_value: bool,
 ) -> (
 	Value_Id,
@@ -1300,7 +1349,7 @@ lower_if_expr :: proc(
 	result_type := ctx.tc.node_types[expr]
 	result_local := INVALID_LOCAL
 	if want_value {
-		result_local = new_local(&ctx.b, core.INVALID_SYMBOL, "$if", result_type)
+		result_local = new_local(&ctx.b, INVALID_SYMBOL, "$if", result_type)
 	}
 
 	set_current_block(&ctx.b, then_block)
@@ -1353,7 +1402,7 @@ new_unreachable_term :: proc(reason: string) -> ^Unreachable_Term {
 // просто кладёт константный 0.0-заполнитель, тем же способом, что
 // пустой блок в value-контексте).
 @(private = "file")
-lower_while_expr :: proc(ctx: ^Lowering_Context, e: ^core.While_Expr) {
+lower_while_expr :: proc(ctx: ^Lowering_Context, e: ^While_Expr) {
 	header_block := new_block(&ctx.b)
 	body_block := new_block(&ctx.b)
 	exit_block := new_block(&ctx.b)
@@ -1385,7 +1434,7 @@ lower_while_expr :: proc(ctx: ^Lowering_Context, e: ^core.While_Expr) {
 // момент написания этой функции) — временная панике-заглушка, дозаписать
 // сразу после 2.3h.
 @(private = "file")
-lower_for_in_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt, s: ^core.For_In_Stmt) -> Flow_Result {
+lower_for_in_stmt :: proc(ctx: ^Lowering_Context, stmt: Stmt, s: ^For_In_Stmt) -> Flow_Result {
 	info, has_info := ctx.tc.for_in_infos[stmt]
 	if !has_info {
 		lower_unsupported("for_in_infos отсутствует для for-in")
@@ -1395,12 +1444,12 @@ lower_for_in_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt, s: ^core.For_
 
 	iterable_v, iflow := lower_expr(ctx, s.iterable)
 	if iflow == .Terminates do return .Terminates
-	iter_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$for_iter", ctx.tc.node_types[s.iterable])
+	iter_local := new_local(&ctx.b, INVALID_SYMBOL, "$for_iter", ctx.tc.node_types[s.iterable])
 	emit(&ctx.b, new_store_local(iter_local, iterable_v))
 
 	#partial switch info.kind {
 	case .Fast_Array:
-		idx_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$for_idx", core.TY_NUM)
+		idx_local := new_local(&ctx.b, INVALID_SYMBOL, "$for_idx", TY_NUM)
 		neg1 := emit_const_number(ctx, -1)
 		emit(&ctx.b, new_store_local(idx_local, neg1))
 
@@ -1410,24 +1459,24 @@ lower_for_in_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt, s: ^core.For_
 		terminate(&ctx.b, new_jump_term(header_block))
 
 		set_current_block(&ctx.b, header_block)
-		idx_v := new_value(&ctx.b, core.TY_NUM)
+		idx_v := new_value(&ctx.b, TY_NUM)
 		emit(&ctx.b, new_load_local(idx_v, idx_local))
 		one_v := emit_const_number(ctx, 1)
-		next_idx_v := emit_binary(ctx, .Add, idx_v, one_v, core.TY_NUM)
+		next_idx_v := emit_binary(ctx, .Add, idx_v, one_v, TY_NUM)
 		emit(&ctx.b, new_store_local(idx_local, next_idx_v))
 
-		idx_v2 := new_value(&ctx.b, core.TY_NUM)
+		idx_v2 := new_value(&ctx.b, TY_NUM)
 		emit(&ctx.b, new_load_local(idx_v2, idx_local))
 		iter_v_len := new_value(&ctx.b, ctx.tc.node_types[s.iterable])
 		emit(&ctx.b, new_load_local(iter_v_len, iter_local))
-		len_v := emit_call_method(ctx, iter_v_len, "длина", nil, core.TY_NUM)
+		len_v := emit_call_method(ctx, iter_v_len, "длина", nil, TY_NUM)
 		cont_v := emit_compare(ctx, .NotEqual, idx_v2, len_v)
 		terminate(&ctx.b, new_branch_term(cont_v, body_block, exit_block))
 
 		set_current_block(&ctx.b, body_block)
 		iter_v_idx := new_value(&ctx.b, ctx.tc.node_types[s.iterable])
 		emit(&ctx.b, new_load_local(iter_v_idx, iter_local))
-		idx_v3 := new_value(&ctx.b, core.TY_NUM)
+		idx_v3 := new_value(&ctx.b, TY_NUM)
 		emit(&ctx.b, new_load_local(idx_v3, idx_local))
 		elem_v := new_value(&ctx.b, nil)
 		gi := new(Get_Index_Instr)
@@ -1463,16 +1512,17 @@ lower_for_in_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt, s: ^core.For_
 		terminate(&ctx.b, new_jump_term(header_block))
 
 		set_current_block(&ctx.b, header_block)
+		next_result_type := ctx.module.functions[int(next_fn_id)].result_type
+		fn_ref := emit_fn_ref(ctx, next_fn_id, nil)
 		iter_v := new_value(&ctx.b, ctx.tc.node_types[s.iterable])
 		emit(&ctx.b, new_load_local(iter_v, iter_local))
-		next_result_type := ctx.module.functions[int(next_fn_id)].result_type
-		opt_v := emit_call(ctx, next_fn_id, value_slice(iter_v), next_result_type)
-		subject_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$for_subject", nil)
+		opt_v := emit_call_value(ctx, fn_ref, value_slice(iter_v), next_result_type)
+		subject_local := new_local(&ctx.b, INVALID_SYMBOL, "$for_subject", nil)
 		emit(&ctx.b, new_store_local(subject_local, opt_v))
 
 		tag_subj := new_value(&ctx.b, nil)
 		emit(&ctx.b, new_load_local(tag_subj, subject_local))
-		tag_ok := new_value(&ctx.b, core.TY_BOOL)
+		tag_ok := new_value(&ctx.b, TY_BOOL)
 		mt := new(Match_Tag_Instr)
 		mt.dst = tag_ok
 		mt.subject = tag_subj
@@ -1510,14 +1560,14 @@ lower_for_in_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt, s: ^core.For_
 // обязано идти через Local, single-use инвариант), Get_Property по
 // позиции на каждое имя.
 @(private = "file")
-lower_for_in_bind_names :: proc(ctx: ^Lowering_Context, names_syms: [dynamic]core.Symbol_Id, elem_v: Value_Id) {
+lower_for_in_bind_names :: proc(ctx: ^Lowering_Context, names_syms: [dynamic]Symbol_Id, elem_v: Value_Id) {
 	if len(names_syms) == 1 {
 		binder := new_local(&ctx.b, names_syms[0], "", nil)
 		ctx.symbol_to_local[names_syms[0]] = binder
 		emit(&ctx.b, new_store_local(binder, elem_v))
 		return
 	}
-	elem_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$for_elem", nil)
+	elem_local := new_local(&ctx.b, INVALID_SYMBOL, "$for_elem", nil)
 	emit(&ctx.b, new_store_local(elem_local, elem_v))
 	for sym, i in names_syms {
 		loaded := new_value(&ctx.b, nil)
@@ -1538,7 +1588,7 @@ lower_for_in_bind_names :: proc(ctx: ^Lowering_Context, names_syms: [dynamic]cor
 // как Invoke_Collection в сегодняшнем байткоде — "длина"/"получить"/
 // т.п. на Массив/Соответствие/Строка) с ноль-или-более аргументами.
 @(private = "file")
-emit_call_method :: proc(ctx: ^Lowering_Context, receiver: Value_Id, name: string, args: []Value_Id, result_type: ^core.Type) -> Value_Id {
+emit_call_method :: proc(ctx: ^Lowering_Context, receiver: Value_Id, name: string, args: []Value_Id, result_type: ^Type) -> Value_Id {
 	dst := new_value(&ctx.b, result_type)
 	i := new(Call_Method_Instr)
 	i.dst = dst
@@ -1557,22 +1607,22 @@ emit_call_method :: proc(ctx: ^Lowering_Context, receiver: Value_Id, name: strin
 // арма N, тот же приём, что сегодняшний fail_jumps-список), последний
 // fail-блок — Unreachable_Term (Match_Fail).
 @(private = "file")
-lower_match_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, m: ^core.Match_Expr) -> (Value_Id, Flow_Result) {
+lower_match_expr :: proc(ctx: ^Lowering_Context, expr: Expr, m: ^Match_Expr) -> (Value_Id, Flow_Result) {
 	arm_infos, has_infos := ctx.tc.match_arm_infos[m]
 	if !has_infos {
 		lower_unsupported("match_arm_infos отсутствует для выбора")
 	}
-	want_value := core.prune_type(ctx.tc.node_types[expr]) != core.TY_VOID
+	want_value := prune_type(ctx.tc.node_types[expr]) != TY_VOID
 
 	subject_v, sflow := lower_expr(ctx, m.subject)
 	if sflow == .Terminates do return INVALID_VALUE, .Terminates
-	subject_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$match_subject", ctx.tc.node_types[m.subject])
+	subject_local := new_local(&ctx.b, INVALID_SYMBOL, "$match_subject", ctx.tc.node_types[m.subject])
 	emit(&ctx.b, new_store_local(subject_local, subject_v))
 
 	result_type := ctx.tc.node_types[expr]
 	result_local := INVALID_LOCAL
 	if want_value {
-		result_local = new_local(&ctx.b, core.INVALID_SYMBOL, "$match_result", result_type)
+		result_local = new_local(&ctx.b, INVALID_SYMBOL, "$match_result", result_type)
 	}
 
 	merge_block := new_block(&ctx.b)
@@ -1621,7 +1671,7 @@ lower_match_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, m: ^core.Match
 // рекурсивным вызовом, single-use инвариант). fail_block — куда прыгать
 // при несовпадении.
 @(private = "file")
-lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^core.Pattern_Info, value_local: Local_Id, fail_block: Block_Id) {
+lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^Pattern_Info, value_local: Local_Id, fail_block: Block_Id) {
 	switch pi.kind {
 	case .Wildcard:
 	// без условия — совпадает всегда
@@ -1646,7 +1696,7 @@ lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^core.Pattern_Info, value_loca
 	case .Constructor:
 		v := new_value(&ctx.b, nil)
 		emit(&ctx.b, new_load_local(v, value_local))
-		tag_ok := new_value(&ctx.b, core.TY_BOOL)
+		tag_ok := new_value(&ctx.b, TY_BOOL)
 		mt := new(Match_Tag_Instr)
 		mt.dst = tag_ok
 		mt.subject = v
@@ -1666,7 +1716,7 @@ lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^core.Pattern_Info, value_loca
 			gvf.subject = subj_v
 			gvf.field_index = field_idx
 			emit(&ctx.b, gvf)
-			field_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$match_field", nil)
+			field_local := new_local(&ctx.b, INVALID_SYMBOL, "$match_field", nil)
 			emit(&ctx.b, new_store_local(field_local, field_v))
 			// Тот же СКВОЗНОЙ fail_block верхнего уровня передаётся КАЖДОМУ
 			// под-паттерну — на несовпадение любого поля арм проваливается
@@ -1686,7 +1736,7 @@ lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^core.Pattern_Info, value_loca
 			gp.object = obj_v
 			gp.field_index = field_idx
 			emit(&ctx.b, gp)
-			field_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$match_field", nil)
+			field_local := new_local(&ctx.b, INVALID_SYMBOL, "$match_field", nil)
 			emit(&ctx.b, new_store_local(field_local, field_v))
 			lower_pattern(ctx, &sub, field_local, fail_block)
 		}
@@ -1699,7 +1749,7 @@ lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^core.Pattern_Info, value_loca
 // (core/compiler.odin). Используется и для голых Ident_Expr, и для
 // снимка захватываемых значений ПЕРЕД Build_Closure (2.3g).
 @(private = "file")
-lower_symbol_value_ref :: proc(ctx: ^Lowering_Context, sym: core.Symbol_Id, type: ^core.Type) -> Value_Id {
+lower_symbol_value_ref :: proc(ctx: ^Lowering_Context, sym: Symbol_Id, type: ^Type) -> Value_Id {
 	if local, ok := ctx.symbol_to_local[sym]; ok {
 		v := new_value(&ctx.b, current_function(&ctx.b).locals[int(local)].type)
 		emit(&ctx.b, new_load_local(v, local))
@@ -1733,7 +1783,7 @@ lower_symbol_value_ref :: proc(ctx: ^Lowering_Context, sym: core.Symbol_Id, type
 // лямбды. Тело лоурится ОТДЕЛЬНЫМ Lowering_Context с своим symbol_to_
 // capture (индекс = позиция в ctx.res.lambda_captures[expr]).
 @(private = "file")
-lower_lambda_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, e: ^core.Lambda_Expr) -> (Value_Id, Flow_Result) {
+lower_lambda_expr :: proc(ctx: ^Lowering_Context, expr: Expr, e: ^Lambda_Expr) -> (Value_Id, Flow_Result) {
 	lambda_type := ctx.tc.node_types[expr]
 	result_type := lambda_type.return_type
 
@@ -1743,7 +1793,7 @@ lower_lambda_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, e: ^core.Lamb
 	} else {
 		name = fmt.tprintf("lambda_%d", len(ctx.module.functions))
 	}
-	fn_id := new_function(ctx.module, name, core.INVALID_SYMBOL, result_type, e.span)
+	fn_id := new_function(ctx.module, name, INVALID_SYMBOL, result_type, e.span)
 
 	captures := ctx.res.lambda_captures[expr]
 	captured_values := make([dynamic]Value_Id, 0, len(captures))
@@ -1773,22 +1823,22 @@ lower_lambda_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, e: ^core.Lamb
 
 @(private = "file")
 lower_lambda_body :: proc(
-	res: ^core.Resolver_Ctx,
-	tc: ^core.Type_Ctx,
+	res: ^Resolver_Ctx,
+	tc: ^Type_Ctx,
 	module: ^Mir_Module,
 	fn_id: Function_Id,
-	expr: core.Expr,
-	e: ^core.Lambda_Expr,
-	captures: [dynamic]core.Symbol_Id,
-	symbol_to_function: map[core.Symbol_Id]Function_Id,
+	expr: Expr,
+	e: ^Lambda_Expr,
+	captures: [dynamic]Symbol_Id,
+	symbol_to_function: map[Symbol_Id]Function_Id,
 ) {
 	inner := Lowering_Context {
 		res                = res,
 		tc                 = tc,
 		module             = module,
-		symbol_to_local    = make(map[core.Symbol_Id]Local_Id),
+		symbol_to_local    = make(map[Symbol_Id]Local_Id),
 		symbol_to_function = symbol_to_function,
-		symbol_to_capture  = make(map[core.Symbol_Id]int),
+		symbol_to_capture  = make(map[Symbol_Id]int),
 		loops              = make([dynamic]Loop_Targets),
 	}
 	inner.b = begin_function(module, fn_id)
@@ -1810,7 +1860,7 @@ lower_lambda_body :: proc(
 	}
 	current_function(&inner.b).parameters = param_locals[:]
 
-	want_value := prune_type_or_self(current_function(&inner.b).result_type) != core.TY_VOID
+	want_value := prune_type_or_self(current_function(&inner.b).result_type) != TY_VOID
 	result, flow := lower_block(&inner, e.body, want_value)
 	if flow == .Continues {
 		if want_value {

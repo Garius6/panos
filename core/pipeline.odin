@@ -65,8 +65,22 @@ Check_Result :: struct {
 // recovery (Error-node/"hole" паттерн) — прогон всех стадий даже после
 // ошибки лексера/парсера обычно даёт полезный частичный AST для позиций
 // ДО места ошибки.
-check_source :: proc(source: string) -> Check_Result {
-	result: Check_Result
+// Возвращает ^Check_Result (не значение) — та же причина, что подстановка
+// last.tc_ctx.res = &last.res_ctx в module_loader.odin (resolve_and_
+// typecheck_all): new_type_ctx(&result.res_ctx) ниже сохраняет tc_ctx.res
+// указателем на res_ctx-поле ЭТОЙ функции. Возврат ПО ЗНАЧЕНИЮ скопировал
+// бы Check_Result вызывающему коду — tc_ctx.res остался бы указывать на
+// адрес локальной переменной этой функции, мёртвый сразу по возврату
+// (висячий указатель, детерминированно не падает только пока эта область
+// стека не переиспользована — воспроизводится как настоящий segfault при
+// вызове чего-либо, читающего tc_ctx.res, напр. compile_program, см.
+// core/mir/differential_test.odin, найдено эмпирически при дифференциальном
+// тестировании Фазы 2). Куча (new()) даёт результату стабильный адрес —
+// tc_ctx.res остаётся валиден сколько угодно после возврата. Все текущие
+// вызывающие используют `result := check_source(...)` + `.field` — точка
+// доступа не меняется (Odin разыменовывает ^T автоматически).
+check_source :: proc(source: string) -> ^Check_Result {
+	result := new(Check_Result)
 	tokens, lex_diags := tokenize(source)
 	for d in lex_diags do append(&result.diags, d)
 

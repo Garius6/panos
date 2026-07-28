@@ -1,4 +1,4 @@
-package mir
+package core
 
 import "core:fmt"
 import "core:strings"
@@ -191,7 +191,9 @@ print_instr_into :: proc(b: ^strings.Builder, instr: Mir_Instruction) {
 		fmt.sbprintf(b, " = fn_ref fn_%d", v.fn)
 	case ^Spawn_Instr:
 		print_value(b, v.dst)
-		fmt.sbprintf(b, " = spawn fn_%d(", v.callee)
+		strings.write_string(b, " = spawn ")
+		print_value(b, v.callee)
+		strings.write_byte(b, '(')
 		print_value_list(b, v.args)
 		strings.write_byte(b, ')')
 	case ^Send_Instr:

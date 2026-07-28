@@ -29,16 +29,23 @@ run_source_with_args :: proc(
 	// 2. Резолв и Типизация
 	res_ctx := new_resolver_ctx()
 	resolve_program(&res_ctx, prog)
-	if len(res_ctx.diagnostics) > 0 do return 0.0, false, res_ctx.diagnostics
+	// diagnostics_have_error, НЕ len() > 0 — резолв теперь тоже может
+	// вернуть ТОЛЬКО Severity.Warning (неиспользуемая 'пер'-переменная,
+	// pop_scope) — не причина обрывать пайплайн ДО typecheck/компиляции/
+	// исполнения. Настоящий баг был здесь: тестовые сценарии, которые
+	// после успешного (но с warning) run_code'а ждут побочных эффектов
+	// исполнения (напр. join на спавненном тестовом сервере, который
+	// разблокируется только РЕАЛЬНЫМ HTTP-запросом изнутри программы) —
+	// зависали НАВСЕГДА, т.к. программа тихо не запускалась вовсе.
+	if diagnostics_have_error(res_ctx.diagnostics[:]) do return 0.0, false, res_ctx.diagnostics
 
 	type_ctx := new_type_ctx(&res_ctx)
 	typecheck_program(&type_ctx, prog)
-	// diagnostics_have_error, НЕ len() > 0 — typecheck теперь может
-	// вернуть ТОЛЬКО Severity.Warning (напр. недостижимый код,
-	// check_unreachable_code) — это не причина отказаться компилировать/
-	// исполнять, только показать. Список диагностик возвращается ПОЛНЫЙ
-	// (с предупреждениями) в любом случае — вызывающий (LSP, run_code)
-	// решает, что с ними делать.
+	// Тот же принцип — typecheck тоже может вернуть только Warning (напр.
+	// недостижимый код, check_unreachable_code) — это не причина
+	// отказаться компилировать/исполнять, только показать. Список
+	// диагностик возвращается ПОЛНЫЙ (с предупреждениями) в любом случае —
+	// вызывающий (LSP, run_code) решает, что с ними делать.
 	if diagnostics_have_error(type_ctx.diagnostics[:]) do return 0.0, false, type_ctx.diagnostics
 
 	// 3. Компиляция (MIR: lower_module уже лоурит прелюдию как часть
@@ -53,13 +60,18 @@ run_source_with_args :: proc(
 	vm := new_vm(registry, program_args)
 	run_scheduler(vm)
 
-	// type_ctx.diagnostics здесь — только Warning (Error уже гейтился бы
-	// выше) или пусто; возвращаем как есть, а не nil — иначе предупреждения
-	// вроде "недостижимый код" молча терялись бы на успешном пути.
+	// res_ctx.diagnostics/type_ctx.diagnostics здесь — только Warning
+	// (Error уже гейтился бы выше на своей стадии) или пусто; объединяем
+	// ОБА (неиспользуемая переменная — резолв; недостижимый код —
+	// typecheck), а не nil — иначе одна из категорий молча терялась бы на
+	// успешном пути.
+	all_diags := make([dynamic]Diagnostic)
+	for d in res_ctx.diagnostics do append(&all_diags, d)
+	for d in type_ctx.diagnostics do append(&all_diags, d)
 	if len(vm.stack) > 0 {
-		return vm.stack[len(vm.stack) - 1], true, type_ctx.diagnostics
+		return vm.stack[len(vm.stack) - 1], true, all_diags
 	}
-	return 0.0, false, type_ctx.diagnostics
+	return 0.0, false, all_diags
 }
 
 Check_Result :: struct {

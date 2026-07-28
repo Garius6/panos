@@ -1,6 +1,7 @@
 #+build !js
 package core
 
+import "core:strings"
 import "core:testing"
 
 @(test)
@@ -1746,4 +1747,131 @@ test_unreachable_code_warning_does_not_block_execution :: proc(t: ^testing.T) {
 	`)
 	testing.expectf(t, ok, "предупреждение не должно блокировать исполнение — стек пуст")
 	testing.expect_value(t, result, Value(f64(42)))
+}
+
+// pop_scope (resolver.odin) — неиспользуемая 'пер'-переменная,
+// Severity.Warning, та же non-blocking семья, что check_unreachable_code.
+// Скоуп: ТОЛЬКО пер (не параметры/for-in/match-биндеры — см. план), "_"
+// всегда исключён.
+@(test)
+test_unused_let_variable_warns :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			пер x = 1
+			42
+		конец
+	`)
+	expect_diagnostic(t, diags, "неиспользованная переменная 'x'")
+}
+
+@(test)
+test_used_let_variable_does_not_warn :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			пер x = 1
+			x + 1
+		конец
+	`)
+	for d in diags {
+		testing.expectf(t, d.message != "неиспользованная переменная 'x'", "ложное срабатывание на реально используемой переменной")
+	}
+}
+
+@(test)
+test_unused_destructured_name_warns_only_that_name :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			пер (a, b) = (1, 2)
+			a
+		конец
+	`)
+	expect_diagnostic(t, diags, "неиспользованная переменная 'b'")
+	for d in diags {
+		testing.expectf(t, d.message != "неиспользованная переменная 'a'", "'a' реально используется, не должна варниться")
+	}
+}
+
+@(test)
+test_underscore_let_never_warns :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			пер _ = 1
+			42
+		конец
+	`)
+	for d in diags {
+		testing.expectf(t, !strings.contains(d.message, "неиспользован"), "'_' должен быть освобождён от проверки")
+	}
+}
+
+// Сознательный скоуп: это детектор "никогда больше не упомянута", не
+// "никогда не прочитана" — переменная, использованная ТОЛЬКО как цель
+// присваивания (x = 5, значение x никогда не читается), НЕ варнится в
+// этой итерации (write-only detection — отдельная, более тонкая фича,
+// см. план).
+@(test)
+test_write_only_variable_does_not_warn :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			пер x = 1
+			x = 5
+			42
+		конец
+	`)
+	for d in diags {
+		testing.expectf(t, d.message != "неиспользованная переменная 'x'", "write-only — вне скоупа этой итерации, не должно варниться")
+	}
+}
+
+@(test)
+test_shadowed_inner_unused_variable_warns_only_inner :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			пер x = 1
+			если истина тогда
+				пер x = 2
+			конец
+			x
+		конец
+	`)
+	expect_diagnostic(t, diags, "неиспользованная переменная 'x'")
+	// Ровно ОДНО предупреждение на 'x' (внутренний, теневой) — внешний
+	// реально используется в последней строке.
+	count := 0
+	for d in diags do if d.message == "неиспользованная переменная 'x'" do count += 1
+	testing.expectf(t, count == 1, "ожидалось ровно 1 предупреждение на теневой x, получено %d", count)
+}
+
+@(test)
+test_variable_captured_by_lambda_counts_as_used :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			пер x = 10
+			пер прибавить = функ(y: Число) -> Число
+				y + x
+			конец
+			прибавить(1)
+		конец
+	`)
+	for d in diags {
+		testing.expectf(t, d.message != "неиспользованная переменная 'x'", "захват лямбдой должен считаться использованием")
+	}
+}
+
+// Регрессия: параметры функций делят тот же scope/pop_scope, что и
+// тело — фильтр по let_bound_symbols обязан их исключать.
+@(test)
+test_unused_function_parameter_does_not_warn :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ ф(неиспользуемый: Число) -> Число
+			42
+		конец
+
+		функ старт() -> Число
+			ф(1)
+		конец
+	`)
+	for d in diags {
+		testing.expectf(t, !strings.contains(d.message, "неиспользован"), "параметры вне скоупа этой проверки, не должны варниться")
+	}
 }

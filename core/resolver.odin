@@ -460,6 +460,21 @@ Resolver_Ctx :: struct {
 	// Деструктуризация в пер/конст (Let_Stmt.names непусто) — та же форма,
 	// что for_in_names_syms, позиционно параллельно Let_Stmt.names.
 	let_destructure_syms: map[Stmt][dynamic]Symbol_Id,
+	// Неиспользуемые переменные (Severity.Warning, см. check_unreachable_
+	// code в type_cheker.odin — та же non-blocking семья диагностик).
+	// used_symbols — ЛЮБАЯ ссылка на символ через Ident_Expr (и чтение, и
+	// цель присваивания — Binary_Expr's .Assign резолвит e.left тем же
+	// case ^Ident_Expr, отдельного случая не нужно) отмечает его
+	// использованным; НЕ различает read vs write-only (x = 5 без
+	// дальнейшего чтения x всё равно считается "использованным" — см.
+	// план, сознательный скоуп этой итерации). let_bound_symbols — только
+	// символы, заведённые ЧЕРЕЗ 'пер' (простое имя И деструктуризация),
+	// КРОМЕ "_" (opt-out, тот же принцип, что Pattern_Wildcard уже даёт
+	// match'у) — параметры функций/for-in/pattern-биндеры НЕ сюда, они
+	// делят тот же scope/pop_scope, что и тела функций, но фильтруются
+	// этой картой намеренно (см. план — расширять на них не в этом раунде).
+	used_symbols:      map[Symbol_Id]bool,
+	let_bound_symbols: map[Symbol_Id]bool,
 
 	// Symbol_Id типов Опция/Результат из прелюдии —
 	// нужны type_cheker.odin (infer_try_expr, оператор `?`), чтобы отличить
@@ -507,6 +522,17 @@ report_resolve :: proc(ctx: ^Resolver_Ctx, span: Span, format: string, args: ..a
 	append(&ctx.diagnostics, Diagnostic{severity = .Error, span = span, message = msg})
 }
 
+// report_resolve_warning — как report_resolve, но severity = .Warning
+// (см. report_warning, core/type_cheker.odin — тот же паттерн, другой
+// Ctx: Resolver_Ctx.diagnostics — отдельное поле от Type_Ctx.diagnostics).
+report_resolve_warning :: proc(ctx: ^Resolver_Ctx, span: Span, format: string, args: ..any) {
+	msg := fmt.aprintf(format, ..args)
+	for d in ctx.diagnostics {
+		if d.span == span && d.message == msg do return
+	}
+	append(&ctx.diagnostics, Diagnostic{severity = .Warning, span = span, message = msg})
+}
+
 push_scope :: proc(resolver: ^Resolver_Ctx) {
 	new_scope := new(Scope)
 	new_scope.parent = resolver.current_scope
@@ -514,7 +540,18 @@ push_scope :: proc(resolver: ^Resolver_Ctx) {
 	resolver.current_scope = new_scope
 }
 
+// pop_scope — вместе с закрытием scope'а проверяет неиспользуемые 'пер'
+// (Severity.Warning, см. check_unreachable_code в type_cheker.odin — та
+// же non-blocking семья). Безопасный момент для проверки: блоки строго
+// вложены, хойстинга нет — к моменту pop_scope резолв УЖЕ посетил каждую
+// возможную ссылку на символы этого scope (единственный прямой проход).
 pop_scope :: proc(resolver: ^Resolver_Ctx) {
+	for _, sym in resolver.current_scope.symbols {
+		if resolver.let_bound_symbols[sym] && !resolver.used_symbols[sym] {
+			s := symbol_at(resolver.symbol_store, sym)
+			report_resolve_warning(resolver, s.span, "неиспользованная переменная '%s'", resolve_interned(s.name))
+		}
+	}
 	if resolver.current_scope.parent != nil {
 		resolver.current_scope = resolver.current_scope.parent
 	}
@@ -590,13 +627,15 @@ check_not_reserved :: proc(ctx: ^Resolver_Ctx, name: string, span: Span) -> bool
 
 new_resolver_ctx :: proc() -> Resolver_Ctx {
 	ctx := Resolver_Ctx {
-		symbol_store    = new_symbol_store(),
-		symbol_types    = make(map[Symbol_Id]^Type),
-		stmt_symbols    = make(map[Stmt]Symbol_Id),
-		decl_symbols    = make(map[Decls]Symbol_Id),
-		node_symbols    = make(map[Expr]Symbol_Id),
-		pattern_binders = make(map[^Pattern_Ident]Symbol_Id),
-		diagnostics     = make([dynamic]Diagnostic),
+		symbol_store       = new_symbol_store(),
+		symbol_types       = make(map[Symbol_Id]^Type),
+		stmt_symbols       = make(map[Stmt]Symbol_Id),
+		decl_symbols       = make(map[Decls]Symbol_Id),
+		node_symbols       = make(map[Expr]Symbol_Id),
+		pattern_binders    = make(map[^Pattern_Ident]Symbol_Id),
+		diagnostics        = make([dynamic]Diagnostic),
+		used_symbols       = make(map[Symbol_Id]bool),
+		let_bound_symbols  = make(map[Symbol_Id]bool),
 	}
 
 	push_scope(&ctx)
@@ -616,13 +655,15 @@ new_module_resolver_ctx :: proc(graph: ^Module_Graph, module: ^Module) -> Resolv
 	// graph.symbol_store, чтобы install_standard_symbols писала builtin'ы
 	// в тот же store, что будет использоваться дальше.
 	ctx := Resolver_Ctx {
-		symbol_store    = graph.symbol_store,
-		symbol_types    = graph.symbol_types,
-		stmt_symbols    = make(map[Stmt]Symbol_Id),
-		decl_symbols    = make(map[Decls]Symbol_Id),
-		node_symbols    = make(map[Expr]Symbol_Id),
-		pattern_binders = make(map[^Pattern_Ident]Symbol_Id),
-		diagnostics     = make([dynamic]Diagnostic),
+		symbol_store       = graph.symbol_store,
+		symbol_types       = graph.symbol_types,
+		stmt_symbols       = make(map[Stmt]Symbol_Id),
+		decl_symbols       = make(map[Decls]Symbol_Id),
+		node_symbols       = make(map[Expr]Symbol_Id),
+		pattern_binders    = make(map[^Pattern_Ident]Symbol_Id),
+		diagnostics        = make([dynamic]Diagnostic),
+		used_symbols       = make(map[Symbol_Id]bool),
+		let_bound_symbols  = make(map[Symbol_Id]bool),
 	}
 	push_scope(&ctx)
 	ctx.global_scope = ctx.current_scope
@@ -1036,6 +1077,12 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 				}
 				ctx.current_scope.symbols[name_id] = sym
 				append(&syms, sym)
+				// "_" — тот же opt-out, что Pattern_Wildcard уже даёт match'у
+				// (parse_pattern превращает голый "_" в Pattern_Wildcard, без
+				// символа вообще) — здесь символ всё равно заводится (нужен
+				// для скоупа/переприсваивания), просто не отслеживается на
+				// неиспользованность.
+				if name != "_" do ctx.let_bound_symbols[sym] = true
 			}
 			ctx.let_destructure_syms[stmt] = syms
 		} else {
@@ -1046,6 +1093,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 				report_resolve(ctx, s.span, "Имя %s уже объявлено", s.name)
 			}
 			ctx.current_scope.symbols[name_id] = sym
+			if s.name != "_" do ctx.let_bound_symbols[sym] = true
 
 			ctx.stmt_symbols[stmt] = sym
 		}
@@ -1103,6 +1151,10 @@ resolve_expr :: proc(ctx: ^Resolver_Ctx, expr: Expr) {
 		// typechecker трактует это как poison, не каскадирует вторичный
 		// diagnostic, см. infer_ident_expr).
 		ctx.node_symbols[expr] = sym
+		// Неиспользуемые переменные: ЛЮБАЯ ссылка (чтение И цель
+		// присваивания — Binary_Expr's .Assign резолвит e.left тем же
+		// путём) отмечает символ использованным, см. pop_scope.
+		if sym != INVALID_SYMBOL do ctx.used_symbols[sym] = true
 
 	case ^Binary_Expr:
 		resolve_expr(ctx, e.left)

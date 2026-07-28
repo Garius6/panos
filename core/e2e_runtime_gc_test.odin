@@ -25,6 +25,7 @@ compile_and_run_for_gc :: proc(source: string) -> ^VM {
 	panic_on_diagnostics(type_ctx.diagnostics)
 
 	module := lower_module(&res_ctx, &type_ctx, &prog)
+	optimize_module(&module)
 	registry := lower_module_to_bytecode(&module)
 	vm := new_vm(registry)
 	run_scheduler(vm)

@@ -40,6 +40,7 @@ run_source_with_args :: proc(
 	// prelude" шага, в отличие от старого ensure_prelude_compiled+
 	// compile_program, не нужно)
 	module := lower_module(&res_ctx, &type_ctx, &prog)
+	optimize_module(&module)
 	registry := lower_module_to_bytecode(&module)
 
 	// 4. Выполнение (VM)

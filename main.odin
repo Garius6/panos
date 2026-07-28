@@ -92,6 +92,7 @@ run_file :: proc(filename: string, program_args: []string = nil, verbose: bool =
 	print_diagnostics_and_exit(&graph, all_diags)
 
 	module := core.lower_program_graph(results)
+	core.optimize_module(&module)
 	global_registry := core.lower_module_to_bytecode(&module)
 	if verbose {
 		for i in 0 ..< len(results) {

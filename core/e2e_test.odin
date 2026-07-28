@@ -94,6 +94,7 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 		panic_on_diagnostics(r.tc_ctx.diagnostics)
 	}
 	module := lower_program_graph(results)
+	optimize_module(&module)
 	registry := lower_module_to_bytecode(&module)
 
 	vm := new_vm(registry)

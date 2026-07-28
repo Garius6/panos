@@ -174,6 +174,7 @@ panos_run :: proc "c" (source_len: int) {
 	}
 
 	module := core.lower_program_graph(results)
+	core.optimize_module(&module)
 	global_registry := core.lower_module_to_bytecode(&module)
 
 	vm := core.new_vm(global_registry, nil)

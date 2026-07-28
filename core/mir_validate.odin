@@ -329,8 +329,8 @@ validate_module :: proc(
 // instr_refs — (dst, []operands) единой инструкции. Исчерпывающий switch
 // (не #partial) — новый вариант Mir_Instruction без case здесь не
 // скомпилируется, тот же принцип, что get_header/mark_value в core/gc.
-// odin (см. docs/src/architecture/memory-and-gc.md).
-@(private = "file")
+// odin (см. docs/src/architecture/memory-and-gc.md). НЕ private = "file" —
+// переиспользуется core/mir_optimize.odin (remove_dead_constants).
 instr_refs :: proc(
 	instr: Mir_Instruction,
 	allocator := context.allocator,

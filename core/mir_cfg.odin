@@ -53,7 +53,7 @@ compute_cfg_info :: proc(fn: ^Mir_Function, allocator := context.allocator) -> C
 	// Odin-компилятора на достаточно большой функции).
 	postorder := make([dynamic]Block_Id, 0, n, allocator)
 	visited := make([]bool, n, allocator)
-	defer delete(visited)
+	defer delete(visited, allocator)
 
 	Frame :: struct {
 		block:      Block_Id,

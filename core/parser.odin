@@ -2288,8 +2288,18 @@ parse_return_stmt :: proc(p: ^Parser) -> Stmt {
 	next_token(p.stream)
 	stmt := new(Return_Stmt)
 
+	// tok.nl_before — тот же приём, что parse_type уже использует для
+	// снятия ровно такой же неоднозначности (генерик-аргументы vs новая
+	// строка, см. Token.nl_before, core/token.odin). Без него голый
+	// `возврат` перед НОВЫМ statement'ом на следующей строке (не
+	// заканчивающимся `;`/`конец`/EOF — т.е. почти любой код) жадно
+	// парсился бы как "возврат <это выражение>", молча меняя семантику
+	// (см. AGENTS.md/reference_panos_language_gotchas — найдено
+	// эмпирически при проверке unreachable-code warning на реальном
+	// проекте pan: `возврат` перед недостижимым кодом СЪЕДАЛ его как
+	// значение возврата вместо того, чтобы оставить недостижимым).
 	tok := peek_token(p.stream)
-	if tok.kind == .Semicolon || tok.kind == .End || tok.kind == .EOF {
+	if tok.kind == .Semicolon || tok.kind == .End || tok.kind == .EOF || tok.nl_before {
 		stmt.value = nil
 	} else {
 		stmt.value = parse_expr(p, 0)

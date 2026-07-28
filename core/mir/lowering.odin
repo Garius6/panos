@@ -1,6 +1,7 @@
 package mir
 
 import core "../"
+import "core:fmt"
 
 // AST (после резолва+тайпчека) -> MIR. Работает в ТОЙ ЖЕ точке пайплайна,
 // где сегодня работает core/compiler.odin: читает уже посчитанные
@@ -37,6 +38,12 @@ Lowering_Context :: struct {
 	b:                  Mir_Builder,
 	symbol_to_local:    map[core.Symbol_Id]Local_Id,
 	symbol_to_function: map[core.Symbol_Id]Function_Id,
+	// Непусто ТОЛЬКО при лоуринге ТЕЛА лямбды — индекс символа в
+	// Closure_Value.captured (порядок = ctx.res.lambda_captures[expr],
+	// тот же, что Get_Captured сегодня). Проверяется ПОСЛЕ symbol_to_local
+	// в Ident_Expr — тот же порядок приоритета, что compile_symbol_value_
+	// ref сегодня (locals, потом captures, потом global function).
+	symbol_to_capture:  map[core.Symbol_Id]int,
 	loops:              [dynamic]Loop_Targets,
 }
 
@@ -63,6 +70,13 @@ prefix_concat :: proc(a, b: string) -> string {
 // --- Модуль: двухпроходный lowering (проход 1 резервирует все функции —
 // forward references/рекурсия; проход 2 лоурит тела) ---
 
+// lower_module — как ensure_prelude_compiled + compile_program сегодня
+// (core/pipeline.odin): прелюдия (Опция/Результат и их методы — .получить/
+// .значение/.причина/т.п., СВОИ res/tc через res.prelude_res_ctx/
+// prelude_tc_ctx, СВОЙ AST через prelude_res_ctx.current_module.ast)
+// хостится/лоурится В ТОТ ЖЕ module/symbol_to_function ПЕРЕД пользова-
+// тельской программой — иначе любой вызов .получить(запасное) и т.п. не
+// резолвился бы (прелюдийные декларации не входят в program.decls).
 lower_module :: proc(
 	res: ^core.Resolver_Ctx,
 	tc: ^core.Type_Ctx,
@@ -71,28 +85,70 @@ lower_module :: proc(
 	module := new_module()
 	symbol_to_function := make(map[core.Symbol_Id]Function_Id)
 
-	for decl in program.decls {
+	if res.prelude_res_ctx != nil && res.prelude_tc_ctx != nil {
+		hoist_decls(res.prelude_res_ctx, &module, &symbol_to_function, res.prelude_res_ctx.current_module.ast.decls)
+		lower_decls(res.prelude_res_ctx, res.prelude_tc_ctx, &module, &symbol_to_function, res.prelude_res_ctx.current_module.ast.decls)
+	}
+
+	hoist_decls(res, &module, &symbol_to_function, program.decls)
+	lower_decls(res, tc, &module, &symbol_to_function, program.decls)
+
+	return module
+}
+
+@(private = "file")
+hoist_decls :: proc(
+	res: ^core.Resolver_Ctx,
+	module: ^Mir_Module,
+	symbol_to_function: ^map[core.Symbol_Id]Function_Id,
+	decls: [dynamic]core.Decls,
+) {
+	for decl in decls {
 		#partial switch d in decl {
 		case ^core.Function_Decl:
 			if len(d.type_param_bounds) > 0 do continue // дженерики — Фаза 2, тот же фильтр, что compile_program сегодня
 			sym := res.decl_symbols[decl]
 			result_type := function_return_type(res, sym)
-			fn_id := new_function(&module, d.name, sym, result_type, d.span)
+			fn_id := new_function(module, d.name, sym, result_type, d.span)
 			symbol_to_function[sym] = fn_id
+		case ^core.Impl_Decl:
+			// Методы структур/интерфейсов — та же двухпроходная логика,
+			// что compile_program's Impl_Decl case (hoist ВСЕХ методов ДО
+			// лоуринга любого тела, forward references/рекурсия между
+			// методами работают так же, как между top-level функциями).
+			for m in d.methods {
+				sym := res.decl_symbols[m]
+				result_type := function_return_type(res, sym)
+				fn_id := new_function(module, m.name, sym, result_type, m.span)
+				symbol_to_function[sym] = fn_id
+			}
 		}
 	}
+}
 
-	for decl in program.decls {
+@(private = "file")
+lower_decls :: proc(
+	res: ^core.Resolver_Ctx,
+	tc: ^core.Type_Ctx,
+	module: ^Mir_Module,
+	symbol_to_function: ^map[core.Symbol_Id]Function_Id,
+	decls: [dynamic]core.Decls,
+) {
+	for decl in decls {
 		#partial switch d in decl {
 		case ^core.Function_Decl:
 			if len(d.type_param_bounds) > 0 do continue
 			sym := res.decl_symbols[decl]
 			fn_id := symbol_to_function[sym]
-			lower_function_body(res, tc, &module, fn_id, decl, d.args, d.body, symbol_to_function)
+			lower_function_body(res, tc, module, fn_id, decl, d.args, d.body, symbol_to_function^)
+		case ^core.Impl_Decl:
+			for m in d.methods {
+				sym := res.decl_symbols[m]
+				fn_id := symbol_to_function[sym]
+				lower_function_body(res, tc, module, fn_id, m, m.args, m.body, symbol_to_function^)
+			}
 		}
 	}
-
-	return module
 }
 
 @(private = "file")
@@ -134,9 +190,9 @@ lower_function_body :: proc(
 			append(&param_locals, local)
 		}
 	}
-	ctx.b.function.parameters = param_locals[:]
+	current_function(&ctx.b).parameters = param_locals[:]
 
-	want_value := prune_type_or_self(ctx.b.function.result_type) != core.TY_VOID
+	want_value := prune_type_or_self(current_function(&ctx.b).result_type) != core.TY_VOID
 	result, flow := lower_block(&ctx, body, want_value)
 	if flow == .Continues {
 		if want_value {
@@ -233,7 +289,39 @@ lower_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt) -> Flow_Result {
 	switch s in stmt {
 	case ^core.Let_Stmt:
 		if len(s.names) > 0 {
-			lower_unsupported("деструктурирующий пер (Фаза 2)")
+			// Деструктуризация (тупл или структура — оба Aggregate_Value,
+			// Get_Property по числовому индексу работает одинаково для
+			// обоих) — тот же приём, что core/compiler.odin: значение
+			// материализуется в СИНТЕТИЧЕСКИЙ Mir_Local (читается по разу
+			// на каждое имя — обязано идти через Local, не bare Value_Id,
+			// см. single-use инвариант), затем Get_Property+Store_Local
+			// на каждое имя.
+			v, flow := lower_expr(ctx, s.value)
+			if flow == .Terminates do return .Terminates
+			value_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$destructure", ctx.tc.node_types[s.value])
+			emit(&ctx.b, new_store_local(value_local, v))
+
+			syms := ctx.res.let_destructure_syms[stmt]
+			field_indices := ctx.tc.let_destructure_field_indices[stmt]
+			for sym, i in syms {
+				// Тип поля не протаскиваем (nil) — ни backend (Фаза 4,
+				// см. план), ни текущий validate.odin не читают value_
+				// types[i] для чего-то, кроме длины/подсчёта; уточнение
+				// типа per-field — не блокер для корректной структуры
+				// инструкций/CFG.
+				loaded := new_value(&ctx.b, nil)
+				emit(&ctx.b, new_load_local(loaded, value_local))
+				field_v := new_value(&ctx.b, nil)
+				gp := new(Get_Property_Instr)
+				gp.dst = field_v
+				gp.object = loaded
+				gp.field_index = field_indices[i]
+				emit(&ctx.b, gp)
+				binder_local := new_local(&ctx.b, sym, s.names[i], nil)
+				ctx.symbol_to_local[sym] = binder_local
+				emit(&ctx.b, new_store_local(binder_local, field_v))
+			}
+			return .Continues
 		}
 		v, flow := lower_expr(ctx, s.value)
 		if flow == .Terminates do return .Terminates
@@ -275,7 +363,7 @@ lower_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt) -> Flow_Result {
 		return .Terminates
 
 	case ^core.For_In_Stmt:
-		lower_unsupported("для-цикл (Фаза 2)")
+		return lower_for_in_stmt(ctx, stmt, s)
 	case ^core.Error_Stmt:
 		lower_unsupported("Error_Stmt (парсер уже отрапортовал ошибку)")
 	}
@@ -327,15 +415,7 @@ lower_expr :: proc(
 
 	case ^core.Ident_Expr:
 		sym := ctx.res.node_symbols[expr]
-		local, ok := ctx.symbol_to_local[sym]
-		if !ok {
-			lower_unsupported(
-				"идентификатор не локаль (builtin/модуль/константа — Фаза 2)",
-			)
-		}
-		v := new_value(&ctx.b, ctx.b.function.locals[int(local)].type)
-		emit(&ctx.b, new_load_local(v, local))
-		result = v
+		result = lower_symbol_value_ref(ctx, sym, ctx.tc.node_types[expr])
 		return
 
 	case ^core.Unary_Expr:
@@ -355,19 +435,147 @@ lower_expr :: proc(
 		result = emit_const_number(ctx, 0)
 		return
 
-	case ^core.Tuple_Expr,
-	     ^core.Property_Expr,
-	     ^core.Lambda_Expr,
-	     ^core.Array_Expr,
-	     ^core.Map_Expr,
-	     ^core.Index_Expr,
-	     ^core.Try_Expr,
-	     ^core.Match_Expr,
-	     ^core.Error_Expr,
-	     ^core.Spawn_Expr:
-		lower_unsupported("вид выражения (Фаза 2)")
+	case ^core.Tuple_Expr:
+		elements := make([dynamic]Value_Id, 0, len(e.elements))
+		for el in e.elements {
+			v, eflow := lower_expr(ctx, el)
+			if eflow == .Terminates do return INVALID_VALUE, .Terminates
+			append(&elements, v)
+		}
+		dst := new_value(&ctx.b, ctx.tc.node_types[expr])
+		i := new(New_Aggregate_Instr)
+		i.dst = dst
+		i.type_name = "" // анонимный тупл — та же конвенция, что Aggregate_Value.type_name сегодня
+		i.elements = elements[:]
+		emit(&ctx.b, i)
+		return dst, .Continues
+
+	case ^core.Array_Expr:
+		elements := make([dynamic]Value_Id, 0, len(e.elements))
+		for el in e.elements {
+			v, eflow := lower_expr(ctx, el)
+			if eflow == .Terminates do return INVALID_VALUE, .Terminates
+			append(&elements, v)
+		}
+		dst := new_value(&ctx.b, ctx.tc.node_types[expr])
+		i := new(New_Array_Instr)
+		i.dst = dst
+		i.elements = elements[:]
+		emit(&ctx.b, i)
+		return dst, .Continues
+
+	case ^core.Map_Expr:
+		keys := make([dynamic]Value_Id, 0, len(e.entries))
+		vals := make([dynamic]Value_Id, 0, len(e.entries))
+		for entry in e.entries {
+			kv, kflow := lower_expr(ctx, entry.key)
+			if kflow == .Terminates do return INVALID_VALUE, .Terminates
+			vv, vflow := lower_expr(ctx, entry.value)
+			if vflow == .Terminates do return INVALID_VALUE, .Terminates
+			append(&keys, kv)
+			append(&vals, vv)
+		}
+		dst := new_value(&ctx.b, ctx.tc.node_types[expr])
+		i := new(New_Map_Instr)
+		i.dst = dst
+		i.keys = keys[:]
+		i.vals = vals[:]
+		emit(&ctx.b, i)
+		return dst, .Continues
+
+	case ^core.Index_Expr:
+		obj, oflow := lower_expr(ctx, e.object)
+		if oflow == .Terminates do return INVALID_VALUE, .Terminates
+		idx, iflow := lower_expr(ctx, e.index)
+		if iflow == .Terminates do return INVALID_VALUE, .Terminates
+		dst := new_value(&ctx.b, ctx.tc.node_types[expr])
+		i := new(Get_Index_Instr)
+		i.dst = dst
+		i.object = obj
+		i.index = idx
+		emit(&ctx.b, i)
+		return dst, .Continues
+
+	case ^core.Property_Expr:
+		// Constructor_Variant через голое свойство (0-арный enum-вариант
+		// без ()) — та же спец-ветка, что core/compiler.odin's case
+		// ^Property_Expr (call_infos[expr].kind == .Constructor_Variant),
+		// не обычное чтение поля.
+		if info, ok := ctx.tc.call_infos[expr]; ok && info.kind == core.Call_Kind.Constructor_Variant {
+			dst := new_value(&ctx.b, ctx.tc.node_types[expr])
+			bv := new(Build_Variant_Instr)
+			bv.dst = dst
+			bv.type_name = info.variant.owner_type.name
+			bv.variant_name = info.variant.owner_type.variants[info.variant.tag_index].name
+			bv.tag = info.variant.tag_index
+			bv.fields = nil
+			emit(&ctx.b, bv)
+			return maybe_wrap_interface_cast(ctx, expr, dst), .Continues
+		}
+
+		obj, oflow := lower_expr(ctx, e.object)
+		if oflow == .Terminates do return INVALID_VALUE, .Terminates
+		dst := new_value(&ctx.b, ctx.tc.node_types[expr])
+		i := new(Get_Property_Instr)
+		i.dst = dst
+		i.object = obj
+		i.field_index = ctx.tc.property_indices[expr]
+		emit(&ctx.b, i)
+		return dst, .Continues
+
+	case ^core.Try_Expr:
+		src, sflow := lower_expr(ctx, e.value)
+		if sflow == .Terminates do return INVALID_VALUE, .Terminates
+		dst := new_value(&ctx.b, ctx.tc.node_types[expr])
+		i := new(Try_Unwrap_Instr)
+		i.dst = dst
+		i.src = src
+		emit(&ctx.b, i)
+		return dst, .Continues
+
+	case ^core.Match_Expr:
+		return lower_match_expr(ctx, expr, e)
+
+	case ^core.Error_Expr:
+		// Компилятор запускается только после typecheck_program с нулём
+		// diagnostics — Error_Expr сюда дойти не должен (см. core/
+		// compiler.odin's тот же комментарий на этом кейсе).
+		lower_unsupported("Error_Expr дошёл до lowering — типизация должна была отклонить программу раньше")
+
+	case ^core.Spawn_Expr:
+		return lower_spawn_expr(ctx, expr, e)
+
+	case ^core.Lambda_Expr:
+		return lower_lambda_expr(ctx, expr, e)
 	}
 	lower_unsupported("неизвестный вид выражения")
+}
+
+// lower_spawn_expr — `запусти f(args...)`. Покрывает только callee-
+// идентификатор В ТОМ ЖЕ модуле (см. core/compiler.odin's case
+// ^Spawn_Expr) — `запусти Модуль.функция(...)` требует cross-module
+// резолва экспортов, которого lower_module целиком (single-программный
+// вход, как и compile_program) сегодня не делает ни для чего (не
+// специфично для Spawn) — известное ограничение, не блокер для этой фазы.
+@(private = "file")
+lower_spawn_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, e: ^core.Spawn_Expr) -> (Value_Id, Flow_Result) {
+	if _, is_prop := e.call.callee.(^core.Property_Expr); is_prop {
+		lower_unsupported("запусти через cross-module callee (Модуль.функция) — Фаза 3+")
+	}
+	callee_sym := ctx.res.node_symbols[e.call.callee]
+	fn_id, found := ctx.symbol_to_function[callee_sym]
+	if !found {
+		lower_unsupported("запусти: функция не найдена в symbol_to_function")
+	}
+	args, aflow := lower_call_args(ctx, e.call.args)
+	if aflow == .Terminates do return INVALID_VALUE, .Terminates
+	dst := new_value(&ctx.b, ctx.tc.node_types[expr])
+	i := new(Spawn_Instr)
+	i.dst = dst
+	i.callee = fn_id
+	i.args = args
+	emit(&ctx.b, i)
+	return dst, .Continues
 }
 
 @(private = "file")
@@ -425,12 +633,14 @@ lower_binary_expr :: proc(
 	Flow_Result,
 ) {
 	if e.op == .Assign {
-		lower_unsupported("присваивание = (Фаза 2)")
+		return lower_assign(ctx, e)
 	}
-	if _, has_sugar := ctx.tc.call_infos[expr]; has_sugar {
-		lower_unsupported(
-			"operator-overload sugar (Сравниваемое/Арифметика, Фаза 2)",
-		)
+	if info, has_sugar := ctx.tc.call_infos[expr]; has_sugar && info.kind == core.Call_Kind.Method_Struct {
+		// Сравниваемое/Арифметика sugar — реюз Method_Struct-кодогена
+		// (сравнить()/сложить()/... возвращают либо Число (3-way compare,
+		// нормализуется ниже до Булево через сравнение с 0), либо Self
+		// напрямую для +/-/*//.
+		return lower_operator_sugar(ctx, expr, e, info)
 	}
 
 	if e.op == .And || e.op == .Or {
@@ -485,6 +695,135 @@ lower_binary_expr :: proc(
 		return emit_compare(ctx, .NotEqual, lhs, rhs), .Continues
 	}
 	lower_unsupported("неизвестный бинарный оператор")
+}
+
+@(private = "file")
+lower_operator_sugar :: proc(
+	ctx: ^Lowering_Context,
+	expr: core.Expr,
+	e: ^core.Binary_Expr,
+	info: core.Call_Info,
+) -> (
+	Value_Id,
+	Flow_Result,
+) {
+	fn_id, found := ctx.symbol_to_function[info.symbol_ref]
+	if !found {
+		lower_unsupported("метод сравнить/сложить/... не найден в symbol_to_function")
+	}
+	lhs, lflow := lower_expr(ctx, e.left)
+	if lflow == .Terminates do return INVALID_VALUE, .Terminates
+	rhs, rflow := lower_expr(ctx, e.right)
+	if rflow == .Terminates do return INVALID_VALUE, .Terminates
+
+	raw := emit_call(ctx, fn_id, value_slice(lhs, rhs), ctx.tc.node_types[expr])
+
+	#partial switch e.op {
+	case .Less:
+		zero := emit_const_number(ctx, 0)
+		return emit_compare(ctx, .Less, raw, zero), .Continues
+	case .Greater:
+		zero := emit_const_number(ctx, 0)
+		return emit_compare(ctx, .Greater, raw, zero), .Continues
+	case .LessEqual:
+		zero := emit_const_number(ctx, 0)
+		gt := emit_compare(ctx, .Greater, raw, zero)
+		return emit_unary(ctx, .Negate_Bool, gt, core.TY_BOOL), .Continues
+	case .GreaterEqual:
+		zero := emit_const_number(ctx, 0)
+		lt := emit_compare(ctx, .Less, raw, zero)
+		return emit_unary(ctx, .Negate_Bool, lt, core.TY_BOOL), .Continues
+	case .NotEqual:
+		return emit_unary(ctx, .Negate_Bool, raw, core.TY_BOOL), .Continues
+	case .Equal, .Plus, .Minus, .Star, .Slash:
+		// равно() уже Булево; сложить/вычесть/умножить/разделить уже Self —
+		// raw и есть ответ, без пост-обработки.
+		return raw, .Continues
+	}
+	lower_unsupported("неизвестный оператор operator-overload sugar")
+}
+
+@(private = "file")
+emit_unary :: proc(ctx: ^Lowering_Context, op: Un_Op, src: Value_Id, result_type: ^core.Type) -> Value_Id {
+	dst := new_value(&ctx.b, result_type)
+	i := new(Unary_Instr)
+	i.dst = dst
+	i.op = op
+	i.src = src
+	emit(&ctx.b, i)
+	return dst
+}
+
+// lower_place — куда писать значение присваивания (см. Place, core/mir/
+// mir.odin). Не читает текущее значение цели — только вычисляет АДРЕС
+// (для Property_Place/Index_Place это значит лоурить object/index как
+// ОБЫЧНЫЕ выражения, они читаются, а не пишутся).
+@(private = "file")
+lower_place :: proc(ctx: ^Lowering_Context, expr: core.Expr) -> (Place, Flow_Result) {
+	#partial switch e in expr {
+	case ^core.Ident_Expr:
+		sym := ctx.res.node_symbols[expr]
+		local, ok := ctx.symbol_to_local[sym]
+		if !ok {
+			lower_unsupported("присваивание не-локали (Фаза 3+)")
+		}
+		p := new(Local_Place)
+		p.local = local
+		return p, .Continues
+
+	case ^core.Property_Expr:
+		obj, flow := lower_expr(ctx, e.object)
+		if flow == .Terminates do return nil, .Terminates
+		p := new(Property_Place)
+		p.object = obj
+		p.field_index = ctx.tc.property_indices[expr]
+		return p, .Continues
+
+	case ^core.Index_Expr:
+		obj, flow := lower_expr(ctx, e.object)
+		if flow == .Terminates do return nil, .Terminates
+		idx, idx_flow := lower_expr(ctx, e.index)
+		if idx_flow == .Terminates do return nil, .Terminates
+		p := new(Index_Place)
+		p.object = obj
+		p.index = idx
+		return p, .Continues
+	}
+	lower_unsupported("недопустимая цель присваивания")
+}
+
+// lower_assign — Binary_Expr{op=.Assign}. Тот же порядок вычисления
+// (RHS, потом место назначения), что core/compiler.odin's Assign-ветка,
+// И то же самое отсутствие результирующего значения — Set_Local/
+// Set_Property/Set_Index сегодня НЕ оставляют значение на стеке
+// (см. core/vm.odin case .Set_Local: pop, не peek), присваивание как
+// выражение (`y = (x = 1)`) не поддержано ни сегодняшним компилятором,
+// ни этим — сохраняем то же поведение, не чиним предсуществующий пробел.
+@(private = "file")
+lower_assign :: proc(ctx: ^Lowering_Context, e: ^core.Binary_Expr) -> (Value_Id, Flow_Result) {
+	rhs, rhs_flow := lower_expr(ctx, e.right)
+	if rhs_flow == .Terminates do return INVALID_VALUE, .Terminates
+
+	place, place_flow := lower_place(ctx, e.left)
+	if place_flow == .Terminates do return INVALID_VALUE, .Terminates
+
+	switch p in place {
+	case ^Local_Place:
+		emit(&ctx.b, new_store_local(p.local, rhs))
+	case ^Property_Place:
+		i := new(Set_Property_Instr)
+		i.object = p.object
+		i.field_index = p.field_index
+		i.value = rhs
+		emit(&ctx.b, i)
+	case ^Index_Place:
+		i := new(Set_Index_Instr)
+		i.object = p.object
+		i.index = p.index
+		i.value = rhs
+		emit(&ctx.b, i)
+	}
+	return INVALID_VALUE, .Continues
 }
 
 @(private = "file")
@@ -605,8 +944,54 @@ new_branch_term :: proc(cond: Value_Id, then_block, else_block: Block_Id) -> ^Br
 	return t
 }
 
+// maybe_wrap_interface_cast — see maybe_emit_interface_cast, core/
+// compiler.odin: если ctx.tc.interface_casts[expr] задан (struct_type,
+// апкаст к интерфейсу нужен в этой позиции — join-точки если/выбор УЖЕ
+// зарегистрировали его в тайпчекере для обеих ветвей, см. CLAUDE.md
+// cross-module-interface-vtable-fix), строим vtable (метод-имя,
+// Function_Id) через struct_type.methods + ctx.symbol_to_function — ТОТ
+// ЖЕ Symbol_Id-based механизм, что compile-time vtable в сегодняшнем
+// байткоде (не рантайм-скан). Вызывается на КАЖДОМ месте, где сегодняшний
+// компилятор зовёт maybe_emit_interface_cast — все они внутри Call_Expr
+// (Build_Variant/все call_infos.kind-ветки/foreign/актор-примитивы/
+// финальный fallback) плюс голый Property_Expr-конструктор варианта.
 @(private = "file")
-lower_call_expr :: proc(
+maybe_wrap_interface_cast :: proc(ctx: ^Lowering_Context, expr: core.Expr, value: Value_Id) -> Value_Id {
+	struct_type, needs_cast := ctx.tc.interface_casts[expr]
+	if !needs_cast do return value
+
+	bindings := make([dynamic]Interface_Method_Binding, 0, len(struct_type.methods))
+	for method_name, method_sym in struct_type.methods {
+		fn_id, found := ctx.symbol_to_function[method_sym]
+		if !found {
+			lower_unsupported("метод не найден в symbol_to_function при построении vtable интерфейса")
+		}
+		append(&bindings, Interface_Method_Binding{method_name = method_name, fn = fn_id})
+	}
+
+	dst := new_value(&ctx.b, nil)
+	i := new(Cast_Interface_Instr)
+	i.dst = dst
+	i.src = value
+	i.vtable = bindings[:]
+	emit(&ctx.b, i)
+	return dst
+}
+
+// lower_call_expr — тонкая обёртка над lower_call_expr_inner, применяющая
+// maybe_wrap_interface_cast к результату РОВНО ОДИН РАЗ (вместо
+// дублирования на каждом из ~15 return сегодняшнего case ^Call_Expr, см.
+// список call site'ов maybe_emit_interface_cast в core/compiler.odin) —
+// эквивалентно (interface_casts ключуется по САМОМУ Call_Expr-узлу,
+// одному на все внутренние ветки).
+lower_call_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, e: ^core.Call_Expr) -> (Value_Id, Flow_Result) {
+	v, flow := lower_call_expr_inner(ctx, expr, e)
+	if flow == .Terminates do return v, flow
+	return maybe_wrap_interface_cast(ctx, expr, v), flow
+}
+
+@(private = "file")
+lower_call_expr_inner :: proc(
 	ctx: ^Lowering_Context,
 	expr: core.Expr,
 	e: ^core.Call_Expr,
@@ -614,41 +999,277 @@ lower_call_expr :: proc(
 	Value_Id,
 	Flow_Result,
 ) {
-	callee_ident, ok := e.callee.(^core.Ident_Expr)
-	if !ok {
-		lower_unsupported(
-			"вызов не через простой идентификатор (метод/builtin/конструктор — Фаза 2)",
-		)
-	}
-	callee_sym := ctx.res.node_symbols[e.callee]
-	fn_id, ok2 := ctx.symbol_to_function[callee_sym]
-	if !ok2 {
-		lower_unsupported(
-			"вызов не top-level функции (builtin/метод/дженерик-инстанциация — Фаза 2)",
-		)
-	}
-
-	args := make([dynamic]Value_Id, 0, len(e.args))
-	for a in e.args {
-		v, flow := lower_expr(ctx, a)
-		if flow == .Terminates do return INVALID_VALUE, .Terminates
-		append(&args, v)
-	}
-
 	result_type := ctx.tc.node_types[expr]
-	i := new(Call_Instr)
-	i.callee = fn_id
-	i.args = args[:]
 
+	// Дженерик-инстанциация (bounded traits) — ключ инстанциации уже
+	// гарантированно зарегистрирован monomorphize_program/lower_module
+	// ДО этой точки (см. 2.3k).
+	if concrete_types, ok := ctx.tc.generic_call_instantiations[expr]; ok {
+		callee_sym := ctx.res.node_symbols[e.callee]
+		key := core.build_instantiation_key(ctx.res.symbol_store, callee_sym, concrete_types)
+		fn_id, found := ctx.module.generic_instantiations[key]
+		if !found {
+			lower_unsupported("инстанциация generic-функции не найдена")
+		}
+		args, aflow := lower_call_args(ctx, e.args)
+		if aflow == .Terminates do return INVALID_VALUE, .Terminates
+		return emit_call(ctx, fn_id, args, result_type), .Continues
+	}
+
+	if info, ok := ctx.tc.call_infos[expr]; ok {
+		switch info.kind {
+		case .Constructor_Variant:
+			args, aflow := lower_call_args(ctx, e.args)
+			if aflow == .Terminates do return INVALID_VALUE, .Terminates
+			dst := new_value(&ctx.b, result_type)
+			i := new(Build_Variant_Instr)
+			i.dst = dst
+			i.type_name = info.variant.owner_type.name
+			i.variant_name = info.variant.owner_type.variants[info.variant.tag_index].name
+			i.tag = info.variant.tag_index
+			i.fields = args
+			emit(&ctx.b, i)
+			return dst, .Continues
+
+		case .Builtin:
+			args, aflow := lower_call_args(ctx, e.args)
+			if aflow == .Terminates do return INVALID_VALUE, .Terminates
+			if core.is_async_builtin_name(info.text_name) {
+				return emit_call_builtin_async(ctx, info.text_name, args, result_type), .Continues
+			}
+			return emit_call_builtin(ctx, info.text_name, args, result_type), .Continues
+
+		case .Method_Collection:
+			prop_expr := e.callee.(^core.Property_Expr)
+			obj, oflow := lower_expr(ctx, prop_expr.object)
+			if oflow == .Terminates do return INVALID_VALUE, .Terminates
+			args, aflow := lower_call_args(ctx, e.args)
+			if aflow == .Terminates do return INVALID_VALUE, .Terminates
+			receiver_type := ctx.tc.node_types[prop_expr.object]
+			if core.is_async_stream_method(receiver_type, info.text_name) {
+				dst := new_value(&ctx.b, result_type)
+				i := new(Call_Async_Instr)
+				i.dst = dst
+				i.receiver = obj
+				i.name = info.text_name
+				i.args = args
+				emit(&ctx.b, i)
+				return dst, .Continues
+			}
+			return emit_call_method(ctx, obj, info.text_name, args, result_type), .Continues
+
+		case .Method_Interface:
+			prop_expr := e.callee.(^core.Property_Expr)
+			obj, oflow := lower_expr(ctx, prop_expr.object)
+			if oflow == .Terminates do return INVALID_VALUE, .Terminates
+			args, aflow := lower_call_args(ctx, e.args)
+			if aflow == .Terminates do return INVALID_VALUE, .Terminates
+			dst := new_value(&ctx.b, result_type)
+			i := new(Invoke_Interface_Instr)
+			i.dst = dst
+			i.receiver = obj
+			i.method_name = info.text_name
+			i.args = args
+			emit(&ctx.b, i)
+			return dst, .Continues
+
+		case .Method_Struct:
+			fn_id, found := ctx.symbol_to_function[info.symbol_ref]
+			if !found {
+				lower_unsupported("метод не найден в symbol_to_function")
+			}
+			prop_expr := e.callee.(^core.Property_Expr)
+			obj, oflow := lower_expr(ctx, prop_expr.object)
+			if oflow == .Terminates do return INVALID_VALUE, .Terminates
+			args, aflow := lower_call_args(ctx, e.args)
+			if aflow == .Terminates do return INVALID_VALUE, .Terminates
+			full_args := make([dynamic]Value_Id, 0, len(args) + 1)
+			append(&full_args, obj)
+			for a in args do append(&full_args, a)
+			return emit_call(ctx, fn_id, full_args[:], result_type), .Continues
+
+		case .Constructor_Struct:
+			args, aflow := lower_call_args(ctx, e.args)
+			if aflow == .Terminates do return INVALID_VALUE, .Terminates
+			dst := new_value(&ctx.b, result_type)
+			i := new(New_Aggregate_Instr)
+			i.dst = dst
+			i.type_name = result_type.name
+			i.elements = args
+			emit(&ctx.b, i)
+			return dst, .Continues
+
+		case .Print_Value:
+			fn_id, found := ctx.symbol_to_function[info.symbol_ref]
+			if !found {
+				lower_unsupported("метод вСтроку не найден в symbol_to_function")
+			}
+			arg0, aflow := lower_expr(ctx, e.args[0])
+			if aflow == .Terminates do return INVALID_VALUE, .Terminates
+			str_v := emit_call(ctx, fn_id, value_slice(arg0), core.TY_STRING)
+			return emit_call_builtin(ctx, info.text_name, value_slice(str_v), result_type), .Continues
+
+		case .Send_Copy:
+			proc_v, pflow := lower_expr(ctx, e.args[0])
+			if pflow == .Terminates do return INVALID_VALUE, .Terminates
+			fn_id, found := ctx.symbol_to_function[info.symbol_ref]
+			if !found {
+				lower_unsupported("метод клонировать не найден в symbol_to_function")
+			}
+			msg_v, mflow := lower_expr(ctx, e.args[1])
+			if mflow == .Terminates do return INVALID_VALUE, .Terminates
+			cloned_v := emit_call(ctx, fn_id, value_slice(msg_v), ctx.tc.node_types[e.args[1]])
+			return emit_call_builtin(ctx, "отправить_без_копии", value_slice(proc_v, cloned_v), result_type), .Continues
+		}
+	}
+
+	if ident, ok := e.callee.(^core.Ident_Expr); ok {
+		sym_id := ctx.res.node_symbols[e.callee]
+		if sym_id != core.INVALID_SYMBOL {
+			if foreign_decl, is_foreign := core.symbol_at(ctx.res.symbol_store, sym_id).decl.(^core.Foreign_Decl); is_foreign {
+				ff := core.get_or_build_foreign_function(foreign_decl)
+				args, aflow := lower_call_args(ctx, e.args)
+				if aflow == .Terminates do return INVALID_VALUE, .Terminates
+				dst := new_value(&ctx.b, result_type)
+				i := new(Call_Foreign_Instr)
+				i.dst = dst
+				i.fn = ff
+				i.args = args
+				emit(&ctx.b, i)
+				return dst, .Continues
+			}
+		}
+		if sym_id != core.INVALID_SYMBOL && core.symbol_at(ctx.res.symbol_store, sym_id).kind == .Builtin {
+			name := core.resolve_interned(ident.name)
+			if name == "получить" {
+				dst := new_value(&ctx.b, result_type)
+				ri := new(Receive_Instr)
+				ri.dst = dst
+				emit(&ctx.b, ri)
+				return dst, .Continues
+			}
+			if name == "получить_сигнал" {
+				dst := new_value(&ctx.b, result_type)
+				rsi := new(Receive_Signal_Instr)
+				rsi.dst = dst
+				emit(&ctx.b, rsi)
+				return dst, .Continues
+			}
+			args, aflow := lower_call_args(ctx, e.args)
+			if aflow == .Terminates do return INVALID_VALUE, .Terminates
+			if core.is_async_builtin_name(name) {
+				return emit_call_builtin_async(ctx, name, args, result_type), .Continues
+			}
+			return emit_call_builtin(ctx, name, args, result_type), .Continues
+		}
+	}
+
+	// Статически известная top-level функция по голому идентификатору —
+	// быстрый путь (Call_Instr, Function_Id известен на этапе лоуринга).
+	if callee_ident, ok := e.callee.(^core.Ident_Expr); ok {
+		callee_sym := ctx.res.node_symbols[callee_ident]
+		if fn_id, found := ctx.symbol_to_function[callee_sym]; found {
+			args, aflow := lower_call_args(ctx, e.args)
+			if aflow == .Terminates do return INVALID_VALUE, .Terminates
+			return emit_call(ctx, fn_id, args, result_type), .Continues
+		}
+	}
+
+	// Общий путь — callee лоурится как ОБЫЧНОЕ выражение (локаль,
+	// содержащая замыкание/^Compiled_Function, результат другого вызова
+	// и т.п.), вызывается через значение (Call_Value_Instr). Тот же
+	// финальный fallback, что core/compiler.odin's case ^Call_Expr:
+	// compile_expr(ctx, e.callee) + обычный .Call — рантайм-диспетчинг
+	// ^Compiled_Function vs ^Closure_Value решает backend (Фаза 2.4), не
+	// lowering.
+	callee_v, cflow := lower_expr(ctx, e.callee)
+	if cflow == .Terminates do return INVALID_VALUE, .Terminates
+	args, aflow := lower_call_args(ctx, e.args)
+	if aflow == .Terminates do return INVALID_VALUE, .Terminates
+	i := new(Call_Value_Instr)
+	i.callee = callee_v
+	i.args = args
 	if result_type != nil && core.prune_type(result_type) != core.TY_VOID {
 		dst := new_value(&ctx.b, result_type)
 		i.dst = dst
 		emit(&ctx.b, i)
 		return dst, .Continues
 	}
-
 	emit(&ctx.b, i)
 	return INVALID_VALUE, .Continues
+}
+
+// value_slice — heap-аллоцированный []Value_Id из 1-2 значений. НЕ
+// заменять на инлайн []Value_Id{...} compound-литерал: такой литерал
+// использует память СТЕКА текущего кадра (тот же класс бага, что &Type{
+// ...} для указателя — см. историю этого файла, Receive_Instr) — если
+// результат сохраняется в поле инструкции, переживающей возврат из
+// текущей функции (i.args = ...), сырой стековый слайс станет мусором
+// уже к моменту, когда backend/print/validate его прочитают. Найдено
+// эмпирически (test_mir_for_in_iterator_protocol — call fn_N(v0) вместо
+// call fn_N(v5), классический stack-reuse симптом).
+@(private = "file")
+value_slice :: proc(vs: ..Value_Id) -> []Value_Id {
+	out := make([]Value_Id, len(vs))
+	copy(out, vs)
+	return out
+}
+
+@(private = "file")
+lower_call_args :: proc(ctx: ^Lowering_Context, exprs: [dynamic]core.Expr) -> ([]Value_Id, Flow_Result) {
+	args := make([dynamic]Value_Id, 0, len(exprs))
+	for a in exprs {
+		v, flow := lower_expr(ctx, a)
+		if flow == .Terminates do return nil, .Terminates
+		append(&args, v)
+	}
+	return args[:], .Continues
+}
+
+@(private = "file")
+emit_call :: proc(ctx: ^Lowering_Context, fn_id: Function_Id, args: []Value_Id, result_type: ^core.Type) -> Value_Id {
+	i := new(Call_Instr)
+	i.callee = fn_id
+	i.args = args
+	if result_type != nil && core.prune_type(result_type) != core.TY_VOID {
+		dst := new_value(&ctx.b, result_type)
+		i.dst = dst
+		emit(&ctx.b, i)
+		return dst
+	}
+	emit(&ctx.b, i)
+	return INVALID_VALUE
+}
+
+@(private = "file")
+emit_call_builtin :: proc(ctx: ^Lowering_Context, name: string, args: []Value_Id, result_type: ^core.Type) -> Value_Id {
+	i := new(Call_Builtin_Instr)
+	i.name = name
+	i.args = args
+	if result_type != nil && core.prune_type(result_type) != core.TY_VOID {
+		dst := new_value(&ctx.b, result_type)
+		i.dst = dst
+		emit(&ctx.b, i)
+		return dst
+	}
+	emit(&ctx.b, i)
+	return INVALID_VALUE
+}
+
+@(private = "file")
+emit_call_builtin_async :: proc(ctx: ^Lowering_Context, name: string, args: []Value_Id, result_type: ^core.Type) -> Value_Id {
+	i := new(Call_Async_Instr)
+	i.receiver = nil
+	i.name = name
+	i.args = args
+	if result_type != nil && core.prune_type(result_type) != core.TY_VOID {
+		dst := new_value(&ctx.b, result_type)
+		i.dst = dst
+		emit(&ctx.b, i)
+		return dst
+	}
+	emit(&ctx.b, i)
+	return INVALID_VALUE
 }
 
 // lower_if_expr — если/иначе как значение ИЛИ как statement
@@ -752,4 +1373,450 @@ lower_while_expr :: proc(ctx: ^Lowering_Context, e: ^core.While_Expr) {
 	}
 
 	set_current_block(&ctx.b, exit_block)
+}
+
+// lower_for_in_stmt — две формы по ctx.tc.for_in_infos (см. core/
+// compiler.odin's compile_for_in_stmt, тот же приём, что здесь: For_In_
+// Stmt не десахарен парсером, форма решается типизатором один раз).
+//
+// Fast_Array реализована полностью. Iterator_Protocol нуждается в
+// разрешении Symbol_Id метода следующий() в Function_Id ЧЕРЕЗ ТОТ ЖЕ
+// механизм, что обычные методы структур (2.3e/2.3h ещё не реализованы на
+// момент написания этой функции) — временная панике-заглушка, дозаписать
+// сразу после 2.3h.
+@(private = "file")
+lower_for_in_stmt :: proc(ctx: ^Lowering_Context, stmt: core.Stmt, s: ^core.For_In_Stmt) -> Flow_Result {
+	info, has_info := ctx.tc.for_in_infos[stmt]
+	if !has_info {
+		lower_unsupported("for_in_infos отсутствует для for-in")
+	}
+
+	names_syms := ctx.res.for_in_names_syms[stmt]
+
+	iterable_v, iflow := lower_expr(ctx, s.iterable)
+	if iflow == .Terminates do return .Terminates
+	iter_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$for_iter", ctx.tc.node_types[s.iterable])
+	emit(&ctx.b, new_store_local(iter_local, iterable_v))
+
+	#partial switch info.kind {
+	case .Fast_Array:
+		idx_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$for_idx", core.TY_NUM)
+		neg1 := emit_const_number(ctx, -1)
+		emit(&ctx.b, new_store_local(idx_local, neg1))
+
+		header_block := new_block(&ctx.b)
+		body_block := new_block(&ctx.b)
+		exit_block := new_block(&ctx.b)
+		terminate(&ctx.b, new_jump_term(header_block))
+
+		set_current_block(&ctx.b, header_block)
+		idx_v := new_value(&ctx.b, core.TY_NUM)
+		emit(&ctx.b, new_load_local(idx_v, idx_local))
+		one_v := emit_const_number(ctx, 1)
+		next_idx_v := emit_binary(ctx, .Add, idx_v, one_v, core.TY_NUM)
+		emit(&ctx.b, new_store_local(idx_local, next_idx_v))
+
+		idx_v2 := new_value(&ctx.b, core.TY_NUM)
+		emit(&ctx.b, new_load_local(idx_v2, idx_local))
+		iter_v_len := new_value(&ctx.b, ctx.tc.node_types[s.iterable])
+		emit(&ctx.b, new_load_local(iter_v_len, iter_local))
+		len_v := emit_call_method(ctx, iter_v_len, "длина", nil, core.TY_NUM)
+		cont_v := emit_compare(ctx, .NotEqual, idx_v2, len_v)
+		terminate(&ctx.b, new_branch_term(cont_v, body_block, exit_block))
+
+		set_current_block(&ctx.b, body_block)
+		iter_v_idx := new_value(&ctx.b, ctx.tc.node_types[s.iterable])
+		emit(&ctx.b, new_load_local(iter_v_idx, iter_local))
+		idx_v3 := new_value(&ctx.b, core.TY_NUM)
+		emit(&ctx.b, new_load_local(idx_v3, idx_local))
+		elem_v := new_value(&ctx.b, nil)
+		gi := new(Get_Index_Instr)
+		gi.dst = elem_v
+		gi.object = iter_v_idx
+		gi.index = idx_v3
+		emit(&ctx.b, gi)
+		lower_for_in_bind_names(ctx, names_syms, elem_v)
+
+		append(&ctx.loops, Loop_Targets{continue_target = header_block, break_target = exit_block})
+		_, body_flow := lower_block(ctx, s.body, false)
+		pop(&ctx.loops)
+		if body_flow == .Continues {
+			terminate(&ctx.b, new_jump_term(header_block))
+		}
+
+		set_current_block(&ctx.b, exit_block)
+		return .Continues
+
+	case .Iterator_Protocol:
+		// `для x в итерируемое цикл ... конец` — .следующий() резолвится
+		// СТАТИЧЕСКИ через info.next_method_sym (тот же Symbol_Id-путь, что
+		// Method_Struct, НЕ Call_Method_Instr с именем — см. core/compiler.
+		// odin's compile_for_in_stmt, Iterator_Protocol-ветка).
+		next_fn_id, found := ctx.symbol_to_function[info.next_method_sym]
+		if !found {
+			lower_unsupported("метод следующий не найден в symbol_to_function")
+		}
+
+		header_block := new_block(&ctx.b)
+		body_block := new_block(&ctx.b)
+		exit_block := new_block(&ctx.b)
+		terminate(&ctx.b, new_jump_term(header_block))
+
+		set_current_block(&ctx.b, header_block)
+		iter_v := new_value(&ctx.b, ctx.tc.node_types[s.iterable])
+		emit(&ctx.b, new_load_local(iter_v, iter_local))
+		next_result_type := ctx.module.functions[int(next_fn_id)].result_type
+		opt_v := emit_call(ctx, next_fn_id, value_slice(iter_v), next_result_type)
+		subject_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$for_subject", nil)
+		emit(&ctx.b, new_store_local(subject_local, opt_v))
+
+		tag_subj := new_value(&ctx.b, nil)
+		emit(&ctx.b, new_load_local(tag_subj, subject_local))
+		tag_ok := new_value(&ctx.b, core.TY_BOOL)
+		mt := new(Match_Tag_Instr)
+		mt.dst = tag_ok
+		mt.subject = tag_subj
+		mt.tag = 1 // Есть — см. prelude.odin, тот же тег, что compile_for_in_stmt использует напрямую
+		emit(&ctx.b, mt)
+		terminate(&ctx.b, new_branch_term(tag_ok, body_block, exit_block))
+
+		set_current_block(&ctx.b, body_block)
+		field_subj := new_value(&ctx.b, nil)
+		emit(&ctx.b, new_load_local(field_subj, subject_local))
+		elem_v := new_value(&ctx.b, nil)
+		gvf := new(Get_Variant_Field_Instr)
+		gvf.dst = elem_v
+		gvf.subject = field_subj
+		gvf.field_index = 0
+		emit(&ctx.b, gvf)
+		lower_for_in_bind_names(ctx, names_syms, elem_v)
+
+		append(&ctx.loops, Loop_Targets{continue_target = header_block, break_target = exit_block})
+		_, body_flow := lower_block(ctx, s.body, false)
+		pop(&ctx.loops)
+		if body_flow == .Continues {
+			terminate(&ctx.b, new_jump_term(header_block))
+		}
+
+		set_current_block(&ctx.b, exit_block)
+		return .Continues
+	}
+	lower_unsupported("неизвестная форма for-in")
+}
+
+// lower_for_in_bind_names — деструктуризация элемента цикла в 1+ имён
+// (для (a, b) в ...) — тот же приём, что 2.3b (пер (a, b) = ...): при
+// >1 имени элемент материализуется в Mir_Local (читается многократно —
+// обязано идти через Local, single-use инвариант), Get_Property по
+// позиции на каждое имя.
+@(private = "file")
+lower_for_in_bind_names :: proc(ctx: ^Lowering_Context, names_syms: [dynamic]core.Symbol_Id, elem_v: Value_Id) {
+	if len(names_syms) == 1 {
+		binder := new_local(&ctx.b, names_syms[0], "", nil)
+		ctx.symbol_to_local[names_syms[0]] = binder
+		emit(&ctx.b, new_store_local(binder, elem_v))
+		return
+	}
+	elem_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$for_elem", nil)
+	emit(&ctx.b, new_store_local(elem_local, elem_v))
+	for sym, i in names_syms {
+		loaded := new_value(&ctx.b, nil)
+		emit(&ctx.b, new_load_local(loaded, elem_local))
+		field_v := new_value(&ctx.b, nil)
+		gp := new(Get_Property_Instr)
+		gp.dst = field_v
+		gp.object = loaded
+		gp.field_index = i
+		emit(&ctx.b, gp)
+		binder := new_local(&ctx.b, sym, "", nil)
+		ctx.symbol_to_local[sym] = binder
+		emit(&ctx.b, new_store_local(binder, field_v))
+	}
+}
+
+// emit_call_method — Call_Method_Instr (динамический вызов по имени,
+// как Invoke_Collection в сегодняшнем байткоде — "длина"/"получить"/
+// т.п. на Массив/Соответствие/Строка) с ноль-или-более аргументами.
+@(private = "file")
+emit_call_method :: proc(ctx: ^Lowering_Context, receiver: Value_Id, name: string, args: []Value_Id, result_type: ^core.Type) -> Value_Id {
+	dst := new_value(&ctx.b, result_type)
+	i := new(Call_Method_Instr)
+	i.dst = dst
+	i.receiver = receiver
+	i.name = name
+	i.args = args
+	emit(&ctx.b, i)
+	return dst
+}
+
+// lower_match_expr — выбор/ADT (см. core/compiler.odin's compile_match_
+// expr/compile_pattern, полностью перечитаны для этой реализации).
+// Subject лоурится ОДИН раз в синтетический Mir_Local (читается многократно
+// — по разу на арм/под-шаблон, обязано идти через Local, single-use
+// инвариант). Армы образуют цепочку fail-блоков (арм N+1 — это fail-блок
+// арма N, тот же приём, что сегодняшний fail_jumps-список), последний
+// fail-блок — Unreachable_Term (Match_Fail).
+@(private = "file")
+lower_match_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, m: ^core.Match_Expr) -> (Value_Id, Flow_Result) {
+	arm_infos, has_infos := ctx.tc.match_arm_infos[m]
+	if !has_infos {
+		lower_unsupported("match_arm_infos отсутствует для выбора")
+	}
+	want_value := core.prune_type(ctx.tc.node_types[expr]) != core.TY_VOID
+
+	subject_v, sflow := lower_expr(ctx, m.subject)
+	if sflow == .Terminates do return INVALID_VALUE, .Terminates
+	subject_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$match_subject", ctx.tc.node_types[m.subject])
+	emit(&ctx.b, new_store_local(subject_local, subject_v))
+
+	result_type := ctx.tc.node_types[expr]
+	result_local := INVALID_LOCAL
+	if want_value {
+		result_local = new_local(&ctx.b, core.INVALID_SYMBOL, "$match_result", result_type)
+	}
+
+	merge_block := new_block(&ctx.b)
+	any_arm_continues := false
+
+	for arm, arm_idx in m.arms {
+		pi := arm_infos[arm_idx]
+		fail_block := new_block(&ctx.b)
+
+		lower_pattern(ctx, &pi, subject_local, fail_block)
+
+		arm_val, arm_flow := lower_block(ctx, arm.body, want_value)
+		if arm_flow == .Continues {
+			any_arm_continues = true
+			if want_value do emit(&ctx.b, new_store_local(result_local, arm_val))
+			terminate(&ctx.b, new_jump_term(merge_block))
+		}
+
+		set_current_block(&ctx.b, fail_block)
+	}
+
+	// Последний fail-блок = ни один арм не подошёл — Match_Fail сегодня
+	// (runtime-паника при "недостижимом" промахе выбора).
+	terminate(&ctx.b, new_unreachable_term("выбор: ни один арм не подошёл (Match_Fail)"))
+
+	if !any_arm_continues {
+		set_current_block(&ctx.b, merge_block)
+		terminate(&ctx.b, new_unreachable_term("выбор: ни один арм не завершается нормально"))
+		return INVALID_VALUE, .Terminates
+	}
+
+	set_current_block(&ctx.b, merge_block)
+	if want_value {
+		result := new_value(&ctx.b, result_type)
+		emit(&ctx.b, new_load_local(result, result_local))
+		return result, .Continues
+	}
+	return INVALID_VALUE, .Continues
+}
+
+// lower_pattern — один Pattern_Info (уже резолвен тайпчекером — kind/tag_
+// index/binder_sym/sub_patterns готовы, AST Pattern-узел сюда не нужен).
+// value_local — locals-ячейка с проверяемым значением (subject ИЛИ поле
+// родительского конструктора — при .Constructor/.Struct_Constructor
+// рекурсия материализует КАЖДОЕ под-поле в СВОЙ Mir_Local перед
+// рекурсивным вызовом, single-use инвариант). fail_block — куда прыгать
+// при несовпадении.
+@(private = "file")
+lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^core.Pattern_Info, value_local: Local_Id, fail_block: Block_Id) {
+	switch pi.kind {
+	case .Wildcard:
+	// без условия — совпадает всегда
+
+	case .Literal:
+		v := new_value(&ctx.b, nil)
+		emit(&ctx.b, new_load_local(v, value_local))
+		lit_v, lflow := lower_expr(ctx, pi.literal_expr)
+		if lflow == .Terminates do return
+		eq := emit_compare(ctx, .Equal, v, lit_v)
+		next_block := new_block(&ctx.b)
+		terminate(&ctx.b, new_branch_term(eq, next_block, fail_block))
+		set_current_block(&ctx.b, next_block)
+
+	case .Binder:
+		v := new_value(&ctx.b, nil)
+		emit(&ctx.b, new_load_local(v, value_local))
+		binder_local := new_local(&ctx.b, pi.binder_sym, "", nil)
+		ctx.symbol_to_local[pi.binder_sym] = binder_local
+		emit(&ctx.b, new_store_local(binder_local, v))
+
+	case .Constructor:
+		v := new_value(&ctx.b, nil)
+		emit(&ctx.b, new_load_local(v, value_local))
+		tag_ok := new_value(&ctx.b, core.TY_BOOL)
+		mt := new(Match_Tag_Instr)
+		mt.dst = tag_ok
+		mt.subject = v
+		mt.tag = pi.tag_index
+		emit(&ctx.b, mt)
+		next_block := new_block(&ctx.b)
+		terminate(&ctx.b, new_branch_term(tag_ok, next_block, fail_block))
+		set_current_block(&ctx.b, next_block)
+
+		for &sub, field_idx in pi.sub_patterns {
+			if sub.kind == .Wildcard do continue
+			subj_v := new_value(&ctx.b, nil)
+			emit(&ctx.b, new_load_local(subj_v, value_local))
+			field_v := new_value(&ctx.b, nil)
+			gvf := new(Get_Variant_Field_Instr)
+			gvf.dst = field_v
+			gvf.subject = subj_v
+			gvf.field_index = field_idx
+			emit(&ctx.b, gvf)
+			field_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$match_field", nil)
+			emit(&ctx.b, new_store_local(field_local, field_v))
+			// Тот же СКВОЗНОЙ fail_block верхнего уровня передаётся КАЖДОМУ
+			// под-паттерну — на несовпадение любого поля арм проваливается
+			// в тот же fail-блок (следующий арм), тот же принцип, что
+			// сегодняшний общий fail_jumps-список в compile_pattern.
+			lower_pattern(ctx, &sub, field_local, fail_block)
+		}
+
+	case .Struct_Constructor:
+		for &sub, field_idx in pi.sub_patterns {
+			if sub.kind == .Wildcard do continue
+			obj_v := new_value(&ctx.b, nil)
+			emit(&ctx.b, new_load_local(obj_v, value_local))
+			field_v := new_value(&ctx.b, nil)
+			gp := new(Get_Property_Instr)
+			gp.dst = field_v
+			gp.object = obj_v
+			gp.field_index = field_idx
+			emit(&ctx.b, gp)
+			field_local := new_local(&ctx.b, core.INVALID_SYMBOL, "$match_field", nil)
+			emit(&ctx.b, new_store_local(field_local, field_v))
+			lower_pattern(ctx, &sub, field_local, fail_block)
+		}
+	}
+}
+
+// lower_symbol_value_ref — читает ТЕКУЩЕЕ значение символа: локаль,
+// захват (если лоурится тело лямбды) или ссылка на функцию по имени —
+// тот же порядок приоритета, что compile_symbol_value_ref сегодня
+// (core/compiler.odin). Используется и для голых Ident_Expr, и для
+// снимка захватываемых значений ПЕРЕД Build_Closure (2.3g).
+@(private = "file")
+lower_symbol_value_ref :: proc(ctx: ^Lowering_Context, sym: core.Symbol_Id, type: ^core.Type) -> Value_Id {
+	if local, ok := ctx.symbol_to_local[sym]; ok {
+		v := new_value(&ctx.b, current_function(&ctx.b).locals[int(local)].type)
+		emit(&ctx.b, new_load_local(v, local))
+		return v
+	}
+	if idx, ok := ctx.symbol_to_capture[sym]; ok {
+		v := new_value(&ctx.b, type)
+		lc := new(Load_Captured_Instr)
+		lc.dst = v
+		lc.index = idx
+		emit(&ctx.b, lc)
+		return v
+	}
+	if fn_id, ok := ctx.symbol_to_function[sym]; ok {
+		v := new_value(&ctx.b, type)
+		fr := new(Function_Ref_Instr)
+		fr.dst = v
+		fr.fn = fn_id
+		emit(&ctx.b, fr)
+		return v
+	}
+	lower_unsupported("идентификатор не резолвится (builtin/модуль/константа — Фаза 3+)")
+}
+
+// lower_lambda_expr — see core/compiler.odin's case ^Lambda_Expr. Имя
+// строится тем же способом (module_prefix::lambda_N или lambda_N),
+// Mir_Function регистрируется ЛЕНИВО (безопасно благодаря 2.1 — Mir_
+// Builder больше не держит сырой ^Mir_Function через границу append).
+// Захваты — снимок ЗНАЧЕНИЙ на момент построения (не ячейки), читаются
+// во ВНЕШНЕМ контексте через lower_symbol_value_ref ДО создания тела
+// лямбды. Тело лоурится ОТДЕЛЬНЫМ Lowering_Context с своим symbol_to_
+// capture (индекс = позиция в ctx.res.lambda_captures[expr]).
+@(private = "file")
+lower_lambda_expr :: proc(ctx: ^Lowering_Context, expr: core.Expr, e: ^core.Lambda_Expr) -> (Value_Id, Flow_Result) {
+	lambda_type := ctx.tc.node_types[expr]
+	result_type := lambda_type.return_type
+
+	name: string
+	if ctx.res.current_module != nil && len(ctx.res.current_module.path) > 0 {
+		name = fmt.tprintf("%s::lambda_%d", ctx.res.current_module.path, len(ctx.module.functions))
+	} else {
+		name = fmt.tprintf("lambda_%d", len(ctx.module.functions))
+	}
+	fn_id := new_function(ctx.module, name, core.INVALID_SYMBOL, result_type, e.span)
+
+	captures := ctx.res.lambda_captures[expr]
+	captured_values := make([dynamic]Value_Id, 0, len(captures))
+	for sym in captures {
+		v := lower_symbol_value_ref(ctx, sym, ctx.res.symbol_types[sym])
+		append(&captured_values, v)
+	}
+
+	dst := new_value(&ctx.b, lambda_type)
+	if len(captures) == 0 {
+		fr := new(Function_Ref_Instr)
+		fr.dst = dst
+		fr.fn = fn_id
+		emit(&ctx.b, fr)
+	} else {
+		bc := new(Build_Closure_Instr)
+		bc.dst = dst
+		bc.fn = fn_id
+		bc.captured = captured_values[:]
+		emit(&ctx.b, bc)
+	}
+
+	lower_lambda_body(ctx.res, ctx.tc, ctx.module, fn_id, expr, e, captures, ctx.symbol_to_function)
+
+	return dst, .Continues
+}
+
+@(private = "file")
+lower_lambda_body :: proc(
+	res: ^core.Resolver_Ctx,
+	tc: ^core.Type_Ctx,
+	module: ^Mir_Module,
+	fn_id: Function_Id,
+	expr: core.Expr,
+	e: ^core.Lambda_Expr,
+	captures: [dynamic]core.Symbol_Id,
+	symbol_to_function: map[core.Symbol_Id]Function_Id,
+) {
+	inner := Lowering_Context {
+		res                = res,
+		tc                 = tc,
+		module             = module,
+		symbol_to_local    = make(map[core.Symbol_Id]Local_Id),
+		symbol_to_function = symbol_to_function,
+		symbol_to_capture  = make(map[core.Symbol_Id]int),
+		loops              = make([dynamic]Loop_Targets),
+	}
+	inner.b = begin_function(module, fn_id)
+
+	for sym, i in captures {
+		inner.symbol_to_capture[sym] = i
+	}
+
+	args_syms, has_args := res.lambda_args[expr]
+	param_locals := make([dynamic]Local_Id, 0, len(e.args))
+	if has_args {
+		for sym, i in args_syms {
+			pt := res.symbol_types[sym]
+			name := i < len(e.args) ? e.args[i].name : ""
+			local := new_local(&inner.b, sym, name, pt)
+			inner.symbol_to_local[sym] = local
+			append(&param_locals, local)
+		}
+	}
+	current_function(&inner.b).parameters = param_locals[:]
+
+	want_value := prune_type_or_self(current_function(&inner.b).result_type) != core.TY_VOID
+	result, flow := lower_block(&inner, e.body, want_value)
+	if flow == .Continues {
+		if want_value {
+			terminate(&inner.b, new_return_term(result))
+		} else {
+			terminate(&inner.b, new_return_term(INVALID_VALUE))
+		}
+	}
 }

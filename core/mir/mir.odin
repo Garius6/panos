@@ -124,6 +124,18 @@ Call_Instr :: struct {
 	args:   []Value_Id,
 }
 
+// Call_Value_Instr — вызов через ЗНАЧЕНИЕ (не статически известный
+// Function_Id): callee — Value_Id, читаемый из локали/захвата/поля и т.п.
+// (например `пер f = функ(...) ... конец; f(...)`, или произвольная
+// функция, переданная аргументом). Рантайм-диспетчинг (^Compiled_Function
+// vs ^Closure_Value) — забота backend'а (тот же .Call опкод, что сегодня
+// обрабатывает оба варианта, см. core/vm.odin), не MIR.
+Call_Value_Instr :: struct {
+	dst:    Maybe(Value_Id),
+	callee: Value_Id,
+	args:   []Value_Id,
+}
+
 Call_Builtin_Instr :: struct {
 	dst:  Maybe(Value_Id),
 	name: string, // "модуль::имя", как сегодня в Call_Builtin-константе
@@ -154,7 +166,12 @@ Call_Async_Instr :: struct {
 
 Call_Foreign_Instr :: struct {
 	dst:  Maybe(Value_Id),
-	fn:   Function_Id, // ^Foreign_Function из constants — представлен как обычный Function_Id
+	// Внешние (`внешний`) функции — НЕ Mir_Function (нет MIR-тела, они
+	// маршаллятся через libffi, см. core/vm_ffi_native.odin) — Function_Id
+	// был бы типовым враньём (индексировал бы module.functions, где их
+	// нет). Несём резолвенный ^core.Foreign_Function напрямую, как
+	// сегодняшний байткод несёт его через constants-пул.
+	fn:   ^core.Foreign_Function,
 	args: []Value_Id,
 }
 
@@ -250,6 +267,15 @@ Build_Closure_Instr :: struct {
 	captured: []Value_Id, // снимок значений на момент Build_Closure — без ячеек, см. план
 }
 
+// Function_Ref_Instr — ссылка на функцию КАК ЗНАЧЕНИЕ (не вызов): нулевые
+// захватом лямбды (голая ^Compiled_Function-константа в сегодняшнем
+// байткоде, без Build_Closure) и передача top-level функции по имени как
+// аргумента высшего порядка — оба случая одинаковы на уровне MIR.
+Function_Ref_Instr :: struct {
+	dst: Value_Id,
+	fn:  Function_Id,
+}
+
 Spawn_Instr :: struct {
 	dst:    Value_Id,
 	callee: Function_Id,
@@ -269,6 +295,18 @@ Receive_Signal_Instr :: struct {
 	dst: Value_Id,
 }
 
+// `?`-оператор (Try_Expr, .Try_Unwrap опкод в core/vm.odin) — ОБЫЧНАЯ
+// инструкция, не terminator: раннее возвращение при неудаче — рантайм-
+// семантика ВНУТРИ одного опкода уже сегодня (распаковывает Опция/
+// Результат/произвольный 2-вариантный Variant_Value, паникует/рано
+// возвращает при неудачном варианте), тот же принцип "невидимо для
+// MIR/CFG", что уже применён к Receive/Await_Async — не заводим отдельный
+// branch-terminator под это.
+Try_Unwrap_Instr :: struct {
+	dst: Value_Id,
+	src: Value_Id,
+}
+
 Mir_Instruction :: union {
 	^Const_Instr,
 	^Copy_Instr,
@@ -279,6 +317,7 @@ Mir_Instruction :: union {
 	^Compare_Instr,
 	^Unary_Instr,
 	^Call_Instr,
+	^Call_Value_Instr,
 	^Call_Builtin_Instr,
 	^Call_Method_Instr,
 	^Call_Async_Instr,
@@ -296,10 +335,37 @@ Mir_Instruction :: union {
 	^Match_Tag_Instr,
 	^Get_Variant_Field_Instr,
 	^Build_Closure_Instr,
+	^Function_Ref_Instr,
 	^Spawn_Instr,
 	^Send_Instr,
 	^Receive_Instr,
 	^Receive_Signal_Instr,
+	^Try_Unwrap_Instr,
+}
+
+// --- Place: адрес для присваивания (lower_place, core/mir/lowering.odin)
+// — куда писать значение RHS Binary_Expr{op=.Assign}. Не instruction сама
+// по себе — используется lowering'ом, чтобы решить, какую именно
+// Store_Local/Set_Property/Set_Index-инструкцию эмитить. ---
+
+Local_Place :: struct {
+	local: Local_Id,
+}
+
+Property_Place :: struct {
+	object:      Value_Id,
+	field_index: int,
+}
+
+Index_Place :: struct {
+	object: Value_Id,
+	index:  Value_Id,
+}
+
+Place :: union {
+	^Local_Place,
+	^Property_Place,
+	^Index_Place,
 }
 
 // --- Terminators (ровно один на блок, источник истины для CFG — см.
@@ -358,4 +424,11 @@ Mir_Function :: struct {
 
 Mir_Module :: struct {
 	functions: [dynamic]Mir_Function,
+	// Ключ — build_instantiation_key (core/monomorphize.odin), тот же
+	// человекочитаемый формат "имя_функции$Тип1,Тип2", что и registry-ключ
+	// сегодняшнего байткода — генерик-клон не имеет одного стабильного
+	// Symbol_Id, разделяемого между инстанциациями, поэтому не может жить
+	// в symbol_to_function как обычная функция (см. 2.3k, core/mir/
+	// lowering.odin).
+	generic_instantiations: map[string]Function_Id,
 }

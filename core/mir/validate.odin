@@ -42,6 +42,21 @@ validate_function :: proc(
 	valid_local :: proc(id: Local_Id, n: int) -> bool { return int(id) < n }
 	valid_value :: proc(id: Value_Id, n: int) -> bool { return int(id) < n && id != INVALID_VALUE }
 
+	// Инвариант лоуринга (см. план Фазы 2, обязателен для ВСЕГО lowering.
+	// odin, не только Фазы 1): каждый Value_Id используется КАК ОПЕРАНД не
+	// более одного раза за всю функцию (и только внутри блока, где
+	// определён — что нужно многократно, идёт через Mir_Local, не через
+	// повторное чтение Value_Id). На этом инварианте держится весь дизайн
+	// MIR→bytecode backend'а (core/mir/bytecode.odin): без него backend не
+	// сможет просто "оставлять результат на стеке" — потребовался бы
+	// register allocator.
+	use_count := make(map[Value_Id]int, allocator)
+	defer delete(use_count)
+	count_use :: proc(uc: ^map[Value_Id]int, v: Value_Id) {
+		if v == INVALID_VALUE do return
+		uc[v] = uc[v] + 1
+	}
+
 	for &blk in fn.blocks {
 		if blk.terminator == nil {
 			append(
@@ -75,6 +90,7 @@ validate_function :: proc(
 				)
 			}
 		case ^Branch_Term:
+			count_use(&use_count, t.cond)
 			if !valid_value(t.cond, n_values) {
 				append(
 					&issues,
@@ -145,6 +161,7 @@ validate_function :: proc(
 					},
 				)
 			}
+			if v, ok := t.value.?; ok do count_use(&use_count, v)
 			if v, ok := t.value.?; ok && !valid_value(v, n_values) {
 				append(
 					&issues,
@@ -177,6 +194,7 @@ validate_function :: proc(
 				)
 			}
 			for op in operands {
+				count_use(&use_count, op)
 				if !valid_value(op, n_values) {
 					append(
 						&issues,
@@ -258,6 +276,23 @@ validate_function :: proc(
 		}
 	}
 
+	for v, count in use_count {
+		if count > 1 {
+			append(
+				&issues,
+				Validation_Issue {
+					fmt.tprintf(
+						"функция '%s': v%d используется %d раз(а) — нарушен single-use инвариант (см. план Фазы 2), значения с >1 использования обязаны идти через Mir_Local",
+						fn.name,
+						v,
+						count,
+					),
+					true,
+				},
+			)
+		}
+	}
+
 	info := compute_cfg_info(fn, allocator)
 	for i in 0 ..< n_blocks {
 		if !info.reachable[i] {
@@ -329,6 +364,10 @@ instr_refs :: proc(
 	case ^Call_Instr:
 		dst = v.dst
 		for a in v.args do append(&operands, a)
+	case ^Call_Value_Instr:
+		dst = v.dst
+		append(&operands, v.callee)
+		for a in v.args do append(&operands, a)
 	case ^Call_Builtin_Instr:
 		dst = v.dst
 		for a in v.args do append(&operands, a)
@@ -382,6 +421,8 @@ instr_refs :: proc(
 	case ^Build_Closure_Instr:
 		dst = v.dst
 		for c in v.captured do append(&operands, c)
+	case ^Function_Ref_Instr:
+		dst = v.dst
 	case ^Spawn_Instr:
 		dst = v.dst
 		for a in v.args do append(&operands, a)
@@ -391,6 +432,9 @@ instr_refs :: proc(
 		dst = v.dst
 	case ^Receive_Signal_Instr:
 		dst = v.dst
+	case ^Try_Unwrap_Instr:
+		dst = v.dst
+		append(&operands, v.src)
 	}
 	return
 }

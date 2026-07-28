@@ -102,6 +102,13 @@ print_instr_into :: proc(b: ^strings.Builder, instr: Mir_Instruction) {
 		fmt.sbprintf(b, "call fn_%d(", v.callee)
 		print_value_list(b, v.args)
 		strings.write_byte(b, ')')
+	case ^Call_Value_Instr:
+		if d, ok := v.dst.?; ok { print_value(b, d); strings.write_string(b, " = ") }
+		strings.write_string(b, "call_value ")
+		print_value(b, v.callee)
+		strings.write_byte(b, '(')
+		print_value_list(b, v.args)
+		strings.write_byte(b, ')')
 	case ^Call_Builtin_Instr:
 		if d, ok := v.dst.?; ok { print_value(b, d); strings.write_string(b, " = ") }
 		fmt.sbprintf(b, "call_builtin %q(", v.name)
@@ -122,7 +129,7 @@ print_instr_into :: proc(b: ^strings.Builder, instr: Mir_Instruction) {
 		strings.write_byte(b, ')')
 	case ^Call_Foreign_Instr:
 		if d, ok := v.dst.?; ok { print_value(b, d); strings.write_string(b, " = ") }
-		fmt.sbprintf(b, "call_foreign fn_%d(", v.fn)
+		fmt.sbprintf(b, "call_foreign %s(", v.fn.name)
 		print_value_list(b, v.args)
 		strings.write_byte(b, ')')
 	case ^New_Aggregate_Instr:
@@ -179,6 +186,9 @@ print_instr_into :: proc(b: ^strings.Builder, instr: Mir_Instruction) {
 		fmt.sbprintf(b, " = build_closure fn_%d(", v.fn)
 		print_value_list(b, v.captured)
 		strings.write_byte(b, ')')
+	case ^Function_Ref_Instr:
+		print_value(b, v.dst)
+		fmt.sbprintf(b, " = fn_ref fn_%d", v.fn)
 	case ^Spawn_Instr:
 		print_value(b, v.dst)
 		fmt.sbprintf(b, " = spawn fn_%d(", v.callee)
@@ -191,6 +201,9 @@ print_instr_into :: proc(b: ^strings.Builder, instr: Mir_Instruction) {
 		print_value(b, v.dst); strings.write_string(b, " = receive")
 	case ^Receive_Signal_Instr:
 		print_value(b, v.dst); strings.write_string(b, " = receive_signal")
+	case ^Try_Unwrap_Instr:
+		print_value(b, v.dst); strings.write_string(b, " = try_unwrap ")
+		print_value(b, v.src)
 	}
 }
 

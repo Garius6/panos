@@ -2,32 +2,39 @@ package mir
 
 import core "../"
 
-// Mir_Builder — тонкая обёртка над одной ^Mir_Function, накапливающая
-// инструкции в "текущий" блок. Block_Id/Local_Id/Value_Id — ИНДЕКСЫ в
-// function.blocks/locals/value_types (не сырые указатели) — append в
-// dynamic-массив может реаллоцировать backing buffer, инвалидируя любой
-// ранее взятый ^T (тот же паттерн, что vm.stack: [dynamic]Value +
-// frame_pointer-индекс в core/vm.odin, а не сырой указатель на слот).
+// Mir_Builder — тонкая обёртка над ОДНОЙ функцией модуля, накапливающая
+// инструкции в "текущий" блок. Ссылается на функцию через module+fn_id
+// (индекс), НЕ через сырой ^Mir_Function — тот же принцип, что уже
+// применён к Block_Id/Local_Id/Value_Id (append в dynamic-массив может
+// реаллоцировать backing buffer, инвалидируя любой ранее взятый ^T).
+// Раньше (Фаза 1) держался сырой ^Mir_Function, что было безопасно ПОКА
+// module.functions не менялся во время лоуринга тела — двухпроходный
+// lowering.odin гарантировал это для top-level функций. Замыкания (Фаза
+// 2) ломают эту гарантию: Lambda_Expr регистрирует СВОЙ Mir_Function
+// ЛЕНИВО, посреди лоуринга ВНЕШНЕЙ функции (тот же приём, что
+// core/compiler.odin делает для Compiled_Function лямбды сегодня — нет
+// отдельного хостинг-прохода для лямбд), а append в module.functions на
+// этом моменте мог бы реаллоцировать и инвалидировать держащийся снаружи
+// указатель. Индекс+свежий разыменование на каждое обращение снимает эту
+// проблему целиком — как и убирает необходимость в инварианте "все
+// new_function ДО лоуринга тел" (см. историю этого файла).
 Mir_Builder :: struct {
-	function:      ^Mir_Function,
+	module:        ^Mir_Module,
+	fn_id:         Function_Id,
 	current_block: Block_Id,
 	terminated:    bool, // true между terminate() и следующим set_current_block()
 }
 
 new_module :: proc() -> Mir_Module {
-	return Mir_Module{functions = make([dynamic]Mir_Function)}
+	return Mir_Module {
+		functions = make([dynamic]Mir_Function),
+		generic_instantiations = make(map[string]Function_Id),
+	}
 }
 
-// Резервирует слот функции в модуле. ВАЖНО (двухпроходный lowering, см.
-// core/mir/lowering.odin): все new_function-вызовы для модуля должны
-// завершиться ДО того, как что-либо берёт индекс/билдер для лоуринга тел
-// — после начала лоуринга тел (проход 2) в module.functions больше
-// ничего не добавляется, иначе индексы, взятые в проходе 2, могли бы
-// указывать не туда после реаллокации (в данном случае используются
-// именно ИНДЕКСЫ, не указатели, так что реаллокация сама по себе не
-// ломает корректность — но добавлять функции по ходу прохода 2 всё равно
-// не предусмотрено дизайном: symbol_to_function должен быть полным ДО
-// прохода 2).
+// Резервирует слот функции в модуле. Безопасно вызывать в ЛЮБОЙ момент —
+// в т.ч. посреди лоуринга ТЕЛА другой функции (замыкания) — все ссылки
+// на функцию идут через Function_Id, не через указатель.
 new_function :: proc(
 	module: ^Mir_Module,
 	name: string,
@@ -53,28 +60,36 @@ new_function :: proc(
 	return id
 }
 
+// current_function — свежее разыменование module.functions[fn_id] НА
+// КАЖДЫЙ вызов (не кэшируется в Mir_Builder), см. комментарий над
+// Mir_Builder.
+current_function :: proc(b: ^Mir_Builder) -> ^Mir_Function {
+	return &b.module.functions[int(b.fn_id)]
+}
+
 // begin_function — создаёт билдер для лоуринга ТЕЛА функции, уже
 // зарезервированной через new_function. Сразу заводит entry-блок.
 begin_function :: proc(module: ^Mir_Module, fn_id: Function_Id) -> Mir_Builder {
-	fn := &module.functions[int(fn_id)]
 	b := Mir_Builder {
-		function = fn,
+		module = module,
+		fn_id  = fn_id,
 	}
 	entry := new_block(&b)
-	fn.entry = entry
+	current_function(&b).entry = entry
 	set_current_block(&b, entry)
 	return b
 }
 
 new_block :: proc(b: ^Mir_Builder) -> Block_Id {
-	id := Block_Id(len(b.function.blocks))
-	append(&b.function.blocks, Mir_Block{id = id, instructions = make([dynamic]Mir_Instruction)})
+	fn := current_function(b)
+	id := Block_Id(len(fn.blocks))
+	append(&fn.blocks, Mir_Block{id = id, instructions = make([dynamic]Mir_Instruction)})
 	return id
 }
 
 set_current_block :: proc(b: ^Mir_Builder, id: Block_Id) {
 	b.current_block = id
-	b.terminated = b.function.blocks[int(id)].terminator != nil
+	b.terminated = current_function(b).blocks[int(id)].terminator != nil
 }
 
 new_local :: proc(
@@ -83,23 +98,25 @@ new_local :: proc(
 	name: string,
 	type: ^core.Type,
 ) -> Local_Id {
-	id := Local_Id(len(b.function.locals))
-	append(&b.function.locals, Mir_Local{id = id, symbol = symbol, name = name, type = type})
+	fn := current_function(b)
+	id := Local_Id(len(fn.locals))
+	append(&fn.locals, Mir_Local{id = id, symbol = symbol, name = name, type = type})
 	return id
 }
 
 new_value :: proc(b: ^Mir_Builder, type: ^core.Type) -> Value_Id {
-	id := Value_Id(len(b.function.value_types))
-	append(&b.function.value_types, type)
+	fn := current_function(b)
+	id := Value_Id(len(fn.value_types))
+	append(&fn.value_types, type)
 	return id
 }
 
 value_type :: proc(b: ^Mir_Builder, v: Value_Id) -> ^core.Type {
-	return b.function.value_types[int(v)]
+	return current_function(b).value_types[int(v)]
 }
 
 current_block :: proc(b: ^Mir_Builder) -> ^Mir_Block {
-	return &b.function.blocks[int(b.current_block)]
+	return &current_function(b).blocks[int(b.current_block)]
 }
 
 // emit/terminate паникуют, если текущий блок УЖЕ завершён — тот же

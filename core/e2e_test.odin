@@ -82,7 +82,6 @@ run_code_capture_stdout :: proc(source: string) -> (Value, bool, string) {
 
 run_module_file :: proc(filename: string) -> (Value, bool) {
 	graph := load_module_graph(filename)
-	registry := make(map[string]^Compiled_Function)
 
 	// resolve_and_typecheck_all — общий с main.odin::run_file и
 	// lsp/lsp_server.odin::revalidate_document путь. Раньше этот тест
@@ -94,13 +93,8 @@ run_module_file :: proc(filename: string) -> (Value, bool) {
 		panic_on_diagnostics(r.res_ctx.diagnostics)
 		panic_on_diagnostics(r.tc_ctx.diagnostics)
 	}
-	if len(results) > 0 {
-		ensure_prelude_compiled(&results[0].res_ctx, &registry)
-	}
-	for i in 0 ..< len(results) {
-		r := &results[i]
-		compile_program(&r.res_ctx, &r.tc_ctx, &r.module.ast, &registry)
-	}
+	module := lower_program_graph(results)
+	registry := lower_module_to_bytecode(&module)
 
 	vm := new_vm(registry)
 	run_scheduler(vm)

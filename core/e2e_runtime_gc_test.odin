@@ -24,9 +24,8 @@ compile_and_run_for_gc :: proc(source: string) -> ^VM {
 	typecheck_program(&type_ctx, prog)
 	panic_on_diagnostics(type_ctx.diagnostics)
 
-	registry := make(map[string]^Compiled_Function)
-	ensure_prelude_compiled(&res_ctx, &registry)
-	compile_program(&res_ctx, &type_ctx, &prog, &registry)
+	module := lower_module(&res_ctx, &type_ctx, &prog)
+	registry := lower_module_to_bytecode(&module)
 	vm := new_vm(registry)
 	run_scheduler(vm)
 	return vm

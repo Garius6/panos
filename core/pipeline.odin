@@ -35,10 +35,12 @@ run_source_with_args :: proc(
 	typecheck_program(&type_ctx, prog)
 	if len(type_ctx.diagnostics) > 0 do return 0.0, false, type_ctx.diagnostics
 
-	// 3. Компиляция
-	registry := make(map[string]^Compiled_Function)
-	ensure_prelude_compiled(&res_ctx, &registry)
-	compile_program(&res_ctx, &type_ctx, &prog, &registry)
+	// 3. Компиляция (MIR: lower_module уже лоурит прелюдию как часть
+	// своего обычного двухпроходного hoist/lower — отдельного "compile
+	// prelude" шага, в отличие от старого ensure_prelude_compiled+
+	// compile_program, не нужно)
+	module := lower_module(&res_ctx, &type_ctx, &prog)
+	registry := lower_module_to_bytecode(&module)
 
 	// 4. Выполнение (VM)
 	vm := new_vm(registry, program_args)
@@ -73,9 +75,9 @@ Check_Result :: struct {
 // адрес локальной переменной этой функции, мёртвый сразу по возврату
 // (висячий указатель, детерминированно не падает только пока эта область
 // стека не переиспользована — воспроизводится как настоящий segfault при
-// вызове чего-либо, читающего tc_ctx.res, напр. compile_program, см.
-// core/mir/differential_test.odin, найдено эмпирически при дифференциальном
-// тестировании Фазы 2). Куча (new()) даёт результату стабильный адрес —
+// вызове чего-либо, читающего tc_ctx.res, найдено эмпирически при
+// дифференциальном тестировании MIR-бэкенда). Куча (new()) даёт
+// результату стабильный адрес —
 // tc_ctx.res остаётся валиден сколько угодно после возврата. Все текущие
 // вызывающие используют `result := check_source(...)` + `.field` — точка
 // доступа не меняется (Odin разыменовывает ^T автоматически).

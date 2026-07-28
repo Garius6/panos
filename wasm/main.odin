@@ -173,14 +173,8 @@ panos_run :: proc "c" (source_len: int) {
 		return
 	}
 
-	global_registry := make(map[string]^core.Compiled_Function)
-	if len(results) > 0 {
-		core.ensure_prelude_compiled(&results[0].res_ctx, &global_registry)
-	}
-	for i in 0 ..< len(results) {
-		r := &results[i]
-		core.compile_program(&r.res_ctx, &r.tc_ctx, &r.module.ast, &global_registry)
-	}
+	module := core.lower_program_graph(results)
+	global_registry := core.lower_module_to_bytecode(&module)
 
 	vm := core.new_vm(global_registry, nil)
 	core.run_scheduler(vm)

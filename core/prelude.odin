@@ -340,24 +340,6 @@ ensure_prelude :: proc(graph: ^Module_Graph) -> ^Module {
 	return module
 }
 
-// Методы Опции/Результата — настоящие Impl_Decl в прелюдии, компилируются в
-// Compiled_Function так же, как реализация пользовательской структуры. Нужно
-// явно скомпилировать AST прелюдии в тот же registry, что и пользовательский
-// код, и ОБЯЗАТЕЛЬНО ДО него: .Method_Struct-диспетчер (compile_expr) кладёт
-// в байткод уже скомпилированный указатель на функцию (emit_constant(fn_ptr)),
-// не отложенный лукап по имени — если тело пользовательской функции,
-// вызывающее Опция.значение()/т.п., скомпилируется раньше прелюдии, реестр
-// пуст и compile_expr падает с "метод не найден". Принимает res (не graph):
-// resolve_program обнуляет module_graph после резолва, а res.prelude_res_ctx/
-// prelude_tc_ctx (скопированы в merge_prelude_exports) переживают это.
-// Повторный вызов безвреден (перезапись идентичным байткодом), но вызывающие
-// зовут ровно один раз на compile-проход.
-ensure_prelude_compiled :: proc(res: ^Resolver_Ctx, registry: ^map[string]^Compiled_Function) {
-	prelude_res := res.prelude_res_ctx
-	prelude_tc := res.prelude_tc_ctx
-	compile_program(prelude_res, prelude_tc, &prelude_res.current_module.ast, registry)
-}
-
 // Сливает exports прелюдии напрямую в scope резолвящегося модуля (module.
 // scope.symbols) — НЕ через .Module-обёртку обычного импорта: импорт в
 // panos не сливает имена в scope, даёт только alias.Имя. Прелюдия должна

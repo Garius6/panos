@@ -113,6 +113,166 @@ test_optimize_divide_by_zero_not_folded :: proc(t: ^testing.T) {
 	testing.expectf(t, !ok, "деление на 0 НЕ должно свернуться, получено %v", folded)
 }
 
+// entry_branch_targets — лоурит source БЕЗ оптимизации, возвращает
+// (then_block, else_block) entry-блока — используется как база для
+// сравнения "куда должен указывать Jump_Term после свёртки" (номера
+// блоков зависят от порядка lower_if_expr's new_block-вызовов, надёжнее
+// прочитать их из РЕАЛЬНОГО неоптимизированного лоуринга, чем
+// захардкодить).
+@(private = "file")
+entry_branch_targets :: proc(t: ^testing.T, source: string) -> (then_block, else_block: Block_Id) {
+	result := check_source(source)
+	testing.expectf(t, len(result.diags) == 0, "check_source diagnostics: %v", result.diags)
+	module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
+	for &fn in module.functions {
+		if fn.name != "старт" do continue
+		entry_blk := &fn.blocks[fn.entry]
+		branch, ok := entry_blk.terminator.(^Branch_Term)
+		testing.expectf(t, ok, "ожидался Branch_Term в entry-блоке неоптимизированного MIR")
+		return branch.then_block, branch.else_block
+	}
+	testing.fail_now(t, "функция 'старт' не найдена")
+}
+
+@(test)
+test_optimize_fold_constant_branch_true :: proc(t: ^testing.T) {
+	source := `
+		функ старт() -> Число
+			если истина тогда
+				1
+			иначе
+				2
+			конец
+		конец
+	`
+	then_block, _ := entry_branch_targets(t, source)
+
+	module, fn := lower_and_optimize(t, source)
+	expect_valid_optimized(t, &module, fn)
+	entry_blk := &fn.blocks[fn.entry]
+	jump, is_jump := entry_blk.terminator.(^Jump_Term)
+	testing.expectf(t, is_jump, "entry-терминатор должен был стать Jump_Term (было %T)", entry_blk.terminator)
+	if is_jump {
+		testing.expect_value(t, jump.target, then_block)
+	}
+}
+
+@(test)
+test_optimize_fold_constant_branch_from_comparison :: proc(t: ^testing.T) {
+	// Условие само не литерал, а свёртывается ДО проверки branch'а —
+	// 1 < 2 сначала фолдится в const true (обычная свёртка), ТОЛЬКО
+	// ПОТОМ fold_constant_branch видит cond в const_val.
+	source := `
+		функ старт() -> Число
+			если 1 < 2 тогда
+				42
+			иначе
+				99
+			конец
+		конец
+	`
+	then_block, _ := entry_branch_targets(t, source)
+
+	module, fn := lower_and_optimize(t, source)
+	expect_valid_optimized(t, &module, fn)
+	entry_blk := &fn.blocks[fn.entry]
+	jump, is_jump := entry_blk.terminator.(^Jump_Term)
+	testing.expectf(t, is_jump, "entry-терминатор должен был стать Jump_Term (было %T)", entry_blk.terminator)
+	if is_jump {
+		testing.expect_value(t, jump.target, then_block)
+	}
+}
+
+@(test)
+test_optimize_fold_constant_branch_false :: proc(t: ^testing.T) {
+	source := `
+		функ старт() -> Число
+			если ложь тогда
+				1
+			иначе
+				2
+			конец
+		конец
+	`
+	_, else_block := entry_branch_targets(t, source)
+
+	module, fn := lower_and_optimize(t, source)
+	expect_valid_optimized(t, &module, fn)
+	entry_blk := &fn.blocks[fn.entry]
+	jump, is_jump := entry_blk.terminator.(^Jump_Term)
+	testing.expectf(t, is_jump, "entry-терминатор должен был стать Jump_Term (было %T)", entry_blk.terminator)
+	if is_jump {
+		testing.expect_value(t, jump.target, else_block)
+	}
+}
+
+@(test)
+test_optimize_fold_constant_branch_removes_dead_side_effect :: proc(t: ^testing.T) {
+	// Вызов внутри МЁРТВОЙ ветки не должен попасть в СКОМПИЛИРОВАННЫЙ
+	// байткод — доказывает удаление ВСЕГО блока через уже существующий
+	// reverse_postorder-пропуск недостижимых блоков в backend'е (core/
+	// mir_bytecode.odin), не просто отсутствие условной инструкции.
+	// print_function ТУТ не годится — она печатает ВСЕ fn.blocks
+	// (включая недостижимые), reachability — забота бэкенда, не принтера.
+	module, fn := lower_and_optimize(t, `
+		функ побочный_эффект() -> Число
+			999
+		конец
+
+		функ старт() -> Число
+			если ложь тогда
+				побочный_эффект()
+			иначе
+				1
+			конец
+		конец
+	`)
+	expect_valid_optimized(t, &module, fn)
+	registry := lower_module_to_bytecode(&module)
+	compiled, found := registry["старт"]
+	testing.expectf(t, found, "функция 'старт' не найдена в registry")
+	if found {
+		has_dead_constant := false
+		for c in compiled.constants {
+			if f, ok := c.(f64); ok && f == 999 do has_dead_constant = true
+		}
+		testing.expectf(t, !has_dead_constant, "константа 999 из мёртвой ветки не должна попасть в скомпилированный байткод")
+	}
+}
+
+@(test)
+test_optimize_execution_constant_branch :: proc(t: ^testing.T) {
+	v, ok := run_via_mir_optimized(t, `
+		функ старт() -> Число
+			если истина тогда
+				42
+			иначе
+				0
+			конец
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	testing.expect_value(t, v, Value(f64(42)))
+}
+
+@(test)
+test_opt_diff_constant_branch :: proc(t: ^testing.T) {
+	opt_diff_check(t, `
+		функ старт() -> Число
+			пер сумма = 0
+			если истина тогда
+				сумма = сумма + 1
+			иначе
+				сумма = сумма - 1
+			конец
+			если 1 < 2 тогда
+				сумма = сумма * 10
+			конец
+			сумма
+		конец
+	`)
+}
+
 @(test)
 test_optimize_eliminate_adjacent_match_binder :: proc(t: ^testing.T) {
 	source := `

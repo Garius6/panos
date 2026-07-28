@@ -244,8 +244,40 @@ fold_constants :: proc(fn: ^Mir_Function) {
 			}
 		}
 
+		fold_constant_branch(&blk, const_val)
 		remove_dead_constants(&blk)
 	}
+}
+
+// fold_constant_branch — если Branch_Term.cond свёрнут в константный
+// bool (той же const_val картой, что и обычная свёртка выше в этом
+// блоке), заменяем терминатор на Jump_Term к живой ветке. Безопасно и
+// дёшево: Cfg_Info (core/mir_cfg.odin) пересчитывается заново из
+// terminator'ов на каждый вызов (никогда не кэшируется) — backend
+// (core/mir_bytecode.odin's emit_function_body) уже эмитит ТОЛЬКО блоки
+// из reverse_postorder (entry-достижимые); как только "мёртвая" ветка
+// теряет ЕДИНСТВЕННОГО предшественника (верно by construction — если/&&/
+// || строят блоки заново на каждое выражение, не шарят), она перестаёт
+// быть достижимой и просто не эмитится — существующая инфраструктура
+// Фазы 2 поглощает это бесплатно, без отдельного прохода "удалить мёртвый
+// блок". Константное условие означает "эта ветка математически никогда
+// не исполнится ни на каком запуске" — не эвристика, поэтому отбрасывать
+// её код (включая побочные эффекты внутри) безусловно корректно. Match_
+// Tag_Instr's dst никогда не попадает в const_val (только Const_Instr
+// туда пишет) — выбор/match естественно не задет этим проходом, без
+// специального исключения.
+@(private = "file")
+fold_constant_branch :: proc(blk: ^Mir_Block, const_val: map[Value_Id]Const_Value) {
+	branch, is_branch := blk.terminator.(^Branch_Term)
+	if !is_branch do return
+	cond_val, ok := const_val[branch.cond]
+	if !ok do return
+	cond_bool, is_bool := cond_val.(bool)
+	if !is_bool do return
+
+	jump := new(Jump_Term)
+	jump.target = cond_bool ? branch.then_block : branch.else_block
+	blk.terminator = jump
 }
 
 @(private = "file")

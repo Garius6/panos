@@ -467,14 +467,16 @@ Resolver_Ctx :: struct {
 	// case ^Ident_Expr, отдельного случая не нужно) отмечает его
 	// использованным; НЕ различает read vs write-only (x = 5 без
 	// дальнейшего чтения x всё равно считается "использованным" — см.
-	// план, сознательный скоуп этой итерации). let_bound_symbols — только
-	// символы, заведённые ЧЕРЕЗ 'пер' (простое имя И деструктуризация),
-	// КРОМЕ "_" (opt-out, тот же принцип, что Pattern_Wildcard уже даёт
-	// match'у) — параметры функций/for-in/pattern-биндеры НЕ сюда, они
-	// делят тот же scope/pop_scope, что и тела функций, но фильтруются
-	// этой картой намеренно (см. план — расширять на них не в этом раунде).
-	used_symbols:      map[Symbol_Id]bool,
-	let_bound_symbols: map[Symbol_Id]bool,
+	// план, сознательный скоуп этой итерации). unused_check_symbols —
+	// символы, заведённые через 'пер' (простое имя И деструктуризация),
+	// for-in переменные цикла и match/pattern-биндеры — КРОМЕ "_" (opt-out,
+	// тот же принцип, что Pattern_Wildcard уже даёт match'у для голого
+	// "_"). Параметры функций НЕ сюда (сознательно, см. план — часто
+	// намеренно не используются при реализации интерфейса/сигнатуры
+	// колбэка, требующей точное совпадение) — делят тот же scope/pop_scope,
+	// что и тело функции, но фильтруются этой картой намеренно.
+	used_symbols:         map[Symbol_Id]bool,
+	unused_check_symbols: map[Symbol_Id]bool,
 
 	// Symbol_Id типов Опция/Результат из прелюдии —
 	// нужны type_cheker.odin (infer_try_expr, оператор `?`), чтобы отличить
@@ -547,7 +549,7 @@ push_scope :: proc(resolver: ^Resolver_Ctx) {
 // возможную ссылку на символы этого scope (единственный прямой проход).
 pop_scope :: proc(resolver: ^Resolver_Ctx) {
 	for _, sym in resolver.current_scope.symbols {
-		if resolver.let_bound_symbols[sym] && !resolver.used_symbols[sym] {
+		if resolver.unused_check_symbols[sym] && !resolver.used_symbols[sym] {
 			s := symbol_at(resolver.symbol_store, sym)
 			report_resolve_warning(resolver, s.span, "неиспользованная переменная '%s'", resolve_interned(s.name))
 		}
@@ -635,7 +637,7 @@ new_resolver_ctx :: proc() -> Resolver_Ctx {
 		pattern_binders    = make(map[^Pattern_Ident]Symbol_Id),
 		diagnostics        = make([dynamic]Diagnostic),
 		used_symbols       = make(map[Symbol_Id]bool),
-		let_bound_symbols  = make(map[Symbol_Id]bool),
+		unused_check_symbols  = make(map[Symbol_Id]bool),
 	}
 
 	push_scope(&ctx)
@@ -663,7 +665,7 @@ new_module_resolver_ctx :: proc(graph: ^Module_Graph, module: ^Module) -> Resolv
 		pattern_binders    = make(map[^Pattern_Ident]Symbol_Id),
 		diagnostics        = make([dynamic]Diagnostic),
 		used_symbols       = make(map[Symbol_Id]bool),
-		let_bound_symbols  = make(map[Symbol_Id]bool),
+		unused_check_symbols  = make(map[Symbol_Id]bool),
 	}
 	push_scope(&ctx)
 	ctx.global_scope = ctx.current_scope
@@ -1045,6 +1047,21 @@ resolve_pattern :: proc(ctx: ^Resolver_Ctx, pattern: Pattern) {
 			)
 			ctx.current_scope.symbols[intern(p.name)] = binder
 			ctx.pattern_binders[p] = binder
+			// НЕ добавляем в unused_check_symbols, несмотря на план: голый
+			// (без payload) вариант перечисления как ИМЯ ПАТТЕРНА (`А ->
+			// ...`, без скобок) резолвится ИМЕННО через эту ветку — lookup_
+			// symbol здесь ищет "А" в scope.symbols, а варианты живут в
+			// ОТДЕЛЬНОЙ структуре (Module.variants, не scope) — typechecker
+			// (classify_pattern) переинтерпретирует его как ссылку на
+			// вариант ТОЛЬКО ПОЗЖЕ, по ожидаемому типу, резолвер этого
+			// заранее не знает. Помечать такой "биндер" неиспользуемым —
+			// систематический false positive (найдено эмпирически: 11 из
+			// 23 фикстур в дифф-корпусе получили ложные предупреждения на
+			// голые варианты — А/Б/В-стиль `выбор` очень частый паттерн).
+			// Настоящее match-биндинг (`Есть(x) -> ...`) сюда тоже не
+			// попадает — не только регресс безопаснее, но и разделять
+			// "иногда это биндер, иногда нет" здесь негде без доступа к
+			// typecheck-информации, которой на этапе резолва ещё нет.
 		}
 	case ^Pattern_Constructor:
 		// Резолвим квалификатор при необходимости и рекурсивно шаблоны
@@ -1082,7 +1099,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 				// символа вообще) — здесь символ всё равно заводится (нужен
 				// для скоупа/переприсваивания), просто не отслеживается на
 				// неиспользованность.
-				if name != "_" do ctx.let_bound_symbols[sym] = true
+				if name != "_" do ctx.unused_check_symbols[sym] = true
 			}
 			ctx.let_destructure_syms[stmt] = syms
 		} else {
@@ -1093,7 +1110,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 				report_resolve(ctx, s.span, "Имя %s уже объявлено", s.name)
 			}
 			ctx.current_scope.symbols[name_id] = sym
-			if s.name != "_" do ctx.let_bound_symbols[sym] = true
+			if s.name != "_" do ctx.unused_check_symbols[sym] = true
 
 			ctx.stmt_symbols[stmt] = sym
 		}
@@ -1126,6 +1143,7 @@ resolve_stmt :: proc(ctx: ^Resolver_Ctx, stmt: Stmt) {
 			}
 			ctx.current_scope.symbols[name_id] = sym
 			append(&names_syms, sym)
+			if name != "_" do ctx.unused_check_symbols[sym] = true
 		}
 		ctx.for_in_names_syms[stmt] = names_syms
 

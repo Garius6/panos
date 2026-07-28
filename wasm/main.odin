@@ -166,11 +166,14 @@ panos_run :: proc "c" (source_len: int) {
 		for d in r.res_ctx.diagnostics do append(&all_diags, d)
 		for d in r.tc_ctx.diagnostics do append(&all_diags, d)
 	}
+	// Warning (напр. недостижимый код) печатается для информации, но не
+	// прерывает запуск — только .Error бросает выполнение (см.
+	// diagnostics_have_error, core/type_cheker.odin).
 	if len(all_diags) > 0 {
 		for d in all_diags {
 			fmt.eprintln(d.message)
 		}
-		return
+		if core.diagnostics_have_error(all_diags[:]) do return
 	}
 
 	module := core.lower_program_graph(results)

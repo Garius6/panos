@@ -33,7 +33,13 @@ run_source_with_args :: proc(
 
 	type_ctx := new_type_ctx(&res_ctx)
 	typecheck_program(&type_ctx, prog)
-	if len(type_ctx.diagnostics) > 0 do return 0.0, false, type_ctx.diagnostics
+	// diagnostics_have_error, НЕ len() > 0 — typecheck теперь может
+	// вернуть ТОЛЬКО Severity.Warning (напр. недостижимый код,
+	// check_unreachable_code) — это не причина отказаться компилировать/
+	// исполнять, только показать. Список диагностик возвращается ПОЛНЫЙ
+	// (с предупреждениями) в любом случае — вызывающий (LSP, run_code)
+	// решает, что с ними делать.
+	if diagnostics_have_error(type_ctx.diagnostics[:]) do return 0.0, false, type_ctx.diagnostics
 
 	// 3. Компиляция (MIR: lower_module уже лоурит прелюдию как часть
 	// своего обычного двухпроходного hoist/lower — отдельного "compile
@@ -47,10 +53,13 @@ run_source_with_args :: proc(
 	vm := new_vm(registry, program_args)
 	run_scheduler(vm)
 
+	// type_ctx.diagnostics здесь — только Warning (Error уже гейтился бы
+	// выше) или пусто; возвращаем как есть, а не nil — иначе предупреждения
+	// вроде "недостижимый код" молча терялись бы на успешном пути.
 	if len(vm.stack) > 0 {
-		return vm.stack[len(vm.stack) - 1], true, nil
+		return vm.stack[len(vm.stack) - 1], true, type_ctx.diagnostics
 	}
-	return 0.0, false, nil
+	return 0.0, false, type_ctx.diagnostics
 }
 
 Check_Result :: struct {

@@ -1076,6 +1076,28 @@ report :: proc(ctx: ^Type_Ctx, span: Span, format: string, args: ..any) -> ^Type
 	return TY_POISON
 }
 
+// report_warning — как report, но severity = .Warning и без TY_POISON
+// (этот диагностик никогда не участвует в выводе типов, в отличие от
+// report — только информационный, см. check_unreachable_code).
+report_warning :: proc(ctx: ^Type_Ctx, span: Span, format: string, args: ..any) {
+	msg := fmt.aprintf(format, ..args)
+	for d in ctx.diagnostics {
+		if d.span == span && d.message == msg do return
+	}
+	append(&ctx.diagnostics, Diagnostic{severity = .Warning, span = span, message = msg})
+}
+
+// diagnostics_have_error — true если среди diags есть хотя бы один
+// .Error (не считая .Warning). Единственный правильный gate-check с тех
+// пор, как Severity.Warning стал реально конструироваться (см.
+// report_warning) — len(diags) > 0 сам по себе больше не значит "нельзя
+// компилировать/исполнять", см. core/pipeline.odin/main.odin/wasm/
+// main.odin/core/e2e_test.odin's panic_on_diagnostics.
+diagnostics_have_error :: proc(diags: []Diagnostic) -> bool {
+	for d in diags do if d.severity == .Error do return true
+	return false
+}
+
 // InferVar - внутренний временный тип. Он не равен Any: позже должен
 // связаться с конкретным типом или дать ошибку.
 new_infer_var :: proc(ctx: ^Type_Ctx) -> ^Type {
@@ -3147,6 +3169,71 @@ expr_always_diverges :: proc(ctx: ^Type_Ctx, expr: Expr) -> bool {
 // найденный там 'возврат' через check_expr. НЕ включает 'возврат' самого
 // body верхнего уровня (тот уже проверен вызывающим check_stmt-циклом) —
 // только то, что спрятано глубже.
+// stmt_diverges_for_reachability — как stmt_always_diverges выше, ПЛЮС
+// Break_Stmt/Continue_Stmt (прервать/продолжить). Отдельная функция, не
+// расширение stmt_always_diverges: та используется ТОЛЬКО для return-
+// exhaustiveness (block_always_diverges) и намеренно НЕ спускается в
+// тела циклов (см. её докстринг — "консервативно считает их 'может не
+// расходиться'"), так что прервать/продолжить там физически недостижимы
+// для проверки и расширение было бы noop — но рисковать смешением двух
+// разных вопросов ("гарантированно ли тело функции возвращает значение"
+// vs "код после этого недостижим") ради этого не стоит. check_unreachable_
+// code (ниже) сам спускается в тела циклов — там прервать/продолжить
+// РЕАЛЬНО встречаются и обязаны считаться точкой расхождения.
+stmt_diverges_for_reachability :: proc(ctx: ^Type_Ctx, stmt: Stmt) -> bool {
+	#partial switch s in stmt {
+	case ^Return_Stmt, ^Break_Stmt, ^Continue_Stmt:
+		return true
+	case ^Expr_Stmt:
+		return expr_always_diverges(ctx, s.expr)
+	}
+	return false
+}
+
+// check_unreachable_code — предупреждает (Severity.Warning, не Error —
+// не блокирует компиляцию/исполнение, см. diagnostics_have_error) о
+// коде, идущем ПОСЛЕ гарантированно расходящегося statement'а в одном
+// blocks'е (тот же вопрос, что stmt_diverges_for_reachability отвечает
+// поточечно). Рекурсивно спускается в if/match/while/for — тот же обход,
+// что check_nested_returns/check_returns_in_block, но НЕ прекращает
+// проверку остального тела при первом расхождении: расхождение внутри
+// ОДНОЙ ветки если не делает недостижимым код ПОСЛЕ всего если-выражения
+// целиком (это отдельный, куда более грубый вопрос — уже решается
+// expr_always_diverges при построении ОДНОГО такого предупреждения на
+// объемлющем уровне, если если само по себе полностью расходится).
+check_unreachable_code :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt) {
+	for stmt, i in body {
+		#partial switch s in stmt {
+		case ^Expr_Stmt:
+			check_unreachable_code_expr(ctx, s.expr)
+		case ^For_In_Stmt:
+			check_unreachable_code(ctx, s.body)
+		}
+		if stmt_diverges_for_reachability(ctx, stmt) && i + 1 < len(body) {
+			first := stmt_span(body[i + 1])
+			last := stmt_span(body[len(body) - 1])
+			report_warning(
+				ctx,
+				Span{file_id = first.file_id, start = first.start, end = last.end},
+				"недостижимый код",
+			)
+			return
+		}
+	}
+}
+
+check_unreachable_code_expr :: proc(ctx: ^Type_Ctx, expr: Expr) {
+	#partial switch e in expr {
+	case ^If_Expr:
+		check_unreachable_code(ctx, e.then_branch)
+		check_unreachable_code(ctx, e.else_branch)
+	case ^Match_Expr:
+		for arm in e.arms do check_unreachable_code(ctx, arm.body)
+	case ^While_Expr:
+		check_unreachable_code(ctx, e.body)
+	}
+}
+
 check_nested_returns :: proc(ctx: ^Type_Ctx, body: [dynamic]Stmt, expected_return: ^Type) {
 	for stmt in body {
 		#partial switch s in stmt {
@@ -3213,6 +3300,7 @@ check_function_body :: proc(ctx: ^Type_Ctx, span: Span, body: [dynamic]Stmt, exp
 	// раньше вообще не сверялся (только типизировался через infer_stmt),
 	// см. комментарий у check_nested_returns.
 	check_nested_returns(ctx, body, expected_return_type)
+	check_unreachable_code(ctx, body)
 
 	body_type := prune_type(infer_block_type(ctx, body))
 	// Implicit return (последнее выражение блока без `возврат`) идёт через

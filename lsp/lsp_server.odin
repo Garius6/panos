@@ -458,13 +458,14 @@ publish_diagnostics :: proc(server: ^LSP_Server, doc: ^LSP_Document) {
 
 		diags := make([dynamic]proto.Diagnostic, 0, len(file_diags))
 		for d in file_diags {
+			// core.Severity.Error/Warning -> LSP DiagnosticSeverity (та же
+			// пара значений, см. lsp/protocol/lsp_types.odin) — раньше было
+			// захардкожено в .Error для всего подряд, т.к. Severity.Warning
+			// нигде не конструировался (см. core.diagnostics_have_error).
+			severity := d.severity == .Error ? proto.DiagnosticSeverity.Error : proto.DiagnosticSeverity.Warning
 			append(
 				&diags,
-				proto.Diagnostic {
-					range = lsp_range(source, d.span.start, d.span.end),
-					severity = proto.DiagnosticSeverity.Error,
-					message = d.message,
-				},
+				proto.Diagnostic{range = lsp_range(source, d.span.start, d.span.end), severity = severity, message = d.message},
 			)
 		}
 

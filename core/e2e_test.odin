@@ -17,8 +17,13 @@ import "core:testing"
 // которые хотят проверить накопление НЕСКОЛЬКИХ ошибок разом, используют
 // expect_diagnostic ниже вместо этого моста.
 panic_on_diagnostics :: proc(diags: [dynamic]Diagnostic) {
-	if len(diags) > 0 {
-		panic(diags[0].message)
+	// severity-aware, НЕ len() > 0 — diags может теперь содержать ТОЛЬКО
+	// Severity.Warning (напр. недостижимый код) без единой ошибки, что не
+	// должно ронять существующие ~200 run_code-тестов. Паникуем текстом
+	// ПЕРВОЙ ошибки конкретно (не diags[0]) — Warning мог оказаться раньше
+	// в накопленном списке.
+	for d in diags {
+		if d.severity == .Error do panic(d.message)
 	}
 }
 

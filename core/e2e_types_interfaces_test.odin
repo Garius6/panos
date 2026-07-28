@@ -1654,3 +1654,96 @@ test_match_join_casts_concrete_branches_to_interface :: proc(t: ^testing.T) {
 		)
 	}
 }
+
+// check_unreachable_code (type_cheker.odin) — Severity.Warning, не Error:
+// код после возврат/прервать/продолжить (или после полностью расходящегося
+// если/выбор) недостижим, но это не должно блокировать компиляцию/
+// исполнение (см. diagnostics_have_error, core/pipeline.odin).
+@(test)
+test_unreachable_code_after_return_warns :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			возврат 1
+			2
+		конец
+	`)
+	expect_diagnostic(t, diags, "недостижимый код")
+}
+
+@(test)
+test_unreachable_code_after_break_warns :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			пока истина цикл
+				прервать
+				пер x = 1
+			конец
+			0
+		конец
+	`)
+	expect_diagnostic(t, diags, "недостижимый код")
+}
+
+@(test)
+test_unreachable_code_after_continue_warns :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			пер i: Целое = 0
+			пока i < 10 цикл
+				продолжить
+				i = i + 1
+			конец
+			0
+		конец
+	`)
+	expect_diagnostic(t, diags, "недостижимый код")
+}
+
+@(test)
+test_unreachable_code_after_exhaustively_diverging_if_warns :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			если истина тогда
+				возврат 1
+			иначе
+				возврат 2
+			конец
+			99
+		конец
+	`)
+	expect_diagnostic(t, diags, "недостижимый код")
+}
+
+// Отрицательный случай — самый частый: обычный если/иначе, ни одна ветка
+// не расходится гарантированно. Код после него не должен считаться
+// недостижимым (не должно быть ЛОЖНОГО срабатывания).
+@(test)
+test_ordinary_if_else_no_unreachable_warning :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			если истина тогда
+				1
+			иначе
+				2
+			конец
+		конец
+	`)
+	for d in diags {
+		testing.expectf(t, d.message != "недостижимый код", "ложное срабатывание на обычном если/иначе")
+	}
+}
+
+// Регрессия на fix гейтов (core/pipeline.odin/core/e2e_test.odin's
+// panic_on_diagnostics): Severity.Warning-only diagnostics НЕ должны
+// мешать run_code реально скомпилировать и исполнить программу.
+@(test)
+test_unreachable_code_warning_does_not_block_execution :: proc(t: ^testing.T) {
+	result, ok := run_code(`
+		функ старт() -> Число
+			возврат 42
+			999
+		конец
+	`)
+	testing.expectf(t, ok, "предупреждение не должно блокировать исполнение — стек пуст")
+	testing.expect_value(t, result, Value(f64(42)))
+}

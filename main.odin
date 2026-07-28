@@ -45,17 +45,20 @@ main :: proc() {
 }
 
 // Печатает diagnostic'и (parser/resolver/typechecker — все три копят в
-// []Diagnostic одинаковой формы) как path:line:col: message и выходит,
-// если список непуст. Общая точка для всех трёх стадий гейта в run_file.
+// []Diagnostic одинаковой формы) как path:line:col: message. Выходит
+// ТОЛЬКО если среди них есть хотя бы одна .Error — Severity.Warning
+// (напр. недостижимый код) печатается для информации, но не мешает
+// запуску (см. diagnostics_have_error, core/type_cheker.odin).
 print_diagnostics_and_exit :: proc(graph: ^core.Module_Graph, diags: [dynamic]core.Diagnostic) {
 	if len(diags) == 0 do return
 	for d in diags {
 		source := graph.file_sources[d.span.file_id]
 		path := graph.file_paths[d.span.file_id]
 		line, col := core.span_line_col(source, d.span.start)
-		fmt.eprintf("%s:%d:%d: %s\n", path, line, col, d.message)
+		prefix := d.severity == .Error ? "" : "warning: "
+		fmt.eprintf("%s:%d:%d: %s%s\n", path, line, col, prefix, d.message)
 	}
-	os.exit(1)
+	if core.diagnostics_have_error(diags[:]) do os.exit(1)
 }
 
 run_file :: proc(filename: string, program_args: []string = nil, verbose: bool = false) {

@@ -928,3 +928,40 @@ test_bytecode_option_prelude_methods :: proc(t: ^testing.T) {
 	testing.expectf(t, ok, "стек пуст")
 	testing.expect_value(t, v, Value(f64(42)))
 }
+
+// Bounded generics (lower_monomorphize_program, mir_monomorphize.odin) —
+// зеркало test_bounded_generic_max_works_with_primitive_and_struct
+// (core/e2e_types_interfaces_test.odin), но через MIR-бэкенд: ОДНО и то
+// же generic-тело вызывается с Число (нативный `>` хардкод) И со
+// структурой (Сравниваемое.сравнить sugar) — должны лоуриться в ДВЕ
+// разные Mir_Function под разными ключами и давать корректный результат
+// независимо.
+@(test)
+test_bytecode_bounded_generic_max :: proc(t: ^testing.T) {
+	v, ok := run_via_mir(t, `
+		тип Точка = структура
+			x: Число
+		конец
+
+		реализация Сравниваемое для Точка
+			функ сравнить(это: Точка, другое: Точка) -> Число
+				это.x - другое.x
+			конец
+		конец
+
+		функ max[T: Сравниваемое](a: T, b: T) -> T
+			если a > b тогда a иначе b конец
+		конец
+
+		функ старт() -> Булево
+			пер число_результат = max(3.0, 7.0)
+			пер п1 = Точка(1)
+			пер п2 = Точка(2)
+			пер структ_результат = max(п1, п2)
+			число_результат == 7.0 и структ_результат.x == 2
+		конец
+	`)
+	testing.expectf(t, ok, "стек пуст")
+	b, is_bool := v.(bool)
+	testing.expectf(t, is_bool && b, "ожидалось true, получено %v", v)
+}

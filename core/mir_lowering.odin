@@ -90,6 +90,17 @@ lower_module :: proc(
 	}
 
 	hoist_decls(res, &module, &symbol_to_function, program.decls)
+
+	// Bounded traits: ПОСЛЕ hoisting (клоны могут ссылаться на Function_Id
+	// обычных функций/методов — skeleton уже существует, тело ещё нет),
+	// но ДО lower_decls — иначе call site'ы bounded generic-функций (см.
+	// lower_call_expr_inner) не найдут свою инстанциацию в module.
+	// generic_instantiations. Один вызов покрывает и прелюдию, и
+	// пользовательскую программу — tc.generic_call_instantiations общая
+	// на весь тайпчек, symbol_at(...).decl не зависит от того, в каком
+	// hoist_decls-проходе была зарегистрирована исходная generic-функция.
+	lower_monomorphize_program(res, tc, &module, &symbol_to_function)
+
 	lower_decls(res, tc, &module, &symbol_to_function, program.decls)
 
 	return module
@@ -157,7 +168,10 @@ function_return_type :: proc(res: ^Resolver_Ctx, sym: Symbol_Id) -> ^Type {
 	return func_type.return_type
 }
 
-@(private = "file")
+// НЕ private = "file" — lower_monomorphize_one (mir_monomorphize.odin)
+// переиспользует эту же функцию для тел мономорфизированных клонов
+// (тот же приём, что lower_module делает для обычных top-level функций,
+// клон неотличим от обычной функции к этому моменту).
 lower_function_body :: proc(
 	res: ^Resolver_Ctx,
 	tc: ^Type_Ctx,
@@ -1023,10 +1037,13 @@ lower_call_expr_inner :: proc(
 	result_type := ctx.tc.node_types[expr]
 
 	// Дженерик-инстанциация (bounded traits) — ключ инстанциации уже
-	// гарантированно зарегистрирован monomorphize_program/lower_module
-	// ДО этой точки (см. 2.3k).
+	// гарантированно зарегистрирован lower_monomorphize_program/lower_module
+	// ДО этой точки (см. 2.3k). generic_call_callee_sym, НЕ node_symbols
+	// [e.callee] — тот же мотив, что у monomorphize_program
+	// (core/monomorphize.odin): cross-module вызов (module.f(...)) имеет
+	// ^Property_Expr callee, не резолвящийся через node_symbols вообще.
 	if concrete_types, ok := ctx.tc.generic_call_instantiations[expr]; ok {
-		callee_sym := ctx.res.node_symbols[e.callee]
+		callee_sym := ctx.tc.generic_call_callee_sym[expr]
 		key := build_instantiation_key(ctx.res.symbol_store, callee_sym, concrete_types)
 		fn_id, found := ctx.module.generic_instantiations[key]
 		if !found {

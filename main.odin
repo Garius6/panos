@@ -91,26 +91,51 @@ run_file :: proc(filename: string, program_args: []string = nil, verbose: bool =
 	}
 	print_diagnostics_and_exit(&graph, all_diags)
 
-	global_registry := make(map[string]^core.Compiled_Function)
-	if len(results) > 0 {
-		core.ensure_prelude_compiled(&results[0].res_ctx, &global_registry)
-	}
-
-	for i in 0 ..< len(results) {
-		r := &results[i]
-		module_registry := core.compile_program(&r.res_ctx, &r.tc_ctx, &r.module.ast, &global_registry)
+	global_registry: map[string]^core.Compiled_Function
+	// PANOS_MIR_BACKEND=1 (см. core/mir_backend_switch_native.odin) —
+	// lower_program_graph+lower_module_to_bytecode вместо ensure_prelude_
+	// compiled+compile_program. Оба пути дают ОДИН и тот же map[string]^
+	// Compiled_Function-реестр (см. Стадия 2.5's differential-тесты,
+	// core/mir_differential_test.odin) — VM ниже не знает и не должна
+	// знать, какой путь его построил.
+	if core.use_mir_backend() {
+		module := core.lower_program_graph(results)
+		global_registry = core.lower_module_to_bytecode(&module)
 		if verbose {
-			core.print_resolver_ctx(&r.res_ctx)
-
-			fmt.println("TYPE CHECK")
+			for i in 0 ..< len(results) {
+				core.print_resolver_ctx(&results[i].res_ctx)
+				fmt.println("TYPE CHECK")
+				fmt.printf("--------------------------\n")
+				core.print_type_ctx(&results[i].tc_ctx)
+				fmt.printf("--------------------------\n\n")
+			}
+			fmt.println("MIR")
 			fmt.printf("--------------------------\n")
-			core.print_type_ctx(&r.tc_ctx)
+			fmt.println(core.print_module(&module))
 			fmt.printf("--------------------------\n\n")
+		}
+	} else {
+		global_registry = make(map[string]^core.Compiled_Function)
+		if len(results) > 0 {
+			core.ensure_prelude_compiled(&results[0].res_ctx, &global_registry)
+		}
 
-			fmt.println("COMPILATION")
-			fmt.printf("--------------------------\n")
-			core.print_assembler(module_registry)
-			fmt.printf("--------------------------\n\n")
+		for i in 0 ..< len(results) {
+			r := &results[i]
+			module_registry := core.compile_program(&r.res_ctx, &r.tc_ctx, &r.module.ast, &global_registry)
+			if verbose {
+				core.print_resolver_ctx(&r.res_ctx)
+
+				fmt.println("TYPE CHECK")
+				fmt.printf("--------------------------\n")
+				core.print_type_ctx(&r.tc_ctx)
+				fmt.printf("--------------------------\n\n")
+
+				fmt.println("COMPILATION")
+				fmt.printf("--------------------------\n")
+				core.print_assembler(module_registry)
+				fmt.printf("--------------------------\n\n")
+			}
 		}
 	}
 

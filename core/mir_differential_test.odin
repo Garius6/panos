@@ -76,6 +76,185 @@ diff_check :: proc(t: ^testing.T, source: string) {
 	}
 }
 
+// --- Многомодульный корпус (реальные fixtures/*.ps, файловые `импорт`ы,
+// module_loader.odin's Module_Graph) — та же пара путей, что выше, но
+// через load_module_graph+resolve_and_typecheck_all вместо check_source,
+// и lower_program_graph (mir_module_graph.odin) вместо lower_module.
+// Зеркалит run_module_file (core/e2e_test.odin) для старого пути.
+
+@(private = "file")
+run_old_path_module_file :: proc(filename: string) -> Diff_Result {
+	graph := load_module_graph(filename)
+	if len(graph.parse_diagnostics) > 0 do return Diff_Result{ok = false}
+	results := resolve_and_typecheck_all(&graph)
+	for r in results {
+		if len(r.res_ctx.diagnostics) > 0 || len(r.tc_ctx.diagnostics) > 0 do return Diff_Result{ok = false}
+	}
+
+	registry := make(map[string]^Compiled_Function)
+	if len(results) > 0 {
+		ensure_prelude_compiled(&results[0].res_ctx, &registry)
+	}
+	for i in 0 ..< len(results) {
+		r := &results[i]
+		compile_program(&r.res_ctx, &r.tc_ctx, &r.module.ast, &registry)
+	}
+
+	vm := new_vm(registry)
+	run_scheduler(vm)
+	if len(vm.stack) == 0 do return Diff_Result{ok = false}
+	return Diff_Result{ok = true, display = value_to_display_string(vm, vm.stack[len(vm.stack) - 1])}
+}
+
+@(private = "file")
+run_new_path_module_file :: proc(filename: string) -> Diff_Result {
+	graph := load_module_graph(filename)
+	if len(graph.parse_diagnostics) > 0 do return Diff_Result{ok = false}
+	results := resolve_and_typecheck_all(&graph)
+	for r in results {
+		if len(r.res_ctx.diagnostics) > 0 || len(r.tc_ctx.diagnostics) > 0 do return Diff_Result{ok = false}
+	}
+
+	module := lower_program_graph(results)
+	registry := lower_module_to_bytecode(&module)
+
+	vm := new_vm(registry)
+	run_scheduler(vm)
+	if len(vm.stack) == 0 do return Diff_Result{ok = false}
+	return Diff_Result{ok = true, display = value_to_display_string(vm, vm.stack[len(vm.stack) - 1])}
+}
+
+@(private = "file")
+diff_check_module_file :: proc(t: ^testing.T, filename: string) {
+	old := run_old_path_module_file(filename)
+	new := run_new_path_module_file(filename)
+	testing.expectf(t, old.ok, "СТАРЫЙ путь не вернул значение (пустой стек) для %s", filename)
+	testing.expectf(t, new.ok, "НОВЫЙ (MIR) путь не вернул значение (пустой стек) для %s", filename)
+	if old.ok && new.ok {
+		testing.expectf(
+			t,
+			old.display == new.display,
+			"РАСХОЖДЕНИЕ на %s: старый=%q, новый(MIR)=%q",
+			filename,
+			old.display,
+			new.display,
+		)
+	}
+}
+
+// Курируемое подмножество fixtures/*.ps (не весь каталог — см. ниже) —
+// реальные многофайловые программы, гоняемые через ОБА пути. Исключены:
+// (1) fixtures БЕЗ функ старт() (библиотеки, импортируются, не
+// запускаются напрямую); (2) заведомо-негативные fixtures (typecheck/
+// resolve diagnostics — qualified_generic_fixture_main_{not_exported,
+// wrong_arity}, module_fixture_missing_import_main, spawn_qualified_
+// bad_{module,type}_fixture_main, spawn_qualified_not_function_fixture_
+// main, adt_fixture_private_use, const_fixture_main_private) — они
+// тестируют diagnostics ДО бэкенда, обоим путям тут нечего сравнивать;
+// (3) random_fixture_main (время.сейчас_мс()-seed — недетерминированно
+// МЕЖДУ двумя прогонами, ложное расхождение, не баг бэкенда);
+// (4) http_router_serve_fixture_main/http_serve_sugar_fixture_main
+// (реальные сокеты — оба прогона подряд на одном порту); (5) supervisor_*
+// и spawn_qualified_fixture_main — намеренно ЗАВЕРШАЮТСЯ паникой (см.
+// core/e2e_actors_test.odin's testing.expect_assert на этих же fixtures)
+// — diff_check_module_file ожидает успешное значение с ОБЕИХ сторон, не
+// подходит; см. отдельные test_diff_module_file_panic_* ниже.
+@(private = "file")
+mir_module_diff_corpus := []string {
+	"fixtures/adt_fixture_main.ps",
+	"fixtures/adt_fixture_private_main.ps",
+	"fixtures/adt_fixture_short.ps",
+	"fixtures/archive_fixture_main.ps",
+	"fixtures/bounded_generic_iface_fixture_main.ps",
+	"fixtures/collections_fixture_main.ps",
+	"fixtures/const_fixture_main.ps",
+	"fixtures/flags_fixture_main.ps",
+	"fixtures/generic_cross_module_fixture_main.ps",
+	"fixtures/http_router_fixture_main.ps",
+	"fixtures/http_url_fixture_main.ps",
+	"fixtures/impl_qualified_target_main.ps",
+	"fixtures/interface_cross_module_main.ps",
+	"fixtures/json_fixture_main.ps",
+	"fixtures/math_fixture_main.ps",
+	"fixtures/module_fixture_main.ps",
+	"fixtures/module_fixture_nested_main.ps",
+	"fixtures/qualified_generic_fixture_main.ps",
+	"fixtures/stdlib_fixture_main.ps",
+	"fixtures/test_fixture_main.ps",
+	"fixtures/toml_fixture_main.ps",
+	"fixtures/type_alias_fixture_main.ps",
+	"fixtures/логгер_fixture_main.ps",
+	"fixtures/слог_fixture_main.ps",
+}
+
+@(test)
+test_diff_module_file_corpus :: proc(t: ^testing.T) {
+	for path in mir_module_diff_corpus {
+		diff_check_module_file(t, path)
+	}
+}
+
+// Cross-module `запусти Модуль.функция(...)` + супервизор-сценарии —
+// намеренно панкуют (см. одноимённые тесты в core/e2e_actors_test.odin,
+// та же testing.expect_assert-точная-строка), проверяем только НОВЫЙ
+// (MIR) путь даёт ТУ ЖЕ панику — старый путь уже покрыт e2e_actors_test.
+@(test)
+test_diff_module_file_panic_spawn_qualified :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Runtime Panic: Runtime Panic: эхо получило: привет")
+	run_new_path_module_file("fixtures/spawn_qualified_fixture_main.ps")
+}
+
+@(test)
+test_diff_module_file_panic_supervisor :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Runtime Panic: супервизор (один-за-одного): 'падающий-рабочий' превысил лимит перезапусков (1 за 60000мс): процесс уже не существует",
+	)
+	run_new_path_module_file("fixtures/supervisor_fixture_main.ps")
+}
+
+@(test)
+test_diff_module_file_panic_supervisor_dynamic_add :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Runtime Panic: Runtime Panic: супервизор (один-за-одного): 'динамический-рабочий' превысил лимит перезапусков (1 за 60000мс): процесс уже не существует",
+	)
+	run_new_path_module_file("fixtures/supervisor_dynamic_add_fixture_main.ps")
+}
+
+@(test)
+test_diff_module_file_panic_supervisor_dynamic_remove :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Runtime Panic: Runtime Panic: супервизор (один-за-одного): 'падающая-после-удаления' превысил лимит перезапусков (1 за 60000мс): процесс уже не существует",
+	)
+	run_new_path_module_file("fixtures/supervisor_dynamic_remove_fixture_main.ps")
+}
+
+@(test)
+test_diff_module_file_panic_supervisor_narrow_window :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Runtime Error: все процессы заблокированы в ожидании сообщений (дедлок)")
+	run_new_path_module_file("fixtures/supervisor_narrow_window_fixture_main.ps")
+}
+
+@(test)
+test_diff_module_file_panic_supervisor_one_for_all :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Runtime Panic: супервизор (групповой рестарт): краш 'падающая' исчерпал лимит групповых перезапусков (1 за 60000мс): Runtime Panic: бум",
+	)
+	run_new_path_module_file("fixtures/supervisor_one_for_all_fixture_main.ps")
+}
+
+@(test)
+test_diff_module_file_panic_supervisor_rest_for_one :: proc(t: ^testing.T) {
+	testing.expect_assert(
+		t,
+		"Runtime Panic: супервизор (групповой рестарт): краш 'падающая' исчерпал лимит групповых перезапусков (1 за 60000мс): Runtime Panic: бум",
+	)
+	run_new_path_module_file("fixtures/supervisor_rest_for_one_fixture_main.ps")
+}
+
 // --- Корпус: та же батарея фич, что уже покрыта unit-тестами Фазы 2
 // (2.3a-2.3k) + 2.4, теперь сравниваемая напрямую со старым компилятором
 // вместо изолированной проверки print+validate/VM-запуска. ---

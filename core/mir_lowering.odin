@@ -84,10 +84,7 @@ lower_module :: proc(
 	module := new_module()
 	symbol_to_function := make(map[Symbol_Id]Function_Id)
 
-	if res.prelude_res_ctx != nil && res.prelude_tc_ctx != nil {
-		hoist_decls(res.prelude_res_ctx, &module, &symbol_to_function, res.prelude_res_ctx.current_module.ast.decls)
-		lower_decls(res.prelude_res_ctx, res.prelude_tc_ctx, &module, &symbol_to_function, res.prelude_res_ctx.current_module.ast.decls)
-	}
+	lower_prelude_into(res, &module, &symbol_to_function)
 
 	hoist_decls(res, &module, &symbol_to_function, program.decls)
 
@@ -106,7 +103,27 @@ lower_module :: proc(
 	return module
 }
 
-@(private = "file")
+// Хостит+лоурит прелюдию (Опция/Результат и их методы) в module/
+// symbol_to_function, если res вообще резолвился С прелюдией (res.
+// prelude_res_ctx/prelude_tc_ctx nil для резолва САМОЙ прелюдии — см.
+// core/prelude.odin, ensure_prelude — иначе бесконечная рекурсия).
+// Общий helper для lower_module (один файл) и lower_program_graph
+// (граф модулей, mir_module_graph.odin) — вызывается РОВНО один раз на
+// компиляцию в обоих случаях. НЕ private = "file" — используется из
+// обоих файлов.
+lower_prelude_into :: proc(
+	res: ^Resolver_Ctx,
+	module: ^Mir_Module,
+	symbol_to_function: ^map[Symbol_Id]Function_Id,
+) {
+	if res.prelude_res_ctx == nil || res.prelude_tc_ctx == nil do return
+	hoist_decls(res.prelude_res_ctx, module, symbol_to_function, res.prelude_res_ctx.current_module.ast.decls)
+	lower_decls(res.prelude_res_ctx, res.prelude_tc_ctx, module, symbol_to_function, res.prelude_res_ctx.current_module.ast.decls)
+}
+
+// НЕ private = "file" — переиспользуется из mir_module_graph.odin
+// (граф из нескольких панос-модулей, каждый лоурится своим hoist_decls/
+// lower_decls-проходом, см. lower_program_graph).
 hoist_decls :: proc(
 	res: ^Resolver_Ctx,
 	module: ^Mir_Module,
@@ -119,7 +136,15 @@ hoist_decls :: proc(
 			if len(d.type_param_bounds) > 0 do continue // дженерики — Фаза 2, тот же фильтр, что compile_program сегодня
 			sym := res.decl_symbols[decl]
 			result_type := function_return_type(res, sym)
-			fn_id := new_function(module, d.name, sym, result_type, d.span)
+			// symbol_registry_key, НЕ d.name — та же квалификация
+			// (<module.path>::<name> для не-entry модулей), что hoist_
+			// compiled_function (core/compiler.odin) уже использует.
+			// Голое d.name коллизирует между модулями (два разных модуля
+			// с одноимённой функцией) и не даёт lower_module_to_bytecode's
+			// итоговой registry-записи совпасть с тем, что ожидает
+			// cross-module call site (byte-код читает имя через
+			// symbol_registry_key на call site тоже).
+			fn_id := new_function(module, symbol_registry_key(res.symbol_store, sym), sym, result_type, d.span)
 			symbol_to_function[sym] = fn_id
 		case ^Impl_Decl:
 			// Методы структур/интерфейсов — та же двухпроходная логика,
@@ -129,14 +154,14 @@ hoist_decls :: proc(
 			for m in d.methods {
 				sym := res.decl_symbols[m]
 				result_type := function_return_type(res, sym)
-				fn_id := new_function(module, m.name, sym, result_type, m.span)
+				fn_id := new_function(module, symbol_registry_key(res.symbol_store, sym), sym, result_type, m.span)
 				symbol_to_function[sym] = fn_id
 			}
 		}
 	}
 }
 
-@(private = "file")
+// НЕ private = "file" — тот же мотив, что hoist_decls выше.
 lower_decls :: proc(
 	res: ^Resolver_Ctx,
 	tc: ^Type_Ctx,
@@ -540,6 +565,21 @@ lower_expr :: proc(
 			return maybe_wrap_interface_cast(ctx, expr, dst), .Continues
 		}
 
+		// Модуль-квалифицированная ссылка на функцию/константу (архив.
+		// собрать, модуль.КОНСТАНТА) — резолвер кладёт Symbol_Id ЦЕЛИ (не
+		// объекта-модуля) в node_symbols[expr] ЦЕЛИКОМ, ТОЛЬКО когда e.object
+		// резолвится в .Module или enum-тип (см. resolver.odin's Property_
+		// Expr — обычный доступ к полю структуры node_symbols[expr] вообще
+		// не трогает, obj.kind там .Variable). ДОЛЖНО проверяться ДО
+		// обычного struct-field доступа ниже — иначе lower_expr(e.object)
+		// попытался бы прочитать сам МОДУЛЬ как значение (не значение
+		// времени выполнения) и упал бы. Та же ветка, что core/compiler.
+		// odin's case ^Property_Expr.
+		if sym_id, ok := ctx.res.node_symbols[expr]; ok && sym_id != INVALID_SYMBOL {
+			dst := lower_symbol_value_ref(ctx, sym_id, ctx.tc.node_types[expr])
+			return maybe_wrap_interface_cast(ctx, expr, dst), .Continues
+		}
+
 		obj, oflow := lower_expr(ctx, e.object)
 		if oflow == .Terminates do return INVALID_VALUE, .Terminates
 		dst := new_value(&ctx.b, ctx.tc.node_types[expr])
@@ -578,17 +618,17 @@ lower_expr :: proc(
 	lower_unsupported("неизвестный вид выражения")
 }
 
-// lower_spawn_expr — `запусти f(args...)`. Покрывает только callee-
-// идентификатор В ТОМ ЖЕ модуле (см. core/compiler.odin's case
-// ^Spawn_Expr) — `запусти Модуль.функция(...)` требует cross-module
-// резолва экспортов, которого lower_module целиком (single-программный
-// вход, как и compile_program) сегодня не делает ни для чего (не
-// специфично для Spawn) — известное ограничение, не блокер для этой фазы.
+// lower_spawn_expr — `запусти f(args...)`. И голый идентификатор, И
+// cross-module callee (`запусти Модуль.функция(...)`) — resolve_expr
+// резолвит e.call ТОЧНО как обычный Call_Expr (см. resolver.odin's case
+// ^Spawn_Expr: "резолвится ТОЧНО как обычный Call_Expr"), а Call_Expr
+// резолвит callee через тот же resolve_expr(ctx, e.callee), что и любой
+// другой Property_Expr — node_symbols[callee] получает Symbol_Id ЦЕЛИ
+// (не объекта-модуля) тем же путём, что и обычный module.function()
+// вызов (см. Property_Expr-ветку в lower_expr выше) — отдельного
+// cross-module резолва здесь не нужно.
 @(private = "file")
 lower_spawn_expr :: proc(ctx: ^Lowering_Context, expr: Expr, e: ^Spawn_Expr) -> (Value_Id, Flow_Result) {
-	if _, is_prop := e.call.callee.(^Property_Expr); is_prop {
-		lower_unsupported("запусти через cross-module callee (Модуль.функция) — Фаза 3+")
-	}
 	callee_sym := ctx.res.node_symbols[e.call.callee]
 	fn_id, found := ctx.symbol_to_function[callee_sym]
 	if !found {
@@ -1788,7 +1828,19 @@ lower_symbol_value_ref :: proc(ctx: ^Lowering_Context, sym: Symbol_Id, type: ^Ty
 		emit(&ctx.b, fr)
 		return v
 	}
-	lower_unsupported("идентификатор не резолвится (builtin/модуль/константа — Фаза 3+)")
+	// Top-level `конст` (см. core/compiler.odin's compile_symbol_value_ref,
+	// та же ветка) — компилируется подстановкой её литерала на каждое
+	// использование, своего рантайм-хранилища нет (см. CLAUDE.md: "no
+	// top-level mutable state"). const_decl.value гарантированно чистый
+	// литерал (грамматика/тайпчек не допускают ничего другого) — Flow_
+	// Result всегда .Continues, отбрасываем.
+	sym_info := symbol_at(ctx.res.symbol_store, sym)
+	if sym_info.kind == .Constant {
+		const_decl := sym_info.decl.(^Const_Decl)
+		v, _ := lower_expr(ctx, const_decl.value)
+		return v
+	}
+	fmt_panic("идентификатор не резолвится: ", resolve_interned(sym_info.name))
 }
 
 // lower_lambda_expr — see core/compiler.odin's case ^Lambda_Expr. Имя

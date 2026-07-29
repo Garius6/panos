@@ -553,8 +553,16 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		case "ввод_вывод::печать":
 			append(code, 0x10) // call
 			write_uleb128(code, u64(PW_PRINT_STRING))
+		case "строки::длина_байт":
+			// pw_string_len возвращает i32, но строки::длина_байт -> Целое
+			// (см. core/stdlib.odin), а Целое в этом бэкенде — f64
+			// (Фаза 1: рантайм-представление Целое/Число не различается,
+			// см. wasm_val_type) — конвертируем.
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_LEN))
+			append(code, 0xB7) // f64.convert_i32_s
 		case:
-			panic(fmt.tprintf("wasm backend Фаза 2.0: builtin '%s' вне области (только ввод_вывод::печать)", v.name))
+			panic(fmt.tprintf("wasm backend Фаза 2.0: builtin '%s' вне области (см. план)", v.name))
 		}
 
 	case ^Copy_Instr,

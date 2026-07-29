@@ -573,6 +573,17 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		case "строки::из_целого":
 			append(code, 0x10)
 			write_uleb128(code, u64(PW_INT_TO_STRING))
+		case "строки::сравнить":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_COMPARE))
+		case "строки::заменить":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_REPLACE_ALL))
+		case "ос::версия_паноса":
+			// Константа, не вызов — тот же emit_string_const, что
+			// Const_Instr(string), см. её докстринг (PW_SCRATCH_SET-цикл +
+			// pw_alloc_from_scratch).
+			emit_string_const(ectx, PANOS_VERSION)
 		case:
 			panic(fmt.tprintf("wasm backend Фаза 2.0: builtin '%s' вне области (см. план)", v.name))
 		}

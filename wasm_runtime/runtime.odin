@@ -309,3 +309,87 @@ pw_int_to_string :: proc "contextless" (value: f64) -> i32 {
 	obj_count += 1
 	return id
 }
+
+// pw_string_compare — трёхзначное лексикографическое БАЙТОВОЕ сравнение,
+// -1/0/1 (см. base/runtime's string_cmp/memory_compare, которое
+// core:strings.compare — и, транзитивно, core/vm.odin's строки::
+// сравнить — использует на стороне байткод-VM: ВСЕГДА ровно -1/0/1, не
+// сырая разница байтов, проверено чтением исходника Odin, не
+// предположено).
+@(export)
+pw_string_compare :: proc "contextless" (a: i32, b: i32) -> f64 {
+	a_off, a_len := obj_offsets[a], obj_sizes[a]
+	b_off, b_len := obj_offsets[b], obj_sizes[b]
+	n := min(a_len, b_len)
+	for i in i32(0) ..< n {
+		if arena[a_off + i] != arena[b_off + i] {
+			return arena[a_off + i] < arena[b_off + i] ? -1 : 1
+		}
+	}
+	if a_len != b_len {
+		return a_len < b_len ? -1 : 1
+	}
+	return 0
+}
+
+// pw_string_replace_all — строки::заменить: два прохода (посчитать
+// непересекающиеся вхождения old, затем построить результат) — то же
+// non-overlapping-сканирование, что core:strings.replace_all на стороне
+// байткод-VM. Пустой old — 0 вхождений (результат = копия text), не
+// пытаемся воспроизвести особый (и редко используемый) случай "вставить
+// new между каждым символом", который дал бы core:strings.replace_all
+// для old="" — вне тестового скоупа этого среза.
+@(export)
+pw_string_replace_all :: proc "contextless" (text: i32, old: i32, new: i32) -> i32 {
+	t_off, t_len := obj_offsets[text], obj_sizes[text]
+	o_off, o_len := obj_offsets[old], obj_sizes[old]
+	n_off, n_len := obj_offsets[new], obj_sizes[new]
+
+	matches_at :: proc "contextless" (t_off, i, o_off, o_len: i32) -> bool {
+		for j in i32(0) ..< o_len {
+			if arena[t_off + i + j] != arena[o_off + j] do return false
+		}
+		return true
+	}
+
+	count: i32 = 0
+	if o_len > 0 {
+		i := i32(0)
+		for i <= t_len - o_len {
+			if matches_at(t_off, i, o_off, o_len) {
+				count += 1
+				i += o_len
+			} else {
+				i += 1
+			}
+		}
+	}
+
+	result_len := t_len + count * (n_len - o_len)
+	if next_free + result_len > ARENA_SIZE || obj_count >= MAX_OBJECTS || result_len < 0 {
+		return -1
+	}
+	off := next_free
+	write_pos := off
+	i := i32(0)
+	for i < t_len {
+		if o_len > 0 && i <= t_len - o_len && matches_at(t_off, i, o_off, o_len) {
+			for j in i32(0) ..< n_len {
+				arena[write_pos] = arena[n_off + j]
+				write_pos += 1
+			}
+			i += o_len
+		} else {
+			arena[write_pos] = arena[t_off + i]
+			write_pos += 1
+			i += 1
+		}
+	}
+	next_free += result_len
+
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = result_len
+	obj_count += 1
+	return id
+}

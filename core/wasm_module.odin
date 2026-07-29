@@ -171,7 +171,18 @@ PW_MAP_SET_STRKEY_F64 :: 39
 PW_MAP_SET_STRKEY_I32 :: 40
 PW_MAP_SET_NUMKEY_F64 :: 41
 PW_MAP_SET_NUMKEY_I32 :: 42
-PW_IMPORT_COUNT :: 43
+PW_STRING_LENGTH_RUNES :: 43
+PW_STRING_SLICE_RUNE :: 44
+PW_STRING_FIND_RUNE :: 45
+PW_STRING_BYTE_AT :: 46
+PW_STRING_SLICE_BYTE :: 47
+PW_STRING_FROM_BYTES :: 48
+PW_STRING_TO_BYTES :: 49
+PW_STRING_CODEPOINT_AT_START :: 50
+PW_STRING_TO_RUNES :: 51
+PW_STRING_FROM_RUNES :: 52
+PW_STRING_CHAR_AT :: 53
+PW_IMPORT_COUNT :: 54
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -218,6 +229,17 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_map_set_strkey_i32", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
 	{"pw_map_set_numkey_f64", {WASM_I32, WASM_F64, WASM_F64}, {WASM_I32}},
 	{"pw_map_set_numkey_i32", {WASM_I32, WASM_F64, WASM_I32}, {WASM_I32}},
+	{"pw_string_length_runes", {WASM_I32}, {WASM_I32}},
+	{"pw_string_slice_rune", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_string_find_rune", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_string_byte_at", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_string_slice_byte", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_string_from_bytes", {WASM_I32}, {WASM_I32}},
+	{"pw_string_to_bytes", {WASM_I32}, {WASM_I32}},
+	{"pw_string_codepoint_at_start", {WASM_I32}, {WASM_I32}},
+	{"pw_string_to_runes", {WASM_I32}, {WASM_I32}},
+	{"pw_string_from_runes", {WASM_I32}, {WASM_I32}},
+	{"pw_string_char_at", {WASM_I32, WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")

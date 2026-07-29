@@ -227,6 +227,29 @@ test_wasm_module_lowers_array_push_and_map_set_index_without_panic :: proc(t: ^t
 	testing.expectf(t, len(bytes) > 8, "модуль пуст")
 }
 
+@(test)
+test_wasm_module_lowers_rune_string_ops_without_panic :: proc(t: ^testing.T) {
+	bytes := lower_wasm_from_source(t, `
+		импорт строки
+		функ старт() -> Булево
+			пер text = "привет"
+			пер n = длина(text)
+			пер часть = строки.срез(text, 0, 3)
+			пер поз = строки.найти(text, "вет", 0)
+			пер б = строки.байт(text, 0)
+			пер срезб = строки.срез_байт(text, 0, 2)
+			пер байты = строки.в_байты(text)
+			пер обратно = строки.из_байтов(байты)
+			пер кт = строки.кодовая_точка(text)
+			пер руны = строки.в_руны(text)
+			пер изрун = строки.из_рун(руны)
+			пер символ = text[0]
+			n > 0 и часть == часть и поз > -2 и б >= 0 и срезб == срезб и обратно == text и кт > 0 и изрун == text и символ == символ
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
 // Намеренно нет теста "паникует на interface/closures/actors вне
 // области": Odin's panic() — фатальный abort процесса (нет
 // recover/unwind), проверка такого пути уронила бы весь тестовый бинарь

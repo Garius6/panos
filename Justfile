@@ -64,7 +64,13 @@ build-wasm-runtime:
 		--export=pw_map_delete_strkey --export=pw_map_delete_numkey \
 		--export=pw_array_push_f64 --export=pw_array_push_i32 \
 		--export=pw_map_set_strkey_f64 --export=pw_map_set_strkey_i32 \
-		--export=pw_map_set_numkey_f64 --export=pw_map_set_numkey_i32 --allow-undefined
+		--export=pw_map_set_numkey_f64 --export=pw_map_set_numkey_i32 \
+		--export=pw_string_length_runes --export=pw_string_slice_rune \
+		--export=pw_string_find_rune --export=pw_string_byte_at \
+		--export=pw_string_slice_byte --export=pw_string_from_bytes \
+		--export=pw_string_to_bytes --export=pw_string_codepoint_at_start \
+		--export=pw_string_to_runes --export=pw_string_from_runes \
+		--export=pw_string_char_at --allow-undefined
 
 # Дифференциальные тесты WASM AOT-бэкенда (Фаза 1/1.5, core/wasm_backend_
 # wasmtime_test.odin) — за #config(PANOS_WASM_BACKEND_TESTS), НЕ входят в

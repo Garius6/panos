@@ -851,9 +851,19 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		emit_set_property(ectx, v)
 
 	case ^Get_Index_Instr:
-		if value_type_of(ectx, v.object).kind == .Map {
+		#partial switch value_type_of(ectx, v.object).kind {
+		case .Map:
 			emit_map_get_index(ectx, v)
-		} else {
+		case .String:
+			// Фаза 2.8: text[i] — рунный индекс, [object, index] уже на
+			// стеке (index сверху), i32.trunc_f64_s на месте (та же
+			// прямая конверсия, что Array-путь ниже), pw_string_char_at
+			// (handle, rune_idx) — совпадает с (object, index) один-в-
+			// один, реордер не нужен.
+			append(code, 0xAA)
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_CHAR_AT))
+		case:
 			// object, index уже на стеке в этом порядке (см. instr_refs:
 			// [object, index], index сверху). index — Целое (f64-
 			// представление, см. wasm_val_type), pw_get_field_* принимает
@@ -956,6 +966,73 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		case "время::сейчас_мс":
 			append(code, 0x10)
 			write_uleb128(code, u64(PW_NOW_MS))
+
+		// --- Фаза 2.8: рун-осведомлённые строковые builtin'ы --------------
+		case "строки::срез", "строки::срез_байт":
+			// [text, start, end] — end сверху, ОБА индекса нужно
+			// конвертировать в i32 — тот же приём, что Массив.срез
+			// (Фаза 2.2): конвертируем end на месте, снимаем в i32-
+			// scratch, конвертируем start (теперь верх), возвращаем end.
+			end_local := alloc_i32_scratch(ectx)
+			append(code, 0xAA) // i32.trunc_f64_s (end)
+			append(code, 0x21)
+			write_uleb128(code, u64(end_local))
+			append(code, 0xAA) // i32.trunc_f64_s (start — теперь верх)
+			append(code, 0x20)
+			write_uleb128(code, u64(end_local))
+			append(code, 0x10)
+			write_uleb128(code, u64(v.name == "строки::срез" ? PW_STRING_SLICE_RUNE : PW_STRING_SLICE_BYTE))
+		case "строки::найти":
+			// [text, pattern, from_idx] — from_idx сверху, конвертация на
+			// месте, реордер не нужен. Результат — Целое, конвертируем.
+			append(code, 0xAA)
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_FIND_RUNE))
+			append(code, 0xB7) // f64.convert_i32_s
+		case "строки::байт":
+			// [text, idx] — idx сверху, конвертация на месте.
+			append(code, 0xAA)
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_BYTE_AT))
+			append(code, 0xB7)
+		case "строки::из_байтов":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_FROM_BYTES))
+		case "строки::в_байты":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_TO_BYTES))
+		case "строки::кодовая_точка":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_CODEPOINT_AT_START))
+			append(code, 0xB7)
+		case "строки::в_руны":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_TO_RUNES))
+		case "строки::из_рун":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_FROM_RUNES))
+		case "длина":
+			// Фаза 2.8: свободный длина(x) — полиморфен по РАСПОЗНАННОМУ
+			// СТАТИЧЕСКИ типу x (Строка/Массив/Соответствие, core/vm.
+			// odin:1120-1133 диспетчерит рантайм-типом — здесь заменяем
+			// на compile-time value_kind, тот же принцип, что весь
+			// остальной static-dispatch в этом бэкенде). Массив/
+			// Соответствие переиспользуют УЖЕ существующие импорты —
+			// новый рантайм-код нужен только для Строка (рунный счёт).
+			#partial switch value_kind(ectx, v.args[0]) {
+			case .String:
+				append(code, 0x10)
+				write_uleb128(code, u64(PW_STRING_LENGTH_RUNES))
+			case .Array:
+				append(code, 0x10)
+				write_uleb128(code, u64(PW_ARRAY_LENGTH))
+			case .Map:
+				append(code, 0x10)
+				write_uleb128(code, u64(PW_MAP_LENGTH))
+			case:
+				panic(fmt.tprintf("wasm backend Фаза 2.8: длина() на типе %v вне области", value_kind(ectx, v.args[0])))
+			}
+			append(code, 0xB7)
 		case:
 			panic(fmt.tprintf("wasm backend Фаза 2.0: builtin '%s' вне области (см. план)", v.name))
 		}

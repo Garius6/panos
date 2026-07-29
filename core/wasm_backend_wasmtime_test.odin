@@ -1112,4 +1112,175 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		`)
 	}
 
+	// Фаза 2.8: рун-осведомлённые строковые операции — panos's собственная
+	// строковая модель рунная (Cyrillic-heavy фикстуры), не байтовая — все
+	// тесты ниже нарочно используют кириллицу, а не ASCII (ASCII-заглушка
+	// тихо разошлась бы с реальным поведением, не покрыла бы 2-байтные
+	// UTF-8-руны).
+
+	@(private = "file")
+	run_wasm_expect_trap :: proc(t: ^testing.T, source: string) {
+		result := check_source(source)
+		testing.expectf(t, len(result.diags) == 0, "check_source diagnostics: %v", result.diags)
+		module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
+		bytes := lower_module_to_wasm(&module)
+
+		id := sync.atomic_add(&wasm_diff_temp_file_counter, 1)
+		dir, dir_err := os.temp_dir(context.allocator)
+		testing.expectf(t, dir_err == nil, "нет temp dir")
+		path := fmt.tprintf("%s/panos_wasm_trap_%d.wasm", dir, id)
+		testing.expectf(t, os.write_entire_file(path, bytes) == nil, "не удалось записать модуль")
+		defer os.remove(path)
+
+		desc := os.Process_Desc {
+			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path},
+		}
+		state, _, _, err := os.process_exec(desc, context.allocator)
+		testing.expectf(t, err == nil, "process_exec ошибка: %v", err)
+		testing.expectf(t, !state.success, "ожидался trap (ненулевой выход), получен успех")
+	}
+
+	@(test)
+	test_wasm_diff_string_length_runes :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Целое
+				длина("привет")
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_length_polymorphic :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Целое
+				массив(1, 2, 3).длина()
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Целое
+				соответствие("а" = 1, "б" = 2).длина()
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_index :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				пер text = "привет"
+				text[0] == "п"
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				пер text = "привет"
+				text[5] == "т"
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_slice_rune :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			импорт строки
+			функ старт() -> Булево
+				строки.срез("привет", 0, 3) == "при"
+			конец
+		`)
+		wasm_diff_check(t, `
+			импорт строки
+			функ старт() -> Булево
+				строки.срез("привет", 3, 6) == "вет"
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_find_rune :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			импорт строки
+			функ старт() -> Целое
+				строки.найти("привет мир", "мир", 0)
+			конец
+		`)
+		wasm_diff_check(t, `
+			импорт строки
+			функ старт() -> Целое
+				строки.найти("привет", "банан", 0)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_byte_at :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			импорт строки
+			функ старт() -> Целое
+				строки.байт("привет", 0)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_slice_byte :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			импорт строки
+			функ старт() -> Булево
+				строки.срез_байт("привет", 0, 2) == "п"
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_bytes_roundtrip :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			импорт строки
+			функ старт() -> Булево
+				пер text = "привет"
+				строки.из_байтов(строки.в_байты(text)) == text
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_codepoint :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			импорт строки
+			функ старт() -> Булево
+				строки.кодовая_точка("п") == строки.кодовая_точка("привет")
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_runes_roundtrip :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			импорт строки
+			функ старт() -> Булево
+				пер text = "привет мир"
+				строки.из_рун(строки.в_руны(text)) == text
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_panic_string_slice_rune_oob_traps :: proc(t: ^testing.T) {
+		run_wasm_expect_trap(t, `
+			импорт строки
+			функ старт() -> Пусто
+				строки.срез("привет", 0, 99)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_panic_string_byte_oob_traps :: proc(t: ^testing.T) {
+		run_wasm_expect_trap(t, `
+			импорт строки
+			функ старт() -> Пусто
+				строки.байт("привет", 99)
+			конец
+		`)
+	}
+
 }

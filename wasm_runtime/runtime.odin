@@ -1,5 +1,6 @@
 package wasm_runtime
 
+import "base:intrinsics"
 import wasi "core:sys/wasm/wasi"
 
 // wasm_runtime — Фаза 1.5 WASM AOT-бэкенда: минимальный, ОТДЕЛЬНЫЙ от
@@ -794,4 +795,348 @@ pw_monotonic_ms :: proc "contextless" () -> f64 {
 pw_now_ms :: proc "contextless" () -> f64 {
 	ts, _ := wasi.clock_time_get(wasi.CLOCK_REALTIME, 0)
 	return f64(ts) / 1e6
+}
+
+// --- Фаза 2.8: рун-осведомлённые строковые операции ---------------------
+//
+// panos's собственная строковая модель — рунная (UTF-8 codepoint), не
+// байтовая (Cyrillic-heavy фикстуры проекта, см. core/utils.odin's
+// get_character_at/string_slice_by_rune/string_find_rune — все считают
+// РУНЫ). Ручной UTF-8 декод/энкод (не core:unicode/utf8 — тот же принцип,
+// что весь этот пакет: contextless, без зависимостей за пределами
+// core:sys/wasm/wasi) — алгоритм по битовому паттерну ведущего байта,
+// общеизвестный, не нуждается в стандартной библиотеке.
+//
+// OOB/невалидный вход — intrinsics.trap() (реальный WASM unreachable,
+// подтверждено спайком перед вживлением, та же дисциплина "проверить
+// перед тем, как вписать в реальный кодоген", что весь этот бэкенд уже
+// применял) — байткод-VM ПАНИКУЕТ на эти случаи (срез/байт/срез_байт/
+// из_байтов), не молча отгружает мусор, как принятый ранее (Фаза 2.1/
+// 2.4, ДО появления паника()/trap в этом бэкенде вообще) gap для
+// Массив/Соответствие OOB — теперь, когда trap-механизм есть, честнее
+// повторить byte-код-семантику, а не тихо читать соседнюю память.
+// найти() остаётся fallback'ом (-1), не паникой — так же, как
+// string_find_rune сама устроена.
+
+@(private)
+utf8_decode_at :: proc "contextless" (off: i32) -> (cp: i32, width: i32) {
+	b0 := arena[off]
+	if b0 & 0x80 == 0 {
+		return i32(b0), 1
+	}
+	if b0 & 0xE0 == 0xC0 {
+		b1 := arena[off + 1]
+		return (i32(b0 & 0x1F) << 6) | i32(b1 & 0x3F), 2
+	}
+	if b0 & 0xF0 == 0xE0 {
+		b1, b2 := arena[off + 1], arena[off + 2]
+		return (i32(b0 & 0x0F) << 12) | (i32(b1 & 0x3F) << 6) | i32(b2 & 0x3F), 3
+	}
+	// 4-байтный случай (ведущий байт 0xF0-паттерн) — тот же "best effort"
+	// допуск для невалидного входа, что был бы у core:unicode/utf8's
+	// decode_rune_in_string на этом масштабе фикстур, не полноценный
+	// UTF-8-валидатор.
+	b1, b2, b3 := arena[off + 1], arena[off + 2], arena[off + 3]
+	return (i32(b0 & 0x07) << 18) | (i32(b1 & 0x3F) << 12) | (i32(b2 & 0x3F) << 6) | i32(b3 & 0x3F), 4
+}
+
+@(private)
+utf8_encode_at :: proc "contextless" (off: i32, cp: i32) -> i32 {
+	if cp < 0x80 {
+		arena[off] = u8(cp)
+		return 1
+	}
+	if cp < 0x800 {
+		arena[off] = u8(0xC0 | (cp >> 6))
+		arena[off + 1] = u8(0x80 | (cp & 0x3F))
+		return 2
+	}
+	if cp < 0x10000 {
+		arena[off] = u8(0xE0 | (cp >> 12))
+		arena[off + 1] = u8(0x80 | ((cp >> 6) & 0x3F))
+		arena[off + 2] = u8(0x80 | (cp & 0x3F))
+		return 3
+	}
+	arena[off] = u8(0xF0 | (cp >> 18))
+	arena[off + 1] = u8(0x80 | ((cp >> 12) & 0x3F))
+	arena[off + 2] = u8(0x80 | ((cp >> 6) & 0x3F))
+	arena[off + 3] = u8(0x80 | (cp & 0x3F))
+	return 4
+}
+
+@(export)
+pw_string_length_runes :: proc "contextless" (handle: i32) -> i32 {
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	count: i32 = 0
+	i: i32 = 0
+	for i < length {
+		_, width := utf8_decode_at(off + i)
+		i += width
+		count += 1
+	}
+	return count
+}
+
+// pw_string_slice_rune — строки::срез. Тот же обход, что core/utils.
+// odin's string_slice_by_rune (проверка idx==start/end ДО декода текущей
+// руны, ширина известна только ПОСЛЕ декода).
+@(export)
+pw_string_slice_rune :: proc "contextless" (handle: i32, start: i32, end: i32) -> i32 {
+	if start < 0 || end < start do intrinsics.trap()
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	start_byte: i32 = -1
+	end_byte := length
+	idx: i32 = 0
+	i: i32 = 0
+	for i < length {
+		if idx == start do start_byte = i
+		if idx == end do end_byte = i
+		_, width := utf8_decode_at(off + i)
+		i += width
+		idx += 1
+	}
+	if end > idx do intrinsics.trap()
+	if start_byte == -1 {
+		if start != idx do intrinsics.trap()
+		start_byte = length
+	}
+	slice_len := end_byte - start_byte
+	if next_free + slice_len > ARENA_SIZE || obj_count >= MAX_OBJECTS do intrinsics.trap()
+	dst_off := next_free
+	for j in i32(0) ..< slice_len {
+		arena[dst_off + j] = arena[off + start_byte + j]
+	}
+	next_free += slice_len
+	id := obj_count
+	obj_offsets[id] = dst_off
+	obj_sizes[id] = slice_len
+	obj_capacity[id] = slice_len
+	obj_count += 1
+	return id
+}
+
+// pw_string_find_rune — строки::найти. Тот же двухфазный приём, что
+// core/utils.odin's string_find_rune: найти байтовую позицию from_rune,
+// байтовый линейный поиск оттуда, перевести найденную байтовую позицию
+// ОБРАТНО в рунный индекс.
+@(export)
+pw_string_find_rune :: proc "contextless" (handle: i32, pattern: i32, from_rune: i32) -> i32 {
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	p_off, p_len := obj_offsets[pattern], obj_sizes[pattern]
+
+	total: i32 = 0
+	i: i32 = 0
+	for i < length {
+		_, width := utf8_decode_at(off + i)
+		i += width
+		total += 1
+	}
+	if from_rune < 0 || from_rune > total do return -1
+
+	start_byte := length
+	idx: i32 = 0
+	i = 0
+	for i < length {
+		if idx == from_rune {
+			start_byte = i
+			break
+		}
+		_, width := utf8_decode_at(off + i)
+		i += width
+		idx += 1
+	}
+
+	match_byte: i32 = -1
+	search_i := start_byte
+	for search_i <= length - p_len {
+		matched := true
+		for j in i32(0) ..< p_len {
+			if arena[off + search_i + j] != arena[p_off + j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			match_byte = search_i
+			break
+		}
+		search_i += 1
+	}
+	if match_byte == -1 do return -1
+
+	rune_idx: i32 = 0
+	i = 0
+	for i < length {
+		if i == match_byte do return rune_idx
+		_, width := utf8_decode_at(off + i)
+		i += width
+		rune_idx += 1
+	}
+	return -1
+}
+
+@(export)
+pw_string_byte_at :: proc "contextless" (handle: i32, idx: i32) -> i32 {
+	if idx < 0 || idx >= obj_sizes[handle] do intrinsics.trap()
+	return i32(arena[obj_offsets[handle] + idx])
+}
+
+@(export)
+pw_string_slice_byte :: proc "contextless" (handle: i32, start: i32, end: i32) -> i32 {
+	if start < 0 || start > end || end > obj_sizes[handle] do intrinsics.trap()
+	length := end - start
+	if next_free + length > ARENA_SIZE || obj_count >= MAX_OBJECTS do intrinsics.trap()
+	src_off := obj_offsets[handle] + start
+	off := next_free
+	for i in i32(0) ..< length {
+		arena[off + i] = arena[src_off + i]
+	}
+	next_free += length
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = length
+	obj_capacity[id] = length
+	obj_count += 1
+	return id
+}
+
+// pw_string_from_bytes/pw_string_to_bytes — байт-значения хранятся как
+// Целое (Массив(Целое), см. core/stdlib.odin), т.е. f64-слоты в этом
+// бэкенде (Фаза 1: Число/Целое не различаются рантайм-представлением) —
+// НЕ i32-слоты, несмотря на то что байт логически 0-255.
+@(export)
+pw_string_from_bytes :: proc "contextless" (array_handle: i32) -> i32 {
+	count := obj_sizes[array_handle] / FIELD_SIZE
+	if next_free + count > ARENA_SIZE || obj_count >= MAX_OBJECTS do intrinsics.trap()
+	off := next_free
+	src_off := obj_offsets[array_handle]
+	for i in i32(0) ..< count {
+		bits := unpack_u64_le(src_off + i * FIELD_SIZE)
+		v := i32(transmute(f64)bits)
+		if v < 0 || v > 255 do intrinsics.trap()
+		arena[off + i] = u8(v)
+	}
+	next_free += count
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = count
+	obj_capacity[id] = count
+	obj_count += 1
+	return id
+}
+
+@(export)
+pw_string_to_bytes :: proc "contextless" (handle: i32) -> i32 {
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	size := length * FIELD_SIZE
+	if next_free + size > ARENA_SIZE || obj_count >= MAX_OBJECTS do intrinsics.trap()
+	dst_off := next_free
+	for i in i32(0) ..< length {
+		pack_u64_le(dst_off + i * FIELD_SIZE, transmute(u64)f64(arena[off + i]))
+	}
+	next_free += size
+	id := obj_count
+	obj_offsets[id] = dst_off
+	obj_sizes[id] = size
+	obj_capacity[id] = size
+	obj_count += 1
+	return id
+}
+
+@(export)
+pw_string_codepoint_at_start :: proc "contextless" (handle: i32) -> i32 {
+	if obj_sizes[handle] == 0 do return 0
+	cp, _ := utf8_decode_at(obj_offsets[handle])
+	return cp
+}
+
+@(export)
+pw_string_to_runes :: proc "contextless" (handle: i32) -> i32 {
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	count: i32 = 0
+	i: i32 = 0
+	for i < length {
+		_, width := utf8_decode_at(off + i)
+		i += width
+		count += 1
+	}
+	size := count * FIELD_SIZE
+	if next_free + size > ARENA_SIZE || obj_count >= MAX_OBJECTS do intrinsics.trap()
+	dst_off := next_free
+	i = 0
+	slot: i32 = 0
+	for i < length {
+		cp, width := utf8_decode_at(off + i)
+		pack_u64_le(dst_off + slot * FIELD_SIZE, transmute(u64)f64(cp))
+		i += width
+		slot += 1
+	}
+	next_free += size
+	id := obj_count
+	obj_offsets[id] = dst_off
+	obj_sizes[id] = size
+	obj_capacity[id] = size
+	obj_count += 1
+	return id
+}
+
+// pw_string_from_runes — размер результата в байтах неизвестен ДО
+// кодирования (1-4 байта на codepoint) — резервируем МАКСИМУМ (4*count),
+// используем реально записанное (write_pos) как obj_sizes — obj_capacity
+// остаётся БОЛЬШЕ obj_sizes, тот же, уже принятый в Фазе 2.7 принцип
+// (capacity >= size, не строго равны), лишний хвост арены просто не
+// используется (не мусор в смысле "неверные данные", просто резерв).
+@(export)
+pw_string_from_runes :: proc "contextless" (array_handle: i32) -> i32 {
+	count := obj_sizes[array_handle] / FIELD_SIZE
+	src_off := obj_offsets[array_handle]
+	max_size := count * 4
+	if next_free + max_size > ARENA_SIZE || obj_count >= MAX_OBJECTS do intrinsics.trap()
+	off := next_free
+	write_pos: i32 = 0
+	for i in i32(0) ..< count {
+		bits := unpack_u64_le(src_off + i * FIELD_SIZE)
+		cp := i32(transmute(f64)bits)
+		width := utf8_encode_at(off + write_pos, cp)
+		write_pos += width
+	}
+	next_free += max_size
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = write_pos
+	obj_capacity[id] = max_size
+	obj_count += 1
+	return id
+}
+
+// pw_string_char_at — text[i] (Get_Index_Instr на Строка) — одна руна
+// как собственная 1-4-байтная подстрока, тот же обход, что core/utils.
+// odin's get_character_at.
+@(export)
+pw_string_char_at :: proc "contextless" (handle: i32, rune_idx: i32) -> i32 {
+	if rune_idx < 0 do intrinsics.trap()
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	idx: i32 = 0
+	i: i32 = 0
+	for i < length {
+		if idx == rune_idx {
+			_, width := utf8_decode_at(off + i)
+			if next_free + width > ARENA_SIZE || obj_count >= MAX_OBJECTS do intrinsics.trap()
+			dst_off := next_free
+			for j in i32(0) ..< width {
+				arena[dst_off + j] = arena[off + i + j]
+			}
+			next_free += width
+			id := obj_count
+			obj_offsets[id] = dst_off
+			obj_sizes[id] = width
+			obj_capacity[id] = width
+			obj_count += 1
+			return id
+		}
+		_, width := utf8_decode_at(off + i)
+		i += width
+		idx += 1
+	}
+	intrinsics.trap()
 }

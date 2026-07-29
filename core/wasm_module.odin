@@ -194,7 +194,8 @@ PW_STRING_SPLIT :: 62
 PW_STRING_JOIN :: 63
 PW_MAP_ENTRIES :: 64
 PW_PRINTLN_STRING :: 65
-PW_IMPORT_COUNT :: 66
+PW_URL_ENCODE :: 66
+PW_IMPORT_COUNT :: 67
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -264,6 +265,7 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_string_join", {WASM_I32, WASM_I32}, {WASM_I32}},
 	{"pw_map_entries", {WASM_I32}, {WASM_I32}},
 	{"pw_println_string", {WASM_I32}, {}},
+	{"pw_url_encode", {WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")

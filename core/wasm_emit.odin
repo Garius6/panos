@@ -927,6 +927,9 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 			// fmt.println — печать с завершающим переводом строки.
 			append(code, 0x10) // call
 			write_uleb128(code, u64(PW_PRINTLN_STRING))
+		case "сеть::кодировать_url":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_URL_ENCODE))
 		case "паника":
 			// Фаза 2.6: паника(сообщение) — Строка-arg уже на стеке
 			// (единственный операнд, см. instr_refs). Байткод-VM не

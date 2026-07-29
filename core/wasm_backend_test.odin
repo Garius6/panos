@@ -331,6 +331,17 @@ test_wasm_module_lowers_println_without_panic :: proc(t: ^testing.T) {
 	testing.expectf(t, len(bytes) > 8, "модуль пуст")
 }
 
+@(test)
+test_wasm_module_lowers_url_encode_without_panic :: proc(t: ^testing.T) {
+	bytes := lower_wasm_from_source(t, `
+		импорт сеть
+		функ старт() -> Булево
+			сеть.кодировать_url("hello world!") == "hello%20world%21"
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
 // Намеренно нет теста "паникует на interface/closures/actors вне
 // области": Odin's panic() — фатальный abort процесса (нет
 // recover/unwind), проверка такого пути уронила бы весь тестовый бинарь

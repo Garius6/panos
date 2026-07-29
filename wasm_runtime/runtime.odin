@@ -1586,3 +1586,52 @@ pw_map_entries :: proc "contextless" (handle: i32) -> i32 {
 	}
 	return arr
 }
+
+// pw_url_encode — сеть::кодировать_url. RFC 3986 unreserved (A-Z a-z 0-9
+// - _ . ~) как есть, остальное — %XX (побайтово, не порунно — многобайтовые
+// UTF-8-руны кодируются байт за байтом, тем же принципом, что байткод-
+// сторона, core/vm.odin's один-в-один комментарий). Худший случай — КАЖДЫЙ
+// байт становится 3 (%XX) — over-allocate 3*length, обрезать obj_sizes до
+// реально записанного, тот же приём, что pw_string_from_runes (Фаза 2.8).
+// Чисто байтовая арифметика — context не нужен (никаких core:*-вызовов).
+@(private)
+hex_digit_upper :: proc "contextless" (v: u8) -> u8 {
+	return v < 10 ? '0' + v : 'A' + (v - 10)
+}
+
+@(export)
+pw_url_encode :: proc "contextless" (handle: i32) -> i32 {
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	max_size := length * 3
+	if next_free + max_size > ARENA_SIZE || obj_count >= MAX_OBJECTS do return -1
+	dst_off := next_free
+	write_pos: i32 = 0
+	for i in i32(0) ..< length {
+		b := arena[off + i]
+		is_unreserved :=
+			(b >= 'A' && b <= 'Z') ||
+			(b >= 'a' && b <= 'z') ||
+			(b >= '0' && b <= '9') ||
+			b == '-' ||
+			b == '_' ||
+			b == '.' ||
+			b == '~'
+		if is_unreserved {
+			arena[dst_off + write_pos] = b
+			write_pos += 1
+		} else {
+			arena[dst_off + write_pos] = '%'
+			arena[dst_off + write_pos + 1] = hex_digit_upper(b >> 4)
+			arena[dst_off + write_pos + 2] = hex_digit_upper(b & 0x0F)
+			write_pos += 3
+		}
+	}
+	next_free += max_size
+
+	id := obj_count
+	obj_offsets[id] = dst_off
+	obj_sizes[id] = write_pos
+	obj_capacity[id] = max_size
+	obj_count += 1
+	return id
+}

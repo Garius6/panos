@@ -594,6 +594,25 @@ pw_print_string :: proc "contextless" (handle: i32) {
 	fd_write(1, {data}, &n)
 }
 
+// pw_println_string — ввод_вывод::строка (bytecode: fmt.println, печать
+// с завершающим переводом строки, в отличие от pw_print_string выше).
+// ДВА отдельных fd_write-вызова, НЕ один с двумя iovec — подтверждено
+// спайком ДО вживления: WASI fd_write здесь делает частичную запись
+// (writev-семантика, валидно по спецификации) — {data, newline[:]} в
+// ОДНОМ вызове реально писал ТОЛЬКО первый iovec (n возвращал len(data),
+// второй молча терялся), а не паниковал/ошибался — тихий, а не громкий
+// баг, если бы не проверили. Два ОДНО-iovec вызова (та же форма, что
+// уже проверенный pw_print_string) надёжно пишут оба куска.
+@(export)
+pw_println_string :: proc "contextless" (handle: i32) {
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	data := arena[off:][:length]
+	newline := [1]byte{'\n'}
+	n: uint
+	fd_write(1, {data}, &n)
+	fd_write(1, {newline[:]}, &n)
+}
+
 // --- Фаза 2: строки::содержит/начинается_с/заканчивается_на -----------
 // Наивный побайтовый поиск (не Boyer-Moore/KMP) — оправдано размером
 // фикстур этого бэкенда, та же логика, что core:strings.contains/

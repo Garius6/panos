@@ -413,6 +413,18 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 	}
 
 	@(test)
+	test_wasm_println_writes_trailing_newline :: proc(t: ^testing.T) {
+		out, ok := run_wasm_stdout(`
+			импорт ввод_вывод
+			функ старт() -> Пусто
+				ввод_вывод.строка("привет")
+			конец
+		`)
+		testing.expectf(t, ok, "wasm-путь не выполнился")
+		testing.expectf(t, out == "привет\n", "ожидался stdout 'привет\\n', получено %q", out)
+	}
+
+	@(test)
 	test_wasm_print_struct_field :: proc(t: ^testing.T) {
 		out, ok := run_wasm_stdout(`
 			импорт ввод_вывод

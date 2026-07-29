@@ -923,6 +923,10 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		case "ввод_вывод::печать":
 			append(code, 0x10) // call
 			write_uleb128(code, u64(PW_PRINT_STRING))
+		case "ввод_вывод::строка":
+			// fmt.println — печать с завершающим переводом строки.
+			append(code, 0x10) // call
+			write_uleb128(code, u64(PW_PRINTLN_STRING))
 		case "паника":
 			// Фаза 2.6: паника(сообщение) — Строка-arg уже на стеке
 			// (единственный операнд, см. instr_refs). Байткод-VM не

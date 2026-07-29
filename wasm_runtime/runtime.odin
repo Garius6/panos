@@ -1545,3 +1545,25 @@ pw_string_join :: proc "contextless" (arr: i32, sep: i32) -> i32 {
 	obj_count += 1
 	return id
 }
+
+// pw_map_entries — Соответствие.записи() -> Массив((Ключ, Значение)).
+// Чистый бит-копи: карта хранит записи как плоские 2*FIELD_SIZE-байтные
+// пары (ключ-слот, значение-слот, Фаза 2.4), а 2-элементный тупл — ТОТ ЖЕ
+// pw_alloc_aggregate(2)-layout — ключ/значение НЕ нужно интерпретировать
+// (в отличие от получить/есть, которым нужно расщепление strkey/numkey и
+// i32/f64) — просто переносим 8 сырых байт на слот.
+@(export)
+pw_map_entries :: proc "contextless" (handle: i32) -> i32 {
+	count := obj_sizes[handle] / (2 * FIELD_SIZE)
+	base := obj_offsets[handle]
+	arr := pw_alloc_aggregate(count)
+	for i in i32(0) ..< count {
+		pair := pw_alloc_aggregate(2)
+		key_bits := unpack_u64_le(base + i * 2 * FIELD_SIZE)
+		val_bits := unpack_u64_le(base + i * 2 * FIELD_SIZE + FIELD_SIZE)
+		pack_u64_le(obj_offsets[pair], key_bits)
+		pack_u64_le(obj_offsets[pair] + FIELD_SIZE, val_bits)
+		pw_set_field_i32(arr, i, pair)
+	}
+	return arr
+}

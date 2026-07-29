@@ -294,6 +294,32 @@ test_wasm_module_lowers_split_join_trim_without_panic :: proc(t: ^testing.T) {
 	testing.expectf(t, len(bytes) > 8, "модуль пуст")
 }
 
+@(test)
+test_wasm_module_lowers_error_field_access_without_panic :: proc(t: ^testing.T) {
+	bytes := lower_wasm_from_source(t, `
+		импорт строки
+		функ старт() -> Булево
+			пер причина = строки.в_число("abc").причина()
+			пер код = причина.код
+			пер сообщение = причина.сообщение
+			код == код и сообщение == сообщение
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
+@(test)
+test_wasm_module_lowers_map_entries_without_panic :: proc(t: ^testing.T) {
+	bytes := lower_wasm_from_source(t, `
+		функ старт() -> Булево
+			пер цены = соответствие("яблоко" = 10, "груша" = 20)
+			пер зап = цены.записи()
+			зап.длина() == 2 и зап[0].0 == зап[0].0 и зап[0].1 == зап[0].1
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
 // Намеренно нет теста "паникует на interface/closures/actors вне
 // области": Odin's panic() — фатальный abort процесса (нет
 // recover/unwind), проверка такого пути уронила бы весь тестовый бинарь

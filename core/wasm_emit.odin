@@ -375,11 +375,20 @@ value_type_of :: proc(ectx: ^Emit_Ctx, v: Value_Id) -> ^Type {
 
 // wasm_field_setter/getter — Булево/Строка (WASM i32-представление, см.
 // wasm_val_type) идут через pw_*_field_i32, Число/Целое — через
-// pw_*_field_f64. Struct-типизированные поля (вложенные агрегаты) ТОЖЕ
-// i32 (handle) — см. wasm_val_type's .Struct case.
+// pw_*_field_f64. Struct/Ошибка/тупл-типизированные поля (вложенные
+// агрегаты) ТОЖЕ i32 (handle) — см. wasm_val_type's .Struct/.Error/
+// .Tuple case. Это ОТДЕЛЬНЫЙ от wasm_val_type switch (не переиспользует
+// его) — Фазы 2.12/2.13 обе нашли реальный баг именно здесь: добавление
+// нового kind в wasm_val_type/is_wasm_phase1_type само по себе НЕ
+// чинит доступ к значениям этого kind как к ПОЛЮ/ЭЛЕМЕНТУ — этот switch
+// держит СВОЙ независимый список типов. .Array/.Enum/.Map ВСЁ ЕЩЁ
+// отсутствуют здесь — латентный, задокументированный (не исправленный)
+// пробел: ни одна текущая фикстура не вкладывает массив/enum/карту КАК
+// ПОЛЕ структуры/тупла/варианта, так что он пока не проявился на
+// практике — проверить в первую очередь, если такое появится.
 @(private = "file")
 wasm_field_is_i32 :: proc(kind: Type_Kind) -> bool {
-	return kind == .Bool || kind == .String || kind == .Struct
+	return kind == .Bool || kind == .String || kind == .Struct || kind == .Error || kind == .Tuple
 }
 
 // emit_construct_object — общая эмиссия для New_Aggregate_Instr/
@@ -655,6 +664,9 @@ emit_map_method_call :: proc(ectx: ^Emit_Ctx, v: ^Call_Method_Instr) {
 	case "удалить":
 		append(code, 0x10)
 		write_uleb128(code, u64(key_is_str ? PW_MAP_DELETE_STRKEY : PW_MAP_DELETE_NUMKEY))
+	case "записи":
+		append(code, 0x10)
+		write_uleb128(code, u64(PW_MAP_ENTRIES))
 	case:
 		panic(fmt.tprintf("wasm backend Фаза 2.4: метод '%s' на Соответствие вне области (см. план)", v.name))
 	}

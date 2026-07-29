@@ -68,7 +68,7 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 	#partial switch pt.kind {
 	case .Number, .Integer:
 		return WASM_F64
-	case .Bool, .String, .Struct, .Array, .Enum, .Map:
+	case .Bool, .String, .Struct, .Array, .Enum, .Map, .Error, .Tuple:
 		return WASM_I32
 	case:
 		panic(
@@ -91,7 +91,7 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 is_wasm_phase1_type :: proc(t: ^Type) -> bool {
 	if t == nil do return false
 	#partial switch prune_type(t).kind {
-	case .Number, .Integer, .Bool, .Void, .String, .Struct, .Array, .Enum, .Map:
+	case .Number, .Integer, .Bool, .Void, .String, .Struct, .Array, .Enum, .Map, .Error, .Tuple:
 		return true
 	case:
 		return false
@@ -192,7 +192,8 @@ PW_STRING_TO_NUMBER :: 60
 PW_STRING_TRIM :: 61
 PW_STRING_SPLIT :: 62
 PW_STRING_JOIN :: 63
-PW_IMPORT_COUNT :: 64
+PW_MAP_ENTRIES :: 64
+PW_IMPORT_COUNT :: 65
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -260,6 +261,7 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_string_trim", {WASM_I32}, {WASM_I32}},
 	{"pw_string_split", {WASM_I32, WASM_I32}, {WASM_I32}},
 	{"pw_string_join", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_map_entries", {WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")

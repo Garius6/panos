@@ -280,6 +280,20 @@ test_wasm_module_lowers_number_string_conversion_without_panic :: proc(t: ^testi
 	testing.expectf(t, len(bytes) > 8, "модуль пуст")
 }
 
+@(test)
+test_wasm_module_lowers_split_join_trim_without_panic :: proc(t: ^testing.T) {
+	bytes := lower_wasm_from_source(t, `
+		импорт строки
+		функ старт() -> Булево
+			пер части = строки.разбить("a,b,c", ",")
+			пер собрано = строки.соединить(части, ",")
+			пер обрезано = строки.обрезать("  привет  ")
+			части.длина() == 3 и собрано == собрано и обрезано == обрезано
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
 // Намеренно нет теста "паникует на interface/closures/actors вне
 // области": Odin's panic() — фатальный abort процесса (нет
 // recover/unwind), проверка такого пути уронила бы весь тестовый бинарь

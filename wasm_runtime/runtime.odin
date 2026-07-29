@@ -1375,3 +1375,173 @@ pw_string_to_number :: proc "contextless" (handle: i32) -> i32 {
 	pw_set_field_i32(result, 0, err)
 	return result
 }
+
+// --- Фаза 2.11: строки::разбить / соединить / обрезать -------------------
+
+@(private)
+alloc_arena_range :: proc "contextless" (src_off: i32, length: i32) -> i32 {
+	if next_free + length > ARENA_SIZE || obj_count >= MAX_OBJECTS || length < 0 {
+		return -1
+	}
+	off := next_free
+	for i in i32(0) ..< length {
+		arena[off + i] = arena[src_off + i]
+	}
+	next_free += length
+
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = length
+	obj_capacity[id] = length
+	obj_count += 1
+	return id
+}
+
+// pw_string_trim — строки::обрезать (strings.trim_space = unicode.is_space
+// с обеих сторон). ОДИН проход вперёд (utf8_decode_at, Фаза 2.8) вместо
+// раздельных trim_left/trim_right: start_byte фиксируется на первой не-
+// пробельной руне, end_byte двигается на каждой не-пробельной руне —
+// после прохода готовы обе границы, обратное UTF-8-декодирование не
+// нужно. unicode.is_space's нелатинская ветка идёт через space_ranges[:]
+// (core/unicode/tables.odin:469) — плоский массив-литерал, срезаемый
+// прямо на месте вызова, та же безопасная категория, что to_lower_ranges
+// у core:unicode (Фаза 2.9's диагностика) — __$startup_runtime не нужен.
+@(export)
+pw_string_trim :: proc "contextless" (handle: i32) -> i32 {
+	context = runtime.default_context()
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	start_byte: i32 = -1
+	end_byte: i32 = 0
+	i: i32 = 0
+	for i < length {
+		cp, width := utf8_decode_at(off + i)
+		if !unicode.is_space(rune(cp)) {
+			if start_byte == -1 do start_byte = i
+			end_byte = i + width
+		}
+		i += width
+	}
+	if start_byte == -1 do return alloc_arena_range(off, 0)
+	return alloc_arena_range(off + start_byte, end_byte - start_byte)
+}
+
+// pw_string_split — строки::разбить. Массив строится через
+// pw_alloc_aggregate (та же арена-раскладка, что New_Array_Instr, Фаза
+// 2.1), слоты — i32-хендлы (Строка на этом бэкенде всегда i32).
+// core:strings.split's РАЗВИЛКА (core/strings/strings.odin:822-837,
+// проверено чтением исходника, не по памяти): пустой sep разбивает на
+// ОТДЕЛЬНЫЕ РУНЫ, непустой — байтовый substring-поиск, count(s,sep)+1
+// сегментов. Substring-скан — та же схема, что уже проверенные
+// pw_string_contains/pw_string_replace_all (не новый алгоритм).
+@(export)
+pw_string_split :: proc "contextless" (text: i32, sep: i32) -> i32 {
+	context = runtime.default_context()
+	t_off, t_len := obj_offsets[text], obj_sizes[text]
+	s_off, s_len := obj_offsets[sep], obj_sizes[sep]
+
+	matches_at :: proc "contextless" (t_off, i, s_off, s_len: i32) -> bool {
+		for j in i32(0) ..< s_len {
+			if arena[t_off + i + j] != arena[s_off + j] do return false
+		}
+		return true
+	}
+
+	if s_len == 0 {
+		count: i32 = 0
+		i: i32 = 0
+		for i < t_len {
+			_, width := utf8_decode_at(t_off + i)
+			i += width
+			count += 1
+		}
+		arr := pw_alloc_aggregate(count)
+		idx: i32 = 0
+		i = 0
+		for i < t_len {
+			_, width := utf8_decode_at(t_off + i)
+			seg := alloc_arena_range(t_off + i, width)
+			pw_set_field_i32(arr, idx, seg)
+			i += width
+			idx += 1
+		}
+		return arr
+	}
+
+	match_count: i32 = 0
+	i := i32(0)
+	for i <= t_len - s_len {
+		if matches_at(t_off, i, s_off, s_len) {
+			match_count += 1
+			i += s_len
+		} else {
+			i += 1
+		}
+	}
+
+	arr := pw_alloc_aggregate(match_count + 1)
+	idx: i32 = 0
+	seg_start := i32(0)
+	i = 0
+	for i <= t_len - s_len {
+		if matches_at(t_off, i, s_off, s_len) {
+			seg := alloc_arena_range(t_off + seg_start, i - seg_start)
+			pw_set_field_i32(arr, idx, seg)
+			idx += 1
+			i += s_len
+			seg_start = i
+		} else {
+			i += 1
+		}
+	}
+	last_seg := alloc_arena_range(t_off + seg_start, t_len - seg_start)
+	pw_set_field_i32(arr, idx, last_seg)
+	return arr
+}
+
+// pw_string_join — строки::соединить. Длина результата известна ПОСЛЕ
+// первого прохода (сумма длин элементов + разделитель между ними) —
+// одна аллокация, второй проход пишет байты напрямую, БЕЗ повторных
+// pw_concat_strings-вызовов (та же дисциплина, что построение сообщения
+// об ошибке в Фазе 2.10). Массив читается тем же obj_sizes[handle]/
+// FIELD_SIZE-соглашением, что любой другой Массив-builtin.
+@(export)
+pw_string_join :: proc "contextless" (arr: i32, sep: i32) -> i32 {
+	context = runtime.default_context()
+	count := obj_sizes[arr] / FIELD_SIZE
+	s_off, s_len := obj_offsets[sep], obj_sizes[sep]
+
+	total: i32 = 0
+	for i in i32(0) ..< count {
+		el := pw_get_field_i32(arr, i)
+		total += obj_sizes[el]
+	}
+	if count > 1 do total += s_len * (count - 1)
+
+	if next_free + total > ARENA_SIZE || obj_count >= MAX_OBJECTS {
+		return -1
+	}
+	off := next_free
+	write_pos := off
+	for i in i32(0) ..< count {
+		el := pw_get_field_i32(arr, i)
+		el_off, el_len := obj_offsets[el], obj_sizes[el]
+		for j in i32(0) ..< el_len {
+			arena[write_pos] = arena[el_off + j]
+			write_pos += 1
+		}
+		if i < count - 1 {
+			for j in i32(0) ..< s_len {
+				arena[write_pos] = arena[s_off + j]
+				write_pos += 1
+			}
+		}
+	}
+	next_free += total
+
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = total
+	obj_capacity[id] = total
+	obj_count += 1
+	return id
+}

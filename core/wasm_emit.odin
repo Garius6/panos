@@ -1035,6 +1035,17 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 			append(code, 0x10)
 			write_uleb128(code, u64(PW_STRING_TO_NUMBER))
 
+		// --- Фаза 2.11: строки::разбить / соединить / обрезать -------------
+		case "строки::обрезать":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_TRIM))
+		case "строки::разбить":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_SPLIT))
+		case "строки::соединить":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_JOIN))
+
 		case "длина":
 			// Фаза 2.8: свободный длина(x) — полиморфен по РАСПОЗНАННОМУ
 			// СТАТИЧЕСКИ типу x (Строка/Массив/Соответствие, core/vm.

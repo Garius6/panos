@@ -9,7 +9,7 @@ import "core:strings"
 // встреченную на call site'ах (ctx.generic_call_instantiations,
 // заполняется infer_bounded_generic_call), и каждый клон проходит
 // ПОЛНОСТЬЮ обычный resolve→typecheck→lower (см. mir_monomorphize.
-// odin's lower_monomorphize_one) — ни один из этих трёх пайплайнов не
+// odin's lower_monomorphize_program) — ни один из этих трёх пайплайнов не
 // знает о bounded traits вообще, клон с T, зарезолвленным в конкретный
 // тип, неотличим от обычной non-generic функции.
 

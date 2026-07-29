@@ -985,6 +985,20 @@ Type_Ctx :: struct {
 	// сюда до завершения — цикл, репортим Type Error вместо бесконечной
 	// рекурсии.
 	resolving_aliases:           map[Symbol_Id]bool,
+	// Method_Struct вызов (см. call_infos) на приёмнике, чей ТИП —
+	// инстанциация generic структуры/перечисления (Опция(Число) и т.п.,
+	// receiver_type.generic_origin != INVALID_SYMBOL): конкретные типы,
+	// подставляемые вместо T владеющего типа (НЕ метода — у Опция.есть()/
+	// получить() нет собственного [T], T достаётся от `тип Опция[T]`, см.
+	// mir_monomorphize.odin's lower_monomorphize_program). Отдельная от
+	// generic_call_instantiations карта: разный источник конкретных типов
+	// (тип приёмника, не Function_Decl.type_params) и разный consumer.
+	generic_method_instantiations: map[Expr][dynamic]^Type,
+	// owner_sym (= receiver_type.generic_origin) для каждый ключ выше —
+	// нужен отдельно от call_infos[expr].symbol_ref (это method_sym, а
+	// T-имена для subst объявлены на владеющей структуре/перечислении,
+	// не на методе).
+	generic_method_owner_sym:      map[Expr]Symbol_Id,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -1007,6 +1021,8 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		checked_bodies = make(map[Symbol_Id]bool),
 		generic_call_instantiations = make(map[Expr][dynamic]^Type),
 		generic_call_callee_sym = make(map[Expr]Symbol_Id),
+		generic_method_instantiations = make(map[Expr][dynamic]^Type),
+		generic_method_owner_sym = make(map[Expr]Symbol_Id),
 		let_destructure_field_indices = make(map[Stmt][dynamic]int),
 		resolving_aliases = make(map[Symbol_Id]bool),
 	}
@@ -1444,6 +1460,87 @@ collect_instance_args :: proc(instance: ^Type, out: ^[dynamic]^Type) {
 			for f in v.fields do append(out, prune_type(f))
 		}
 	}
+}
+
+// record_generic_method_instantiation — Method_Struct вызов на приёмнике,
+// чей ВЛАДЕЮЩИЙ ТИП сам объявлен generic (Опция[T]/Результат[T,E] и
+// т.п.): запоминает конкретные типы владеющего типа (НЕ метода — см.
+// Type_Ctx.generic_method_instantiations) для последующей монофирмизации
+// тела метода (mir_monomorphize.odin's lower_monomorphize_method_one).
+//
+// ВАЖНО: receiver_type.generic_origin != INVALID_SYMBOL — НЕ признак
+// "это инстанциация generic-типа": typecheck_pass_nominal выставляет
+// struct_type.generic_origin = sym БЕЗУСЛОВНО, для ЛЮБОЙ структуры
+// (generic или нет — сам механизм method_lookup читает через него,
+// см. её докстринг), в отличие от Interface_Decl, где generic_origin
+// ставится ТОЛЬКО при len(d.type_params)>0. Без явной проверки
+// "владелец реально объявлен с [T]" ЛЮБОЙ вызов метода на ОБЫЧНОЙ,
+// не-generic структуре (Коробка без [T]) тоже проходил бы сюда:
+// collect_instance_args тогда собрал бы её ОБЫЧНЫЕ типы полей как
+// "concrete_types" (бессмысленно), а owner_type_params (ниже) —
+// пустой, subst — пустой, T метода (если у НЕГО СОБСТВЕННОЕ [T], см.
+// test_method_own_type_param) остаётся неразрешённым — "неизвестный
+// тип 'T'". Найдено эмпирически (`just test` — 15 упавших тестов,
+// не гипотеза), не только по чтению кода.
+record_generic_method_instantiation :: proc(ctx: ^Type_Ctx, expr: Expr, method_sym: Symbol_Id, receiver_type: ^Type) {
+	if receiver_type.generic_origin == INVALID_SYMBOL do return
+	owner_sym := receiver_type.generic_origin
+	owner_type_params: [dynamic]string
+	#partial switch owner_decl in symbol_at(ctx.res.symbol_store, owner_sym).decl {
+	case ^Struct_Decl:
+		owner_type_params = owner_decl.type_params
+	case ^Enum_Decl:
+		owner_type_params = owner_decl.type_params
+	}
+	if len(owner_type_params) == 0 do return
+
+	// Метод с СОБСТВЕННЫМ [T] (см. test_method_own_type_param,
+	// Опция.результат_или[E]) поверх generic-владельца — вне области
+	// этого механизма (subst ниже покрывает ТОЛЬКО T владельца, не T
+	// метода) — оставляем прежнему (symbol_to_function) пути, как для
+	// не-generic владельца. Реальный случай в самой прелюдии
+	// (заменить_значение[U]) — не покрыт этой сессией, задокументировано
+	// в плане как future work.
+	if fn_decl, has_decl := symbol_at(ctx.res.symbol_store, method_sym).decl.(^Function_Decl);
+	   has_decl && len(fn_decl.type_params) > 0 {
+		return
+	}
+
+	// Абстрактный проход тела generic-декларации (см. ctx.in_abstract_
+	// generic_body — тот же флаг, что infer_bounded_generic_call уже
+	// проверяет для generic_call_instantiations): "это.есть()" ВНУТРИ
+	// САМОЙ прелюдии (core/prelude.odin's "пусто"/"ошибка", см.
+	// PRELUDE_SOURCE) типизируется с T ещё абстрактным (свежий InferVar
+	// от instantiate_scheme, не настоящая конкретная инстанциация) —
+	// без этой проверки concrete_types содержал бы InferVar, ключ
+	// никогда не совпал бы с реальным (конкретным) call site'ом.
+	// Дополнительно — прямая проверка каждого элемента на .InferVar, а
+	// не только флаг: не полагаться на то, что флаг покрывает вообще
+	// все пути, которыми сюда можно попасть.
+	if ctx.in_abstract_generic_body do return
+	concrete_types := make([dynamic]^Type)
+	collect_instance_args(receiver_type, &concrete_types)
+	if len(concrete_types) == 0 do return
+	for t in concrete_types {
+		pruned := prune_type(t)
+		if pruned.kind == .InferVar do return
+		// Известный, узкий пробел — НЕ покрыт этой сессией, найден
+		// эмпирически (test_qualified_impl_supervisor_restarts_then_
+		// gives_up и соседние supervisor-тесты: Опция(Процесс(Задача)) —
+		// значение()-клон падает "'это' используется до инициализации"
+		// внутри check_function_body, корень не найден — что-то в
+		// резолве receiver-параметра метода отличается специфически для
+		// Процесс(T) как T-аргумента, не воспроизводится для Число/
+		// Строка/Struct/Enum-аргументов (json/toml тесты с той же формой
+		// .значение() проходят чисто). Не гадаем дальше — откатываемся к
+		// прежнему (symbol_to_function, немономорфизированный шаблон)
+		// пути, как было ДО Фазы 2.3, тот же принцип, что и остальные
+		// явно задокументированные гэпы этой сессии (не молча отгружать
+		// сломанное).
+		if pruned.kind == .Process do return
+	}
+	ctx.generic_method_instantiations[expr] = concrete_types
+	ctx.generic_method_owner_sym[expr] = owner_sym
 }
 
 // Унификация — СИММЕТРИЧНАЯ проверка совместимости: unify_types(a, b) ==
@@ -4650,6 +4747,7 @@ infer_arithmetic_sugar :: proc(
 	}
 	method_sym, _ := method_lookup(ctx, left_t, method_name)
 	ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
+	record_generic_method_instantiation(ctx, expr, method_sym, left_t)
 	return left_t
 }
 
@@ -4876,6 +4974,7 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 			if unify_types(left_t, right_t) {
 				method_sym, _ := method_lookup(ctx, left_t, "сравнить")
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
+				record_generic_method_instantiation(ctx, expr, method_sym, left_t)
 				t = TY_BOOL
 			} else {
 				// Grilled: left_t реализует Сравниваемое, но не с ЭТИМ
@@ -4918,6 +5017,7 @@ infer_binary_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Binary_Expr) -> ^Type 
 		   unify_types(left_t, right_t) {
 			method_sym, _ := method_lookup(ctx, left_t, "равно")
 			ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
+			record_generic_method_instantiation(ctx, expr, method_sym, left_t)
 			t = TY_BOOL
 		} else {
 			// Равнозначное — opt-in override (см. Стадия 22): без impl'а
@@ -5716,6 +5816,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				for arg, i in e.args do check_expr(ctx, arg, method_type.params[i + 1])
 
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
+				record_generic_method_instantiation(ctx, expr, method_sym, obj_type)
 				return prune_type(method_type.return_type)
 			}
 		} else if obj_type.kind == .Enum {
@@ -5757,6 +5858,7 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 				for arg, i in e.args do check_expr(ctx, arg, method_type.params[i + 1])
 
 				ctx.call_infos[expr] = Call_Info{kind = .Method_Struct, symbol_ref = method_sym}
+				record_generic_method_instantiation(ctx, expr, method_sym, obj_type)
 				return prune_type(method_type.return_type)
 			}
 		} else if obj_type.kind == .Interface {

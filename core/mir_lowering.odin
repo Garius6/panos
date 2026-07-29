@@ -193,7 +193,7 @@ function_return_type :: proc(res: ^Resolver_Ctx, sym: Symbol_Id) -> ^Type {
 	return func_type.return_type
 }
 
-// НЕ private = "file" — lower_monomorphize_one (mir_monomorphize.odin)
+// НЕ private = "file" — lower_monomorphize_program (mir_monomorphize.odin)
 // переиспользует эту же функцию для тел мономорфизированных клонов
 // (тот же приём, что lower_module делает для обычных top-level функций,
 // клон неотличим от обычной функции к этому моменту).
@@ -1153,9 +1153,29 @@ lower_call_expr_inner :: proc(
 			return dst, .Continues
 
 		case .Method_Struct:
-			fn_id, found := ctx.symbol_to_function[info.symbol_ref]
-			if !found {
-				lower_unsupported("метод не найден в symbol_to_function")
+			fn_id: Function_Id
+			found: bool
+			// Фаза 2.3: приёмник — конкретная инстанциация generic-типа
+			// (Опция(Число) и т.п., см. record_generic_method_instantiation) —
+			// symbol_to_function[info.symbol_ref] указывает на ОБЩИЙ,
+			// немономорфизированный шаблон метода (T абстрактен), непригодный
+			// для wasm-бэкенда (нужен статический f64/i32-тип). Та же схема
+			// проверки, что generic_call_instantiations выше — если ключ есть,
+			// используем предварительно смонофирмизированный клон
+			// (lower_monomorphize_program уже зарегистрировал его в
+			// module.generic_instantiations ДО этой точки), иначе — прежний
+			// путь (обычная не-generic структура).
+			if concrete_types, ok := ctx.tc.generic_method_instantiations[expr]; ok {
+				key := build_instantiation_key(ctx.res.symbol_store, info.symbol_ref, concrete_types)
+				fn_id, found = ctx.module.generic_instantiations[key]
+				if !found {
+					lower_unsupported("инстанциация generic-метода не найдена")
+				}
+			} else {
+				fn_id, found = ctx.symbol_to_function[info.symbol_ref]
+				if !found {
+					lower_unsupported("метод не найден в symbol_to_function")
+				}
 			}
 			fn_ref := emit_fn_ref(ctx, fn_id, nil)
 			prop_expr := e.callee.(^Property_Expr)

@@ -177,6 +177,21 @@ test_wasm_module_lowers_enum_match_without_panic :: proc(t: ^testing.T) {
 	testing.expectf(t, len(bytes) > 8, "модуль пуст")
 }
 
+@(test)
+test_wasm_module_lowers_array_method_call_without_panic :: proc(t: ^testing.T) {
+	bytes := lower_wasm_from_source(t, `
+		функ старт() -> Число
+			пер значения = массив(1, 2, 3)
+			пер часть = значения.срез(0, 1)
+			если значения.есть(0) и значения.содержит(2) и часть.длина() == 1 тогда
+				возврат значения.получить(0, -1)
+			конец
+			0
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
 // Намеренно нет теста "паникует на interface/closures/actors/Соответствие
 // вне области Фазы 2.1": Odin's panic() — фатальный abort процесса (нет
 // recover/unwind), проверка такого пути уронила бы весь тестовый бинарь

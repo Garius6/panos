@@ -688,4 +688,144 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		`)
 	}
 
+	// Фаза 2.2, Шаг 0: обычный .метод()-синтаксис (не голый `выбор`) для
+	// НЕ-generic структуры — типизируется как Method_Struct (call_infos
+	// kind == .Method_Struct, см. type_cheker.odin ~5721), лоурится в
+	// Function_Ref_Instr+Call_Value_Instr (Фаза 1) — уже работает без
+	// изменений в wasm_emit.odin/wasm_module.odin/wasm_runtime.
+	//
+	// ВАЖНО: Опция/Результат-методы (.есть()/.получить()/...) через тот же
+	// Method_Struct-путь НЕ работают — найден реальный, отдельный от этого
+	// плана баг в core/mir_lowering.odin: Method_Struct-ветка резолвит fn_id
+	// только через symbol_to_function[info.symbol_ref] (СЫРОЙ generic-
+	// шаблон), не проверяя tc.generic_call_instantiations[expr] на
+	// monomorphized-клон — в отличие от обычных generic-вызовов функций
+	// (mir_lowering.odin:1085-1088), где эта проверка есть. В байткоде
+	// незаметно (Value — рантайм-типизированный union, один шаблонный body
+	// работает для любой инстанциации), в wasm фатально (нужен статический
+	// f64/i32 тип функции) — resolve_func_index паникует "вне области Фазы
+	// 1". Не тестируется здесь (паника валит весь процесс — см. комментарий
+	// внизу core/wasm_backend_test.odin про то же ограничение), задокументи-
+	// ровано в project-памяти, чинится отдельной сессией, не блокирует
+	// Массив-only Call_Method_Instr ниже (Method_Collection у Массива не
+	// проходит через symbol_to_function вообще).
+
+	@(test)
+	test_wasm_diff_struct_method_call :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			тип Точка = структура
+				x: Число
+				y: Число
+			конец
+			реализация Точка
+				функ сумма(это: Точка) -> Число
+					это.x + это.y
+				конец
+			конец
+			функ старт() -> Число
+				пер p = Точка(3, 4)
+				p.сумма()
+			конец
+		`)
+	}
+
+	// Фаза 2.2: настоящий Call_Method_Instr — Массив.длина/получить/есть/
+	// содержит/срез (Method_Collection, type_cheker.odin:5594-5626).
+	// добавить намеренно не покрыт (мутирующий рост — вне области, см.
+	// план). f64- и Булево-элементные фикстуры оба — упражняют
+	// PW_ARRAY_GET_F64/PW_ARRAY_CONTAINS_F64 и их _I32-пары (см.
+	// wasm_field_is_i32 в wasm_emit.odin).
+
+	@(test)
+	test_wasm_diff_array_length :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Целое
+				массив(10, 20, 30).длина()
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_array_get_with_fallback :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер значения = массив(10, 20, 30)
+				значения.получить(1, -1)
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер значения = массив(10, 20, 30)
+				значения.получить(5, -1)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_array_get_bool_elements :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				пер флаги = массив(истина, ложь, истина)
+				флаги.получить(1, истина)
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				пер флаги = массив(истина, ложь, истина)
+				флаги.получить(9, ложь)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_array_has_index :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				массив(1, 2, 3).есть(1)
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				массив(1, 2, 3).есть(9)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_array_contains :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				массив(1, 2, 3).содержит(2)
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				массив(1, 2, 3).содержит(9)
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				массив(истина, ложь).содержит(ложь)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_array_slice :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Целое
+				пер значения = массив(10, 20, 30, 40)
+				пер часть = значения.срез(1, 3)
+				часть.длина()
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер значения = массив(10, 20, 30, 40)
+				пер часть = значения.срез(1, 3)
+				часть[0] + часть[1]
+			конец
+		`)
+	}
+
 }

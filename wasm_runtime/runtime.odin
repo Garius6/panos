@@ -225,6 +225,89 @@ pw_get_field_i32 :: proc "contextless" (handle: i32, index: i32) -> i32 {
 	return i32(u32(bits))
 }
 
+// --- Фаза 2.2: Массив.длина/получить/есть/содержит/срез ----------------
+//
+// Массив — тот же field_count*FIELD_SIZE арена-объект, что и структуры
+// (см. New_Array_Instr в core/wasm_emit.odin, переиспользует
+// pw_alloc_aggregate) — obj_sizes[handle]/FIELD_SIZE = число элементов.
+// Ветвление (bounds-check, fallback) сделано ЗДЕСЬ, в обычном Odin, а не
+// синтезом новых WASM-блоков на месте вызова (core/wasm_stackify.odin
+// фиксирует границы блоков ДО того, как core/wasm_emit.odin эмитит
+// инструкции внутри блока — вставка нового ветвления посередине блока
+// архитектурно не укладывается в эту схему, а здесь branching бесплатен).
+
+@(export)
+pw_array_length :: proc "contextless" (handle: i32) -> i32 {
+	return obj_sizes[handle] / FIELD_SIZE
+}
+
+@(export)
+pw_array_in_bounds :: proc "contextless" (handle: i32, index: i32) -> i32 {
+	count := obj_sizes[handle] / FIELD_SIZE
+	return (index >= 0 && index < count) ? 1 : 0
+}
+
+@(export)
+pw_array_get_f64 :: proc "contextless" (handle: i32, index: i32, fallback: f64) -> f64 {
+	count := obj_sizes[handle] / FIELD_SIZE
+	if index < 0 || index >= count do return fallback
+	bits := unpack_u64_le(obj_offsets[handle] + index * FIELD_SIZE)
+	return transmute(f64)bits
+}
+
+@(export)
+pw_array_get_i32 :: proc "contextless" (handle: i32, index: i32, fallback: i32) -> i32 {
+	count := obj_sizes[handle] / FIELD_SIZE
+	if index < 0 || index >= count do return fallback
+	bits := unpack_u64_le(obj_offsets[handle] + index * FIELD_SIZE)
+	return i32(u32(bits))
+}
+
+@(export)
+pw_array_contains_f64 :: proc "contextless" (handle: i32, needle: f64) -> i32 {
+	count := obj_sizes[handle] / FIELD_SIZE
+	needle_bits := transmute(u64)needle
+	for i in i32(0) ..< count {
+		if unpack_u64_le(obj_offsets[handle] + i * FIELD_SIZE) == needle_bits do return 1
+	}
+	return 0
+}
+
+@(export)
+pw_array_contains_i32 :: proc "contextless" (handle: i32, needle: i32) -> i32 {
+	count := obj_sizes[handle] / FIELD_SIZE
+	needle_bits := u64(u32(needle))
+	for i in i32(0) ..< count {
+		if unpack_u64_le(obj_offsets[handle] + i * FIELD_SIZE) == needle_bits do return 1
+	}
+	return 0
+}
+
+// pw_array_slice — новый объект, побайтовая (не f64/i32-осведомлённая)
+// копия исходных 8-байтных слотов [start, end) — та же логика, что
+// pw_concat_strings's byte-copy, срезу не нужно интерпретировать
+// содержимое слотов, только переместить его.
+@(export)
+pw_array_slice :: proc "contextless" (handle: i32, start: i32, end: i32) -> i32 {
+	if start < 0 || end < start do return -1
+	count := (end - start) * FIELD_SIZE
+	if next_free + count > ARENA_SIZE || obj_count >= MAX_OBJECTS {
+		return -1
+	}
+	src_off := obj_offsets[handle] + start * FIELD_SIZE
+	off := next_free
+	for i in i32(0) ..< count {
+		arena[off + i] = arena[src_off + i]
+	}
+	next_free += count
+
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = count
+	obj_count += 1
+	return id
+}
+
 // --- Фаза 2.0: ввод_вывод::печать ------------------------------------
 //
 // Единственный builtin, поддержанный на этом срезе (см. план) — прямой

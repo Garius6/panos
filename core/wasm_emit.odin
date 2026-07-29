@@ -468,6 +468,67 @@ emit_set_index :: proc(ectx: ^Emit_Ctx, v: ^Set_Index_Instr) {
 	write_uleb128(code, u64(is_i32 ? PW_SET_FIELD_I32 : PW_SET_FIELD_F64))
 }
 
+// emit_array_method_call — Фаза 2.2: Call_Method_Instr на Массив
+// (Method_Collection, type_cheker.odin — длина/получить/есть/содержит/
+// срез, 5 не-мутирующих методов; добавить вне области — arena не
+// поддерживает рост объекта на месте, см. план). receiver затем args
+// уже на стеке в естественном MIR-порядке (instr_refs: [receiver,
+// args...]), но КАЖДЫЙ индексный аргумент (idx у есть/получить,
+// start/end у срез) — Целое, т.е. f64 на этом бэкенде (Фаза 1: Число/
+// Целое не различаются рантайм-представлением) — pw_array_* принимают
+// его как i32 (байтовая арифметика внутри wasm_runtime), нужен
+// i32.trunc_f64_s. Если индекс — не верх стека (получить/срез), тот же
+// приём, что emit_set_index/emit_set_property: снять верхние операнды в
+// scratch-локаль, сконвертировать, вернуть на место.
+@(private = "file")
+emit_array_method_call :: proc(ectx: ^Emit_Ctx, v: ^Call_Method_Instr) {
+	code := &ectx.code
+	switch v.name {
+	case "длина":
+		append(code, 0x10)
+		write_uleb128(code, u64(PW_ARRAY_LENGTH))
+		append(code, 0xB7) // f64.convert_i32_s — длина() -> Целое
+	case "есть":
+		// [receiver, idx] — idx уже верх стека.
+		append(code, 0xAA) // i32.trunc_f64_s
+		append(code, 0x10)
+		write_uleb128(code, u64(PW_ARRAY_IN_BOUNDS))
+	case "получить":
+		// [receiver, idx, fallback] — fallback сверху, idx под ним.
+		is_i32 := wasm_field_is_i32(value_kind(ectx, v.args[1]))
+		local := is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
+		append(code, 0x21) // local.set fallback (снимает верх стека)
+		write_uleb128(code, u64(local))
+		append(code, 0xAA) // i32.trunc_f64_s (idx — теперь верх)
+		append(code, 0x20) // local.get fallback
+		write_uleb128(code, u64(local))
+		getter := is_i32 ? PW_ARRAY_GET_I32 : PW_ARRAY_GET_F64
+		append(code, 0x10)
+		write_uleb128(code, u64(getter))
+	case "содержит":
+		// [receiver, needle] — needle остаётся как есть (не индекс, само
+		// значение — f64 или i32 в зависимости от типа элемента).
+		checker := wasm_field_is_i32(value_kind(ectx, v.args[0])) ? PW_ARRAY_CONTAINS_I32 : PW_ARRAY_CONTAINS_F64
+		append(code, 0x10)
+		write_uleb128(code, u64(checker))
+	case "срез":
+		// [receiver, start, end] — end сверху, ОБА нужно конвертировать в
+		// i32: конвертируем end на месте, снимаем в i32-scratch,
+		// конвертируем start (теперь верх), возвращаем end.
+		end_local := alloc_i32_scratch(ectx)
+		append(code, 0xAA) // i32.trunc_f64_s (end)
+		append(code, 0x21) // local.set end
+		write_uleb128(code, u64(end_local))
+		append(code, 0xAA) // i32.trunc_f64_s (start — теперь верх)
+		append(code, 0x20) // local.get end
+		write_uleb128(code, u64(end_local))
+		append(code, 0x10)
+		write_uleb128(code, u64(PW_ARRAY_SLICE))
+	case:
+		panic(fmt.tprintf("wasm backend Фаза 2.2: метод '%s' вне области (см. план)", v.name))
+	}
+}
+
 @(private = "file")
 resolve_func_index :: proc(ectx: ^Emit_Ctx, fn: Function_Id) -> int {
 	idx, ok := ectx.func_index^[fn]
@@ -664,9 +725,11 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 			panic(fmt.tprintf("wasm backend Фаза 2.0: builtin '%s' вне области (см. план)", v.name))
 		}
 
+	case ^Call_Method_Instr:
+		emit_array_method_call(ectx, v)
+
 	case ^Copy_Instr,
 	     ^Load_Captured_Instr,
-	     ^Call_Method_Instr,
 	     ^Call_Async_Instr,
 	     ^Call_Foreign_Instr,
 	     ^New_Map_Instr,

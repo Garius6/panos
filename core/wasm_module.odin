@@ -149,7 +149,14 @@ PW_MONOTONIC_MS :: 17
 PW_NOW_MS :: 18
 PW_BUILD_VARIANT :: 19
 PW_MATCH_TAG :: 20
-PW_IMPORT_COUNT :: 21
+PW_ARRAY_LENGTH :: 21
+PW_ARRAY_IN_BOUNDS :: 22
+PW_ARRAY_GET_F64 :: 23
+PW_ARRAY_GET_I32 :: 24
+PW_ARRAY_CONTAINS_F64 :: 25
+PW_ARRAY_CONTAINS_I32 :: 26
+PW_ARRAY_SLICE :: 27
+PW_IMPORT_COUNT :: 28
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -174,6 +181,13 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_now_ms", {}, {WASM_F64}},
 	{"pw_build_variant", {WASM_I32, WASM_I32}, {WASM_I32}},
 	{"pw_match_tag", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_array_length", {WASM_I32}, {WASM_I32}},
+	{"pw_array_in_bounds", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_array_get_f64", {WASM_I32, WASM_I32, WASM_F64}, {WASM_F64}},
+	{"pw_array_get_i32", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_array_contains_f64", {WASM_I32, WASM_F64}, {WASM_I32}},
+	{"pw_array_contains_i32", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_array_slice", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")

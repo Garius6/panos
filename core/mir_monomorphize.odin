@@ -149,10 +149,37 @@ monomorphize_register_method_one :: proc(
 		if i >= len(concrete_types) do break
 		subst[name] = concrete_types[i]
 	}
+
+	// Фаза 2.5: голая ссылка "это: Опция" (без явных type-аргументов)
+	// внутри клона резолвится через resolve_type_node's Type_Ident case
+	// в отдельную (не эту, string-keyed) infer_id-keyed карту — см. её
+	// докстринг про то, почему НЕ через ctx.decl_type_params[owner_sym]
+	// (per-Type_Ctx, у прелюдийных Опция/Результат живёт в ЧУЖОМ
+	// tc_ctx, найдено эмпирически). Placeholder'ы (T-InferVar'ы) берём
+	// СТРУКТУРНЫМ обходом СЫРОГО (неинстанцированного) шаблона —
+	// collect_instance_args уже так же используется в record_generic_
+	// method_instantiation на РЕАЛЬНОМ instance'е (собирает конкретные
+	// типы); здесь тот же обход на АБСТРАКТНОМ шаблоне просто вернёт
+	// сырые InferVar'ы вместо конкретных типов — тот же порядковый
+	// walk, та же уже принятая позиционная оговорка (см. её докстринг).
+	receiver_placeholders := make([dynamic]^Type)
+	collect_instance_args(res.symbol_types[owner_sym], &receiver_placeholders)
+	receiver_subst := make(map[int]^Type)
+	for placeholder, i in receiver_placeholders {
+		if i >= len(concrete_types) do break
+		if pruned := prune_type(placeholder); pruned.kind == .InferVar {
+			receiver_subst[pruned.infer_id] = concrete_types[i]
+		}
+	}
+
 	prev_params := tc.current_type_params
 	prev_res := tc.res
+	prev_owner_sym := tc.current_receiver_owner_sym
+	prev_receiver_subst := tc.current_receiver_subst
 	tc.current_type_params = subst
 	tc.res = decl_res
+	tc.current_receiver_owner_sym = owner_sym
+	tc.current_receiver_subst = receiver_subst
 
 	func_type := function_type_from_decl(tc, clone)
 	bind_function_args(tc, clone, func_type)
@@ -160,6 +187,8 @@ monomorphize_register_method_one :: proc(
 
 	tc.current_type_params = prev_params
 	tc.res = prev_res
+	tc.current_receiver_owner_sym = prev_owner_sym
+	tc.current_receiver_subst = prev_receiver_subst
 
 	fn_id := new_function(module, key, INVALID_SYMBOL, func_type.return_type, clone.span)
 	module.generic_instantiations[key] = fn_id

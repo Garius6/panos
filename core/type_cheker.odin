@@ -999,6 +999,30 @@ Type_Ctx :: struct {
 	// T-имена для subst объявлены на владеющей структуре/перечислении,
 	// не на методе).
 	generic_method_owner_sym:      map[Expr]Symbol_Id,
+	// Фаза 2.5: во время typecheck клона метода generic-типа (см.
+	// mir_monomorphize.odin's monomorphize_register_method_one) —
+	// Symbol_Id владеющего типа (Опция и т.п.), ЧЬЁ имя приёмник-
+	// параметр ("это: Опция", ВСЕГДА голое, без явных type-аргументов)
+	// резолвит через resolve_type_node. INVALID_SYMBOL вне такого
+	// клона. Точное совпадение Symbol_Id (не имя параметра) — сознательно:
+	// current_type_params активен и для АБСТРАКТНЫХ generic-функций
+	// (Фаза 3, bounded traits), не имеющих отношения к владеющему типу
+	// метода — совпадение по имени ("T" совпало бы случайно) рисковало
+	// бы подставить ЧУЖОЙ T туда, где current_receiver_owner_sym явно
+	// говорит "это не тот контекст".
+	current_receiver_owner_sym:   Symbol_Id,
+	//
+	// НЕ используем ctx.decl_type_params[sym] здесь — та карта per-
+	// Type_Ctx (заполняется typecheck_pass_nominal ТОЛЬКО в Type_Ctx,
+	// где Опция/Результат САМИ типизируются, т.е. в res.prelude_tc_ctx,
+	// НЕ в вызывающего-модуля tc — найдено эмпирически, "DEBUG no
+	// decl_params for sym", не по чтению кода) — mir_monomorphize.odin's
+	// monomorphize_register_method_one уже сталкивалась с этим для
+	// owner_type_params (идёт через AST decl напрямую, не decl_
+	// type_params) — current_receiver_subst строится ТАМ ЖЕ, тем же
+	// способом (collect_instance_args на СЫРОМ шаблоне, глобально
+	// консистентный res.symbol_types, не per-Type_Ctx карта).
+	current_receiver_subst:      map[int]^Type,
 }
 
 new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
@@ -1023,6 +1047,7 @@ new_type_ctx :: proc(res: ^Resolver_Ctx) -> Type_Ctx {
 		generic_call_callee_sym = make(map[Expr]Symbol_Id),
 		generic_method_instantiations = make(map[Expr][dynamic]^Type),
 		generic_method_owner_sym = make(map[Expr]Symbol_Id),
+		current_receiver_owner_sym = INVALID_SYMBOL,
 		let_destructure_field_indices = make(map[Stmt][dynamic]int),
 		resolving_aliases = make(map[Symbol_Id]bool),
 	}
@@ -1524,19 +1549,26 @@ record_generic_method_instantiation :: proc(ctx: ^Type_Ctx, expr: Expr, method_s
 	for t in concrete_types {
 		pruned := prune_type(t)
 		if pruned.kind == .InferVar do return
-		// Известный, узкий пробел — НЕ покрыт этой сессией, найден
-		// эмпирически (test_qualified_impl_supervisor_restarts_then_
-		// gives_up и соседние supervisor-тесты: Опция(Процесс(Задача)) —
-		// значение()-клон падает "'это' используется до инициализации"
-		// внутри check_function_body, корень не найден — что-то в
-		// резолве receiver-параметра метода отличается специфически для
-		// Процесс(T) как T-аргумента, не воспроизводится для Число/
-		// Строка/Struct/Enum-аргументов (json/toml тесты с той же формой
-		// .значение() проходят чисто). Не гадаем дальше — откатываемся к
-		// прежнему (symbol_to_function, немономорфизированный шаблон)
-		// пути, как было ДО Фазы 2.3, тот же принцип, что и остальные
-		// явно задокументированные гэпы этой сессии (не молча отгружать
-		// сломанное).
+		// Известный, узкий пробел — НЕ полностью закрыт этой сессией
+		// (Фаза 2.5 значительно сузила его, не устранила целиком).
+		// Фаза 2.5's приёмник-реинстанциация (см. resolve_type_node's
+		// Type_Ident case + current_receiver_subst) чинит ИСХОДНЫЙ
+		// симптом ("'это' используется до инициализации" — подтверждено:
+		// эта диагностика больше не появляется) — но supervisor-тесты
+		// (test_qualified_impl_supervisor_restarts_then_gives_up и
+		// соседние, Опция(Процесс(Задача))) после фикса падают на
+		// ДРУГОЙ, downstream ошибке — "match_arm_infos отсутствует для
+		// выбора" (mir_lowering.odin) — тот же паник-текст, что видели
+		// раньше в этой сессии (Фаза 2.3) для СОВСЕМ другого сценария
+		// (bounded-generic функция + метод, там причина была найдена и
+		// исправлена) — здесь корень НЕ найден: что-то ЕЩЁ отличается
+		// специфически для Процесс(T) как T-аргумента внутри клона,
+		// раз typecheck клона теперь проходит БЕЗ diagnostic-ошибок
+		// (проверено), но какой-то `выбор` внутри того же клона всё
+		// равно не получает свою запись в match_arm_infos. Не гадаем
+		// дальше — откатываемся к прежнему (symbol_to_function)
+		// пути, тот же принцип, что остальные явно задокументированные
+		// гэпы этой сессии.
 		if pruned.kind == .Process do return
 	}
 	ctx.generic_method_instantiations[expr] = concrete_types
@@ -2909,6 +2941,21 @@ resolve_type_node :: proc(ctx: ^Type_Ctx, node: Type_Node) -> ^Type {
 					"Type Error: модуль '%s' нельзя использовать как тип",
 					n.name,
 				)
+			}
+			// Фаза 2.5: голая ссылка на ВЛАДЕЮЩИЙ ТИП внутри клона его же
+			// метода ("это: Опция", ВСЕГДА без явных type-аргументов) —
+			// resolve_symbol_type ниже вернула бы ОБЩИЙ, никогда не
+			// инстанцируемый шаблон (symbol_types[sym] — один объект на
+			// весь компилятор, T/E внутри абстрактны) — та же инстанциация,
+			// что уже делает case ^Type_Generic ниже для явного "Опция(
+			// Число)" (instantiate_type + subst по InferVar.infer_id).
+			// current_receiver_subst строится ЦЕЛИКОМ в mir_monomorphize.
+			// odin's monomorphize_register_method_one (не здесь) — там уже
+			// есть и concrete_types, и res.symbol_types (глобально
+			// консистентный, см. её докстринг), нужные для построения
+			// правильного infer_id-ключенного subst.
+			if sym == ctx.current_receiver_owner_sym && ctx.current_receiver_subst != nil {
+				return instantiate_type(ctx, ctx.res.symbol_types[sym], &ctx.current_receiver_subst)
 			}
 			if typ, ok := resolve_symbol_type(ctx, sym); ok do return typ
 		}

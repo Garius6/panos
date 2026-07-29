@@ -40,6 +40,13 @@ obj_offsets: [MAX_OBJECTS]i32
 obj_sizes:   [MAX_OBJECTS]i32
 obj_count:   i32
 
+// obj_tags — только для variant-объектов (см. pw_build_variant/
+// pw_match_tag, Фаза 2.1); для строк/структур/массивов не используется —
+// тот же индекс-пространство object-id, отдельная параллельная таблица,
+// не встроено в obj_offsets/obj_sizes, чтобы не трогать существующую
+// раскладку строк/агрегатов/массивов.
+obj_tags: [MAX_OBJECTS]i32
+
 // pw_scratch_set — записывает ОДИН байт строковой константы в scratch-
 // буфер (сгенерированный код зовёт это в цикле, по байту на константу,
 // ПЕРЕД pw_alloc_from_scratch) — см. докстринг файла про то, почему не
@@ -164,6 +171,36 @@ pw_alloc_aggregate :: proc "contextless" (field_count: i32) -> i32 {
 	obj_sizes[id] = size
 	obj_count += 1
 	return id
+}
+
+// pw_build_variant — Фаза 2.1 (ADT): та же раскладка, что
+// pw_alloc_aggregate (field_count*FIELD_SIZE нулевых байт), плюс тег в
+// obj_tags — Build_Variant_Instr's эмиссия (core/wasm_emit.odin)
+// заполняет поля ТЕМ ЖЕ pw_set_field_f64/pw_set_field_i32 циклом, что
+// New_Aggregate_Instr/New_Array_Instr.
+@(export)
+pw_build_variant :: proc "contextless" (tag: i32, field_count: i32) -> i32 {
+	size := field_count * FIELD_SIZE
+	if next_free + size > ARENA_SIZE || obj_count >= MAX_OBJECTS || field_count < 0 {
+		return -1
+	}
+	off := next_free
+	for i in i32(0) ..< size {
+		arena[off + i] = 0
+	}
+	next_free += size
+
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = size
+	obj_tags[id] = tag
+	obj_count += 1
+	return id
+}
+
+@(export)
+pw_match_tag :: proc "contextless" (handle: i32, tag: i32) -> i32 {
+	return obj_tags[handle] == tag ? 1 : 0
 }
 
 @(export)

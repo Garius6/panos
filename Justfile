@@ -52,7 +52,8 @@ build-wasm-runtime:
 		--export=pw_set_field_i32 --export=pw_get_field_i32 --export=pw_print_string \
 		--export=pw_string_starts_with --export=pw_string_ends_with --export=pw_string_contains \
 		--export=pw_int_to_string --export=pw_string_compare --export=pw_string_replace_all \
-		--export=pw_monotonic_ms --export=pw_now_ms --allow-undefined
+		--export=pw_monotonic_ms --export=pw_now_ms \
+		--export=pw_build_variant --export=pw_match_tag --allow-undefined
 
 # Дифференциальные тесты WASM AOT-бэкенда (Фаза 1/1.5, core/wasm_backend_
 # wasmtime_test.odin) — за #config(PANOS_WASM_BACKEND_TESTS), НЕ входят в

@@ -143,11 +143,45 @@ test_wasm_module_lowers_print_call_without_panic :: proc(t: ^testing.T) {
 	testing.expectf(t, found, "имя импорта 'pw_print_string' не найдено в байтах модуля")
 }
 
-// Намеренно нет теста "паникует на heap-инструкции вне области Фазы 1.5"
-// (агрегаты/массивы/interface/closures/actors): Odin's panic() —
-// фатальный abort процесса (нет recover/unwind), проверка такого пути
-// уронила бы весь тестовый бинарь вместе со всеми остальными тестами.
-// Код, отвечающий за это (emit_mir_instr в core/wasm_emit.odin,
-// wasm_val_type в core/wasm_module.odin), прост и самоочевиден —
-// понятное сообщение вместо тихого неверного вывода достигается самой
-// структурой кода, не отдельным регрессионным тестом.
+@(test)
+test_wasm_module_lowers_array_without_panic :: proc(t: ^testing.T) {
+	// Фаза 2.1: Массив (New_Array_Instr/Get_Index_Instr/Set_Index_Instr)
+	// больше не паникует — семантика проверяется дифференциальными
+	// тестами.
+	bytes := lower_wasm_from_source(t, `
+		функ старт() -> Число
+			пер значения = массив(1, 2, 3)
+			значения[0]
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
+@(test)
+test_wasm_module_lowers_enum_match_without_panic :: proc(t: ^testing.T) {
+	// Фаза 2.1: Build_Variant_Instr/Match_Tag_Instr/Get_Variant_Field_
+	// Instr (через `выбор`) больше не паникуют — семантика проверяется
+	// дифференциальными тестами.
+	bytes := lower_wasm_from_source(t, `
+		тип Ф = перечисление
+			Точка
+			Круг(Число)
+		конец
+		функ старт() -> Число
+			возврат выбор Ф.Круг(5)
+				Точка -> 0
+				Круг(р) -> р
+			конец
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
+// Намеренно нет теста "паникует на interface/closures/actors/Соответствие
+// вне области Фазы 2.1": Odin's panic() — фатальный abort процесса (нет
+// recover/unwind), проверка такого пути уронила бы весь тестовый бинарь
+// вместе со всеми остальными тестами. Код, отвечающий за это
+// (emit_mir_instr в core/wasm_emit.odin, wasm_val_type в core/wasm_
+// module.odin), прост и самоочевиден — понятное сообщение вместо тихого
+// неверного вывода достигается самой структурой кода, не отдельным
+// регрессионным тестом.

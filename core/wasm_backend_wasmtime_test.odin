@@ -599,4 +599,93 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		`)
 	}
 
+	// Фаза 2.1: Массив (New_Array_Instr/Get_Index_Instr/Set_Index_Instr) и
+	// ADT construction+pattern matching (Build_Variant_Instr/Match_Tag_
+	// Instr/Get_Variant_Field_Instr через `выбор`, не через методы —
+	// Call_Method_Instr вне области, см. план).
+
+	@(test)
+	test_wasm_diff_array_construct_and_index :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер значения = массив(10, 20, 30)
+				значения[0] + значения[1] + значения[2]
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер i: Целое = 1
+				пер значения = массив(10, 20, 30)
+				значения[i]
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_array_set_index :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер значения = массив(1, 2, 3)
+				значения[1] = 99
+				значения[0] + значения[1] + значения[2]
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_enum_match_user_declared :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			тип Ф = перечисление
+				Точка
+				Круг(Число)
+				Прямоугольник(Число, Число)
+			конец
+			функ площадь(ф: Ф) -> Число
+				возврат выбор ф
+					Точка -> 0
+					Круг(р) -> р * р
+					Прямоугольник(ш, выс) -> ш * выс
+				конец
+			конец
+			функ старт() -> Число
+				площадь(Ф.Точка) + площадь(Ф.Круг(3)) + площадь(Ф.Прямоугольник(4, 5))
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_opciya_match :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер p: Опция(Число) = Опция.Есть(42)
+				возврат выбор p
+					Опция.Есть(x) -> x
+					Нет -> 0
+				конец
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер p: Опция(Число) = Опция.Нет()
+				возврат выбор p
+					Опция.Есть(x) -> x
+					Нет -> -1
+				конец
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_rezultat_match :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер r: Результат(Число, Строка) = Результат.Успех(7)
+				возврат выбор r
+					Результат.Успех(x) -> x
+					Неудача(_) -> -1
+				конец
+			конец
+		`)
+	}
+
 }

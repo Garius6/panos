@@ -55,22 +55,25 @@ WASM_I32 :: 0x7F
 WASM_F64 :: 0x7C
 
 // wasm_val_type — тип значения в WASM для статического типа panos-Value_Id
-// (Фаза 1: Число/Целое -> f64, Булево -> i32; Фаза 1.5: Строка ТОЖЕ i32 —
-// handle в wasm_runtime's таблице объектов (см. wasm_runtime/runtime.odin),
-// не сырой указатель — сгенерированный код никогда не видит/не вычисляет
-// адреса в памяти рантайма, только handle'ы, см. её докстринг про
-// раздельно слинкованные модули).
+// (Фаза 1: Число/Целое -> f64, Булево -> i32; Фаза 1.5: Строка/структура
+// ТОЖЕ i32 — handle в wasm_runtime's таблице объектов (см. wasm_runtime/
+// runtime.odin), не сырой указатель; Фаза 2.1: Массив/перечисление
+// (включая Опция/Результат прелюдии) — та же handle-репрезентация,
+// см. obj_tags в wasm_runtime/runtime.odin для перечислений).
 wasm_val_type :: proc(t: ^Type) -> u8 {
+	if t == nil {
+		panic("wasm backend: nil-тип (нерезолвленный generic-параметр?) дошёл до эмиссии — is_wasm_phase1_function должен был это отсечь")
+	}
 	pt := prune_type(t)
 	#partial switch pt.kind {
 	case .Number, .Integer:
 		return WASM_F64
-	case .Bool, .String, .Struct:
+	case .Bool, .String, .Struct, .Array, .Enum:
 		return WASM_I32
 	case:
 		panic(
 			fmt.tprintf(
-				"wasm backend Фаза 1/1.5: тип %v не поддержан (нет interface/generics/массивов/map в этой фазе)",
+				"wasm backend Фаза 2.1: тип %v не поддержан (нет interface/generics/Соответствие/closures/actors в этой фазе)",
 				pt.kind,
 			),
 		)
@@ -78,11 +81,17 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 }
 
 // is_wasm_phase1_type — как wasm_val_type, но БЕЗ паники (проверка, а не
-// конвертация) — Пусто тоже допустим (возврат без значения).
+// конвертация) — Пусто тоже допустим (возврат без значения). nil — тоже
+// "не в области" (не паника): найдено реальным крашем — до появления
+// .Enum в списке ниже, какая-то прелюдийная локаль с ЕЩЁ nil-типом (не
+// зарезолвленным generic-параметром) никогда не достигалась, потому что
+// is_wasm_phase1_function рано выходил на .Enum-локали ПЕРЕД ней; теперь
+// когда .Enum разрешён, обход доходит и до неё.
 @(private = "file")
 is_wasm_phase1_type :: proc(t: ^Type) -> bool {
+	if t == nil do return false
 	#partial switch prune_type(t).kind {
-	case .Number, .Integer, .Bool, .Void, .String, .Struct:
+	case .Number, .Integer, .Bool, .Void, .String, .Struct, .Array, .Enum:
 		return true
 	case:
 		return false
@@ -138,7 +147,9 @@ PW_STRING_COMPARE :: 15
 PW_STRING_REPLACE_ALL :: 16
 PW_MONOTONIC_MS :: 17
 PW_NOW_MS :: 18
-PW_IMPORT_COUNT :: 19
+PW_BUILD_VARIANT :: 19
+PW_MATCH_TAG :: 20
+PW_IMPORT_COUNT :: 21
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -161,6 +172,8 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_string_replace_all", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
 	{"pw_monotonic_ms", {}, {WASM_F64}},
 	{"pw_now_ms", {}, {WASM_F64}},
+	{"pw_build_variant", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_match_tag", {WASM_I32, WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")

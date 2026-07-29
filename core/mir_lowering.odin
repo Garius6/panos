@@ -1729,12 +1729,22 @@ lower_match_expr :: proc(ctx: ^Lowering_Context, expr: Expr, m: ^Match_Expr) -> 
 // при несовпадении.
 @(private = "file")
 lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^Pattern_Info, value_local: Local_Id, fail_block: Block_Id) {
+	// value_type — тип value_local, известен ВСЕГДА (либо исходный
+	// subject, либо материализованное под-поле родителя — см. .Constructor/
+	// .Struct_Constructor ниже, обе ветки теперь передают настоящий тип, не
+	// nil). Раньше многие new_value/new_local в этой функции получали nil —
+	// байткод-бэкенду было всё равно (типы локалей/значений не читает), но
+	// это реальный, ранее НЕВИДИМЫЙ пробел: core/wasm_emit.odin нуждается в
+	// настоящих типах, чтобы выбрать f64-vs-i32 WASM-представление, и без
+	// этой правки падал (найдено реальным крашем, не гипотетически).
+	value_type := current_function(&ctx.b).locals[int(value_local)].type
+
 	switch pi.kind {
 	case .Wildcard:
 	// без условия — совпадает всегда
 
 	case .Literal:
-		v := new_value(&ctx.b, nil)
+		v := new_value(&ctx.b, value_type)
 		emit(&ctx.b, new_load_local(v, value_local))
 		lit_v, lflow := lower_expr(ctx, pi.literal_expr)
 		if lflow == .Terminates do return
@@ -1744,14 +1754,14 @@ lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^Pattern_Info, value_local: Lo
 		set_current_block(&ctx.b, next_block)
 
 	case .Binder:
-		v := new_value(&ctx.b, nil)
+		v := new_value(&ctx.b, value_type)
 		emit(&ctx.b, new_load_local(v, value_local))
-		binder_local := new_local(&ctx.b, pi.binder_sym, "", nil)
+		binder_local := new_local(&ctx.b, pi.binder_sym, "", value_type)
 		ctx.symbol_to_local[pi.binder_sym] = binder_local
 		emit(&ctx.b, new_store_local(binder_local, v))
 
 	case .Constructor:
-		v := new_value(&ctx.b, nil)
+		v := new_value(&ctx.b, value_type)
 		emit(&ctx.b, new_load_local(v, value_local))
 		tag_ok := new_value(&ctx.b, TY_BOOL)
 		mt := new(Match_Tag_Instr)
@@ -1763,17 +1773,19 @@ lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^Pattern_Info, value_local: Lo
 		terminate(&ctx.b, new_branch_term(tag_ok, next_block, fail_block))
 		set_current_block(&ctx.b, next_block)
 
+		variant_fields := prune_type(value_type).variants[pi.tag_index].fields
 		for &sub, field_idx in pi.sub_patterns {
 			if sub.kind == .Wildcard do continue
-			subj_v := new_value(&ctx.b, nil)
+			subj_v := new_value(&ctx.b, value_type)
 			emit(&ctx.b, new_load_local(subj_v, value_local))
-			field_v := new_value(&ctx.b, nil)
+			field_type := variant_fields[field_idx]
+			field_v := new_value(&ctx.b, field_type)
 			gvf := new(Get_Variant_Field_Instr)
 			gvf.dst = field_v
 			gvf.subject = subj_v
 			gvf.field_index = field_idx
 			emit(&ctx.b, gvf)
-			field_local := new_local(&ctx.b, INVALID_SYMBOL, "$match_field", nil)
+			field_local := new_local(&ctx.b, INVALID_SYMBOL, "$match_field", field_type)
 			emit(&ctx.b, new_store_local(field_local, field_v))
 			// Тот же СКВОЗНОЙ fail_block верхнего уровня передаётся КАЖДОМУ
 			// под-паттерну — на несовпадение любого поля арм проваливается
@@ -1783,17 +1795,19 @@ lower_pattern :: proc(ctx: ^Lowering_Context, pi: ^Pattern_Info, value_local: Lo
 		}
 
 	case .Struct_Constructor:
+		struct_fields := prune_type(value_type).fields
 		for &sub, field_idx in pi.sub_patterns {
 			if sub.kind == .Wildcard do continue
-			obj_v := new_value(&ctx.b, nil)
+			obj_v := new_value(&ctx.b, value_type)
 			emit(&ctx.b, new_load_local(obj_v, value_local))
-			field_v := new_value(&ctx.b, nil)
+			field_type := struct_fields[field_idx].type
+			field_v := new_value(&ctx.b, field_type)
 			gp := new(Get_Property_Instr)
 			gp.dst = field_v
 			gp.object = obj_v
 			gp.field_index = field_idx
 			emit(&ctx.b, gp)
-			field_local := new_local(&ctx.b, INVALID_SYMBOL, "$match_field", nil)
+			field_local := new_local(&ctx.b, INVALID_SYMBOL, "$match_field", field_type)
 			emit(&ctx.b, new_store_local(field_local, field_v))
 			lower_pattern(ctx, &sub, field_local, fail_block)
 		}

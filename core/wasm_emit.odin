@@ -377,22 +377,25 @@ wasm_field_is_i32 :: proc(kind: Type_Kind) -> bool {
 	return kind == .Bool || kind == .String || kind == .Struct
 }
 
-// emit_new_aggregate — элементы УЖЕ на стеке пачкой (обычный replay, в
-// порядке v.elements), но pw_set_field_* нужен порядок (handle, index,
-// value) на КАЖДЫЙ элемент по отдельности — снимаем все элементы в
-// scratch-локали (в ОБРАТНОМ порядке, раз последний элемент СВЕРХУ),
-// затем собираем агрегат и заполняем поля в прямом порядке, читая
-// значения обратно из scratch (та же схема, что Function_Ref_Instr's
-// Callee_Info, обобщённая на N значений и на f64/i32 сразу).
+// emit_construct_object — общая эмиссия для New_Aggregate_Instr/
+// New_Array_Instr/Build_Variant_Instr (Фаза 2.1: все три — тот же
+// field_count*FIELD_SIZE arena-объект, только выбор ALLOC-импорта и
+// наличие tag-аргумента отличаются, см. wasm_runtime/runtime.odin's
+// pw_alloc_aggregate/pw_build_variant). Элементы уже на стеке пачкой
+// (обычный replay), но заполнение полей нужно по одному вперемешку с
+// handle/индексом — снимаем все элементы в scratch-локали (в ОБРАТНОМ
+// порядке, раз последний элемент сверху), затем собираем объект и
+// заполняем поля в прямом порядке (тот же класс проблемы порядка, что у
+// Call_Value_Instr's callee, см. Callee_Info в докстринге Emit_Ctx).
 @(private = "file")
-emit_new_aggregate :: proc(ectx: ^Emit_Ctx, v: ^New_Aggregate_Instr) {
+emit_construct_object :: proc(ectx: ^Emit_Ctx, elements: []Value_Id, alloc_import: int, tag: Maybe(i64)) {
 	code := &ectx.code
-	n := len(v.elements)
+	n := len(elements)
 
 	elem_locals := make([]int, n, context.temp_allocator)
 	elem_is_i32 := make([]bool, n, context.temp_allocator)
 	for i := n - 1; i >= 0; i -= 1 {
-		is_i32 := wasm_field_is_i32(value_kind(ectx, v.elements[i]))
+		is_i32 := wasm_field_is_i32(value_kind(ectx, elements[i]))
 		elem_is_i32[i] = is_i32
 		local := is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
 		elem_locals[i] = local
@@ -401,10 +404,14 @@ emit_new_aggregate :: proc(ectx: ^Emit_Ctx, v: ^New_Aggregate_Instr) {
 	}
 
 	handle_local := alloc_i32_scratch(ectx)
+	if t, has_tag := tag.?; has_tag {
+		append(code, 0x41) // i32.const tag (pw_build_variant(tag, field_count))
+		write_sleb128(code, t)
+	}
 	append(code, 0x41) // i32.const field_count
 	write_sleb128(code, i64(n))
-	append(code, 0x10) // call pw_alloc_aggregate
-	write_uleb128(code, u64(PW_ALLOC_AGGREGATE))
+	append(code, 0x10) // call pw_alloc_aggregate/pw_build_variant
+	write_uleb128(code, u64(alloc_import))
 	append(code, 0x21) // local.set handle
 	write_uleb128(code, u64(handle_local))
 
@@ -419,7 +426,7 @@ emit_new_aggregate :: proc(ectx: ^Emit_Ctx, v: ^New_Aggregate_Instr) {
 		write_uleb128(code, u64(elem_is_i32[i] ? PW_SET_FIELD_I32 : PW_SET_FIELD_F64))
 	}
 
-	append(code, 0x20) // local.get handle — итоговое значение New_Aggregate_Instr
+	append(code, 0x20) // local.get handle — итоговое значение
 	write_uleb128(code, u64(handle_local))
 }
 
@@ -436,6 +443,25 @@ emit_set_property :: proc(ectx: ^Emit_Ctx, v: ^Set_Property_Instr) {
 	write_uleb128(code, u64(local))
 	append(code, 0x41) // i32.const field_index
 	write_sleb128(code, i64(v.field_index))
+	append(code, 0x20) // local.get value
+	write_uleb128(code, u64(local))
+	append(code, 0x10)
+	write_uleb128(code, u64(is_i32 ? PW_SET_FIELD_I32 : PW_SET_FIELD_F64))
+}
+
+// emit_set_index — object, index(Целое/f64), value уже на стеке в этом
+// порядке (см. instr_refs: [object, index, value], value сверху).
+// pw_set_field_* нужен (handle, index_i32, value) — снимаем value в
+// scratch (object остаётся снизу, index — теперь сверху), конвертируем
+// index на месте, кладём value назад.
+@(private = "file")
+emit_set_index :: proc(ectx: ^Emit_Ctx, v: ^Set_Index_Instr) {
+	code := &ectx.code
+	is_i32 := wasm_field_is_i32(value_kind(ectx, v.value))
+	local := is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
+	append(code, 0x21) // local.set value (снимает верх стека)
+	write_uleb128(code, u64(local))
+	append(code, 0xAA) // i32.trunc_f64_s (index — теперь верх стека)
 	append(code, 0x20) // local.get value
 	write_uleb128(code, u64(local))
 	append(code, 0x10)
@@ -523,7 +549,14 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		write_uleb128(code, 0) // tableidx 0
 
 	case ^New_Aggregate_Instr:
-		emit_new_aggregate(ectx, v)
+		emit_construct_object(ectx, v.elements, PW_ALLOC_AGGREGATE, nil)
+
+	case ^New_Array_Instr:
+		// Массив — та же raw-раскладка, что структура (см. план Фазы 2.1:
+		// wasm_runtime не различает "структура" и "массив" на уровне
+		// хранения, только сам факт field_count*FIELD_SIZE-объекта) —
+		// тот же alloc-импорт, что New_Aggregate_Instr.
+		emit_construct_object(ectx, v.elements, PW_ALLOC_AGGREGATE, nil)
 
 	case ^Get_Property_Instr:
 		// object (handle) уже на стеке — pw_get_field_* принимает
@@ -543,6 +576,43 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		// и value (та же проблема порядка, что Call_Value_Instr, см.
 		// Callee_Info в докстринге Emit_Ctx).
 		emit_set_property(ectx, v)
+
+	case ^Get_Index_Instr:
+		// object, index уже на стеке в этом порядке (см. instr_refs:
+		// [object, index], index сверху). index — Целое (f64-представление,
+		// см. wasm_val_type), pw_get_field_* принимает i32 — конвертируем
+		// ПРЯМО на месте (index уже на вершине стека, конверсия не требует
+		// scratch-локали, в отличие от Set_Index_Instr ниже).
+		append(code, 0xAA) // i32.trunc_f64_s
+		field_getter := wasm_field_is_i32(value_kind(ectx, v.dst)) ? PW_GET_FIELD_I32 : PW_GET_FIELD_F64
+		append(code, 0x10)
+		write_uleb128(code, u64(field_getter))
+
+	case ^Set_Index_Instr:
+		emit_set_index(ectx, v)
+
+	case ^Build_Variant_Instr:
+		emit_construct_object(ectx, v.fields, PW_BUILD_VARIANT, i64(v.tag))
+
+	case ^Match_Tag_Instr:
+		// subject уже на стеке — ОБЫЧНЫЙ, полностью потребляемый операнд в
+		// этом бэкенде (в отличие от core/mir_bytecode.odin's .Match_Tag,
+		// который PEEK'ает subject и требует явного Pop на обеих ветках,
+		// см. её докстринг — здесь этот воркэраунд не нужен: этот бэкенд
+		// никогда не оставляет на стеке ничего, что не потребляется сразу
+		// же, single-use держится буквально).
+		append(code, 0x41) // i32.const tag
+		write_sleb128(code, i64(v.tag))
+		append(code, 0x10)
+		write_uleb128(code, u64(PW_MATCH_TAG))
+
+	case ^Get_Variant_Field_Instr:
+		// Идентично Get_Property_Instr — field_index известен статически.
+		append(code, 0x41) // i32.const field_index
+		write_sleb128(code, i64(v.field_index))
+		field_getter := wasm_field_is_i32(value_kind(ectx, v.dst)) ? PW_GET_FIELD_I32 : PW_GET_FIELD_F64
+		append(code, 0x10)
+		write_uleb128(code, u64(field_getter))
 
 	case ^Call_Builtin_Instr:
 		// Фаза 2.0: единственный поддержанный builtin — ввод_вывод::печать
@@ -599,15 +669,9 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 	     ^Call_Method_Instr,
 	     ^Call_Async_Instr,
 	     ^Call_Foreign_Instr,
-	     ^New_Array_Instr,
 	     ^New_Map_Instr,
-	     ^Get_Index_Instr,
-	     ^Set_Index_Instr,
 	     ^Cast_Interface_Instr,
 	     ^Invoke_Interface_Instr,
-	     ^Build_Variant_Instr,
-	     ^Match_Tag_Instr,
-	     ^Get_Variant_Field_Instr,
 	     ^Build_Closure_Instr,
 	     ^Spawn_Instr,
 	     ^Send_Instr,

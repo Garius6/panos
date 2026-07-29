@@ -1,6 +1,8 @@
 package wasm_runtime
 
 import "base:intrinsics"
+import "base:runtime"
+import "core:unicode"
 import wasi "core:sys/wasm/wasi"
 
 // wasm_runtime — Фаза 1.5 WASM AOT-бэкенда: минимальный, ОТДЕЛЬНЫЙ от
@@ -1139,4 +1141,132 @@ pw_string_char_at :: proc "contextless" (handle: i32, rune_idx: i32) -> i32 {
 		idx += 1
 	}
 	intrinsics.trap()
+}
+
+// --- Фаза 2.9: Unicode-классификация/регистр -----------------------------
+//
+// core:unicode's is_digit/is_letter(=is_alpha)/to_upper/to_lower — чистые
+// табличные функции (binary_search по статическим сгенерированным
+// range-таблицам, core/unicode/letter.odin) — БЕЗ аллокаций/IO, ничего из
+// того, что заблокировало переиспользование core/gc.odin в Фазе 1.5
+// (core:dynlib/core:terminal). Единственное трение: обычная (не
+// "contextless") calling convention Odin всегда протаскивает context
+// параметром структурно, даже для функций, ему не пользующихся —
+// "contextless"-вызывающему (весь этот пакет) нечего передать без
+// явного `context = runtime.default_context()` (ошибка компиляции без
+// этой строки, предложенный САМИМ Odin фикс) — проверено СПАЙКОМ ДО
+// вживления (реальный wasi_wasm32-билд + wasmtime run, включая
+// кириллический to_upper('п')=='П'), не просто "должно скомпилироваться".
+// НИКАКИХ собственных Unicode-таблиц не нужно — намного меньший риск,
+// чем изначально предполагалось при выборе этого направления.
+//
+// unicode.is_digit/is_alpha(=is_letter) идут через in_range() по глобалам
+// вроде ll_ranges/lu_ranges/nd_ranges (core/unicode/generated.odin) —
+// это Range{ranges_16 = ll_ranges16[:], ...}, ЗНАЧЕНИЕ ЧЬИХ ПОЛЕЙ
+// вычисляется срезом ДРУГОГО глобала — Odin эмитит это как код в
+// компилятором сгенерированном __$startup_runtime (см. base:runtime/
+// entry_wasm.odin — обычно вызывается из _start ДО main), а не как
+// статические данные. Наш модуль собран с -no-entry-point и вызывается
+// напрямую по имени экспорта (без _start) — __$startup_runtime НИКОГДА
+// не выполняется, так что эти Range-глобалы остаются нулевыми
+// (нил-слайсы) и in_range всегда возвращает false. НЕ баг в
+// core:unicode — плата за -no-entry-point/reactor-стиль сборки; сам
+// пакет unicode's doc.odin прямо предупреждает об этом ("если не
+// используется обычная точка входа, _startup_runtime нужно вызвать
+// самостоятельно"). to_upper/to_lower НЕ задеты той же проблемой —
+// их range-таблицы (to_upper_ranges/to_lower_ranges) объявлены как
+// плоские массивы-литералы и срезаются `[:]` ПРЯМО В МЕСТЕ ВЫЗОВА
+// (константные данные линкуются напрямую в data-секцию, без кода
+// инициализации) — подтверждено спайком до фикса (to_upper('п') уже
+// работал БЕЗ этого вызова, is_alpha('п') — нет, тем же спайком).
+@(private)
+unicode_runtime_initialized: bool
+
+@(private)
+ensure_unicode_runtime :: proc "contextless" () {
+	if unicode_runtime_initialized do return
+	context = runtime.default_context()
+	runtime._startup_runtime()
+	unicode_runtime_initialized = true
+}
+
+@(export)
+pw_string_is_digit :: proc "contextless" (handle: i32) -> i32 {
+	ensure_unicode_runtime()
+	context = runtime.default_context()
+	if obj_sizes[handle] == 0 do return 0
+	cp, _ := utf8_decode_at(obj_offsets[handle])
+	return unicode.is_digit(rune(cp)) ? 1 : 0
+}
+
+@(export)
+pw_string_is_alpha :: proc "contextless" (handle: i32) -> i32 {
+	ensure_unicode_runtime()
+	context = runtime.default_context()
+	if obj_sizes[handle] == 0 do return 0
+	cp, _ := utf8_decode_at(obj_offsets[handle])
+	return unicode.is_alpha(rune(cp)) ? 1 : 0
+}
+
+@(export)
+pw_string_is_digit_or_alpha :: proc "contextless" (handle: i32) -> i32 {
+	ensure_unicode_runtime()
+	context = runtime.default_context()
+	if obj_sizes[handle] == 0 do return 0
+	cp, _ := utf8_decode_at(obj_offsets[handle])
+	r := rune(cp)
+	return (unicode.is_digit(r) || unicode.is_alpha(r)) ? 1 : 0
+}
+
+// pw_string_to_upper/pw_string_to_lower — итоговая длина в байтах не
+// известна ДО кодирования (регистр может поменять UTF-8-ширину руны) —
+// резервируем МАКСИМУМ (4*rune_count), obj_sizes — реально записанное,
+// obj_capacity остаётся БОЛЬШЕ — тот же приём, что pw_string_from_runes
+// (Фаза 2.8), не новая техника.
+@(export)
+pw_string_to_upper :: proc "contextless" (handle: i32) -> i32 {
+	context = runtime.default_context()
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	max_size := length * 4
+	if next_free + max_size > ARENA_SIZE || obj_count >= MAX_OBJECTS do intrinsics.trap()
+	dst_off := next_free
+	write_pos: i32 = 0
+	i: i32 = 0
+	for i < length {
+		cp, width := utf8_decode_at(off + i)
+		upper := unicode.to_upper(rune(cp))
+		write_pos += utf8_encode_at(dst_off + write_pos, i32(upper))
+		i += width
+	}
+	next_free += max_size
+	id := obj_count
+	obj_offsets[id] = dst_off
+	obj_sizes[id] = write_pos
+	obj_capacity[id] = max_size
+	obj_count += 1
+	return id
+}
+
+@(export)
+pw_string_to_lower :: proc "contextless" (handle: i32) -> i32 {
+	context = runtime.default_context()
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	max_size := length * 4
+	if next_free + max_size > ARENA_SIZE || obj_count >= MAX_OBJECTS do intrinsics.trap()
+	dst_off := next_free
+	write_pos: i32 = 0
+	i: i32 = 0
+	for i < length {
+		cp, width := utf8_decode_at(off + i)
+		lower := unicode.to_lower(rune(cp))
+		write_pos += utf8_encode_at(dst_off + write_pos, i32(lower))
+		i += width
+	}
+	next_free += max_size
+	id := obj_count
+	obj_offsets[id] = dst_off
+	obj_sizes[id] = write_pos
+	obj_capacity[id] = max_size
+	obj_count += 1
+	return id
 }

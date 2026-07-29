@@ -182,7 +182,12 @@ PW_STRING_CODEPOINT_AT_START :: 50
 PW_STRING_TO_RUNES :: 51
 PW_STRING_FROM_RUNES :: 52
 PW_STRING_CHAR_AT :: 53
-PW_IMPORT_COUNT :: 54
+PW_STRING_IS_DIGIT :: 54
+PW_STRING_IS_ALPHA :: 55
+PW_STRING_IS_DIGIT_OR_ALPHA :: 56
+PW_STRING_TO_UPPER :: 57
+PW_STRING_TO_LOWER :: 58
+PW_IMPORT_COUNT :: 59
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -240,6 +245,11 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_string_to_runes", {WASM_I32}, {WASM_I32}},
 	{"pw_string_from_runes", {WASM_I32}, {WASM_I32}},
 	{"pw_string_char_at", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_string_is_digit", {WASM_I32}, {WASM_I32}},
+	{"pw_string_is_alpha", {WASM_I32}, {WASM_I32}},
+	{"pw_string_is_digit_or_alpha", {WASM_I32}, {WASM_I32}},
+	{"pw_string_to_upper", {WASM_I32}, {WASM_I32}},
+	{"pw_string_to_lower", {WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")

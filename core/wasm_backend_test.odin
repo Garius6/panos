@@ -250,6 +250,22 @@ test_wasm_module_lowers_rune_string_ops_without_panic :: proc(t: ^testing.T) {
 	testing.expectf(t, len(bytes) > 8, "модуль пуст")
 }
 
+@(test)
+test_wasm_module_lowers_unicode_classify_case_ops_without_panic :: proc(t: ^testing.T) {
+	bytes := lower_wasm_from_source(t, `
+		импорт строки
+		функ старт() -> Булево
+			пер цифра = строки.это_цифра("5")
+			пер буква = строки.это_буква("п")
+			пер циф_или_букв = строки.цифра_или_буква(" ")
+			пер верх = строки.верхний_регистр("привет mir")
+			пер низ = строки.нижний_регистр("ПРИВЕТ MIR")
+			цифра и буква и циф_или_букв == циф_или_букв и верх == верх и низ == низ
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
 // Намеренно нет теста "паникует на interface/closures/actors вне
 // области": Odin's panic() — фатальный abort процесса (нет
 // recover/unwind), проверка такого пути уронила бы весь тестовый бинарь

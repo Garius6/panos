@@ -70,7 +70,10 @@ build-wasm-runtime:
 		--export=pw_string_slice_byte --export=pw_string_from_bytes \
 		--export=pw_string_to_bytes --export=pw_string_codepoint_at_start \
 		--export=pw_string_to_runes --export=pw_string_from_runes \
-		--export=pw_string_char_at --allow-undefined
+		--export=pw_string_char_at \
+		--export=pw_string_is_digit --export=pw_string_is_alpha \
+		--export=pw_string_is_digit_or_alpha \
+		--export=pw_string_to_upper --export=pw_string_to_lower --allow-undefined
 
 # Дифференциальные тесты WASM AOT-бэкенда (Фаза 1/1.5, core/wasm_backend_
 # wasmtime_test.odin) — за #config(PANOS_WASM_BACKEND_TESTS), НЕ входят в

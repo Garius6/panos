@@ -165,7 +165,13 @@ PW_MAP_GET_NUMKEY_F64 :: 33
 PW_MAP_GET_NUMKEY_I32 :: 34
 PW_MAP_DELETE_STRKEY :: 35
 PW_MAP_DELETE_NUMKEY :: 36
-PW_IMPORT_COUNT :: 37
+PW_ARRAY_PUSH_F64 :: 37
+PW_ARRAY_PUSH_I32 :: 38
+PW_MAP_SET_STRKEY_F64 :: 39
+PW_MAP_SET_STRKEY_I32 :: 40
+PW_MAP_SET_NUMKEY_F64 :: 41
+PW_MAP_SET_NUMKEY_I32 :: 42
+PW_IMPORT_COUNT :: 43
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -206,6 +212,12 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_map_get_numkey_i32", {WASM_I32, WASM_F64, WASM_I32}, {WASM_I32}},
 	{"pw_map_delete_strkey", {WASM_I32, WASM_I32}, {WASM_I32}},
 	{"pw_map_delete_numkey", {WASM_I32, WASM_F64}, {WASM_I32}},
+	{"pw_array_push_f64", {WASM_I32, WASM_F64}, {WASM_I32}},
+	{"pw_array_push_i32", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_map_set_strkey_f64", {WASM_I32, WASM_I32, WASM_F64}, {WASM_I32}},
+	{"pw_map_set_strkey_i32", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_map_set_numkey_f64", {WASM_I32, WASM_F64, WASM_F64}, {WASM_I32}},
+	{"pw_map_set_numkey_i32", {WASM_I32, WASM_F64, WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")

@@ -1045,4 +1045,71 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		)
 	}
 
+	// Фаза 2.7: рост арены — Массив.добавить и m[k]=v на Соответствие,
+	// оба ранее исключены (арена не растила объект на месте). 6 push'ей
+	// с нуля пересекают НЕСКОЛЬКО удвоений capacity (0->8->16->32->64
+	// байт, см. wasm_runtime/runtime.odin's ensure_capacity) — не только
+	// первый рост-с-нуля.
+
+	@(test)
+	test_wasm_diff_array_push_length :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Целое
+				пер a: Массив(Целое) = массив()
+				a.добавить(10)
+				a.добавить(20)
+				a.добавить(30)
+				a.добавить(40)
+				a.добавить(50)
+				a.добавить(60)
+				a.длина()
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_array_push_values_survive_growth :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер a: Массив(Число) = массив()
+				a.добавить(1)
+				a.добавить(2)
+				a.добавить(3)
+				a.добавить(4)
+				a.добавить(5)
+				a[0] + a[4]
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_map_set_index_existing_key :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер m = соответствие("а" = 1, "б" = 2)
+				m["а"] = 99
+				m["а"]
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_map_set_index_new_key_grows :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Целое
+				пер m = соответствие("а" = 1)
+				m["б"] = 2
+				m["в"] = 3
+				m.длина()
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер m = соответствие("а" = 1)
+				m["б"] = 2
+				m["б"]
+			конец
+		`)
+	}
+
 }

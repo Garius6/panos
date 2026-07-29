@@ -531,14 +531,9 @@ emit_set_property :: proc(ectx: ^Emit_Ctx, v: ^Set_Property_Instr) {
 // index на месте, кладём value назад.
 @(private = "file")
 emit_set_index :: proc(ectx: ^Emit_Ctx, v: ^Set_Index_Instr) {
-	// Фаза 2.4: m[k]=v на Соответствие — вне области (арена не растит
-	// объект на месте для вставки нового ключа, тот же blocker, что
-	// Массив.добавить, см. план) — явная паника вместо молчаливого
-	// прогона через Array-путь ниже (который трактовал бы ключ как
-	// байтовый индекс — тихая порча памяти, не просто неверный
-	// результат).
 	if value_type_of(ectx, v.object).kind == .Map {
-		panic("wasm backend Фаза 2.4: запись по индексу (m[k]=v) на Соответствие вне области (см. план — арена не растит объект на месте)")
+		emit_map_set_index(ectx, v)
+		return
 	}
 	code := &ectx.code
 	is_i32 := wasm_field_is_i32(value_kind(ectx, v.value))
@@ -550,6 +545,36 @@ emit_set_index :: proc(ectx: ^Emit_Ctx, v: ^Set_Index_Instr) {
 	write_uleb128(code, u64(local))
 	append(code, 0x10)
 	write_uleb128(code, u64(is_i32 ? PW_SET_FIELD_I32 : PW_SET_FIELD_F64))
+}
+
+// emit_map_set_index — Фаза 2.7: m[k]=v на Соответствие. object, key,
+// value уже на стеке в ЭТОМ порядке (value сверху, см. instr_refs) —
+// СОВПАДАЕТ с pw_map_set_*(handle, key, value) один-в-один: ПРОЩЕ, чем
+// Массив-путь выше (там нужен scratch-реордер из-за truncation индекса)
+// — ключ Соответствия НИКОГДА не усекается (не байтовый индекс, сам
+// ключ, см. emit_map_get_index), значит и переставлять нечего.
+// pw_map_set_*'s i32-результат (успех/провал) отбрасывается — Set_
+// Index_Instr не имеет dst (m[k]=v — statement, не expression).
+@(private = "file")
+emit_map_set_index :: proc(ectx: ^Emit_Ctx, v: ^Set_Index_Instr) {
+	code := &ectx.code
+	map_type := value_type_of(ectx, v.object)
+	key_is_str := wasm_field_is_i32(prune_type(map_type.key_type).kind)
+	val_is_i32 := wasm_field_is_i32(value_kind(ectx, v.value))
+	setter := PW_MAP_SET_NUMKEY_F64
+	switch {
+	case key_is_str && val_is_i32:
+		setter = PW_MAP_SET_STRKEY_I32
+	case key_is_str && !val_is_i32:
+		setter = PW_MAP_SET_STRKEY_F64
+	case !key_is_str && val_is_i32:
+		setter = PW_MAP_SET_NUMKEY_I32
+	case !key_is_str && !val_is_i32:
+		setter = PW_MAP_SET_NUMKEY_F64
+	}
+	append(code, 0x10)
+	write_uleb128(code, u64(setter))
+	append(code, 0x1A) // drop — i32-результат set'а никому не нужен
 }
 
 // emit_map_get_index — Фаза 2.4: m[k] на Соответствие. object, key уже
@@ -691,6 +716,23 @@ emit_array_method_call :: proc(ectx: ^Emit_Ctx, v: ^Call_Method_Instr) {
 		write_uleb128(code, u64(end_local))
 		append(code, 0x10)
 		write_uleb128(code, u64(PW_ARRAY_SLICE))
+	case "добавить":
+		// Фаза 2.7: [receiver, value] уже на стеке — СОВПАДАЕТ с
+		// pw_array_push_*(handle, value) один-в-один, никакой индекс не
+		// участвует (в отличие от получить/срез), переупорядочивание не
+		// нужно. Результат (i32 успех/провал) НЕ дропаем здесь явно —
+		// Call_Method_Instr.dst (Maybe(Value_Id)) ВСЕГДА Some(...) (см.
+		// mir_lowering.odin's emit_call_method — не смотрит на result_
+		// type == Пусто), значит emit_block_instructions's общий use_
+		// count-based drop (core/wasm_emit.odin:360) УЖЕ снимет это
+		// значение сам, раз добавить()'s результат нигде не используется
+		// — явный drop здесь оставил бы стек пустым ДО того, как общий
+		// механизм попытается дропнуть ЕЩЁ раз — underflow (найдено
+		// эмпирически через wasmtime: "expected a type but nothing on
+		// stack", не по чтению кода).
+		pusher := wasm_field_is_i32(value_kind(ectx, v.args[0])) ? PW_ARRAY_PUSH_I32 : PW_ARRAY_PUSH_F64
+		append(code, 0x10)
+		write_uleb128(code, u64(pusher))
 	case:
 		panic(fmt.tprintf("wasm backend Фаза 2.2: метод '%s' вне области (см. план)", v.name))
 	}

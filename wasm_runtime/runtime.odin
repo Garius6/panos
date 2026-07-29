@@ -40,6 +40,17 @@ obj_offsets: [MAX_OBJECTS]i32
 obj_sizes:   [MAX_OBJECTS]i32
 obj_count:   i32
 
+// obj_capacity — Фаза 2.7 (рост арены): байт РЕЗЕРВИРОВАНО, в отличие
+// от obj_sizes (байт ИСПОЛЬЗУЕТСЯ). Каждый существующий allocator
+// (pw_alloc_from_scratch/pw_concat_strings/pw_alloc_aggregate/pw_build_
+// variant/pw_array_slice/pw_int_to_string/pw_string_replace_all)
+// выставляет obj_capacity[id] = размер В МОМЕНТ создания (без запаса —
+// массив()+.добавить()-цикл — доминирующий реальный паттерн, первый
+// добавить() растёт с нуля в любом случае, простота важнее микро-
+// оптимизации на масштабе фикстур этого бэкенда) — см. ensure_capacity
+// ниже, единственное место, где capacity РАСХОДИТСЯ с size.
+obj_capacity: [MAX_OBJECTS]i32
+
 // obj_tags — только для variant-объектов (см. pw_build_variant/
 // pw_match_tag, Фаза 2.1); для строк/структур/массивов не используется —
 // тот же индекс-пространство object-id, отдельная параллельная таблица,
@@ -74,6 +85,7 @@ pw_alloc_from_scratch :: proc "contextless" (length: i32) -> i32 {
 	id := obj_count
 	obj_offsets[id] = off
 	obj_sizes[id] = length
+	obj_capacity[id] = obj_sizes[id]
 	obj_count += 1
 	return id
 }
@@ -105,6 +117,7 @@ pw_concat_strings :: proc "contextless" (a: i32, b: i32) -> i32 {
 	id := obj_count
 	obj_offsets[id] = off
 	obj_sizes[id] = total
+	obj_capacity[id] = obj_sizes[id]
 	obj_count += 1
 	return id
 }
@@ -169,6 +182,7 @@ pw_alloc_aggregate :: proc "contextless" (field_count: i32) -> i32 {
 	id := obj_count
 	obj_offsets[id] = off
 	obj_sizes[id] = size
+	obj_capacity[id] = obj_sizes[id]
 	obj_count += 1
 	return id
 }
@@ -193,6 +207,7 @@ pw_build_variant :: proc "contextless" (tag: i32, field_count: i32) -> i32 {
 	id := obj_count
 	obj_offsets[id] = off
 	obj_sizes[id] = size
+	obj_capacity[id] = obj_sizes[id]
 	obj_tags[id] = tag
 	obj_count += 1
 	return id
@@ -304,8 +319,62 @@ pw_array_slice :: proc "contextless" (handle: i32, start: i32, end: i32) -> i32 
 	id := obj_count
 	obj_offsets[id] = off
 	obj_sizes[id] = count
+	obj_capacity[id] = obj_sizes[id]
 	obj_count += 1
 	return id
+}
+
+// --- Фаза 2.7: рост арены (Массив.добавить, m[k]=v) ---------------------
+//
+// handle — стабильный ID (индекс в obj_offsets/obj_sizes/obj_capacity),
+// НЕ сырой адрес — весь код всегда читает obj_offsets[handle] заново на
+// каждый вызов (см. докстринг файла про то, почему сгенерированный код
+// никогда не держит сырых адресов) — значит объект МОЖНО релоцировать
+// (скопировать байты в новый регион, поменять obj_offsets[handle]) без
+// инвалидации чего-либо снаружи, тот же handle продолжает работать. Тем
+// самым рост становится классическим growable-vector realloc поверх
+// bump-арены — БЕЗ настоящего GC (старые байты остаются мусором,
+// никогда не переиспользуются — тот же принцип, что уже принят для
+// удалить()'s сжатия и pw_string_replace_all's пересборки).
+@(private)
+ensure_capacity :: proc "contextless" (handle: i32, extra: i32) -> bool {
+	needed := obj_sizes[handle] + extra
+	if needed <= obj_capacity[handle] do return true
+	new_cap := obj_capacity[handle] * 2
+	if new_cap < needed do new_cap = needed
+	if next_free + new_cap > ARENA_SIZE || obj_count >= MAX_OBJECTS {
+		return false
+	}
+	off := next_free
+	for i in i32(0) ..< obj_sizes[handle] {
+		arena[off + i] = arena[obj_offsets[handle] + i]
+	}
+	next_free += new_cap
+	obj_offsets[handle] = off
+	obj_capacity[handle] = new_cap
+	return true
+}
+
+// pw_array_push_f64/i32 — Массив.добавить: растёт на ровно 1 FIELD_SIZE-
+// слот (тот же f64/i32-выбор по статическому типу элемента, что весь
+// остальной Массив-код, см. core/wasm_emit.odin) и дописывает value в
+// хвост. 0 — арена/таблица объектов исчерпана (тот же -1-конвенции для
+// других аллокаторов здесь неприменим — эти функции возвращают i32-
+// булево "успех", не handle).
+@(export)
+pw_array_push_f64 :: proc "contextless" (handle: i32, value: f64) -> i32 {
+	if !ensure_capacity(handle, FIELD_SIZE) do return 0
+	pack_u64_le(obj_offsets[handle] + obj_sizes[handle], transmute(u64)value)
+	obj_sizes[handle] += FIELD_SIZE
+	return 1
+}
+
+@(export)
+pw_array_push_i32 :: proc "contextless" (handle: i32, value: i32) -> i32 {
+	if !ensure_capacity(handle, FIELD_SIZE) do return 0
+	pack_u64_le(obj_offsets[handle] + obj_sizes[handle], u64(u32(value)))
+	obj_sizes[handle] += FIELD_SIZE
+	return 1
 }
 
 // --- Фаза 2.4: Соответствие ---------------------------------------------
@@ -429,6 +498,68 @@ pw_map_delete_numkey :: proc "contextless" (handle: i32, key: f64) -> i32 {
 	return 1
 }
 
+// pw_map_set_* — Фаза 2.7: m[k]=v. Совпадает с core/vm.odin's .Set_Index
+// UPSERT-семантикой ровно (см. её докстринг): ключ найден — перезаписать
+// value-слот НА МЕСТЕ (роста не нужно); не найден — вырастить на 2*
+// FIELD_SIZE (ключ+значение) и дописать пару в хвост. Найденный индекс
+// умножается на 2*FIELD_SIZE (размер ПАРЫ), а не FIELD_SIZE — та же
+// раскладка, что map_find_*/map_delete_at уже используют.
+@(export)
+pw_map_set_strkey_f64 :: proc "contextless" (handle: i32, key: i32, value: f64) -> i32 {
+	if idx := map_find_strkey(handle, key); idx >= 0 {
+		pack_u64_le(obj_offsets[handle] + idx * 2 * FIELD_SIZE + FIELD_SIZE, transmute(u64)value)
+		return 1
+	}
+	if !ensure_capacity(handle, 2 * FIELD_SIZE) do return 0
+	base := obj_offsets[handle] + obj_sizes[handle]
+	pack_u64_le(base, u64(u32(key)))
+	pack_u64_le(base + FIELD_SIZE, transmute(u64)value)
+	obj_sizes[handle] += 2 * FIELD_SIZE
+	return 1
+}
+
+@(export)
+pw_map_set_strkey_i32 :: proc "contextless" (handle: i32, key: i32, value: i32) -> i32 {
+	if idx := map_find_strkey(handle, key); idx >= 0 {
+		pack_u64_le(obj_offsets[handle] + idx * 2 * FIELD_SIZE + FIELD_SIZE, u64(u32(value)))
+		return 1
+	}
+	if !ensure_capacity(handle, 2 * FIELD_SIZE) do return 0
+	base := obj_offsets[handle] + obj_sizes[handle]
+	pack_u64_le(base, u64(u32(key)))
+	pack_u64_le(base + FIELD_SIZE, u64(u32(value)))
+	obj_sizes[handle] += 2 * FIELD_SIZE
+	return 1
+}
+
+@(export)
+pw_map_set_numkey_f64 :: proc "contextless" (handle: i32, key: f64, value: f64) -> i32 {
+	if idx := map_find_numkey(handle, key); idx >= 0 {
+		pack_u64_le(obj_offsets[handle] + idx * 2 * FIELD_SIZE + FIELD_SIZE, transmute(u64)value)
+		return 1
+	}
+	if !ensure_capacity(handle, 2 * FIELD_SIZE) do return 0
+	base := obj_offsets[handle] + obj_sizes[handle]
+	pack_u64_le(base, transmute(u64)key)
+	pack_u64_le(base + FIELD_SIZE, transmute(u64)value)
+	obj_sizes[handle] += 2 * FIELD_SIZE
+	return 1
+}
+
+@(export)
+pw_map_set_numkey_i32 :: proc "contextless" (handle: i32, key: f64, value: i32) -> i32 {
+	if idx := map_find_numkey(handle, key); idx >= 0 {
+		pack_u64_le(obj_offsets[handle] + idx * 2 * FIELD_SIZE + FIELD_SIZE, u64(u32(value)))
+		return 1
+	}
+	if !ensure_capacity(handle, 2 * FIELD_SIZE) do return 0
+	base := obj_offsets[handle] + obj_sizes[handle]
+	pack_u64_le(base, transmute(u64)key)
+	pack_u64_le(base + FIELD_SIZE, u64(u32(value)))
+	obj_sizes[handle] += 2 * FIELD_SIZE
+	return 1
+}
+
 // --- Фаза 2.0: ввод_вывод::печать ------------------------------------
 //
 // Единственный builtin, поддержанный на этом срезе (см. план) — прямой
@@ -549,6 +680,7 @@ pw_int_to_string :: proc "contextless" (value: f64) -> i32 {
 	id := obj_count
 	obj_offsets[id] = off
 	obj_sizes[id] = length
+	obj_capacity[id] = obj_sizes[id]
 	obj_count += 1
 	return id
 }
@@ -633,6 +765,7 @@ pw_string_replace_all :: proc "contextless" (text: i32, old: i32, new: i32) -> i
 	id := obj_count
 	obj_offsets[id] = off
 	obj_sizes[id] = result_len
+	obj_capacity[id] = obj_sizes[id]
 	obj_count += 1
 	return id
 }

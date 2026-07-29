@@ -211,8 +211,24 @@ test_wasm_module_lowers_map_without_panic :: proc(t: ^testing.T) {
 	testing.expectf(t, len(bytes) > 8, "модуль пуст")
 }
 
-// Намеренно нет теста "паникует на interface/closures/actors/m[k]=v на
-// Соответствие вне области": Odin's panic() — фатальный abort процесса (нет
+@(test)
+test_wasm_module_lowers_array_push_and_map_set_index_without_panic :: proc(t: ^testing.T) {
+	bytes := lower_wasm_from_source(t, `
+		функ старт() -> Целое
+			пер a: Массив(Целое) = массив()
+			a.добавить(1)
+			a.добавить(2)
+			пер m = соответствие("а" = 1)
+			m["б"] = 2
+			m["а"] = 99
+			a.длина() + m.длина()
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
+// Намеренно нет теста "паникует на interface/closures/actors вне
+// области": Odin's panic() — фатальный abort процесса (нет
 // recover/unwind), проверка такого пути уронила бы весь тестовый бинарь
 // вместе со всеми остальными тестами. Код, отвечающий за это
 // (emit_mir_instr в core/wasm_emit.odin, wasm_val_type в core/wasm_

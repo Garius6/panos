@@ -584,6 +584,12 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 			// Const_Instr(string), см. её докстринг (PW_SCRATCH_SET-цикл +
 			// pw_alloc_from_scratch).
 			emit_string_const(ectx, PANOS_VERSION)
+		case "время::монотонно_мс":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_MONOTONIC_MS))
+		case "время::сейчас_мс":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_NOW_MS))
 		case:
 			panic(fmt.tprintf("wasm backend Фаза 2.0: builtin '%s' вне области (см. план)", v.name))
 		}

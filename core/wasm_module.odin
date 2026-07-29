@@ -136,7 +136,9 @@ PW_STRING_CONTAINS :: 13
 PW_INT_TO_STRING :: 14
 PW_STRING_COMPARE :: 15
 PW_STRING_REPLACE_ALL :: 16
-PW_IMPORT_COUNT :: 17
+PW_MONOTONIC_MS :: 17
+PW_NOW_MS :: 18
+PW_IMPORT_COUNT :: 19
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -157,6 +159,8 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_int_to_string", {WASM_F64}, {WASM_I32}},
 	{"pw_string_compare", {WASM_I32, WASM_I32}, {WASM_F64}},
 	{"pw_string_replace_all", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_monotonic_ms", {}, {WASM_F64}},
+	{"pw_now_ms", {}, {WASM_F64}},
 }
 
 @(private = "file")

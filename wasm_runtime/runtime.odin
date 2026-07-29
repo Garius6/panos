@@ -1,5 +1,7 @@
 package wasm_runtime
 
+import wasi "core:sys/wasm/wasi"
+
 // wasm_runtime — Фаза 1.5 WASM AOT-бэкенда: минимальный, ОТДЕЛЬНЫЙ от
 // core/gc.odin аллокатор для heap-значений (пока только строки) в
 // скомпилированных panos-программах. НЕ переиспользует core/gc.odin —
@@ -202,9 +204,9 @@ pw_get_field_i32 :: proc "contextless" (handle: i32, index: i32) -> i32 {
 // ("Redeclaration... with different type signatures"), найдено эмпирически
 // при первой попытке. Повторяем ТОЧНО ЕЁ сигнатуру — Odin сам маршаллит
 // [][]byte в нужный сырой iovec-массив, независимо от того, кто объявил.
-foreign import wasi "wasi_snapshot_preview1"
+foreign import wasi_snapshot "wasi_snapshot_preview1"
 @(default_calling_convention = "contextless")
-foreign wasi {
+foreign wasi_snapshot {
 	fd_write :: proc(fd: i32, iovs: [][]byte, n: ^uint) -> u16 ---
 }
 
@@ -392,4 +394,30 @@ pw_string_replace_all :: proc "contextless" (text: i32, old: i32, new: i32) -> i
 	obj_sizes[id] = result_len
 	obj_count += 1
 	return id
+}
+
+// --- время::монотонно_мс/сейчас_мс -------------------------------------
+//
+// core:sys/wasm/wasi (ОТДЕЛЬНЫЙ публичный Odin-пакет, не base/runtime's
+// #private os_specific_wasi.odin, см. докстринг про fd_write выше) —
+// собственного raw foreign import здесь заводить не нужно, wasi.
+// clock_time_get уже proc "contextless" и не требует context.allocator.
+//
+// ВАЖНО (не для дифф-тестов на точное равенство, см. core/wasm_backend_
+// wasmtime_test.odin): байткод-VM's время::монотонно_мс отсчитывает от
+// СВОЕГО vm.monotonic_epoch (момент запуска ЭТОГО процесса), а WASI's
+// CLOCK_MONOTONIC — от опорной точки хоста (обычно system boot), у
+// байткод-VM и скомпилированного .wasm-модуля РАЗНЫЕ процессы — значения
+// заведомо не совпадут численно. Проверяется отдельно ("возвращает
+// положительное число"), не через wasm_diff_check.
+@(export)
+pw_monotonic_ms :: proc "contextless" () -> f64 {
+	ts, _ := wasi.clock_time_get(wasi.CLOCK_MONOTONIC, 0)
+	return f64(ts) / 1e6
+}
+
+@(export)
+pw_now_ms :: proc "contextless" () -> f64 {
+	ts, _ := wasi.clock_time_get(wasi.CLOCK_REALTIME, 0)
+	return f64(ts) / 1e6
 }

@@ -561,6 +561,15 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 			append(code, 0x10)
 			write_uleb128(code, u64(PW_STRING_LEN))
 			append(code, 0xB7) // f64.convert_i32_s
+		case "строки::начинается_с":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_STARTS_WITH))
+		case "строки::заканчивается_на":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_ENDS_WITH))
+		case "строки::содержит":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_CONTAINS))
 		case:
 			panic(fmt.tprintf("wasm backend Фаза 2.0: builtin '%s' вне области (см. план)", v.name))
 		}

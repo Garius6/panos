@@ -130,7 +130,10 @@ PW_GET_FIELD_F64 :: 7
 PW_SET_FIELD_I32 :: 8
 PW_GET_FIELD_I32 :: 9
 PW_PRINT_STRING :: 10
-PW_IMPORT_COUNT :: 11
+PW_STRING_STARTS_WITH :: 11
+PW_STRING_ENDS_WITH :: 12
+PW_STRING_CONTAINS :: 13
+PW_IMPORT_COUNT :: 14
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -145,6 +148,9 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_set_field_i32", {WASM_I32, WASM_I32, WASM_I32}, {}},
 	{"pw_get_field_i32", {WASM_I32, WASM_I32}, {WASM_I32}},
 	{"pw_print_string", {WASM_I32}, {}},
+	{"pw_string_starts_with", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_string_ends_with", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_string_contains", {WASM_I32, WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")

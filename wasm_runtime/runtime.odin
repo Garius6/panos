@@ -215,3 +215,51 @@ pw_print_string :: proc "contextless" (handle: i32) {
 	n: uint
 	fd_write(1, {data}, &n)
 }
+
+// --- Фаза 2: строки::содержит/начинается_с/заканчивается_на -----------
+// Наивный побайтовый поиск (не Boyer-Moore/KMP) — оправдано размером
+// фикстур этого бэкенда, та же логика, что core:strings.contains/
+// has_prefix/has_suffix на стороне байткод-VM (core/vm.odin), только без
+// доступа к core:strings отсюда (contextless, своя память).
+
+@(export)
+pw_string_starts_with :: proc "contextless" (a: i32, prefix: i32) -> i32 {
+	a_off, a_len := obj_offsets[a], obj_sizes[a]
+	p_off, p_len := obj_offsets[prefix], obj_sizes[prefix]
+	if p_len > a_len do return 0
+	for i in i32(0) ..< p_len {
+		if arena[a_off + i] != arena[p_off + i] do return 0
+	}
+	return 1
+}
+
+@(export)
+pw_string_ends_with :: proc "contextless" (a: i32, suffix: i32) -> i32 {
+	a_off, a_len := obj_offsets[a], obj_sizes[a]
+	s_off, s_len := obj_offsets[suffix], obj_sizes[suffix]
+	if s_len > a_len do return 0
+	base := a_off + (a_len - s_len)
+	for i in i32(0) ..< s_len {
+		if arena[base + i] != arena[s_off + i] do return 0
+	}
+	return 1
+}
+
+@(export)
+pw_string_contains :: proc "contextless" (a: i32, pattern: i32) -> i32 {
+	a_off, a_len := obj_offsets[a], obj_sizes[a]
+	p_off, p_len := obj_offsets[pattern], obj_sizes[pattern]
+	if p_len == 0 do return 1
+	if p_len > a_len do return 0
+	for start in i32(0) ..= a_len - p_len {
+		match := true
+		for i in i32(0) ..< p_len {
+			if arena[a_off + start + i] != arena[p_off + i] {
+				match = false
+				break
+			}
+		}
+		if match do return 1
+	}
+	return 0
+}

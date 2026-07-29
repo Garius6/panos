@@ -185,3 +185,33 @@ pw_get_field_i32 :: proc "contextless" (handle: i32, index: i32) -> i32 {
 	bits := unpack_u64_le(obj_offsets[handle] + index * FIELD_SIZE)
 	return i32(u32(bits))
 }
+
+// --- Фаза 2.0: ввод_вывод::печать ------------------------------------
+//
+// Единственный builtin, поддержанный на этом срезе (см. план) — прямой
+// WASI-вызов, СВОЙ foreign import (то, что odin's собственная runtime-
+// инициализация уже импортирует wasi_snapshot_preview1.fd_write/
+// random_get, видно в объектнике этого же пакета, НЕ делает эти функции
+// вызываемыми ИЗ нашего кода — нужен собственный site вызова).
+
+// fd_write — Odin's СОБСТВЕННЫЙ base/runtime (os_specific_wasi.odin)
+// уже импортирует "wasi_snapshot_preview1"."fd_write" (для _stderr_write,
+// #private — не вызвать напрямую) со СВОЕЙ, высокоуровневой Odin-
+// сигнатурой (iovs: [][]byte, не сырой WASI ABI) — объявление ТОГО ЖЕ
+// имени import'а с ДРУГОЙ сигнатурой в этом же билде — ошибка компиляции
+// ("Redeclaration... with different type signatures"), найдено эмпирически
+// при первой попытке. Повторяем ТОЧНО ЕЁ сигнатуру — Odin сам маршаллит
+// [][]byte в нужный сырой iovec-массив, независимо от того, кто объявил.
+foreign import wasi "wasi_snapshot_preview1"
+@(default_calling_convention = "contextless")
+foreign wasi {
+	fd_write :: proc(fd: i32, iovs: [][]byte, n: ^uint) -> u16 ---
+}
+
+@(export)
+pw_print_string :: proc "contextless" (handle: i32) {
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	data := arena[off:][:length]
+	n: uint
+	fd_write(1, {data}, &n)
+}

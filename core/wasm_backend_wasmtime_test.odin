@@ -103,6 +103,34 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		return Diff_Result{ok = true, is_bool = false, num = n}
 	}
 
+	// run_wasm_stdout — Фаза 2.0 (ввод_вывод::печать): в отличие от
+	// run_wasm_diff, не парсит возврат старт() как число/булево (печать
+	// возвращает Пусто) — вместо этого возвращает СЫРОЙ stdout, реально
+	// написанный через pw_print_string (см. wasm_runtime/runtime.odin) —
+	// первый случай в этом бэкенде, где результат наблюдается напрямую, а
+	// не через Compare_Instr-обходной путь (см. строковые тесты Фазы 1.5).
+	@(private = "file")
+	run_wasm_stdout :: proc(source: string) -> (stdout: string, ok: bool) {
+		result := check_source(source)
+		if len(result.diags) > 0 do return "", false
+		module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
+		bytes := lower_module_to_wasm(&module)
+
+		id := sync.atomic_add(&wasm_diff_temp_file_counter, 1)
+		dir, dir_err := os.temp_dir(context.allocator)
+		if dir_err != nil do return "", false
+		path := fmt.tprintf("%s/panos_wasm_stdout_%d.wasm", dir, id)
+		if os.write_entire_file(path, bytes) != nil do return "", false
+		defer os.remove(path)
+
+		desc := os.Process_Desc {
+			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path},
+		}
+		state, stdout_bytes, _, err := os.process_exec(desc, context.allocator)
+		if err != nil || !state.success do return "", false
+		return string(stdout_bytes), true
+	}
+
 	@(private = "file")
 	wasm_diff_check :: proc(t: ^testing.T, source: string) {
 		bc := run_bytecode_diff(source)
@@ -352,6 +380,52 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 				(r.имя == "тест") и (r.активен == истина) и (r.счёт == 42)
 			конец
 		`)
+	}
+
+	// Фаза 2.0: первый Call_Builtin_Instr (ввод_вывод::печать) — реальный,
+	// напрямую наблюдаемый stdout через pw_print_string (wasm_runtime/
+	// runtime.odin's WASI fd_write), не Compare_Instr-обходной путь.
+
+	@(test)
+	test_wasm_print_writes_real_stdout :: proc(t: ^testing.T) {
+		out, ok := run_wasm_stdout(`
+			импорт ввод_вывод
+			функ старт() -> Пусто
+				ввод_вывод.печать("hello wasm")
+			конец
+		`)
+		testing.expectf(t, ok, "wasm-путь не выполнился")
+		testing.expectf(t, out == "hello wasm", "ожидался stdout 'hello wasm', получено %q", out)
+	}
+
+	@(test)
+	test_wasm_print_concatenated_string :: proc(t: ^testing.T) {
+		out, ok := run_wasm_stdout(`
+			импорт ввод_вывод
+			функ старт() -> Пусто
+				пер a = "при"
+				пер b = "вет"
+				ввод_вывод.печать(a + b)
+			конец
+		`)
+		testing.expectf(t, ok, "wasm-путь не выполнился")
+		testing.expectf(t, out == "привет", "ожидался stdout 'привет', получено %q", out)
+	}
+
+	@(test)
+	test_wasm_print_struct_field :: proc(t: ^testing.T) {
+		out, ok := run_wasm_stdout(`
+			импорт ввод_вывод
+			тип Запись = структура
+				имя: Строка
+			конец
+			функ старт() -> Пусто
+				пер r = Запись("панос")
+				ввод_вывод.печать(r.имя)
+			конец
+		`)
+		testing.expectf(t, ok, "wasm-путь не выполнился")
+		testing.expectf(t, out == "панос", "ожидался stdout 'панос', получено %q", out)
 	}
 
 }

@@ -111,6 +111,38 @@ test_wasm_module_lowers_string_const_without_panic :: proc(t: ^testing.T) {
 	testing.expectf(t, len(bytes) > 8, "модуль пуст")
 }
 
+@(test)
+test_wasm_module_lowers_print_call_without_panic :: proc(t: ^testing.T) {
+	// Фаза 2.0: ввод_вывод::печать больше не паникует (единственный
+	// поддержанный builtin, см. core/wasm_emit.odin's Call_Builtin_Instr
+	// case) — семантика (реальный stdout) проверяется дифференциальными
+	// тестами.
+	bytes := lower_wasm_from_source(t, `
+		импорт ввод_вывод
+		функ старт() -> Пусто
+			ввод_вывод.печать("привет")
+		конец
+	`)
+	name := transmute([]u8)string("pw_print_string")
+	found := false
+	if len(bytes) >= len(name) {
+		for i := 0; i <= len(bytes) - len(name); i += 1 {
+			match := true
+			for j in 0 ..< len(name) {
+				if bytes[i + j] != name[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				found = true
+				break
+			}
+		}
+	}
+	testing.expectf(t, found, "имя импорта 'pw_print_string' не найдено в байтах модуля")
+}
+
 // Намеренно нет теста "паникует на heap-инструкции вне области Фазы 1.5"
 // (агрегаты/массивы/interface/closures/actors): Odin's panic() —
 // фатальный abort процесса (нет recover/unwind), проверка такого пути

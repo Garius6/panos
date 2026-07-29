@@ -544,9 +544,21 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		// Callee_Info в докстринге Emit_Ctx).
 		emit_set_property(ectx, v)
 
+	case ^Call_Builtin_Instr:
+		// Фаза 2.0: единственный поддержанный builtin — ввод_вывод::печать
+		// (dst == nil / Пусто, не паникует use_count-based drop-логику
+		// emit_block_instructions — instr_refs для Call_Builtin_Instr
+		// возвращает dst = v.dst напрямую, т.е. nil здесь).
+		switch v.name {
+		case "ввод_вывод::печать":
+			append(code, 0x10) // call
+			write_uleb128(code, u64(PW_PRINT_STRING))
+		case:
+			panic(fmt.tprintf("wasm backend Фаза 2.0: builtin '%s' вне области (только ввод_вывод::печать)", v.name))
+		}
+
 	case ^Copy_Instr,
 	     ^Load_Captured_Instr,
-	     ^Call_Builtin_Instr,
 	     ^Call_Method_Instr,
 	     ^Call_Async_Instr,
 	     ^Call_Foreign_Instr,

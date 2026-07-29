@@ -263,3 +263,49 @@ pw_string_contains :: proc "contextless" (a: i32, pattern: i32) -> i32 {
 	}
 	return 0
 }
+
+// pw_int_to_string — строки::из_целого: десятичное форматирование БЕЗ
+// плавающей точки (Целое всегда целое число на этом срезе — никакой
+// scientific-notation неоднозначности, в отличие от строки::из_числа,
+// сознательно НЕ реализованного здесь — core:fmt-совместимое
+// форматирование f64 воспроизводить вручную рискованно, см. память
+// проекта про "%v" f64 -> scientific notation выше ~6-7 значащих цифр).
+@(export)
+pw_int_to_string :: proc "contextless" (value: f64) -> i32 {
+	n := i64(value)
+	neg := n < 0
+	if neg do n = -n
+
+	buf: [24]u8
+	pos := len(buf)
+	if n == 0 {
+		pos -= 1
+		buf[pos] = '0'
+	} else {
+		for n > 0 {
+			pos -= 1
+			buf[pos] = u8('0' + (n % 10))
+			n /= 10
+		}
+	}
+	if neg {
+		pos -= 1
+		buf[pos] = '-'
+	}
+	length := i32(len(buf) - pos)
+
+	if next_free + length > ARENA_SIZE || obj_count >= MAX_OBJECTS {
+		return -1
+	}
+	off := next_free
+	for i in i32(0) ..< length {
+		arena[off + i] = buf[pos + int(i)]
+	}
+	next_free += length
+
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = length
+	obj_count += 1
+	return id
+}

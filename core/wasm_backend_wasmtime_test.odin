@@ -305,4 +305,53 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		`)
 	}
 
+	// Фаза 1.5: агрегаты (New_Aggregate_Instr/Get_Property_Instr/
+	// Set_Property_Instr) — только через прямой доступ к полям (.x/.y),
+	// без методов (Call_Method_Instr вне области Фазы 1.5).
+
+	@(test)
+	test_wasm_diff_struct_construct_and_read_fields :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			тип Точка = структура
+				x: Число
+				y: Число
+			конец
+			функ старт() -> Число
+				пер p = Точка(3, 4)
+				p.x + p.y
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_struct_set_field :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			тип Точка = структура
+				x: Число
+				y: Число
+			конец
+			функ старт() -> Число
+				пер p = Точка(1, 1)
+				p.x = 10
+				p.y = 20
+				p.x + p.y
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_struct_mixed_field_types :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			тип Запись = структура
+				имя: Строка
+				активен: Булево
+				счёт: Число
+			конец
+			функ старт() -> Булево
+				пер r = Запись("тест", истина, 42)
+				(r.имя == "тест") и (r.активен == истина) и (r.счёт == 42)
+			конец
+		`)
+	}
+
 }

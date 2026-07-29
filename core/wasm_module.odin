@@ -65,12 +65,12 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 	#partial switch pt.kind {
 	case .Number, .Integer:
 		return WASM_F64
-	case .Bool, .String:
+	case .Bool, .String, .Struct:
 		return WASM_I32
 	case:
 		panic(
 			fmt.tprintf(
-				"wasm backend Фаза 1/1.5: тип %v не поддержан (нет агрегатов/interface/generics в этой фазе)",
+				"wasm backend Фаза 1/1.5: тип %v не поддержан (нет interface/generics/массивов/map в этой фазе)",
 				pt.kind,
 			),
 		)
@@ -82,7 +82,7 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 @(private = "file")
 is_wasm_phase1_type :: proc(t: ^Type) -> bool {
 	#partial switch prune_type(t).kind {
-	case .Number, .Integer, .Bool, .Void, .String:
+	case .Number, .Integer, .Bool, .Void, .String, .Struct:
 		return true
 	case:
 		return false
@@ -124,7 +124,12 @@ PW_ALLOC_FROM_SCRATCH :: 1
 PW_STRING_LEN :: 2
 PW_CONCAT_STRINGS :: 3
 PW_STRING_EQUAL :: 4
-PW_IMPORT_COUNT :: 5
+PW_ALLOC_AGGREGATE :: 5
+PW_SET_FIELD_F64 :: 6
+PW_GET_FIELD_F64 :: 7
+PW_SET_FIELD_I32 :: 8
+PW_GET_FIELD_I32 :: 9
+PW_IMPORT_COUNT :: 10
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -133,6 +138,11 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_string_len", {WASM_I32}, {WASM_I32}},
 	{"pw_concat_strings", {WASM_I32, WASM_I32}, {WASM_I32}},
 	{"pw_string_equal", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_alloc_aggregate", {WASM_I32}, {WASM_I32}},
+	{"pw_set_field_f64", {WASM_I32, WASM_I32, WASM_F64}, {}},
+	{"pw_get_field_f64", {WASM_I32, WASM_I32}, {WASM_F64}},
+	{"pw_set_field_i32", {WASM_I32, WASM_I32, WASM_I32}, {}},
+	{"pw_get_field_i32", {WASM_I32, WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")

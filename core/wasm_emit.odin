@@ -43,15 +43,21 @@ Emit_Ctx :: struct {
 	// СВЕРХУ (последним операндом, ПОСЛЕ аргументов), т.е. ПРОТИВОПОЛОЖНЫЙ
 	// порядок. Поэтому Function_Ref_Instr НЕ кладёт значение на
 	// operand-стек вообще — сохраняет его в СОБСТВЕННУЮ (на каждый
-	// Function_Ref_Instr — свою, см. next_callee_local: вложенные вызовы,
-	// напр. `f(g(1), 2)`, иначе перезаписали бы общую ячейку между
-	// собственным Function_Ref_Instr'ом g и f) i32-scratch-локаль, а
-	// Call_Value_Instr перечитывает её local.get'ом ПОСЛЕ того, как
-	// аргументы уже легли на стек обычным replay — восстанавливая нужный
-	// WASM-порядок.
+	// Function_Ref_Instr — свою — вложенные вызовы, напр. `f(g(1), 2)`,
+	// иначе перезаписали бы общую ячейку между собственным
+	// Function_Ref_Instr'ом g и f) i32-scratch-локаль из общего пула (см.
+	// alloc_i32_scratch), а Call_Value_Instr перечитывает её local.get'ом
+	// ПОСЛЕ того, как аргументы уже легли на стек обычным replay —
+	// восстанавливая нужный WASM-порядок. New_Aggregate_Instr (Фаза 1.5)
+	// использует ТОТ ЖЕ пул по той же причине — элементы уже на стеке
+	// пачкой к моменту New_Aggregate_Instr, порядок вызовов pw_set_field_*
+	// требует их по одному вперемешку с handle/индексом, см. её case.
 	value_to_callee:    map[Value_Id]Callee_Info,
-	next_callee_local:  int,
 	scratch_base:       int, // индекс первого из 2 f64 scratch-локалей (Modulo/битовые)
+	i32_pool_base:      int, // индекс первого из I32_SCRATCH_POOL_SIZE scratch-локалей
+	f64_pool_base:      int, // индекс первого из F64_SCRATCH_POOL_SIZE scratch-локалей
+	next_i32_scratch:   int,
+	next_f64_scratch:   int,
 	// Исходный Function_Id (индекс в module.functions) -> компактный wasm
 	// funcidx/typeidx/table-slot (см. core/wasm_module.odin's
 	// lower_module_to_wasm — прелюдийные функции выброшены, нумерация
@@ -77,6 +83,9 @@ Wasm_Scope :: struct {
 new_emit_ctx :: proc(module: ^Mir_Module, fn: ^Mir_Function, func_index: ^map[Function_Id]int) -> Emit_Ctx {
 	info := compute_cfg_info(fn)
 	rpo_index := build_rpo_index(&info)
+	scratch_base := len(fn.locals)
+	i32_pool_base := scratch_base + WASM_SCRATCH_COUNT
+	f64_pool_base := i32_pool_base + I32_SCRATCH_POOL_SIZE
 	ectx := Emit_Ctx {
 		module           = module,
 		fn               = fn,
@@ -87,12 +96,44 @@ new_emit_ctx :: proc(module: ^Mir_Module, fn: ^Mir_Function, func_index: ^map[Fu
 		scope_stack      = make([dynamic]Wasm_Scope),
 		code             = make([dynamic]u8),
 		value_to_callee  = make(map[Value_Id]Callee_Info),
-		scratch_base     = len(fn.locals),
-		next_callee_local = len(fn.locals) + WASM_SCRATCH_COUNT,
+		scratch_base     = scratch_base,
+		i32_pool_base    = i32_pool_base,
+		f64_pool_base    = f64_pool_base,
+		next_i32_scratch = i32_pool_base,
+		next_f64_scratch = f64_pool_base,
 		func_index       = func_index,
 		use_count        = compute_use_count(fn),
 	}
 	return ectx
+}
+
+// alloc_i32_scratch/alloc_f64_scratch — свежая локаль из фиксированного
+// пула (см. Emit_Ctx's докстринг про Function_Ref_Instr/New_Aggregate_
+// Instr) — размер пула фиксирован ЗАРАНЕЕ (I32/F64_SCRATCH_POOL_SIZE),
+// поэтому декларация локалей функции (emit_function_wasm) не должна ждать
+// конца эмиссии тела, чтобы узнать точный размер (в отличие от Фазы 1,
+// где n_callee_locals считался ПОСЛЕ process_from) — просто, ценой
+// декларации фиксированного числа локалей даже если реально использована
+// лишь часть (незаметные лишние байты в секции локалей, не рантайм-
+// накладные расходы — оправдано для размера фикстур Фазы 1.5).
+@(private = "file")
+alloc_i32_scratch :: proc(ectx: ^Emit_Ctx) -> int {
+	idx := ectx.next_i32_scratch
+	ectx.next_i32_scratch += 1
+	if idx >= ectx.i32_pool_base + I32_SCRATCH_POOL_SIZE {
+		panic("wasm backend Фаза 1.5: исчерпан пул i32 scratch-локалей — см. I32_SCRATCH_POOL_SIZE")
+	}
+	return idx
+}
+
+@(private = "file")
+alloc_f64_scratch :: proc(ectx: ^Emit_Ctx) -> int {
+	idx := ectx.next_f64_scratch
+	ectx.next_f64_scratch += 1
+	if idx >= ectx.f64_pool_base + F64_SCRATCH_POOL_SIZE {
+		panic("wasm backend Фаза 1.5: исчерпан пул f64 scratch-локалей — см. F64_SCRATCH_POOL_SIZE")
+	}
+	return idx
 }
 
 @(private = "file")
@@ -133,28 +174,24 @@ compute_use_count :: proc(fn: ^Mir_Function, allocator := context.allocator) -> 
 	return uc
 }
 
-WASM_SCRATCH_COUNT :: 2
+WASM_SCRATCH_COUNT :: 2 // f64 scratch для Modulo/битовых, см. emit_modulo/emit_bitwise_f64
+I32_SCRATCH_POOL_SIZE :: 64
+F64_SCRATCH_POOL_SIZE :: 64
 
 // emit_function_wasm — тело функции в code-секции: вектор деклараций
 // локалей + сами инструкции + завершающий 0x0B. Вызывается из
-// core/wasm_module.odin.
+// core/wasm_module.odin. Пулы scratch-локалей — ФИКСИРОВАННОГО размера
+// (см. alloc_i32_scratch/alloc_f64_scratch) — декларация не должна ждать
+// конца эмиссии тела, чтобы узнать точный размер.
 emit_function_wasm :: proc(module: ^Mir_Module, mfn: ^Mir_Function, func_index: ^map[Function_Id]int) -> [dynamic]u8 {
 	ectx := new_emit_ctx(module, mfn, func_index)
 	defer destroy_emit_ctx(&ectx)
 
 	process_from(&ectx, mfn.entry, INVALID_BLOCK)
 
-	// n_callee_locals посчитан ТОЛЬКО СЕЙЧАС (после process_from) — каждый
-	// Function_Ref_Instr, встреченный по пути, завёл себе одну i32-локаль
-	// (см. Callee_Info в докстринге Emit_Ctx) — то же самое, что уже было
-	// сделано ниже для scratch_base/WASM_SCRATCH_COUNT: тело эмитится
-	// ПЕРВЫМ, декларация локалей строится по факту того, что реально
-	// понадобилось.
-	n_callee_locals := ectx.next_callee_local - (ectx.scratch_base + WASM_SCRATCH_COUNT)
-
 	out := make([dynamic]u8)
 	n_body_locals := len(mfn.locals) - len(mfn.parameters)
-	write_uleb128(&out, u64(n_body_locals + WASM_SCRATCH_COUNT + n_callee_locals))
+	write_uleb128(&out, u64(n_body_locals + WASM_SCRATCH_COUNT + I32_SCRATCH_POOL_SIZE + F64_SCRATCH_POOL_SIZE))
 	for i in len(mfn.parameters) ..< len(mfn.locals) {
 		write_uleb128(&out, 1)
 		append(&out, wasm_val_type(mfn.locals[i].type))
@@ -163,9 +200,13 @@ emit_function_wasm :: proc(module: ^Mir_Module, mfn: ^Mir_Function, func_index: 
 		write_uleb128(&out, 1)
 		append(&out, WASM_F64)
 	}
-	for _ in 0 ..< n_callee_locals {
+	for _ in 0 ..< I32_SCRATCH_POOL_SIZE {
 		write_uleb128(&out, 1)
 		append(&out, WASM_I32)
+	}
+	for _ in 0 ..< F64_SCRATCH_POOL_SIZE {
+		write_uleb128(&out, 1)
+		append(&out, WASM_F64)
 	}
 	for b in ectx.code do append(&out, b)
 	append(&out, 0x0B) // end функции
@@ -327,6 +368,80 @@ value_kind :: proc(ectx: ^Emit_Ctx, v: Value_Id) -> Type_Kind {
 	return prune_type(ectx.fn.value_types[int(v)]).kind
 }
 
+// wasm_field_setter/getter — Булево/Строка (WASM i32-представление, см.
+// wasm_val_type) идут через pw_*_field_i32, Число/Целое — через
+// pw_*_field_f64. Struct-типизированные поля (вложенные агрегаты) ТОЖЕ
+// i32 (handle) — см. wasm_val_type's .Struct case.
+@(private = "file")
+wasm_field_is_i32 :: proc(kind: Type_Kind) -> bool {
+	return kind == .Bool || kind == .String || kind == .Struct
+}
+
+// emit_new_aggregate — элементы УЖЕ на стеке пачкой (обычный replay, в
+// порядке v.elements), но pw_set_field_* нужен порядок (handle, index,
+// value) на КАЖДЫЙ элемент по отдельности — снимаем все элементы в
+// scratch-локали (в ОБРАТНОМ порядке, раз последний элемент СВЕРХУ),
+// затем собираем агрегат и заполняем поля в прямом порядке, читая
+// значения обратно из scratch (та же схема, что Function_Ref_Instr's
+// Callee_Info, обобщённая на N значений и на f64/i32 сразу).
+@(private = "file")
+emit_new_aggregate :: proc(ectx: ^Emit_Ctx, v: ^New_Aggregate_Instr) {
+	code := &ectx.code
+	n := len(v.elements)
+
+	elem_locals := make([]int, n, context.temp_allocator)
+	elem_is_i32 := make([]bool, n, context.temp_allocator)
+	for i := n - 1; i >= 0; i -= 1 {
+		is_i32 := wasm_field_is_i32(value_kind(ectx, v.elements[i]))
+		elem_is_i32[i] = is_i32
+		local := is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
+		elem_locals[i] = local
+		append(code, 0x21) // local.set (снимает текущий верх стека — элемент i, т.к. идём с конца)
+		write_uleb128(code, u64(local))
+	}
+
+	handle_local := alloc_i32_scratch(ectx)
+	append(code, 0x41) // i32.const field_count
+	write_sleb128(code, i64(n))
+	append(code, 0x10) // call pw_alloc_aggregate
+	write_uleb128(code, u64(PW_ALLOC_AGGREGATE))
+	append(code, 0x21) // local.set handle
+	write_uleb128(code, u64(handle_local))
+
+	for i in 0 ..< n {
+		append(code, 0x20) // local.get handle
+		write_uleb128(code, u64(handle_local))
+		append(code, 0x41) // i32.const index
+		write_sleb128(code, i64(i))
+		append(code, 0x20) // local.get элемент (тип берётся из декларации локали, не из опкода)
+		write_uleb128(code, u64(elem_locals[i]))
+		append(code, 0x10)
+		write_uleb128(code, u64(elem_is_i32[i] ? PW_SET_FIELD_I32 : PW_SET_FIELD_F64))
+	}
+
+	append(code, 0x20) // local.get handle — итоговое значение New_Aggregate_Instr
+	write_uleb128(code, u64(handle_local))
+}
+
+// emit_set_property — object и value уже на стеке В ЭТОМ порядке (см.
+// instr_refs: [object, value], value сверху) — pw_set_field_* нужен
+// (handle, index, value), т.е. index должен встать МЕЖДУ ними. Снимаем
+// value в scratch, кладём его назад ПОСЛЕ индекса.
+@(private = "file")
+emit_set_property :: proc(ectx: ^Emit_Ctx, v: ^Set_Property_Instr) {
+	code := &ectx.code
+	is_i32 := wasm_field_is_i32(value_kind(ectx, v.value))
+	local := is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
+	append(code, 0x21) // local.set value (снимает верх стека — object остаётся)
+	write_uleb128(code, u64(local))
+	append(code, 0x41) // i32.const field_index
+	write_sleb128(code, i64(v.field_index))
+	append(code, 0x20) // local.get value
+	write_uleb128(code, u64(local))
+	append(code, 0x10)
+	write_uleb128(code, u64(is_i32 ? PW_SET_FIELD_I32 : PW_SET_FIELD_F64))
+}
+
 @(private = "file")
 resolve_func_index :: proc(ectx: ^Emit_Ctx, fn: Function_Id) -> int {
 	idx, ok := ectx.func_index^[fn]
@@ -383,8 +498,7 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		// докстринге Emit_Ctx (порядок callee/аргументов у MIR
 		// противоположен тому, что нужен WASM call_indirect).
 		wasm_idx := resolve_func_index(ectx, v.fn)
-		local := ectx.next_callee_local
-		ectx.next_callee_local += 1
+		local := alloc_i32_scratch(ectx)
 		append(code, 0x41) // i32.const
 		write_sleb128(code, i64(wasm_idx))
 		append(code, 0x21) // local.set
@@ -408,15 +522,34 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		write_uleb128(code, u64(wasm_idx)) // typeidx == funcidx (см. wasm_module.odin)
 		write_uleb128(code, 0) // tableidx 0
 
+	case ^New_Aggregate_Instr:
+		emit_new_aggregate(ectx, v)
+
+	case ^Get_Property_Instr:
+		// object (handle) уже на стеке — pw_get_field_* принимает
+		// (handle, index), нужен ЕЩЁ индекс сверху ПЕРЕД вызовом.
+		append(code, 0x41) // i32.const field_index
+		write_sleb128(code, i64(v.field_index))
+		field_getter := wasm_field_is_i32(value_kind(ectx, v.dst)) ? PW_GET_FIELD_I32 : PW_GET_FIELD_F64
+		append(code, 0x10)
+		write_uleb128(code, u64(field_getter))
+
+	case ^Set_Property_Instr:
+		// Set_Property_Instr не имеет dst — object и value УЖЕ на стеке в
+		// этом порядке (см. instr_refs: append(&operands, v.object, v.value)),
+		// но pw_set_field_* нужен порядок (handle, index, value) — index
+		// между ними, поэтому здесь нельзя просто "оставить как есть":
+		// нужна scratch-локаль для value, чтобы вставить index между handle
+		// и value (та же проблема порядка, что Call_Value_Instr, см.
+		// Callee_Info в докстринге Emit_Ctx).
+		emit_set_property(ectx, v)
+
 	case ^Copy_Instr,
 	     ^Load_Captured_Instr,
 	     ^Call_Builtin_Instr,
 	     ^Call_Method_Instr,
 	     ^Call_Async_Instr,
 	     ^Call_Foreign_Instr,
-	     ^New_Aggregate_Instr,
-	     ^Get_Property_Instr,
-	     ^Set_Property_Instr,
 	     ^New_Array_Instr,
 	     ^New_Map_Instr,
 	     ^Get_Index_Instr,

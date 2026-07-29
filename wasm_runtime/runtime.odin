@@ -113,3 +113,75 @@ pw_string_equal :: proc "contextless" (a: i32, b: i32) -> i32 {
 	}
 	return 1
 }
+
+// --- Агрегаты (структуры/анонимные туплы) --------------------------------
+//
+// Тот же объект-в-арене принцип, что строки (obj_offsets/obj_sizes,
+// общая таблица) — размер объекта в байтах = field_count*FIELD_SIZE.
+// Каждое поле — 8-байтный слот, ЛИБО f64 (Число/Целое), ЛИБО i32 в
+// младших 4 байтах (Булево/Строка-handle) — какой из двух, знает
+// СТАТИЧЕСКИ сгенерированный код (см. core/wasm_emit.odin — то же
+// "статический тип, без рантайм-тега" решение, что для строк). Ручная
+// побайтовая упаковка/распаковка (не прямой `(^f64)(&arena[off])^`) —
+// `arena` не гарантированно выровнена под f64 на произвольном смещении.
+
+FIELD_SIZE :: 8
+
+@(private)
+pack_u64_le :: proc "contextless" (off: i32, bits: u64) {
+	for i in i32(0) ..< 8 {
+		arena[off + i] = u8(bits >> uint(i * 8))
+	}
+}
+
+@(private)
+unpack_u64_le :: proc "contextless" (off: i32) -> u64 {
+	bits: u64
+	for i in i32(0) ..< 8 {
+		bits |= u64(arena[off + i]) << uint(i * 8)
+	}
+	return bits
+}
+
+// pw_alloc_aggregate — field_count полей по FIELD_SIZE байт, поля
+// изначально нулевые. -1 — арена/таблица объектов исчерпана.
+@(export)
+pw_alloc_aggregate :: proc "contextless" (field_count: i32) -> i32 {
+	size := field_count * FIELD_SIZE
+	if next_free + size > ARENA_SIZE || obj_count >= MAX_OBJECTS || field_count < 0 {
+		return -1
+	}
+	off := next_free
+	for i in i32(0) ..< size {
+		arena[off + i] = 0
+	}
+	next_free += size
+
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = size
+	obj_count += 1
+	return id
+}
+
+@(export)
+pw_set_field_f64 :: proc "contextless" (handle: i32, index: i32, value: f64) {
+	pack_u64_le(obj_offsets[handle] + index * FIELD_SIZE, transmute(u64)value)
+}
+
+@(export)
+pw_get_field_f64 :: proc "contextless" (handle: i32, index: i32) -> f64 {
+	bits := unpack_u64_le(obj_offsets[handle] + index * FIELD_SIZE)
+	return transmute(f64)bits
+}
+
+@(export)
+pw_set_field_i32 :: proc "contextless" (handle: i32, index: i32, value: i32) {
+	pack_u64_le(obj_offsets[handle] + index * FIELD_SIZE, u64(u32(value)))
+}
+
+@(export)
+pw_get_field_i32 :: proc "contextless" (handle: i32, index: i32) -> i32 {
+	bits := unpack_u64_le(obj_offsets[handle] + index * FIELD_SIZE)
+	return i32(u32(bits))
+}

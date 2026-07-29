@@ -1,3 +1,4 @@
+#+build !js
 package core
 
 import "core:fmt"

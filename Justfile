@@ -35,6 +35,14 @@ sync-lsp-protocol:
 test:
 	odin test ./core -define:ODIN_TEST_TRACK_MEMORY=false
 
+# Дифференциальные тесты WASM AOT-бэкенда (Фаза 1, core/wasm_backend_
+# wasmtime_test.odin) — за #config(PANOS_WASM_BACKEND_TESTS), НЕ входят в
+# обычный `just test`: требуют установленный `wasmtime` в PATH (dev/test-
+# only зависимость, см. специфику вендоринга в проекте — это НЕ то же
+# самое, что зависимости самого бинаря panos).
+test-wasm-backend:
+	odin test ./core -define:ODIN_TEST_TRACK_MEMORY=false -define:PANOS_WASM_BACKEND_TESTS=true
+
 # Обновляет PANOS_VERSION (core/vm.odin), собирает+тестирует, коммитит
 # "chore: версия X.Y.Z", тегирует vX.Y.Z, пушит main и тег — тот же
 # ручной semver, что описан в комментарии у PANOS_VERSION. Версию

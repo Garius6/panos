@@ -1,0 +1,256 @@
+package core
+
+import "core:fmt"
+import "core:os"
+import "core:strconv"
+import "core:strings"
+import "core:sync"
+import "core:testing"
+
+// wasm_backend_wasmtime_test.odin — дифференциальные тесты WASM AOT-
+// бэкенда (Фаза 1): один и тот же исходник исполняется (а) существующей
+// байткод-VM, (б) реально скомпилированным .wasm-модулем под wasmtime —
+// результаты должны совпасть. Тот же принцип, что core/mir_optimize_test.
+// odin's opt_diff_check (страховка, поймавшая 2 реальных бага за эту
+// сессию) — здесь применён к НОВОМУ бэкенду вместо оптимизации.
+//
+// За #config(PANOS_WASM_BACKEND_TESTS, false) — требует установленный
+// `wasmtime` в PATH, НЕ входит в обычный `odin test ./core`/`just test`
+// (см. `just test-wasm-backend`, Justfile) — согласовано с пользователем
+// явно (отдельный рецепт вместо runtime-skip, чтобы контрибьюторы без
+// wasmtime вообще не собирали эти тесты, а не просто видели их "прошли
+// тривиально").
+
+when #config(PANOS_WASM_BACKEND_TESTS, false) {
+
+	@(private = "file")
+	wasm_diff_temp_file_counter: i64
+
+	@(private = "file")
+	Diff_Result :: struct {
+		ok:      bool,
+		is_bool: bool,
+		num:     f64,
+		bl:      bool,
+	}
+
+	@(private = "file")
+	run_bytecode_diff :: proc(source: string) -> Diff_Result {
+		result := check_source(source)
+		if len(result.diags) > 0 do return Diff_Result{ok = false}
+		module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
+		registry := lower_module_to_bytecode(&module)
+		vm := new_vm(registry)
+		run_scheduler(vm)
+		if len(vm.stack) == 0 do return Diff_Result{ok = false}
+		top := vm.stack[len(vm.stack) - 1]
+		if b, is_b := top.(bool); is_b {
+			return Diff_Result{ok = true, is_bool = true, bl = b}
+		}
+		if n, is_n := top.(f64); is_n {
+			return Diff_Result{ok = true, is_bool = false, num = n}
+		}
+		return Diff_Result{ok = false}
+	}
+
+	@(private = "file")
+	run_wasm_diff :: proc(source: string) -> Diff_Result {
+		result := check_source(source)
+		if len(result.diags) > 0 do return Diff_Result{ok = false}
+		module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
+
+		entry_is_bool := false
+		found_entry := false
+		for &mfn in module.functions {
+			if mfn.name == "старт" {
+				entry_is_bool = prune_type(mfn.result_type).kind == .Bool
+				found_entry = true
+				break
+			}
+		}
+		if !found_entry do return Diff_Result{ok = false}
+
+		bytes := lower_module_to_wasm(&module)
+
+		id := sync.atomic_add(&wasm_diff_temp_file_counter, 1)
+		dir, dir_err := os.temp_dir(context.allocator)
+		if dir_err != nil do return Diff_Result{ok = false}
+		path := fmt.tprintf("%s/panos_wasm_diff_%d.wasm", dir, id)
+		if os.write_entire_file(path, bytes) != nil do return Diff_Result{ok = false}
+		defer os.remove(path)
+
+		desc := os.Process_Desc {
+			command = []string{"wasmtime", "run", "--invoke", "старт", path},
+		}
+		state, stdout_bytes, _, err := os.process_exec(desc, context.allocator)
+		if err != nil || !state.success do return Diff_Result{ok = false}
+
+		out := strings.trim_space(string(stdout_bytes))
+		if entry_is_bool {
+			n, parsed := strconv.parse_int(out)
+			if !parsed do return Diff_Result{ok = false}
+			return Diff_Result{ok = true, is_bool = true, bl = n != 0}
+		}
+		n, parsed := strconv.parse_f64(out)
+		if !parsed do return Diff_Result{ok = false}
+		return Diff_Result{ok = true, is_bool = false, num = n}
+	}
+
+	@(private = "file")
+	wasm_diff_check :: proc(t: ^testing.T, source: string) {
+		bc := run_bytecode_diff(source)
+		wa := run_wasm_diff(source)
+		testing.expectf(t, bc.ok, "байткод-путь не вернул значение для:\n%s", source)
+		testing.expectf(t, wa.ok, "wasm-путь (wasmtime) не вернул значение для:\n%s", source)
+		if bc.ok && wa.ok {
+			testing.expectf(
+				t,
+				bc.is_bool == wa.is_bool,
+				"РАСХОЖДЕНИЕ ТИПА: байткод is_bool=%v, wasm is_bool=%v, источник:\n%s",
+				bc.is_bool,
+				wa.is_bool,
+				source,
+			)
+			if bc.is_bool {
+				testing.expectf(
+					t,
+					bc.bl == wa.bl,
+					"РАСХОЖДЕНИЕ: байткод=%v, wasm=%v, источник:\n%s",
+					bc.bl,
+					wa.bl,
+					source,
+				)
+			} else {
+				testing.expectf(
+					t,
+					bc.num == wa.num,
+					"РАСХОЖДЕНИЕ: байткод=%v, wasm=%v, источник:\n%s",
+					bc.num,
+					wa.num,
+					source,
+				)
+			}
+		}
+	}
+
+	@(test)
+	test_wasm_diff_arithmetic :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				(1 + 2 * 3 - 4) / 2
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_bitwise_and_integer_division :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Целое
+				пер a: Целое = 13
+				пер b: Целое = 5
+				a / b + a % b + (a & b) + (a | b) + (a ^ b) + (~a) + (a << 1) + (a >> 1)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_comparisons :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				пер a = 3
+				пер b = 5
+				(a < b) и (b > a) и (a <= 3) и (b >= 5) и (a <> b) и не (a == b)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_if_else_both_branches_as_value :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер x = 7
+				если x > 5 тогда
+					100
+				иначе
+					200
+				конец
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер x = 2
+				если x > 5 тогда
+					100
+				иначе
+					200
+				конец
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_if_else_as_statement :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер x = 7
+				пер результат = 0.0
+				если x > 5 тогда
+					результат = 1
+				иначе
+					результат = 2
+				конец
+				результат
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_while_break_continue :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Целое
+				пер i: Целое = 0
+				пер сумма: Целое = 0
+				пока i < 10 цикл
+					i = i + 1
+					если i % 2 == 0 тогда
+						продолжить
+					конец
+					если i > 7 тогда
+						прервать
+					конец
+					сумма = сумма + i
+				конец
+				сумма
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_function_call_with_args :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ сложить(a: Число, b: Число) -> Число
+				a + b
+			конец
+			функ старт() -> Число
+				сложить(3, 4) + сложить(10, 20)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_recursion :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ факториал(n: Целое) -> Целое
+				если n <= 1 тогда
+					1
+				иначе
+					n * факториал(n - 1)
+				конец
+			конец
+			функ старт() -> Целое
+				факториал(6)
+			конец
+		`)
+	}
+
+}

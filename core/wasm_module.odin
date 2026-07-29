@@ -1,0 +1,222 @@
+package core
+
+import "core:fmt"
+
+// wasm_module.odin — сборка итогового .wasm-модуля (Фаза 1, "walking
+// skeleton" WASM AOT-бэкенда). LEB128/секционные помощники + entry point
+// lower_module_to_wasm. Инструкции самих функций эмитит wasm_emit.odin
+// (через process_from, core/wasm_emit.odin) — этот файл только упаковывает
+// готовые байты тел в секции согласно бинарному формату WASM (порядок
+// секций СТРОГО по числовому id: Type(1) < Function(3) < Table(4) <
+// Export(7) < Element(9) < Code(10), см. спецификацию).
+//
+// Функция i модуля получает typeidx=i, table-slot=i — тот же индекс во
+// ВСЕХ трёх пространствах (простейшее однозначное соответствие, не
+// экономит место в typesection на дублирующихся сигнатурах, но не требует
+// отдельной de-dup таблицы — оправдано для Фазы 1).
+
+write_uleb128 :: proc(buf: ^[dynamic]u8, value: u64) {
+	v := value
+	for {
+		b := u8(v & 0x7F)
+		v >>= 7
+		if v != 0 {
+			append(buf, b | 0x80)
+		} else {
+			append(buf, b)
+			break
+		}
+	}
+}
+
+write_sleb128 :: proc(buf: ^[dynamic]u8, value: i64) {
+	v := value
+	more := true
+	for more {
+		b := u8(v & 0x7F)
+		v >>= 7 // арифметический (знаковый) сдвиг у Odin на i64 — то, что нужно SLEB128
+		if (v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0) {
+			more = false
+		} else {
+			b |= 0x80
+		}
+		append(buf, b)
+	}
+}
+
+write_f64_le :: proc(buf: ^[dynamic]u8, value: f64) {
+	bits := transmute(u64)value
+	for i in 0 ..< 8 {
+		append(buf, u8(bits >> uint(i * 8)))
+	}
+}
+
+WASM_I32 :: 0x7F
+WASM_F64 :: 0x7C
+
+// wasm_val_type — тип значения в WASM для статического типа panos-Value_Id
+// (Фаза 1: только Число/Целое -> f64, Булево -> i32; всё остальное — вне
+// области действия Фазы 1, см. план "Explicitly OUT").
+wasm_val_type :: proc(t: ^Type) -> u8 {
+	pt := prune_type(t)
+	#partial switch pt.kind {
+	case .Number, .Integer:
+		return WASM_F64
+	case .Bool:
+		return WASM_I32
+	case:
+		panic(
+			fmt.tprintf(
+				"wasm backend Фаза 1: тип %v не поддержан (нет heap-значений в этой фазе)",
+				pt.kind,
+			),
+		)
+	}
+}
+
+// is_wasm_phase1_type — как wasm_val_type, но БЕЗ паники (проверка, а не
+// конвертация) — Пусто тоже допустим (возврат без значения).
+@(private = "file")
+is_wasm_phase1_type :: proc(t: ^Type) -> bool {
+	#partial switch prune_type(t).kind {
+	case .Number, .Integer, .Bool, .Void:
+		return true
+	case:
+		return false
+	}
+}
+
+// is_wasm_phase1_function — lower_module лоурит ВСЕ функции программы,
+// включая прелюдию (Опция/Результат — @prelude::*, см. core/prelude.odin) —
+// они используют Enum/InferVar и вне области Фазы 1 независимо от того,
+// использует ли их конкретная тестовая программа. Функция включается в
+// wasm-модуль, только если ЕЁ СОБСТВЕННАЯ сигнатура+локали не выходят за
+// рамки Фазы 1 — остальные просто не эмитятся (не вызываются фикстурами
+// Фазы 1 по построению, см. план).
+@(private = "file")
+is_wasm_phase1_function :: proc(mfn: ^Mir_Function) -> bool {
+	if !is_wasm_phase1_type(mfn.result_type) do return false
+	for l in mfn.locals {
+		if !is_wasm_phase1_type(l.type) do return false
+	}
+	return true
+}
+
+@(private = "file")
+write_section :: proc(out: ^[dynamic]u8, id: u8, content: []u8) {
+	append(out, id)
+	write_uleb128(out, u64(len(content)))
+	for b in content do append(out, b)
+}
+
+@(private = "file")
+write_name :: proc(buf: ^[dynamic]u8, name: string) {
+	bytes := transmute([]u8)name
+	write_uleb128(buf, u64(len(bytes)))
+	for b in bytes do append(buf, b)
+}
+
+// lower_module_to_wasm — единственная точка входа (Фаза 1). Возвращает
+// готовые байты полноценного, самостоятельного (без внешних import'ов)
+// WASM MVP-модуля — Фаза 1 не трогает heap/GC/stdlib, поэтому не нужен ни
+// один import (см. план: Шаг 0-спайк про переиспользование core/gc.odin —
+// актуален только с Фазы 1.5, когда появятся heap-значения).
+lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
+	// included[k] — исходный индекс (в module.functions) функции, получившей
+	// НОВЫЙ (компактный, только среди Фаза-1-совместимых функций) wasm-
+	// индекс k. func_index — обратное отображение (Function_Id исходного
+	// module.functions -> новый k), для Call_Instr.callee/Function_Ref_Instr.fn
+	// (см. wasm_emit.odin) — исходные Function_Id из mir.odin НЕЛЬЗЯ
+	// использовать напрямую как wasm funcidx/typeidx/table-slot, раз
+	// прелюдийные функции (см. is_wasm_phase1_function) выброшены и
+	// нумерация сдвинулась.
+	included := make([dynamic]int)
+	defer delete(included)
+	func_index := make(map[Function_Id]int)
+	defer delete(func_index)
+	for &mfn, i in module.functions {
+		if is_wasm_phase1_function(&mfn) {
+			func_index[Function_Id(i)] = len(included)
+			append(&included, i)
+		}
+	}
+	n := len(included)
+
+	types_content := make([dynamic]u8)
+	defer delete(types_content)
+	write_uleb128(&types_content, u64(n))
+
+	func_content := make([dynamic]u8)
+	defer delete(func_content)
+	write_uleb128(&func_content, u64(n))
+
+	export_content := make([dynamic]u8)
+	defer delete(export_content)
+	write_uleb128(&export_content, u64(n))
+
+	for k in 0 ..< n {
+		mfn := &module.functions[included[k]]
+		param_types := make([dynamic]u8, 0, len(mfn.parameters))
+		defer delete(param_types)
+		for p in mfn.parameters {
+			append(&param_types, wasm_val_type(mfn.locals[int(p)].type))
+		}
+		returns := prune_type(mfn.result_type) != TY_VOID
+
+		append(&types_content, 0x60) // functype tag
+		write_uleb128(&types_content, u64(len(param_types)))
+		for b in param_types do append(&types_content, b)
+		if returns {
+			write_uleb128(&types_content, 1)
+			append(&types_content, wasm_val_type(mfn.result_type))
+		} else {
+			write_uleb128(&types_content, 0)
+		}
+
+		write_uleb128(&func_content, u64(k)) // typeidx == funcidx == k
+
+		write_name(&export_content, mfn.name)
+		append(&export_content, 0x00) // exportdesc kind = func
+		write_uleb128(&export_content, u64(k))
+	}
+
+	table_content := make([dynamic]u8)
+	defer delete(table_content)
+	write_uleb128(&table_content, 1) // 1 таблица
+	append(&table_content, 0x70) // funcref
+	append(&table_content, 0x00) // limits: только min (без max)
+	write_uleb128(&table_content, u64(n))
+
+	elem_content := make([dynamic]u8)
+	defer delete(elem_content)
+	write_uleb128(&elem_content, 1) // 1 активный elem-сегмент
+	write_uleb128(&elem_content, 0) // flags=0: active, table 0, expr-offset, funcidx vec
+	append(&elem_content, 0x41) // i32.const
+	write_sleb128(&elem_content, 0)
+	append(&elem_content, 0x0B) // end
+	write_uleb128(&elem_content, u64(n))
+	for k in 0 ..< n do write_uleb128(&elem_content, u64(k))
+
+	code_content := make([dynamic]u8)
+	defer delete(code_content)
+	write_uleb128(&code_content, u64(n))
+	for k in 0 ..< n {
+		mfn := &module.functions[included[k]]
+		body := emit_function_wasm(module, mfn, &func_index)
+		write_uleb128(&code_content, u64(len(body)))
+		for b in body do append(&code_content, b)
+		delete(body)
+	}
+
+	out := make([dynamic]u8)
+	append(&out, 0x00, 0x61, 0x73, 0x6D) // "\0asm"
+	append(&out, 0x01, 0x00, 0x00, 0x00) // version 1
+	write_section(&out, 0x01, types_content[:])
+	write_section(&out, 0x03, func_content[:])
+	write_section(&out, 0x04, table_content[:])
+	write_section(&out, 0x07, export_content[:])
+	write_section(&out, 0x09, elem_content[:])
+	write_section(&out, 0x0A, code_content[:])
+
+	return out[:]
+}

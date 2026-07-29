@@ -57,7 +57,11 @@ build-wasm-runtime:
 		--export=pw_array_length --export=pw_array_in_bounds \
 		--export=pw_array_get_f64 --export=pw_array_get_i32 \
 		--export=pw_array_contains_f64 --export=pw_array_contains_i32 \
-		--export=pw_array_slice --allow-undefined
+		--export=pw_array_slice \
+		--export=pw_map_length --export=pw_map_has_strkey --export=pw_map_has_numkey \
+		--export=pw_map_get_strkey_f64 --export=pw_map_get_strkey_i32 \
+		--export=pw_map_get_numkey_f64 --export=pw_map_get_numkey_i32 \
+		--export=pw_map_delete_strkey --export=pw_map_delete_numkey --allow-undefined
 
 # Дифференциальные тесты WASM AOT-бэкенда (Фаза 1/1.5, core/wasm_backend_
 # wasmtime_test.odin) — за #config(PANOS_WASM_BACKEND_TESTS), НЕ входят в

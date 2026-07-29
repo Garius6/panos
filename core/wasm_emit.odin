@@ -368,6 +368,11 @@ value_kind :: proc(ectx: ^Emit_Ctx, v: Value_Id) -> Type_Kind {
 	return prune_type(ectx.fn.value_types[int(v)]).kind
 }
 
+@(private = "file")
+value_type_of :: proc(ectx: ^Emit_Ctx, v: Value_Id) -> ^Type {
+	return prune_type(ectx.fn.value_types[int(v)])
+}
+
 // wasm_field_setter/getter — Булево/Строка (WASM i32-представление, см.
 // wasm_val_type) идут через pw_*_field_i32, Число/Целое — через
 // pw_*_field_f64. Struct-типизированные поля (вложенные агрегаты) ТОЖЕ
@@ -430,6 +435,76 @@ emit_construct_object :: proc(ectx: ^Emit_Ctx, elements: []Value_Id, alloc_impor
 	write_uleb128(code, u64(handle_local))
 }
 
+// emit_new_map — Фаза 2.4 (Соответствие): НЕ переиспользует emit_
+// construct_object напрямую — тот пишет element i -> field i, а тут
+// element i (ключ ИЛИ значение) должен попасть в РАЗНЫЙ field-индекс
+// (2i для ключа, 2i+1 для значения). Реальный стек-порядок — НЕ "все
+// ключи, потом все значения" (это лишь порядок в mir_validate.odin's
+// instr_refs, для валидации, не для replay) — а ИНТЕРЛИВЛЕННЫЙ, per-
+// entry: `для entry в e.entries { лоурить key; лоурить value }`
+// (core/mir_lowering.odin's Map_Expr case, строки ~519-529) — т.е. на
+// стеке [key0,val0,key1,val1,...], верх — val(n-1). Найдено эмпирически
+// (wasmtime "type mismatch: expected f64, found i32" — исходная
+// keys-затем-vals попытка снимала операнды не в том порядке, ловила
+// значение в локаль не того типа), не по чтению кода.
+@(private = "file")
+emit_new_map :: proc(ectx: ^Emit_Ctx, v: ^New_Map_Instr) {
+	code := &ectx.code
+	n := len(v.keys)
+
+	key_locals := make([]int, n, context.temp_allocator)
+	key_is_i32 := make([]bool, n, context.temp_allocator)
+	val_locals := make([]int, n, context.temp_allocator)
+	val_is_i32 := make([]bool, n, context.temp_allocator)
+	for i := n - 1; i >= 0; i -= 1 {
+		// val[i] пушился ПОСЛЕДНИМ в своей паре — снимается ПЕРВЫМ.
+		v_is_i32 := wasm_field_is_i32(value_kind(ectx, v.vals[i]))
+		val_is_i32[i] = v_is_i32
+		vlocal := v_is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
+		val_locals[i] = vlocal
+		append(code, 0x21)
+		write_uleb128(code, u64(vlocal))
+
+		k_is_i32 := wasm_field_is_i32(value_kind(ectx, v.keys[i]))
+		key_is_i32[i] = k_is_i32
+		klocal := k_is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
+		key_locals[i] = klocal
+		append(code, 0x21)
+		write_uleb128(code, u64(klocal))
+	}
+
+	handle_local := alloc_i32_scratch(ectx)
+	append(code, 0x41) // i32.const field_count (2n)
+	write_sleb128(code, i64(n * 2))
+	append(code, 0x10)
+	write_uleb128(code, u64(PW_ALLOC_AGGREGATE))
+	append(code, 0x21)
+	write_uleb128(code, u64(handle_local))
+
+	for i in 0 ..< n {
+		append(code, 0x20) // local.get handle
+		write_uleb128(code, u64(handle_local))
+		append(code, 0x41) // i32.const 2i (key field)
+		write_sleb128(code, i64(i * 2))
+		append(code, 0x20)
+		write_uleb128(code, u64(key_locals[i]))
+		append(code, 0x10)
+		write_uleb128(code, u64(key_is_i32[i] ? PW_SET_FIELD_I32 : PW_SET_FIELD_F64))
+
+		append(code, 0x20) // local.get handle
+		write_uleb128(code, u64(handle_local))
+		append(code, 0x41) // i32.const 2i+1 (value field)
+		write_sleb128(code, i64(i * 2 + 1))
+		append(code, 0x20)
+		write_uleb128(code, u64(val_locals[i]))
+		append(code, 0x10)
+		write_uleb128(code, u64(val_is_i32[i] ? PW_SET_FIELD_I32 : PW_SET_FIELD_F64))
+	}
+
+	append(code, 0x20) // local.get handle — итоговое значение
+	write_uleb128(code, u64(handle_local))
+}
+
 // emit_set_property — object и value уже на стеке В ЭТОМ порядке (см.
 // instr_refs: [object, value], value сверху) — pw_set_field_* нужен
 // (handle, index, value), т.е. index должен встать МЕЖДУ ними. Снимаем
@@ -456,6 +531,15 @@ emit_set_property :: proc(ectx: ^Emit_Ctx, v: ^Set_Property_Instr) {
 // index на месте, кладём value назад.
 @(private = "file")
 emit_set_index :: proc(ectx: ^Emit_Ctx, v: ^Set_Index_Instr) {
+	// Фаза 2.4: m[k]=v на Соответствие — вне области (арена не растит
+	// объект на месте для вставки нового ключа, тот же blocker, что
+	// Массив.добавить, см. план) — явная паника вместо молчаливого
+	// прогона через Array-путь ниже (который трактовал бы ключ как
+	// байтовый индекс — тихая порча памяти, не просто неверный
+	// результат).
+	if value_type_of(ectx, v.object).kind == .Map {
+		panic("wasm backend Фаза 2.4: запись по индексу (m[k]=v) на Соответствие вне области (см. план — арена не растит объект на месте)")
+	}
 	code := &ectx.code
 	is_i32 := wasm_field_is_i32(value_kind(ectx, v.value))
 	local := is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
@@ -466,6 +550,89 @@ emit_set_index :: proc(ectx: ^Emit_Ctx, v: ^Set_Index_Instr) {
 	write_uleb128(code, u64(local))
 	append(code, 0x10)
 	write_uleb128(code, u64(is_i32 ? PW_SET_FIELD_I32 : PW_SET_FIELD_F64))
+}
+
+// emit_map_get_index — Фаза 2.4: m[k] на Соответствие. object, key уже
+// на стеке в этом порядке (index сверху) — В ОТЛИЧИЕ от Массив, key НЕ
+// конвертируется в i32 (это не байтовый индекс — сам ключ, f64 если
+// Число, i32-handle если Строка, передаётся pw_map_get_* как есть).
+// Байткод-VM паникует на отсутствующий ключ (core/vm.odin:2243-2249) —
+// здесь вместо трапа emitим ноль-литерал fallback (тот же принятый
+// gap, что у Массив: OOB читает соседнюю память вместо трапа, см. Фаза
+// 2.1) — pw_map_get_* уже принимает fallback (переиспользуется
+// получить()-семейством ниже), значит здесь просто эмитим 0/0.0
+// ПОСЛЕ [object, key] — без scratch-переупорядочивания, т.к. fallback
+// не с стека, а компайл-тайм константа.
+@(private = "file")
+emit_map_get_index :: proc(ectx: ^Emit_Ctx, v: ^Get_Index_Instr) {
+	code := &ectx.code
+	map_type := value_type_of(ectx, v.object)
+	key_is_str := wasm_field_is_i32(prune_type(map_type.key_type).kind)
+	val_is_i32 := wasm_field_is_i32(value_kind(ectx, v.dst))
+	if val_is_i32 {
+		append(code, 0x41) // i32.const 0
+		write_sleb128(code, 0)
+	} else {
+		append(code, 0x44) // f64.const 0.0
+		write_f64_le(code, 0)
+	}
+	getter := PW_MAP_GET_NUMKEY_F64
+	switch {
+	case key_is_str && val_is_i32:
+		getter = PW_MAP_GET_STRKEY_I32
+	case key_is_str && !val_is_i32:
+		getter = PW_MAP_GET_STRKEY_F64
+	case !key_is_str && val_is_i32:
+		getter = PW_MAP_GET_NUMKEY_I32
+	case !key_is_str && !val_is_i32:
+		getter = PW_MAP_GET_NUMKEY_F64
+	}
+	append(code, 0x10)
+	write_uleb128(code, u64(getter))
+}
+
+// emit_map_method_call — Фаза 2.4: Call_Method_Instr на Соответствие
+// (Method_Collection, type_cheker.odin — длина/есть/получить/удалить).
+// receiver затем args уже на стеке в естественном MIR-порядке (см.
+// Call_Method_Instr's instr_refs: [receiver, args...]), СОВПАДАЕТ с
+// параметрами каждой pw_map_* сигнатуры один-в-один (handle, key[,
+// fallback]) — никакого scratch-переупорядочивания не нужно, ключ НЕ
+// конвертируется (в отличие от Массив: ключ — это сам ключ, не
+// байтовый индекс).
+@(private = "file")
+emit_map_method_call :: proc(ectx: ^Emit_Ctx, v: ^Call_Method_Instr) {
+	code := &ectx.code
+	map_type := value_type_of(ectx, v.receiver)
+	key_is_str := wasm_field_is_i32(prune_type(map_type.key_type).kind)
+	switch v.name {
+	case "длина":
+		append(code, 0x10)
+		write_uleb128(code, u64(PW_MAP_LENGTH))
+		append(code, 0xB7) // f64.convert_i32_s — длина() -> Целое
+	case "есть":
+		append(code, 0x10)
+		write_uleb128(code, u64(key_is_str ? PW_MAP_HAS_STRKEY : PW_MAP_HAS_NUMKEY))
+	case "получить":
+		val_is_i32 := wasm_field_is_i32(value_kind(ectx, v.dst.(Value_Id)))
+		getter := PW_MAP_GET_NUMKEY_F64
+		switch {
+		case key_is_str && val_is_i32:
+			getter = PW_MAP_GET_STRKEY_I32
+		case key_is_str && !val_is_i32:
+			getter = PW_MAP_GET_STRKEY_F64
+		case !key_is_str && val_is_i32:
+			getter = PW_MAP_GET_NUMKEY_I32
+		case !key_is_str && !val_is_i32:
+			getter = PW_MAP_GET_NUMKEY_F64
+		}
+		append(code, 0x10)
+		write_uleb128(code, u64(getter))
+	case "удалить":
+		append(code, 0x10)
+		write_uleb128(code, u64(key_is_str ? PW_MAP_DELETE_STRKEY : PW_MAP_DELETE_NUMKEY))
+	case:
+		panic(fmt.tprintf("wasm backend Фаза 2.4: метод '%s' на Соответствие вне области (см. план)", v.name))
+	}
 }
 
 // emit_array_method_call — Фаза 2.2: Call_Method_Instr на Массив
@@ -619,6 +786,9 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		// тот же alloc-импорт, что New_Aggregate_Instr.
 		emit_construct_object(ectx, v.elements, PW_ALLOC_AGGREGATE, nil)
 
+	case ^New_Map_Instr:
+		emit_new_map(ectx, v)
+
 	case ^Get_Property_Instr:
 		// object (handle) уже на стеке — pw_get_field_* принимает
 		// (handle, index), нужен ЕЩЁ индекс сверху ПЕРЕД вызовом.
@@ -639,15 +809,20 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		emit_set_property(ectx, v)
 
 	case ^Get_Index_Instr:
-		// object, index уже на стеке в этом порядке (см. instr_refs:
-		// [object, index], index сверху). index — Целое (f64-представление,
-		// см. wasm_val_type), pw_get_field_* принимает i32 — конвертируем
-		// ПРЯМО на месте (index уже на вершине стека, конверсия не требует
-		// scratch-локали, в отличие от Set_Index_Instr ниже).
-		append(code, 0xAA) // i32.trunc_f64_s
-		field_getter := wasm_field_is_i32(value_kind(ectx, v.dst)) ? PW_GET_FIELD_I32 : PW_GET_FIELD_F64
-		append(code, 0x10)
-		write_uleb128(code, u64(field_getter))
+		if value_type_of(ectx, v.object).kind == .Map {
+			emit_map_get_index(ectx, v)
+		} else {
+			// object, index уже на стеке в этом порядке (см. instr_refs:
+			// [object, index], index сверху). index — Целое (f64-
+			// представление, см. wasm_val_type), pw_get_field_* принимает
+			// i32 — конвертируем ПРЯМО на месте (index уже на вершине
+			// стека, конверсия не требует scratch-локали, в отличие от
+			// Set_Index_Instr ниже).
+			append(code, 0xAA) // i32.trunc_f64_s
+			field_getter := wasm_field_is_i32(value_kind(ectx, v.dst)) ? PW_GET_FIELD_I32 : PW_GET_FIELD_F64
+			append(code, 0x10)
+			write_uleb128(code, u64(field_getter))
+		}
 
 	case ^Set_Index_Instr:
 		emit_set_index(ectx, v)
@@ -726,13 +901,16 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		}
 
 	case ^Call_Method_Instr:
-		emit_array_method_call(ectx, v)
+		if value_type_of(ectx, v.receiver).kind == .Map {
+			emit_map_method_call(ectx, v)
+		} else {
+			emit_array_method_call(ectx, v)
+		}
 
 	case ^Copy_Instr,
 	     ^Load_Captured_Instr,
 	     ^Call_Async_Instr,
 	     ^Call_Foreign_Instr,
-	     ^New_Map_Instr,
 	     ^Cast_Interface_Instr,
 	     ^Invoke_Interface_Instr,
 	     ^Build_Closure_Instr,

@@ -68,7 +68,7 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 	#partial switch pt.kind {
 	case .Number, .Integer:
 		return WASM_F64
-	case .Bool, .String, .Struct, .Array, .Enum:
+	case .Bool, .String, .Struct, .Array, .Enum, .Map:
 		return WASM_I32
 	case:
 		panic(
@@ -91,7 +91,7 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 is_wasm_phase1_type :: proc(t: ^Type) -> bool {
 	if t == nil do return false
 	#partial switch prune_type(t).kind {
-	case .Number, .Integer, .Bool, .Void, .String, .Struct, .Array, .Enum:
+	case .Number, .Integer, .Bool, .Void, .String, .Struct, .Array, .Enum, .Map:
 		return true
 	case:
 		return false
@@ -156,7 +156,16 @@ PW_ARRAY_GET_I32 :: 24
 PW_ARRAY_CONTAINS_F64 :: 25
 PW_ARRAY_CONTAINS_I32 :: 26
 PW_ARRAY_SLICE :: 27
-PW_IMPORT_COUNT :: 28
+PW_MAP_LENGTH :: 28
+PW_MAP_HAS_STRKEY :: 29
+PW_MAP_HAS_NUMKEY :: 30
+PW_MAP_GET_STRKEY_F64 :: 31
+PW_MAP_GET_STRKEY_I32 :: 32
+PW_MAP_GET_NUMKEY_F64 :: 33
+PW_MAP_GET_NUMKEY_I32 :: 34
+PW_MAP_DELETE_STRKEY :: 35
+PW_MAP_DELETE_NUMKEY :: 36
+PW_IMPORT_COUNT :: 37
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -188,6 +197,15 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_array_contains_f64", {WASM_I32, WASM_F64}, {WASM_I32}},
 	{"pw_array_contains_i32", {WASM_I32, WASM_I32}, {WASM_I32}},
 	{"pw_array_slice", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_map_length", {WASM_I32}, {WASM_I32}},
+	{"pw_map_has_strkey", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_map_has_numkey", {WASM_I32, WASM_F64}, {WASM_I32}},
+	{"pw_map_get_strkey_f64", {WASM_I32, WASM_I32, WASM_F64}, {WASM_F64}},
+	{"pw_map_get_strkey_i32", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_map_get_numkey_f64", {WASM_I32, WASM_F64, WASM_F64}, {WASM_F64}},
+	{"pw_map_get_numkey_i32", {WASM_I32, WASM_F64, WASM_I32}, {WASM_I32}},
+	{"pw_map_delete_strkey", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_map_delete_numkey", {WASM_I32, WASM_F64}, {WASM_I32}},
 }
 
 @(private = "file")

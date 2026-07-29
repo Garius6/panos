@@ -308,6 +308,127 @@ pw_array_slice :: proc "contextless" (handle: i32, start: i32, end: i32) -> i32 
 	return id
 }
 
+// --- Фаза 2.4: Соответствие ---------------------------------------------
+//
+// Map_Value в байткод-VM — линейный список пар (core/compiler.odin's
+// Map_Value.entries), не хеш-таблица (core/vm.odin's map_find_index —
+// линейный скан value_equals) — тот же "плоский, arena-дружественный"
+// принцип, что Массив уже использует. Запись = 2*FIELD_SIZE байт
+// (ключ-слот, значение-слот, в этом порядке) — New_Map_Instr эмитится
+// через emit_construct_object (core/wasm_emit.odin), интерливя keys/
+// vals в единый список элементов ДО вызова — здесь не нужен отдельный
+// allocator, pw_alloc_aggregate уже подходит (field_count = 2*entry_
+// count).
+//
+// Ключ может быть Число (f64) ИЛИ Строка (i32-handle) — сравнение ключа
+// поэтому расщеплено на strkey/numkey варианты (байтовое через
+// pw_string_equal, числовое напрямую), тем же принципом, что f64/i32-
+// расщепление у Массив.получить/содержит. m[k]=v (растущая вставка) —
+// вне области (тот же blocker, что Массив.добавить — арена не растит
+// объект на месте) — только чтение/удаление (удаление УМЕНЬШАЕТ,
+// tractable без роста, см. core/vm.odin's map_remove_at — тот же
+// сдвиг-и-уменьшить, портированный на байтовый layout арены).
+
+@(export)
+pw_map_length :: proc "contextless" (handle: i32) -> i32 {
+	return obj_sizes[handle] / (2 * FIELD_SIZE)
+}
+
+@(private)
+map_find_strkey :: proc "contextless" (handle: i32, key: i32) -> i32 {
+	count := obj_sizes[handle] / (2 * FIELD_SIZE)
+	base := obj_offsets[handle]
+	for i in i32(0) ..< count {
+		key_bits := unpack_u64_le(base + i * 2 * FIELD_SIZE)
+		entry_key := i32(u32(key_bits))
+		if pw_string_equal(entry_key, key) == 1 do return i
+	}
+	return -1
+}
+
+@(private)
+map_find_numkey :: proc "contextless" (handle: i32, key: f64) -> i32 {
+	count := obj_sizes[handle] / (2 * FIELD_SIZE)
+	base := obj_offsets[handle]
+	needle_bits := transmute(u64)key
+	for i in i32(0) ..< count {
+		key_bits := unpack_u64_le(base + i * 2 * FIELD_SIZE)
+		if key_bits == needle_bits do return i
+	}
+	return -1
+}
+
+@(export)
+pw_map_has_strkey :: proc "contextless" (handle: i32, key: i32) -> i32 {
+	return map_find_strkey(handle, key) >= 0 ? 1 : 0
+}
+
+@(export)
+pw_map_has_numkey :: proc "contextless" (handle: i32, key: f64) -> i32 {
+	return map_find_numkey(handle, key) >= 0 ? 1 : 0
+}
+
+@(export)
+pw_map_get_strkey_f64 :: proc "contextless" (handle: i32, key: i32, fallback: f64) -> f64 {
+	idx := map_find_strkey(handle, key)
+	if idx < 0 do return fallback
+	bits := unpack_u64_le(obj_offsets[handle] + idx * 2 * FIELD_SIZE + FIELD_SIZE)
+	return transmute(f64)bits
+}
+
+@(export)
+pw_map_get_strkey_i32 :: proc "contextless" (handle: i32, key: i32, fallback: i32) -> i32 {
+	idx := map_find_strkey(handle, key)
+	if idx < 0 do return fallback
+	bits := unpack_u64_le(obj_offsets[handle] + idx * 2 * FIELD_SIZE + FIELD_SIZE)
+	return i32(u32(bits))
+}
+
+@(export)
+pw_map_get_numkey_f64 :: proc "contextless" (handle: i32, key: f64, fallback: f64) -> f64 {
+	idx := map_find_numkey(handle, key)
+	if idx < 0 do return fallback
+	bits := unpack_u64_le(obj_offsets[handle] + idx * 2 * FIELD_SIZE + FIELD_SIZE)
+	return transmute(f64)bits
+}
+
+@(export)
+pw_map_get_numkey_i32 :: proc "contextless" (handle: i32, key: f64, fallback: i32) -> i32 {
+	idx := map_find_numkey(handle, key)
+	if idx < 0 do return fallback
+	bits := unpack_u64_le(obj_offsets[handle] + idx * 2 * FIELD_SIZE + FIELD_SIZE)
+	return i32(u32(bits))
+}
+
+@(private)
+map_delete_at :: proc "contextless" (handle: i32, idx: i32) {
+	base := obj_offsets[handle]
+	count := obj_sizes[handle] / (2 * FIELD_SIZE)
+	entry_size := i32(2 * FIELD_SIZE)
+	for i in idx ..< count - 1 {
+		for b in i32(0) ..< entry_size {
+			arena[base + i * entry_size + b] = arena[base + (i + 1) * entry_size + b]
+		}
+	}
+	obj_sizes[handle] -= entry_size
+}
+
+@(export)
+pw_map_delete_strkey :: proc "contextless" (handle: i32, key: i32) -> i32 {
+	idx := map_find_strkey(handle, key)
+	if idx < 0 do return 0
+	map_delete_at(handle, idx)
+	return 1
+}
+
+@(export)
+pw_map_delete_numkey :: proc "contextless" (handle: i32, key: f64) -> i32 {
+	idx := map_find_numkey(handle, key)
+	if idx < 0 do return 0
+	map_delete_at(handle, idx)
+	return 1
+}
+
 // --- Фаза 2.0: ввод_вывод::печать ------------------------------------
 //
 // Единственный builtin, поддержанный на этом срезе (см. план) — прямой

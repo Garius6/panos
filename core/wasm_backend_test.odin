@@ -192,8 +192,27 @@ test_wasm_module_lowers_array_method_call_without_panic :: proc(t: ^testing.T) {
 	testing.expectf(t, len(bytes) > 8, "модуль пуст")
 }
 
-// Намеренно нет теста "паникует на interface/closures/actors/Соответствие
-// вне области Фазы 2.1": Odin's panic() — фатальный abort процесса (нет
+@(test)
+test_wasm_module_lowers_map_without_panic :: proc(t: ^testing.T) {
+	bytes := lower_wasm_from_source(t, `
+		функ старт() -> Целое
+			пер цены = соответствие("яблоко" = 10, "груша" = 20)
+			цены.удалить("яблоко")
+			если цены.есть("груша") тогда
+				пер прочитано = цены["груша"]
+				пер запасное = цены.получить("груша", -1)
+				если прочитано + запасное > 0 тогда
+					цены.удалить("груша")
+				конец
+			конец
+			цены.длина()
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
+// Намеренно нет теста "паникует на interface/closures/actors/m[k]=v на
+// Соответствие вне области": Odin's panic() — фатальный abort процесса (нет
 // recover/unwind), проверка такого пути уронила бы весь тестовый бинарь
 // вместе со всеми остальными тестами. Код, отвечающий за это
 // (emit_mir_instr в core/wasm_emit.odin, wasm_val_type в core/wasm_

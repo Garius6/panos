@@ -80,8 +80,14 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		if os.write_entire_file(path, bytes) != nil do return Diff_Result{ok = false}
 		defer os.remove(path)
 
+		// Каждый Фаза-1/1.5-модуль импортирует wasm_runtime (см.
+		// core/wasm_module.odin's pw_imports) НЕЗАВИСИМО от того,
+		// использует ли КОНКРЕТНАЯ фикстура строки — --preload обязателен
+		// всегда, не только для строковых тестов (см. `just build-wasm-
+		// runtime`, запускается перед этим тестом через зависимость
+		// рецепта test-wasm-backend в Justfile).
 		desc := os.Process_Desc {
-			command = []string{"wasmtime", "run", "--invoke", "старт", path},
+			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path},
 		}
 		state, stdout_bytes, _, err := os.process_exec(desc, context.allocator)
 		if err != nil || !state.success do return Diff_Result{ok = false}
@@ -250,6 +256,51 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 			конец
 			функ старт() -> Целое
 				факториал(6)
+			конец
+		`)
+	}
+
+	// Фаза 1.5: строки. Наблюдаемый результат — ТОЛЬКО через Compare_Instr
+	// (Equal/NotEqual, см. core/wasm_emit.odin's emit_compare_op) — нет ни
+	// длины, ни чтения байт обратно (Call_Builtin_Instr вне области Фазы
+	// 1.5, см. план), поэтому фикстуры возвращают Булево, переиспользуя
+	// уже существующий bool-путь дифф-харнесса.
+
+	@(test)
+	test_wasm_diff_string_const_equal :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				"привет" == "привет"
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				"привет" == "пока"
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_concat :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				("при" + "вет") == "привет"
+			конец
+		`)
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				("а" + "б" + "в") <> "абв"
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_string_variable :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Булево
+				пер a = "hello"
+				пер b = "world"
+				(a + " " + b) == "hello world"
 			конец
 		`)
 	}

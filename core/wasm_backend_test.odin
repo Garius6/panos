@@ -66,10 +66,56 @@ test_wasm_module_exports_entry_function :: proc(t: ^testing.T) {
 	testing.expectf(t, found, "имя функции 'старт' не найдено в байтах модуля")
 }
 
-// Намеренно нет теста "паникует на строковом литерале/heap-инструкции вне
-// области Фазы 1": Odin's panic() — фатальный abort процесса (нет
-// recover/unwind), проверка такого пути уронила бы весь тестовый бинарь
-// вместе со всеми остальными тестами. Код, отвечающий за это (emit_mir_instr
-// в core/wasm_emit.odin, wasm_val_type в core/wasm_module.odin), прост и
-// самоочевиден — понятное сообщение вместо тихого неверного вывода
-// достигается самой структурой кода, не отдельным регрессионным тестом.
+@(test)
+test_wasm_module_has_import_section_for_runtime :: proc(t: ^testing.T) {
+	// Фаза 1.5: КАЖДЫЙ модуль импортирует wasm_runtime (см.
+	// core/wasm_module.odin's pw_imports), даже если фикстура строк не
+	// использует — funcidx-пространство начинается с них безусловно.
+	bytes := lower_wasm_from_source(t, `
+		функ старт() -> Число
+			1 + 2
+		конец
+	`)
+	name := transmute([]u8)string("pw_alloc_from_scratch")
+	found := false
+	if len(bytes) >= len(name) {
+		for i := 0; i <= len(bytes) - len(name); i += 1 {
+			match := true
+			for j in 0 ..< len(name) {
+				if bytes[i + j] != name[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				found = true
+				break
+			}
+		}
+	}
+	testing.expectf(t, found, "имя импорта 'pw_alloc_from_scratch' не найдено в байтах модуля")
+}
+
+@(test)
+test_wasm_module_lowers_string_const_without_panic :: proc(t: ^testing.T) {
+	// Фаза 1.5: строковый литерал (и `+`/`==` на Строка) больше не
+	// паникует, см. core/wasm_emit.odin's emit_string_const/
+	// PW_CONCAT_STRINGS/PW_STRING_EQUAL — семантика проверяется
+	// дифференциальными тестами (core/wasm_backend_wasmtime_test.odin),
+	// здесь только структурная гарантия "лоуринг не падает".
+	bytes := lower_wasm_from_source(t, `
+		функ старт() -> Булево
+			("при" + "вет") == "привет"
+		конец
+	`)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}
+
+// Намеренно нет теста "паникует на heap-инструкции вне области Фазы 1.5"
+// (агрегаты/массивы/interface/closures/actors): Odin's panic() —
+// фатальный abort процесса (нет recover/unwind), проверка такого пути
+// уронила бы весь тестовый бинарь вместе со всеми остальными тестами.
+// Код, отвечающий за это (emit_mir_instr в core/wasm_emit.odin,
+// wasm_val_type в core/wasm_module.odin), прост и самоочевиден —
+// понятное сообщение вместо тихого неверного вывода достигается самой
+// структурой кода, не отдельным регрессионным тестом.

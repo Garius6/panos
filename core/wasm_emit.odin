@@ -349,7 +349,7 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 			append(code, 0x41) // i32.const
 			write_sleb128(code, cv ? 1 : 0)
 		case string:
-			panic("wasm backend Фаза 1: строковые константы не поддержаны (нет heap-значений)")
+			emit_string_const(ectx, cv)
 		}
 
 	case ^Load_Local_Instr:
@@ -361,7 +361,16 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		write_uleb128(code, u64(v.local))
 
 	case ^Binary_Instr:
-		emit_binary_op(ectx, v.op)
+		if v.op == .Add && value_kind(ectx, v.lhs) == .String {
+			// panos's `+` на Строка — конкатенация (см. core/vm.odin's
+			// .Add: полиморфный опкод, число-vs-строка решается по
+			// РАНТАЙМ-типу там; здесь решаем СТАТИЧЕСКИ, per Compare_Instr's
+			// уже устоявшийся паттерн для is_bool ниже).
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_CONCAT_STRINGS))
+		} else {
+			emit_binary_op(ectx, v.op)
+		}
 
 	case ^Compare_Instr:
 		emit_compare_op(ectx, v.op, value_kind(ectx, v.lhs))
@@ -529,6 +538,21 @@ emit_unary_op :: proc(ectx: ^Emit_Ctx, op: Un_Op) {
 emit_compare_op :: proc(ectx: ^Emit_Ctx, op: Cmp_Op, operand_kind: Type_Kind) {
 	code := &ectx.code
 	is_bool := operand_kind == .Bool
+	is_string := operand_kind == .String
+	if is_string {
+		#partial switch op {
+		case .Equal:
+			append(code, 0x10) // call pw_string_equal (уже возвращает i32 0/1)
+			write_uleb128(code, u64(PW_STRING_EQUAL))
+		case .NotEqual:
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_STRING_EQUAL))
+			append(code, 0x45) // i32.eqz — инверсия 0/1
+		case:
+			panic("wasm backend: этот Cmp_Op для Строка не должен возникать (typechecker должен был отклонить)")
+		}
+		return
+	}
 	#partial switch op {
 	case .Less:
 		if is_bool do panic("wasm backend: '<' для Булево не должно возникать (typechecker должен был отклонить)")
@@ -549,4 +573,27 @@ emit_compare_op :: proc(ectx: ^Emit_Ctx, op: Cmp_Op, operand_kind: Type_Kind) {
 	case:
 		panic("wasm backend: неизвестный Cmp_Op")
 	}
+}
+
+// emit_string_const — байты строковой константы передаются в wasm_runtime
+// ПОБАЙТОВО через pw_scratch_set (не сырым адресом — см. докстринг
+// wasm_runtime/runtime.odin про раздельно слинкованные модули), затем
+// pw_alloc_from_scratch кладёт handle (i32) на стек — та же
+// WASM_I32-репрезентация, что wasm_val_type даёт Строка.
+@(private = "file")
+emit_string_const :: proc(ectx: ^Emit_Ctx, s: string) {
+	code := &ectx.code
+	bytes := transmute([]u8)s
+	for b, i in bytes {
+		append(code, 0x41) // i32.const index
+		write_sleb128(code, i64(i))
+		append(code, 0x41) // i32.const byte
+		write_sleb128(code, i64(b))
+		append(code, 0x10) // call pw_scratch_set
+		write_uleb128(code, u64(PW_SCRATCH_SET))
+	}
+	append(code, 0x41) // i32.const length
+	write_sleb128(code, i64(len(bytes)))
+	append(code, 0x10) // call pw_alloc_from_scratch
+	write_uleb128(code, u64(PW_ALLOC_FROM_SCRATCH))
 }

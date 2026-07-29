@@ -55,19 +55,22 @@ WASM_I32 :: 0x7F
 WASM_F64 :: 0x7C
 
 // wasm_val_type — тип значения в WASM для статического типа panos-Value_Id
-// (Фаза 1: только Число/Целое -> f64, Булево -> i32; всё остальное — вне
-// области действия Фазы 1, см. план "Explicitly OUT").
+// (Фаза 1: Число/Целое -> f64, Булево -> i32; Фаза 1.5: Строка ТОЖЕ i32 —
+// handle в wasm_runtime's таблице объектов (см. wasm_runtime/runtime.odin),
+// не сырой указатель — сгенерированный код никогда не видит/не вычисляет
+// адреса в памяти рантайма, только handle'ы, см. её докстринг про
+// раздельно слинкованные модули).
 wasm_val_type :: proc(t: ^Type) -> u8 {
 	pt := prune_type(t)
 	#partial switch pt.kind {
 	case .Number, .Integer:
 		return WASM_F64
-	case .Bool:
+	case .Bool, .String:
 		return WASM_I32
 	case:
 		panic(
 			fmt.tprintf(
-				"wasm backend Фаза 1: тип %v не поддержан (нет heap-значений в этой фазе)",
+				"wasm backend Фаза 1/1.5: тип %v не поддержан (нет агрегатов/interface/generics в этой фазе)",
 				pt.kind,
 			),
 		)
@@ -79,7 +82,7 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 @(private = "file")
 is_wasm_phase1_type :: proc(t: ^Type) -> bool {
 	#partial switch prune_type(t).kind {
-	case .Number, .Integer, .Bool, .Void:
+	case .Number, .Integer, .Bool, .Void, .String:
 		return true
 	case:
 		return false
@@ -102,6 +105,36 @@ is_wasm_phase1_function :: proc(mfn: ^Mir_Function) -> bool {
 	return true
 }
 
+// wasm_runtime import-контракт (см. wasm_runtime/runtime.odin) — module
+// name "env" (совпадает с ключом --preload в тестах, core/wasm_backend_
+// wasmtime_test.odin) + фиксированный порядок функций, задающий
+// typeidx/funcidx 0..PW_IMPORT_COUNT-1 (импорты ВСЕГДА занимают младшие
+// индексы функционального пространства WASM, до любых локально
+// определённых функций, см. спецификацию).
+PW_IMPORT_MODULE :: "env"
+
+Pw_Import :: struct {
+	name:    string,
+	params:  []u8,
+	results: []u8,
+}
+
+PW_SCRATCH_SET :: 0
+PW_ALLOC_FROM_SCRATCH :: 1
+PW_STRING_LEN :: 2
+PW_CONCAT_STRINGS :: 3
+PW_STRING_EQUAL :: 4
+PW_IMPORT_COUNT :: 5
+
+@(private = "file")
+pw_imports := [PW_IMPORT_COUNT]Pw_Import {
+	{"pw_scratch_set", {WASM_I32, WASM_I32}, {}},
+	{"pw_alloc_from_scratch", {WASM_I32}, {WASM_I32}},
+	{"pw_string_len", {WASM_I32}, {WASM_I32}},
+	{"pw_concat_strings", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"pw_string_equal", {WASM_I32, WASM_I32}, {WASM_I32}},
+}
+
 @(private = "file")
 write_section :: proc(out: ^[dynamic]u8, id: u8, content: []u8) {
 	append(out, id)
@@ -116,27 +149,31 @@ write_name :: proc(buf: ^[dynamic]u8, name: string) {
 	for b in bytes do append(buf, b)
 }
 
-// lower_module_to_wasm — единственная точка входа (Фаза 1). Возвращает
-// готовые байты полноценного, самостоятельного (без внешних import'ов)
-// WASM MVP-модуля — Фаза 1 не трогает heap/GC/stdlib, поэтому не нужен ни
-// один import (см. план: Шаг 0-спайк про переиспользование core/gc.odin —
-// актуален только с Фазы 1.5, когда появятся heap-значения).
+// lower_module_to_wasm — единственная точка входа (Фаза 1/1.5). Возвращает
+// готовые байты WASM MVP-модуля, ИМПОРТИРУЮЩЕГО функции wasm_runtime (см.
+// PW_IMPORT_MODULE/pw_imports выше) — сам НЕ владеет памятью и не
+// объявляет собственной memory-секции: с Фазы 1.5 память целиком у
+// wasm_runtime-модуля (см. его докстринг), сюда попадают только вызовы
+// готовых функций. Итоговый модуль запускается композицией с ним (см.
+// `wasmtime run --preload env=<runtime>.wasm <это>.wasm`, core/
+// wasm_backend_wasmtime_test.odin).
 lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 	// included[k] — исходный индекс (в module.functions) функции, получившей
-	// НОВЫЙ (компактный, только среди Фаза-1-совместимых функций) wasm-
-	// индекс k. func_index — обратное отображение (Function_Id исходного
-	// module.functions -> новый k), для Call_Instr.callee/Function_Ref_Instr.fn
-	// (см. wasm_emit.odin) — исходные Function_Id из mir.odin НЕЛЬЗЯ
-	// использовать напрямую как wasm funcidx/typeidx/table-slot, раз
-	// прелюдийные функции (см. is_wasm_phase1_function) выброшены и
-	// нумерация сдвинулась.
+	// НОВЫЙ (компактный, только среди Фаза-1/1.5-совместимых функций) wasm-
+	// индекс PW_IMPORT_COUNT+k — funcidx-пространство начинается с
+	// ИМПОРТОВ (см. спецификацию: импортированные функции ВСЕГДА идут
+	// раньше локально определённых), локальные функции сдвинуты на
+	// PW_IMPORT_COUNT. func_index — обратное отображение (Function_Id
+	// исходного module.functions -> итоговый funcidx), для Call_Instr.
+	// callee/Function_Ref_Instr.fn (см. wasm_emit.odin) — уже готовое,
+	// сдвинутое значение, wasm_emit.odin про сдвиг ничего не знает.
 	included := make([dynamic]int)
 	defer delete(included)
 	func_index := make(map[Function_Id]int)
 	defer delete(func_index)
 	for &mfn, i in module.functions {
 		if is_wasm_phase1_function(&mfn) {
-			func_index[Function_Id(i)] = len(included)
+			func_index[Function_Id(i)] = PW_IMPORT_COUNT + len(included)
 			append(&included, i)
 		}
 	}
@@ -144,7 +181,24 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 
 	types_content := make([dynamic]u8)
 	defer delete(types_content)
-	write_uleb128(&types_content, u64(n))
+	write_uleb128(&types_content, u64(PW_IMPORT_COUNT + n))
+	for imp in pw_imports {
+		append(&types_content, 0x60) // functype tag
+		write_uleb128(&types_content, u64(len(imp.params)))
+		for b in imp.params do append(&types_content, b)
+		write_uleb128(&types_content, u64(len(imp.results)))
+		for b in imp.results do append(&types_content, b)
+	}
+
+	import_content := make([dynamic]u8)
+	defer delete(import_content)
+	write_uleb128(&import_content, u64(PW_IMPORT_COUNT))
+	for imp, i in pw_imports {
+		write_name(&import_content, PW_IMPORT_MODULE)
+		write_name(&import_content, imp.name)
+		append(&import_content, 0x00) // importdesc kind = func
+		write_uleb128(&import_content, u64(i)) // typeidx == i (импорты — первые PW_IMPORT_COUNT записей types_content)
+	}
 
 	func_content := make([dynamic]u8)
 	defer delete(func_content)
@@ -173,11 +227,12 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 			write_uleb128(&types_content, 0)
 		}
 
-		write_uleb128(&func_content, u64(k)) // typeidx == funcidx == k
+		wasm_idx := PW_IMPORT_COUNT + k
+		write_uleb128(&func_content, u64(wasm_idx)) // typeidx == funcidx == PW_IMPORT_COUNT+k
 
 		write_name(&export_content, mfn.name)
 		append(&export_content, 0x00) // exportdesc kind = func
-		write_uleb128(&export_content, u64(k))
+		write_uleb128(&export_content, u64(wasm_idx))
 	}
 
 	table_content := make([dynamic]u8)
@@ -185,7 +240,7 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 	write_uleb128(&table_content, 1) // 1 таблица
 	append(&table_content, 0x70) // funcref
 	append(&table_content, 0x00) // limits: только min (без max)
-	write_uleb128(&table_content, u64(n))
+	write_uleb128(&table_content, u64(PW_IMPORT_COUNT + n))
 
 	elem_content := make([dynamic]u8)
 	defer delete(elem_content)
@@ -194,8 +249,8 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 	append(&elem_content, 0x41) // i32.const
 	write_sleb128(&elem_content, 0)
 	append(&elem_content, 0x0B) // end
-	write_uleb128(&elem_content, u64(n))
-	for k in 0 ..< n do write_uleb128(&elem_content, u64(k))
+	write_uleb128(&elem_content, u64(PW_IMPORT_COUNT + n))
+	for i in 0 ..< PW_IMPORT_COUNT + n do write_uleb128(&elem_content, u64(i))
 
 	code_content := make([dynamic]u8)
 	defer delete(code_content)
@@ -212,6 +267,7 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 	append(&out, 0x00, 0x61, 0x73, 0x6D) // "\0asm"
 	append(&out, 0x01, 0x00, 0x00, 0x00) // version 1
 	write_section(&out, 0x01, types_content[:])
+	write_section(&out, 0x02, import_content[:])
 	write_section(&out, 0x03, func_content[:])
 	write_section(&out, 0x04, table_content[:])
 	write_section(&out, 0x07, export_content[:])

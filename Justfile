@@ -35,12 +35,26 @@ sync-lsp-protocol:
 test:
 	odin test ./core -define:ODIN_TEST_TRACK_MEMORY=false
 
-# Дифференциальные тесты WASM AOT-бэкенда (Фаза 1, core/wasm_backend_
+# wasm_runtime/runtime.wasm — линкуемый рантайм для heap-значений
+# AOT-скомпилированных программ (Фаза 1.5, см. wasm_runtime/runtime.odin) —
+# отдельный маленький пакет, НЕ package core (не разделяет судьбу с
+# core/gc.odin — см. план/память проекта, почему). -build-mode:obj +
+# wasm-ld — тот же двухшаговый процесс, что верифицирован Шагом 0-спайком
+# Фазы 1: релокуемый объект, слинкованный в самостоятельный модуль,
+# экспортирующий свою память + функции для composition через
+# `wasmtime run --preload` (см. core/wasm_backend_wasmtime_test.odin).
+build-wasm-runtime:
+	odin build wasm_runtime -target:wasi_wasm32 -build-mode:obj -out:wasm_runtime/runtime.o -no-entry-point
+	wasm-ld wasm_runtime/runtime.o -o wasm_runtime/runtime.wasm --no-entry \
+		--export=pw_scratch_set --export=pw_alloc_from_scratch --export=pw_string_len \
+		--export=pw_concat_strings --export=pw_string_equal --allow-undefined
+
+# Дифференциальные тесты WASM AOT-бэкенда (Фаза 1/1.5, core/wasm_backend_
 # wasmtime_test.odin) — за #config(PANOS_WASM_BACKEND_TESTS), НЕ входят в
-# обычный `just test`: требуют установленный `wasmtime` в PATH (dev/test-
-# only зависимость, см. специфику вендоринга в проекте — это НЕ то же
-# самое, что зависимости самого бинаря panos).
-test-wasm-backend:
+# обычный `just test`: требуют установленный `wasmtime`+`wasm-ld` в PATH
+# (dev/test-only зависимость, см. специфику вендоринга в проекте — это НЕ
+# то же самое, что зависимости самого бинаря panos).
+test-wasm-backend: build-wasm-runtime
 	odin test ./core -define:ODIN_TEST_TRACK_MEMORY=false -define:PANOS_WASM_BACKEND_TESTS=true
 
 # Обновляет PANOS_VERSION (core/vm.odin), собирает+тестирует, коммитит

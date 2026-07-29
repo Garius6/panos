@@ -187,7 +187,9 @@ PW_STRING_IS_ALPHA :: 55
 PW_STRING_IS_DIGIT_OR_ALPHA :: 56
 PW_STRING_TO_UPPER :: 57
 PW_STRING_TO_LOWER :: 58
-PW_IMPORT_COUNT :: 59
+PW_NUMBER_TO_STRING :: 59
+PW_STRING_TO_NUMBER :: 60
+PW_IMPORT_COUNT :: 61
 
 @(private = "file")
 pw_imports := [PW_IMPORT_COUNT]Pw_Import {
@@ -250,6 +252,8 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_string_is_digit_or_alpha", {WASM_I32}, {WASM_I32}},
 	{"pw_string_to_upper", {WASM_I32}, {WASM_I32}},
 	{"pw_string_to_lower", {WASM_I32}, {WASM_I32}},
+	{"pw_number_to_string", {WASM_F64}, {WASM_I32}},
+	{"pw_string_to_number", {WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")

@@ -2,6 +2,7 @@ package wasm_runtime
 
 import "base:intrinsics"
 import "base:runtime"
+import "core:strconv"
 import "core:unicode"
 import wasi "core:sys/wasm/wasi"
 
@@ -1269,4 +1270,108 @@ pw_string_to_lower :: proc "contextless" (handle: i32) -> i32 {
 	obj_capacity[id] = max_size
 	obj_count += 1
 	return id
+}
+
+// --- Фаза 2.10: строки::в_число / из_числа ------------------------------
+//
+// core:strconv's generic_ftoa/parse_f64 переиспользуются напрямую, тем же
+// приёмом, что core:unicode в Фазе 2.9 (`context = runtime.default_
+// context()`, единственное трение) — проверено СПАЙКОМ ДО вживления,
+// включая round-trip через реальный wasi_wasm32-билд + wasmtime run.
+// В ОТЛИЧИЕ от Фазы 2.9, __$startup_runtime здесь НЕ нужен: единственная
+// package-level таблица core:strconv/decimal (_shift_left_offsets) —
+// плоский массив-литерал (та же безопасная категория, что to_lower_ranges
+// у core:unicode, не Range{ranges_16 = other[:], ...} с вычисляемым
+// полем-срезом) — подтверждено спайком, не только чтением исходников.
+
+@(private)
+alloc_arena_string :: proc "contextless" (s: string) -> i32 {
+	length := i32(len(s))
+	if next_free + length > ARENA_SIZE || obj_count >= MAX_OBJECTS do return -1
+	off := next_free
+	for i in i32(0) ..< length {
+		arena[off + i] = s[i]
+	}
+	next_free += length
+
+	id := obj_count
+	obj_offsets[id] = off
+	obj_sizes[id] = length
+	obj_capacity[id] = length
+	obj_count += 1
+	return id
+}
+
+// pw_number_to_string — зеркалит core/vm.odin's format_number 1:1:
+// generic_ftoa(fmt='f', precision=-1) даёт кратчайшее round-trip
+// фиксированно-точечное представление БЕЗ экспоненты (обходит живой баг,
+// который core/vm.odin:1002 комментирует), затем срезаем ведущий '+'
+// (generic_ftoa всегда его печатает для неотрицательных).
+@(export)
+pw_number_to_string :: proc "contextless" (value: f64) -> i32 {
+	context = runtime.default_context()
+	buf: [400]byte
+	formatted := strconv.generic_ftoa(buf[:], value, 'f', -1, 64)
+	text := string(formatted)
+	if len(text) > 0 && text[0] == '+' {
+		text = text[1:]
+	}
+	return alloc_arena_string(text)
+}
+
+// pw_string_to_number — Результат(Число,Ошибка) строится вручную (тег-
+// порядок Успех=0/Неудача=1 зафиксирован в core/prelude.odin:11), тем же
+// pw_build_variant/pw_set_field_*, что MIR-видимый Build_Variant_Instr
+// использует (core/wasm_emit.odin) — вызываются напрямую как обычные
+// Odin-процедуры того же пакета, не через wasm-таблицу импортов (@(export)
+// лишь ДОБАВЛЯЕТ экспорт, не мешает прямому вызову изнутри пакета).
+// Ошибка{код,сообщение} — не MIR-конструируемый тип (в этой кодовой базе
+// НЕТ ни одного вызова конструктора `Ошибка(...)` из panos-исходников,
+// он только native-side в core/vm.odin's make_error_value) — собирается
+// здесь целиком вручную, без участия wasm_emit.odin.
+@(export)
+pw_string_to_number :: proc "contextless" (handle: i32) -> i32 {
+	context = runtime.default_context()
+	off, length := obj_offsets[handle], obj_sizes[handle]
+	text := string(arena[off:off + length])
+	num, ok := strconv.parse_f64(text)
+	if ok {
+		result := pw_build_variant(0, 1)
+		pw_set_field_f64(result, 0, num)
+		return result
+	}
+
+	prefix := "'"
+	suffix := "' не является числом"
+	msg_len := i32(len(prefix)) + length + i32(len(suffix))
+	if next_free + msg_len > ARENA_SIZE || obj_count >= MAX_OBJECTS do intrinsics.trap()
+	msg_off := next_free
+	pos: i32 = 0
+	for i in 0 ..< len(prefix) {
+		arena[msg_off + pos] = prefix[i]
+		pos += 1
+	}
+	for i in i32(0) ..< length {
+		arena[msg_off + pos] = arena[off + i]
+		pos += 1
+	}
+	for i in 0 ..< len(suffix) {
+		arena[msg_off + pos] = suffix[i]
+		pos += 1
+	}
+	next_free += msg_len
+	msg_id := obj_count
+	obj_offsets[msg_id] = msg_off
+	obj_sizes[msg_id] = msg_len
+	obj_capacity[msg_id] = msg_len
+	obj_count += 1
+
+	code_id := alloc_arena_string("строки")
+	err := pw_alloc_aggregate(2)
+	pw_set_field_i32(err, 0, code_id)
+	pw_set_field_i32(err, 1, msg_id)
+
+	result := pw_build_variant(1, 1)
+	pw_set_field_i32(result, 0, err)
+	return result
 }

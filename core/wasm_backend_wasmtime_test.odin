@@ -990,4 +990,59 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		`)
 	}
 
+	// Фаза 2.6: паника(сообщение) — теперь эмитится (pw_print_string +
+	// WASM unreachable-трап), больше не паникует КОМПИЛЯТОР при попытке
+	// сгенерировать код. Разблокирует .причина()/.ожидать() на УСПЕШНОМ
+	// пути (паника() никогда реально не вызывается — Опция/Результат
+	// содержат значение, "не тот" арм с паника() внутри просто не
+	// исполняется, но ДОЛЖЕН быть валидно эмиттируем регардлесс —
+	// is_wasm_phase1_function/резолюция функций не смотрит на runtime-
+	// достижимость, только на компайл-тайм совместимость сигнатуры).
+	// Прямая проверка самого трапа — отдельный тест ниже (единственный
+	// в этом файле, ожидающий !success от wasmtime, а не запись через
+	// wasm_diff_check).
+
+	@(test)
+	test_wasm_diff_rezultat_ozhidat_and_prichina_success_path :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер r: Результат(Число, Строка) = Результат.Успех(7)
+				r.ожидать("не должно случиться")
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_panic_traps_and_prints_message :: proc(t: ^testing.T) {
+		src := `
+			функ старт() -> Пусто
+				паника("бум-сообщение")
+			конец
+		`
+		result := check_source(src)
+		testing.expectf(t, len(result.diags) == 0, "check_source diagnostics: %v", result.diags)
+		module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
+		bytes := lower_module_to_wasm(&module)
+
+		id := sync.atomic_add(&wasm_diff_temp_file_counter, 1)
+		dir, dir_err := os.temp_dir(context.allocator)
+		testing.expectf(t, dir_err == nil, "нет temp dir")
+		path := fmt.tprintf("%s/panos_wasm_panic_%d.wasm", dir, id)
+		testing.expectf(t, os.write_entire_file(path, bytes) == nil, "не удалось записать модуль")
+		defer os.remove(path)
+
+		desc := os.Process_Desc {
+			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path},
+		}
+		state, stdout_bytes, _, err := os.process_exec(desc, context.allocator)
+		testing.expectf(t, err == nil, "process_exec ошибка: %v", err)
+		testing.expectf(t, !state.success, "паника() должна трапнуть wasm-модуль (ненулевой выход), получен успех")
+		testing.expectf(
+			t,
+			strings.contains(string(stdout_bytes), "бум-сообщение"),
+			"ожидалось сообщение паники в stdout, получено: %q",
+			string(stdout_bytes),
+		)
+	}
+
 }

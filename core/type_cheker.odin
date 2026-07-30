@@ -1549,27 +1549,6 @@ record_generic_method_instantiation :: proc(ctx: ^Type_Ctx, expr: Expr, method_s
 	for t in concrete_types {
 		pruned := prune_type(t)
 		if pruned.kind == .InferVar do return
-		// Известный, узкий пробел — НЕ полностью закрыт этой сессией
-		// (Фаза 2.5 значительно сузила его, не устранила целиком).
-		// Фаза 2.5's приёмник-реинстанциация (см. resolve_type_node's
-		// Type_Ident case + current_receiver_subst) чинит ИСХОДНЫЙ
-		// симптом ("'это' используется до инициализации" — подтверждено:
-		// эта диагностика больше не появляется) — но supervisor-тесты
-		// (test_qualified_impl_supervisor_restarts_then_gives_up и
-		// соседние, Опция(Процесс(Задача))) после фикса падают на
-		// ДРУГОЙ, downstream ошибке — "match_arm_infos отсутствует для
-		// выбора" (mir_lowering.odin) — тот же паник-текст, что видели
-		// раньше в этой сессии (Фаза 2.3) для СОВСЕМ другого сценария
-		// (bounded-generic функция + метод, там причина была найдена и
-		// исправлена) — здесь корень НЕ найден: что-то ЕЩЁ отличается
-		// специфически для Процесс(T) как T-аргумента внутри клона,
-		// раз typecheck клона теперь проходит БЕЗ diagnostic-ошибок
-		// (проверено), но какой-то `выбор` внутри того же клона всё
-		// равно не получает свою запись в match_arm_infos. Не гадаем
-		// дальше — откатываемся к прежнему (symbol_to_function)
-		// пути, тот же принцип, что остальные явно задокументированные
-		// гэпы этой сессии.
-		if pruned.kind == .Process do return
 	}
 	ctx.generic_method_instantiations[expr] = concrete_types
 	ctx.generic_method_owner_sym[expr] = owner_sym

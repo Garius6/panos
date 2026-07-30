@@ -58,6 +58,7 @@ monomorphize_register_one :: proc(
 	callee_sym: Symbol_Id,
 	concrete_types: [dynamic]^Type,
 	key: string,
+	resynced: ^map[^Resolver_Ctx]bool,
 ) -> Clone_To_Lower {
 	clone := clone_function_decl(fn_decl)
 	module_of_callee := symbol_at(res.symbol_store, callee_sym).module
@@ -71,7 +72,31 @@ monomorphize_register_one :: proc(
 		if found, ok := res.module_graph.module_resolvers[module_of_callee]; ok {
 			decl_res = found
 		}
-		decl_res.symbol_types = res.module_graph.symbol_types
+		// Резинхронизация — ТОЛЬКО на ПЕРВОЕ использование decl_res за весь
+		// вызов lower_monomorphize_program (см. resynced, передаётся отсюда).
+		// Реальный баг, найденный лишь через lldb (не по чтению кода):
+		// decl_res.symbol_types — ОБЫЧНОЕ Odin-значение (map — заголовок
+		// ptr+len+cap, копируется по значению), а НЕ живая ссылка на res.
+		// module_graph.symbol_types. Как только decl_res.symbol_types
+		// РАСТЁТ локально (bind_function_args ниже пишет это.значение —
+		// ЛЮБАЯ вставка может триггернуть Odin-рехеш, реаллоцируя backing-
+		// массив), res.module_graph.symbol_types остаётся указывать на
+		// СТАРЫЙ (для больших карт — уже освобождённый после рехеша)
+		// массив. Безусловная резинхронизация НА КАЖДЫЙ клон отбрасывала
+		// весь локальный рост ПРЕДЫДУЩЕГО клона и возвращала decl_res.
+		// symbol_types к этому устаревшему снимку — вставка это.значение
+		// СЛЕДУЮЩЕГО клона попадала в orphaned/протухшую память: len не
+		// увеличивался, немедленное чтение того же ключа сразу после
+		// записи возвращало ok=false — подтверждено проверкой (transmute в
+		// runtime.Raw_Map) `data`-указателя ДО/ПОСЛЕ каждой записи в двух
+		// последовательных вызовах. Проявлялось только когда ВТОРОЙ клон
+		// того же владеющего generic-типа (Опция(Процесс(T)) — методы
+		// Опция.есть/Опция.значение) регистрировался в ТОМ ЖЕ фиксед-пойнт
+		// раунде — оба общий decl_res (прелюдийный резолвер).
+		if !resynced[decl_res] {
+			decl_res.symbol_types = res.module_graph.symbol_types
+			resynced[decl_res] = true
+		}
 	}
 
 	resolve_function_body(decl_res, module_of_callee, Decls(clone), clone.args[:], clone.body)
@@ -117,6 +142,7 @@ monomorphize_register_method_one :: proc(
 	owner_sym: Symbol_Id,
 	concrete_types: [dynamic]^Type,
 	key: string,
+	resynced: ^map[^Resolver_Ctx]bool,
 ) -> (
 	Clone_To_Lower,
 	bool,
@@ -132,7 +158,17 @@ monomorphize_register_method_one :: proc(
 		if found, ok := res.module_graph.module_resolvers[module_of_callee]; ok {
 			decl_res = found
 		}
-		decl_res.symbol_types = res.module_graph.symbol_types
+		// Резинхронизация только на ПЕРВОЕ использование decl_res за весь
+		// вызов lower_monomorphize_program — см. подробное объяснение бага
+		// в monomorphize_register_one (тот же самый механизм, тот же decl_
+		// res объект, когда за один фиксед-пойнт раунд регистрируется
+		// БОЛЬШЕ ОДНОГО метода того же generic-типа — реальный, найденный
+		// через lldb сценарий: Опция.есть + Опция.значение для Опция(
+		// Процесс(Задача)) в одном раунде).
+		if !resynced[decl_res] {
+			decl_res.symbol_types = res.module_graph.symbol_types
+			resynced[decl_res] = true
+		}
 	}
 
 	resolve_function_body(decl_res, module_of_callee, Decls(clone), clone.args[:], clone.body)
@@ -226,6 +262,12 @@ lower_monomorphize_program :: proc(
 
 	to_lower := make([dynamic]Clone_To_Lower)
 	processed := make(map[string]bool)
+	// resynced — тот же decl_res может понадобиться НЕСКОЛЬКО раз за один
+	// вызов lower_monomorphize_program (несколько методов/функций одного
+	// generic-владельца в одном фиксед-пойнт раунде) — резинхронизация
+	// decl_res.symbol_types из res.module_graph.symbol_types безопасна
+	// ТОЛЬКО один раз, см. подробности в monomorphize_register_one.
+	resynced := make(map[^Resolver_Ctx]bool)
 	for {
 		pending_fns := make([dynamic]Pending_Fn)
 		for call_expr, concrete_types in tc.generic_call_instantiations {
@@ -255,12 +297,12 @@ lower_monomorphize_program :: proc(
 
 		for p in pending_fns {
 			if processed[p.key] do continue
-			append(&to_lower, monomorphize_register_one(res, tc, module, p.fn_decl, p.callee_sym, p.concrete_types, p.key))
+			append(&to_lower, monomorphize_register_one(res, tc, module, p.fn_decl, p.callee_sym, p.concrete_types, p.key, &resynced))
 			processed[p.key] = true
 		}
 		for p in pending_methods {
 			if processed[p.key] do continue
-			c, ok := monomorphize_register_method_one(res, tc, module, p.method_sym, p.owner_sym, p.concrete_types, p.key)
+			c, ok := monomorphize_register_method_one(res, tc, module, p.method_sym, p.owner_sym, p.concrete_types, p.key, &resynced)
 			if ok do append(&to_lower, c)
 			processed[p.key] = true
 		}

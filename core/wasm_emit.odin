@@ -415,7 +415,7 @@ value_type_of :: proc(ectx: ^Emit_Ctx, v: Value_Id) -> ^Type {
 // практике — проверить в первую очередь, если такое появится.
 @(private = "file")
 wasm_field_is_i32 :: proc(kind: Type_Kind) -> bool {
-	return kind == .Bool || kind == .String || kind == .Struct || kind == .Error || kind == .Tuple || kind == .Function
+	return kind == .Bool || kind == .String || kind == .Struct || kind == .Error || kind == .Tuple || kind == .Function || kind == .Interface
 }
 
 // emit_construct_object — общая эмиссия для New_Aggregate_Instr/
@@ -951,6 +951,308 @@ call_value_result_shape :: proc(ectx: ^Emit_Ctx, v: ^Call_Value_Instr) -> (retur
 	return true, wasm_val_type(value_type_of(ectx, d))
 }
 
+// pop_leading_and_args — общий приём для ЛЮБОЙ инструкции, чей "ведущий"
+// операнд (Call_Value_Instr's callee, Invoke_Interface_Instr's receiver)
+// лоурится РАНЬШЕ args (структурный факт MIR) и потому лежит НА СТЕКЕ
+// ПОД args к моменту исполнения самой инструкции — снимаем args в
+// scratch (в ОБРАТНОМ порядке — последний сверху), затем ведущее
+// значение, оставляя вызывающему решать, В КАКОМ порядке (и с какими
+// доп. значениями, см. Invoke_Interface_Instr — это_receiver вставляется
+// ПЕРЕД args) всё это возвращать на стек.
+@(private = "file")
+pop_leading_and_args :: proc(ectx: ^Emit_Ctx, args: []Value_Id) -> (leading_local: int, arg_locals: []int) {
+	code := &ectx.code
+	n := len(args)
+	arg_locals = make([]int, n, context.temp_allocator)
+	for i := n - 1; i >= 0; i -= 1 {
+		is_i32 := wasm_val_type(value_type_of(ectx, args[i])) == WASM_I32
+		local := is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
+		arg_locals[i] = local
+		append(code, 0x21) // local.set
+		write_uleb128(code, u64(local))
+	}
+	leading_local = alloc_i32_scratch(ectx)
+	append(code, 0x21) // local.set (ведущее значение — callee/receiver)
+	write_uleb128(code, u64(leading_local))
+	return leading_local, arg_locals
+}
+
+// MAX_INTERFACE_METHODS — верхняя граница числа методов интерфейса,
+// поддержанная Invoke_Interface_Instr's развёрнутой (unrolled) цепочкой
+// сравнений (см. emit_invoke_interface) — panos'овские интерфейсы не
+// превышают 5 методов (Логгер, std/слог.ps), 16 — щедрый запас. ПОЧЕМУ
+// unrolled, а не настоящий WASM-цикл: индекс поля 2+2i/3+2i остаётся
+// КОМПАЙЛ-ТАЙМ константой при развёртке (i — компайл-тайм), избегая
+// рантайм-арифметики над индексами полей — первого в этом бэкенде
+// хендролленного цикла с арифметикой не потребовалось вообще (реальный
+// design-фork, решённый через AskUserQuestion — см. план interfaces).
+MAX_INTERFACE_METHODS :: 16
+
+// emit_cast_interface — Cast_Interface_Instr: строит [receiver,
+// method_count, name_0, handle_0, ..., name_{k-1}, handle_{k-1}]
+// arena-объект (k = len(v.vtable), НЕ дополненный до MAX — Invoke_
+// Interface_Instr читает method_count и никогда не читает за его
+// пределы, см. её докстринг). Каждый method_i handle — ТОТ ЖЕ
+// [fn_index]-объект, что emit_closure_value строит для некапчурящего
+// Function_Ref_Instr (переиспользует emit_construct_object напрямую) —
+// поэтому финальный вызов через найденный handle идентичен Call_Value_
+// Instr's механике (fn_index из поля 0, handle сам как __env), новой
+// calling convention не потребовалось.
+//
+// Диспетчинг СТРОКОВЫЙ (не позиционный): struct_type.methods — Odin
+// map[string]Symbol_Id, порядок итерации НЕ детерминирован между
+// разными Cast_Interface_Instr одного и того же интерфейса (см. план
+// interfaces, п.2) — bytecode VM's Interface_Value{data, methods:
+// map[string]^Compiled_Function} уже делает диспетчинг по имени
+// рантайм-ово, не позиционно; wasm обязан повторить это, а не
+// полагаться на совпадение индексов между кастами.
+@(private = "file")
+emit_cast_interface :: proc(ectx: ^Emit_Ctx, v: ^Cast_Interface_Instr) {
+	code := &ectx.code
+	k := len(v.vtable)
+	if k > MAX_INTERFACE_METHODS {
+		panic(
+			fmt.tprintf(
+				"wasm backend: интерфейс с %d методами превышает MAX_INTERFACE_METHODS=%d (см. план interfaces)",
+				k,
+				MAX_INTERFACE_METHODS,
+			),
+		)
+	}
+
+	receiver_local := alloc_i32_scratch(ectx)
+	append(code, 0x21) // local.set (снимает v.src со стека)
+	write_uleb128(code, u64(receiver_local))
+
+	name_locals := make([]int, k, context.temp_allocator)
+	handle_locals := make([]int, k, context.temp_allocator)
+	for binding, i in v.vtable {
+		emit_string_const(ectx, binding.method_name)
+		name_locals[i] = alloc_i32_scratch(ectx)
+		append(code, 0x21) // local.set
+		write_uleb128(code, u64(name_locals[i]))
+
+		wasm_idx := resolve_func_index(ectx, binding.fn)
+		handle_locals[i] = emit_construct_object(ectx, {}, PW_ALLOC_AGGREGATE, nil, i64(wasm_idx), false)
+	}
+
+	field_count := 2 + 2 * k
+	iface_local := alloc_i32_scratch(ectx)
+	append(code, 0x41) // i32.const field_count
+	write_sleb128(code, i64(field_count))
+	append(code, 0x10) // call pw_alloc_aggregate
+	write_uleb128(code, u64(PW_ALLOC_AGGREGATE))
+	append(code, 0x21) // local.set handle
+	write_uleb128(code, u64(iface_local))
+
+	emit_set_field_i32_const(ectx, iface_local, 0, receiver_local)
+	emit_set_field_i32_literal(ectx, iface_local, 1, i64(k))
+	for i in 0 ..< k {
+		emit_set_field_i32_const(ectx, iface_local, 2 + 2 * i, name_locals[i])
+		emit_set_field_i32_const(ectx, iface_local, 3 + 2 * i, handle_locals[i])
+	}
+
+	append(code, 0x20) // local.get handle — итоговое значение
+	write_uleb128(code, u64(iface_local))
+}
+
+// emit_set_field_i32_const/emit_set_field_i32_literal — маленькие
+// хелперы для emit_cast_interface's поля-из-локали / поле-из-константы
+// записей (pw_set_field_i32(handle, index, value)) — то же самое, что
+// emit_construct_object уже делает построчно, но здесь поля собираются
+// из РАЗНОРОДНЫХ источников (Value_Id, свежепостроенные локали,
+// компайл-тайм константы), не единого elements-массива, так что
+// emit_construct_object как есть не подходит без искусственного
+// оборачивания каждого источника в Value_Id.
+@(private = "file")
+emit_set_field_i32_const :: proc(ectx: ^Emit_Ctx, handle_local: int, field_index: int, value_local: int) {
+	code := &ectx.code
+	append(code, 0x20) // local.get handle
+	write_uleb128(code, u64(handle_local))
+	append(code, 0x41) // i32.const field_index
+	write_sleb128(code, i64(field_index))
+	append(code, 0x20) // local.get value
+	write_uleb128(code, u64(value_local))
+	append(code, 0x10) // call pw_set_field_i32
+	write_uleb128(code, u64(PW_SET_FIELD_I32))
+}
+
+@(private = "file")
+emit_set_field_i32_literal :: proc(ectx: ^Emit_Ctx, handle_local: int, field_index: int, value: i64) {
+	code := &ectx.code
+	append(code, 0x20) // local.get handle
+	write_uleb128(code, u64(handle_local))
+	append(code, 0x41) // i32.const field_index
+	write_sleb128(code, i64(field_index))
+	append(code, 0x41) // i32.const value
+	write_sleb128(code, value)
+	append(code, 0x10) // call pw_set_field_i32
+	write_uleb128(code, u64(PW_SET_FIELD_I32))
+}
+
+// find_interface_typeidx — Invoke_Interface_Instr's typeidx-резолюция.
+// НЕ переиспользует find_call_value_typeidx напрямую (обсуждалось в
+// плане как возможность, отклонено при реализации): позиция 0
+// (это/receiver) метода намеренно НЕ сверяется по типу — Invoke_
+// Interface_Instr.receiver's MIR-тип на месте вызова — это тип ЛОКАЛИ/
+// параметра, через который пришло значение (после mir_lowering.odin's
+// фикса Cast_Interface_Instr.dst — тип ИСХОДНОЙ структуры на самом
+// касте, но на join-точках если/иначе локаль часто типизирована как
+// САМ ИНТЕРФЕЙС, см. Let_Stmt's node_types[s.value]) — ни один из этих
+// двух вариантов совпадает с РЕАЛЬНЫМ это-параметром искомого метода
+// (конкретный struct/enum, известный только методу). Тайпчекер уже
+// гарантирует совместимость на этой позиции — сверяем только arity и
+// ОСТАЛЬНЫЕ (1..) позиции + тип результата.
+@(private = "file")
+find_interface_typeidx :: proc(ectx: ^Emit_Ctx, v: ^Invoke_Interface_Instr) -> int {
+	want_returns, want_result_byte := invoke_interface_result_shape(ectx, v)
+	for &mfn in ectx.module.functions {
+		wasm_idx, included := ectx.func_index^[mfn.id]
+		if !included do continue
+		if len(mfn.parameters) != len(v.args) + 1 do continue
+		match := true
+		for a, i in v.args {
+			pt := mfn.locals[int(mfn.parameters[i + 1])].type
+			if wasm_val_type(pt) != wasm_val_type(value_type_of(ectx, a)) {
+				match = false
+				break
+			}
+		}
+		if !match do continue
+		fn_returns := prune_type(mfn.result_type) != TY_VOID
+		if fn_returns != want_returns do continue
+		if want_returns && wasm_val_type(mfn.result_type) != want_result_byte do continue
+		return wasm_idx
+	}
+	panic("wasm backend: не найдена функция, соответствующая сигнатуре вызова интерфейсного метода — нарушена типобезопасность (см. план interfaces)")
+}
+
+@(private = "file")
+invoke_interface_result_shape :: proc(ectx: ^Emit_Ctx, v: ^Invoke_Interface_Instr) -> (returns: bool, byte: u8) {
+	d, ok := v.dst.?
+	if !ok do return false, 0
+	return true, wasm_val_type(value_type_of(ectx, d))
+}
+
+// emit_invoke_interface — Invoke_Interface_Instr: находит method_name
+// (компайл-тайм строка) в receiver's [receiver, method_count, name_0,
+// handle_0, ...]-объекте через РАЗВЁРНУТУЮ (MAX_INTERFACE_METHODS
+// итераций, i — компайл-тайм) цепочку сравнений (см. её докстринг для
+// MAX_INTERFACE_METHODS выше про то, почему НЕ настоящий цикл), затем
+// вызывает найденный handle ТОЧНО как Call_Value_Instr вызывает
+// closure-хендл (fn_index из поля 0, handle сам как __env) — с ОДНИМ
+// отличием: реальный receiver (сырой struct/enum, поле 0 хендла,
+// НЕ сам interface-wrapper) идёт ПЕРВЫМ реальным аргументом (это),
+// перед v.args.
+@(private = "file")
+emit_invoke_interface :: proc(ectx: ^Emit_Ctx, v: ^Invoke_Interface_Instr) {
+	code := &ectx.code
+	iface_local, arg_locals := pop_leading_and_args(ectx, v.args)
+
+	method_count_local := alloc_i32_scratch(ectx)
+	append(code, 0x20) // local.get iface
+	write_uleb128(code, u64(iface_local))
+	append(code, 0x41) // i32.const 1 (field index)
+	write_sleb128(code, 1)
+	append(code, 0x10) // call pw_get_field_i32
+	write_uleb128(code, u64(PW_GET_FIELD_I32))
+	append(code, 0x21) // local.set method_count
+	write_uleb128(code, u64(method_count_local))
+
+	emit_string_const(ectx, v.method_name)
+	target_name_local := alloc_i32_scratch(ectx)
+	append(code, 0x21) // local.set
+	write_uleb128(code, u64(target_name_local))
+
+	found_flag_local := alloc_i32_scratch(ectx)
+	found_handle_local := alloc_i32_scratch(ectx)
+	append(code, 0x41) // i32.const 0
+	write_sleb128(code, 0)
+	append(code, 0x21) // local.set found_flag = 0
+	write_uleb128(code, u64(found_flag_local))
+
+	for i in 0 ..< MAX_INTERFACE_METHODS {
+		// if found_flag == 0
+		append(code, 0x20) // local.get found_flag
+		write_uleb128(code, u64(found_flag_local))
+		append(code, 0x45) // i32.eqz
+		append(code, 0x04, 0x40) // if (пустой blocktype)
+
+		// if i < method_count
+		append(code, 0x41) // i32.const i
+		write_sleb128(code, i64(i))
+		append(code, 0x20) // local.get method_count
+		write_uleb128(code, u64(method_count_local))
+		append(code, 0x48) // i32.lt_s
+		append(code, 0x04, 0x40)
+
+		// if pw_string_equal(name_i, target_name)
+		append(code, 0x20) // local.get iface
+		write_uleb128(code, u64(iface_local))
+		append(code, 0x41) // i32.const 2+2i (name_i field index)
+		write_sleb128(code, i64(2 + 2 * i))
+		append(code, 0x10) // call pw_get_field_i32
+		write_uleb128(code, u64(PW_GET_FIELD_I32))
+		append(code, 0x20) // local.get target_name
+		write_uleb128(code, u64(target_name_local))
+		append(code, 0x10) // call pw_string_equal
+		write_uleb128(code, u64(PW_STRING_EQUAL))
+		append(code, 0x04, 0x40)
+
+		// found_handle = pw_get_field_i32(iface, 3+2i)
+		append(code, 0x20) // local.get iface
+		write_uleb128(code, u64(iface_local))
+		append(code, 0x41) // i32.const 3+2i
+		write_sleb128(code, i64(3 + 2 * i))
+		append(code, 0x10)
+		write_uleb128(code, u64(PW_GET_FIELD_I32))
+		append(code, 0x21) // local.set found_handle
+		write_uleb128(code, u64(found_handle_local))
+		// found_flag = 1
+		append(code, 0x41)
+		write_sleb128(code, 1)
+		append(code, 0x21)
+		write_uleb128(code, u64(found_flag_local))
+
+		append(code, 0x0B) // end (string_equal if)
+		append(code, 0x0B) // end (i < method_count if)
+		append(code, 0x0B) // end (found_flag == 0 if)
+	}
+
+	receiver_local := alloc_i32_scratch(ectx)
+	append(code, 0x20) // local.get iface
+	write_uleb128(code, u64(iface_local))
+	append(code, 0x41) // i32.const 0 (receiver field index)
+	write_sleb128(code, 0)
+	append(code, 0x10)
+	write_uleb128(code, u64(PW_GET_FIELD_I32))
+	append(code, 0x21) // local.set receiver
+	write_uleb128(code, u64(receiver_local))
+
+	append(code, 0x20) // local.get receiver (это — первый реальный арг)
+	write_uleb128(code, u64(receiver_local))
+	for i in 0 ..< len(arg_locals) {
+		append(code, 0x20) // local.get arg i
+		write_uleb128(code, u64(arg_locals[i]))
+	}
+
+	typeidx := find_interface_typeidx(ectx, v)
+
+	append(code, 0x20) // local.get found_handle (как __env)
+	write_uleb128(code, u64(found_handle_local))
+
+	append(code, 0x20) // local.get found_handle (снова — fn_index из поля 0)
+	write_uleb128(code, u64(found_handle_local))
+	append(code, 0x41) // i32.const 0
+	write_sleb128(code, 0)
+	append(code, 0x10)
+	write_uleb128(code, u64(PW_GET_FIELD_I32))
+
+	append(code, 0x11) // call_indirect
+	write_uleb128(code, u64(typeidx))
+	write_uleb128(code, 0) // tableidx 0
+}
+
 @(private = "file")
 emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 	code := &ectx.code
@@ -1015,26 +1317,11 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		// хендл (emit_closure_value), никогда голый funcidx, и ВСЕГДА
 		// положен на стек ОБЫЧНЫМ replay'ем (см. Emit_Ctx's докстринг) —
 		// т.е. лежит ПОД аргументами (callee лоурится раньше args, см.
-		// mir_lowering.odin), а call_indirect нужен ПОСЛЕ них. Снимаем
-		// args в scratch (в ОБРАТНОМ порядке — последний сверху), затем
-		// сам callee, затем восстанавливаем args в исходном порядке —
-		// тот же приём, что emit_construct_object (wasm_val_type, не
-		// wasm_field_is_i32 — это ОБЫЧНЫЕ значения-аргументы, не поля
-		// структуры, wasm_field_is_i32 неполон для Массив/Enum/
-		// Соответствие, см. её докстринг).
-		n := len(v.args)
-		arg_locals := make([]int, n, context.temp_allocator)
-		for i := n - 1; i >= 0; i -= 1 {
-			is_i32 := wasm_val_type(value_type_of(ectx, v.args[i])) == WASM_I32
-			local := is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
-			arg_locals[i] = local
-			append(code, 0x21) // local.set
-			write_uleb128(code, u64(local))
-		}
-		handle_local := alloc_i32_scratch(ectx)
-		append(code, 0x21) // local.set callee
-		write_uleb128(code, u64(handle_local))
-		for i in 0 ..< n {
+		// mir_lowering.odin), а call_indirect нужен ПОСЛЕ них —
+		// pop_leading_and_args разгребает порядок (тот же приём для
+		// Invoke_Interface_Instr, см. её case).
+		handle_local, arg_locals := pop_leading_and_args(ectx, v.args)
+		for i in 0 ..< len(arg_locals) {
 			append(code, 0x20) // local.get arg i
 			write_uleb128(code, u64(arg_locals[i]))
 		}
@@ -1390,10 +1677,14 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		append(code, 0x10)
 		write_uleb128(code, u64(field_getter))
 
+	case ^Cast_Interface_Instr:
+		emit_cast_interface(ectx, v)
+
+	case ^Invoke_Interface_Instr:
+		emit_invoke_interface(ectx, v)
+
 	case ^Call_Async_Instr,
 	     ^Call_Foreign_Instr,
-	     ^Cast_Interface_Instr,
-	     ^Invoke_Interface_Instr,
 	     ^Spawn_Instr,
 	     ^Send_Instr,
 	     ^Receive_Instr,

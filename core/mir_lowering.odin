@@ -1044,7 +1044,13 @@ maybe_wrap_interface_cast :: proc(ctx: ^Lowering_Context, expr: Expr, value: Val
 		append(&bindings, Interface_Method_Binding{method_name = method_name, fn = fn_id})
 	}
 
-	dst := new_value(&ctx.b, nil)
+	// wasm backend (план interfaces): dst раньше получал nil-тип —
+	// is_wasm_phase1_type(nil) отбрасывает ЛЮБУЮ функцию с Cast_
+	// Interface_Instr из WASM-эмиссии целиком, независимо от того,
+	// реализован ли сам Cast_Interface_Instr. Переиспользуем тип
+	// ИСХОДНОГО значения (struct/enum, уже i32-представимый в wasm) —
+	// байткод-VM типы Value_Id вообще не читает, поведенчески незаметно.
+	dst := new_value(&ctx.b, value_type(&ctx.b, value))
 	i := new(Cast_Interface_Instr)
 	i.dst = dst
 	i.src = value

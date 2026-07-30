@@ -69,7 +69,7 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 	#partial switch pt.kind {
 	case .Number, .Integer:
 		return WASM_F64
-	case .Bool, .String, .Struct, .Array, .Enum, .Map, .Error, .Tuple, .Function:
+	case .Bool, .String, .Struct, .Array, .Enum, .Map, .Error, .Tuple, .Function, .Interface:
 		return WASM_I32
 	case:
 		panic(
@@ -92,7 +92,7 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 is_wasm_phase1_type :: proc(t: ^Type) -> bool {
 	if t == nil do return false
 	#partial switch prune_type(t).kind {
-	case .Number, .Integer, .Bool, .Void, .String, .Struct, .Array, .Enum, .Map, .Error, .Tuple, .Function:
+	case .Number, .Integer, .Bool, .Void, .String, .Struct, .Array, .Enum, .Map, .Error, .Tuple, .Function, .Interface:
 		return true
 	case:
 		return false

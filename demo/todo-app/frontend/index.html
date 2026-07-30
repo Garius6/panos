@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ru">
+<head>
+	<meta charset="utf-8" />
+	<title>panos todo-демо</title>
+</head>
+<body>
+	<h1>Список задач</h1>
+	<input id="новая-задача" type="text" placeholder="новая задача" />
+	<button id="добавить">добавить</button>
+	<ul id="список"></ul>
+
+	<script type="module">
+		import { loadAotDomProgram } from "../../../docs/src/assets/aot-dom-loader.js"
+
+		await loadAotDomProgram("./main.wasm", "./runtime_js.wasm")
+	</script>
+</body>
+</html>

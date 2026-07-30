@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="ru">
+<head>
+	<meta charset="utf-8" />
+	<title>panos DOM target — счётчик</title>
+</head>
+<body>
+	<p id="count">0</p>
+	<button id="btn">+1</button>
+
+	<script type="module">
+		import { loadAotDomProgram } from "../../docs/src/assets/aot-dom-loader.js"
+
+		await loadAotDomProgram("./counter.wasm", "./runtime_js.wasm")
+	</script>
+</body>
+</html>

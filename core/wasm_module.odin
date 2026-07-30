@@ -1,6 +1,7 @@
 package core
 
 import "core:fmt"
+import "core:strings"
 
 // wasm_module.odin — сборка итогового .wasm-модуля (Фаза 1, "walking
 // skeleton" WASM AOT-бэкенда). LEB128/секционные помощники + entry point
@@ -268,6 +269,47 @@ pw_imports := [PW_IMPORT_COUNT]Pw_Import {
 	{"pw_url_encode", {WASM_I32}, {WASM_I32}},
 }
 
+// PW_DOM_MODULE/pw_dom_imports — DOM target (browser only): ОТДЕЛЬНЫЙ
+// именованный import-модуль ("dom", не "env") в ТОМ ЖЕ WASM-файле —
+// стандартно и уже ровно так работает "env" сам по себе (WASM импорт —
+// плоская пара module+name на функцию, ничего не мешает нескольким
+// РАЗНЫМ module-именам сосуществовать). Реализация ВСЕГДА на JS-стороне
+// (docs/src/assets/aot-dom-loader.js) — document.* недостижим из WASM
+// напрямую ни при каких обстоятельствах, в отличие от "env" (которое
+// wasm_runtime САМ реализует на Odin, компилируемом в тот же WASM).
+// Индексы ПРОДОЛЖАЮТ pw_imports (см. total_import_count в lower_module_
+// to_wasm) — единое funcidx-пространство для ОБОИХ модулей импортов, как
+// того требует спецификация (импорты всегда идут раньше локальных
+// функций, независимо от того, из скольких разных модулей).
+PW_DOM_MODULE :: "dom"
+
+// Абсолютные funcidx (см. докстринг выше про единое пространство) —
+// PW_IMPORT_COUNT+k, той же формой, что PW_IMPORT_COUNT+k используется
+// для локальных функций в lower_module_to_wasm ниже.
+PW_DOM_GET_TEXT :: PW_IMPORT_COUNT + 0
+PW_DOM_SET_TEXT :: PW_IMPORT_COUNT + 1
+PW_DOM_GET_ATTRIBUTE :: PW_IMPORT_COUNT + 2
+PW_DOM_SET_ATTRIBUTE :: PW_IMPORT_COUNT + 3
+PW_DOM_REMOVE_ATTRIBUTE :: PW_IMPORT_COUNT + 4
+PW_DOM_CREATE_AND_APPEND :: PW_IMPORT_COUNT + 5
+PW_DOM_REMOVE :: PW_IMPORT_COUNT + 6
+PW_DOM_ON_CLICK :: PW_IMPORT_COUNT + 7
+PW_DOM_ON_INPUT :: PW_IMPORT_COUNT + 8
+PW_DOM_IMPORT_COUNT :: 9
+
+@(private = "file")
+pw_dom_imports := [PW_DOM_IMPORT_COUNT]Pw_Import {
+	{"dom_get_text", {WASM_I32}, {WASM_I32}},
+	{"dom_set_text", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"dom_get_attribute", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"dom_set_attribute", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"dom_remove_attribute", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"dom_create_and_append", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"dom_remove", {WASM_I32}, {WASM_I32}},
+	{"dom_on_click", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"dom_on_input", {WASM_I32, WASM_I32}, {WASM_I32}},
+}
+
 @(private = "file")
 write_section :: proc(out: ^[dynamic]u8, id: u8, content: []u8) {
 	append(out, id)
@@ -300,13 +342,38 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 	// исходного module.functions -> итоговый funcidx), для Call_Instr.
 	// callee/Function_Ref_Instr.fn (см. wasm_emit.odin) — уже готовое,
 	// сдвинутое значение, wasm_emit.odin про сдвиг ничего не знает.
+	// dom_used — "dom"-импорты объявляются ТОЛЬКО если модуль реально
+	// зовёт хоть один DOM::*-билтин. Иначе wasmtime (дифференциальный
+	// тестовый харнесс, --preload только "env=...") отказывается
+	// инстанцировать ЛЮБОЙ модуль — недостающий импорт-модуль "dom"
+	// проваливает инстанциацию целиком, даже если ни один DOM::*-вызов
+	// в программе не участвует. PW_DOM_*-константы (funcidx PW_IMPORT_
+	// COUNT+k) остаются корректны В ОБОИХ случаях: единственный код,
+	// который их читает (wasm_emit.odin, Call_Builtin_Instr) сам
+	// исполняется только когда DOM::*-инструкция реально есть — а
+	// значит dom_used уже true и импорты объявлены по тем же индексам.
+	dom_used := false
+	dom_scan: for &mfn in module.functions {
+		for &blk in mfn.blocks {
+			for instr in blk.instructions {
+				if cb, ok := instr.(^Call_Builtin_Instr); ok {
+					if strings.has_prefix(cb.name, "DOM::") {
+						dom_used = true
+						break dom_scan
+					}
+				}
+			}
+		}
+	}
+	total_imports := PW_IMPORT_COUNT + (dom_used ? PW_DOM_IMPORT_COUNT : 0)
+
 	included := make([dynamic]int)
 	defer delete(included)
 	func_index := make(map[Function_Id]int)
 	defer delete(func_index)
 	for &mfn, i in module.functions {
 		if is_wasm_phase1_function(&mfn) {
-			func_index[Function_Id(i)] = PW_IMPORT_COUNT + len(included)
+			func_index[Function_Id(i)] = total_imports + len(included)
 			append(&included, i)
 		}
 	}
@@ -314,7 +381,7 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 
 	types_content := make([dynamic]u8)
 	defer delete(types_content)
-	write_uleb128(&types_content, u64(PW_IMPORT_COUNT + n))
+	write_uleb128(&types_content, u64(total_imports + n))
 	for imp in pw_imports {
 		append(&types_content, 0x60) // functype tag
 		write_uleb128(&types_content, u64(len(imp.params)))
@@ -322,15 +389,32 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 		write_uleb128(&types_content, u64(len(imp.results)))
 		for b in imp.results do append(&types_content, b)
 	}
+	if dom_used {
+		for imp in pw_dom_imports {
+			append(&types_content, 0x60) // functype tag
+			write_uleb128(&types_content, u64(len(imp.params)))
+			for b in imp.params do append(&types_content, b)
+			write_uleb128(&types_content, u64(len(imp.results)))
+			for b in imp.results do append(&types_content, b)
+		}
+	}
 
 	import_content := make([dynamic]u8)
 	defer delete(import_content)
-	write_uleb128(&import_content, u64(PW_IMPORT_COUNT))
+	write_uleb128(&import_content, u64(total_imports))
 	for imp, i in pw_imports {
 		write_name(&import_content, PW_IMPORT_MODULE)
 		write_name(&import_content, imp.name)
 		append(&import_content, 0x00) // importdesc kind = func
-		write_uleb128(&import_content, u64(i)) // typeidx == i (импорты — первые PW_IMPORT_COUNT записей types_content)
+		write_uleb128(&import_content, u64(i)) // typeidx == i (импорты — первые total_imports записей types_content)
+	}
+	if dom_used {
+		for imp, i in pw_dom_imports {
+			write_name(&import_content, PW_DOM_MODULE)
+			write_name(&import_content, imp.name)
+			append(&import_content, 0x00) // importdesc kind = func
+			write_uleb128(&import_content, u64(PW_IMPORT_COUNT + i)) // typeidx продолжает нумерацию pw_imports
+		}
 	}
 
 	func_content := make([dynamic]u8)
@@ -360,8 +444,8 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 			write_uleb128(&types_content, 0)
 		}
 
-		wasm_idx := PW_IMPORT_COUNT + k
-		write_uleb128(&func_content, u64(wasm_idx)) // typeidx == funcidx == PW_IMPORT_COUNT+k
+		wasm_idx := total_imports + k
+		write_uleb128(&func_content, u64(wasm_idx)) // typeidx == funcidx == total_imports+k
 
 		write_name(&export_content, mfn.name)
 		append(&export_content, 0x00) // exportdesc kind = func
@@ -373,7 +457,7 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 	write_uleb128(&table_content, 1) // 1 таблица
 	append(&table_content, 0x70) // funcref
 	append(&table_content, 0x00) // limits: только min (без max)
-	write_uleb128(&table_content, u64(PW_IMPORT_COUNT + n))
+	write_uleb128(&table_content, u64(total_imports + n))
 
 	elem_content := make([dynamic]u8)
 	defer delete(elem_content)
@@ -382,8 +466,8 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 	append(&elem_content, 0x41) // i32.const
 	write_sleb128(&elem_content, 0)
 	append(&elem_content, 0x0B) // end
-	write_uleb128(&elem_content, u64(PW_IMPORT_COUNT + n))
-	for i in 0 ..< PW_IMPORT_COUNT + n do write_uleb128(&elem_content, u64(i))
+	write_uleb128(&elem_content, u64(total_imports + n))
+	for i in 0 ..< total_imports + n do write_uleb128(&elem_content, u64(i))
 
 	code_content := make([dynamic]u8)
 	defer delete(code_content)

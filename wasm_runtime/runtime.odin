@@ -4,7 +4,6 @@ import "base:intrinsics"
 import "base:runtime"
 import "core:strconv"
 import "core:unicode"
-import wasi "core:sys/wasm/wasi"
 
 // wasm_runtime — Фаза 1.5 WASM AOT-бэкенда: минимальный, ОТДЕЛЬНЫЙ от
 // core/gc.odin аллокатор для heap-значений (пока только строки) в
@@ -97,6 +96,25 @@ pw_alloc_from_scratch :: proc "contextless" (length: i32) -> i32 {
 @(export)
 pw_string_len :: proc "contextless" (handle: i32) -> i32 {
 	return obj_sizes[handle]
+}
+
+// pw_string_ptr — АБСОЛЮТНЫЙ байтовый адрес строки в ЛИНЕЙНОЙ ПАМЯТИ
+// ЭТОГО ИНСТАНСА целиком (то, что JS видит как exports.memory.buffer),
+// НЕ obj_offsets[handle] само по себе — тот индекс ОТНОСИТЕЛЕН к началу
+// arena (см. её докстринг: next_free — счётчик байт ВНУТРИ arena, не
+// абсолютный адрес), а arena — ОБЫЧНЫЙ package-level массив, который сам
+// расположен Odin'ом по НЕнулевому адресу среди прочих globals. Внутри
+// WASM-кода (этот пакет, сгенерированная программа) разница невидима —
+// весь доступ идёт через `arena[off]`, Odin сам считает `&arena + off`.
+// Но JS, индексирующий Uint8Array НАПРЯМУЮ, обязан получить настоящий
+// абсолютный адрес — экспортирован СПЕЦИАЛЬНО для браузерного DOM-
+// загрузчика (docs/src/assets/aot-dom-loader.js), никакой WASM-код
+// (ни рантайм, ни сгенерированная программа) сырые адреса не использует
+// и не должен — см. докстринг файла про побайтовую pw_scratch_set-
+// передачу как единственный WASM-WASM канал.
+@(export)
+pw_string_ptr :: proc "contextless" (handle: i32) -> i32 {
+	return i32(uintptr(&arena[obj_offsets[handle]]))
 }
 
 // pw_concat_strings — новый объект = байты a + байты b (panos's `+` на
@@ -564,54 +582,12 @@ pw_map_set_numkey_i32 :: proc "contextless" (handle: i32, key: f64, value: i32) 
 	return 1
 }
 
-// --- Фаза 2.0: ввод_вывод::печать ------------------------------------
-//
-// Единственный builtin, поддержанный на этом срезе (см. план) — прямой
-// WASI-вызов, СВОЙ foreign import (то, что odin's собственная runtime-
-// инициализация уже импортирует wasi_snapshot_preview1.fd_write/
-// random_get, видно в объектнике этого же пакета, НЕ делает эти функции
-// вызываемыми ИЗ нашего кода — нужен собственный site вызова).
-
-// fd_write — Odin's СОБСТВЕННЫЙ base/runtime (os_specific_wasi.odin)
-// уже импортирует "wasi_snapshot_preview1"."fd_write" (для _stderr_write,
-// #private — не вызвать напрямую) со СВОЕЙ, высокоуровневой Odin-
-// сигнатурой (iovs: [][]byte, не сырой WASI ABI) — объявление ТОГО ЖЕ
-// имени import'а с ДРУГОЙ сигнатурой в этом же билде — ошибка компиляции
-// ("Redeclaration... with different type signatures"), найдено эмпирически
-// при первой попытке. Повторяем ТОЧНО ЕЁ сигнатуру — Odin сам маршаллит
-// [][]byte в нужный сырой iovec-массив, независимо от того, кто объявил.
-foreign import wasi_snapshot "wasi_snapshot_preview1"
-@(default_calling_convention = "contextless")
-foreign wasi_snapshot {
-	fd_write :: proc(fd: i32, iovs: [][]byte, n: ^uint) -> u16 ---
-}
-
-@(export)
-pw_print_string :: proc "contextless" (handle: i32) {
-	off, length := obj_offsets[handle], obj_sizes[handle]
-	data := arena[off:][:length]
-	n: uint
-	fd_write(1, {data}, &n)
-}
-
-// pw_println_string — ввод_вывод::строка (bytecode: fmt.println, печать
-// с завершающим переводом строки, в отличие от pw_print_string выше).
-// ДВА отдельных fd_write-вызова, НЕ один с двумя iovec — подтверждено
-// спайком ДО вживления: WASI fd_write здесь делает частичную запись
-// (writev-семантика, валидно по спецификации) — {data, newline[:]} в
-// ОДНОМ вызове реально писал ТОЛЬКО первый iovec (n возвращал len(data),
-// второй молча терялся), а не паниковал/ошибался — тихий, а не громкий
-// баг, если бы не проверили. Два ОДНО-iovec вызова (та же форма, что
-// уже проверенный pw_print_string) надёжно пишут оба куска.
-@(export)
-pw_println_string :: proc "contextless" (handle: i32) {
-	off, length := obj_offsets[handle], obj_sizes[handle]
-	data := arena[off:][:length]
-	newline := [1]byte{'\n'}
-	n: uint
-	fd_write(1, {data}, &n)
-	fd_write(1, {newline[:]}, &n)
-}
+// pw_print_string/pw_println_string (ввод_вывод::печать/строка) и
+// pw_monotonic_ms/pw_now_ms (время::монотонно_мс/сейчас_мс) — target-
+// СПЕЦИФИЧНЫ (WASI fd_write/clock_time_get vs. браузерный js_runtime-
+// импорт), см. runtime_wasi.odin (#+build !js) / runtime_js.odin
+// (#+build js) — та же #+build-развилка, что core/*_native.odin/
+// core/*_wasm.odin уже используют для native/браузер-специфичного кода.
 
 // --- Фаза 2: строки::содержит/начинается_с/заканчивается_на -----------
 // Наивный побайтовый поиск (не Boyer-Moore/KMP) — оправдано размером
@@ -791,32 +767,6 @@ pw_string_replace_all :: proc "contextless" (text: i32, old: i32, new: i32) -> i
 	obj_capacity[id] = obj_sizes[id]
 	obj_count += 1
 	return id
-}
-
-// --- время::монотонно_мс/сейчас_мс -------------------------------------
-//
-// core:sys/wasm/wasi (ОТДЕЛЬНЫЙ публичный Odin-пакет, не base/runtime's
-// #private os_specific_wasi.odin, см. докстринг про fd_write выше) —
-// собственного raw foreign import здесь заводить не нужно, wasi.
-// clock_time_get уже proc "contextless" и не требует context.allocator.
-//
-// ВАЖНО (не для дифф-тестов на точное равенство, см. core/wasm_backend_
-// wasmtime_test.odin): байткод-VM's время::монотонно_мс отсчитывает от
-// СВОЕГО vm.monotonic_epoch (момент запуска ЭТОГО процесса), а WASI's
-// CLOCK_MONOTONIC — от опорной точки хоста (обычно system boot), у
-// байткод-VM и скомпилированного .wasm-модуля РАЗНЫЕ процессы — значения
-// заведомо не совпадут численно. Проверяется отдельно ("возвращает
-// положительное число"), не через wasm_diff_check.
-@(export)
-pw_monotonic_ms :: proc "contextless" () -> f64 {
-	ts, _ := wasi.clock_time_get(wasi.CLOCK_MONOTONIC, 0)
-	return f64(ts) / 1e6
-}
-
-@(export)
-pw_now_ms :: proc "contextless" () -> f64 {
-	ts, _ := wasi.clock_time_get(wasi.CLOCK_REALTIME, 0)
-	return f64(ts) / 1e6
 }
 
 // --- Фаза 2.8: рун-осведомлённые строковые операции ---------------------

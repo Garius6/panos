@@ -1029,6 +1029,14 @@ format_number :: proc(num: f64) -> string {
 }
 
 call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
+	// DOM::* — ТОЛЬКО AOT WASM-вывод (core/wasm_emit.odin) реально вызывает
+	// document.*; байткод-VM (нативный ИЛИ сам собранный в js_wasm32 —
+	// интерактивный плейграунд) не имеет доступа к DOM вообще, паникуем
+	// ЗДЕСЬ, в общем диспетчере, ОДИН раз — не дублируем проверку в
+	// vm_io_native.odin И vm_io_wasm.odin по отдельности.
+	if strings.has_prefix(name, "DOM::") {
+		fmt.panicf("Runtime Panic: '%s' доступно только в AOT WASM-выводе, не в байткод-VM", name)
+	}
 	// фс::*/ос::окружение*/ввод_вывод::прочитать_строку/поток/сеть::подключиться
 	// — в vm_io_native.odin/vm_io_wasm.odin (#+build split, трогают
 	// os.exists/os.open/os.lookup_env/net.dial_tcp...). Остальные builtin'ы

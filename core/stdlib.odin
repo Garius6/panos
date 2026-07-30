@@ -12,7 +12,8 @@ is_builtin_module_name :: proc(name: string) -> bool {
 		name == "время" ||
 		name == "сжатие" ||
 		name == "синтаксис" ||
-		name == "бд" \
+		name == "бд" ||
+		name == "DOM" \
 	)
 }
 
@@ -260,6 +261,24 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 			TY_STRING,
 			stdlib_result_type(graph, stdlib_option_type(graph, TY_STRING), TY_ERROR),
 		)
+	case "DOM::текст":
+		return builtin_function_type_1(TY_STRING, stdlib_option_type(graph, TY_STRING))
+	case "DOM::установить_текст":
+		return builtin_function_type_2(TY_STRING, TY_STRING, TY_BOOL)
+	case "DOM::атрибут":
+		return builtin_function_type_2(TY_STRING, TY_STRING, stdlib_option_type(graph, TY_STRING))
+	case "DOM::установить_атрибут":
+		return builtin_function_type_3(TY_STRING, TY_STRING, TY_STRING, TY_BOOL)
+	case "DOM::удалить_атрибут":
+		return builtin_function_type_2(TY_STRING, TY_STRING, TY_BOOL)
+	case "DOM::создать_и_добавить":
+		return builtin_function_type_3(TY_STRING, TY_STRING, TY_STRING, TY_BOOL)
+	case "DOM::удалить":
+		return builtin_function_type_1(TY_STRING, TY_BOOL)
+	case "DOM::на_клик":
+		return builtin_function_type_2(TY_STRING, TY_STRING, TY_BOOL)
+	case "DOM::на_ввод":
+		return builtin_function_type_2(TY_STRING, TY_STRING, TY_BOOL)
 	}
 	return nil
 }
@@ -500,6 +519,36 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 		)
 	} else if name == "бд" {
 		add_builtin_export(graph, module, "открыть", builtin_export_type(graph, "бд::открыть"))
+	} else if name == "DOM" {
+		add_builtin_export(graph, module, "текст", builtin_export_type(graph, "DOM::текст"))
+		add_builtin_export(
+			graph,
+			module,
+			"установить_текст",
+			builtin_export_type(graph, "DOM::установить_текст"),
+		)
+		add_builtin_export(graph, module, "атрибут", builtin_export_type(graph, "DOM::атрибут"))
+		add_builtin_export(
+			graph,
+			module,
+			"установить_атрибут",
+			builtin_export_type(graph, "DOM::установить_атрибут"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"удалить_атрибут",
+			builtin_export_type(graph, "DOM::удалить_атрибут"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"создать_и_добавить",
+			builtin_export_type(graph, "DOM::создать_и_добавить"),
+		)
+		add_builtin_export(graph, module, "удалить", builtin_export_type(graph, "DOM::удалить"))
+		add_builtin_export(graph, module, "на_клик", builtin_export_type(graph, "DOM::на_клик"))
+		add_builtin_export(graph, module, "на_ввод", builtin_export_type(graph, "DOM::на_ввод"))
 	}
 
 	return module

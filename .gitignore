@@ -8,5 +8,7 @@ node_modules
 docs/book/
 /wasm.wasm
 /demo/*.wasm
+/demo/**/*.wasm
 /wasm_runtime/*.o
 /wasm_runtime/*.wasm
+/tests/**/test-results/

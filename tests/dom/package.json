@@ -1,0 +1,16 @@
+{
+  "name": "panos-dom-target-tests",
+  "version": "1.0.0",
+  "description": "Playwright end-to-end tests for the panos WASM AOT DOM target — real headless Chromium, wasmtime cannot exercise document.*",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.62.0"
+  }
+}

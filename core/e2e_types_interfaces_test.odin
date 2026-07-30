@@ -2000,3 +2000,21 @@ test_option_process_two_generic_methods_same_round :: proc(t: ^testing.T) {
 		testing.expectf(t, is_bool && b, "Опция(Процесс(T)) — два метода в одном раунде: ожидалось true, получено %v", result)
 	}
 }
+
+// DOM::* доступно ТОЛЬКО в AOT WASM-выводе (core/wasm_emit.odin) — тайп-
+// чекер регистрацию не различает по бэкенду (core/stdlib.odin — общая),
+// значит `DOM.текст(...)` typecheck'ается везде одинаково, но байткод-
+// VM's call_builtin (core/vm.odin) обязана явно паниковать при попытке
+// РЕАЛЬНО выполнить его — нет document.* ни у нативного бинаря, ни у
+// самого интерпретатора, собранного в js_wasm32.
+@(test)
+test_dom_builtin_panics_on_bytecode_vm :: proc(t: ^testing.T) {
+	testing.expect_assert(t, "Runtime Panic: 'DOM::текст' доступно только в AOT WASM-выводе, не в байткод-VM")
+	run_code(`
+		импорт DOM
+		функ старт() -> Число
+			DOM.текст("#a")
+			0
+		конец
+	`)
+}

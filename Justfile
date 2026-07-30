@@ -76,7 +76,18 @@ build-wasm-runtime:
 		--export=pw_string_to_upper --export=pw_string_to_lower \
 		--export=pw_number_to_string --export=pw_string_to_number \
 		--export=pw_string_trim --export=pw_string_split --export=pw_string_join \
-		--export=pw_map_entries --export=pw_println_string --export=pw_url_encode --allow-undefined
+		--export=pw_map_entries --export=pw_println_string --export=pw_url_encode \
+		--export=pw_string_ptr --allow-undefined
+
+# js_wasm32-вариант того же wasm_runtime, для DOM-загрузчика (docs/src/
+# assets/aot-dom-loader.js) — В ОТЛИЧИЕ от wasi_wasm32 выше, ОДНА команда:
+# js_wasm32 не нуждается в отдельном wasm-ld-шаге, Odin сам делает полное
+# слинкованное .wasm — @(export) сам по себе достаточен (подтверждено
+# спайком: все pw_*-экспорты видны в instance.exports без единого
+# --export-флага). runtime_js.odin (#+build js) — реализация ввод_вывод::
+# печать/строка и время::*, отличная от wasi-варианта (runtime_wasi.odin).
+build-wasm-runtime-js:
+	odin build wasm_runtime -target:js_wasm32 -out:wasm_runtime/runtime_js.wasm -no-entry-point
 
 # Дифференциальные тесты WASM AOT-бэкенда (Фаза 1/1.5, core/wasm_backend_
 # wasmtime_test.odin) — за #config(PANOS_WASM_BACKEND_TESTS), НЕ входят в

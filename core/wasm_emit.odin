@@ -930,6 +930,43 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		case "сеть::кодировать_url":
 			append(code, 0x10)
 			write_uleb128(code, u64(PW_URL_ENCODE))
+
+		// --- DOM target (браузер) — все direct-call, БЕЗ переупорядочивания
+		// операндов: аргументы уже в естественном MIR-порядке на стеке, и
+		// "dom"-импорты (core/wasm_module.odin) принимают их в том же
+		// порядке один-в-один. Опция(Строка)-возвращающие (текст/атрибут)
+		// получают УЖЕ полностью собранный Опция-хендл от JS-стороны
+		// (dom_get_text/dom_get_attribute сами вызывают pw_build_variant —
+		// см. docs/src/assets/aot-dom-loader.js) — здесь нет разницы с
+		// Булево-возвращающими, оба просто i32.
+		case "DOM::текст":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_GET_TEXT))
+		case "DOM::установить_текст":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_SET_TEXT))
+		case "DOM::атрибут":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_GET_ATTRIBUTE))
+		case "DOM::установить_атрибут":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_SET_ATTRIBUTE))
+		case "DOM::удалить_атрибут":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_REMOVE_ATTRIBUTE))
+		case "DOM::создать_и_добавить":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_CREATE_AND_APPEND))
+		case "DOM::удалить":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_REMOVE))
+		case "DOM::на_клик":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_ON_CLICK))
+		case "DOM::на_ввод":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_ON_INPUT))
+
 		case "паника":
 			// Фаза 2.6: паника(сообщение) — Строка-arg уже на стеке
 			// (единственный операнд, см. instr_refs). Байткод-VM не

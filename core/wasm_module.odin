@@ -129,6 +129,43 @@ Pw_Import :: struct {
 	results: []u8,
 }
 
+// Wasm_Foreign_Import — план interop с внешний: в отличие от Pw_Import
+// (module фиксирован — "env" для ВСЕГО массива), у КАЖДОЙ внешний-
+// декларации СВОЙ module (библиотека из `внешний "либа" ...`) — module
+// хранится на самой записи, не подразумевается общим для массива.
+Wasm_Foreign_Import :: struct {
+	library: string,
+	name:    string,
+	params:  []u8,
+	results: []u8,
+	fn:      ^Foreign_Function,
+}
+
+// foreign_marshal_wasm_type — Foreign_Marshal_Kind -> WASM valtype.
+// Целое/Число (Int*/Float*, ЛЮБОЙ ширины — панос-тип один и тот же
+// регардлесс ширины, см. type_cheker.odin's foreign_marshal_panos_type)
+// -> f64, та же "Целое/Число делят f64" конвенция, что везде в этом
+// бэкенде. CString -> i32 (строковый хендл, та же конвенция, что DOM-
+// строки). Pointer/Struct-по-значению НЕ имеют установленного смысла
+// для JS/host-импорта — вне области v1, паникуем явно, не молча
+// откусываем/искажаем.
+@(private = "file")
+foreign_marshal_wasm_type :: proc(kind: Foreign_Marshal_Kind) -> u8 {
+	#partial switch kind {
+	case .Int8, .Int32, .Int64, .Float32, .Float64:
+		return WASM_F64
+	case .CString:
+		return WASM_I32
+	case:
+		panic(
+			fmt.tprintf(
+				"wasm backend: внешний-параметр/результат marshal-кинда %v вне области (только Целое/Число/Строка, см. план interop)",
+				kind,
+			),
+		)
+	}
+}
+
 PW_SCRATCH_SET :: 0
 PW_ALLOC_FROM_SCRATCH :: 1
 PW_STRING_LEN :: 2
@@ -365,7 +402,47 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 			}
 		}
 	}
-	total_imports := PW_IMPORT_COUNT + (dom_used ? PW_DOM_IMPORT_COUNT : 0)
+
+	// План interop с внешний (WASM AOT): каждая РЕАЛЬНО вызванная
+	// внешний-функция становится СВОИМ wasm-импортом, module=библиотека
+	// (из `внешний "либа" функ ...`), name=имя функции — ОДИН импорт на
+	// РАЗЛИЧНЫЙ ^Foreign_Function (get_or_build_foreign_function кеширует
+	// один на Foreign_Decl, переиспользуется всеми call site'ами — pointer
+	// identity как dedup-ключ, надёжнее строкового "либа::имя"). В отличие
+	// от dom_used (один bool) — это ДИНАМИЧЕСКИЙ список, размер и модули
+	// зависят от конкретной программы (0 в общем случае — большинство
+	// программ не используют внешний вообще).
+	foreign_imports := make([dynamic]Wasm_Foreign_Import)
+	defer delete(foreign_imports)
+	foreign_func_index := make(map[^Foreign_Function]int)
+	defer delete(foreign_func_index)
+	foreign_seen := make(map[^Foreign_Function]bool)
+	defer delete(foreign_seen)
+	for &mfn in module.functions {
+		for &blk in mfn.blocks {
+			for instr in blk.instructions {
+				cf, ok := instr.(^Call_Foreign_Instr)
+				if !ok || foreign_seen[cf.fn] do continue
+				foreign_seen[cf.fn] = true
+
+				params := make([]u8, len(cf.fn.param_kinds))
+				for k, i in cf.fn.param_kinds {
+					params[i] = foreign_marshal_wasm_type(k)
+				}
+				results: []u8
+				if cf.fn.return_kind != .Void {
+					results = []u8{foreign_marshal_wasm_type(cf.fn.return_kind)}
+				}
+				append(&foreign_imports, Wasm_Foreign_Import{library = cf.fn.library, name = cf.fn.name, params = params, results = results, fn = cf.fn})
+			}
+		}
+	}
+
+	total_imports := PW_IMPORT_COUNT + (dom_used ? PW_DOM_IMPORT_COUNT : 0) + len(foreign_imports)
+	foreign_base := PW_IMPORT_COUNT + (dom_used ? PW_DOM_IMPORT_COUNT : 0)
+	for imp, i in foreign_imports {
+		foreign_func_index[imp.fn] = foreign_base + i
+	}
 
 	included := make([dynamic]int)
 	defer delete(included)
@@ -398,6 +475,13 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 			for b in imp.results do append(&types_content, b)
 		}
 	}
+	for imp in foreign_imports {
+		append(&types_content, 0x60) // functype tag
+		write_uleb128(&types_content, u64(len(imp.params)))
+		for b in imp.params do append(&types_content, b)
+		write_uleb128(&types_content, u64(len(imp.results)))
+		for b in imp.results do append(&types_content, b)
+	}
 
 	import_content := make([dynamic]u8)
 	defer delete(import_content)
@@ -415,6 +499,15 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 			append(&import_content, 0x00) // importdesc kind = func
 			write_uleb128(&import_content, u64(PW_IMPORT_COUNT + i)) // typeidx продолжает нумерацию pw_imports
 		}
+	}
+	for imp, i in foreign_imports {
+		// module = сама библиотека из `внешний "либа" ...` — В ОТЛИЧИЕ
+		// от pw_imports/pw_dom_imports, здесь module МЕНЯЕТСЯ по записям
+		// (см. Wasm_Foreign_Import's докстринг).
+		write_name(&import_content, imp.library)
+		write_name(&import_content, imp.name)
+		append(&import_content, 0x00) // importdesc kind = func
+		write_uleb128(&import_content, u64(foreign_base + i)) // typeidx продолжает нумерацию env+dom
 	}
 
 	func_content := make([dynamic]u8)
@@ -480,7 +573,7 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 	write_uleb128(&code_content, u64(n))
 	for k in 0 ..< n {
 		mfn := &module.functions[included[k]]
-		body := emit_function_wasm(module, mfn, &func_index)
+		body := emit_function_wasm(module, mfn, &func_index, &foreign_func_index)
 		write_uleb128(&code_content, u64(len(body)))
 		for b in body do append(&code_content, b)
 		delete(body)

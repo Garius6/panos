@@ -56,7 +56,7 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 
 	@(private = "file")
 	run_wasm_diff :: proc(source: string) -> Diff_Result {
-		result := check_source(source)
+		result := check_source(source, wasm_target = true)
 		if len(result.diags) > 0 do return Diff_Result{ok = false}
 		module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
 
@@ -115,7 +115,7 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 	// не через Compare_Instr-обходной путь (см. строковые тесты Фазы 1.5).
 	@(private = "file")
 	run_wasm_stdout :: proc(source: string) -> (stdout: string, ok: bool) {
-		result := check_source(source)
+		result := check_source(source, wasm_target = true)
 		if len(result.diags) > 0 do return "", false
 		module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
 		bytes := lower_module_to_wasm(&module)
@@ -1191,7 +1191,7 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 
 	@(private = "file")
 	run_wasm_expect_trap :: proc(t: ^testing.T, source: string) {
-		result := check_source(source)
+		result := check_source(source, wasm_target = true)
 		testing.expectf(t, len(result.diags) == 0, "check_source diagnostics: %v", result.diags)
 		module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
 		bytes := lower_module_to_wasm(&module)
@@ -1829,6 +1829,126 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 				p.значение() + a + b
 			конец
 		`)
+	}
+
+	// План interop с внешний: build_stub_foreign_module — минимальный
+	// автономный wasm-модуль (СВОЙ, независимый от wasm_runtime), ОДИН
+	// экспорт (f64)->f64, x*2.0. Preload'ится ВТОРЫМ модулем (рядом с
+	// env=wasm_runtime/runtime.wasm) под именем библиотеки из
+	// `внешний "тестлиб" ...` — единственный способ доказать, что
+	// динамический внешний-импорт (core/wasm_module.odin) РЕАЛЬНО
+	// резолвится и вызывается wasmtime'ом, а не только "не паникует"
+	// (структурный тест в core/wasm_backend_test.odin — то же самое,
+	// но без гарантии, что импорт вообще на что-то ссылается корректно).
+	@(private = "file")
+	build_stub_foreign_module :: proc(export_name: string) -> []u8 {
+		types_content := make([dynamic]u8)
+		defer delete(types_content)
+		write_uleb128(&types_content, 1) // 1 тип
+		append(&types_content, 0x60) // functype tag
+		write_uleb128(&types_content, 1) // 1 параметр
+		append(&types_content, WASM_F64)
+		write_uleb128(&types_content, 1) // 1 результат
+		append(&types_content, WASM_F64)
+
+		func_content := make([dynamic]u8)
+		defer delete(func_content)
+		write_uleb128(&func_content, 1) // 1 функция
+		write_uleb128(&func_content, 0) // typeidx 0
+
+		export_content := make([dynamic]u8)
+		defer delete(export_content)
+		write_uleb128(&export_content, 1) // 1 экспорт
+		name_bytes := transmute([]u8)export_name
+		write_uleb128(&export_content, u64(len(name_bytes)))
+		for b in name_bytes do append(&export_content, b)
+		append(&export_content, 0x00) // exportdesc kind = func
+		write_uleb128(&export_content, 0) // funcidx 0
+
+		body := make([dynamic]u8)
+		defer delete(body)
+		write_uleb128(&body, 0) // 0 групп локалей
+		append(&body, 0x20) // local.get 0
+		write_uleb128(&body, 0)
+		append(&body, 0x44) // f64.const 2.0
+		write_f64_le(&body, 2.0)
+		append(&body, 0xA2) // f64.mul
+		append(&body, 0x0B) // end
+
+		code_content := make([dynamic]u8)
+		defer delete(code_content)
+		write_uleb128(&code_content, 1) // 1 функция
+		write_uleb128(&code_content, u64(len(body)))
+		for b in body do append(&code_content, b)
+
+		out := make([dynamic]u8)
+		append(&out, 0x00, 0x61, 0x73, 0x6D) // magic
+		append(&out, 0x01, 0x00, 0x00, 0x00) // version
+
+		append(&out, 0x01) // section id 1 = Type
+		write_uleb128(&out, u64(len(types_content)))
+		for b in types_content do append(&out, b)
+
+		append(&out, 0x03) // section id 3 = Function
+		write_uleb128(&out, u64(len(func_content)))
+		for b in func_content do append(&out, b)
+
+		append(&out, 0x07) // section id 7 = Export
+		write_uleb128(&out, u64(len(export_content)))
+		for b in export_content do append(&out, b)
+
+		append(&out, 0x0A) // section id 10 = Code
+		write_uleb128(&out, u64(len(code_content)))
+		for b in code_content do append(&out, b)
+
+		return out[:]
+	}
+
+	@(test)
+	test_wasm_diff_foreign_import_real_call :: proc(t: ^testing.T) {
+		source := `
+			внешний "тестлиб" функ удвоить(x: Число(64)) -> Число(64)
+			функ старт() -> Число
+				удвоить(21.0)
+			конец
+		`
+		result := check_source(source, wasm_target = true)
+		testing.expectf(t, len(result.diags) == 0, "check_source diagnostics: %v", result.diags)
+		if len(result.diags) > 0 do return
+		module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
+		bytes := lower_module_to_wasm(&module)
+
+		id := sync.atomic_add(&wasm_diff_temp_file_counter, 1)
+		dir, dir_err := os.temp_dir(context.allocator)
+		testing.expectf(t, dir_err == nil, "нет temp dir")
+		program_path := fmt.tprintf("%s/panos_wasm_foreign_program_%d.wasm", dir, id)
+		testing.expectf(t, os.write_entire_file(program_path, bytes) == nil, "не удалось записать программу")
+		defer os.remove(program_path)
+
+		stub_bytes := build_stub_foreign_module("удвоить")
+		stub_path := fmt.tprintf("%s/panos_wasm_foreign_stub_%d.wasm", dir, id)
+		testing.expectf(t, os.write_entire_file(stub_path, stub_bytes) == nil, "не удалось записать стаб")
+		defer os.remove(stub_path)
+
+		desc := os.Process_Desc {
+			command = []string{
+				"wasmtime",
+				"run",
+				"--preload",
+				"env=wasm_runtime/runtime.wasm",
+				"--preload",
+				fmt.tprintf("тестлиб=%s", stub_path),
+				"--invoke",
+				"старт",
+				program_path,
+				"0",
+			},
+		}
+		state, stdout_bytes, _, err := os.process_exec(desc, context.allocator)
+		testing.expectf(t, err == nil, "process_exec ошибка: %v", err)
+		testing.expectf(t, state.success, "wasmtime не завершился успешно")
+		out := strings.trim_space(string(stdout_bytes))
+		testing.expectf(t, out == "42", "ожидалось '42' (21*2 через реальный внешний-импорт), получено %q", out)
 	}
 
 }

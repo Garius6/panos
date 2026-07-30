@@ -208,6 +208,13 @@ Closure_Value :: struct {
 // первом реальном вызове (vm_ffi_native.odin), не на компиляции.
 Foreign_Function :: struct {
 	name:          string,
+	// План interop с внешний (WASM AOT) — "либа" из `внешний "либа"
+	// функ имя(...)`, нужна wasm-бэкенду как имя WASM-import-модуля
+	// (core/wasm_module.odin) — раньше нигде не сохранялась (native-
+	// сторона резолвит библиотеку САМА, до этой структуры, через
+	// resolver.odin's dynlib.load_library, ей эта строка была не нужна
+	// повторно).
+	library:       string,
 	fn_ptr:        rawptr,
 	param_kinds:   []Foreign_Marshal_Kind,
 	return_kind:   Foreign_Marshal_Kind,
@@ -383,6 +390,7 @@ get_or_build_foreign_function :: proc(d: ^Foreign_Decl) -> ^Foreign_Function {
 	ff := new(Foreign_Function)
 	ff^ = Foreign_Function {
 		name               = d.name,
+		library            = d.library,
 		fn_ptr             = d.fn_ptr,
 		param_kinds        = kinds,
 		return_kind        = d.return_marshal,

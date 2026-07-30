@@ -103,7 +103,7 @@ Check_Result :: struct {
 // tc_ctx.res остаётся валиден сколько угодно после возврата. Все текущие
 // вызывающие используют `result := check_source(...)` + `.field` — точка
 // доступа не меняется (Odin разыменовывает ^T автоматически).
-check_source :: proc(source: string) -> ^Check_Result {
+check_source :: proc(source: string, wasm_target: bool = false) -> ^Check_Result {
 	result := new(Check_Result)
 	tokens, lex_diags := tokenize(source)
 	for d in lex_diags do append(&result.diags, d)
@@ -115,7 +115,7 @@ check_source :: proc(source: string) -> ^Check_Result {
 	result.prog = parse_program(&parser)
 	for d in parser.diagnostics do append(&result.diags, d)
 
-	result.res_ctx = new_resolver_ctx()
+	result.res_ctx = new_resolver_ctx(wasm_target)
 	resolve_program(&result.res_ctx, result.prog)
 	for d in result.res_ctx.diagnostics do append(&result.diags, d)
 

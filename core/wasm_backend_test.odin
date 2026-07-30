@@ -375,3 +375,23 @@ test_wasm_module_lowers_dom_builtins_without_panic :: proc(t: ^testing.T) {
 // module.odin), прост и самоочевиден — понятное сообщение вместо тихого
 // неверного вывода достигается самой структурой кода, не отдельным
 // регрессионным тестом.
+
+// План interop с внешний: check_source нужен wasm_target=true (иначе
+// resolve_program попытается dynlib.load_library("тестлиб"), которой не
+// существует, см. план) — НЕ lower_wasm_from_source (тот всегда false).
+@(test)
+test_wasm_module_lowers_foreign_import_without_panic :: proc(t: ^testing.T) {
+	result := check_source(
+		`
+			внешний "тестлиб" функ удвоить(x: Число(64)) -> Число(64)
+			функ старт() -> Число
+				удвоить(21.0)
+			конец
+		`,
+		wasm_target = true,
+	)
+	testing.expectf(t, len(result.diags) == 0, "check_source diagnostics: %v", result.diags)
+	module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
+	bytes := lower_module_to_wasm(&module)
+	testing.expectf(t, len(bytes) > 8, "модуль пуст")
+}

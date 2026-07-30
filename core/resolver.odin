@@ -437,6 +437,14 @@ Resolver_Ctx :: struct {
 	// Diagnostic/Severity из type_cheker.odin — тот же package, тот же
 	// accumulate-not-panic паттерн, что и в парсере/тайпчекере.
 	diagnostics:     [dynamic]Diagnostic,
+	// wasm-план (план interop с внешний): резолв разделяемый между
+	// байткод-VM и WASM AOT бэкендами (см. check_source) — case
+	// ^Foreign_Decl ниже безусловно делает dynlib.load_library, что
+	// бессмысленно/невозможно для wasm-таргетируемой компиляции ("либа"
+	// становится именем WASM-import-модуля, не реальной нативной
+	// библиотекой). wasm_target пропускает этот шаг, оставляя d.fn_ptr
+	// nil (читается только native-стороной, vm_ffi_native.odin).
+	wasm_target:     bool,
 
 	// Side Tables
 	decl_symbols:    map[Decls]Symbol_Id,
@@ -627,7 +635,7 @@ check_not_reserved :: proc(ctx: ^Resolver_Ctx, name: string, span: Span) -> bool
 	return false
 }
 
-new_resolver_ctx :: proc() -> Resolver_Ctx {
+new_resolver_ctx :: proc(wasm_target: bool = false) -> Resolver_Ctx {
 	ctx := Resolver_Ctx {
 		symbol_store       = new_symbol_store(),
 		symbol_types       = make(map[Symbol_Id]^Type),
@@ -638,6 +646,7 @@ new_resolver_ctx :: proc() -> Resolver_Ctx {
 		diagnostics        = make([dynamic]Diagnostic),
 		used_symbols       = make(map[Symbol_Id]bool),
 		unused_check_symbols  = make(map[Symbol_Id]bool),
+		wasm_target        = wasm_target,
 	}
 
 	push_scope(&ctx)
@@ -647,7 +656,7 @@ new_resolver_ctx :: proc() -> Resolver_Ctx {
 	return ctx
 }
 
-new_module_resolver_ctx :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
+new_module_resolver_ctx :: proc(graph: ^Module_Graph, module: ^Module, wasm_target: bool = false) -> Resolver_Ctx {
 	// Не через new_resolver_ctx(): она ставит собственный свежий
 	// symbol_store и сразу устанавливает в него builtin'ы — если потом
 	// подменить symbol_store на graph.symbol_store, Symbol_Id builtin'ов
@@ -666,6 +675,7 @@ new_module_resolver_ctx :: proc(graph: ^Module_Graph, module: ^Module) -> Resolv
 		diagnostics        = make([dynamic]Diagnostic),
 		used_symbols       = make(map[Symbol_Id]bool),
 		unused_check_symbols  = make(map[Symbol_Id]bool),
+		wasm_target        = wasm_target,
 	}
 	push_scope(&ctx)
 	ctx.global_scope = ctx.current_scope
@@ -891,27 +901,36 @@ register_top_level_decl :: proc(ctx: ^Resolver_Ctx, module: ^Module, decl: Decls
 		}
 
 	case ^Foreign_Decl:
-		lib, lib_cached := ctx.module_graph.foreign_libraries[d.library]
-		if !lib_cached {
-			filename := foreign_library_filename(d.library)
-			loaded, did_load := dynlib.load_library(filename)
-			if !did_load {
-				report_resolve(ctx, d.span, "Resolve Error: библиотека '%s' не найдена (%s)", d.library, filename)
+		// План interop с внешний (WASM AOT): при wasm_target "либа" —
+		// имя WASM-import-модуля, не реальная нативная библиотека —
+		// dynlib.load_library бессмысленен (и упал бы, "js"/т.п. не
+		// существуют как .dylib/.dll/.so). d.fn_ptr остаётся nil —
+		// читает только native-сторона (vm_ffi_native.odin), wasm-
+		// сторона резолвит через собственный funcidx-механизм (см. план
+		// interop, core/wasm_module.odin), не через fn_ptr вообще.
+		if !ctx.wasm_target {
+			lib, lib_cached := ctx.module_graph.foreign_libraries[d.library]
+			if !lib_cached {
+				filename := foreign_library_filename(d.library)
+				loaded, did_load := dynlib.load_library(filename)
+				if !did_load {
+					report_resolve(ctx, d.span, "Resolve Error: библиотека '%s' не найдена (%s)", d.library, filename)
+					return
+				}
+				if ctx.module_graph.foreign_libraries == nil {
+					ctx.module_graph.foreign_libraries = make(map[string]dynlib.Library)
+				}
+				ctx.module_graph.foreign_libraries[d.library] = loaded
+				lib = loaded
+			}
+
+			fn_ptr, found := dynlib.symbol_address(lib, d.name)
+			if !found {
+				report_resolve(ctx, d.span, "Resolve Error: библиотека '%s' не экспортирует символ '%s'", d.library, d.name)
 				return
 			}
-			if ctx.module_graph.foreign_libraries == nil {
-				ctx.module_graph.foreign_libraries = make(map[string]dynlib.Library)
-			}
-			ctx.module_graph.foreign_libraries[d.library] = loaded
-			lib = loaded
+			d.fn_ptr = fn_ptr
 		}
-
-		fn_ptr, found := dynlib.symbol_address(lib, d.name)
-		if !found {
-			report_resolve(ctx, d.span, "Resolve Error: библиотека '%s' не экспортирует символ '%s'", d.library, d.name)
-			return
-		}
-		d.fn_ptr = fn_ptr
 		ctx.decl_symbols[decl] = register_named_symbol(ctx, module, d.name, .Function, decl, d.span, false)
 	}
 }
@@ -938,8 +957,8 @@ foreign_library_filename :: proc(logical_name: string) -> string {
 	}
 }
 
-resolve_module :: proc(graph: ^Module_Graph, module: ^Module) -> Resolver_Ctx {
-	ctx := new_module_resolver_ctx(graph, module)
+resolve_module :: proc(graph: ^Module_Graph, module: ^Module, wasm_target: bool = false) -> Resolver_Ctx {
+	ctx := new_module_resolver_ctx(graph, module, wasm_target)
 	module.scope = ctx.global_scope
 	if module.exports == nil {
 		module.exports = make(map[Interned]Symbol_Id)
@@ -1012,7 +1031,11 @@ resolve_program :: proc(ctx: ^Resolver_Ctx, prog: Program) {
 	}
 	module.scope = ctx.global_scope
 	graph := new_module_graph()
-	resolved := resolve_module(&graph, module)
+	// wasm_target читается ИЗ ctx ДО перезаписи ctx^ = resolved ниже —
+	// resolve_module строит СВЕЖИЙ внутренний Resolver_Ctx (new_module_
+	// resolver_ctx), поле wasm_target вызывающего в него НЕ переносится
+	// само по себе, нужно явно прокинуть параметром.
+	resolved := resolve_module(&graph, module, ctx.wasm_target)
 	resolved.module_graph = nil
 	resolved.current_module = nil
 	ctx^ = resolved

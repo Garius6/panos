@@ -75,6 +75,12 @@ Emit_Ctx :: struct {
 	// lower_module_to_wasm — прелюдийные функции выброшены, нумерация
 	// сдвинута).
 	func_index:         ^map[Function_Id]int,
+	// План interop с внешний: ^Foreign_Function (get_or_build_foreign_
+	// function кеширует ОДИН на Foreign_Decl, переиспользуется всеми call
+	// site'ами — pointer identity надёжнее строкового "либа::имя" ключа)
+	// -> funcidx нового wasm-import'а (core/wasm_module.odin). Пустая
+	// map, если в программе нет ни одного внешний.
+	foreign_func_index: ^map[^Foreign_Function]int,
 	use_count:          map[Value_Id]int, // см. emit_block_instructions
 }
 
@@ -87,7 +93,12 @@ Wasm_Scope :: struct {
 }
 
 @(private = "file")
-new_emit_ctx :: proc(module: ^Mir_Module, fn: ^Mir_Function, func_index: ^map[Function_Id]int) -> Emit_Ctx {
+new_emit_ctx :: proc(
+	module: ^Mir_Module,
+	fn: ^Mir_Function,
+	func_index: ^map[Function_Id]int,
+	foreign_func_index: ^map[^Foreign_Function]int,
+) -> Emit_Ctx {
 	info := compute_cfg_info(fn)
 	rpo_index := build_rpo_index(&info)
 	// +1: __env занимает WASM-параметр-слот P (см. план closures,
@@ -113,6 +124,7 @@ new_emit_ctx :: proc(module: ^Mir_Module, fn: ^Mir_Function, func_index: ^map[Fu
 		next_i32_scratch       = i32_pool_base,
 		next_f64_scratch       = f64_pool_base,
 		func_index             = func_index,
+		foreign_func_index     = foreign_func_index,
 		use_count              = compute_use_count(fn),
 	}
 	return ectx
@@ -204,8 +216,13 @@ F64_SCRATCH_POOL_SIZE :: 64
 // core/wasm_module.odin. Пулы scratch-локалей — ФИКСИРОВАННОГО размера
 // (см. alloc_i32_scratch/alloc_f64_scratch) — декларация не должна ждать
 // конца эмиссии тела, чтобы узнать точный размер.
-emit_function_wasm :: proc(module: ^Mir_Module, mfn: ^Mir_Function, func_index: ^map[Function_Id]int) -> [dynamic]u8 {
-	ectx := new_emit_ctx(module, mfn, func_index)
+emit_function_wasm :: proc(
+	module: ^Mir_Module,
+	mfn: ^Mir_Function,
+	func_index: ^map[Function_Id]int,
+	foreign_func_index: ^map[^Foreign_Function]int,
+) -> [dynamic]u8 {
+	ectx := new_emit_ctx(module, mfn, func_index, foreign_func_index)
 	defer destroy_emit_ctx(&ectx)
 
 	process_from(&ectx, mfn.entry, INVALID_BLOCK)
@@ -1683,8 +1700,24 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 	case ^Invoke_Interface_Instr:
 		emit_invoke_interface(ectx, v)
 
+	case ^Call_Foreign_Instr:
+		// План interop с внешний: args уже на стеке в порядке (обычный
+		// replay) — внешний-импорт НЕ панос-компилируемая функция,
+		// __env-трейлинг-параметр (см. план closures) сюда не относится
+		// вообще, никакого разгребания порядка не нужно (в отличие от
+		// Call_Value_Instr/Invoke_Interface_Instr — там callee/receiver
+		// сам был значением НА стеке; здесь funcidx известен статически,
+		// как у обычного Call_Instr). Тип-безопасность аргументов уже
+		// гарантирована тайпчекером против Foreign_Decl-сигнатуры —
+		// сверять их ещё раз здесь не нужно.
+		wasm_idx, found := ectx.foreign_func_index^[v.fn]
+		if !found {
+			panic("wasm backend: внешний-функция не найдена в foreign_func_index — см. план interop (скан Call_Foreign_Instr в wasm_module.odin)")
+		}
+		append(code, 0x10) // call
+		write_uleb128(code, u64(wasm_idx))
+
 	case ^Call_Async_Instr,
-	     ^Call_Foreign_Instr,
 	     ^Spawn_Instr,
 	     ^Send_Instr,
 	     ^Receive_Instr,

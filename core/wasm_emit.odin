@@ -368,6 +368,17 @@ value_kind :: proc(ectx: ^Emit_Ctx, v: Value_Id) -> Type_Kind {
 	return prune_type(ectx.fn.value_types[int(v)]).kind
 }
 
+// pw_typed_import — Число/Целое пишутся/читаются через *_F64-импорты,
+// Булево/Строка/Struct/Ошибка/тупл/Массив/перечисление (все i32-handle-
+// представленные, см. wasm_field_is_i32) — через *_I32-пары. Один и тот
+// же выбор повторялся дословно на 6 сайтах (Get_Variant_Field_Instr,
+// Get_Index_Instr, эмит Соответствие-методов, Try_Unwrap) — вынесено
+// сюда, а не оставлено как копипаста тернарника на каждом.
+@(private = "file")
+pw_typed_import :: proc(ectx: ^Emit_Ctx, v: Value_Id, i32_import, f64_import: int) -> int {
+	return wasm_field_is_i32(value_kind(ectx, v)) ? i32_import : f64_import
+}
+
 @(private = "file")
 value_type_of :: proc(ectx: ^Emit_Ctx, v: Value_Id) -> ^Type {
 	return prune_type(ectx.fn.value_types[int(v)])
@@ -501,7 +512,7 @@ emit_try_unwrap :: proc(ectx: ^Emit_Ctx, v: ^Try_Unwrap_Instr) {
 	write_uleb128(code, u64(handle_local))
 	append(code, 0x41) // i32.const 0 — payload всегда поле 0 у Есть(x)/Успех(x)
 	write_sleb128(code, 0)
-	field_getter := wasm_field_is_i32(value_kind(ectx, v.dst)) ? PW_GET_FIELD_I32 : PW_GET_FIELD_F64
+	field_getter := pw_typed_import(ectx, v.dst, PW_GET_FIELD_I32, PW_GET_FIELD_F64)
 	append(code, 0x10)
 	write_uleb128(code, u64(field_getter))
 
@@ -781,7 +792,7 @@ emit_array_method_call :: proc(ectx: ^Emit_Ctx, v: ^Call_Method_Instr) {
 	case "содержит":
 		// [receiver, needle] — needle остаётся как есть (не индекс, само
 		// значение — f64 или i32 в зависимости от типа элемента).
-		checker := wasm_field_is_i32(value_kind(ectx, v.args[0])) ? PW_ARRAY_CONTAINS_I32 : PW_ARRAY_CONTAINS_F64
+		checker := pw_typed_import(ectx, v.args[0], PW_ARRAY_CONTAINS_I32, PW_ARRAY_CONTAINS_F64)
 		append(code, 0x10)
 		write_uleb128(code, u64(checker))
 	case "срез":
@@ -811,7 +822,7 @@ emit_array_method_call :: proc(ectx: ^Emit_Ctx, v: ^Call_Method_Instr) {
 		// механизм попытается дропнуть ЕЩЁ раз — underflow (найдено
 		// эмпирически через wasmtime: "expected a type but nothing on
 		// stack", не по чтению кода).
-		pusher := wasm_field_is_i32(value_kind(ectx, v.args[0])) ? PW_ARRAY_PUSH_I32 : PW_ARRAY_PUSH_F64
+		pusher := pw_typed_import(ectx, v.args[0], PW_ARRAY_PUSH_I32, PW_ARRAY_PUSH_F64)
 		append(code, 0x10)
 		write_uleb128(code, u64(pusher))
 	case:
@@ -917,7 +928,7 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		// (handle, index), нужен ЕЩЁ индекс сверху ПЕРЕД вызовом.
 		append(code, 0x41) // i32.const field_index
 		write_sleb128(code, i64(v.field_index))
-		field_getter := wasm_field_is_i32(value_kind(ectx, v.dst)) ? PW_GET_FIELD_I32 : PW_GET_FIELD_F64
+		field_getter := pw_typed_import(ectx, v.dst, PW_GET_FIELD_I32, PW_GET_FIELD_F64)
 		append(code, 0x10)
 		write_uleb128(code, u64(field_getter))
 
@@ -952,7 +963,7 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 			// стека, конверсия не требует scratch-локали, в отличие от
 			// Set_Index_Instr ниже).
 			append(code, 0xAA) // i32.trunc_f64_s
-			field_getter := wasm_field_is_i32(value_kind(ectx, v.dst)) ? PW_GET_FIELD_I32 : PW_GET_FIELD_F64
+			field_getter := pw_typed_import(ectx, v.dst, PW_GET_FIELD_I32, PW_GET_FIELD_F64)
 			append(code, 0x10)
 			write_uleb128(code, u64(field_getter))
 		}
@@ -979,7 +990,7 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		// Идентично Get_Property_Instr — field_index известен статически.
 		append(code, 0x41) // i32.const field_index
 		write_sleb128(code, i64(v.field_index))
-		field_getter := wasm_field_is_i32(value_kind(ectx, v.dst)) ? PW_GET_FIELD_I32 : PW_GET_FIELD_F64
+		field_getter := pw_typed_import(ectx, v.dst, PW_GET_FIELD_I32, PW_GET_FIELD_F64)
 		append(code, 0x10)
 		write_uleb128(code, u64(field_getter))
 

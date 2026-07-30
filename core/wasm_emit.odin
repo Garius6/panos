@@ -444,6 +444,75 @@ emit_construct_object :: proc(ectx: ^Emit_Ctx, elements: []Value_Id, alloc_impor
 	write_uleb128(code, u64(handle_local))
 }
 
+// emit_try_unwrap — `?`-оператор (Try_Unwrap_Instr). Типчекер уже
+// гарантирует src — Опция/Результат (infer_try_expr, core/type_cheker.
+// odin) и dst's тип совпадает с успешным payload'ом — здесь только
+// рантайм-разветвление. src (handle) снимается в scratch-локаль, т.к.
+// нужен ДВАЖДЫ (pw_match_tag на проверку, затем pw_get_field_* НА
+// УСПЕШНОЙ ветке ИЛИ сам handle целиком на ветке раннего возврата — ни
+// один MIR Value_Id не читается дважды, но handle_local — обычная WASM-
+// локаль, не Value_Id, ей это можно). Тег успеха — 1 (Есть) для Опции,
+// 0 (Успех) для Результата, ТЕ ЖЕ константы, что core/vm.odin's
+// байткодный .Try_Unwrap опкод (variant-порядок объявлен в core/
+// prelude.odin, тайпчекер и рантайм должны совпадать по построению).
+// `if` здесь — ЕДИНСТВЕННОЕ типизированное (не пустое 0x40) blocktype
+// во всём бэкенде: blocktype-байт напрямую совпадает с WASM_I32/
+// WASM_F64 (кодировка valtype и однорезультатный blocktype — один и тот
+// же байт в MVP). Else-ветка кончается `return` (0x0F) — по спецификации
+// код после безусловного return/unreachable стек-полиморфен, так что
+// компилятору не нужно "балансировать" тип else-ветки под тип if-ветки
+// отдельно — сам факт, что она никогда не проваливается сквозь `end`,
+// уже валиден.
+@(private = "file")
+emit_try_unwrap :: proc(ectx: ^Emit_Ctx, v: ^Try_Unwrap_Instr) {
+	code := &ectx.code
+	src_type := value_type_of(ectx, v.src)
+	success_tag: i64
+	switch src_type.name {
+	case "Опция":
+		success_tag = 1
+	case "Результат":
+		success_tag = 0
+	case:
+		panic(
+			fmt.tprintf(
+				"wasm backend: '?' на типе '%s' — тайпчекер должен был отсечь всё, кроме Опции/Результата (см. infer_try_expr)",
+				src_type.name,
+			),
+		)
+	}
+
+	handle_local := alloc_i32_scratch(ectx)
+	append(code, 0x21) // local.set handle (снимает src со стека)
+	write_uleb128(code, u64(handle_local))
+
+	append(code, 0x20) // local.get handle
+	write_uleb128(code, u64(handle_local))
+	append(code, 0x41) // i32.const success_tag
+	write_sleb128(code, success_tag)
+	append(code, 0x10) // call pw_match_tag
+	write_uleb128(code, u64(PW_MATCH_TAG))
+
+	dst_wasm_type := wasm_val_type(value_type_of(ectx, v.dst))
+	append(code, 0x04) // if (typed blocktype)
+	append(code, dst_wasm_type)
+
+	append(code, 0x20) // local.get handle
+	write_uleb128(code, u64(handle_local))
+	append(code, 0x41) // i32.const 0 — payload всегда поле 0 у Есть(x)/Успех(x)
+	write_sleb128(code, 0)
+	field_getter := wasm_field_is_i32(value_kind(ectx, v.dst)) ? PW_GET_FIELD_I32 : PW_GET_FIELD_F64
+	append(code, 0x10)
+	write_uleb128(code, u64(field_getter))
+
+	append(code, 0x05) // else
+	append(code, 0x20) // local.get handle — ранний возврат ВСЕГО Опции/Результата как есть
+	write_uleb128(code, u64(handle_local))
+	append(code, 0x0F) // return
+
+	append(code, 0x0B) // end if
+}
+
 // emit_new_map — Фаза 2.4 (Соответствие): НЕ переиспользует emit_
 // construct_object напрямую — тот пишет element i -> field i, а тут
 // element i (ключ ИЛИ значение) должен попасть в РАЗНЫЙ field-индекс
@@ -1135,6 +1204,9 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 			emit_array_method_call(ectx, v)
 		}
 
+	case ^Try_Unwrap_Instr:
+		emit_try_unwrap(ectx, v)
+
 	case ^Copy_Instr,
 	     ^Load_Captured_Instr,
 	     ^Call_Async_Instr,
@@ -1145,8 +1217,7 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 	     ^Spawn_Instr,
 	     ^Send_Instr,
 	     ^Receive_Instr,
-	     ^Receive_Signal_Instr,
-	     ^Try_Unwrap_Instr:
+	     ^Receive_Signal_Instr:
 		panic(fmt.tprintf("wasm backend Фаза 1: инструкция %T вне области Фазы 1 (см. план — heap/builtins/interfaces/closures/actors отложены)", v))
 	}
 }

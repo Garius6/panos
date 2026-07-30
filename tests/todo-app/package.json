@@ -1,0 +1,16 @@
+{
+  "name": "panos-todo-app-tests",
+  "version": "1.0.0",
+  "description": "Playwright end-to-end tests for the panos todo-app demo — backend (native panos HTTP server) + frontend (AOT-compiled panos-to-wasm, real fetch via сеть.http_запрос_sync)",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.62.0"
+  }
+}

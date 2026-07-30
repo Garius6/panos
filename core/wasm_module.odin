@@ -69,7 +69,7 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 	#partial switch pt.kind {
 	case .Number, .Integer:
 		return WASM_F64
-	case .Bool, .String, .Struct, .Array, .Enum, .Map, .Error, .Tuple:
+	case .Bool, .String, .Struct, .Array, .Enum, .Map, .Error, .Tuple, .Function:
 		return WASM_I32
 	case:
 		panic(
@@ -92,7 +92,7 @@ wasm_val_type :: proc(t: ^Type) -> u8 {
 is_wasm_phase1_type :: proc(t: ^Type) -> bool {
 	if t == nil do return false
 	#partial switch prune_type(t).kind {
-	case .Number, .Integer, .Bool, .Void, .String, .Struct, .Array, .Enum, .Map, .Error, .Tuple:
+	case .Number, .Integer, .Bool, .Void, .String, .Struct, .Array, .Enum, .Map, .Error, .Tuple, .Function:
 		return true
 	case:
 		return false
@@ -427,11 +427,17 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 
 	for k in 0 ..< n {
 		mfn := &module.functions[included[k]]
-		param_types := make([dynamic]u8, 0, len(mfn.parameters))
+		param_types := make([dynamic]u8, 0, len(mfn.parameters) + 1)
 		defer delete(param_types)
 		for p in mfn.parameters {
 			append(&param_types, wasm_val_type(mfn.locals[int(p)].type))
 		}
+		// __env — замыкание-хендл (см. план closures): КАЖДАЯ функция
+		// получает этот параметр единообразно, захватывающая или нет —
+		// call_indirect типизирован строго, единственный способ вызывать
+		// ЛЮБОЕ функциональное значение через один и тот же механизм без
+		// дублирования сигнатур. Некапчурящие функции его просто не читают.
+		append(&param_types, WASM_I32)
 		returns := prune_type(mfn.result_type) != TY_VOID
 
 		append(&types_content, 0x60) // functype tag

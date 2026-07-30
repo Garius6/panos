@@ -34,25 +34,37 @@ Emit_Ctx :: struct {
 	visited:           map[Block_Id]bool, // только для back-edge теста (Jump на уже эмитированный header)
 	scope_stack:       [dynamic]Wasm_Scope,
 	code:              [dynamic]u8,
-	// Function_Ref_Instr непосредственно перед Call_Value_Instr — тот же
-	// структурный факт, на который опирается core/mir_bytecode.odin
-	// (emit_fn_ref emitted ДО аргументов на ВСЕХ call site'ах, см. её
-	// докстринг). ВАЖНО: это значит callee лежит НИЖЕ аргументов на
-	// MIR-стеке (Function_Ref_Instr первый, затем аргументы, затем
-	// Call_Value_Instr) — а WASM's call_indirect требует table-индекс
-	// СВЕРХУ (последним операндом, ПОСЛЕ аргументов), т.е. ПРОТИВОПОЛОЖНЫЙ
-	// порядок. Поэтому Function_Ref_Instr НЕ кладёт значение на
-	// operand-стек вообще — сохраняет его в СОБСТВЕННУЮ (на каждый
-	// Function_Ref_Instr — свою — вложенные вызовы, напр. `f(g(1), 2)`,
-	// иначе перезаписали бы общую ячейку между собственным
-	// Function_Ref_Instr'ом g и f) i32-scratch-локаль из общего пула (см.
-	// alloc_i32_scratch), а Call_Value_Instr перечитывает её local.get'ом
-	// ПОСЛЕ того, как аргументы уже легли на стек обычным replay —
-	// восстанавливая нужный WASM-порядок. New_Aggregate_Instr (Фаза 1.5)
-	// использует ТОТ ЖЕ пул по той же причине — элементы уже на стеке
-	// пачкой к моменту New_Aggregate_Instr, порядок вызовов pw_set_field_*
-	// требует их по одному вперемешку с handle/индексом, см. её case.
-	value_to_callee:    map[Value_Id]Callee_Info,
+	// closures (см. план): И Function_Ref_Instr, И Build_Closure_Instr
+	// строят один и тот же вид объекта — [fn_index, captured_0, ...]
+	// arena-хендл (см. emit_closure_value) и КЛАДУТ его на operand-стек
+	// НОРМАЛЬНО, как любая другая dst-инструкция — НЕ по-особому (первая
+	// версия этого бэкенда пыталась не класть хендл на стек вовсе, как
+	// раньше делал только Function_Ref_Instr для callee — оказалось
+	// некорректно: тот же Value_Id может быть потреблён Store_Local_
+	// Instr'ом (`пер f = функ(...)...конец`) или обычным аргументом
+	// (`применить(удвоить, 21)` — Function_Ref_Instr'а докстринг САМ
+	// описывает этот случай), а не только немедленным Call_Value_Instr —
+	// найдено реальным "expected i32 but nothing on stack" от wasmtime,
+	// не гипотезой).
+	//
+	// Раз callee всегда лоурится ДО аргументов (структурный факт, на
+	// который опирается и core/mir_bytecode.odin — emit_fn_ref эмитится
+	// ДО аргументов на ВСЕХ call site'ах), а WASM's call_indirect
+	// требует table-индекс СВЕРХУ (последним операндом, ПОСЛЕ
+	// аргументов) — Call_Value_Instr САМ разгребает порядок на месте:
+	// снимает args в scratch (в обратном порядке), снимает callee в
+	// scratch, восстанавливает args — см. её case. value_to_closure_fn
+	// НЕ участвует в этой механике вообще — это ЧИСТО O(1)-путь для
+	// typeidx: когда callee — Value_Id, произведённый Function_Ref_
+	// Instr/Build_Closure_Instr В ТОЙ ЖЕ функции (не через Store_Local/
+	// Load_Local — самый частый случай, включая ВСЕ существовавшие ДО
+	// closures тесты, см. emit_fn_ref/emit_call_value в mir_lowering.
+	// odin), fn известен статически — resolve_func_index даёт typeidx
+	// без структурного скана. Когда callee пришёл ИЗДАЛЕКА (через
+	// локаль/параметр/захват — настоящее значение-функция) — записи не
+	// будет, find_call_value_typeidx делает структурный скан-фоллбэк
+	// (см. её докстринг).
+	value_to_closure_fn: map[Value_Id]Function_Id,
 	scratch_base:       int, // индекс первого из 2 f64 scratch-локалей (Modulo/битовые)
 	i32_pool_base:      int, // индекс первого из I32_SCRATCH_POOL_SIZE scratch-локалей
 	f64_pool_base:      int, // индекс первого из F64_SCRATCH_POOL_SIZE scratch-локалей
@@ -64,11 +76,6 @@ Emit_Ctx :: struct {
 	// сдвинута).
 	func_index:         ^map[Function_Id]int,
 	use_count:          map[Value_Id]int, // см. emit_block_instructions
-}
-
-Callee_Info :: struct {
-	fn:    Function_Id,
-	local: int,
 }
 
 Wasm_Scope :: struct {
@@ -83,26 +90,30 @@ Wasm_Scope :: struct {
 new_emit_ctx :: proc(module: ^Mir_Module, fn: ^Mir_Function, func_index: ^map[Function_Id]int) -> Emit_Ctx {
 	info := compute_cfg_info(fn)
 	rpo_index := build_rpo_index(&info)
-	scratch_base := len(fn.locals)
+	// +1: __env занимает WASM-параметр-слот P (см. план closures,
+	// "Local-index collision") — тело-локали и scratch-пулы сдвинуты
+	// на один WASM-индекс относительно len(fn.locals) (было ==,
+	// т.к. Local_Id == WASM-индекс без __env).
+	scratch_base := len(fn.locals) + 1
 	i32_pool_base := scratch_base + WASM_SCRATCH_COUNT
 	f64_pool_base := i32_pool_base + I32_SCRATCH_POOL_SIZE
 	ectx := Emit_Ctx {
-		module           = module,
-		fn               = fn,
-		info             = info,
-		rpo_index        = rpo_index,
-		idom             = compute_idom(fn, &info, rpo_index),
-		visited          = make(map[Block_Id]bool),
-		scope_stack      = make([dynamic]Wasm_Scope),
-		code             = make([dynamic]u8),
-		value_to_callee  = make(map[Value_Id]Callee_Info),
-		scratch_base     = scratch_base,
-		i32_pool_base    = i32_pool_base,
-		f64_pool_base    = f64_pool_base,
-		next_i32_scratch = i32_pool_base,
-		next_f64_scratch = f64_pool_base,
-		func_index       = func_index,
-		use_count        = compute_use_count(fn),
+		module                 = module,
+		fn                     = fn,
+		info                   = info,
+		rpo_index              = rpo_index,
+		idom                   = compute_idom(fn, &info, rpo_index),
+		visited                = make(map[Block_Id]bool),
+		scope_stack            = make([dynamic]Wasm_Scope),
+		code                   = make([dynamic]u8),
+		value_to_closure_fn    = make(map[Value_Id]Function_Id),
+		scratch_base           = scratch_base,
+		i32_pool_base          = i32_pool_base,
+		f64_pool_base          = f64_pool_base,
+		next_i32_scratch       = i32_pool_base,
+		next_f64_scratch       = f64_pool_base,
+		func_index             = func_index,
+		use_count              = compute_use_count(fn),
 	}
 	return ectx
 }
@@ -136,6 +147,16 @@ alloc_f64_scratch :: proc(ectx: ^Emit_Ctx) -> int {
 	return idx
 }
 
+// wasm_local_index — Local_Id -> реальный WASM local-индекс. Params
+// (Local_Id 0..P-1) не сдвинуты; тело-локали (Local_Id >= P) сдвинуты
+// на +1 из-за __env, занявшего WASM-параметр-слот P (см. план closures,
+// "Local-index collision" — НЕ блэнкет +1, params не трогать).
+@(private = "file")
+wasm_local_index :: proc(ectx: ^Emit_Ctx, local: Local_Id) -> int {
+	p := len(ectx.fn.parameters)
+	return int(local) < p ? int(local) : int(local) + 1
+}
+
 @(private = "file")
 destroy_emit_ctx :: proc(ectx: ^Emit_Ctx) {
 	destroy_cfg_info(&ectx.info)
@@ -143,7 +164,7 @@ destroy_emit_ctx :: proc(ectx: ^Emit_Ctx) {
 	delete(ectx.idom)
 	delete(ectx.visited)
 	delete(ectx.scope_stack)
-	delete(ectx.value_to_callee)
+	delete(ectx.value_to_closure_fn)
 	delete(ectx.use_count)
 }
 
@@ -350,11 +371,6 @@ process_from :: proc(ectx: ^Emit_Ctx, start: Block_Id, stop_at: Block_Id) -> (fa
 emit_block_instructions :: proc(ectx: ^Emit_Ctx, blk: ^Mir_Block) {
 	for instr in blk.instructions {
 		emit_mir_instr(ectx, instr)
-		// Function_Ref_Instr — единственная dst-инструкция, которая
-		// НАМЕРЕННО не кладёт значение на стек в этом бэкенде (см. её
-		// case выше) — drop для нулевого использования был бы лишним
-		// и/или некорректным (нечего снимать).
-		if _, is_fn_ref := instr.(^Function_Ref_Instr); is_fn_ref do continue
 		dst, operands := instr_refs(instr)
 		delete(operands)
 		if d, ok := dst.?; ok && ectx.use_count[d] == 0 {
@@ -399,23 +415,44 @@ value_type_of :: proc(ectx: ^Emit_Ctx, v: Value_Id) -> ^Type {
 // практике — проверить в первую очередь, если такое появится.
 @(private = "file")
 wasm_field_is_i32 :: proc(kind: Type_Kind) -> bool {
-	return kind == .Bool || kind == .String || kind == .Struct || kind == .Error || kind == .Tuple
+	return kind == .Bool || kind == .String || kind == .Struct || kind == .Error || kind == .Tuple || kind == .Function
 }
 
 // emit_construct_object — общая эмиссия для New_Aggregate_Instr/
-// New_Array_Instr/Build_Variant_Instr (Фаза 2.1: все три — тот же
-// field_count*FIELD_SIZE arena-объект, только выбор ALLOC-импорта и
-// наличие tag-аргумента отличаются, см. wasm_runtime/runtime.odin's
+// New_Array_Instr/Build_Variant_Instr/closures (Фаза 2.1 + план closures:
+// ВСЕ — тот же field_count*FIELD_SIZE arena-объект, только выбор ALLOC-
+// импорта, наличие tag-аргумента и (для closures) наличие ИНЪЕЦИРОВАННОЙ
+// константы в поле 0 отличаются, см. wasm_runtime/runtime.odin's
 // pw_alloc_aggregate/pw_build_variant). Элементы уже на стеке пачкой
 // (обычный replay), но заполнение полей нужно по одному вперемешку с
 // handle/индексом — снимаем все элементы в scratch-локали (в ОБРАТНОМ
 // порядке, раз последний элемент сверху), затем собираем объект и
-// заполняем поля в прямом порядке (тот же класс проблемы порядка, что у
-// Call_Value_Instr's callee, см. Callee_Info в докстринге Emit_Ctx).
+// заполняем поля в прямом порядке.
+//
+// leading_const — если задан, пишется в поле 0 КАК КОНСТАНТА (не
+// Value_Id — closures нужен fn_index, известный на этапе эмиссии, не
+// значение со стека), остальные элементы сдвигаются на поле 1..N.
+// push_result — управляет, кладётся ли итоговый handle на стек
+// (единообразно true везде сегодня, включая closures — см. Emit_Ctx's
+// докстринг про то, почему closures НЕ могут не класть хендл на стек);
+// параметр оставлен на случай будущего вызывающего, которому handle_
+// local нужен БЕЗ побочного эффекта на стек.
 @(private = "file")
-emit_construct_object :: proc(ectx: ^Emit_Ctx, elements: []Value_Id, alloc_import: int, tag: Maybe(i64)) {
+emit_construct_object :: proc(
+	ectx: ^Emit_Ctx,
+	elements: []Value_Id,
+	alloc_import: int,
+	tag: Maybe(i64),
+	leading_const: Maybe(i64) = nil,
+	push_result: bool = true,
+) -> (
+	handle_local: int,
+) {
 	code := &ectx.code
 	n := len(elements)
+	field_offset := 0
+	if _, has_lc := leading_const.?; has_lc do field_offset = 1
+	field_count := n + field_offset
 
 	elem_locals := make([]int, n, context.temp_allocator)
 	elem_is_i32 := make([]bool, n, context.temp_allocator)
@@ -428,31 +465,45 @@ emit_construct_object :: proc(ectx: ^Emit_Ctx, elements: []Value_Id, alloc_impor
 		write_uleb128(code, u64(local))
 	}
 
-	handle_local := alloc_i32_scratch(ectx)
+	handle_local = alloc_i32_scratch(ectx)
 	if t, has_tag := tag.?; has_tag {
 		append(code, 0x41) // i32.const tag (pw_build_variant(tag, field_count))
 		write_sleb128(code, t)
 	}
 	append(code, 0x41) // i32.const field_count
-	write_sleb128(code, i64(n))
+	write_sleb128(code, i64(field_count))
 	append(code, 0x10) // call pw_alloc_aggregate/pw_build_variant
 	write_uleb128(code, u64(alloc_import))
 	append(code, 0x21) // local.set handle
 	write_uleb128(code, u64(handle_local))
 
+	if lc, has_lc := leading_const.?; has_lc {
+		append(code, 0x20) // local.get handle
+		write_uleb128(code, u64(handle_local))
+		append(code, 0x41) // i32.const 0 (field index)
+		write_sleb128(code, 0)
+		append(code, 0x41) // i32.const fn_index (value)
+		write_sleb128(code, lc)
+		append(code, 0x10) // call pw_set_field_i32
+		write_uleb128(code, u64(PW_SET_FIELD_I32))
+	}
+
 	for i in 0 ..< n {
 		append(code, 0x20) // local.get handle
 		write_uleb128(code, u64(handle_local))
 		append(code, 0x41) // i32.const index
-		write_sleb128(code, i64(i))
+		write_sleb128(code, i64(i + field_offset))
 		append(code, 0x20) // local.get элемент (тип берётся из декларации локали, не из опкода)
 		write_uleb128(code, u64(elem_locals[i]))
 		append(code, 0x10)
 		write_uleb128(code, u64(elem_is_i32[i] ? PW_SET_FIELD_I32 : PW_SET_FIELD_F64))
 	}
 
-	append(code, 0x20) // local.get handle — итоговое значение
-	write_uleb128(code, u64(handle_local))
+	if push_result {
+		append(code, 0x20) // local.get handle — итоговое значение
+		write_uleb128(code, u64(handle_local))
+	}
+	return handle_local
 }
 
 // emit_try_unwrap — `?`-оператор (Try_Unwrap_Instr). Типчекер уже
@@ -839,6 +890,67 @@ resolve_func_index :: proc(ectx: ^Emit_Ctx, fn: Function_Id) -> int {
 	return idx
 }
 
+// emit_closure_value — ЕДИНЫЙ эмиттер для Function_Ref_Instr (captured
+// == {}) И Build_Closure_Instr (captured != {}) — см. план closures: оба
+// строят один и тот же [fn_index, captured...] arena-хендл через emit_
+// construct_object И КЛАДУТ его на стек нормально (см. Emit_Ctx's
+// докстринг про то, почему НЕ по-особому — реальный баг был найден
+// именно на этом).
+@(private = "file")
+emit_closure_value :: proc(ectx: ^Emit_Ctx, dst: Value_Id, fn: Function_Id, captured: []Value_Id) {
+	wasm_idx := resolve_func_index(ectx, fn)
+	emit_construct_object(ectx, captured, PW_ALLOC_AGGREGATE, nil, i64(wasm_idx), true)
+	ectx.value_to_closure_fn[dst] = fn
+}
+
+// find_call_value_typeidx — фоллбэк-путь Call_Value_Instr, когда callee
+// НЕ найден в value_to_closure_fn (пришёл издалека — Load_Local_Instr от
+// параметра/сохранённого значения, настоящее замыкание как значение, не
+// немедленно вызванное). Конкретный Function_Id здесь недоступен —
+// известен только СТАТИЧЕСКИЙ ТИП вызова (panos's типчекер гарантирует:
+// в этом значении может оказаться только функция с ИМЕННО такой
+// сигнатурой). WASM's call_indirect типизирован СТРУКТУРНО (сверяет
+// functype таблицы с functype по typeidx побайтово) — НЕ требует, чтобы
+// typeidx был "родным" для конкретной функции в слоте, так что подходит
+// ЛЮБАЯ Phase-1-включённая функция с той же (params, result) формой;
+// panos's типобезопасность гарантирует, что искомая — среди них (иначе
+// она сама не прошла бы is_wasm_phase1_function при своей эмиссии).
+// O(n) по числу включённых функций — приемлемо на масштабе фикстур этого
+// бэкенда (тот же "корректность важнее скорости" прецедент, что и
+// O(n·m)-строковый поиск Фазы 2.0); ТОЛЬКО фоллбэк-путь, обычные вызовы
+// (Function_Ref_Instr в области видимости) идут через O(1) resolve_
+// func_index в Call_Value_Instr напрямую.
+@(private = "file")
+find_call_value_typeidx :: proc(ectx: ^Emit_Ctx, v: ^Call_Value_Instr) -> int {
+	want_returns, want_result_byte := call_value_result_shape(ectx, v)
+	for &mfn in ectx.module.functions {
+		wasm_idx, included := ectx.func_index^[mfn.id]
+		if !included do continue
+		if len(mfn.parameters) != len(v.args) do continue
+		match := true
+		for a, i in v.args {
+			pt := mfn.locals[int(mfn.parameters[i])].type
+			if wasm_val_type(pt) != wasm_val_type(value_type_of(ectx, a)) {
+				match = false
+				break
+			}
+		}
+		if !match do continue
+		fn_returns := prune_type(mfn.result_type) != TY_VOID
+		if fn_returns != want_returns do continue
+		if want_returns && wasm_val_type(mfn.result_type) != want_result_byte do continue
+		return wasm_idx
+	}
+	panic("wasm backend: не найдена функция, соответствующая сигнатуре вызова через значение — нарушена типобезопасность (см. план closures)")
+}
+
+@(private = "file")
+call_value_result_shape :: proc(ectx: ^Emit_Ctx, v: ^Call_Value_Instr) -> (returns: bool, byte: u8) {
+	d, ok := v.dst.?
+	if !ok do return false, 0
+	return true, wasm_val_type(value_type_of(ectx, d))
+}
+
 @(private = "file")
 emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 	code := &ectx.code
@@ -857,11 +969,11 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 
 	case ^Load_Local_Instr:
 		append(code, 0x20) // local.get
-		write_uleb128(code, u64(v.local))
+		write_uleb128(code, u64(wasm_local_index(ectx, v.local)))
 
 	case ^Store_Local_Instr:
 		append(code, 0x21) // local.set
-		write_uleb128(code, u64(v.local))
+		write_uleb128(code, u64(wasm_local_index(ectx, v.local)))
 
 	case ^Binary_Instr:
 		if v.op == .Add && value_kind(ectx, v.lhs) == .String {
@@ -882,32 +994,70 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		emit_unary_op(ectx, v.op)
 
 	case ^Function_Ref_Instr:
-		// НЕ кладёт значение на operand-стек — см. Callee_Info в
-		// докстринге Emit_Ctx (порядок callee/аргументов у MIR
-		// противоположен тому, что нужен WASM call_indirect).
-		wasm_idx := resolve_func_index(ectx, v.fn)
-		local := alloc_i32_scratch(ectx)
-		append(code, 0x41) // i32.const
-		write_sleb128(code, i64(wasm_idx))
-		append(code, 0x21) // local.set
-		write_uleb128(code, u64(local))
-		ectx.value_to_callee[v.dst] = Callee_Info{fn = v.fn, local = local}
+		emit_closure_value(ectx, v.dst, v.fn, {})
+
+	case ^Build_Closure_Instr:
+		emit_closure_value(ectx, v.dst, v.fn, v.captured)
 
 	case ^Call_Instr:
+		// Мёртвый код: lowering.odin никогда не строит Call_Instr
+		// (см. план closures — ВСЕ реальные вызовы идут через
+		// Call_Value_Instr). Если бы этот case когда-нибудь исполнился,
+		// он был бы неверен после введения __env (прямой call без
+		// трейлинг-аргумента не совпал бы с новой сигнатурой функции) —
+		// не чинится намеренно, т.к. недостижимо.
 		wasm_idx := resolve_func_index(ectx, v.callee)
 		append(code, 0x10) // call
 		write_uleb128(code, u64(wasm_idx))
 
 	case ^Call_Value_Instr:
-		info, known := ectx.value_to_callee[v.callee]
-		if !known {
-			panic("wasm backend Фаза 1: вызов через значение поддержан только для статически известного Function_Ref_Instr (см. план)")
+		// closures (см. план): callee — ВСЕГДА [fn_index, captured...]
+		// хендл (emit_closure_value), никогда голый funcidx, и ВСЕГДА
+		// положен на стек ОБЫЧНЫМ replay'ем (см. Emit_Ctx's докстринг) —
+		// т.е. лежит ПОД аргументами (callee лоурится раньше args, см.
+		// mir_lowering.odin), а call_indirect нужен ПОСЛЕ них. Снимаем
+		// args в scratch (в ОБРАТНОМ порядке — последний сверху), затем
+		// сам callee, затем восстанавливаем args в исходном порядке —
+		// тот же приём, что emit_construct_object (wasm_val_type, не
+		// wasm_field_is_i32 — это ОБЫЧНЫЕ значения-аргументы, не поля
+		// структуры, wasm_field_is_i32 неполон для Массив/Enum/
+		// Соответствие, см. её докстринг).
+		n := len(v.args)
+		arg_locals := make([]int, n, context.temp_allocator)
+		for i := n - 1; i >= 0; i -= 1 {
+			is_i32 := wasm_val_type(value_type_of(ectx, v.args[i])) == WASM_I32
+			local := is_i32 ? alloc_i32_scratch(ectx) : alloc_f64_scratch(ectx)
+			arg_locals[i] = local
+			append(code, 0x21) // local.set
+			write_uleb128(code, u64(local))
 		}
-		wasm_idx := resolve_func_index(ectx, info.fn)
-		append(code, 0x20) // local.get callee — ПОСЛЕ аргументов (уже на стеке из replay), см. Callee_Info
-		write_uleb128(code, u64(info.local))
+		handle_local := alloc_i32_scratch(ectx)
+		append(code, 0x21) // local.set callee
+		write_uleb128(code, u64(handle_local))
+		for i in 0 ..< n {
+			append(code, 0x20) // local.get arg i
+			write_uleb128(code, u64(arg_locals[i]))
+		}
+
+		// typeidx — O(1) через value_to_closure_fn, когда callee —
+		// известный Function_Ref_Instr/Build_Closure_Instr В ЭТОЙ
+		// функции (не через локаль/захват), иначе O(n) структурный
+		// скан-фоллбэк (см. find_call_value_typeidx).
+		fn, known := ectx.value_to_closure_fn[v.callee]
+		typeidx := known ? resolve_func_index(ectx, fn) : find_call_value_typeidx(ectx, v)
+
+		append(code, 0x20) // local.get handle (как __env — трейлинг-аргумент)
+		write_uleb128(code, u64(handle_local))
+
+		append(code, 0x20) // local.get handle (снова — fn_index из поля 0)
+		write_uleb128(code, u64(handle_local))
+		append(code, 0x41) // i32.const 0
+		write_sleb128(code, 0)
+		append(code, 0x10) // call pw_get_field_i32
+		write_uleb128(code, u64(PW_GET_FIELD_I32))
+
 		append(code, 0x11) // call_indirect
-		write_uleb128(code, u64(wasm_idx)) // typeidx == funcidx (см. wasm_module.odin)
+		write_uleb128(code, u64(typeidx))
 		write_uleb128(code, 0) // tableidx 0
 
 	case ^New_Aggregate_Instr:
@@ -938,8 +1088,8 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 		// но pw_set_field_* нужен порядок (handle, index, value) — index
 		// между ними, поэтому здесь нельзя просто "оставить как есть":
 		// нужна scratch-локаль для value, чтобы вставить index между handle
-		// и value (та же проблема порядка, что Call_Value_Instr, см.
-		// Callee_Info в докстринге Emit_Ctx).
+		// и value (тот же класс проблемы порядка, что Call_Value_Instr's
+		// args/callee-разгребание, см. её case).
 		emit_set_property(ectx, v)
 
 	case ^Get_Index_Instr:
@@ -1218,13 +1368,32 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 	case ^Try_Unwrap_Instr:
 		emit_try_unwrap(ectx, v)
 
-	case ^Copy_Instr,
-	     ^Load_Captured_Instr,
-	     ^Call_Async_Instr,
+	case ^Copy_Instr:
+	// Никогда не конструируется lowering'ом сегодня (зарезервирован для
+	// будущих optimization-проходов, см. core/mir_bytecode.odin's
+	// докстринг на этом же case) — но семантически тривиален для этого
+	// бэкенда: src уже на стеке (обычный replay), dst — просто НОВОЕ имя
+	// для ТОГО ЖЕ значения, никакой доп. эмиссии не нужно.
+
+	case ^Load_Captured_Instr:
+		// closures (см. план): __env — ПОСЛЕДНИЙ WASM-параметр текущей
+		// функции (её собственный closure-хендл), см. wasm_module.odin's
+		// per-function functype. Индекс+1 — поле 0 хендла зарезервировано
+		// под fn_index (см. emit_closure_value), captured_i лежит в поле
+		// i+1.
+		env_local := len(ectx.fn.parameters)
+		append(code, 0x20) // local.get __env
+		write_uleb128(code, u64(env_local))
+		append(code, 0x41) // i32.const (index+1)
+		write_sleb128(code, i64(v.index + 1))
+		field_getter := pw_typed_import(ectx, v.dst, PW_GET_FIELD_I32, PW_GET_FIELD_F64)
+		append(code, 0x10)
+		write_uleb128(code, u64(field_getter))
+
+	case ^Call_Async_Instr,
 	     ^Call_Foreign_Instr,
 	     ^Cast_Interface_Instr,
 	     ^Invoke_Interface_Instr,
-	     ^Build_Closure_Instr,
 	     ^Spawn_Instr,
 	     ^Send_Instr,
 	     ^Receive_Instr,

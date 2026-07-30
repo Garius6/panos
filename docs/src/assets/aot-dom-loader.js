@@ -205,7 +205,11 @@ export async function loadAotDomProgram(programWasmUrl, runtimeWasmUrl) {
 		const handlerName = readString(handlerNameHandle)
 		const handlerFn = program.exports[handlerName]
 		if (!el || typeof handlerFn !== "function") return 0
-		el.addEventListener(eventName, () => handlerFn())
+		// __env — closure-хендл (см. план closures, core/wasm_module.odin):
+		// КАЖДАЯ panos-функция теперь принимает этот трейлинг i32-параметр
+		// единообразно, обработчик — обычная неcaptured функция и его не
+		// читает, но арность WASM-сигнатуры требует передать хоть что-то.
+		el.addEventListener(eventName, () => handlerFn(0))
 		return 1
 	}
 
@@ -221,8 +225,9 @@ export async function loadAotDomProgram(programWasmUrl, runtimeWasmUrl) {
 	// не настоящая Odin-сборка — нет _start/своей инициализации вообще,
 	// только объявленные panos-функции. "старт" — ФИКСИРОВАННОЕ имя
 	// точки входа во всём проекте (тот же вызов, что `panos run`/
-	// wasmtime-путь этого бэкенда, `--invoke старт`, делают).
-	program.exports["старт"]()
+	// wasmtime-путь этого бэкенда, `--invoke старт`, делают). Трейлинг 0
+	// — __env (см. план closures) — старт его не читает, см. registerHandler.
+	program.exports["старт"](0)
 
 	return program
 }

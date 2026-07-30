@@ -85,9 +85,13 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		// использует ли КОНКРЕТНАЯ фикстура строки — --preload обязателен
 		// всегда, не только для строковых тестов (см. `just build-wasm-
 		// runtime`, запускается перед этим тестом через зависимость
-		// рецепта test-wasm-backend в Justfile).
+		// рецепта test-wasm-backend в Justfile). Трейлинг "0" — __env
+		// (см. план closures): КАЖДАЯ функция, включая старт, теперь
+		// имеет этот параметр единообразно, старт его просто не читает —
+		// wasmtime's --invoke передаёт трейлинг CLI-аргументы как
+		// аргументы вызываемой функции.
 		desc := os.Process_Desc {
-			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path},
+			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path, "0"},
 		}
 		state, stdout_bytes, _, err := os.process_exec(desc, context.allocator)
 		if err != nil || !state.success do return Diff_Result{ok = false}
@@ -124,7 +128,7 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		defer os.remove(path)
 
 		desc := os.Process_Desc {
-			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path},
+			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path, "0"},
 		}
 		state, stdout_bytes, _, err := os.process_exec(desc, context.allocator)
 		if err != nil || !state.success do return "", false
@@ -1099,7 +1103,7 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		defer os.remove(path)
 
 		desc := os.Process_Desc {
-			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path},
+			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path, "0"},
 		}
 		state, stdout_bytes, _, err := os.process_exec(desc, context.allocator)
 		testing.expectf(t, err == nil, "process_exec ошибка: %v", err)
@@ -1200,7 +1204,7 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 		defer os.remove(path)
 
 		desc := os.Process_Desc {
-			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path},
+			command = []string{"wasmtime", "run", "--preload", "env=wasm_runtime/runtime.wasm", "--invoke", "старт", path, "0"},
 		}
 		state, _, _, err := os.process_exec(desc, context.allocator)
 		testing.expectf(t, err == nil, "process_exec ошибка: %v", err)
@@ -1653,6 +1657,90 @@ when #config(PANOS_WASM_BACKEND_TESTS, false) {
 			конец
 			функ старт() -> Булево
 				шаг2().получить_ошибку("нет") == "исходная"
+			конец
+		`)
+	}
+
+	// Closures (Build_Closure_Instr/Load_Captured_Instr, план closures) —
+	// каждое компилируемое функциональное значение (захватывающее или
+	// нет) теперь единообразный [fn_index, captured...] arena-хендл;
+	// КАЖДАЯ WASM-функция получила трейлинг __env-параметр (см.
+	// core/wasm_module.odin). Call_Value_Instr's callee почти ВСЕГДА
+	// проходит через ОБЩИЙ (структурный скан, find_call_value_typeidx)
+	// путь — "быстрый" O(1)-путь (value_to_closure_local) покрывает
+	// только вызов ПО ИМЕНИ напрямую (без прохода через локаль), т.е.
+	// РОВНО то, что уже работало ДО closures — сам `пер f = ...; f()`
+	// паттерн (нормальный способ хранить/передавать функцию) ВСЕГДА идёт
+	// через фоллбэк, что и проверяют тесты ниже.
+
+	@(test)
+	test_wasm_diff_closure_non_capturing_stored_then_called :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ ответ() -> Число
+				42.0
+			конец
+			функ старт() -> Число
+				пер f = ответ
+				f()
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_closure_capturing_called_immediately :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер y = 10.0
+				пер f = функ(x: Число) -> Число
+					x + y
+				конец
+				f(5.0)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_closure_capturing_stored_then_called_twice :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер y = 100.0
+				пер f = функ(x: Число) -> Число
+					x + y
+				конец
+				пер a = f(1.0)
+				пер b = f(2.0)
+				a + b
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_closure_passed_as_argument_and_called_inside :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ применить(ф: функ(Число) -> Число, значение: Число) -> Число
+				ф(значение)
+			конец
+			функ старт() -> Число
+				пер y = 7.0
+				пер f = функ(x: Число) -> Число
+					x + y
+				конец
+				применить(f, 3.0)
+			конец
+		`)
+	}
+
+	@(test)
+	test_wasm_diff_closure_nested_captures_another_closure :: proc(t: ^testing.T) {
+		wasm_diff_check(t, `
+			функ старт() -> Число
+				пер прибавить_один = функ(x: Число) -> Число
+					x + 1.0
+				конец
+				пер обёртка = функ(x: Число) -> Число
+					прибавить_один(x) * 2.0
+				конец
+				обёртка(3.0)
 			конец
 		`)
 	}

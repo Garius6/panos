@@ -13,6 +13,12 @@ import "core:testing"
 lower_wasm_from_source :: proc(t: ^testing.T, source: string) -> []u8 {
 	result := check_source(source)
 	testing.expectf(t, len(result.diags) == 0, "check_source diagnostics: %v", result.diags)
+	// Реальный, ранее скрытый баг: без этого return, при диагностиках
+	// (напр. type error) выполнение всё равно шло в lower_module —
+	// падало НЕПОНЯТНОЙ паникой ("идентификатор не резолвится" и т.п.)
+	// вместо чистого testing-фейла с текстом самой диагностики. Найдено
+	// реальным крашем при правке DOM.на_клик's арности, не гипотезой.
+	if len(result.diags) > 0 do return nil
 	module := lower_module(&result.res_ctx, &result.tc_ctx, &result.prog)
 	return lower_module_to_wasm(&module)
 }
@@ -349,7 +355,7 @@ test_wasm_module_lowers_url_encode_without_panic :: proc(t: ^testing.T) {
 test_wasm_module_lowers_dom_builtins_without_panic :: proc(t: ^testing.T) {
 	bytes := lower_wasm_from_source(t, `
 		импорт DOM
-		функ обработчик() -> Пусто
+		функ обработчик(контекст: Строка) -> Пусто
 		конец
 		функ старт() -> Булево
 			пер текст = DOM.текст("#a").есть()
@@ -359,9 +365,11 @@ test_wasm_module_lowers_dom_builtins_without_panic :: proc(t: ^testing.T) {
 			пер удалён_атрибут = DOM.удалить_атрибут("#a", "href")
 			пер создан = DOM.создать_и_добавить("#a", "div", "новый")
 			пер удалён = DOM.удалить("#новый")
-			пер клик = DOM.на_клик("#a", "обработчик")
-			пер ввод = DOM.на_ввод("#a", "обработчик")
-			текст и установлено и атрибут и уст_атрибут и удалён_атрибут и создан и удалён и клик и ввод
+			пер клик = DOM.на_клик("#a", "обработчик", "конт")
+			пер ввод = DOM.на_ввод("#a", "обработчик", "конт")
+			пер значение = DOM.значение_поля("#a").есть()
+			пер уст_значение = DOM.установить_значение_поля("#a", "z")
+			текст и установлено и атрибут и уст_атрибут и удалён_атрибут и создан и удалён и клик и ввод и значение и уст_значение
 		конец
 	`)
 	testing.expectf(t, len(bytes) > 8, "модуль пуст")

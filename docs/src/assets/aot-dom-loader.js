@@ -185,31 +185,81 @@ export async function loadAotDomProgram(programWasmUrl, runtimeWasmUrl) {
 			el.remove()
 			return 1
 		},
-		dom_on_click: (selHandle, handlerNameHandle) => {
-			return registerHandler(selHandle, handlerNameHandle, "click")
+		dom_on_click: (selHandle, handlerNameHandle, contextHandle) => {
+			return registerHandler(selHandle, handlerNameHandle, contextHandle, "click")
 		},
-		dom_on_input: (selHandle, handlerNameHandle) => {
-			return registerHandler(selHandle, handlerNameHandle, "input")
+		dom_on_input: (selHandle, handlerNameHandle, contextHandle) => {
+			return registerHandler(selHandle, handlerNameHandle, contextHandle, "input")
+		},
+		// значение_поля/установить_значение_поля (план todo-демо): ЖИВОЕ
+		// element.value, НЕ HTML-атрибут (dom_get_attribute/dom_set_
+		// attribute выше читают/пишут АТРИБУТ — для <input> это начальное
+		// значение из разметки, не то, что реально набрал пользователь).
+		dom_get_value: (selHandle) => {
+			const el = document.querySelector(readString(selHandle))
+			return buildTextOption(el && "value" in el ? el.value : null)
+		},
+		dom_set_value: (selHandle, valueHandle) => {
+			const el = document.querySelector(readString(selHandle))
+			if (!el || !("value" in el)) return 0
+			el.value = readString(valueHandle)
+			return 1
+		},
+	}
+
+	// net — план todo-демо: сеть.http_запрос_sync's единственная JS-
+	// реализация — СИНХРОННЫЙ XMLHttpRequest (третий аргумент open()
+	// false). Deprecated для cross-origin/unload-обработчиков, но рабочий
+	// для обычных same-origin запросов на главном потоке — единственный
+	// способ сделать НАСТОЯЩИЙ (не JS-инициированный) fetch из wasm-кода
+	// БЕЗ suspend/resume, которого у WASM MVP нет вообще (см. [[project_
+	// panos_wasm_actors_cps_design]] про то же ограничение у actors —
+	// асинхронный fetch потребовал бы того же CPS-transform). Опция
+	// (Строка): Нет() на сетевой ошибке ИЛИ не-2xx статусе, Есть(тело) на
+	// успехе — та же buildTextOption-конструкция, что DOM.текст уже
+	// использует.
+	const net = {
+		net_http_request_sync: (methodHandle, urlHandle, bodyHandle) => {
+			const method = readString(methodHandle)
+			const url = readString(urlHandle)
+			const body = readString(bodyHandle)
+			try {
+				const xhr = new XMLHttpRequest()
+				xhr.open(method, url, false)
+				xhr.send(body.length > 0 ? body : null)
+				if (xhr.status < 200 || xhr.status >= 300) return buildTextOption(null)
+				return buildTextOption(xhr.responseText)
+			} catch (e) {
+				return buildTextOption(null)
+			}
 		},
 	}
 
 	// registerHandler — имя_обработчика ДОЛЖНО совпадать с ИМЕНЕМ
 	// экспортированной panos-функции (core/wasm_module.odin's export-
 	// секция экспортирует КАЖДУЮ функцию по её имени безусловно) —
-	// программа обязана объявить `функ имя() -> Пусто` В ГЛАВНОМ файле
-	// (не в импортированном модуле — там имя несёт префикс "модуль::",
-	// см. resolver.odin's full_name, за пределами v1). Несуществующее
-	// имя — ложь СРАЗУ (не тихий no-op), не ждёт первого клика.
-	function registerHandler(selHandle, handlerNameHandle, eventName) {
+	// программа обязана объявить `функ имя(контекст: Строка) -> Пусто` В
+	// ГЛАВНОМ файле (не в импортированном модуле — там имя несёт префикс
+	// "модуль::", см. resolver.odin's full_name, за пределами v1).
+	// Несуществующее имя — ложь СРАЗУ (не тихий no-op), не ждёт первого
+	// клика. contextHandle читается и ПЕРЕСТРОИЛСЯ в реальный panos-
+	// строковый хендл ОДИН раз при РЕГИСТРАЦИИ (не на каждый клик) —
+	// wasm_runtime's арена — bump-аллокатор без сборки мусора (см. её
+	// докстринг), переиспользование одного хендла на каждый клик
+	// безопасно (план todo-демо: контекст = id элемента списка,
+	// позволяет ОДНОМУ обработчику узнать, ДЛЯ КАКОГО элемента его
+	// вызвали).
+	function registerHandler(selHandle, handlerNameHandle, contextHandle, eventName) {
 		const el = document.querySelector(readString(selHandle))
 		const handlerName = readString(handlerNameHandle)
 		const handlerFn = program.exports[handlerName]
 		if (!el || typeof handlerFn !== "function") return 0
-		// __env — closure-хендл (см. план closures, core/wasm_module.odin):
-		// КАЖДАЯ panos-функция теперь принимает этот трейлинг i32-параметр
-		// единообразно, обработчик — обычная неcaptured функция и его не
-		// читает, но арность WASM-сигнатуры требует передать хоть что-то.
-		el.addEventListener(eventName, () => handlerFn(0))
+		const contextText = readString(contextHandle)
+		const boundContextHandle = allocString(contextText)
+		// __env — ВСЕГДА ПОСЛЕДНИЙ параметр (core/wasm_module.odin
+		// добавляет его ПОСЛЕ реальных параметров, план closures) —
+		// (контекст, __env), не наоборот.
+		el.addEventListener(eventName, () => handlerFn(boundContextHandle, 0))
 		return 1
 	}
 
@@ -218,6 +268,7 @@ export async function loadAotDomProgram(programWasmUrl, runtimeWasmUrl) {
 	const programResult = await WebAssembly.instantiate(programBytes, {
 		env: runtime.exports,
 		dom: dom,
+		"сеть": net,
 	})
 	program = programResult.instance
 

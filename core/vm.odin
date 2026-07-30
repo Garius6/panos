@@ -1037,6 +1037,14 @@ call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
 	if strings.has_prefix(name, "DOM::") {
 		fmt.panicf("Runtime Panic: '%s' доступно только в AOT WASM-выводе, не в байткод-VM", name)
 	}
+	// сеть::http_запрос_sync (план todo-демо) — синхронный XHR, реален
+	// только в браузере через JS-грузчик, той же причине, что DOM выше.
+	// Байткод-VM (нативная ИЛИ сама в js_wasm32 — интерактивный
+	// плейграунд) уже имеет свой (АСИНХРОННЫЙ) сеть::http_запрос — не
+	// путать с этим.
+	if name == "сеть::http_запрос_sync" {
+		fmt.panicf("Runtime Panic: '%s' доступно только в AOT WASM-выводе, не в байткод-VM", name)
+	}
 	// фс::*/ос::окружение*/ввод_вывод::прочитать_строку/поток/сеть::подключиться
 	// — в vm_io_native.odin/vm_io_wasm.odin (#+build split, трогают
 	// os.exists/os.open/os.lookup_env/net.dial_tcp...). Остальные builtin'ы

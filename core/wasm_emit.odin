@@ -81,6 +81,14 @@ Emit_Ctx :: struct {
 	// -> funcidx нового wasm-import'а (core/wasm_module.odin). Пустая
 	// map, если в программе нет ни одного внешний.
 	foreign_func_index: ^map[^Foreign_Function]int,
+	// План todo-демо: база "сеть"-import-группы (core/wasm_module.odin's
+	// net_base) — самостоятельная переменная, НЕ компайл-тайм константа
+	// (в отличие от PW_DOM_*), т.к. dom и сеть эмитятся НЕЗАВИСИМО друг
+	// от друга — сдвиг сети зависит от того, эмитирован ли dom. Читается
+	// только когда сеть::http_запрос_sync реально эмитируется — самосог-
+	// ласовано тем же принципом, что PW_DOM_*-константы (см. их докстринг
+	// в wasm_module.odin).
+	net_base:           int,
 	use_count:          map[Value_Id]int, // см. emit_block_instructions
 }
 
@@ -98,6 +106,7 @@ new_emit_ctx :: proc(
 	fn: ^Mir_Function,
 	func_index: ^map[Function_Id]int,
 	foreign_func_index: ^map[^Foreign_Function]int,
+	net_base: int,
 ) -> Emit_Ctx {
 	info := compute_cfg_info(fn)
 	rpo_index := build_rpo_index(&info)
@@ -125,6 +134,7 @@ new_emit_ctx :: proc(
 		next_f64_scratch       = f64_pool_base,
 		func_index             = func_index,
 		foreign_func_index     = foreign_func_index,
+		net_base               = net_base,
 		use_count              = compute_use_count(fn),
 	}
 	return ectx
@@ -221,8 +231,9 @@ emit_function_wasm :: proc(
 	mfn: ^Mir_Function,
 	func_index: ^map[Function_Id]int,
 	foreign_func_index: ^map[^Foreign_Function]int,
+	net_base: int,
 ) -> [dynamic]u8 {
-	ectx := new_emit_ctx(module, mfn, func_index, foreign_func_index)
+	ectx := new_emit_ctx(module, mfn, func_index, foreign_func_index, net_base)
 	defer destroy_emit_ctx(&ectx)
 
 	process_from(&ectx, mfn.entry, INVALID_BLOCK)
@@ -1495,11 +1506,33 @@ emit_mir_instr :: proc(ectx: ^Emit_Ctx, instr: Mir_Instruction) {
 			append(code, 0x10)
 			write_uleb128(code, u64(PW_DOM_REMOVE))
 		case "DOM::на_клик":
+			// План todo-демо: контекст (3-й арг) уже на стеке в естественном
+			// порядке вместе с селектором/именем — dom_on_click сама
+			// запоминает его на JS-стороне и передаёт обработчику при
+			// каждом клике (см. aot-dom-loader.js's registerHandler).
 			append(code, 0x10)
 			write_uleb128(code, u64(PW_DOM_ON_CLICK))
 		case "DOM::на_ввод":
 			append(code, 0x10)
 			write_uleb128(code, u64(PW_DOM_ON_INPUT))
+		case "DOM::значение_поля":
+			// План todo-демо: ЖИВОЕ element.value (не HTML-атрибут — см.
+			// PW_DOM_GET_VALUE's докстринг в wasm_module.odin).
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_GET_VALUE))
+		case "DOM::установить_значение_поля":
+			append(code, 0x10)
+			write_uleb128(code, u64(PW_DOM_SET_VALUE))
+
+		case "сеть::http_запрос_sync":
+			// План todo-демо: синхронный XHR на JS-стороне (aot-dom-loader.js)
+			// — единственный способ сделать реальный fetch из wasm-кода без
+			// suspend/resume, которого WASM MVP не даёт (см. [[project_
+			// panos_wasm_actors_cps_design]] про то же ограничение у
+			// actors). net_base — НЕ компайл-тайм константа (в отличие от
+			// PW_DOM_*), см. Emit_Ctx.net_base's докстринг.
+			append(code, 0x10)
+			write_uleb128(code, u64(ectx.net_base))
 
 		case "паника":
 			// Фаза 2.6: паника(сообщение) — Строка-arg уже на стеке

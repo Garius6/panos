@@ -330,9 +330,20 @@ PW_DOM_SET_ATTRIBUTE :: PW_IMPORT_COUNT + 3
 PW_DOM_REMOVE_ATTRIBUTE :: PW_IMPORT_COUNT + 4
 PW_DOM_CREATE_AND_APPEND :: PW_IMPORT_COUNT + 5
 PW_DOM_REMOVE :: PW_IMPORT_COUNT + 6
+// на_клик/на_ввод (план todo-демо): третий параметр — контекст
+// (строковый хендл), передаётся JS-стороне ПРИ РЕГИСТРАЦИИ, возвращается
+// обработчику КАК АРГУМЕНТ на каждый клик/ввод (см. emit_call_builtin's
+// "DOM::на_клик" case) — без этого обработчик не мог бы узнать, ДЛЯ
+// КАКОГО элемента списка (напр. задачи todo-списка) его вызвали.
 PW_DOM_ON_CLICK :: PW_IMPORT_COUNT + 7
 PW_DOM_ON_INPUT :: PW_IMPORT_COUNT + 8
-PW_DOM_IMPORT_COUNT :: 9
+// значение_поля/установить_значение_поля (план todo-демо): ЖИВОЕ
+// element.value (не HTML-атрибут "value", см. PW_DOM_GET_ATTRIBUTE —
+// атрибут = начальное значение из разметки, не то, что реально ввёл
+// пользователь в <input>/<textarea>).
+PW_DOM_GET_VALUE :: PW_IMPORT_COUNT + 9
+PW_DOM_SET_VALUE :: PW_IMPORT_COUNT + 10
+PW_DOM_IMPORT_COUNT :: 11
 
 @(private = "file")
 pw_dom_imports := [PW_DOM_IMPORT_COUNT]Pw_Import {
@@ -343,8 +354,34 @@ pw_dom_imports := [PW_DOM_IMPORT_COUNT]Pw_Import {
 	{"dom_remove_attribute", {WASM_I32, WASM_I32}, {WASM_I32}},
 	{"dom_create_and_append", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
 	{"dom_remove", {WASM_I32}, {WASM_I32}},
-	{"dom_on_click", {WASM_I32, WASM_I32}, {WASM_I32}},
-	{"dom_on_input", {WASM_I32, WASM_I32}, {WASM_I32}},
+	{"dom_on_click", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"dom_on_input", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
+	{"dom_get_value", {WASM_I32}, {WASM_I32}},
+	{"dom_set_value", {WASM_I32, WASM_I32}, {WASM_I32}},
+}
+
+// PW_NET_MODULE/pw_net_imports (план todo-демо): тот же принцип, что
+// PW_DOM_MODULE — отдельный именованный import-модуль, реализация
+// ВСЕГДА на JS-стороне (синхронный XHR, aot-dom-loader.js) — wasmtime-
+// путь (нет fetch/XHR API у CLI-хоста) не может дать реализацию вообще,
+// только браузер. conditional-эмиссия (см. net_used в lower_module_to_
+// wasm) — та же причина, что у dom_used: --preload в тестах даёт только
+// "env", недостающий import-модуль проваливает инстанциацию ЛЮБОГО
+// модуля, не только сетевых.
+//
+// В ОТЛИЧИЕ от PW_DOM_*-констант — funcidx НЕ фиксированная константа:
+// dom и сеть ОБА условно эмитятся НЕЗАВИСИМО друг от друга (программа
+// может звать DOM::* без сеть::*, и наоборот), а сеть эмитится ПОСЛЕ
+// dom в порядке секций — её база СДВИГАЕТСЯ, если dom_used=false.
+// Реальный funcidx считается в lower_module_to_wasm и прокидывается в
+// Emit_Ctx.net_http_request_sync_idx (тот же приём, что foreign_func_
+// index у внешний-интеропа), НЕ хардкодится здесь.
+PW_NET_MODULE :: "сеть"
+PW_NET_IMPORT_COUNT :: 1
+
+@(private = "file")
+pw_net_imports := [PW_NET_IMPORT_COUNT]Pw_Import {
+	{"net_http_request_sync", {WASM_I32, WASM_I32, WASM_I32}, {WASM_I32}},
 }
 
 @(private = "file")
@@ -403,6 +440,24 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 		}
 	}
 
+	// net_used — тот же принцип, что dom_used, для "сеть"-import-модуля
+	// (план todo-демо) — единственный сегодня сетевой builtin в этой
+	// группе — сеть::http_запрос_sync.
+	net_used := false
+	net_scan: for &mfn in module.functions {
+		for &blk in mfn.blocks {
+			for instr in blk.instructions {
+				if cb, ok := instr.(^Call_Builtin_Instr); ok {
+					if cb.name == "сеть::http_запрос_sync" {
+						net_used = true
+						break net_scan
+					}
+				}
+			}
+		}
+	}
+	net_base := PW_IMPORT_COUNT + (dom_used ? PW_DOM_IMPORT_COUNT : 0)
+
 	// План interop с внешний (WASM AOT): каждая РЕАЛЬНО вызванная
 	// внешний-функция становится СВОИМ wasm-импортом, module=библиотека
 	// (из `внешний "либа" функ ...`), name=имя функции — ОДИН импорт на
@@ -438,8 +493,8 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 		}
 	}
 
-	total_imports := PW_IMPORT_COUNT + (dom_used ? PW_DOM_IMPORT_COUNT : 0) + len(foreign_imports)
-	foreign_base := PW_IMPORT_COUNT + (dom_used ? PW_DOM_IMPORT_COUNT : 0)
+	total_imports := net_base + (net_used ? PW_NET_IMPORT_COUNT : 0) + len(foreign_imports)
+	foreign_base := net_base + (net_used ? PW_NET_IMPORT_COUNT : 0)
 	for imp, i in foreign_imports {
 		foreign_func_index[imp.fn] = foreign_base + i
 	}
@@ -475,6 +530,15 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 			for b in imp.results do append(&types_content, b)
 		}
 	}
+	if net_used {
+		for imp in pw_net_imports {
+			append(&types_content, 0x60) // functype tag
+			write_uleb128(&types_content, u64(len(imp.params)))
+			for b in imp.params do append(&types_content, b)
+			write_uleb128(&types_content, u64(len(imp.results)))
+			for b in imp.results do append(&types_content, b)
+		}
+	}
 	for imp in foreign_imports {
 		append(&types_content, 0x60) // functype tag
 		write_uleb128(&types_content, u64(len(imp.params)))
@@ -500,6 +564,14 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 			write_uleb128(&import_content, u64(PW_IMPORT_COUNT + i)) // typeidx продолжает нумерацию pw_imports
 		}
 	}
+	if net_used {
+		for imp, i in pw_net_imports {
+			write_name(&import_content, PW_NET_MODULE)
+			write_name(&import_content, imp.name)
+			append(&import_content, 0x00) // importdesc kind = func
+			write_uleb128(&import_content, u64(net_base + i)) // typeidx продолжает нумерацию env+dom
+		}
+	}
 	for imp, i in foreign_imports {
 		// module = сама библиотека из `внешний "либа" ...` — В ОТЛИЧИЕ
 		// от pw_imports/pw_dom_imports, здесь module МЕНЯЕТСЯ по записям
@@ -507,7 +579,7 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 		write_name(&import_content, imp.library)
 		write_name(&import_content, imp.name)
 		append(&import_content, 0x00) // importdesc kind = func
-		write_uleb128(&import_content, u64(foreign_base + i)) // typeidx продолжает нумерацию env+dom
+		write_uleb128(&import_content, u64(foreign_base + i)) // typeidx продолжает нумерацию env+dom+сеть
 	}
 
 	func_content := make([dynamic]u8)
@@ -573,7 +645,7 @@ lower_module_to_wasm :: proc(module: ^Mir_Module) -> []u8 {
 	write_uleb128(&code_content, u64(n))
 	for k in 0 ..< n {
 		mfn := &module.functions[included[k]]
-		body := emit_function_wasm(module, mfn, &func_index, &foreign_func_index)
+		body := emit_function_wasm(module, mfn, &func_index, &foreign_func_index, net_base)
 		write_uleb128(&code_content, u64(len(body)))
 		for b in body do append(&code_content, b)
 		delete(body)

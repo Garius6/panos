@@ -276,9 +276,18 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 	case "DOM::удалить":
 		return builtin_function_type_1(TY_STRING, TY_BOOL)
 	case "DOM::на_клик":
-		return builtin_function_type_2(TY_STRING, TY_STRING, TY_BOOL)
+		// План todo-демо: третий параметр — контекст, передаётся
+		// обработчику при каждом срабатывании (см. wasm_emit.odin's
+		// "DOM::на_клик" case).
+		return builtin_function_type_3(TY_STRING, TY_STRING, TY_STRING, TY_BOOL)
 	case "DOM::на_ввод":
+		return builtin_function_type_3(TY_STRING, TY_STRING, TY_STRING, TY_BOOL)
+	case "DOM::значение_поля":
+		return builtin_function_type_1(TY_STRING, stdlib_option_type(graph, TY_STRING))
+	case "DOM::установить_значение_поля":
 		return builtin_function_type_2(TY_STRING, TY_STRING, TY_BOOL)
+	case "сеть::http_запрос_sync":
+		return builtin_function_type_3(TY_STRING, TY_STRING, TY_STRING, stdlib_option_type(graph, TY_STRING))
 	}
 	return nil
 }
@@ -466,6 +475,12 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 		add_builtin_export(
 			graph,
 			module,
+			"http_запрос_sync",
+			builtin_export_type(graph, "сеть::http_запрос_sync"),
+		)
+		add_builtin_export(
+			graph,
+			module,
 			"http_сервер_слушать",
 			builtin_export_type(graph, "сеть::http_сервер_слушать"),
 		)
@@ -549,6 +564,18 @@ ensure_builtin_module :: proc(graph: ^Module_Graph, name: string) -> ^Module {
 		add_builtin_export(graph, module, "удалить", builtin_export_type(graph, "DOM::удалить"))
 		add_builtin_export(graph, module, "на_клик", builtin_export_type(graph, "DOM::на_клик"))
 		add_builtin_export(graph, module, "на_ввод", builtin_export_type(graph, "DOM::на_ввод"))
+		add_builtin_export(
+			graph,
+			module,
+			"значение_поля",
+			builtin_export_type(graph, "DOM::значение_поля"),
+		)
+		add_builtin_export(
+			graph,
+			module,
+			"установить_значение_поля",
+			builtin_export_type(graph, "DOM::установить_значение_поля"),
+		)
 	}
 
 	return module

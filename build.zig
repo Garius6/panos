@@ -70,6 +70,20 @@ pub fn build(b: *std.Build) void {
     runtime_wasi_step.dependOn(&b.addInstallArtifact(runtime_wasi, .{}).step);
 
     const core_tests = b.addTest(.{ .root_module = core_module });
+    const frontend_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/parser.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const target_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/target.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
     const cli_tests = b.addTest(.{ .root_module = panos.root_module });
     const conformance_module = b.addModule("panos_conformance", .{
         .root_source_file = b.path("zig/conformance/manifest.zig"),
@@ -92,19 +106,55 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const outcome_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/conformance/outcome.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    const lexer_conformance_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/conformance/lexer_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    const parser_conformance_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/conformance/parser_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
 
     const run_core_tests = b.addRunArtifact(core_tests);
+    const run_frontend_unit_tests = b.addRunArtifact(frontend_unit_tests);
+    const run_target_unit_tests = b.addRunArtifact(target_unit_tests);
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const run_manifest_tests = b.addRunArtifact(manifest_tests);
     const run_reference_tests = b.addRunArtifact(reference_tests);
+    const run_outcome_tests = b.addRunArtifact(outcome_tests);
+    const run_lexer_conformance_tests = b.addRunArtifact(lexer_conformance_tests);
+    const run_parser_conformance_tests = b.addRunArtifact(parser_conformance_tests);
     const test_step = b.step("test", "Run Zig unit tests");
     test_step.dependOn(&run_core_tests.step);
+    test_step.dependOn(&run_frontend_unit_tests.step);
+    test_step.dependOn(&run_target_unit_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_manifest_tests.step);
     test_step.dependOn(&run_reference_tests.step);
+    test_step.dependOn(&run_outcome_tests.step);
+    test_step.dependOn(&run_lexer_conformance_tests.step);
+    test_step.dependOn(&run_parser_conformance_tests.step);
 
     const conformance_step = b.step("conformance", "Validate the local conformance manifest");
     conformance_step.dependOn(&run_manifest_tests.step);
+    conformance_step.dependOn(&run_lexer_conformance_tests.step);
+    conformance_step.dependOn(&run_parser_conformance_tests.step);
 }
 
 fn addWasmRuntime(

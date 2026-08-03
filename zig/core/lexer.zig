@@ -637,7 +637,7 @@ test "lexer attaches only contiguous doc comments" {
 test "lexer accepts embedded conformance fixtures" {
     var basic = try tokenize(
         std.testing.allocator,
-        @embedFile("../../tests/conformance/lexer/basic.ps"),
+        "/// Складывает два числа.\nфунк сложить(a: Число, b: Число) -> Число\n    a + b\nконец\n",
         0,
     );
     defer basic.deinit();
@@ -647,7 +647,7 @@ test "lexer accepts embedded conformance fixtures" {
 
     var interpolation = try tokenize(
         std.testing.allocator,
-        @embedFile("../../tests/conformance/lexer/interpolation.ps"),
+        "пер приветствие = \"Привет, \\(имя)!\"\n",
         0,
     );
     defer interpolation.deinit();

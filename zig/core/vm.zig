@@ -21,6 +21,7 @@ pub const Vm = struct {
     stack: std.ArrayList(value.Value) = .empty,
     frames: std.ArrayList(Frame) = .empty,
     processes: std.ArrayList(*value.Process) = .empty,
+    active_processes: std.ArrayList(*value.Process) = .empty,
     current_process: ?*value.Process = null,
     current_message: ?value.Value = null,
     next_process_id: u64 = 0,
@@ -40,6 +41,7 @@ pub const Vm = struct {
         self.stack.deinit(self.allocator);
         self.clearProcesses();
         self.processes.deinit(self.allocator);
+        self.active_processes.deinit(self.allocator);
         self.heap.deinit();
         self.* = undefined;
     }
@@ -51,9 +53,12 @@ pub const Vm = struct {
         self.stack.clearRetainingCapacity();
         self.clearFrames();
         self.clearProcesses();
+        self.active_processes.clearRetainingCapacity();
         self.next_process_id = 0;
         self.collect();
         const root = try self.createProcess(entry, &.{}, arguments);
+        try self.active_processes.append(self.allocator, root);
+        defer self.active_processes.clearRetainingCapacity();
         self.current_process = root;
         self.pushFrame(entry, &.{}, arguments) catch |err| switch (err) {
             error.RuntimeFault => return .{ .runtime_error = if (self.failure) |failure| failure.bytes else "Runtime Error: неизвестная ошибка" },
@@ -580,7 +585,7 @@ pub const Vm = struct {
         };
         if (target.status == .ready) {
             try target.mailbox.append(self.allocator, message);
-            try self.runProcess(target);
+            if (!self.isProcessActive(target)) try self.runProcess(target);
         }
         try self.stack.append(self.allocator, .{ .void = {} });
     }
@@ -728,8 +733,15 @@ pub const Vm = struct {
         return process;
     }
 
+    fn isProcessActive(self: *const Vm, process: *const value.Process) bool {
+        for (self.active_processes.items) |active| {
+            if (active == process) return true;
+        }
+        return false;
+    }
+
     fn runProcess(self: *Vm, process: *value.Process) anyerror!void {
-        if (process.status != .ready or process.mailbox.items.len == 0) return;
+        if (process.status != .ready or process.mailbox.items.len == 0 or self.isProcessActive(process)) return;
         const message = process.mailbox.orderedRemove(0);
         const saved_stack = self.stack;
         const saved_frames = self.frames;
@@ -741,7 +753,9 @@ pub const Vm = struct {
         self.failure = null;
         self.current_process = process;
         self.current_message = message;
+        try self.active_processes.append(self.allocator, process);
         defer {
+            _ = self.active_processes.pop();
             self.clearFrames();
             self.frames.deinit(self.allocator);
             self.stack.deinit(self.allocator);
@@ -3049,6 +3063,48 @@ test "VM reorders named function arguments" {
     const resolver = @import("resolver.zig");
     const type_checker = @import("type_checker.zig");
     var lexed = try lexer.tokenize(std.testing.allocator, "функ вычесть(уменьшаемое: Число, вычитаемое: Число) -> Число\nуменьшаемое - вычитаемое\nконец\nфунк старт() -> Число\nвычесть(вычитаемое = 3, уменьшаемое = 10)\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(1), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 7), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM reorders named spawn arguments" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\функ вычислить(ответ: Процесс(Число), уменьшаемое: Число, вычитаемое: Число) -> Пусто
+        \\    отправить(ответ, уменьшаемое - вычитаемое)
+        \\конец
+        \\функ проверка() -> Число
+        \\    пер ответ: Процесс(Число) = себя()
+        \\    пер child: Процесс(Число) = запусти вычислить(вычитаемое = 3, ответ = ответ, уменьшаемое = 10)
+        \\    отправить(child, 0)
+        \\    получить()
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

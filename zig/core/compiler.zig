@@ -603,11 +603,16 @@ const FunctionCompiler = struct {
             .call => |value| value,
             else => return self.unsupportedExpression(spawn.span),
         };
-        if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
-        if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
+        const ordered_arguments = self.compiler.checked.call_arguments.get(spawn.call);
+        if (call.argument_names != null and ordered_arguments == null) {
+            try self.compiler.report(call.span, "Compiler Error: именованные аргументы не поддержаны для этого вызова", .{});
+            return self.emitVoid();
+        }
+        const arguments = ordered_arguments orelse call.arguments;
+        if (arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
         try self.compileExpression(call.callee);
-        for (call.arguments) |argument| try self.compileExpression(argument);
-        try self.function.emit(self.compiler.result.allocator, .{ .spawn = @intCast(call.arguments.len) });
+        for (arguments) |argument| try self.compileExpression(argument);
+        try self.function.emit(self.compiler.result.allocator, .{ .spawn = @intCast(arguments.len) });
     }
 
     fn compileLengthBuiltin(self: *FunctionCompiler, call: anytype) !bool {

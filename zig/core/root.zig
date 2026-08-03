@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const diagnostic = @import("diagnostic.zig");
 pub const source = @import("source.zig");
+pub const token = @import("token.zig");
 
 pub const migration_stage = "phase-0";
 

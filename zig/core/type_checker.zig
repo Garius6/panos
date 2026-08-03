@@ -79,6 +79,7 @@ pub const ImportedNominal = struct {
     source_symbol: symbols.SymbolId,
     local_symbol: symbols.SymbolId,
     identity: u32,
+    fields: ?[]const NominalField = null,
 };
 
 pub const ImportContext = struct {
@@ -240,7 +241,19 @@ const Checker = struct {
     }
 
     fn importSignaturePass(self: *Checker, imports: ImportContext) !void {
-        for (imports.nominals) |imported| try self.result.imported_nominal_identities.put(imported.local_symbol, imported.identity);
+        for (imports.nominals) |imported| {
+            try self.result.imported_nominal_identities.put(imported.local_symbol, imported.identity);
+            const source_fields = imported.fields orelse continue;
+            var fields: std.ArrayList(NominalField) = .empty;
+            defer fields.deinit(self.result.allocator);
+            for (source_fields) |field| {
+                try fields.append(self.result.allocator, .{
+                    .name = try self.result.arena.allocator().dupe(u8, field.name),
+                    .typ = try self.copyImportedType(imported.store, field.typ, imports.nominals),
+                });
+            }
+            try self.result.nominal_fields.put(imported.local_symbol, try self.result.arena.allocator().dupe(NominalField, fields.items));
+        }
         for (imports.symbols) |imported| {
             const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals) catch |err| switch (err) {
                 error.UnsupportedImportedType => {
@@ -1402,6 +1415,7 @@ const Checker = struct {
         if (self.resolution.expr_symbols.get(expression)) |symbol| {
             if (self.resolution.symbols.get(symbol)) |entry| {
                 if (entry.kind == .enum_variant) return self.result.types.nominal(entry.owner_type, &.{});
+                if (entry.kind == .type) return self.nominalType(symbol, &.{});
                 if (self.result.unsupported_imports.contains(symbol)) {
                     try self.report(property.span, "Type Error: импортированный экспорт '{s}' использует пока неподдерживаемый тип", .{entry.name});
                     return self.result.types.poison();

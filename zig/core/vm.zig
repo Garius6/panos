@@ -114,6 +114,7 @@ pub const Vm = struct {
             .build_struct => |structure| try self.buildStruct(compiled, structure),
             .build_array => |count| try self.buildArray(count),
             .array_length => try self.arrayLength(),
+            .string_length => try self.stringLength(),
             .array_get_or => try self.arrayGetOr(),
             .array_contains => try self.arrayContains(),
             .build_map => |count| try self.buildMap(count),
@@ -475,6 +476,18 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .number = @floatFromInt(array.elements.len) });
     }
 
+    fn stringLength(self: *Vm) anyerror!void {
+        const string = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: длина доступна только для строки", .{});
+            return;
+        };
+        const length = std.unicode.utf8CountCodepoints(string) catch {
+            try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .number = @floatFromInt(length) });
+    }
+
     fn arrayGetOr(self: *Vm) anyerror!void {
         const fallback = try self.pop();
         const index = try self.pop();
@@ -661,8 +674,37 @@ pub const Vm = struct {
                 }
                 try self.fault("Runtime Error: ключ отсутствует в соответствии", .{});
             },
-            else => try self.fault("Runtime Error: индексирование поддержано только для массива и соответствия", .{}),
+            else => {
+                const string = object.stringBytes() orelse {
+                    try self.fault("Runtime Error: индексирование поддержано только для строки, массива и соответствия", .{});
+                    return;
+                };
+                const character = try self.stringAt(string, index);
+                const result = try self.heap.createString(try self.allocator.dupe(u8, character));
+                try self.stack.append(self.allocator, .{ .heap_string = result });
+            },
         }
+    }
+
+    fn stringAt(self: *Vm, string: []const u8, index: value.Value) anyerror![]const u8 {
+        const target = try self.arrayIndex(index);
+        var offset: usize = 0;
+        var current: usize = 0;
+        while (offset < string.len) {
+            const width = std.unicode.utf8ByteSequenceLength(string[offset]) catch {
+                try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+                return "";
+            };
+            if (offset + width > string.len or std.unicode.utf8Decode(string[offset .. offset + width]) catch null == null) {
+                try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+                return "";
+            }
+            if (current == target) return string[offset .. offset + width];
+            current += 1;
+            offset += width;
+        }
+        try self.fault("Runtime Error: индекс строки вне границ", .{});
+        return "";
     }
 
     fn setIndex(self: *Vm) anyerror!void {
@@ -1182,6 +1224,38 @@ test "VM constructs error values for result failures" {
     }
 }
 
+test "VM measures and indexes Unicode strings" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Булево\nпер строка = \"я\" + \"блоко\"\nдлина(строка) == 6 и строка[0] == \"я\" и строка[5] == \"о\"\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .boolean => |boolean| try std.testing.expect(boolean),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM matches generic enum variants" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -1405,6 +1479,25 @@ test "VM guards array length against non-array values" {
     const outcome = try vm.run(function_id, &.{});
     switch (outcome) {
         .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: длина доступна только для массива", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM guards string length against non-string values" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("длина", 0);
+    const function = program.function(function_id).?;
+    const number = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    try function.emit(std.testing.allocator, .{ .constant = number });
+    try function.emit(std.testing.allocator, .{ .string_length = {} });
+    try function.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: длина доступна только для строки", message),
         .success => return error.TestUnexpectedResult,
     }
 }

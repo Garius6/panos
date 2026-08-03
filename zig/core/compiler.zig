@@ -419,6 +419,7 @@ const FunctionCompiler = struct {
     fn compileCall(self: *FunctionCompiler, expression: ast.ExprId, call: anytype) !void {
         if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
         if (try self.compileErrorConstructor(call)) return;
+        if (try self.compileLengthBuiltin(call)) return;
         if (try self.compileCollectionMethod(call)) return;
         if (try self.compilePreludeEnumMethod(call)) return;
         if (self.compiler.checked.method_calls.get(expression)) |method| {
@@ -474,6 +475,24 @@ const FunctionCompiler = struct {
             .name_constant = name_constant,
             .field_count = 2,
         } });
+        return true;
+    }
+
+    fn compileLengthBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        if (call.arguments.len != 1) return false;
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or !std.mem.eql(u8, entry.name, "длина")) return false;
+        const argument_type = self.compiler.checked.expression_types.get(call.arguments[0]) orelse return false;
+        const type_entry = self.compiler.checked.types.get(argument_type) orelse return false;
+        const instruction: bytecode.Instruction = switch (type_entry.*) {
+            .primitive => |primitive| if (primitive == .string) .{ .string_length = {} } else return false,
+            .array => .{ .array_length = {} },
+            .map => .{ .map_length = {} },
+            else => return false,
+        };
+        try self.compileExpression(call.arguments[0]);
+        try self.function.emit(self.compiler.result.allocator, instruction);
         return true;
     }
 

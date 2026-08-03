@@ -851,6 +851,15 @@ const Checker = struct {
         const index_type = try self.infer(index.index);
         const object = self.result.types.get(object_type) orelse return self.result.types.poison();
         return switch (object.*) {
+            .primitive => |primitive| if (primitive == .string) blk: {
+                if (!self.assignable(index_type, self.result.types.builtins.integer) and !self.assignable(index_type, self.result.types.builtins.number)) {
+                    try self.report(index.span, "Type Error: индекс строки должен быть числом", .{});
+                }
+                break :blk self.result.types.builtins.string;
+            } else blk: {
+                try self.report(index.span, "Type Error: индексирование поддержано только для строки, массива и соответствия", .{});
+                break :blk try self.result.types.poison();
+            },
             .array => |element| blk: {
                 if (!self.assignable(index_type, self.result.types.builtins.integer) and !self.assignable(index_type, self.result.types.builtins.number)) {
                     try self.report(index.span, "Type Error: индекс массива должен быть числом", .{});
@@ -862,7 +871,7 @@ const Checker = struct {
                 break :blk map.value;
             },
             else => blk: {
-                try self.report(index.span, "Type Error: индексирование поддержано только для массива и соответствия", .{});
+                try self.report(index.span, "Type Error: индексирование поддержано только для строки, массива и соответствия", .{});
                 break :blk try self.result.types.poison();
             },
         };
@@ -1061,6 +1070,11 @@ const Checker = struct {
         return entry.kind == .builtin and std.mem.eql(u8, entry.name, "Ошибка");
     }
 
+    fn isLengthBuiltin(self: *const Checker, symbol: symbols.SymbolId) bool {
+        const entry = self.resolution.symbols.get(symbol) orelse return false;
+        return entry.kind == .builtin and std.mem.eql(u8, entry.name, "длина");
+    }
+
     fn inferCall(self: *Checker, expression: ast.ExprId, call: anytype) anyerror!types.TypeId {
         if (self.resolution.expr_symbols.get(call.callee)) |symbol| {
             if (self.enumVariant(symbol)) |variant| return self.inferEnumVariantCall(call, variant);
@@ -1076,6 +1090,23 @@ const Checker = struct {
                     }
                 }
                 return self.result.types.builtins.error_value;
+            }
+            if (self.isLengthBuiltin(symbol)) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: длина ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.integer;
+                }
+                const argument_type = try self.infer(call.arguments[0]);
+                const argument = self.result.types.get(argument_type) orelse return self.result.types.poison();
+                switch (argument.*) {
+                    .primitive => |primitive| if (primitive == .string) return self.result.types.builtins.integer,
+                    .array, .map => return self.result.types.builtins.integer,
+                    .poison => return argument_type,
+                    else => {},
+                }
+                try self.report(call.span, "Type Error: длина ожидает строку, массив или соответствие", .{});
+                return self.result.types.poison();
             }
         }
         switch (self.tree.expr(call.callee).*) {

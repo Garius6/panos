@@ -322,7 +322,7 @@ test "module compiler retains imported string constants in the shared program" {
 
 test "module compiler preserves opaque exported nominal types across function calls" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка = точки.создать(40)\nточки.добавить(точка, 2)\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.создать(40)\nточки.добавить(точка, 2)\nконец" },
         .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nэкспорт функ создать(x: Число) -> Точка\nТочка(x)\nконец\nэкспорт функ добавить(точка: Точка, значение: Число) -> Число\nточка.x + значение\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);

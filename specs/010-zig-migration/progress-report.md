@@ -52,10 +52,11 @@ Odin-бинарники и не смешивает состояния runtime'о
   декларации. Значение можно создать/вернуть в исходном модуле и передать в
   другую его экспортированную функцию как opaque value; одноимённые типы
   разных модулей остаются несовместимы.
-- Квалифицированные type annotations, constructors/fields/methods,
-  enum variants, generic parameters и interface implementations через module
-  boundary пока не поддержаны. Эти случаи остаются контролируемой границей,
-  пока отдельные symbol/type stores не получат полную shared semantic model.
+- Квалифицированные annotations `модуль.Тип` поддержаны для opaque exported
+  nominal types. Constructors/fields/methods, enum variants, generic
+  parameters и interface implementations через module boundary пока не
+  поддержаны. Эти случаи остаются контролируемой границей, пока отдельные
+  symbol/type stores не получат полную shared semantic model.
 - CLI использует graph compiler и выполняет локальные multi-file программы.
   Browser/LSP остаются на single-source API и по-прежнему не выполняют
   импорты без filesystem/document graph.
@@ -140,8 +141,8 @@ Odin-файлах: они не относятся к Zig-срезам и не д
 идентичность пользовательских типов. Следующие инварианты нужны до
 полноценного cutover:
 
-1. Раскрыть imported nominal types в qualified annotations,
-   constructors/fields и enum variants, сохраняя уже введённую origin identity.
+1. Раскрыть imported nominal types в constructors/fields и enum variants,
+   сохраняя уже введённую origin identity.
 2. Расширить `ImportContext` на generic definitions, methods и interface
    vtables; не допускать несовместимых копий generic parameter IDs.
 3. Подтвердить hidden/private exports, missing export, import cycle и runtime

@@ -120,6 +120,7 @@ pub const CheckResult = struct {
     expression_types: std.AutoHashMap(ast.ExprId, types.TypeId),
     symbol_types: std.AutoHashMap(symbols.SymbolId, types.TypeId),
     unsupported_imports: std.AutoHashMap(symbols.SymbolId, void),
+    imported_nominal_identities: std.AutoHashMap(symbols.SymbolId, u32),
     nominal_fields: std.AutoHashMap(symbols.SymbolId, []const NominalField),
     type_aliases: std.AutoHashMap(symbols.SymbolId, types.TypeId),
     alias_type_nodes: std.AutoHashMap(symbols.SymbolId, ast.TypeId),
@@ -145,6 +146,7 @@ pub const CheckResult = struct {
             .expression_types = .init(allocator),
             .symbol_types = .init(allocator),
             .unsupported_imports = .init(allocator),
+            .imported_nominal_identities = .init(allocator),
             .nominal_fields = .init(allocator),
             .type_aliases = .init(allocator),
             .alias_type_nodes = .init(allocator),
@@ -179,6 +181,7 @@ pub const CheckResult = struct {
         self.alias_type_nodes.deinit();
         self.type_aliases.deinit();
         self.nominal_fields.deinit();
+        self.imported_nominal_identities.deinit();
         self.unsupported_imports.deinit();
         self.symbol_types.deinit();
         self.expression_types.deinit();
@@ -237,6 +240,7 @@ const Checker = struct {
     }
 
     fn importSignaturePass(self: *Checker, imports: ImportContext) !void {
+        for (imports.nominals) |imported| try self.result.imported_nominal_identities.put(imported.local_symbol, imported.identity);
         for (imports.symbols) |imported| {
             const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals) catch |err| switch (err) {
                 error.UnsupportedImportedType => {
@@ -2021,7 +2025,7 @@ const Checker = struct {
                             break :blk try self.result.types.nominal(symbol, arguments.items);
                         }
                     }
-                    break :blk try self.result.types.nominal(symbol, &.{});
+                    break :blk try self.nominalType(symbol, &.{});
                 }
                 try self.report(ident.span, "Type Error: неизвестный тип '{s}'", .{ident.name});
                 break :blk try self.result.types.poison();
@@ -2034,7 +2038,7 @@ const Checker = struct {
                     var arguments: std.ArrayList(types.TypeId) = .empty;
                     defer arguments.deinit(self.result.allocator);
                     for (generic.parameters) |parameter| try arguments.append(self.result.allocator, try self.resolveType(parameter));
-                    break :blk try self.result.types.nominal(symbol, arguments.items);
+                    break :blk try self.nominalType(symbol, arguments.items);
                 }
                 try self.report(generic.span, "Type Error: неизвестный generic-тип '{s}'", .{generic.name});
                 break :blk try self.result.types.poison();
@@ -2051,8 +2055,25 @@ const Checker = struct {
                 for (function.parameters) |parameter| try parameters.append(self.result.allocator, try self.resolveType(parameter));
                 break :blk try self.result.types.function(parameters.items, try self.resolveType(function.return_type));
             },
+            .qualified => |qualified| blk: {
+                const symbol = self.findQualifiedTypeSymbol(qualified.module_name, qualified.name) orelse {
+                    try self.report(qualified.span, "Type Error: неизвестный тип '{s}.{s}'", .{ qualified.module_name, qualified.name });
+                    break :blk try self.result.types.poison();
+                };
+                var arguments: std.ArrayList(types.TypeId) = .empty;
+                defer arguments.deinit(self.result.allocator);
+                for (qualified.parameters) |parameter| try arguments.append(self.result.allocator, try self.resolveType(parameter));
+                break :blk try self.nominalType(symbol, arguments.items);
+            },
             else => try self.result.types.poison(),
         };
+    }
+
+    fn nominalType(self: *Checker, symbol: symbols.SymbolId, arguments: []const types.TypeId) !types.TypeId {
+        if (self.result.imported_nominal_identities.get(symbol)) |identity| {
+            return self.result.types.nominalWithIdentity(symbol, identity, arguments);
+        }
+        return self.result.types.nominal(symbol, arguments);
     }
 
     fn assignable(self: *const Checker, actual: types.TypeId, expected: types.TypeId) bool {
@@ -2080,6 +2101,15 @@ const Checker = struct {
     fn findTypeSymbol(self: *const Checker, name: []const u8) ?symbols.SymbolId {
         for (self.resolution.symbols.symbols.items[1..], 1..) |entry, index| {
             if (entry.kind == .type and std.mem.eql(u8, entry.name, name)) return @enumFromInt(index);
+        }
+        return null;
+    }
+
+    fn findQualifiedTypeSymbol(self: *const Checker, module_name: []const u8, name: []const u8) ?symbols.SymbolId {
+        for (self.resolution.symbols.symbols.items[1..], 1..) |entry, index| {
+            if (entry.kind == .type and entry.module_path != null and std.mem.eql(u8, entry.module_path.?, module_name) and std.mem.eql(u8, entry.name, name)) {
+                return @enumFromInt(index);
+            }
         }
         return null;
     }

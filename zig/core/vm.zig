@@ -1,5 +1,6 @@
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
+const gc = @import("gc.zig");
 const value = @import("value.zig");
 
 pub const Execution = union(enum) {
@@ -16,6 +17,7 @@ const Frame = struct {
 pub const Vm = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
+    heap: gc.Heap,
     program: *const bytecode.Program,
     stack: std.ArrayList(value.Value) = .empty,
     frames: std.ArrayList(Frame) = .empty,
@@ -25,13 +27,16 @@ pub const Vm = struct {
         return .{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
+            .heap = gc.Heap.init(allocator),
             .program = program,
         };
     }
 
     pub fn deinit(self: *Vm) void {
+        self.clearFrames();
         self.frames.deinit(self.allocator);
         self.stack.deinit(self.allocator);
+        self.heap.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -39,7 +44,8 @@ pub const Vm = struct {
     pub fn run(self: *Vm, entry: bytecode.FunctionId, arguments: []const value.Value) !Execution {
         self.failure = null;
         self.stack.clearRetainingCapacity();
-        self.frames.clearRetainingCapacity();
+        self.clearFrames();
+        self.collect();
         self.pushFrame(entry, &.{}, arguments) catch |err| switch (err) {
             error.RuntimeFault => return .{ .runtime_error = self.failure orelse "Runtime Error: неизвестная ошибка" },
             else => return err,
@@ -53,6 +59,13 @@ pub const Vm = struct {
             if (completed) |result| return .{ .success = result };
         }
         return .{ .success = .{ .void = {} } };
+    }
+
+    pub fn collect(self: *Vm) void {
+        self.heap.clearMarks();
+        self.heap.markValues(self.stack.items);
+        for (self.frames.items) |frame| self.heap.markValues(frame.locals);
+        self.heap.sweep();
     }
 
     fn step(self: *Vm) anyerror!?value.Value {
@@ -137,7 +150,8 @@ pub const Vm = struct {
             try self.fault("Runtime Error: повреждённый фрейм функции", .{});
             return;
         }
-        const locals = try self.arena.allocator().alloc(value.Value, compiled.local_count);
+        const locals = try self.allocator.alloc(value.Value, compiled.local_count);
+        errdefer self.allocator.free(locals);
         for (locals) |*local| local.* = .{ .void = {} };
         @memcpy(locals[0..captures.len], captures);
         @memcpy(locals[captures.len .. captures.len + arguments.len], arguments);
@@ -145,7 +159,8 @@ pub const Vm = struct {
     }
 
     fn finishFrame(self: *Vm, result: value.Value) !?value.Value {
-        _ = self.frames.pop();
+        const frame = self.frames.pop().?;
+        self.allocator.free(frame.locals);
         if (self.frames.items.len == 0) return result;
         try self.stack.append(self.allocator, result);
         return null;
@@ -174,13 +189,13 @@ pub const Vm = struct {
         };
     }
 
-    fn popValues(self: *Vm, count: usize) anyerror![]const value.Value {
+    fn popValues(self: *Vm, count: usize) anyerror![]value.Value {
         if (self.stack.items.len < count) {
             try self.fault("Runtime Error: недостаточно значений на стеке", .{});
             return &.{};
         }
         const start = self.stack.items.len - count;
-        const values = try self.arena.allocator().dupe(value.Value, self.stack.items[start..]);
+        const values = try self.allocator.dupe(value.Value, self.stack.items[start..]);
         self.stack.shrinkRetainingCapacity(start);
         return values;
     }
@@ -361,16 +376,15 @@ pub const Vm = struct {
         }
         const function_index = self.stack.items.len - count - 1;
         const callee = self.stack.items[function_index];
-        const arguments = try self.arena.allocator().dupe(value.Value, self.stack.items[function_index + 1 ..]);
-        self.stack.shrinkRetainingCapacity(function_index);
         switch (callee) {
-            .function_ref => |function_id| try self.pushFrame(function_id, &.{}, arguments),
-            .closure => |closure| try self.pushFrame(closure.function_id, closure.captures, arguments),
+            .function_ref => |function_id| try self.pushFrame(function_id, &.{}, self.stack.items[function_index + 1 ..]),
+            .closure => |closure| try self.pushFrame(closure.function_id, closure.captures, self.stack.items[function_index + 1 ..]),
             else => {
                 try self.fault("Runtime Error: попытка вызвать не функцию", .{});
                 return;
             },
         }
+        self.stack.shrinkRetainingCapacity(function_index);
     }
 
     fn buildClosure(self: *Vm, closure: anytype) anyerror!void {
@@ -382,20 +396,12 @@ pub const Vm = struct {
             try self.fault("Runtime Error: неверное количество захватов замыкания", .{});
             return;
         }
-        const runtime_closure = try self.arena.allocator().create(value.Closure);
-        runtime_closure.* = .{
-            .function_id = closure.function_id,
-            .captures = try self.arena.allocator().dupe(value.Value, try self.popValues(closure.capture_count)),
-        };
+        const runtime_closure = try self.heap.createClosure(closure.function_id, try self.popValues(closure.capture_count));
         try self.stack.append(self.allocator, .{ .closure = runtime_closure });
     }
 
     fn buildAggregate(self: *Vm, name: ?[]const u8, count: u16) !void {
-        const aggregate = try self.arena.allocator().create(value.Aggregate);
-        aggregate.* = .{
-            .name = name,
-            .elements = try self.arena.allocator().dupe(value.Value, try self.popValues(count)),
-        };
+        const aggregate = try self.heap.createAggregate(name, try self.popValues(count));
         try self.stack.append(self.allocator, .{ .aggregate = aggregate });
     }
 
@@ -415,8 +421,7 @@ pub const Vm = struct {
     }
 
     fn buildArray(self: *Vm, count: u16) !void {
-        const array = try self.arena.allocator().create(value.Array);
-        array.* = .{ .elements = try self.arena.allocator().dupe(value.Value, try self.popValues(count)) };
+        const array = try self.heap.createArray(try self.popValues(count));
         try self.stack.append(self.allocator, .{ .array = array });
     }
 
@@ -467,10 +472,10 @@ pub const Vm = struct {
 
     fn buildMap(self: *Vm, count: u16) !void {
         const values = try self.popValues(@as(usize, count) * 2);
-        const map = try self.arena.allocator().create(value.Map);
-        map.* = .{};
+        defer self.allocator.free(values);
+        const map = try self.heap.createMap();
         for (0..count) |index| {
-            try map.entries.append(self.arena.allocator(), .{
+            try map.entries.append(self.allocator, .{
                 .key = values[index * 2],
                 .value = values[index * 2 + 1],
             });
@@ -518,17 +523,16 @@ pub const Vm = struct {
                 return;
             },
         };
-        const array = try self.arena.allocator().create(value.Array);
-        const elements = try self.arena.allocator().alloc(value.Value, map.entries.items.len);
+        const elements = try self.allocator.alloc(value.Value, map.entries.items.len);
+        errdefer self.allocator.free(elements);
         for (map.entries.items, 0..) |entry, index| {
-            const pair = try self.arena.allocator().create(value.Aggregate);
-            const pair_elements = try self.arena.allocator().alloc(value.Value, 2);
+            const pair_elements = try self.allocator.alloc(value.Value, 2);
             pair_elements[0] = entry.key;
             pair_elements[1] = entry.value;
-            pair.* = .{ .elements = pair_elements };
+            const pair = try self.heap.createAggregate(null, pair_elements);
             elements[index] = .{ .aggregate = pair };
         }
-        array.* = .{ .elements = elements };
+        const array = try self.heap.createArray(elements);
         try self.stack.append(self.allocator, .{ .array = array });
     }
 
@@ -593,9 +597,11 @@ pub const Vm = struct {
                 return;
             },
         };
-        const elements = try self.arena.allocator().alloc(value.Value, array.elements.len + 1);
+        const elements = try self.allocator.alloc(value.Value, array.elements.len + 1);
+        errdefer self.allocator.free(elements);
         @memcpy(elements[0..array.elements.len], array.elements);
         elements[array.elements.len] = appended;
+        self.allocator.free(array.elements);
         array.elements = elements;
         try self.stack.append(self.allocator, .{ .void = {} });
     }
@@ -637,7 +643,7 @@ pub const Vm = struct {
                         return;
                     }
                 }
-                try map.entries.append(self.arena.allocator(), .{ .key = index, .value = replacement });
+                try map.entries.append(self.allocator, .{ .key = index, .value = replacement });
             },
             else => try self.fault("Runtime Error: индексирование поддержано только для массива и соответствия", .{}),
         }
@@ -699,11 +705,40 @@ pub const Vm = struct {
         return self.program.functionConst(self.frames.items[self.frames.items.len - 1].function_id);
     }
 
+    fn clearFrames(self: *Vm) void {
+        while (self.frames.pop()) |frame| self.allocator.free(frame.locals);
+    }
+
     fn fault(self: *Vm, comptime format: []const u8, args: anytype) anyerror!void {
         self.failure = try std.fmt.allocPrint(self.arena.allocator(), format, args);
         return error.RuntimeFault;
     }
 };
+
+test "VM collection retains stack and frame roots" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("старт", 0);
+    program.function(function_id).?.local_count = 1;
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const elements = try std.testing.allocator.alloc(value.Value, 0);
+    const array = try vm.heap.createArray(elements);
+    try vm.stack.append(std.testing.allocator, .{ .array = array });
+    vm.collect();
+    try std.testing.expectEqual(@as(usize, 1), vm.heap.objectCount());
+
+    vm.stack.clearRetainingCapacity();
+    try vm.pushFrame(function_id, &.{}, &.{});
+    vm.frames.items[0].locals[0] = .{ .array = array };
+    vm.collect();
+    try std.testing.expectEqual(@as(usize, 1), vm.heap.objectCount());
+
+    vm.clearFrames();
+    vm.collect();
+    try std.testing.expectEqual(@as(usize, 0), vm.heap.objectCount());
+}
 
 test "VM executes compiled calls and control flow" {
     const compiler = @import("compiler.zig");

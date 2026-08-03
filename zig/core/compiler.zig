@@ -132,10 +132,22 @@ const Compiler = struct {
     }
 };
 
+const LoopContext = struct {
+    break_fixups: std.ArrayList(usize) = .empty,
+    continue_fixups: std.ArrayList(usize) = .empty,
+
+    fn deinit(self: *LoopContext, allocator: std.mem.Allocator) void {
+        self.continue_fixups.deinit(allocator);
+        self.break_fixups.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const FunctionCompiler = struct {
     compiler: *Compiler,
     function: *bytecode.Function,
     locals: std.AutoHashMap(symbols.SymbolId, u16),
+    loops: std.ArrayList(LoopContext) = .empty,
     next_local: u16 = 0,
 
     fn init(compiler: *Compiler, function: *bytecode.Function) FunctionCompiler {
@@ -147,16 +159,23 @@ const FunctionCompiler = struct {
     }
 
     fn deinit(self: *FunctionCompiler) void {
+        for (self.loops.items) |*loop| loop.deinit(self.compiler.result.allocator);
+        self.loops.deinit(self.compiler.result.allocator);
         self.locals.deinit();
         self.* = undefined;
     }
 
     fn ensureLocal(self: *FunctionCompiler, symbol: symbols.SymbolId) !u16 {
         if (self.locals.get(symbol)) |slot| return slot;
+        const slot = try self.allocateLocal();
+        try self.locals.put(symbol, slot);
+        return slot;
+    }
+
+    fn allocateLocal(self: *FunctionCompiler) !u16 {
         if (self.next_local == std.math.maxInt(u16)) return error.LocalLimitReached;
         const slot = self.next_local;
         self.next_local += 1;
-        try self.locals.put(symbol, slot);
         return slot;
     }
 
@@ -201,6 +220,22 @@ const FunctionCompiler = struct {
                 try self.compileExpression(expression.value);
                 if (!keep_value) try self.function.emit(self.compiler.result.allocator, .{ .pop = {} });
                 break :blk keep_value;
+            },
+            .for_range => |range| blk: {
+                try self.compileForRange(statement, range);
+                if (keep_value) {
+                    try self.emitVoid();
+                    break :blk true;
+                }
+                break :blk false;
+            },
+            .continue_stmt => |span| blk: {
+                try self.compileLoopControl(span, true);
+                break :blk false;
+            },
+            .break_stmt => |span| blk: {
+                try self.compileLoopControl(span, false);
+                break :blk false;
             },
             else => blk: {
                 try self.compiler.report(statementSpan(self.compiler.tree, statement), "Compiler Error: инструкция пока не поддержана", .{});
@@ -312,10 +347,45 @@ const FunctionCompiler = struct {
         try self.compileExpression(loop.condition);
         const exit_jump = self.function.instructions.items.len;
         try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.enterLoop();
         try self.compileBlockStatements(loop.body);
         try self.function.emit(self.compiler.result.allocator, .{ .jump = loop_start });
-        self.patchJump(exit_jump, self.function.instructions.items.len);
+        const exit_target = self.function.instructions.items.len;
+        self.patchJump(exit_jump, exit_target);
+        self.leaveLoop(loop_start, exit_target);
         try self.emitVoid();
+    }
+
+    fn compileForRange(self: *FunctionCompiler, statement: ast.StmtId, range: anytype) !void {
+        const bindings = self.compiler.resolution.stmt_bindings.get(statement) orelse &.{};
+        if (bindings.len != 1) {
+            try self.compiler.report(range.span, "Compiler Error: диапазон 'для' ожидает одну переменную", .{});
+            return;
+        }
+        const index_slot = try self.ensureLocal(bindings[0]);
+        const end_slot = try self.allocateLocal();
+        try self.compileExpression(range.start);
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = index_slot });
+        try self.compileExpression(range.end);
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = end_slot });
+
+        const loop_start = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = index_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = end_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .less_equal = {} });
+        const exit_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.enterLoop();
+        try self.compileBlockStatements(range.body);
+        const continue_target = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = index_slot });
+        try self.emitConstant(.{ .number = 1 });
+        try self.function.emit(self.compiler.result.allocator, .{ .add = {} });
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = index_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = loop_start });
+        const exit_target = self.function.instructions.items.len;
+        self.patchJump(exit_jump, exit_target);
+        self.leaveLoop(continue_target, exit_target);
     }
 
     fn compileBlockValue(self: *FunctionCompiler, statements: []const ast.StmtId) !void {
@@ -336,6 +406,32 @@ const FunctionCompiler = struct {
             .jump => self.function.instructions.items[instruction_index].jump = target,
             .jump_if_false => self.function.instructions.items[instruction_index].jump_if_false = target,
             else => unreachable,
+        }
+    }
+
+    fn enterLoop(self: *FunctionCompiler) !void {
+        try self.loops.append(self.compiler.result.allocator, .{});
+    }
+
+    fn leaveLoop(self: *FunctionCompiler, continue_target: usize, break_target: usize) void {
+        var loop = self.loops.pop().?;
+        defer loop.deinit(self.compiler.result.allocator);
+        for (loop.continue_fixups.items) |fixup| self.patchJump(fixup, continue_target);
+        for (loop.break_fixups.items) |fixup| self.patchJump(fixup, break_target);
+    }
+
+    fn compileLoopControl(self: *FunctionCompiler, span: source.Span, is_continue: bool) !void {
+        if (self.loops.items.len == 0) {
+            try self.compiler.report(span, "Compiler Error: управление циклом использовано вне цикла", .{});
+            return;
+        }
+        const jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+        const loop = &self.loops.items[self.loops.items.len - 1];
+        if (is_continue) {
+            try loop.continue_fixups.append(self.compiler.result.allocator, jump);
+        } else {
+            try loop.break_fixups.append(self.compiler.result.allocator, jump);
         }
     }
 

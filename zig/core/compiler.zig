@@ -422,6 +422,8 @@ const FunctionCompiler = struct {
                 .{ .map_length = {} }
             else if (std.mem.eql(u8, property.property, "есть") and call.arguments.len == 1)
                 .{ .map_has_key = {} }
+            else if (std.mem.eql(u8, property.property, "удалить") and call.arguments.len == 1)
+                .{ .map_remove_key = {} }
             else
                 return false,
             else => return false,

@@ -717,6 +717,13 @@ const Checker = struct {
                             }
                             return self.result.types.builtins.boolean;
                         }
+                        if (std.mem.eql(u8, property.property, "удалить")) {
+                            try self.checkMethodArity(call, "удалить", 1);
+                            if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], map.key), map.key)) {
+                                try self.report(call.span, "Type Error: ключ соответствия имеет неверный тип", .{});
+                            }
+                            return self.result.types.builtins.boolean;
+                        }
                     },
                     else => {},
                 }

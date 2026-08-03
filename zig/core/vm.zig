@@ -105,6 +105,7 @@ pub const Vm = struct {
             .map_length => try self.mapLength(),
             .array_has_index => try self.arrayHasIndex(),
             .map_has_key => try self.mapHasKey(),
+            .map_remove_key => try self.mapRemoveKey(),
             .array_append => try self.arrayAppend(),
             .get_index => try self.getIndex(),
             .set_index => try self.setIndex(),
@@ -484,6 +485,25 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .boolean = false });
     }
 
+    fn mapRemoveKey(self: *Vm) anyerror!void {
+        const key = try self.pop();
+        const runtime_value = try self.pop();
+        const map = switch (runtime_value) {
+            .map => |map| map,
+            else => {
+                try self.fault("Runtime Error: удаление доступно только для соответствия", .{});
+                return;
+            },
+        };
+        for (map.entries.items, 0..) |entry, index| {
+            if (!entry.key.eql(key)) continue;
+            _ = map.entries.orderedRemove(index);
+            try self.stack.append(self.allocator, .{ .boolean = true });
+            return;
+        }
+        try self.stack.append(self.allocator, .{ .boolean = false });
+    }
+
     fn arrayAppend(self: *Vm) anyerror!void {
         const appended = try self.pop();
         const runtime_value = try self.pop();
@@ -820,6 +840,26 @@ test "VM guards array append against non-array values" {
     }
 }
 
+test "VM guards map deletion against non-map values" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("удалить", 0);
+    const function = program.function(function_id).?;
+    const one = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    try function.emit(std.testing.allocator, .{ .constant = one });
+    try function.emit(std.testing.allocator, .{ .constant = one });
+    try function.emit(std.testing.allocator, .{ .map_remove_key = {} });
+    try function.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: удаление доступно только для соответствия", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM guards closure capture metadata" {
     var program = bytecode.Program.init(std.testing.allocator);
     defer program.deinit();
@@ -955,6 +995,36 @@ test "VM appends array elements" {
     switch (outcome) {
         .success => |runtime_value| switch (runtime_value) {
             .number => |number| try std.testing.expectEqual(@as(f64, 4), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM removes map keys" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ удалить() -> Булево\nпер цены = соответствие(\"a\" = 1, \"b\" = 2)\nцены.удалить(\"a\") и не цены.есть(\"a\") и не цены.удалить(\"a\") и цены.длина() == 1\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .boolean => |boolean| try std.testing.expect(boolean),
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

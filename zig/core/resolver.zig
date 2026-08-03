@@ -145,10 +145,35 @@ const Resolver = struct {
             });
             try self.scopes.declare(&self.result.symbols, symbol);
         }
+        try self.installBuiltinModule("фс", &.{"есть"});
         try self.installPreludeEnum("Опция", &.{ "Нет", "Есть" });
         try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });
         try self.installPreludeInterface("Сравниваемое");
         try self.installPreludeInterface("Итерируемое");
+    }
+
+    fn installBuiltinModule(self: *Resolver, name: []const u8, exports: []const []const u8) !void {
+        const module = try self.result.symbols.add(.{
+            .name = name,
+            .kind = .module,
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+        });
+        try self.scopes.declare(&self.result.symbols, module);
+        var members = ModuleMembers{
+            .module = module,
+            .values = .init(self.result.allocator),
+        };
+        errdefer members.values.deinit();
+        for (exports) |exported| {
+            const symbol = try self.result.symbols.add(.{
+                .name = exported,
+                .kind = .builtin,
+                .module_path = name,
+                .span = .{ .file_id = 0, .start = 0, .end = 0 },
+            });
+            try members.values.put(exported, symbol);
+        }
+        try self.module_members.append(self.result.allocator, members);
     }
 
     fn predeclareImports(self: *Resolver, imports: []const ImportedModule) !void {

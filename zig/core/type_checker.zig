@@ -4,6 +4,7 @@ const diagnostic = @import("diagnostic.zig");
 const resolver = @import("resolver.zig");
 const source = @import("source.zig");
 const symbols = @import("symbols.zig");
+const target_policy = @import("target.zig");
 const types = @import("types.zig");
 
 pub const NominalField = struct {
@@ -185,6 +186,7 @@ const Checker = struct {
     current_nominal_owner: ?NominalOwner = null,
     loop_depth: usize = 0,
     next_generic_parameter: u32 = 1,
+    target_profile: target_policy.TargetProfile,
     resolving_aliases: std.AutoHashMap(symbols.SymbolId, void),
 
     fn report(self: *Checker, span: source.Span, comptime format: []const u8, args: anytype) !void {
@@ -1598,7 +1600,34 @@ const Checker = struct {
         return entry.kind == .builtin and std.mem.eql(u8, entry.name, name);
     }
 
+    fn isBuiltinModule(self: *const Checker, symbol: symbols.SymbolId, module: []const u8, name: []const u8) bool {
+        const entry = self.resolution.symbols.get(symbol) orelse return false;
+        return entry.kind == .builtin and entry.module_path != null and std.mem.eql(u8, entry.module_path.?, module) and std.mem.eql(u8, entry.name, name);
+    }
+
+    fn rejectUnavailableBuiltin(self: *Checker, callee: ast.ExprId, span: source.Span) !bool {
+        const symbol = self.resolution.expr_symbols.get(callee) orelse return false;
+        const entry = self.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin) return false;
+        const name = if (entry.module_path) |module|
+            try std.fmt.allocPrint(self.result.arena.allocator(), "{s}::{s}", .{ module, entry.name })
+        else
+            entry.name;
+        if (target_policy.builtinAvailableForTarget(name, self.target_profile)) return false;
+        _ = try self.result.diagnostics.appendUnique(self.result.allocator, .{
+            .phase = .type_checker,
+            .severity = .err,
+            .span = span,
+            .message = try target_policy.typeErrorMessage(self.result.arena.allocator(), name, self.target_profile),
+        });
+        return true;
+    }
+
     fn inferCall(self: *Checker, expression: ast.ExprId, call: anytype) anyerror!types.TypeId {
+        if (try self.rejectUnavailableBuiltin(call.callee, call.span)) {
+            for (call.arguments) |argument| _ = try self.infer(argument);
+            return self.result.types.poison();
+        }
         if (self.resolution.expr_symbols.get(call.callee)) |symbol| {
             if (self.enumVariant(symbol)) |variant| return self.inferEnumVariantCall(call, variant);
             if (self.isErrorConstructor(symbol)) {
@@ -1624,6 +1653,17 @@ const Checker = struct {
                     try self.report(call.span, "Type Error: паника ожидает строку", .{});
                 }
                 return self.result.types.builtins.never;
+            }
+            if (self.isBuiltinModule(symbol, "фс", "есть")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: фс.есть() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.boolean;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: фс.есть() ожидает путь типа Строка", .{});
+                }
+                return self.result.types.builtins.boolean;
             }
             if (self.isBuiltin(symbol, "получить")) {
                 if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить() не принимает аргументы", .{});
@@ -2571,12 +2611,23 @@ pub fn checkWithImports(
     resolution: *const resolver.Resolution,
     imports: []const ImportedSymbolType,
 ) !CheckResult {
+    return checkWithImportsForTarget(allocator, tree, resolution, imports, .native);
+}
+
+pub fn checkWithImportsForTarget(
+    allocator: std.mem.Allocator,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    imports: []const ImportedSymbolType,
+    target_profile: target_policy.TargetProfile,
+) !CheckResult {
     var result = try CheckResult.init(allocator);
     errdefer result.deinit();
     var checker = Checker{
         .tree = tree,
         .resolution = resolution,
         .result = &result,
+        .target_profile = target_profile,
         .resolving_aliases = .init(allocator),
     };
     defer checker.resolving_aliases.deinit();

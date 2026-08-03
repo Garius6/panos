@@ -76,6 +76,7 @@ pub const Opcode = enum {
     set_index,
     get_property,
     set_property,
+    file_exists,
 };
 
 pub const Instruction = union(Opcode) {
@@ -150,6 +151,7 @@ pub const Instruction = union(Opcode) {
     set_index: void,
     get_property: u16,
     set_property: u16,
+    file_exists: void,
 };
 
 pub const Function = struct {

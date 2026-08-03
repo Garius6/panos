@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const bytecode = @import("bytecode.zig");
 const gc = @import("gc.zig");
+const target_policy = @import("target.zig");
 const value = @import("value.zig");
 
 pub const Execution = union(enum) {
@@ -26,6 +28,7 @@ pub const Vm = struct {
     current_message: ?value.Value = null,
     next_process_id: u64 = 0,
     failure: ?*value.HeapString = null,
+    target_profile: target_policy.TargetProfile = .native,
 
     pub fn init(allocator: std.mem.Allocator, program: *const bytecode.Program) Vm {
         return .{
@@ -33,6 +36,12 @@ pub const Vm = struct {
             .heap = gc.Heap.init(allocator),
             .program = program,
         };
+    }
+
+    pub fn initForTarget(allocator: std.mem.Allocator, program: *const bytecode.Program, target_profile: target_policy.TargetProfile) Vm {
+        var result = init(allocator, program);
+        result.target_profile = target_profile;
+        return result;
     }
 
     pub fn deinit(self: *Vm) void {
@@ -164,6 +173,7 @@ pub const Vm = struct {
             .set_index => try self.setIndex(),
             .get_property => |field| try self.getProperty(field),
             .set_property => |field| try self.setProperty(field),
+            .file_exists => try self.fileExists(),
         }
         return null;
     }
@@ -220,6 +230,31 @@ pub const Vm = struct {
             },
         };
         try self.stack.append(self.allocator, runtime_value);
+    }
+
+    fn fileExists(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::есть", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::есть", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.есть() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::есть' недоступно в этом runtime-таргете", .{});
+            return;
+        } else {
+            var io = std.Io.Threaded.init(self.allocator, .{});
+            defer io.deinit();
+            std.Io.Dir.cwd().access(io.io(), path, .{}) catch {
+                try self.stack.append(self.allocator, .{ .boolean = false });
+                return;
+            };
+            try self.stack.append(self.allocator, .{ .boolean = true });
+        }
     }
 
     fn pop(self: *Vm) anyerror!value.Value {
@@ -3454,5 +3489,23 @@ test "VM returns the current process" {
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM guards a native builtin when bytecode bypasses static checking" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("старт", 0);
+    const function = program.function(function_id).?;
+    const path = try function.addConstant(std.testing.allocator, .{ .string = try program.copyString("build.zig") });
+    try function.emit(std.testing.allocator, .{ .constant = path });
+    try function.emit(std.testing.allocator, .{ .file_exists = {} });
+    try function.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var machine = Vm.initForTarget(std.testing.allocator, &program, .browser_interpreter);
+    defer machine.deinit();
+    switch (try machine.run(function_id, &.{})) {
+        .success => return error.TestUnexpectedResult,
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Panic: 'фс::есть' недоступно в этом runtime-таргете", message),
     }
 }

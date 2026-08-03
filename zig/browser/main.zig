@@ -31,7 +31,7 @@ pub export fn panos_run(source_len: i32) void {
         setResult("Ошибка спайка: исходник длиннее буфера демо\n");
         return;
     };
-    var run = panos_core.runner.runSource(allocator, "плейграунд.ps", input) catch {
+    var run = panos_core.runner.runSourceForTarget(allocator, "плейграунд.ps", input, .browser_interpreter) catch {
         setResult("Ошибка выполнения Zig-версии\n");
         return;
     };
@@ -56,7 +56,7 @@ pub export fn panos_check(source_len: i32) void {
         setResult("[]");
         return;
     };
-    var run = panos_core.runner.checkSource(allocator, "плейграунд.ps", input) catch {
+    var run = panos_core.runner.checkSourceForTarget(allocator, "плейграунд.ps", input, .browser_interpreter) catch {
         setResult("[]");
         return;
     };
@@ -74,7 +74,7 @@ pub export fn panos_hover(source_len: i32, utf16_offset: i32) void {
         setResult("null");
         return;
     };
-    var analysis = panos_core.runner.analyzeSource(allocator, "плейграунд.ps", input) catch {
+    var analysis = panos_core.runner.analyzeSourceForTarget(allocator, "плейграунд.ps", input, .browser_interpreter) catch {
         setResult("null");
         return;
     };
@@ -133,7 +133,7 @@ pub export fn panos_complete(source_len: i32, utf16_offset: i32) void {
         @memcpy(bytes[byte_offset + placeholder.len ..], input[byte_offset..]);
         break :blk bytes;
     };
-    var analysis = panos_core.runner.analyzeSource(allocator, "плейграунд.ps", analysis_input) catch {
+    var analysis = panos_core.runner.analyzeSourceForTarget(allocator, "плейграунд.ps", analysis_input, .browser_interpreter) catch {
         setResult("[]");
         return;
     };
@@ -361,6 +361,14 @@ test "browser check rejects unsupported imports" {
     panos_check(@intCast(input.len));
 
     try std.testing.expect(std.mem.indexOf(u8, result_buffer[0..result_len], "выполнение импортов ещё не поддержано Zig-версией") != null);
+}
+
+test "browser check rejects a native filesystem builtin" {
+    const input = "экспорт функ старт() -> Булево\nфс.есть(\"build.zig\")\nконец";
+    @memcpy(source_buffer[0..input.len], input);
+    panos_check(@intCast(input.len));
+
+    try std.testing.expect(std.mem.indexOf(u8, result_buffer[0..result_len], "Type Error: builtin 'фс::есть' недоступен для WASM-таргета") != null);
 }
 
 test "browser hover returns an inferred type at a UTF-16 offset" {

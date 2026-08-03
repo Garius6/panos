@@ -8,6 +8,7 @@ const parser = @import("parser.zig");
 const resolver = @import("resolver.zig");
 const source = @import("source.zig");
 const symbols = @import("symbols.zig");
+const target_policy = @import("target.zig");
 const type_checker = @import("type_checker.zig");
 const types = @import("types.zig");
 const value = @import("value.zig");
@@ -224,11 +225,15 @@ pub const SourceRun = struct {
 };
 
 pub fn runSource(allocator: std.mem.Allocator, path: []const u8, input: []const u8) !SourceRun {
-    return runSourceWithVerbose(allocator, path, input, false);
+    return runSourceForTarget(allocator, path, input, .native);
 }
 
 pub fn checkSource(allocator: std.mem.Allocator, path: []const u8, input: []const u8) !SourceRun {
-    var analysis = try analyzeSource(allocator, path, input);
+    return checkSourceForTarget(allocator, path, input, .native);
+}
+
+pub fn checkSourceForTarget(allocator: std.mem.Allocator, path: []const u8, input: []const u8, target_profile: target_policy.TargetProfile) !SourceRun {
+    var analysis = try analyzeSourceForTarget(allocator, path, input, target_profile);
     defer analysis.deinit();
 
     var result = SourceRun.init(allocator);
@@ -238,6 +243,15 @@ pub fn checkSource(allocator: std.mem.Allocator, path: []const u8, input: []cons
 }
 
 pub fn analyzeSource(allocator: std.mem.Allocator, path: []const u8, input: []const u8) !SourceAnalysis {
+    return analyzeSourceForTarget(allocator, path, input, .native);
+}
+
+pub fn analyzeSourceForTarget(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    input: []const u8,
+    target_profile: target_policy.TargetProfile,
+) !SourceAnalysis {
     var analysis = SourceAnalysis.init(allocator);
     errdefer analysis.deinit();
     const file = source.SourceFile.init(0, path, input);
@@ -256,16 +270,30 @@ pub fn analyzeSource(allocator: std.mem.Allocator, path: []const u8, input: []co
     const resolved = &analysis.resolved.?;
     try analysis.appendDiagnostics(&resolved.diagnostics);
 
-    analysis.checked = try type_checker.check(allocator, tree, resolved);
+    analysis.checked = try type_checker.checkWithImportsForTarget(allocator, tree, resolved, &.{}, target_profile);
     const checked = &analysis.checked.?;
     try analysis.appendDiagnostics(&checked.diagnostics);
     return analysis;
 }
 
 pub fn runSourceWithVerbose(allocator: std.mem.Allocator, path: []const u8, input: []const u8, verbose: bool) !SourceRun {
+    return runSourceWithVerboseForTarget(allocator, path, input, verbose, .native);
+}
+
+pub fn runSourceForTarget(allocator: std.mem.Allocator, path: []const u8, input: []const u8, target_profile: target_policy.TargetProfile) !SourceRun {
+    return runSourceWithVerboseForTarget(allocator, path, input, false, target_profile);
+}
+
+pub fn runSourceWithVerboseForTarget(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    input: []const u8,
+    verbose: bool,
+    target_profile: target_policy.TargetProfile,
+) !SourceRun {
     var result = SourceRun.init(allocator);
     errdefer result.deinit();
-    var analysis = try analyzeSource(allocator, path, input);
+    var analysis = try analyzeSourceForTarget(allocator, path, input, target_profile);
     defer analysis.deinit();
     try result.appendDiagnostics(&analysis.diagnostics);
 
@@ -287,7 +315,7 @@ pub fn runSourceWithVerbose(allocator: std.mem.Allocator, path: []const u8, inpu
         try result.report(.compiler, .{ .file_id = 0, .start = 0, .end = 0 }, "Compiler Error: не определена функция 'старт'");
         return result;
     };
-    var machine = vm.Vm.init(allocator, &compiled.program);
+    var machine = vm.Vm.initForTarget(allocator, &compiled.program, target_profile);
     defer machine.deinit();
     switch (try machine.run(start, &.{})) {
         .success => |runtime_value| result.execution = .{ .success = try renderValue(result.arena.allocator(), runtime_value) },
@@ -352,6 +380,25 @@ test "checker accepts a valid program without an entry function" {
 
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
     try std.testing.expect(result.execution == null);
+}
+
+test "runner executes the native filesystem existence builtin" {
+    var result = try runSource(std.testing.allocator, "пример.ps", "экспорт функ старт() -> Булево\nфс.есть(\"build.zig\")\nконец");
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
+    switch (result.execution orelse return error.TestUnexpectedResult) {
+        .success => |output| try std.testing.expectEqualStrings("true", output),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "browser target rejects the native filesystem builtin before compilation" {
+    var result = try checkSourceForTarget(std.testing.allocator, "плейграунд.ps", "экспорт функ старт() -> Булево\nфс.есть(\"build.zig\")\nконец", .browser_interpreter);
+    defer result.deinit();
+
+    try std.testing.expect(result.hasErrors());
+    try std.testing.expectEqualStrings("Type Error: builtin 'фс::есть' недоступен для WASM-таргета", result.diagnostics.items.items[0].message);
 }
 
 test "runner rejects imports before a single-file execution" {

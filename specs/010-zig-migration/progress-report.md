@@ -60,11 +60,17 @@ Odin-бинарники и не смешивает состояния runtime'о
 
 - `zig/core/target.zig` содержит единый каталог доступности builtin'ов для
   `native`, browser bytecode VM, JS AOT WASM и WASI.
-- Таблица и русскоязычные static/runtime сообщения покрыты unit-тестами.
-- Реальная интеграция policy в type checker/bytecode/VM пока невозможна без
-  портированных target-specific builtin'ов: Zig ещё не регистрирует
-  `фс::*`, `DOM::*`, сетевые, SQL или FFI вызовы. Нельзя выдавать guard за
-  рабочий, пока имя не существует в реальном dispatch.
+- Первый настоящий вертикальный срез — `фс.есть(Строка)`: resolver
+  регистрирует builtin-module, type checker проверяет сигнатуру и target,
+  compiler emits `file_exists`, native VM использует `Io.Dir.access`.
+- Browser runner передаёт `.browser_interpreter`, поэтому `фс.есть` получает
+  static diagnostic до компиляции. VM повторяет проверку перед host access и
+  сообщает policy-defined runtime panic для вручную созданного bytecode.
+- Таблица и русскоязычные static/runtime сообщения, native adapter,
+  browser rejection и VM runtime boundary покрыты тестами.
+- Остальные `фс::*`, `DOM::*`, сетевые, SQL и FFI вызовы пока не
+  зарегистрированы/не портированы; для них guard нельзя считать
+  реализованным.
 
 ### Browser interpreter
 

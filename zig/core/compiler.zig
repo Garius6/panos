@@ -518,6 +518,7 @@ const FunctionCompiler = struct {
         const arguments = ordered_arguments orelse call.arguments;
         if (try self.compileErrorConstructor(call)) return;
         if (try self.compilePanicBuiltin(call)) return;
+        if (try self.compileFilesystemBuiltin(call)) return;
         if (try self.compileProcessBuiltin(call)) return;
         if (try self.compileLengthBuiltin(call)) return;
         if (try self.compileCollectionMethod(call)) return;
@@ -603,6 +604,20 @@ const FunctionCompiler = struct {
         }
         try self.compileExpression(call.arguments[0]);
         try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
+        return true;
+    }
+
+    fn compileFilesystemBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        if (call.arguments.len != 1) return false;
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "фс") or !std.mem.eql(u8, property.property, "есть")) return false;
+        try self.compileExpression(call.arguments[0]);
+        try self.function.emit(self.compiler.result.allocator, .{ .file_exists = {} });
         return true;
     }
 

@@ -1,0 +1,471 @@
+const std = @import("std");
+const ast = @import("ast.zig");
+const diagnostic = @import("diagnostic.zig");
+const source = @import("source.zig");
+const symbols = @import("symbols.zig");
+
+const EnumVariants = struct {
+    owner: symbols.SymbolId,
+    values: std.StringHashMap(symbols.SymbolId),
+};
+
+pub const Resolution = struct {
+    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    symbols: symbols.SymbolStore,
+    diagnostics: diagnostic.DiagnosticList = .{},
+    decl_symbols: std.AutoHashMap(ast.DeclId, symbols.SymbolId),
+    stmt_symbols: std.AutoHashMap(ast.StmtId, symbols.SymbolId),
+    expr_symbols: std.AutoHashMap(ast.ExprId, symbols.SymbolId),
+    pattern_symbols: std.AutoHashMap(ast.PatternId, symbols.SymbolId),
+    function_parameters: std.AutoHashMap(ast.DeclId, []const symbols.SymbolId),
+    lambda_parameters: std.AutoHashMap(ast.ExprId, []const symbols.SymbolId),
+    lambda_captures: std.AutoHashMap(ast.ExprId, []const symbols.SymbolId),
+    enum_variants: std.ArrayList(EnumVariants) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) !Resolution {
+        return .{
+            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .symbols = try symbols.SymbolStore.init(allocator),
+            .decl_symbols = .init(allocator),
+            .stmt_symbols = .init(allocator),
+            .expr_symbols = .init(allocator),
+            .pattern_symbols = .init(allocator),
+            .function_parameters = .init(allocator),
+            .lambda_parameters = .init(allocator),
+            .lambda_captures = .init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Resolution) void {
+        for (self.enum_variants.items) |*variants| variants.values.deinit();
+        self.enum_variants.deinit(self.allocator);
+        self.lambda_captures.deinit();
+        self.lambda_parameters.deinit();
+        self.function_parameters.deinit();
+        self.pattern_symbols.deinit();
+        self.expr_symbols.deinit();
+        self.stmt_symbols.deinit();
+        self.decl_symbols.deinit();
+        self.diagnostics.deinit(self.allocator);
+        self.symbols.deinit();
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn findEnumVariant(self: *const Resolution, owner: symbols.SymbolId, name: []const u8) ?symbols.SymbolId {
+        for (self.enum_variants.items) |variants| {
+            if (variants.owner == owner) return variants.values.get(name);
+        }
+        return null;
+    }
+};
+
+const Resolver = struct {
+    result: *Resolution,
+    scopes: symbols.ScopeStack,
+    tree: *const ast.Ast = undefined,
+
+    fn init(result: *Resolution) !Resolver {
+        return .{
+            .result = result,
+            .scopes = try symbols.ScopeStack.init(result.allocator),
+        };
+    }
+
+    fn deinit(self: *Resolver) void {
+        self.scopes.deinit();
+        self.* = undefined;
+    }
+
+    fn report(self: *Resolver, span: source.Span, comptime format: []const u8, args: anytype) !void {
+        const message = try std.fmt.allocPrint(self.result.arena.allocator(), format, args);
+        _ = try self.result.diagnostics.appendUnique(self.result.allocator, .{
+            .phase = .resolver,
+            .severity = .err,
+            .span = span,
+            .message = message,
+        });
+    }
+
+    fn installBuiltins(self: *Resolver) !void {
+        const builtin_names = [_][]const u8{
+            "Ошибка",
+            "длина",
+            "паника",
+            "получить",
+            "отправить",
+            "себя",
+            "наблюдать",
+            "получить_сигнал",
+            "убить",
+            "связать",
+            "встроку",
+            "Целое",
+            "Число",
+        };
+        for (builtin_names) |name| {
+            const symbol = try self.result.symbols.add(.{
+                .name = name,
+                .kind = .builtin,
+                .span = .{ .file_id = 0, .start = 0, .end = 0 },
+            });
+            try self.scopes.declare(&self.result.symbols, symbol);
+        }
+    }
+
+    fn predeclare(self: *Resolver, tree: *const ast.Ast) !void {
+        for (tree.program.?.declarations) |declaration| {
+            switch (tree.decl(declaration).*) {
+                .function => |value| {
+                    _ = try self.registerDeclaration(declaration, value.name, .function, value.span, value.is_exported, false);
+                },
+                .constant => |value| {
+                    _ = try self.registerDeclaration(declaration, value.name, .constant, value.span, value.is_exported, true);
+                },
+                .struct_decl => |value| {
+                    _ = try self.registerDeclaration(declaration, value.name, .type, value.span, value.is_exported, false);
+                },
+                .interface_decl => |value| {
+                    _ = try self.registerDeclaration(declaration, value.name, .type, value.span, value.is_exported, false);
+                },
+                .type_alias => |value| {
+                    _ = try self.registerDeclaration(declaration, value.name, .type, value.span, value.is_exported, false);
+                },
+                .enum_decl => |value| try self.registerEnumDeclaration(declaration, value),
+                .foreign => |value| {
+                    _ = try self.registerDeclaration(declaration, value.name, .function, value.span, false, false);
+                },
+                .impl => |value| for (value.methods) |method| {
+                    const function = tree.decl(method).function;
+                    _ = try self.registerDeclaration(method, function.name, .function, function.span, false, false);
+                },
+                .import, .error_node => {},
+            }
+        }
+    }
+
+    fn registerEnumDeclaration(self: *Resolver, declaration: ast.DeclId, value: anytype) !void {
+        const owner = try self.registerDeclaration(declaration, value.name, .type, value.span, value.is_exported, false);
+        var variants = EnumVariants{
+            .owner = owner,
+            .values = .init(self.result.allocator),
+        };
+        errdefer variants.values.deinit();
+        for (value.variants) |variant| {
+            const symbol = try self.result.symbols.add(.{
+                .name = variant.name,
+                .kind = .enum_variant,
+                .is_exported = value.is_exported,
+                .owner_type = owner,
+                .span = variant.span,
+            });
+            if (variants.values.contains(variant.name)) {
+                try self.report(variant.span, "Resolve Error: вариант '{s}' уже объявлен", .{variant.name});
+            } else {
+                try variants.values.put(variant.name, symbol);
+            }
+        }
+        try self.result.enum_variants.append(self.result.allocator, variants);
+    }
+
+    fn registerDeclaration(
+        self: *Resolver,
+        declaration: ast.DeclId,
+        name: []const u8,
+        kind: symbols.SymbolKind,
+        span: source.Span,
+        is_exported: bool,
+        is_const: bool,
+    ) !symbols.SymbolId {
+        const symbol = try self.result.symbols.add(.{
+            .name = name,
+            .kind = kind,
+            .is_exported = is_exported,
+            .is_const = is_const,
+            .span = span,
+        });
+        self.scopes.declare(&self.result.symbols, symbol) catch |err| switch (err) {
+            error.DuplicateSymbol => try self.report(span, "Resolve Error: символ '{s}' уже объявлен", .{name}),
+            else => return err,
+        };
+        try self.result.decl_symbols.put(declaration, symbol);
+        return symbol;
+    }
+
+    fn resolveDeclarations(self: *Resolver, tree: *const ast.Ast) !void {
+        for (tree.program.?.declarations) |declaration| {
+            switch (tree.decl(declaration).*) {
+                .function => |value| try self.resolveFunction(declaration, value.parameters, value.body),
+                .constant => |value| try self.resolveExpression(tree, value.value),
+                .impl => |value| for (value.methods) |method| {
+                    const function = tree.decl(method).function;
+                    try self.resolveFunction(method, function.parameters, function.body);
+                },
+                .import, .struct_decl, .interface_decl, .enum_decl, .foreign, .type_alias, .error_node => {},
+            }
+        }
+    }
+
+    fn resolveFunction(self: *Resolver, declaration: ast.DeclId, parameters: []const ast.ParamDecl, body: []const ast.StmtId) !void {
+        _ = try self.scopes.push();
+        defer _ = self.scopes.pop() catch unreachable;
+        const parameter_symbols = try self.declareParameters(parameters);
+        try self.result.function_parameters.put(declaration, parameter_symbols);
+        try self.resolveStatements(body);
+    }
+
+    fn declareParameters(self: *Resolver, parameters: []const ast.ParamDecl) ![]const symbols.SymbolId {
+        var parameter_symbols: std.ArrayList(symbols.SymbolId) = .empty;
+        defer parameter_symbols.deinit(self.result.allocator);
+        for (parameters) |parameter| {
+            try parameter_symbols.append(self.result.allocator, try self.declareLocal(parameter.name, parameter.span, true, false));
+        }
+        return self.result.arena.allocator().dupe(symbols.SymbolId, parameter_symbols.items);
+    }
+
+    fn declareLocal(self: *Resolver, name: []const u8, span: source.Span, is_const: bool, is_pattern_binder: bool) !symbols.SymbolId {
+        if (isReservedBuiltin(name)) {
+            try self.report(span, "Resolve Error: '{s}' — зарезервированное имя, нельзя использовать", .{name});
+        }
+        const symbol = try self.result.symbols.add(.{
+            .name = name,
+            .kind = .variable,
+            .is_const = is_const,
+            .is_pattern_binder = is_pattern_binder,
+            .span = span,
+        });
+        self.scopes.declare(&self.result.symbols, symbol) catch |err| switch (err) {
+            error.DuplicateSymbol => try self.report(span, "Resolve Error: символ '{s}' уже объявлен", .{name}),
+            else => return err,
+        };
+        return symbol;
+    }
+
+    fn resolveStatements(self: *Resolver, statements: []const ast.StmtId) anyerror!void {
+        for (statements) |statement| try self.resolveStatement(statement);
+    }
+
+    fn resolveStatement(self: *Resolver, statement: ast.StmtId) anyerror!void {
+        const value = self.tree.stmt(statement).*;
+        switch (value) {
+            .let => |let| {
+                try self.resolveExpression(self.tree, let.value);
+                if (let.name) |name| {
+                    const symbol = try self.declareLocal(name, let.span, let.is_const, false);
+                    try self.result.stmt_symbols.put(statement, symbol);
+                } else {
+                    for (let.destructure_names) |name| {
+                        _ = try self.declareLocal(name, let.span, let.is_const, false);
+                    }
+                }
+            },
+            .return_stmt => |return_stmt| try self.resolveExpression(self.tree, return_stmt.value),
+            .expr => |expression| try self.resolveExpression(self.tree, expression.value),
+            .for_in => |loop| {
+                try self.resolveExpression(self.tree, loop.iterable);
+                _ = try self.scopes.push();
+                defer _ = self.scopes.pop() catch unreachable;
+                for (loop.names) |name| _ = try self.declareLocal(name, loop.span, false, false);
+                try self.resolveStatements(loop.body);
+            },
+            .for_range => |range| {
+                try self.resolveExpression(self.tree, range.start);
+                try self.resolveExpression(self.tree, range.end);
+                _ = try self.scopes.push();
+                defer _ = self.scopes.pop() catch unreachable;
+                _ = try self.declareLocal(range.name, range.span, false, false);
+                try self.resolveStatements(range.body);
+            },
+            .continue_stmt, .break_stmt, .error_node => {},
+        }
+    }
+
+    fn resolveExpression(self: *Resolver, tree: *const ast.Ast, expression: ast.ExprId) anyerror!void {
+        self.tree = tree;
+        switch (tree.expr(expression).*) {
+            .ident => |ident| {
+                const symbol = try self.scopes.lookupTrackingCaptures(&self.result.symbols, ident.name) orelse blk: {
+                    try self.report(ident.span, "Resolve Error: неопределённое имя '{s}'", .{ident.name});
+                    break :blk symbols.invalid_symbol;
+                };
+                try self.result.expr_symbols.put(expression, symbol);
+            },
+            .unary => |unary| try self.resolveExpression(tree, unary.operand),
+            .binary => |binary| {
+                try self.resolveExpression(tree, binary.left);
+                try self.resolveExpression(tree, binary.right);
+            },
+            .call => |call| {
+                try self.resolveExpression(tree, call.callee);
+                for (call.arguments) |argument| try self.resolveExpression(tree, argument);
+            },
+            .spawn => |spawn| try self.resolveExpression(tree, spawn.call),
+            .property => |property| {
+                try self.resolveExpression(tree, property.object);
+                if (self.result.expr_symbols.get(property.object)) |object_symbol| {
+                    const entry = self.result.symbols.get(object_symbol) orelse return;
+                    if (entry.kind == .type) {
+                        if (self.result.findEnumVariant(object_symbol, property.property)) |variant| {
+                            try self.result.expr_symbols.put(expression, variant);
+                        }
+                    }
+                }
+            },
+            .if_expr => |conditional| {
+                try self.resolveExpression(tree, conditional.condition);
+                try self.resolveScopedStatements(conditional.then_branch);
+                try self.resolveScopedStatements(conditional.else_branch);
+            },
+            .while_expr => |loop| {
+                try self.resolveExpression(tree, loop.condition);
+                try self.resolveScopedStatements(loop.body);
+            },
+            .tuple => |tuple| for (tuple.elements) |element| try self.resolveExpression(tree, element),
+            .lambda => |lambda| try self.resolveLambda(tree, expression, lambda),
+            .array => |array| for (array.elements) |element| try self.resolveExpression(tree, element),
+            .map => |map| for (map.entries) |entry| {
+                try self.resolveExpression(tree, entry.key);
+                try self.resolveExpression(tree, entry.value);
+            },
+            .index => |index| {
+                try self.resolveExpression(tree, index.object);
+                try self.resolveExpression(tree, index.index);
+            },
+            .try_expr => |try_expression| try self.resolveExpression(tree, try_expression.value),
+            .match_expr => |match| {
+                try self.resolveExpression(tree, match.subject);
+                for (match.arms) |arm| {
+                    _ = try self.scopes.push();
+                    defer _ = self.scopes.pop() catch unreachable;
+                    try self.resolvePattern(tree, arm.pattern);
+                    try self.resolveStatements(arm.body);
+                }
+            },
+            .number, .boolean, .string, .error_node => {},
+        }
+    }
+
+    fn resolveScopedStatements(self: *Resolver, statements: []const ast.StmtId) anyerror!void {
+        _ = try self.scopes.push();
+        defer _ = self.scopes.pop() catch unreachable;
+        try self.resolveStatements(statements);
+    }
+
+    fn resolveLambda(self: *Resolver, tree: *const ast.Ast, expression: ast.ExprId, lambda: anytype) anyerror!void {
+        _ = try self.scopes.enterLambda();
+        const parameter_symbols = try self.declareParameters(lambda.parameters);
+        try self.result.lambda_parameters.put(expression, parameter_symbols);
+        try self.resolveStatements(lambda.body);
+        var captures = try self.scopes.leaveLambda();
+        defer captures.deinit();
+        try self.result.lambda_captures.put(expression, try self.result.arena.allocator().dupe(symbols.SymbolId, captures.values.items));
+        _ = tree;
+    }
+
+    fn resolvePattern(self: *Resolver, tree: *const ast.Ast, pattern: ast.PatternId) anyerror!void {
+        switch (tree.pattern(pattern).*) {
+            .literal => |literal| try self.resolveExpression(tree, literal.value),
+            .ident => |ident| {
+                const symbol = try self.declareLocal(ident.name, ident.span, false, true);
+                try self.result.pattern_symbols.put(pattern, symbol);
+            },
+            .constructor => |constructor| for (constructor.arguments) |argument| try self.resolvePattern(tree, argument),
+            .wildcard, .error_node => {},
+        }
+    }
+};
+
+pub fn resolve(allocator: std.mem.Allocator, tree: *const ast.Ast) !Resolution {
+    var result = try Resolution.init(allocator);
+    errdefer result.deinit();
+    var resolver = try Resolver.init(&result);
+    defer resolver.deinit();
+    resolver.tree = tree;
+
+    try resolver.installBuiltins();
+    try resolver.predeclare(tree);
+    try resolver.resolveDeclarations(tree);
+    return result;
+}
+
+fn isReservedBuiltin(name: []const u8) bool {
+    const names = [_][]const u8{
+        "Ошибка",
+        "длина",
+        "паника",
+        "получить",
+        "отправить",
+        "себя",
+        "наблюдать",
+        "получить_сигнал",
+        "убить",
+        "связать",
+        "встроку",
+        "Целое",
+        "Число",
+    };
+    for (names) |reserved| {
+        if (std.mem.eql(u8, name, reserved)) return true;
+    }
+    return false;
+}
+
+test "resolver links closures to outer locals and functions" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "функ внешняя(значение: Число) -> Число\nзначение\nконец\nфунк вычислить(параметр: Число) -> Число\nпер локальная = параметр\nпер замыкание = функ(добавка)\nлокальная + добавка + внешняя(1)\nконец\nзамыкание(2)\nконец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    const function = parsed.ast.decl(parsed.ast.program.?.declarations[1]).function;
+    const lambda = parsed.ast.stmt(function.body[1]).let.value;
+    const captures = resolved.lambda_captures.get(lambda).?;
+    try std.testing.expectEqual(@as(usize, 2), captures.len);
+    try std.testing.expectEqualStrings("локальная", resolved.symbols.get(captures[0]).?.name);
+    try std.testing.expectEqualStrings("внешняя", resolved.symbols.get(captures[1]).?.name);
+}
+
+test "resolver accumulates undefined and duplicate name diagnostics" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Число\nпер x = нет\nпер x = 1\nx\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), resolved.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Resolve Error: неопределённое имя 'нет'", resolved.diagnostics.items.items[0].message);
+    try std.testing.expectEqualStrings("Resolve Error: символ 'x' уже объявлен", resolved.diagnostics.items.items[1].message);
+}
+
+test "resolver links qualified enum constructors to variant symbols" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Ответ = перечисление\nДа\nНет\nконец\nфунк f() -> Ответ\nОтвет.Да()\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    const function = parsed.ast.decl(parsed.ast.program.?.declarations[1]).function;
+    const call = parsed.ast.stmt(function.body[0]).expr.value;
+    const property = parsed.ast.expr(call).call.callee;
+    const variant = resolved.expr_symbols.get(property).?;
+    try std.testing.expectEqual(symbols.SymbolKind.enum_variant, resolved.symbols.get(variant).?.kind);
+    try std.testing.expectEqualStrings("Да", resolved.symbols.get(variant).?.name);
+}

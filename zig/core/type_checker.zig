@@ -429,10 +429,68 @@ const Checker = struct {
             .lambda => |lambda| try self.inferLambda(expression, lambda, null),
             .if_expr => |conditional| try self.inferIf(conditional),
             .while_expr => |loop| try self.inferWhile(loop),
+            .try_expr => |try_expression| try self.inferTry(try_expression),
             .match_expr => |match| try self.inferMatch(match),
             else => try self.result.types.poison(),
         };
         return self.recordExpressionType(expression, inferred);
+    }
+
+    fn inferTry(self: *Checker, try_expression: anytype) !types.TypeId {
+        const value_type = try self.infer(try_expression.value);
+        const value_entry = self.result.types.get(value_type) orelse return self.result.types.poison();
+        const value_nominal = switch (value_entry.*) {
+            .nominal => |nominal| nominal,
+            else => {
+                try self.report(try_expression.span, "Type Error: оператор '?' ожидает Опцию или Результат", .{});
+                return self.result.types.poison();
+            },
+        };
+        const value_owner = self.resolution.symbols.get(value_nominal.symbol) orelse return self.result.types.poison();
+        const return_type = self.current_return orelse {
+            try self.report(try_expression.span, "Type Error: оператор '?' можно использовать только внутри функции", .{});
+            return self.result.types.poison();
+        };
+        if (std.mem.eql(u8, value_owner.name, "Опция")) {
+            if (value_nominal.arguments.len != 1) return self.result.types.poison();
+            const return_entry = self.result.types.get(return_type) orelse return self.result.types.poison();
+            const return_nominal = switch (return_entry.*) {
+                .nominal => |nominal| nominal,
+                else => {
+                    try self.report(try_expression.span, "Type Error: оператор '?' для Опции можно использовать только в функции, возвращающей Опцию", .{});
+                    return self.result.types.poison();
+                },
+            };
+            const return_owner = self.resolution.symbols.get(return_nominal.symbol) orelse return self.result.types.poison();
+            if (!std.mem.eql(u8, return_owner.name, "Опция")) {
+                try self.report(try_expression.span, "Type Error: оператор '?' для Опции можно использовать только в функции, возвращающей Опцию", .{});
+                return self.result.types.poison();
+            }
+            return value_nominal.arguments[0];
+        }
+        if (std.mem.eql(u8, value_owner.name, "Результат")) {
+            if (value_nominal.arguments.len != 2) return self.result.types.poison();
+            const return_entry = self.result.types.get(return_type) orelse return self.result.types.poison();
+            const return_nominal = switch (return_entry.*) {
+                .nominal => |nominal| nominal,
+                else => {
+                    try self.report(try_expression.span, "Type Error: оператор '?' можно использовать только в функции, возвращающей Результат", .{});
+                    return self.result.types.poison();
+                },
+            };
+            const return_owner = self.resolution.symbols.get(return_nominal.symbol) orelse return self.result.types.poison();
+            if (!std.mem.eql(u8, return_owner.name, "Результат")) {
+                try self.report(try_expression.span, "Type Error: оператор '?' можно использовать только в функции, возвращающей Результат", .{});
+                return self.result.types.poison();
+            }
+            if (return_nominal.arguments.len != 2 or !self.result.types.eql(value_nominal.arguments[1], return_nominal.arguments[1])) {
+                try self.report(try_expression.span, "Type Error: оператор '?' возвращает ошибку другого типа", .{});
+                return self.result.types.poison();
+            }
+            return value_nominal.arguments[0];
+        }
+        try self.report(try_expression.span, "Type Error: оператор '?' ожидает Опцию или Результат", .{});
+        return self.result.types.poison();
     }
 
     fn inferExpected(self: *Checker, expression: ast.ExprId, expected: types.TypeId) anyerror!types.TypeId {
@@ -1886,4 +1944,21 @@ test "type checker rejects local values of type void" {
 
     try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("Type Error: переменная не может иметь тип 'Пусто'", checked.diagnostics.items.items[0].message);
+}
+
+test "type checker restricts try expressions to compatible return envelopes" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ неверная_опция(значение: Опция(Число)) -> Число\nзначение?\nконец\nфунк неверный_результат(значение: Результат(Число, Строка)) -> Результат(Число, Число)\nзначение?\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: оператор '?' для Опции можно использовать только в функции, возвращающей Опцию", checked.diagnostics.items.items[0].message);
+    try std.testing.expectEqualStrings("Type Error: оператор '?' возвращает ошибку другого типа", checked.diagnostics.items.items[1].message);
 }

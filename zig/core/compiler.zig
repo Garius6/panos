@@ -356,9 +356,41 @@ const FunctionCompiler = struct {
             .property => |property| try self.compileProperty(property),
             .if_expr => |conditional| try self.compileIf(conditional),
             .while_expr => |loop| try self.compileWhile(loop),
+            .try_expr => |try_expression| try self.compileTry(try_expression),
             .match_expr => |match| try self.compileMatch(match),
             else => try self.unsupportedExpression(expressionSpan(self.compiler.tree, expression)),
         }
+    }
+
+    fn compileTry(self: *FunctionCompiler, try_expression: anytype) !void {
+        const value_type = self.compiler.checked.expression_types.get(try_expression.value) orelse return self.unsupportedExpression(try_expression.span);
+        const value_entry = self.compiler.checked.types.get(value_type) orelse return self.unsupportedExpression(try_expression.span);
+        const nominal = switch (value_entry.*) {
+            .nominal => |value| value,
+            else => return self.unsupportedExpression(try_expression.span),
+        };
+        const owner = self.compiler.resolution.symbols.get(nominal.symbol) orelse return self.unsupportedExpression(try_expression.span);
+        const success_variant = if (std.mem.eql(u8, owner.name, "Опция"))
+            "Опция.Есть"
+        else if (std.mem.eql(u8, owner.name, "Результат"))
+            "Результат.Успех"
+        else
+            return self.unsupportedExpression(try_expression.span);
+        const object_slot = try self.allocateLocal();
+        try self.compileExpression(try_expression.value);
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = object_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
+        try self.emitEnumMatch(success_variant);
+        const return_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_property = 0 });
+        const end_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+        self.patchJump(return_jump, self.function.instructions.items.len);
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .return_value = {} });
+        self.patchJump(end_jump, self.function.instructions.items.len);
     }
 
     fn compileLambda(self: *FunctionCompiler, expression: ast.ExprId, lambda: anytype) !void {

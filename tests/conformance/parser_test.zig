@@ -215,3 +215,31 @@ test "parser conformance fixture preserves match patterns and both arm forms" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture preserves foreign ABI declarations" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/foreign.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.ast.program.?.declarations.len);
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[0]).*) {
+        .foreign => |decl| {
+            try std.testing.expectEqualStrings("libc", decl.library);
+            try std.testing.expectEqualStrings("копировать", decl.name);
+            try std.testing.expectEqual(@as(usize, 3), decl.parameters.len);
+            try std.testing.expectEqual(panos.ast.ForeignMarshalKind.pointer, decl.parameters[0].marshal);
+            try std.testing.expectEqual(panos.ast.ForeignMarshalKind.c_string, decl.parameters[1].marshal);
+            try std.testing.expectEqual(panos.ast.ForeignMarshalKind.int64, decl.parameters[2].marshal);
+            try std.testing.expectEqual(panos.ast.ForeignMarshalKind.pointer, decl.return_marshal);
+            try std.testing.expect(decl.return_owned);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[1]).*) {
+        .foreign => |decl| try std.testing.expectEqual(panos.ast.ForeignMarshalKind.float64, decl.return_marshal),
+        else => return error.TestUnexpectedResult,
+    }
+}

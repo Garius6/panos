@@ -110,6 +110,12 @@ const Parser = struct {
                 continue;
             }
 
+            if (self.at(.foreign)) {
+                if (exported) try self.report(self.peek().span, "Синтаксическая ошибка: 'внешний' не может быть экспортирован");
+                try declarations.append(self.result.allocator, try self.parseForeignDeclaration());
+                continue;
+            }
+
             if (exported) {
                 try self.report(self.peek().span, "Синтаксическая ошибка: после 'экспорт' ожидается 'функ'");
             } else {
@@ -352,6 +358,119 @@ const Parser = struct {
             .target_type = target_type,
             .methods = try self.result.ast.copySlice(ast.DeclId, methods.items),
         } });
+    }
+
+    const ParsedForeignMarshal = struct {
+        span: source.Span,
+        marshal: ast.ForeignMarshalKind,
+        pointee: ?ast.TypeId = null,
+        struct_type_name: ?[]const u8 = null,
+    };
+
+    fn parseForeignDeclaration(self: *Parser) !ast.DeclId {
+        const start = try self.expect(.foreign, "Синтаксическая ошибка: ожидается 'внешний'");
+        const library = try self.expect(.string, "Синтаксическая ошибка: после 'внешний' ожидается имя библиотеки строкой");
+        _ = try self.expect(.function, "Синтаксическая ошибка: после имени библиотеки ожидается 'функ'");
+        const name = try self.expect(.ident, "Синтаксическая ошибка: после 'функ' ожидается имя");
+
+        var parameters: std.ArrayList(ast.ForeignParam) = .empty;
+        defer parameters.deinit(self.result.allocator);
+        _ = try self.expect(.l_paren, "Синтаксическая ошибка: после имени внешней функции ожидается '('");
+        while (!self.at(.r_paren) and !self.at(.eof)) {
+            const parameter_start = self.peek().span;
+            const parameter_name = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя параметра внешней функции");
+            _ = try self.expect(.colon, "Синтаксическая ошибка: после имени параметра ожидается ':'");
+            const parameter_type = try self.parseForeignMarshalType();
+            if (parameter_type.marshal == .void) {
+                try self.report(parameter_start, "Синтаксическая ошибка: 'Пусто' допустим только как возвращаемый тип 'внешний', не как тип параметра");
+            }
+            try parameters.append(self.result.allocator, .{
+                .span = spanFrom(parameter_start, parameter_type.span),
+                .name = try self.result.ast.copyText(parameter_name.lexeme),
+                .marshal = parameter_type.marshal,
+                .pointee = parameter_type.pointee,
+                .struct_type_name = parameter_type.struct_type_name,
+            });
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        _ = try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' после параметров внешней функции");
+        _ = try self.expect(.arrow, "Синтаксическая ошибка: после параметров внешней функции ожидается '-> Тип'");
+        const return_type = try self.parseForeignMarshalType();
+        const return_owned = if (return_type.marshal == .pointer) self.parseForeignOwnershipSuffix() else false;
+        self.consumeSemicolons();
+
+        return self.result.ast.addDecl(.{ .foreign = .{
+            .span = spanFrom(start.span, return_type.span),
+            .library = try self.result.ast.copyText(library.lexeme),
+            .name = try self.result.ast.copyText(name.lexeme),
+            .parameters = try self.result.ast.copySlice(ast.ForeignParam, parameters.items),
+            .return_marshal = return_type.marshal,
+            .return_pointee = return_type.pointee,
+            .return_struct_type_name = return_type.struct_type_name,
+            .return_owned = return_owned,
+        } });
+    }
+
+    fn parseForeignMarshalType(self: *Parser) anyerror!ParsedForeignMarshal {
+        const type_token = self.peek();
+        if (type_token.kind != .ident) {
+            try self.report(type_token.span, "Синтаксическая ошибка: во 'внешний' ожидается тип (Целое/Число/КСтрока/Указатель/Пусто)");
+            _ = self.next();
+            return .{ .span = type_token.span, .marshal = .int32 };
+        }
+        _ = self.next();
+
+        if (std.mem.eql(u8, type_token.lexeme, "Пусто")) {
+            return .{ .span = type_token.span, .marshal = .void };
+        }
+        if (std.mem.eql(u8, type_token.lexeme, "КСтрока")) {
+            return .{ .span = type_token.span, .marshal = .c_string };
+        }
+        if (std.mem.eql(u8, type_token.lexeme, "Указатель")) {
+            _ = try self.expect(.l_paren, "Синтаксическая ошибка: после 'Указатель' ожидается '('");
+            const pointee = try self.parseType();
+            const end = try self.expect(.r_paren, "Синтаксическая ошибка: после типа указателя ожидается ')'");
+            return .{ .span = spanFrom(type_token.span, end.span), .marshal = .pointer, .pointee = pointee };
+        }
+        if (std.mem.eql(u8, type_token.lexeme, "Целое") or std.mem.eql(u8, type_token.lexeme, "Число")) {
+            _ = try self.expect(.l_paren, "Синтаксическая ошибка: после ABI-типа ожидается ширина в скобках");
+            const width = self.next();
+            const end = try self.expect(.r_paren, "Синтаксическая ошибка: после ширины ABI-типа ожидается ')'");
+            const is_integer = std.mem.eql(u8, type_token.lexeme, "Целое");
+            const valid_width = if (is_integer)
+                std.mem.eql(u8, width.lexeme, "8") or std.mem.eql(u8, width.lexeme, "32") or std.mem.eql(u8, width.lexeme, "64")
+            else
+                std.mem.eql(u8, width.lexeme, "32") or std.mem.eql(u8, width.lexeme, "64");
+            if (width.kind != .number or !valid_width) {
+                try self.report(width.span, if (is_integer)
+                    "Синтаксическая ошибка: 'Целое(...)' в 'внешний' ожидает ширину 8, 32 или 64"
+                else
+                    "Синтаксическая ошибка: 'Число(...)' в 'внешний' ожидает ширину 32 или 64");
+            }
+            return .{
+                .span = spanFrom(type_token.span, end.span),
+                .marshal = if (is_integer)
+                    if (std.mem.eql(u8, width.lexeme, "8")) .int8 else if (std.mem.eql(u8, width.lexeme, "64")) .int64 else .int32
+                else if (std.mem.eql(u8, width.lexeme, "64")) .float64 else .float32,
+            };
+        }
+
+        return .{
+            .span = type_token.span,
+            .marshal = .struct_value,
+            .struct_type_name = try self.result.ast.copyText(type_token.lexeme),
+        };
+    }
+
+    fn parseForeignOwnershipSuffix(self: *Parser) bool {
+        if (!self.at(.ident)) return false;
+        if (std.mem.eql(u8, self.peek().lexeme, "свой")) {
+            _ = self.next();
+            return true;
+        }
+        if (std.mem.eql(u8, self.peek().lexeme, "чужой")) _ = self.next();
+        return false;
     }
 
     const QualifiedName = struct {

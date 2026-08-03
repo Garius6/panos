@@ -100,7 +100,7 @@ const Parser = struct {
             }
 
             if (self.at(.type_decl)) {
-                try declarations.append(self.result.allocator, try self.parseTypeAlias(exported, doc));
+                try declarations.append(self.result.allocator, try self.parseTypeDeclaration(exported, doc));
                 continue;
             }
 
@@ -235,14 +235,31 @@ const Parser = struct {
         } });
     }
 
-    fn parseTypeAlias(self: *Parser, is_exported: bool, doc: []const u8) !ast.DeclId {
+    fn parseTypeDeclaration(self: *Parser, is_exported: bool, doc: []const u8) !ast.DeclId {
         const start = try self.expect(.type_decl, "Синтаксическая ошибка: ожидается 'тип'");
         const name = try self.expect(.ident, "Синтаксическая ошибка: после 'тип' ожидается имя");
-        if (self.at(.l_bracket)) {
-            try self.report(self.peek().span, "Синтаксическая ошибка: generic type alias пока не поддержан");
-            self.skipBracketedTypeParameters();
-        }
+        const type_parameters = try self.parseDeclaredTypeParameters();
         _ = try self.expect(.assign, "Синтаксическая ошибка: после имени типа ожидается '='");
+
+        return switch (self.peek().kind) {
+            .struct_decl => self.parseStructDeclaration(start, name, type_parameters, is_exported, doc),
+            .interface => self.parseInterfaceDeclaration(start, name, type_parameters, is_exported, doc),
+            .enum_decl => self.parseEnumDeclaration(start, name, type_parameters, is_exported, doc),
+            else => self.parseTypeAliasAfterHeader(start, name, type_parameters, is_exported, doc),
+        };
+    }
+
+    fn parseTypeAliasAfterHeader(
+        self: *Parser,
+        start: token.Token,
+        name: token.Token,
+        type_parameters: []const []const u8,
+        is_exported: bool,
+        doc: []const u8,
+    ) !ast.DeclId {
+        if (type_parameters.len != 0) {
+            try self.report(name.span, "Синтаксическая ошибка: generic type alias пока не поддержан");
+        }
         const aliased_type = try self.parseType();
         self.consumeSemicolons();
         return self.result.ast.addDecl(.{ .type_alias = .{
@@ -252,6 +269,167 @@ const Parser = struct {
             .is_exported = is_exported,
             .aliased_type = aliased_type,
         } });
+    }
+
+    fn parseStructDeclaration(
+        self: *Parser,
+        start: token.Token,
+        name: token.Token,
+        type_parameters: []const []const u8,
+        is_exported: bool,
+        doc: []const u8,
+    ) !ast.DeclId {
+        _ = try self.expect(.struct_decl, "Синтаксическая ошибка: ожидается 'структура'");
+        var fields: std.ArrayList(ast.FieldDecl) = .empty;
+        defer fields.deinit(self.result.allocator);
+
+        while (!self.at(.end) and !self.at(.eof)) {
+            const field_start = self.peek().span;
+            const field_name = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя поля структуры");
+            _ = try self.expect(.colon, "Синтаксическая ошибка: после имени поля ожидается ':'");
+            const field_type = try self.parseType();
+            try fields.append(self.result.allocator, .{
+                .span = spanFrom(field_start, self.astTypeSpan(field_type)),
+                .name = try self.result.ast.copyText(field_name.lexeme),
+                .type_annotation = field_type,
+            });
+            self.consumeSemicolons();
+        }
+        const end = try self.expect(.end, "Синтаксическая ошибка: структура не закрыта 'конец'");
+        return self.result.ast.addDecl(.{ .struct_decl = .{
+            .span = spanFrom(start.span, end.span),
+            .name = try self.result.ast.copyText(name.lexeme),
+            .doc = try self.result.ast.copyText(doc),
+            .type_parameters = type_parameters,
+            .fields = try self.result.ast.copySlice(ast.FieldDecl, fields.items),
+            .is_exported = is_exported,
+        } });
+    }
+
+    fn parseInterfaceDeclaration(
+        self: *Parser,
+        start: token.Token,
+        name: token.Token,
+        type_parameters: []const []const u8,
+        is_exported: bool,
+        doc: []const u8,
+    ) !ast.DeclId {
+        _ = try self.expect(.interface, "Синтаксическая ошибка: ожидается 'интерфейс'");
+        var methods: std.ArrayList(ast.MethodSignature) = .empty;
+        defer methods.deinit(self.result.allocator);
+
+        while (!self.at(.end) and !self.at(.eof)) {
+            try methods.append(self.result.allocator, try self.parseMethodSignature());
+            self.consumeSemicolons();
+        }
+        const end = try self.expect(.end, "Синтаксическая ошибка: интерфейс не закрыт 'конец'");
+        return self.result.ast.addDecl(.{ .interface_decl = .{
+            .span = spanFrom(start.span, end.span),
+            .name = try self.result.ast.copyText(name.lexeme),
+            .doc = try self.result.ast.copyText(doc),
+            .type_parameters = type_parameters,
+            .methods = try self.result.ast.copySlice(ast.MethodSignature, methods.items),
+            .is_exported = is_exported,
+        } });
+    }
+
+    fn parseMethodSignature(self: *Parser) !ast.MethodSignature {
+        const start = try self.expect(.function, "Синтаксическая ошибка: в интерфейсе ожидается 'функ'");
+        const name = try self.expect(.ident, "Синтаксическая ошибка: после 'функ' ожидается имя метода");
+        const parameters = try self.parseParameterList();
+        _ = try self.expect(.arrow, "Синтаксическая ошибка: после параметров ожидается '-> Тип'");
+        const return_type = try self.parseType();
+        return .{
+            .span = spanFrom(start.span, self.astTypeSpan(return_type)),
+            .name = try self.result.ast.copyText(name.lexeme),
+            .parameters = parameters,
+            .return_type = return_type,
+        };
+    }
+
+    fn parseEnumDeclaration(
+        self: *Parser,
+        start: token.Token,
+        name: token.Token,
+        type_parameters: []const []const u8,
+        is_exported: bool,
+        doc: []const u8,
+    ) !ast.DeclId {
+        _ = try self.expect(.enum_decl, "Синтаксическая ошибка: ожидается 'перечисление'");
+        var variants: std.ArrayList(ast.VariantDecl) = .empty;
+        defer variants.deinit(self.result.allocator);
+
+        while (!self.at(.end) and !self.at(.eof)) {
+            const variant_name = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя варианта перечисления");
+            var types: std.ArrayList(ast.TypeId) = .empty;
+            defer types.deinit(self.result.allocator);
+            var end = variant_name.span;
+            if (self.at(.l_paren)) {
+                _ = self.next();
+                while (!self.at(.r_paren) and !self.at(.eof)) {
+                    try types.append(self.result.allocator, try self.parseType());
+                    if (!self.at(.comma)) break;
+                    _ = self.next();
+                }
+                end = (try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' после полей варианта")).span;
+            }
+            try variants.append(self.result.allocator, .{
+                .span = spanFrom(variant_name.span, end),
+                .name = try self.result.ast.copyText(variant_name.lexeme),
+                .types = try self.result.ast.copySlice(ast.TypeId, types.items),
+            });
+            self.consumeSemicolons();
+        }
+        const end = try self.expect(.end, "Синтаксическая ошибка: перечисление не закрыто 'конец'");
+        return self.result.ast.addDecl(.{ .enum_decl = .{
+            .span = spanFrom(start.span, end.span),
+            .name = try self.result.ast.copyText(name.lexeme),
+            .doc = try self.result.ast.copyText(doc),
+            .type_parameters = type_parameters,
+            .variants = try self.result.ast.copySlice(ast.VariantDecl, variants.items),
+            .is_exported = is_exported,
+        } });
+    }
+
+    fn parseParameterList(self: *Parser) ![]const ast.ParamDecl {
+        var parameters: std.ArrayList(ast.ParamDecl) = .empty;
+        defer parameters.deinit(self.result.allocator);
+        _ = try self.expect(.l_paren, "Синтаксическая ошибка: после имени ожидается '('");
+        while (!self.at(.r_paren) and !self.at(.eof)) {
+            const parameter_start = self.peek().span;
+            const parameter_name = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя параметра");
+            _ = try self.expect(.colon, "Синтаксическая ошибка: после имени параметра ожидается ':'");
+            const parameter_type = try self.parseType();
+            try parameters.append(self.result.allocator, .{
+                .span = spanFrom(parameter_start, self.astTypeSpan(parameter_type)),
+                .name = try self.result.ast.copyText(parameter_name.lexeme),
+                .type_annotation = parameter_type,
+            });
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        _ = try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')'");
+        return self.result.ast.copySlice(ast.ParamDecl, parameters.items);
+    }
+
+    fn parseDeclaredTypeParameters(self: *Parser) ![]const []const u8 {
+        if (!self.at(.l_bracket)) return &.{};
+        _ = self.next();
+        var parameters: std.ArrayList([]const u8) = .empty;
+        defer parameters.deinit(self.result.allocator);
+        while (!self.at(.r_bracket) and !self.at(.eof)) {
+            const name = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя type-параметра");
+            try parameters.append(self.result.allocator, try self.result.ast.copyText(name.lexeme));
+            if (self.at(.colon)) {
+                try self.report(self.peek().span, "Синтаксическая ошибка: ограничения type-параметров допустимы только у функций");
+                _ = self.next();
+                while (self.at(.ident) or self.at(.plus)) _ = self.next();
+            }
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        _ = try self.expect(.r_bracket, "Синтаксическая ошибка: ожидается ']' после type-параметров");
+        return self.result.ast.copySlice([]const u8, parameters.items);
     }
 
     fn parseTypeParameters(self: *Parser) ![]const ast.TypeParameter {

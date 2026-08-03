@@ -50,3 +50,35 @@ test "parser conformance fixture preserves module declarations and type syntax" 
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture preserves structs interfaces and generic ADTs" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/types.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 3), parsed.ast.program.?.declarations.len);
+
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[0]).*) {
+        .struct_decl => |decl| {
+            try std.testing.expect(decl.is_exported);
+            try std.testing.expectEqual(@as(usize, 2), decl.fields.len);
+            try std.testing.expectEqualStrings("Точка на плоскости.", decl.doc);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[1]).*) {
+        .interface_decl => |decl| try std.testing.expectEqual(@as(usize, 1), decl.methods.len),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[2]).*) {
+        .enum_decl => |decl| {
+            try std.testing.expectEqualStrings("T", decl.type_parameters[0]);
+            try std.testing.expectEqual(@as(usize, 2), decl.variants.len);
+            try std.testing.expectEqual(@as(usize, 1), decl.variants[1].types.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

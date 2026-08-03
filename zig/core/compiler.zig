@@ -418,6 +418,7 @@ const FunctionCompiler = struct {
 
     fn compileCall(self: *FunctionCompiler, expression: ast.ExprId, call: anytype) !void {
         if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
+        if (try self.compileErrorConstructor(call)) return;
         if (try self.compileCollectionMethod(call)) return;
         if (try self.compilePreludeEnumMethod(call)) return;
         if (self.compiler.checked.method_calls.get(expression)) |method| {
@@ -460,6 +461,20 @@ const FunctionCompiler = struct {
         for (call.arguments) |argument| try self.compileExpression(argument);
         if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
         try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(call.arguments.len) });
+    }
+
+    fn compileErrorConstructor(self: *FunctionCompiler, call: anytype) !bool {
+        if (call.arguments.len != 2) return false;
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or !std.mem.eql(u8, entry.name, "Ошибка")) return false;
+        for (call.arguments) |argument| try self.compileExpression(argument);
+        const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString("Ошибка") });
+        try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
+            .name_constant = name_constant,
+            .field_count = 2,
+        } });
+        return true;
     }
 
     fn compileCollectionMethod(self: *FunctionCompiler, call: anytype) !bool {
@@ -1097,6 +1112,11 @@ const FunctionCompiler = struct {
 
     fn propertyIndex(self: *FunctionCompiler, object: ast.ExprId, property: []const u8) !?u16 {
         const object_type = self.compiler.checked.expression_types.get(object) orelse return null;
+        if (self.compiler.checked.types.eql(object_type, self.compiler.checked.types.builtins.error_value)) {
+            if (std.mem.eql(u8, property, "код")) return 0;
+            if (std.mem.eql(u8, property, "сообщение")) return 1;
+            return null;
+        }
         const type_entry = self.compiler.checked.types.get(object_type) orelse return null;
         switch (type_entry.*) {
             .tuple => |elements| {

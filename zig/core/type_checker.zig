@@ -875,6 +875,9 @@ const Checker = struct {
             }
         }
         const object_type = try self.infer(property.object);
+        if (self.isType(object_type, self.result.types.builtins.error_value)) {
+            if (std.mem.eql(u8, property.property, "код") or std.mem.eql(u8, property.property, "сообщение")) return self.result.types.builtins.string;
+        }
         const object = self.result.types.get(object_type) orelse return self.result.types.poison();
         switch (object.*) {
             .tuple => |elements| if (tuplePropertyIndex(property.property)) |index| {
@@ -1053,9 +1056,27 @@ const Checker = struct {
         return entry.* == .poison;
     }
 
+    fn isErrorConstructor(self: *const Checker, symbol: symbols.SymbolId) bool {
+        const entry = self.resolution.symbols.get(symbol) orelse return false;
+        return entry.kind == .builtin and std.mem.eql(u8, entry.name, "Ошибка");
+    }
+
     fn inferCall(self: *Checker, expression: ast.ExprId, call: anytype) anyerror!types.TypeId {
         if (self.resolution.expr_symbols.get(call.callee)) |symbol| {
             if (self.enumVariant(symbol)) |variant| return self.inferEnumVariantCall(call, variant);
+            if (self.isErrorConstructor(symbol)) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: Ошибка ожидает 2 аргумент(а)", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.error_value;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: Ошибка ожидает строки кода и сообщения", .{});
+                    }
+                }
+                return self.result.types.builtins.error_value;
+            }
         }
         switch (self.tree.expr(call.callee).*) {
             .property => |property| {

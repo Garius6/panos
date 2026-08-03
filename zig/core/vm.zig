@@ -1153,6 +1153,35 @@ test "VM unwraps prelude option and result values" {
     }
 }
 
+test "VM constructs error values for result failures" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Строка\nпер ошибка: Ошибка = Ошибка(\"фс\", \"нет файла\")\nпер результат: Результат(Число, Ошибка) = Результат.Неудача(ошибка)\nрезультат.получить_ошибку(Ошибка(\"нет\", \"запас\")).код + \": \" + ошибка.сообщение\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| try std.testing.expectEqualStrings("фс: нет файла", runtime_value.stringBytes().?),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM matches generic enum variants" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");

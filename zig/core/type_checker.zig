@@ -53,6 +53,7 @@ pub const InterfaceImplementation = struct {
 
 pub const InterfaceCast = struct {
     interface: symbols.SymbolId,
+    arguments: []const types.TypeId,
     target: symbols.SymbolId,
 };
 
@@ -1997,6 +1998,7 @@ const Checker = struct {
         if (self.interfaceImplementation(expected_nominal.symbol, expected_nominal.arguments, actual_nominal.symbol) == null) return;
         try self.result.interface_casts.put(expression, .{
             .interface = expected_nominal.symbol,
+            .arguments = expected_nominal.arguments,
             .target = actual_nominal.symbol,
         });
     }

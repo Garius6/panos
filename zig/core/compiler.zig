@@ -379,7 +379,10 @@ const FunctionCompiler = struct {
         const cast = self.compiler.checked.interface_casts.get(expression) orelse return;
         const implementation = blk: {
             for (self.compiler.checked.interface_implementations.items) |candidate| {
-                if (candidate.interface == cast.interface and candidate.target == cast.target) break :blk candidate;
+                if (candidate.interface != cast.interface or candidate.target != cast.target or candidate.arguments.len != cast.arguments.len) continue;
+                for (candidate.arguments, cast.arguments) |actual, expected| {
+                    if (!self.compiler.checked.types.eql(actual, expected)) break;
+                } else break :blk candidate;
             }
             try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти реализацию интерфейса", .{});
             return;

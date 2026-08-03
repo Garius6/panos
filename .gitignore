@@ -12,3 +12,5 @@ docs/book/
 /wasm_runtime/*.o
 /wasm_runtime/*.wasm
 /tests/**/test-results/
+.zig-cache/
+zig-out/

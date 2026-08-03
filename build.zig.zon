@@ -1,0 +1,12 @@
+.{
+    .name = .panos,
+    .version = "0.0.0-dev",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xd54a36709a2d0727,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "zig",
+        "tests",
+    },
+}

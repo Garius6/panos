@@ -200,3 +200,9 @@ odin test . -debug -vet -strict-style -vet-tabs -warnings-as-errors
   `e2e_test.odin`, если это практически возможно.
 - Не коммитить `panos.dSYM/` и другие локальные артефакты сборки.
 - Не менять unrelated untracked файлы без явного запроса.
+
+## Контекст миграции на Zig
+
+- Zig `0.16.0` — целевой toolchain; Odin остаётся эталонной реализацией до
+  завершения cutover.
+- План совместимого переноса: `specs/010-zig-migration/plan.md`.

@@ -884,11 +884,29 @@ const Parser = struct {
 
     fn parseLet(self: *Parser) !ast.StmtId {
         const start = self.next();
-        const name_token = try self.expect(.ident, "Синтаксическая ошибка: после 'пер' ожидается имя");
+        var name: ?[]const u8 = null;
         var type_annotation: ?ast.TypeId = null;
-        if (self.at(.colon)) {
-            _ = self.next();
-            type_annotation = try self.parseType();
+        var destructure_names: []const []const u8 = &.{};
+        var destructure_type: ?[]const u8 = null;
+        var destructure_field_names: ?[]const []const u8 = null;
+
+        if (self.at(.l_paren)) {
+            const destructure = try self.parseDestructureNames(false);
+            destructure_names = destructure.names;
+        } else {
+            const name_token = try self.expect(.ident, "Синтаксическая ошибка: после 'пер' ожидается имя");
+            if (self.at(.l_paren)) {
+                destructure_type = try self.result.ast.copyText(name_token.lexeme);
+                const destructure = try self.parseDestructureNames(true);
+                destructure_names = destructure.names;
+                destructure_field_names = destructure.field_names;
+            } else {
+                name = try self.result.ast.copyText(name_token.lexeme);
+                if (self.at(.colon)) {
+                    _ = self.next();
+                    type_annotation = try self.parseType();
+                }
+            }
         }
         if (self.at(.assign)) {
             _ = self.next();
@@ -898,11 +916,48 @@ const Parser = struct {
         const value = try self.parseExpression(0);
         return self.result.ast.addStmt(.{ .let = .{
             .span = spanFrom(start.span, self.astExprSpan(value)),
-            .name = try self.result.ast.copyText(name_token.lexeme),
+            .name = name,
             .value = value,
             .type_annotation = type_annotation,
             .is_const = start.kind == .constant,
+            .destructure_names = destructure_names,
+            .destructure_type = destructure_type,
+            .destructure_field_names = destructure_field_names,
         } });
+    }
+
+    const DestructureNames = struct {
+        names: []const []const u8,
+        field_names: ?[]const []const u8 = null,
+    };
+
+    fn parseDestructureNames(self: *Parser, allow_named: bool) !DestructureNames {
+        _ = try self.expect(.l_paren, "Синтаксическая ошибка: ожидается '('");
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(self.result.allocator);
+        var field_names: std.ArrayList([]const u8) = .empty;
+        defer field_names.deinit(self.result.allocator);
+        const named = allow_named and self.at(.ident) and self.peekSecond().kind == .colon;
+
+        while (!self.at(.r_paren) and !self.at(.eof)) {
+            if (named) {
+                const field = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя поля в именованной деструктуризации");
+                _ = try self.expect(.colon, "Синтаксическая ошибка: после имени поля деструктуризации ожидается ':'");
+                try field_names.append(self.result.allocator, try self.result.ast.copyText(field.lexeme));
+            } else if (allow_named and self.at(.ident) and self.peekSecond().kind == .colon) {
+                try self.report(self.peek().span, "Синтаксическая ошибка: нельзя смешивать позиционную и именованную деструктуризацию");
+            }
+
+            const name = try self.expect(.ident, "Синтаксическая ошибка: в шаблоне деструктуризации ожидается идентификатор");
+            try names.append(self.result.allocator, try self.result.ast.copyText(name.lexeme));
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        _ = try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' после шаблона деструктуризации");
+        return .{
+            .names = try self.result.ast.copySlice([]const u8, names.items),
+            .field_names = if (named) try self.result.ast.copySlice([]const u8, field_names.items) else null,
+        };
     }
 
     fn parseReturn(self: *Parser) !ast.StmtId {

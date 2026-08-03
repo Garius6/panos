@@ -331,3 +331,42 @@ test "parser conformance fixture lowers collection constructor literals" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture preserves tuple and struct destructuring" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/destructure.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    const declaration = parsed.ast.decl(parsed.ast.program.?.declarations[1]);
+    switch (declaration.*) {
+        .function => |function| {
+            switch (parsed.ast.stmt(function.body[0]).*) {
+                .let => |statement| {
+                    try std.testing.expect(statement.name == null);
+                    try std.testing.expectEqual(@as(usize, 2), statement.destructure_names.len);
+                    try std.testing.expect(statement.destructure_type == null);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (parsed.ast.stmt(function.body[1]).*) {
+                .let => |statement| {
+                    try std.testing.expectEqualStrings("Точка", statement.destructure_type.?);
+                    try std.testing.expectEqualStrings("x", statement.destructure_field_names.?[0]);
+                    try std.testing.expectEqualStrings("абсцисса", statement.destructure_names[0]);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (parsed.ast.stmt(function.body[2]).*) {
+                .let => |statement| {
+                    try std.testing.expect(statement.is_const);
+                    try std.testing.expect(statement.destructure_field_names == null);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

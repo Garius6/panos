@@ -50,9 +50,12 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("zig/browser/main.zig"),
             .target = wasm_target,
             .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
         }),
     });
     browser.entry = .disabled;
+    browser.rdynamic = true;
+    browser.export_memory = true;
     const install_browser = b.addInstallArtifact(browser, .{});
     const browser_step = b.step("browser", "Build the browser interpreter WASM scaffold");
     browser_step.dependOn(&install_browser.step);
@@ -141,6 +144,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const cli_tests = b.addTest(.{ .root_module = panos.root_module });
+    const browser_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/browser/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
     const conformance_module = b.addModule("panos_conformance", .{
         .root_source_file = b.path("zig/conformance/manifest.zig"),
         .target = target,
@@ -207,6 +218,7 @@ pub fn build(b: *std.Build) void {
     const run_value_unit_tests = b.addRunArtifact(value_unit_tests);
     const run_vm_unit_tests = b.addRunArtifact(vm_unit_tests);
     const run_cli_tests = b.addRunArtifact(cli_tests);
+    const run_browser_tests = b.addRunArtifact(browser_tests);
     const run_manifest_tests = b.addRunArtifact(manifest_tests);
     const run_reference_tests = b.addRunArtifact(reference_tests);
     const run_outcome_tests = b.addRunArtifact(outcome_tests);
@@ -226,6 +238,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_value_unit_tests.step);
     test_step.dependOn(&run_vm_unit_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_browser_tests.step);
     test_step.dependOn(&run_manifest_tests.step);
     test_step.dependOn(&run_reference_tests.step);
     test_step.dependOn(&run_outcome_tests.step);

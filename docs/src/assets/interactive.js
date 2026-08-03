@@ -14,9 +14,8 @@
 	let memory = null;
 	let instance = null;
 	let initPromise = null;
-	// Синхронный WASM-вызов — реентерабельности нет, значит один общий
-	// указатель "куда сейчас пишем" безопасен между запусками разных
-	// виджетов на одной странице.
+	const decoder = new TextDecoder();
+	let usesOdinRuntime = false;
 	let activeOutput = null;
 
 	function wasmUrl() {
@@ -38,7 +37,6 @@
 	function initWasm() {
 		if (initPromise) return initPromise;
 		initPromise = (async () => {
-			const decoder = new TextDecoder();
 			const imports = {
 				env: {},
 				odin_env: {
@@ -70,10 +68,12 @@
 			};
 			const resp = await fetch(wasmUrl());
 			const bytes = await resp.arrayBuffer();
-			const result = await WebAssembly.instantiate(bytes, imports);
+			const module = new WebAssembly.Module(bytes);
+			usesOdinRuntime = WebAssembly.Module.imports(module).some((entry) => entry.module === "odin_env");
+			const result = await WebAssembly.instantiate(module, imports);
 			instance = result.instance;
 			memory = instance.exports.memory;
-			instance.exports._start();
+			if (instance.exports._start) instance.exports._start();
 		})();
 		return initPromise;
 	}
@@ -96,12 +96,13 @@
 			crashed = true;
 		}
 		activeOutput = null;
-		// panos_run сам печатает "── запуск ──" перед стартом — нужно
-		// demo/index.html (там #console общий и растущий, разделитель
-		// помогает отличить прогоны друг от друга). У наших виджетов
-		// область вывода своя и чистится перед каждым запуском — разделитель
-		// тут чистый шум, срезаем.
-		const text = output.text.replace(/^── запуск ──\n\n?/, "");
+		const text = usesOdinRuntime
+			? output.text.replace(/^── запуск ──\n\n?/, "")
+			: decoder.decode(new Uint8Array(
+				memory.buffer,
+				instance.exports.panos_result_ptr(),
+				instance.exports.panos_result_len(),
+			));
 		return { ok: !crashed, text };
 	}
 

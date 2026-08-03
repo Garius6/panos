@@ -1038,6 +1038,7 @@ const Parser = struct {
                 .span = value.span,
                 .value = try self.result.ast.copyText(value.lexeme),
             } }),
+            .interp_string_start => self.parseInterpolatedString(value),
             .ident => self.result.ast.addExpr(.{ .ident = .{
                 .span = value.span,
                 .name = try self.result.ast.copyText(value.lexeme),
@@ -1296,6 +1297,68 @@ const Parser = struct {
             return self.result.ast.addExpr(.{ .error_node = value.span });
         };
         return self.result.ast.addExpr(.{ .number = .{ .span = value.span, .value = number } });
+    }
+
+    fn parseInterpolatedString(self: *Parser, start: token.Token) anyerror!ast.ExprId {
+        var result: ?ast.ExprId = null;
+        try self.appendInterpolationString(&result, start);
+
+        while (true) {
+            const embedded = try self.parseExpression(0);
+            const embedded_span = self.astExprSpan(embedded);
+            const callee = try self.result.ast.addExpr(.{ .ident = .{
+                .span = embedded_span,
+                .name = try self.result.ast.copyText("встроку"),
+            } });
+            const conversion = try self.result.ast.addExpr(.{ .call = .{
+                .span = embedded_span,
+                .callee = callee,
+                .arguments = try self.result.ast.copySlice(ast.ExprId, &.{embedded}),
+            } });
+            if (result) |previous| {
+                result = try self.result.ast.addExpr(.{ .binary = .{
+                    .span = spanFrom(self.astExprSpan(previous), embedded_span),
+                    .left = previous,
+                    .operator = .plus,
+                    .right = conversion,
+                } });
+            } else {
+                result = conversion;
+            }
+
+            const fragment = self.next();
+            switch (fragment.kind) {
+                .interp_string_mid => {
+                    try self.appendInterpolationString(&result, fragment);
+                },
+                .interp_string_end => {
+                    try self.appendInterpolationString(&result, fragment);
+                    return result.?;
+                },
+                else => {
+                    try self.report(fragment.span, "Синтаксическая ошибка: ожидалось продолжение строковой интерполяции");
+                    return result.?;
+                },
+            }
+        }
+    }
+
+    fn appendInterpolationString(self: *Parser, result: *?ast.ExprId, fragment: token.Token) !void {
+        if (fragment.lexeme.len == 0) return;
+        const literal = try self.result.ast.addExpr(.{ .string = .{
+            .span = fragment.span,
+            .value = try self.result.ast.copyText(fragment.lexeme),
+        } });
+        if (result.*) |previous| {
+            result.* = try self.result.ast.addExpr(.{ .binary = .{
+                .span = spanFrom(self.astExprSpan(previous), fragment.span),
+                .left = previous,
+                .operator = .plus,
+                .right = literal,
+            } });
+        } else {
+            result.* = literal;
+        }
     }
 
     fn parseGrouped(self: *Parser, start: token.Token) !ast.ExprId {

@@ -370,3 +370,24 @@ test "parser conformance fixture preserves tuple and struct destructuring" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture desugars interpolated strings" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/interpolation.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    var conversions: usize = 0;
+    for (parsed.ast.expressions.items) |expression| switch (expression) {
+        .call => |call| switch (parsed.ast.expr(call.callee).*) {
+            .ident => |ident| {
+                if (std.mem.eql(u8, ident.name, "встроку")) conversions += 1;
+            },
+            else => {},
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), conversions);
+}

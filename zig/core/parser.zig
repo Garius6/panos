@@ -1207,6 +1207,13 @@ const Parser = struct {
             module_name = name;
             name = try self.result.ast.copyText(member.lexeme);
             end = member.span;
+            if (self.at(.dot)) {
+                _ = self.next();
+                const variant = try self.expect(.ident, "Синтаксическая ошибка: после '.' в квалифицированном шаблоне ожидается идентификатор");
+                module_name = try std.fmt.allocPrint(self.result.ast.arena.allocator(), "{s}.{s}", .{ module_name.?, name });
+                name = try self.result.ast.copyText(variant.lexeme);
+                end = variant.span;
+            }
         }
 
         if (!self.at(.l_paren)) {

@@ -391,3 +391,30 @@ test "parser conformance fixture desugars interpolated strings" {
     };
     try std.testing.expectEqual(@as(usize, 2), conversions);
 }
+
+test "parser conformance fixture preserves three-part match qualifications" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/qualified_match.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    const declaration = parsed.ast.decl(parsed.ast.program.?.declarations[0]);
+    switch (declaration.*) {
+        .function => |function| switch (parsed.ast.stmt(function.body[0]).*) {
+            .expr => |statement| switch (parsed.ast.expr(statement.value).*) {
+                .match_expr => |match| switch (parsed.ast.pattern(match.arms[0].pattern).*) {
+                    .constructor => |pattern| {
+                        try std.testing.expectEqualStrings("геометрия.Фигура", pattern.module_name.?);
+                        try std.testing.expectEqualStrings("Круг", pattern.name);
+                    },
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

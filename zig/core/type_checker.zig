@@ -684,7 +684,7 @@ const Checker = struct {
                 const object_type = try self.infer(property.object);
                 const object = self.result.types.get(object_type) orelse return self.result.types.poison();
                 switch (object.*) {
-                    .array => {
+                    .array => |element| {
                         if (std.mem.eql(u8, property.property, "длина")) {
                             try self.checkMethodArity(call, "длина", 0);
                             return self.result.types.builtins.integer;
@@ -696,6 +696,13 @@ const Checker = struct {
                                 if (!self.isNumeric(index)) try self.report(call.span, "Type Error: индекс массива должен быть числом", .{});
                             }
                             return self.result.types.builtins.boolean;
+                        }
+                        if (std.mem.eql(u8, property.property, "добавить")) {
+                            try self.checkMethodArity(call, "добавить", 1);
+                            if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], element), element)) {
+                                try self.report(call.span, "Type Error: элемент массива имеет неверный тип", .{});
+                            }
+                            return self.result.types.builtins.void;
                         }
                     },
                     .map => |map| {

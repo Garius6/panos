@@ -399,8 +399,6 @@ const Resolver = struct {
                     } else {
                         try self.report(constructor.span, "Resolve Error: неопределённый тип перечисления '{s}'", .{owner_name});
                     }
-                } else {
-                    try self.report(constructor.span, "Resolve Error: вариант в шаблоне должен быть квалифицирован именем перечисления", .{});
                 }
                 for (constructor.arguments) |argument| try self.resolvePattern(tree, argument);
             },

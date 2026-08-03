@@ -519,24 +519,21 @@ const FunctionCompiler = struct {
         var fallback_seen = false;
         for (match.arms) |arm| {
             if (fallback_seen) break;
+            if (try self.patternEnumVariantName(arm.pattern)) |variant_name| {
+                try self.function.emit(self.compiler.result.allocator, .{ .get_local = subject_slot });
+                const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(variant_name) });
+                try self.function.emit(self.compiler.result.allocator, .{ .match_enum = name_constant });
+                const next_arm = self.function.instructions.items.len;
+                try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+                if (self.compiler.tree.pattern(arm.pattern).* == .constructor) try self.compilePatternBindings(arm.pattern, subject_slot);
+                try self.compileBlockValue(arm.body);
+                const end_jump = self.function.instructions.items.len;
+                try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+                try end_jumps.append(self.compiler.result.allocator, end_jump);
+                self.patchJump(next_arm, self.function.instructions.items.len);
+                continue;
+            }
             switch (self.compiler.tree.pattern(arm.pattern).*) {
-                .constructor => {
-                    const variant_name = try self.patternEnumVariantName(arm.pattern) orelse {
-                        try self.unsupportedExpression(arm.span);
-                        continue;
-                    };
-                    try self.function.emit(self.compiler.result.allocator, .{ .get_local = subject_slot });
-                    const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(variant_name) });
-                    try self.function.emit(self.compiler.result.allocator, .{ .match_enum = name_constant });
-                    const next_arm = self.function.instructions.items.len;
-                    try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
-                    try self.compilePatternBindings(arm.pattern, subject_slot);
-                    try self.compileBlockValue(arm.body);
-                    const end_jump = self.function.instructions.items.len;
-                    try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
-                    try end_jumps.append(self.compiler.result.allocator, end_jump);
-                    self.patchJump(next_arm, self.function.instructions.items.len);
-                },
                 .wildcard, .ident => {
                     fallback_seen = true;
                     try self.compilePatternBindings(arm.pattern, subject_slot);
@@ -825,7 +822,7 @@ const FunctionCompiler = struct {
     }
 
     fn patternEnumVariantName(self: *FunctionCompiler, pattern: ast.PatternId) !?[]const u8 {
-        const variant_symbol = self.compiler.resolution.pattern_symbols.get(pattern) orelse return null;
+        const variant_symbol = self.compiler.checked.pattern_variants.get(pattern) orelse self.compiler.resolution.pattern_symbols.get(pattern) orelse return null;
         return self.enumVariantName(variant_symbol);
     }
 

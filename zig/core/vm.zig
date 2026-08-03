@@ -908,7 +908,7 @@ test "VM matches generic enum variants" {
     const parser = @import("parser.zig");
     const resolver = @import("resolver.zig");
     const type_checker = @import("type_checker.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "тип Опция[T] = перечисление\nНет()\nЕсть(T)\nконец\nфунк извлечь[T](опция: Опция(T), запас: T) -> T\nвыбор опция\nОпция.Есть(значение) -> значение\nОпция.Нет() -> запас\nконец\nконец\nфунк старт() -> Строка\nизвлечь(Опция.Есть(\"готово\"), \"запас\")\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Опция[T] = перечисление\nНет()\nЕсть(T)\nконец\nфунк извлечь[T](опция: Опция(T), запас: T) -> T\nвыбор опция\nЕсть(значение) -> значение\nНет -> запас\nконец\nконец\nфунк старт() -> Строка\nизвлечь(Опция.Есть(\"готово\"), \"запас\")\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

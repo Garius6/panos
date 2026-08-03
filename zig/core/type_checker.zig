@@ -1306,6 +1306,15 @@ const Checker = struct {
                 if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], element), element)) try self.report(call.span, "Type Error: значение по умолчанию имеет неверный тип", .{});
                 return element;
             }
+            if (std.mem.eql(u8, property.property, "значение")) {
+                try self.checkMethodArity(call, "значение", 0);
+                return element;
+            }
+            if (std.mem.eql(u8, property.property, "ожидать")) {
+                try self.checkMethodArity(call, "ожидать", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) try self.report(call.span, "Type Error: сообщение ожидания должно быть строкой", .{});
+                return element;
+            }
             if (std.mem.eql(u8, property.property, "запас")) {
                 try self.checkMethodArity(call, "запас", 1);
                 if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], object_type), object_type)) try self.report(call.span, "Type Error: запасная опция имеет неверный тип", .{});
@@ -1324,6 +1333,24 @@ const Checker = struct {
                 try self.checkMethodArity(call, "получить", 1);
                 if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], success), success)) try self.report(call.span, "Type Error: значение по умолчанию имеет неверный тип", .{});
                 return success;
+            }
+            if (std.mem.eql(u8, property.property, "значение")) {
+                try self.checkMethodArity(call, "значение", 0);
+                return success;
+            }
+            if (std.mem.eql(u8, property.property, "причина")) {
+                try self.checkMethodArity(call, "причина", 0);
+                return failure;
+            }
+            if (std.mem.eql(u8, property.property, "ожидать")) {
+                try self.checkMethodArity(call, "ожидать", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) try self.report(call.span, "Type Error: сообщение ожидания должно быть строкой", .{});
+                return success;
+            }
+            if (std.mem.eql(u8, property.property, "ожидать_ошибку")) {
+                try self.checkMethodArity(call, "ожидать_ошибку", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) try self.report(call.span, "Type Error: сообщение ожидания должно быть строкой", .{});
+                return failure;
             }
             if (std.mem.eql(u8, property.property, "получить_ошибку")) {
                 try self.checkMethodArity(call, "получить_ошибку", 1);

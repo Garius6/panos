@@ -497,6 +497,14 @@ const FunctionCompiler = struct {
                 try self.compileEnumFallback(property.object, call.arguments[0], "Опция.Есть", .field);
                 return true;
             }
+            if (std.mem.eql(u8, property.property, "значение") and call.arguments.len == 0) {
+                try self.compileEnumStrict(property.object, null, "Опция.Есть", "нет значения");
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "ожидать") and call.arguments.len == 1) {
+                try self.compileEnumStrict(property.object, call.arguments[0], "Опция.Есть", "нет значения");
+                return true;
+            }
             if (std.mem.eql(u8, property.property, "запас") and call.arguments.len == 1) {
                 try self.compileEnumFallback(property.object, call.arguments[0], "Опция.Есть", .receiver);
                 return true;
@@ -515,6 +523,22 @@ const FunctionCompiler = struct {
             }
             if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 1) {
                 try self.compileEnumFallback(property.object, call.arguments[0], "Результат.Успех", .field);
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "значение") and call.arguments.len == 0) {
+                try self.compileEnumStrict(property.object, null, "Результат.Успех", "нет значения");
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "причина") and call.arguments.len == 0) {
+                try self.compileEnumStrict(property.object, null, "Результат.Неудача", "нет ошибки");
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "ожидать") and call.arguments.len == 1) {
+                try self.compileEnumStrict(property.object, call.arguments[0], "Результат.Успех", "нет значения");
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "ожидать_ошибку") and call.arguments.len == 1) {
+                try self.compileEnumStrict(property.object, call.arguments[0], "Результат.Неудача", "нет ошибки");
                 return true;
             }
             if (std.mem.eql(u8, property.property, "получить_ошибку") and call.arguments.len == 1) {
@@ -548,6 +572,28 @@ const FunctionCompiler = struct {
         try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
         self.patchJump(fallback_jump, self.function.instructions.items.len);
         try self.compileExpression(fallback);
+        self.patchJump(end_jump, self.function.instructions.items.len);
+    }
+
+    fn compileEnumStrict(self: *FunctionCompiler, object: ast.ExprId, message: ?ast.ExprId, variant_name: []const u8, default_message: []const u8) !void {
+        const object_slot = try self.allocateLocal();
+        try self.compileExpression(object);
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = object_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
+        try self.emitEnumMatch(variant_name);
+        const panic_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_property = 0 });
+        const end_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+        self.patchJump(panic_jump, self.function.instructions.items.len);
+        if (message) |value| {
+            try self.compileExpression(value);
+        } else {
+            try self.emitConstant(.{ .string = try self.compiler.result.program.copyString(default_message) });
+        }
+        try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
         self.patchJump(end_jump, self.function.instructions.items.len);
     }
 

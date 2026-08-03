@@ -104,6 +104,7 @@ pub const Vm = struct {
             .jump => |target| try self.jump(target),
             .jump_if_false => |target| try self.jumpIfFalse(target),
             .match_enum => |name_constant| try self.matchEnum(compiled, name_constant),
+            .panic => try self.panic(),
             .pop => _ = try self.pop(),
             .call => |argument_count| try self.call(argument_count),
             .build_closure => |closure| try self.buildClosure(closure),
@@ -447,6 +448,14 @@ pub const Vm = struct {
             return;
         };
         try self.stack.append(self.allocator, .{ .boolean = std.mem.eql(u8, actual_name, expected_name) });
+    }
+
+    fn panic(self: *Vm) anyerror!void {
+        const message = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: паника ожидает строку", .{});
+            return;
+        };
+        try self.fault("Runtime Panic: {s}", .{message});
     }
 
     fn buildArray(self: *Vm, count: u16) !void {
@@ -992,6 +1001,65 @@ test "VM executes safe prelude option and result methods" {
     }
 }
 
+test "VM executes strict prelude option and result methods" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Число\nпер опция: Опция(Число) = Опция.Есть(2)\nпер результат: Результат(Число, Строка) = Результат.Неудача(\"нет\")\nопция.значение() + опция.ожидать(\"не будет\") + если результат.причина() == \"нет\" и результат.ожидать_ошибку(\"не будет\") == \"нет\" тогда\n6\nиначе\n0\nконец\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 10), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM reports a missing strict option value" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Число\nпер опция: Опция(Число) = Опция.Нет()\nопция.значение()\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Panic: нет значения", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM matches generic enum variants" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -1177,6 +1245,25 @@ test "VM guards enum matches against non-enum values" {
     const outcome = try vm.run(function_id, &.{});
     switch (outcome) {
         .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: сопоставление варианта ожидает перечисление", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM guards panic against non-string values" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("паника", 0);
+    const function = program.function(function_id).?;
+    const number = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    try function.emit(std.testing.allocator, .{ .constant = number });
+    try function.emit(std.testing.allocator, .{ .panic = {} });
+    try function.emit(std.testing.allocator, .{ .return_void = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: паника ожидает строку", message),
         .success => return error.TestUnexpectedResult,
     }
 }

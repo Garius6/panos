@@ -39,6 +39,7 @@ pub const Opcode = enum {
     jump,
     jump_if_false,
     match_enum,
+    panic,
     pop,
     call,
     build_closure,
@@ -91,6 +92,7 @@ pub const Instruction = union(Opcode) {
     jump: usize,
     jump_if_false: usize,
     match_enum: u16,
+    panic: void,
     pop: void,
     call: u16,
     build_closure: struct {

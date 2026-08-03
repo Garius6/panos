@@ -446,6 +446,9 @@ const Checker = struct {
         const object_type = try self.infer(property.object);
         const object = self.result.types.get(object_type) orelse return self.result.types.poison();
         switch (object.*) {
+            .tuple => |elements| if (tuplePropertyIndex(property.property)) |index| {
+                if (index < elements.len) return elements[index];
+            },
             .nominal => |nominal| if (self.result.nominal_fields.get(nominal.symbol)) |fields| {
                 for (fields) |field| {
                     if (std.mem.eql(u8, field.name, property.property)) return field.typ;
@@ -732,6 +735,11 @@ pub fn check(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *co
     try checker.signaturePass();
     try checker.bodyPass();
     return result;
+}
+
+fn tuplePropertyIndex(property: []const u8) ?usize {
+    if (property.len == 0) return null;
+    return std.fmt.parseInt(usize, property, 10) catch null;
 }
 
 fn builtinType(store: *types.TypeStore, name: []const u8) ?types.TypeId {

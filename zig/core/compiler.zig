@@ -692,6 +692,14 @@ const FunctionCompiler = struct {
     fn propertyIndex(self: *FunctionCompiler, object: ast.ExprId, property: []const u8) !?u16 {
         const object_type = self.compiler.checked.expression_types.get(object) orelse return null;
         const type_entry = self.compiler.checked.types.get(object_type) orelse return null;
+        switch (type_entry.*) {
+            .tuple => |elements| {
+                const index = std.fmt.parseInt(usize, property, 10) catch return null;
+                if (index >= elements.len or index > std.math.maxInt(u16)) return null;
+                return @intCast(index);
+            },
+            else => {},
+        }
         const nominal = switch (type_entry.*) {
             .nominal => |value| value,
             else => return null,

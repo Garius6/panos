@@ -264,7 +264,7 @@ const FunctionCompiler = struct {
                 if (bindings.len == 0) {
                     try self.compiler.report(let.span, "Compiler Error: деструктуризация пока не поддержана", .{});
                     try self.function.emit(self.compiler.result.allocator, .{ .pop = {} });
-                } else if (bindings.len == 1) {
+                } else if (bindings.len == 1 and let.destructure_type == null) {
                     const slot = try self.ensureLocal(bindings[0]);
                     try self.function.emit(self.compiler.result.allocator, .{ .set_local = slot });
                 } else {

@@ -1458,6 +1458,19 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.void;
             }
+            if (self.isBuiltin(symbol, "связать")) {
+                if (call.arguments.len != 1) try self.report(call.span, "Type Error: связать() ожидает 1 аргумент", .{});
+                for (call.arguments, 0..) |argument, index| {
+                    const argument_type = try self.infer(argument);
+                    if (index != 0) continue;
+                    const argument_entry = self.result.types.get(argument_type) orelse continue;
+                    switch (argument_entry.*) {
+                        .process, .poison => {},
+                        else => try self.report(call.span, "Type Error: связать() ожидает Процесс(T) первым аргументом", .{}),
+                    }
+                }
+                return self.result.types.builtins.void;
+            }
             if (self.isBuiltin(symbol, "отправить")) {
                 if (call.arguments.len != 2) try self.report(call.span, "Type Error: отправить() ожидает 2 аргумент(а)", .{});
                 for (call.arguments) |argument| _ = try self.infer(argument);

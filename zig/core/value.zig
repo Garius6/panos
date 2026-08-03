@@ -62,9 +62,11 @@ pub const Process = struct {
     mailbox: std.ArrayList(Value) = .empty,
     signals: std.ArrayList(Value) = .empty,
     watchers: std.ArrayList(*Process) = .empty,
+    links: std.ArrayList(*Process) = .empty,
     status: ProcessStatus = .ready,
 
     pub fn deinit(self: *Process, allocator: std.mem.Allocator) void {
+        self.links.deinit(allocator);
         self.watchers.deinit(allocator);
         self.signals.deinit(allocator);
         self.mailbox.deinit(allocator);

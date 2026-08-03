@@ -136,6 +136,7 @@ pub const Vm = struct {
             .process_id => try self.processId(),
             .current_process => try self.currentProcess(),
             .kill_process => try self.killProcess(),
+            .link_process => try self.linkProcess(),
             .build_closure => |closure| try self.buildClosure(closure),
             .return_value => return self.finishFrame(try self.pop()),
             .return_void => return self.finishFrame(.{ .void = {} }),
@@ -676,10 +677,35 @@ pub const Vm = struct {
             return;
         }
         if (target.status == .ready) {
-            target.status = .failed;
-            target.mailbox.clearRetainingCapacity();
             const reason = try self.heap.formatString("процесс принудительно остановлен (убить())", .{});
-            try self.notifyWatchers(target, .{ .heap_string = reason });
+            try self.terminateProcess(target, .{ .heap_string = reason });
+        }
+        try self.stack.append(self.allocator, .{ .void = {} });
+    }
+
+    fn linkProcess(self: *Vm) anyerror!void {
+        const target = switch (try self.pop()) {
+            .process => |process| process,
+            else => {
+                try self.fault("Runtime Error: связать() ожидает Процесс(T) первым аргументом", .{});
+                return;
+            },
+        };
+        const current = self.current_process orelse {
+            try self.fault("Runtime Error: связать() вызвано вне процесса", .{});
+            return;
+        };
+        if (current.id == 0) {
+            try self.fault("Runtime Error: связать() нельзя вызвать из главного процесса", .{});
+            return;
+        }
+        if (target.id == 0) {
+            try self.fault("Runtime Error: связать() нельзя применить к главному процессу", .{});
+            return;
+        }
+        if (target.status == .ready) {
+            try current.links.append(self.allocator, target);
+            try target.links.append(self.allocator, current);
         }
         try self.stack.append(self.allocator, .{ .void = {} });
     }
@@ -728,8 +754,7 @@ pub const Vm = struct {
 
         self.pushFrame(process.function_id, process.captures, process.arguments) catch |err| switch (err) {
             error.RuntimeFault => {
-                process.status = .failed;
-                try self.notifyWatchers(process, if (self.failure) |failure| .{ .heap_string = failure } else null);
+                try self.terminateFailedProcess(process);
                 return;
             },
             else => return err,
@@ -737,12 +762,12 @@ pub const Vm = struct {
         while (self.frames.items.len != 0) {
             const completed = self.step() catch |err| switch (err) {
                 error.RuntimeFault => {
-                    process.status = .failed;
-                    try self.notifyWatchers(process, if (self.failure) |failure| .{ .heap_string = failure } else null);
+                    try self.terminateFailedProcess(process);
                     return;
                 },
                 else => return err,
             };
+            if (process.status != .ready) return;
             if (completed != null) {
                 process.status = .completed;
                 try self.notifyWatchers(process, null);
@@ -751,6 +776,25 @@ pub const Vm = struct {
         }
         process.status = .completed;
         try self.notifyWatchers(process, null);
+    }
+
+    fn terminateFailedProcess(self: *Vm, process: *value.Process) !void {
+        const reason: value.Value = if (self.failure) |failure|
+            .{ .heap_string = failure }
+        else
+            .{ .heap_string = try self.heap.formatString("неизвестная ошибка процесса", .{}) };
+        try self.terminateProcess(process, reason);
+    }
+
+    fn terminateProcess(self: *Vm, process: *value.Process, reason: value.Value) !void {
+        if (process.status != .ready) return;
+        process.status = .failed;
+        process.mailbox.clearRetainingCapacity();
+        try self.notifyWatchers(process, reason);
+        const reason_text = reason.stringBytes() orelse "неизвестная ошибка";
+        const linked_reason = try self.heap.formatString("связанный процесс #{d} упал: {s}", .{ process.id, reason_text });
+        for (process.links.items) |linked| try self.terminateProcess(linked, .{ .heap_string = linked_reason });
+        process.links.clearRetainingCapacity();
     }
 
     fn notifyWatchers(self: *Vm, process: *value.Process, reason: ?value.Value) !void {
@@ -2822,6 +2866,128 @@ test "VM guards process kills against non-process values" {
     const outcome = try vm.run(function_id, &.{});
     switch (outcome) {
         .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: убить() ожидает Процесс(T) первым аргументом", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM cascades linked process failures" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\функ падающий() -> Пусто
+        \\    получить()
+        \\    паника("сбой")
+        \\конец
+        \\функ связанный() -> Пусто
+        \\    пер child: Процесс(Число) = запусти падающий()
+        \\    связать(child)
+        \\    отправить(child, 1)
+        \\конец
+        \\функ проверка() -> Булево
+        \\    пер process: Процесс(Число) = запусти связанный()
+        \\    наблюдать(process)
+        \\    отправить(process, 1)
+        \\    пер (id, причина) = получить_сигнал()
+        \\    выбор причина
+        \\        Нет -> ложь
+        \\        Есть(_) -> id == process.номер()
+        \\    конец
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .boolean => |result| try std.testing.expect(result),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM does not cascade linked process completion" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\функ штатный() -> Пусто
+        \\    получить()
+        \\конец
+        \\функ связанный() -> Пусто
+        \\    пер child: Процесс(Число) = запусти штатный()
+        \\    связать(child)
+        \\    отправить(child, 1)
+        \\конец
+        \\функ проверка() -> Булево
+        \\    пер process: Процесс(Число) = запусти связанный()
+        \\    наблюдать(process)
+        \\    отправить(process, 1)
+        \\    пер (_, причина) = получить_сигнал()
+        \\    выбор причина
+        \\        Нет -> истина
+        \\        Есть(_) -> ложь
+        \\    конец
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .boolean => |result| try std.testing.expect(result),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM guards process links against non-process values" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("связать", 0);
+    const function = program.function(function_id).?;
+    const number = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    try function.emit(std.testing.allocator, .{ .constant = number });
+    try function.emit(std.testing.allocator, .{ .link_process = {} });
+    try function.emit(std.testing.allocator, .{ .return_void = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: связать() ожидает Процесс(T) первым аргументом", message),
         .success => return error.TestUnexpectedResult,
     }
 }

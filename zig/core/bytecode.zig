@@ -10,6 +10,7 @@ pub const Constant = union(enum) {
     boolean: bool,
     string: []const u8,
     function_ref: FunctionId,
+    interface_vtable: []const FunctionId,
 };
 
 pub const Opcode = enum {
@@ -42,6 +43,8 @@ pub const Opcode = enum {
     panic,
     pop,
     call,
+    cast_interface,
+    call_interface,
     build_closure,
     return_value,
     return_void,
@@ -96,6 +99,11 @@ pub const Instruction = union(Opcode) {
     panic: void,
     pop: void,
     call: u16,
+    cast_interface: u16,
+    call_interface: struct {
+        method_index: u16,
+        argument_count: u16,
+    },
     build_closure: struct {
         function_id: FunctionId,
         capture_count: u16,

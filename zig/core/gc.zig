@@ -1,4 +1,5 @@
 const std = @import("std");
+const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
 
 const Object = union(enum) {
@@ -6,6 +7,7 @@ const Object = union(enum) {
     aggregate: *value.Aggregate,
     array: *value.Array,
     closure: *value.Closure,
+    interface: *value.Interface,
     map: *value.Map,
 };
 
@@ -63,6 +65,14 @@ pub const Heap = struct {
         return closure;
     }
 
+    pub fn createInterface(self: *Heap, receiver: value.Value, methods: []const bytecode.FunctionId) !*value.Interface {
+        const interface = try self.allocator.create(value.Interface);
+        errdefer self.allocator.destroy(interface);
+        interface.* = .{ .receiver = receiver, .methods = methods };
+        try self.objects.append(self.allocator, .{ .interface = interface });
+        return interface;
+    }
+
     pub fn createMap(self: *Heap) !*value.Map {
         const map = try self.allocator.create(value.Map);
         errdefer self.allocator.destroy(map);
@@ -85,6 +95,7 @@ pub const Heap = struct {
             .aggregate => |aggregate| self.mark(.{ .aggregate = aggregate }),
             .array => |array| self.mark(.{ .array = array }),
             .closure => |closure| self.mark(.{ .closure = closure }),
+            .interface => |interface| self.mark(.{ .interface = interface }),
             .map => |map| self.mark(.{ .map = map }),
             else => {},
         }
@@ -122,6 +133,7 @@ pub const Heap = struct {
             .aggregate => |aggregate| self.markValues(aggregate.elements),
             .array => |array| self.markValues(array.elements),
             .closure => |closure| self.markValues(closure.captures),
+            .interface => |interface| self.markValue(interface.receiver),
             .map => |map| for (map.entries.items) |entry| {
                 self.markValue(entry.key);
                 self.markValue(entry.value);
@@ -147,6 +159,7 @@ pub const Heap = struct {
                 self.allocator.free(closure.captures);
                 self.allocator.destroy(closure);
             },
+            .interface => |interface| self.allocator.destroy(interface),
             .map => |map| {
                 map.deinit(self.allocator);
                 self.allocator.destroy(map);
@@ -161,6 +174,7 @@ fn header(object: Object) *value.GcHeader {
         .aggregate => |aggregate| &aggregate.header,
         .array => |array| &array.header,
         .closure => |closure| &closure.header,
+        .interface => |interface| &interface.header,
         .map => |map| &map.header,
     };
 }
@@ -189,6 +203,19 @@ test "heap collects unreachable array cycles and retains roots" {
     right.elements[0] = .{ .array = left };
 
     heap.collect(&.{.{ .array = left }});
+    try std.testing.expectEqual(@as(usize, 2), heap.objectCount());
+
+    heap.collect(&.{});
+    try std.testing.expectEqual(@as(usize, 0), heap.objectCount());
+}
+
+test "heap retains interface receivers" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    const string = try heap.formatString("{s}", .{"значение"});
+    const interface = try heap.createInterface(.{ .heap_string = string }, &.{});
+    heap.collect(&.{.{ .interface = interface }});
     try std.testing.expectEqual(@as(usize, 2), heap.objectCount());
 
     heap.collect(&.{});

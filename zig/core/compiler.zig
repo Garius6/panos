@@ -360,6 +360,27 @@ const FunctionCompiler = struct {
             .match_expr => |match| try self.compileMatch(match),
             else => try self.unsupportedExpression(expressionSpan(self.compiler.tree, expression)),
         }
+        try self.emitInterfaceCast(expression);
+    }
+
+    fn emitInterfaceCast(self: *FunctionCompiler, expression: ast.ExprId) !void {
+        const cast = self.compiler.checked.interface_casts.get(expression) orelse return;
+        const implementation = blk: {
+            for (self.compiler.checked.interface_implementations.items) |candidate| {
+                if (candidate.interface == cast.interface and candidate.target == cast.target) break :blk candidate;
+            }
+            try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти реализацию интерфейса", .{});
+            return;
+        };
+        const methods = try self.compiler.result.program.arena.allocator().alloc(bytecode.FunctionId, implementation.methods.len);
+        for (implementation.methods, methods) |method, *function_id| {
+            function_id.* = self.compiler.result.function_ids.get(method) orelse {
+                try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти метод интерфейса", .{});
+                return;
+            };
+        }
+        const constant = try self.function.addConstant(self.compiler.result.allocator, .{ .interface_vtable = methods });
+        try self.function.emit(self.compiler.result.allocator, .{ .cast_interface = constant });
     }
 
     fn compileTry(self: *FunctionCompiler, try_expression: anytype) !void {
@@ -422,6 +443,19 @@ const FunctionCompiler = struct {
         if (try self.compileLengthBuiltin(call)) return;
         if (try self.compileCollectionMethod(call)) return;
         if (try self.compilePreludeEnumMethod(call)) return;
+        if (self.compiler.checked.interface_calls.get(expression)) |interface_call| {
+            const property = switch (self.compiler.tree.expr(call.callee).*) {
+                .property => |value| value,
+                else => return self.unsupportedExpression(call.span),
+            };
+            try self.compileExpression(property.object);
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .call_interface = .{
+                .method_index = interface_call.method_index,
+                .argument_count = @intCast(call.arguments.len),
+            } });
+            return;
+        }
         if (self.compiler.checked.method_calls.get(expression)) |method| {
             const property = switch (self.compiler.tree.expr(call.callee).*) {
                 .property => |value| value,

@@ -42,6 +42,12 @@ pub const HeapString = struct {
     bytes: []u8,
 };
 
+pub const Interface = struct {
+    header: GcHeader = .{},
+    receiver: Value,
+    methods: []const bytecode.FunctionId,
+};
+
 pub const Value = union(enum) {
     void: void,
     number: f64,
@@ -50,6 +56,7 @@ pub const Value = union(enum) {
     heap_string: *HeapString,
     function_ref: bytecode.FunctionId,
     closure: *Closure,
+    interface: *Interface,
     aggregate: *Aggregate,
     array: *Array,
     map: *Map,
@@ -85,6 +92,10 @@ pub const Value = union(enum) {
             },
             .closure => |left_closure| switch (right) {
                 .closure => |right_closure| left_closure == right_closure,
+                else => false,
+            },
+            .interface => |left_interface| switch (right) {
+                .interface => |right_interface| left_interface.receiver.eql(right_interface.receiver),
                 else => false,
             },
             .aggregate => |left_aggregate| switch (right) {

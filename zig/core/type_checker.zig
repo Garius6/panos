@@ -32,8 +32,36 @@ pub const EnumDefinition = struct {
     variants: []const EnumVariant,
 };
 
+pub const InterfaceMethod = struct {
+    name: []const u8,
+    parameters: []const types.TypeId,
+    return_type: types.TypeId,
+};
+
+pub const InterfaceDefinition = struct {
+    parameters: []const GenericParameter,
+    methods: []const InterfaceMethod,
+};
+
+pub const InterfaceImplementation = struct {
+    interface: symbols.SymbolId,
+    target: symbols.SymbolId,
+    methods: []const symbols.SymbolId,
+};
+
+pub const InterfaceCast = struct {
+    interface: symbols.SymbolId,
+    target: symbols.SymbolId,
+};
+
+pub const InterfaceCall = struct {
+    interface: symbols.SymbolId,
+    method_index: u16,
+};
+
 pub const MethodDefinition = struct {
     owner: symbols.SymbolId,
+    interface: ?symbols.SymbolId,
     symbol: symbols.SymbolId,
     name: []const u8,
     owner_parameters: []const GenericParameter,
@@ -59,9 +87,13 @@ pub const CheckResult = struct {
     generic_function_parameters: std.AutoHashMap(symbols.SymbolId, []const GenericParameter),
     generic_nominal_fields: std.AutoHashMap(symbols.SymbolId, GenericNominal),
     enum_definitions: std.AutoHashMap(symbols.SymbolId, EnumDefinition),
+    interface_definitions: std.AutoHashMap(symbols.SymbolId, InterfaceDefinition),
+    interface_implementations: std.ArrayList(InterfaceImplementation) = .empty,
     pattern_variants: std.AutoHashMap(ast.PatternId, symbols.SymbolId),
     methods: std.ArrayList(MethodDefinition) = .empty,
     method_calls: std.AutoHashMap(ast.ExprId, symbols.SymbolId),
+    interface_calls: std.AutoHashMap(ast.ExprId, InterfaceCall),
+    interface_casts: std.AutoHashMap(ast.ExprId, InterfaceCast),
 
     pub fn init(allocator: std.mem.Allocator) !CheckResult {
         return .{
@@ -76,15 +108,22 @@ pub const CheckResult = struct {
             .generic_function_parameters = .init(allocator),
             .generic_nominal_fields = .init(allocator),
             .enum_definitions = .init(allocator),
+            .interface_definitions = .init(allocator),
             .pattern_variants = .init(allocator),
             .method_calls = .init(allocator),
+            .interface_calls = .init(allocator),
+            .interface_casts = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CheckResult) void {
+        self.interface_casts.deinit();
+        self.interface_calls.deinit();
         self.method_calls.deinit();
         self.methods.deinit(self.allocator);
         self.pattern_variants.deinit();
+        self.interface_implementations.deinit(self.allocator);
+        self.interface_definitions.deinit();
         self.enum_definitions.deinit();
         self.generic_nominal_fields.deinit();
         self.generic_function_parameters.deinit();
@@ -127,15 +166,18 @@ const Checker = struct {
                 .function => |function| try self.defineFunctionSignature(declaration, function.type_parameters, function.parameters, function.return_type),
                 .foreign => {},
                 .impl => |implementation| {
-                    if (implementation.interface_name != null) continue;
                     const owner = self.findTypeSymbol(implementation.target_type) orelse {
                         try self.report(implementation.span, "Type Error: неизвестный тип реализации '{s}'", .{implementation.target_type});
                         continue;
                     };
                     const owner_parameters = self.nominalParameters(owner);
-                    for (implementation.methods) |method| {
-                        const function = self.tree.decl(method).function;
-                        try self.defineMethodSignature(method, owner, owner_parameters, function.type_parameters, function.parameters, function.return_type);
+                    if (implementation.interface_name) |interface_name| {
+                        try self.defineInterfaceImplementation(implementation, owner, owner_parameters, interface_name);
+                    } else {
+                        for (implementation.methods) |method| {
+                            const function = self.tree.decl(method).function;
+                            try self.defineMethodSignature(method, owner, null, owner_parameters, function.type_parameters, function.parameters, function.return_type);
+                        }
                     }
                 },
                 else => {},
@@ -220,6 +262,36 @@ const Checker = struct {
         }
     }
 
+    fn interfacePass(self: *Checker) !void {
+        for (self.tree.program.?.declarations) |declaration| {
+            const interface = switch (self.tree.decl(declaration).*) {
+                .interface_decl => |value| value,
+                else => continue,
+            };
+            const symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
+            const parameters = try self.defineGenericNominalParameters(symbol, interface.type_parameters);
+            const previous_generic_parameters = self.current_generic_parameters;
+            self.current_generic_parameters = parameters;
+            defer self.current_generic_parameters = previous_generic_parameters;
+            var methods: std.ArrayList(InterfaceMethod) = .empty;
+            defer methods.deinit(self.result.allocator);
+            for (interface.methods) |method| {
+                var method_parameters: std.ArrayList(types.TypeId) = .empty;
+                defer method_parameters.deinit(self.result.allocator);
+                for (method.parameters) |parameter| try method_parameters.append(self.result.allocator, try self.resolveType(parameter.type_annotation.?));
+                try methods.append(self.result.allocator, .{
+                    .name = method.name,
+                    .parameters = try self.result.arena.allocator().dupe(types.TypeId, method_parameters.items),
+                    .return_type = try self.resolveType(method.return_type),
+                });
+            }
+            try self.result.interface_definitions.put(symbol, .{
+                .parameters = parameters,
+                .methods = try self.result.arena.allocator().dupe(InterfaceMethod, methods.items),
+            });
+        }
+    }
+
     fn preludePass(self: *Checker) !void {
         const option_symbol = self.findTypeSymbol("Опция") orelse return;
         const result_symbol = self.findTypeSymbol("Результат") orelse return;
@@ -275,7 +347,7 @@ const Checker = struct {
         try self.result.symbol_types.put(symbol, signature);
     }
 
-    fn defineMethodSignature(self: *Checker, declaration: ast.DeclId, owner: symbols.SymbolId, owner_parameters: []const GenericParameter, function_parameters: []const ast.TypeParameter, parameters: []const ast.ParamDecl, return_type: ast.TypeId) !void {
+    fn defineMethodSignature(self: *Checker, declaration: ast.DeclId, owner: symbols.SymbolId, interface: ?symbols.SymbolId, owner_parameters: []const GenericParameter, function_parameters: []const ast.TypeParameter, parameters: []const ast.ParamDecl, return_type: ast.TypeId) !void {
         const symbol = self.resolution.decl_symbols.get(declaration) orelse return;
         const method_parameters = try self.defineGenericParameters(symbol, function_parameters);
         var all_parameters: std.ArrayList(GenericParameter) = .empty;
@@ -298,12 +370,110 @@ const Checker = struct {
         try self.result.symbol_types.put(symbol, signature);
         try self.result.methods.append(self.result.allocator, .{
             .owner = owner,
+            .interface = interface,
             .symbol = symbol,
             .name = self.tree.decl(declaration).function.name,
             .owner_parameters = owner_parameters,
             .function_parameters = method_parameters,
             .all_parameters = parameter_scope,
         });
+    }
+
+    fn defineInterfaceImplementation(self: *Checker, implementation: anytype, owner: symbols.SymbolId, owner_parameters: []const GenericParameter, interface_name: []const u8) !void {
+        const interface_symbol = self.findTypeSymbol(interface_name) orelse {
+            try self.report(implementation.span, "Type Error: неизвестный интерфейс '{s}'", .{interface_name});
+            return;
+        };
+        const definition = self.result.interface_definitions.get(interface_symbol) orelse {
+            try self.report(implementation.span, "Type Error: '{s}' не является интерфейсом", .{interface_name});
+            return;
+        };
+        if (!self.isImplementableNominal(owner)) {
+            try self.report(implementation.span, "Type Error: интерфейс может реализовать только структура или перечисление", .{});
+            return;
+        }
+        if (definition.parameters.len != 0) {
+            try self.report(implementation.span, "Type Error: generic-интерфейсы пока не поддержаны", .{});
+            return;
+        }
+
+        for (implementation.methods) |method| {
+            const function = self.tree.decl(method).function;
+            try self.defineMethodSignature(method, owner, interface_symbol, owner_parameters, function.type_parameters, function.parameters, function.return_type);
+        }
+
+        var implementation_methods: std.ArrayList(symbols.SymbolId) = .empty;
+        defer implementation_methods.deinit(self.result.allocator);
+        var valid = true;
+        for (definition.methods) |interface_method| {
+            var matched: ?ast.DeclId = null;
+            for (implementation.methods) |method| {
+                const function = self.tree.decl(method).function;
+                if (!std.mem.eql(u8, function.name, interface_method.name)) continue;
+                if (matched != null) {
+                    try self.report(function.span, "Type Error: метод '{s}' повторён в реализации интерфейса", .{interface_method.name});
+                    valid = false;
+                    continue;
+                }
+                matched = method;
+            }
+            const method = matched orelse {
+                try self.report(implementation.span, "Type Error: в реализации отсутствует метод '{s}'", .{interface_method.name});
+                valid = false;
+                continue;
+            };
+            const method_symbol = self.resolution.decl_symbols.get(method) orelse {
+                valid = false;
+                continue;
+            };
+            try implementation_methods.append(self.result.allocator, method_symbol);
+            if (!try self.interfaceMethodMatches(owner, owner_parameters, method_symbol, interface_method)) valid = false;
+        }
+        for (implementation.methods) |method| {
+            const function = self.tree.decl(method).function;
+            if (self.interfaceMethod(definition, function.name) == null) {
+                try self.report(function.span, "Type Error: метод '{s}' отсутствует в интерфейсе", .{function.name});
+                valid = false;
+            }
+        }
+        if (!valid or implementation_methods.items.len != definition.methods.len) return;
+        try self.result.interface_implementations.append(self.result.allocator, .{
+            .interface = interface_symbol,
+            .target = owner,
+            .methods = try self.result.arena.allocator().dupe(symbols.SymbolId, implementation_methods.items),
+        });
+    }
+
+    fn interfaceMethodMatches(self: *Checker, owner: symbols.SymbolId, owner_parameters: []const GenericParameter, method_symbol: symbols.SymbolId, interface_method: InterfaceMethod) !bool {
+        const signature_id = self.result.symbol_types.get(method_symbol) orelse return false;
+        const signature = self.result.types.get(signature_id) orelse return false;
+        const function = switch (signature.*) {
+            .function => |value| value,
+            else => return false,
+        };
+        if (function.parameters.len != interface_method.parameters.len + 1) {
+            try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: сигнатура метода не совпадает с интерфейсом", .{});
+            return false;
+        }
+        var owner_arguments: std.ArrayList(types.TypeId) = .empty;
+        defer owner_arguments.deinit(self.result.allocator);
+        for (owner_parameters) |parameter| try owner_arguments.append(self.result.allocator, parameter.typ);
+        const receiver = try self.result.types.nominal(owner, owner_arguments.items);
+        if (!self.result.types.eql(function.parameters[0], receiver)) {
+            try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: первый аргумент метода должен иметь тип реализующего типа", .{});
+            return false;
+        }
+        for (function.parameters[1..], interface_method.parameters) |parameter, expected| {
+            if (!self.result.types.eql(parameter, expected)) {
+                try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: сигнатура метода не совпадает с интерфейсом", .{});
+                return false;
+            }
+        }
+        if (!self.result.types.eql(function.return_type, interface_method.return_type)) {
+            try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: сигнатура метода не совпадает с интерфейсом", .{});
+            return false;
+        }
+        return true;
     }
 
     fn bodyPass(self: *Checker) !void {
@@ -355,22 +525,35 @@ const Checker = struct {
                 const expected = if (let.type_annotation) |annotation| try self.resolveType(annotation) else null;
                 const value_type = if (expected) |type_id| try self.inferExpected(let.value, type_id) else try self.infer(let.value);
                 if (expected) |type_id| {
-                    if (!self.assignable(value_type, type_id)) try self.report(let.span, "Type Error: значение переменной не совпадает с аннотацией", .{});
+                    if (!self.assignable(value_type, type_id)) {
+                        try self.report(let.span, "Type Error: значение переменной не совпадает с аннотацией", .{});
+                    } else {
+                        try self.registerInterfaceCast(let.value, value_type, type_id);
+                    }
                 }
-                if (self.isType(value_type, self.result.types.builtins.void)) try self.report(let.span, "Type Error: переменная не может иметь тип 'Пусто'", .{});
+                const binding_type = expected orelse value_type;
+                if (self.isType(binding_type, self.result.types.builtins.void)) try self.report(let.span, "Type Error: переменная не может иметь тип 'Пусто'", .{});
                 if (let.destructure_type != null) {
-                    try self.bindNominalDestructure(statement, let, value_type);
+                    try self.bindNominalDestructure(statement, let, binding_type);
                 } else {
-                    try self.bindStatementValue(statement, value_type, let.span, "Type Error: деструктуризация ожидает тупл с соответствующим числом значений");
+                    try self.bindStatementValue(statement, binding_type, let.span, "Type Error: деструктуризация ожидает тупл с соответствующим числом значений");
                 }
                 break :blk self.result.types.builtins.void;
             },
             .return_stmt => |return_statement| blk: {
                 const value_type = try self.inferExpected(return_statement.value, expected_return);
-                if (!self.assignable(value_type, expected_return)) try self.report(return_statement.span, "Type Error: возвращаемое значение не совпадает с типом функции", .{});
+                if (!self.assignable(value_type, expected_return)) {
+                    try self.report(return_statement.span, "Type Error: возвращаемое значение не совпадает с типом функции", .{});
+                } else {
+                    try self.registerInterfaceCast(return_statement.value, value_type, expected_return);
+                }
                 break :blk expected_return;
             },
-            .expr => |expression| if (expected_value) |expected| self.inferExpected(expression.value, expected) else self.infer(expression.value),
+            .expr => |expression| if (expected_value) |expected| blk: {
+                const actual = try self.inferExpected(expression.value, expected);
+                if (self.assignable(actual, expected)) try self.registerInterfaceCast(expression.value, actual, expected);
+                break :blk actual;
+            } else self.infer(expression.value),
             .for_in => |loop| try self.inferForIn(statement, loop),
             .for_range => |range| try self.inferForRange(statement, range),
             .continue_stmt => |span| blk: {
@@ -1113,6 +1296,7 @@ const Checker = struct {
             .property => |property| {
                 const object_type = try self.infer(property.object);
                 if (try self.inferPreludeEnumMethod(call, property, object_type)) |method_type| return method_type;
+                if (try self.inferInterfaceCall(expression, call, property, object_type)) |method_type| return method_type;
                 if (try self.inferMethodCall(expression, call, property, object_type)) |method_type| return method_type;
                 const object = self.result.types.get(object_type) orelse return self.result.types.poison();
                 switch (object.*) {
@@ -1216,12 +1400,22 @@ const Checker = struct {
                     }
                     for (call.arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
                         const expected = try self.substituteGeneric(parameter, &substitutions);
-                        if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
+                        const actual = try self.inferExpected(argument, expected);
+                        if (!self.assignable(actual, expected)) {
+                            try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
+                        } else {
+                            try self.registerInterfaceCast(argument, actual, expected);
+                        }
                     }
                     return self.substituteGeneric(function.return_type, &substitutions);
                 }
                 for (call.arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
-                    if (!self.assignable(try self.inferExpected(argument, parameter), parameter)) try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
+                    const actual = try self.inferExpected(argument, parameter);
+                    if (!self.assignable(actual, parameter)) {
+                        try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
+                    } else {
+                        try self.registerInterfaceCast(argument, actual, parameter);
+                    }
                 }
                 return function.return_type;
             },
@@ -1325,7 +1519,20 @@ const Checker = struct {
         const actual_type = self.result.types.get(actual) orelse return true;
         const expected_type = self.result.types.get(expected) orelse return true;
         if (actual_type.* == .poison or expected_type.* == .poison) return true;
-        return self.result.types.eql(actual, expected);
+        if (self.result.types.eql(actual, expected)) return true;
+        const actual_nominal = switch (actual_type.*) {
+            .nominal => |value| value,
+            else => return false,
+        };
+        const expected_nominal = switch (expected_type.*) {
+            .nominal => |value| value,
+            else => return false,
+        };
+        if (self.result.interface_definitions.get(expected_nominal.symbol)) |interface| {
+            if (interface.parameters.len != expected_nominal.arguments.len) return false;
+            return self.interfaceImplementation(expected_nominal.symbol, actual_nominal.symbol) != null;
+        }
+        return false;
     }
 
     fn findTypeSymbol(self: *const Checker, name: []const u8) ?symbols.SymbolId {
@@ -1338,6 +1545,7 @@ const Checker = struct {
     fn nominalParameters(self: *const Checker, symbol: symbols.SymbolId) []const GenericParameter {
         if (self.result.generic_nominal_fields.get(symbol)) |nominal| return nominal.parameters;
         if (self.result.enum_definitions.get(symbol)) |enumeration| return enumeration.parameters;
+        if (self.result.interface_definitions.get(symbol)) |interface| return interface.parameters;
         return &.{};
     }
 
@@ -1353,6 +1561,87 @@ const Checker = struct {
             if (method.owner == owner and std.mem.eql(u8, method.name, name)) return method;
         }
         return null;
+    }
+
+    fn interfaceMethod(_: *const Checker, definition: InterfaceDefinition, name: []const u8) ?InterfaceMethod {
+        for (definition.methods) |method| {
+            if (std.mem.eql(u8, method.name, name)) return method;
+        }
+        return null;
+    }
+
+    fn interfaceImplementation(self: *const Checker, interface: symbols.SymbolId, target: symbols.SymbolId) ?InterfaceImplementation {
+        for (self.result.interface_implementations.items) |implementation| {
+            if (implementation.interface == interface and implementation.target == target) return implementation;
+        }
+        return null;
+    }
+
+    fn isImplementableNominal(self: *const Checker, symbol: symbols.SymbolId) bool {
+        return self.result.nominal_fields.contains(symbol) or self.result.generic_nominal_fields.contains(symbol) or self.result.enum_definitions.contains(symbol);
+    }
+
+    fn registerInterfaceCast(self: *Checker, expression: ast.ExprId, actual: types.TypeId, expected: types.TypeId) !void {
+        if (self.result.types.eql(actual, expected)) return;
+        const actual_entry = self.result.types.get(actual) orelse return;
+        const expected_entry = self.result.types.get(expected) orelse return;
+        const actual_nominal = switch (actual_entry.*) {
+            .nominal => |value| value,
+            else => return,
+        };
+        const expected_nominal = switch (expected_entry.*) {
+            .nominal => |value| value,
+            else => return,
+        };
+        if (!self.result.interface_definitions.contains(expected_nominal.symbol)) return;
+        if (self.result.interface_definitions.contains(actual_nominal.symbol)) return;
+        if (self.interfaceImplementation(expected_nominal.symbol, actual_nominal.symbol) == null) return;
+        try self.result.interface_casts.put(expression, .{
+            .interface = expected_nominal.symbol,
+            .target = actual_nominal.symbol,
+        });
+    }
+
+    fn inferInterfaceCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
+        const object = self.result.types.get(object_type) orelse return null;
+        const nominal = switch (object.*) {
+            .nominal => |value| value,
+            else => return null,
+        };
+        const definition = self.result.interface_definitions.get(nominal.symbol) orelse return null;
+        if (nominal.arguments.len != definition.parameters.len) {
+            try self.report(call.span, "Type Error: неверное количество параметров типа интерфейса", .{});
+            return @as(?types.TypeId, try self.result.types.poison());
+        }
+        var method_index: ?usize = null;
+        for (definition.methods, 0..) |method, index| {
+            if (std.mem.eql(u8, method.name, property.property)) {
+                method_index = index;
+                break;
+            }
+        }
+        const index = method_index orelse return null;
+        const method = definition.methods[index];
+        if (call.arguments.len != method.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов метода", .{});
+        var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+        defer substitutions.deinit();
+        for (definition.parameters, nominal.arguments) |parameter, argument| try substitutions.put(parameter.typ, argument);
+        const shared = @min(call.arguments.len, method.parameters.len);
+        for (call.arguments[0..shared], method.parameters[0..shared]) |argument, parameter| {
+            const expected = try self.substituteGeneric(parameter, &substitutions);
+            const actual = try self.inferExpected(argument, expected);
+            if (!self.assignable(actual, expected)) {
+                try self.report(call.span, "Type Error: аргумент метода не совпадает с типом параметра", .{});
+            } else {
+                try self.registerInterfaceCast(argument, actual, expected);
+            }
+        }
+        if (index > std.math.maxInt(u16)) return error.MethodLimitReached;
+        try self.result.interface_calls.put(expression, .{
+            .interface = nominal.symbol,
+            .method_index = @intCast(index),
+        });
+        return @as(?types.TypeId, try self.substituteGeneric(method.return_type, &substitutions));
     }
 
     fn inferMethodCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
@@ -1391,7 +1680,12 @@ const Checker = struct {
         if (!self.assignable(object_type, receiver)) try self.report(call.span, "Type Error: получатель метода имеет неверный тип", .{});
         for (call.arguments[0..shared], function.parameters[1 .. shared + 1]) |argument, parameter| {
             const expected = try self.substituteGeneric(parameter, &substitutions);
-            if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент метода не совпадает с типом параметра", .{});
+            const actual = try self.inferExpected(argument, expected);
+            if (!self.assignable(actual, expected)) {
+                try self.report(call.span, "Type Error: аргумент метода не совпадает с типом параметра", .{});
+            } else {
+                try self.registerInterfaceCast(argument, actual, expected);
+            }
         }
         try self.result.method_calls.put(expression, method.symbol);
         return @as(?types.TypeId, try self.substituteGeneric(function.return_type, &substitutions));
@@ -1753,6 +2047,7 @@ pub fn check(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *co
     try checker.nominalPass();
     try checker.preludePass();
     try checker.enumPass();
+    try checker.interfacePass();
     try checker.signaturePass();
     try checker.bodyPass();
     return result;
@@ -1996,6 +2291,45 @@ test "type checker rejects local values of type void" {
 
     try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("Type Error: переменная не может иметь тип 'Пусто'", checked.diagnostics.items.items[0].message);
+}
+
+test "type checker accepts generic interface implementations and records casts" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "тип Печатаемый = интерфейс\n" ++
+            "функ вСтроку() -> Строка\n" ++
+            "конец\n" ++
+            "тип Коробка[T] = структура\n" ++
+            "значение: T\n" ++
+            "конец\n" ++
+            "реализация Печатаемый для Коробка\n" ++
+            "функ вСтроку(это: Коробка) -> Строка\n" ++
+            "\"коробка\"\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "функ показать(значение: Печатаемый) -> Строка\n" ++
+            "значение.вСтроку()\n" ++
+            "конец\n" ++
+            "функ старт() -> Строка\n" ++
+            "показать(Коробка(\"готово\"))\n" ++
+            "конец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), checked.interface_implementations.items.len);
+    try std.testing.expectEqual(@as(usize, 1), checked.interface_calls.count());
+    try std.testing.expectEqual(@as(usize, 1), checked.interface_casts.count());
 }
 
 test "type checker restricts try expressions to compatible return envelopes" {

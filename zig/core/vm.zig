@@ -107,6 +107,8 @@ pub const Vm = struct {
             .panic => try self.panic(),
             .pop => _ = try self.pop(),
             .call => |argument_count| try self.call(argument_count),
+            .cast_interface => |vtable| try self.castInterface(compiled, vtable),
+            .call_interface => |interface_call| try self.callInterface(interface_call),
             .build_closure => |closure| try self.buildClosure(closure),
             .return_value => return self.finishFrame(try self.pop()),
             .return_void => return self.finishFrame(.{ .void = {} }),
@@ -179,6 +181,10 @@ pub const Vm = struct {
             .boolean => |constant_boolean| .{ .boolean = constant_boolean },
             .string => |string| .{ .string = string },
             .function_ref => |function_id| .{ .function_ref = function_id },
+            .interface_vtable => {
+                try self.fault("Runtime Error: vtable интерфейса нельзя использовать как значение", .{});
+                return;
+            },
         };
         try self.stack.append(self.allocator, runtime_value);
     }
@@ -389,6 +395,53 @@ pub const Vm = struct {
             },
         }
         self.stack.shrinkRetainingCapacity(function_index);
+    }
+
+    fn castInterface(self: *Vm, compiled: *const bytecode.Function, vtable_index: u16) anyerror!void {
+        if (vtable_index >= compiled.constants.items.len) {
+            try self.fault("Runtime Error: vtable интерфейса вне границ пула", .{});
+            return;
+        }
+        const methods = switch (compiled.constants.items[vtable_index]) {
+            .interface_vtable => |vtable| vtable,
+            else => {
+                try self.fault("Runtime Error: vtable интерфейса имеет неверный тип", .{});
+                return;
+            },
+        };
+        const receiver = try self.pop();
+        switch (receiver) {
+            .aggregate => {},
+            else => {
+                try self.fault("Runtime Error: в интерфейс можно привести только структуру или перечисление", .{});
+                return;
+            },
+        }
+        const interface = try self.heap.createInterface(receiver, methods);
+        try self.stack.append(self.allocator, .{ .interface = interface });
+    }
+
+    fn callInterface(self: *Vm, call_info: anytype) anyerror!void {
+        const argument_count: usize = call_info.argument_count;
+        if (self.stack.items.len < argument_count + 1) {
+            try self.fault("Runtime Error: недостаточно аргументов интерфейсного метода", .{});
+            return;
+        }
+        const interface_index = self.stack.items.len - argument_count - 1;
+        const interface = switch (self.stack.items[interface_index]) {
+            .interface => |interface_value| interface_value,
+            else => {
+                try self.fault("Runtime Error: попытка вызвать интерфейсный метод у не-интерфейса", .{});
+                return;
+            },
+        };
+        if (call_info.method_index >= interface.methods.len) {
+            try self.fault("Runtime Error: метод не найден в vtable интерфейса", .{});
+            return;
+        }
+        self.stack.items[interface_index] = .{ .function_ref = interface.methods[call_info.method_index] };
+        try self.stack.insert(self.allocator, interface_index + 1, interface.receiver);
+        try self.call(@intCast(argument_count + 1));
     }
 
     fn buildClosure(self: *Vm, closure: anytype) anyerror!void {
@@ -929,6 +982,56 @@ test "VM executes generic structure methods" {
     }
 }
 
+test "VM dispatches generic structures through interfaces" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "тип Печатаемый = интерфейс\n" ++
+            "функ вСтроку() -> Строка\n" ++
+            "конец\n" ++
+            "тип Коробка[T] = структура\n" ++
+            "значение: T\n" ++
+            "конец\n" ++
+            "реализация Печатаемый для Коробка\n" ++
+            "функ вСтроку(это: Коробка) -> Строка\n" ++
+            "\"коробка\"\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "функ показать(значение: Печатаемый) -> Строка\n" ++
+            "значение.вСтроку()\n" ++
+            "конец\n" ++
+            "функ старт() -> Строка\n" ++
+            "пер значение: Печатаемый = Коробка(\"готово\")\n" ++
+            "показать(значение) + \": \" + показать(Коробка(\"ещё\"))\n" ++
+            "конец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| try std.testing.expectEqualStrings("коробка: коробка", runtime_value.stringBytes().?),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM constructs enum variants" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -1421,6 +1524,48 @@ test "VM reports division by zero without crashing" {
     const outcome = try vm.run(function_id, &.{});
     switch (outcome) {
         .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: деление на ноль", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM guards interface calls against non-interface receivers" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("интерфейс", 0);
+    const function = program.function(function_id).?;
+    const receiver = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    try function.emit(std.testing.allocator, .{ .constant = receiver });
+    try function.emit(std.testing.allocator, .{ .call_interface = .{
+        .method_index = 0,
+        .argument_count = 0,
+    } });
+    try function.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: попытка вызвать интерфейсный метод у не-интерфейса", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM guards interface casts against primitive values" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("приведение", 0);
+    const function = program.function(function_id).?;
+    const receiver = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    const vtable = try function.addConstant(std.testing.allocator, .{ .interface_vtable = &.{} });
+    try function.emit(std.testing.allocator, .{ .constant = receiver });
+    try function.emit(std.testing.allocator, .{ .cast_interface = vtable });
+    try function.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: в интерфейс можно привести только структуру или перечисление", message),
         .success => return error.TestUnexpectedResult,
     }
 }

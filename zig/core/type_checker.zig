@@ -47,6 +47,7 @@ const Checker = struct {
     resolution: *const resolver.Resolution,
     result: *CheckResult,
     current_return: ?types.TypeId = null,
+    loop_depth: usize = 0,
 
     fn report(self: *Checker, span: source.Span, comptime format: []const u8, args: anytype) !void {
         const message = try std.fmt.allocPrint(self.result.arena.allocator(), format, args);
@@ -133,14 +134,14 @@ const Checker = struct {
         for (parameter_symbols, function_type.parameters) |parameter_symbol, parameter_type| {
             try self.result.symbol_types.put(parameter_symbol, parameter_type);
         }
-        const actual = try self.inferBlock(body);
+        const actual = try self.inferBlockExpected(body, function_type.return_type);
         if (!self.assignable(actual, function_type.return_type)) {
             const span = self.tree.decl(declaration).function.span;
             try self.report(span, "Type Error: функция должна возвращать объявленный тип", .{});
         }
     }
 
-    fn inferStatement(self: *Checker, statement: ast.StmtId, expected_return: types.TypeId) anyerror!types.TypeId {
+    fn inferStatement(self: *Checker, statement: ast.StmtId, expected_return: types.TypeId, expected_value: ?types.TypeId) anyerror!types.TypeId {
         return switch (self.tree.stmt(statement).*) {
             .let => |let| blk: {
                 const expected = if (let.type_annotation) |annotation| try self.resolveType(annotation) else null;
@@ -148,15 +149,25 @@ const Checker = struct {
                 if (expected) |type_id| {
                     if (!self.assignable(value_type, type_id)) try self.report(let.span, "Type Error: значение переменной не совпадает с аннотацией", .{});
                 }
-                if (self.resolution.stmt_symbols.get(statement)) |symbol| try self.result.symbol_types.put(symbol, value_type);
+                try self.bindStatementValue(statement, value_type, let.span, "Type Error: деструктуризация ожидает тупл с соответствующим числом значений");
                 break :blk self.result.types.builtins.void;
             },
             .return_stmt => |return_statement| blk: {
-                const value_type = try self.infer(return_statement.value);
+                const value_type = try self.inferExpected(return_statement.value, expected_return);
                 if (!self.assignable(value_type, expected_return)) try self.report(return_statement.span, "Type Error: возвращаемое значение не совпадает с типом функции", .{});
                 break :blk expected_return;
             },
-            .expr => |expression| self.infer(expression.value),
+            .expr => |expression| if (expected_value) |expected| self.inferExpected(expression.value, expected) else self.infer(expression.value),
+            .for_in => |loop| try self.inferForIn(statement, loop),
+            .for_range => |range| try self.inferForRange(statement, range),
+            .continue_stmt => |span| blk: {
+                if (self.loop_depth == 0) try self.report(span, "Type Error: 'продолжить' можно использовать только внутри цикла", .{});
+                break :blk self.result.types.builtins.void;
+            },
+            .break_stmt => |span| blk: {
+                if (self.loop_depth == 0) try self.report(span, "Type Error: 'прервать' можно использовать только внутри цикла", .{});
+                break :blk self.result.types.builtins.void;
+            },
             else => self.result.types.builtins.void,
         };
     }
@@ -207,35 +218,112 @@ const Checker = struct {
             .while_expr => |loop| try self.inferWhile(loop),
             else => try self.result.types.poison(),
         };
-        try self.result.expression_types.put(expression, inferred);
-        return inferred;
+        return self.recordExpressionType(expression, inferred);
     }
 
     fn inferExpected(self: *Checker, expression: ast.ExprId, expected: types.TypeId) anyerror!types.TypeId {
-        if (self.tree.expr(expression).* == .lambda) {
-            return self.inferLambda(expression, self.tree.expr(expression).lambda, expected);
-        }
-        return self.infer(expression);
+        return switch (self.tree.expr(expression).*) {
+            .lambda => |lambda| self.recordExpressionType(expression, try self.inferLambda(expression, lambda, expected)),
+            .number => |number| if (expected == self.result.types.builtins.integer) blk: {
+                if (number.value != std.math.trunc(number.value)) {
+                    try self.report(number.span, "Type Error: дробный литерал несовместим с Целое", .{});
+                }
+                break :blk self.recordExpressionType(expression, expected);
+            } else self.infer(expression),
+            .unary => |unary| if (expected == self.result.types.builtins.integer and unary.operator == .minus) blk: {
+                _ = try self.inferExpected(unary.operand, expected);
+                break :blk self.recordExpressionType(expression, expected);
+            } else self.infer(expression),
+            .binary => |binary| if (expected == self.result.types.builtins.integer and (binary.operator == .plus or binary.operator == .minus or binary.operator == .star)) blk: {
+                const left = try self.inferExpected(binary.left, expected);
+                const right = try self.inferExpected(binary.right, expected);
+                if (!self.assignable(left, expected) or !self.assignable(right, expected)) {
+                    try self.report(binary.span, "Type Error: целочисленное выражение содержит несовместимый операнд", .{});
+                    break :blk self.recordExpressionType(expression, try self.result.types.poison());
+                }
+                break :blk self.recordExpressionType(expression, expected);
+            } else self.infer(expression),
+            .tuple => |tuple| blk: {
+                const expected_type = self.result.types.get(expected) orelse break :blk self.infer(expression);
+                if (expected_type.* != .tuple or expected_type.tuple.len != tuple.elements.len) break :blk self.infer(expression);
+                for (tuple.elements, expected_type.tuple) |element, element_type| {
+                    const actual = try self.inferExpected(element, element_type);
+                    if (!self.assignable(actual, element_type)) try self.report(tuple.span, "Type Error: элемент тупла не совпадает с ожидаемым типом", .{});
+                }
+                break :blk self.recordExpressionType(expression, expected);
+            },
+            .array => |array| blk: {
+                const expected_type = self.result.types.get(expected) orelse break :blk self.infer(expression);
+                const element_type = switch (expected_type.*) {
+                    .array => |element| element,
+                    else => break :blk self.infer(expression),
+                };
+                for (array.elements) |element| {
+                    const actual = try self.inferExpected(element, element_type);
+                    if (!self.assignable(actual, element_type)) try self.report(array.span, "Type Error: элемент массива не совпадает с ожидаемым типом", .{});
+                }
+                break :blk self.recordExpressionType(expression, expected);
+            },
+            .map => |map| blk: {
+                const expected_type = self.result.types.get(expected) orelse break :blk self.infer(expression);
+                const expected_map = switch (expected_type.*) {
+                    .map => |value| value,
+                    else => break :blk self.infer(expression),
+                };
+                for (map.entries) |entry| {
+                    const key = try self.inferExpected(entry.key, expected_map.key);
+                    const value = try self.inferExpected(entry.value, expected_map.value);
+                    if (!self.assignable(key, expected_map.key)) try self.report(entry.span, "Type Error: ключ соответствия не совпадает с ожидаемым типом", .{});
+                    if (!self.assignable(value, expected_map.value)) try self.report(entry.span, "Type Error: значение соответствия не совпадает с ожидаемым типом", .{});
+                }
+                break :blk self.recordExpressionType(expression, expected);
+            },
+            .if_expr => |conditional| self.recordExpressionType(expression, try self.inferIfExpected(conditional, expected)),
+            else => self.infer(expression),
+        };
     }
 
     fn inferBlock(self: *Checker, statements: []const ast.StmtId) anyerror!types.TypeId {
+        return self.inferBlockExpected(statements, null);
+    }
+
+    fn inferBlockExpected(self: *Checker, statements: []const ast.StmtId, expected_last: ?types.TypeId) anyerror!types.TypeId {
         var result_type = self.result.types.builtins.void;
-        for (statements) |statement| result_type = try self.inferStatement(statement, self.current_return orelse self.result.types.builtins.void);
+        for (statements, 0..) |statement, index| {
+            const expected_value = if (index + 1 == statements.len) expected_last else null;
+            result_type = try self.inferStatement(statement, self.current_return orelse self.result.types.builtins.void, expected_value);
+        }
         return result_type;
     }
 
     fn inferIf(self: *Checker, conditional: anytype) anyerror!types.TypeId {
+        return self.inferIfExpected(conditional, null);
+    }
+
+    fn inferIfExpected(self: *Checker, conditional: anytype, expected: ?types.TypeId) anyerror!types.TypeId {
         const condition = try self.infer(conditional.condition);
         if (!self.assignable(condition, self.result.types.builtins.boolean)) {
             try self.report(conditional.span, "Type Error: условие 'если' должно иметь тип Булево", .{});
         }
-        const then_type = try self.inferBlock(conditional.then_branch);
-        const else_type = try self.inferBlock(conditional.else_branch);
+        const then_type = try self.inferBlockExpected(conditional.then_branch, expected);
+        const else_type = try self.inferBlockExpected(conditional.else_branch, expected);
         if (!self.assignable(then_type, else_type) or !self.assignable(else_type, then_type)) {
             try self.report(conditional.span, "Type Error: ветви 'если' возвращают разные типы", .{});
             return self.result.types.poison();
         }
+        if (expected) |expected_type| {
+            if (!self.assignable(then_type, expected_type) or !self.assignable(else_type, expected_type)) {
+                try self.report(conditional.span, "Type Error: ветви 'если' не совпадают с ожидаемым типом", .{});
+                return self.result.types.poison();
+            }
+            return expected_type;
+        }
         return then_type;
+    }
+
+    fn recordExpressionType(self: *Checker, expression: ast.ExprId, inferred: types.TypeId) !types.TypeId {
+        try self.result.expression_types.put(expression, inferred);
+        return inferred;
     }
 
     fn inferWhile(self: *Checker, loop: anytype) anyerror!types.TypeId {
@@ -243,8 +331,69 @@ const Checker = struct {
         if (!self.assignable(condition, self.result.types.builtins.boolean)) {
             try self.report(loop.span, "Type Error: условие 'пока' должно иметь тип Булево", .{});
         }
+        self.loop_depth += 1;
+        defer self.loop_depth -= 1;
         _ = try self.inferBlock(loop.body);
         return self.result.types.builtins.void;
+    }
+
+    fn inferForIn(self: *Checker, statement: ast.StmtId, loop: anytype) anyerror!types.TypeId {
+        const iterable_type = try self.infer(loop.iterable);
+        const iterable = self.result.types.get(iterable_type) orelse return self.result.types.builtins.void;
+        switch (iterable.*) {
+            .array => |element| try self.bindStatementValue(statement, element, loop.span, "Type Error: шаблон 'для (...)' не совпадает с элементом массива"),
+            .map => {
+                try self.report(loop.span, "Type Error: Соответствие не поддерживает позиционный доступ; для перебора элементов используйте .записи() и 'для (ключ, значение) в ...'", .{});
+                try self.bindStatementPoison(statement);
+            },
+            .poison => try self.bindStatementPoison(statement),
+            else => {
+                try self.report(loop.span, "Type Error: тип не поддерживает 'для x в' (нужен Массив или Итерируемое)", .{});
+                try self.bindStatementPoison(statement);
+            },
+        }
+        self.loop_depth += 1;
+        defer self.loop_depth -= 1;
+        _ = try self.inferBlock(loop.body);
+        return self.result.types.builtins.void;
+    }
+
+    fn inferForRange(self: *Checker, statement: ast.StmtId, range: anytype) anyerror!types.TypeId {
+        const integer = self.result.types.builtins.integer;
+        const start = try self.infer(range.start);
+        const end = try self.infer(range.end);
+        if (!self.assignable(start, integer) and !self.assignable(start, self.result.types.builtins.number)) {
+            try self.report(range.span, "Type Error: начало диапазона 'для' должно быть числом", .{});
+        }
+        if (!self.assignable(end, integer) and !self.assignable(end, self.result.types.builtins.number)) {
+            try self.report(range.span, "Type Error: конец диапазона 'для' должен быть числом", .{});
+        }
+        try self.bindStatementValue(statement, integer, range.span, "Type Error: диапазон 'для' объявляет одну переменную");
+        self.loop_depth += 1;
+        defer self.loop_depth -= 1;
+        _ = try self.inferBlock(range.body);
+        return self.result.types.builtins.void;
+    }
+
+    fn bindStatementValue(self: *Checker, statement: ast.StmtId, value_type: types.TypeId, span: source.Span, mismatch_message: []const u8) !void {
+        const bindings = self.resolution.stmt_bindings.get(statement) orelse return;
+        if (bindings.len == 1) {
+            try self.result.symbol_types.put(bindings[0], value_type);
+            return;
+        }
+        const value = self.result.types.get(value_type) orelse return;
+        if (value.* == .tuple and value.tuple.len == bindings.len) {
+            for (bindings, value.tuple) |symbol, element_type| try self.result.symbol_types.put(symbol, element_type);
+            return;
+        }
+        try self.report(span, "{s}", .{mismatch_message});
+        try self.bindStatementPoison(statement);
+    }
+
+    fn bindStatementPoison(self: *Checker, statement: ast.StmtId) !void {
+        const bindings = self.resolution.stmt_bindings.get(statement) orelse return;
+        const poison = try self.result.types.poison();
+        for (bindings) |symbol| try self.result.symbol_types.put(symbol, poison);
     }
 
     fn inferIndex(self: *Checker, index: anytype) anyerror!types.TypeId {
@@ -330,7 +479,7 @@ const Checker = struct {
         const previous_return = self.current_return;
         self.current_return = return_type;
         defer self.current_return = previous_return;
-        const body_type = try self.inferBlock(lambda.body);
+        const body_type = try self.inferBlockExpected(lambda.body, return_type);
         if (!self.assignable(body_type, return_type)) try self.report(lambda.span, "Type Error: тело лямбды не совпадает с типом возврата", .{});
         return self.result.types.function(parameter_types.items, return_type);
     }
@@ -573,4 +722,60 @@ test "type checker checks struct constructors and field access" {
     const function = parsed.ast.decl(parsed.ast.program.?.declarations[1]).function;
     const property = parsed.ast.stmt(function.body[1]).expr.value;
     try std.testing.expectEqual(checked.types.builtins.number, checked.expression_types.get(property).?);
+}
+
+test "type checker types destructuring and loop binders" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ сумма() -> Число\nпер (x, y) = (1, 2)\nпер результат = 0\nдля значение в массив(x, y) цикл\nрезультат = результат + значение\nконец\nдля индекс = 1 по 2 цикл\nрезультат = результат + индекс\nконец\nрезультат\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    const function = parsed.ast.decl(parsed.ast.program.?.declarations[0]).function;
+    const for_in_binder = resolved.stmt_bindings.get(function.body[2]).?[0];
+    const for_range_binder = resolved.stmt_bindings.get(function.body[3]).?[0];
+    try std.testing.expectEqual(checked.types.builtins.number, checked.symbol_types.get(for_in_binder).?);
+    try std.testing.expectEqual(checked.types.builtins.integer, checked.symbol_types.get(for_range_binder).?);
+}
+
+test "type checker rejects loop control outside a loop" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Пусто\nпродолжить\nпрервать\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: 'продолжить' можно использовать только внутри цикла", checked.diagnostics.items.items[0].message);
+    try std.testing.expectEqualStrings("Type Error: 'прервать' можно использовать только внутри цикла", checked.diagnostics.items.items[1].message);
+}
+
+test "type checker narrows integer literals in an expected context" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ взять(значение: Целое) -> Целое\nзначение\nконец\nфунк сумма() -> Целое\nпер значения: Массив(Целое) = массив(1, 2)\nвзять(значения[0]) + 3\nконец\nфунк ошибка() -> Целое\nпер дробь: Целое = 1.5\nдробь\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: дробный литерал несовместим с Целое", checked.diagnostics.items.items[0].message);
+    const sum = parsed.ast.decl(parsed.ast.program.?.declarations[1]).function;
+    const expression = parsed.ast.stmt(sum.body[1]).expr.value;
+    try std.testing.expectEqual(checked.types.builtins.integer, checked.expression_types.get(expression).?);
 }

@@ -268,3 +268,36 @@ test "parser conformance fixture preserves FFI structs and values by ABI" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture preserves declaration and field annotations" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/annotations.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[0]).*) {
+        .function => |decl| {
+            try std.testing.expect(decl.is_exported);
+            try std.testing.expectEqual(@as(usize, 1), decl.annotations.len);
+            try std.testing.expectEqualStrings("Маршрут", decl.annotations[0].name);
+            try std.testing.expectEqual(@as(usize, 4), decl.annotations[0].arguments.len);
+            try std.testing.expectEqualStrings("путь", decl.annotations[0].arguments[1].name.?);
+            switch (decl.annotations[0].arguments[0].value) {
+                .string => |value| try std.testing.expectEqualStrings("GET", value),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[1]).*) {
+        .struct_decl => |decl| {
+            try std.testing.expectEqualStrings("Модель", decl.annotations[0].name);
+            try std.testing.expectEqual(@as(usize, 1), decl.fields[0].annotations.len);
+            try std.testing.expectEqualStrings("Поле", decl.fields[0].annotations[0].name);
+            try std.testing.expectEqualStrings("индекс", decl.fields[0].annotations[0].arguments[1].name.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

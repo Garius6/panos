@@ -71,12 +71,64 @@ const Parser = struct {
         };
     }
 
+    fn parseAnnotations(self: *Parser) ![]const ast.Annotation {
+        var annotations: std.ArrayList(ast.Annotation) = .empty;
+        defer annotations.deinit(self.result.allocator);
+
+        while (self.at(.ampersand)) {
+            const start = self.next();
+            const name = try self.expect(.ident, "Синтаксическая ошибка: после '&' ожидается имя аннотации");
+            var arguments: std.ArrayList(ast.AnnotationArgument) = .empty;
+            defer arguments.deinit(self.result.allocator);
+            var end = name.span;
+
+            if (self.at(.l_paren)) {
+                _ = self.next();
+                while (!self.at(.r_paren) and !self.at(.eof)) {
+                    try arguments.append(self.result.allocator, try self.parseAnnotationArgument());
+                    if (!self.at(.comma)) break;
+                    _ = self.next();
+                }
+                end = (try self.expect(.r_paren, "Синтаксическая ошибка: после аргументов аннотации ожидается ')'")).span;
+            }
+
+            try annotations.append(self.result.allocator, .{
+                .span = spanFrom(start.span, end),
+                .name = try self.result.ast.copyText(name.lexeme),
+                .arguments = try self.result.ast.copySlice(ast.AnnotationArgument, arguments.items),
+            });
+        }
+        return self.result.ast.copySlice(ast.Annotation, annotations.items);
+    }
+
+    fn parseAnnotationArgument(self: *Parser) !ast.AnnotationArgument {
+        var name: ?[]const u8 = null;
+        if (self.at(.ident) and self.peekSecond().kind == .assign) {
+            name = try self.result.ast.copyText(self.next().lexeme);
+            _ = self.next();
+        }
+
+        const value = self.next();
+        const annotation_value: ast.AnnotationValue = switch (value.kind) {
+            .string => .{ .string = try self.result.ast.copyText(value.lexeme) },
+            .number => .{ .number = try self.result.ast.copyText(value.lexeme) },
+            .boolean => .{ .boolean = try self.result.ast.copyText(value.lexeme) },
+            .ident => .{ .ident = try self.result.ast.copyText(value.lexeme) },
+            else => blk: {
+                try self.report(value.span, "Синтаксическая ошибка: недопустимое значение аргумента аннотации");
+                break :blk .{ .ident = "" };
+            },
+        };
+        return .{ .name = name, .value = annotation_value };
+    }
+
     fn parseProgram(self: *Parser) !void {
         var declarations: std.ArrayList(ast.DeclId) = .empty;
         defer declarations.deinit(self.result.allocator);
 
         while (!self.at(.eof)) {
             const doc = self.peek().doc;
+            const annotations = try self.parseAnnotations();
             var exported = false;
             if (self.at(.export_decl)) {
                 exported = true;
@@ -84,34 +136,38 @@ const Parser = struct {
             }
 
             if (self.at(.function)) {
-                try declarations.append(self.result.allocator, try self.parseFunction(exported, doc));
+                try declarations.append(self.result.allocator, try self.parseFunction(exported, doc, annotations));
                 continue;
             }
 
             if (self.at(.import)) {
                 if (exported) try self.report(self.peek().span, "Синтаксическая ошибка: 'экспорт' недопустим для импорта");
+                if (annotations.len != 0) try self.report(self.peek().span, "Синтаксическая ошибка: аннотации недопустимы для импорта");
                 try declarations.append(self.result.allocator, try self.parseImport());
                 continue;
             }
 
             if (self.at(.constant)) {
+                if (annotations.len != 0) try self.report(self.peek().span, "Синтаксическая ошибка: аннотации недопустимы для константы");
                 try declarations.append(self.result.allocator, try self.parseTopLevelConst(exported, doc));
                 continue;
             }
 
             if (self.at(.type_decl)) {
-                try declarations.append(self.result.allocator, try self.parseTypeDeclaration(exported, doc));
+                try declarations.append(self.result.allocator, try self.parseTypeDeclaration(exported, doc, annotations));
                 continue;
             }
 
             if (self.at(.impl)) {
                 if (exported) try self.report(self.peek().span, "Синтаксическая ошибка: 'экспорт' недопустим для реализации");
+                if (annotations.len != 0) try self.report(self.peek().span, "Синтаксическая ошибка: аннотации недопустимы для реализации");
                 try declarations.append(self.result.allocator, try self.parseImplDeclaration());
                 continue;
             }
 
             if (self.at(.foreign)) {
                 if (exported) try self.report(self.peek().span, "Синтаксическая ошибка: 'внешний' не может быть экспортирован");
+                if (annotations.len != 0) try self.report(self.peek().span, "Синтаксическая ошибка: аннотации недопустимы для 'внешний'");
                 try declarations.append(self.result.allocator, try self.parseForeignDeclaration());
                 continue;
             }
@@ -127,7 +183,7 @@ const Parser = struct {
         try self.result.ast.setProgram(declarations.items);
     }
 
-    fn parseFunction(self: *Parser, is_exported: bool, doc: []const u8) !ast.DeclId {
+    fn parseFunction(self: *Parser, is_exported: bool, doc: []const u8, annotations: []const ast.Annotation) !ast.DeclId {
         const start = try self.expect(.function, "Синтаксическая ошибка: ожидается 'функ'");
         const name_token = try self.expect(.ident, "Синтаксическая ошибка: после 'функ' ожидается имя");
         const name = try self.result.ast.copyText(name_token.lexeme);
@@ -171,6 +227,7 @@ const Parser = struct {
             .return_type = return_type,
             .body = try self.result.ast.copySlice(ast.StmtId, body.items),
             .is_exported = is_exported,
+            .annotations = annotations,
         } });
     }
 
@@ -247,18 +304,21 @@ const Parser = struct {
         } });
     }
 
-    fn parseTypeDeclaration(self: *Parser, is_exported: bool, doc: []const u8) !ast.DeclId {
+    fn parseTypeDeclaration(self: *Parser, is_exported: bool, doc: []const u8, annotations: []const ast.Annotation) !ast.DeclId {
         const start = try self.expect(.type_decl, "Синтаксическая ошибка: ожидается 'тип'");
         const name = try self.expect(.ident, "Синтаксическая ошибка: после 'тип' ожидается имя");
         const type_parameters = try self.parseDeclaredTypeParameters();
         _ = try self.expect(.assign, "Синтаксическая ошибка: после имени типа ожидается '='");
 
         return switch (self.peek().kind) {
-            .struct_decl => self.parseStructDeclaration(start, name, type_parameters, is_exported, doc),
-            .interface => self.parseInterfaceDeclaration(start, name, type_parameters, is_exported, doc),
-            .enum_decl => self.parseEnumDeclaration(start, name, type_parameters, is_exported, doc),
-            .ff_struct => self.parseFfiStructDeclaration(start, name, type_parameters, is_exported, doc),
-            else => self.parseTypeAliasAfterHeader(start, name, type_parameters, is_exported, doc),
+            .struct_decl => self.parseStructDeclaration(start, name, type_parameters, is_exported, doc, annotations),
+            .interface => self.parseInterfaceDeclaration(start, name, type_parameters, is_exported, doc, annotations),
+            .enum_decl => self.parseEnumDeclaration(start, name, type_parameters, is_exported, doc, annotations),
+            .ff_struct => blk: {
+                if (annotations.len != 0) try self.report(name.span, "Синтаксическая ошибка: аннотации недопустимы для ff_структура");
+                break :blk self.parseFfiStructDeclaration(start, name, type_parameters, is_exported, doc);
+            },
+            else => self.parseTypeAliasAfterHeader(start, name, type_parameters, is_exported, doc, annotations),
         };
     }
 
@@ -269,6 +329,7 @@ const Parser = struct {
         type_parameters: []const []const u8,
         is_exported: bool,
         doc: []const u8,
+        annotations: []const ast.Annotation,
     ) !ast.DeclId {
         if (type_parameters.len != 0) {
             try self.report(name.span, "Синтаксическая ошибка: generic type alias пока не поддержан");
@@ -280,6 +341,7 @@ const Parser = struct {
             .name = try self.result.ast.copyText(name.lexeme),
             .doc = try self.result.ast.copyText(doc),
             .is_exported = is_exported,
+            .annotations = annotations,
             .aliased_type = aliased_type,
         } });
     }
@@ -291,12 +353,14 @@ const Parser = struct {
         type_parameters: []const []const u8,
         is_exported: bool,
         doc: []const u8,
+        annotations: []const ast.Annotation,
     ) !ast.DeclId {
         _ = try self.expect(.struct_decl, "Синтаксическая ошибка: ожидается 'структура'");
         var fields: std.ArrayList(ast.FieldDecl) = .empty;
         defer fields.deinit(self.result.allocator);
 
         while (!self.at(.end) and !self.at(.eof)) {
+            const field_annotations = try self.parseAnnotations();
             const field_start = self.peek().span;
             const field_name = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя поля структуры");
             _ = try self.expect(.colon, "Синтаксическая ошибка: после имени поля ожидается ':'");
@@ -305,6 +369,7 @@ const Parser = struct {
                 .span = spanFrom(field_start, self.astTypeSpan(field_type)),
                 .name = try self.result.ast.copyText(field_name.lexeme),
                 .type_annotation = field_type,
+                .annotations = field_annotations,
             });
             self.consumeSemicolons();
         }
@@ -316,6 +381,7 @@ const Parser = struct {
             .type_parameters = type_parameters,
             .fields = try self.result.ast.copySlice(ast.FieldDecl, fields.items),
             .is_exported = is_exported,
+            .annotations = annotations,
         } });
     }
 
@@ -394,7 +460,7 @@ const Parser = struct {
                 _ = self.next();
                 continue;
             }
-            try methods.append(self.result.allocator, try self.parseFunction(false, doc));
+            try methods.append(self.result.allocator, try self.parseFunction(false, doc, &.{}));
         }
         const end = try self.expect(.end, "Синтаксическая ошибка: реализация не закрыта 'конец'");
         return self.result.ast.addDecl(.{ .impl = .{
@@ -552,6 +618,7 @@ const Parser = struct {
         type_parameters: []const []const u8,
         is_exported: bool,
         doc: []const u8,
+        annotations: []const ast.Annotation,
     ) !ast.DeclId {
         _ = try self.expect(.interface, "Синтаксическая ошибка: ожидается 'интерфейс'");
         var methods: std.ArrayList(ast.MethodSignature) = .empty;
@@ -569,6 +636,7 @@ const Parser = struct {
             .type_parameters = type_parameters,
             .methods = try self.result.ast.copySlice(ast.MethodSignature, methods.items),
             .is_exported = is_exported,
+            .annotations = annotations,
         } });
     }
 
@@ -593,6 +661,7 @@ const Parser = struct {
         type_parameters: []const []const u8,
         is_exported: bool,
         doc: []const u8,
+        annotations: []const ast.Annotation,
     ) !ast.DeclId {
         _ = try self.expect(.enum_decl, "Синтаксическая ошибка: ожидается 'перечисление'");
         var variants: std.ArrayList(ast.VariantDecl) = .empty;
@@ -627,6 +696,7 @@ const Parser = struct {
             .type_parameters = type_parameters,
             .variants = try self.result.ast.copySlice(ast.VariantDecl, variants.items),
             .is_exported = is_exported,
+            .annotations = annotations,
         } });
     }
 

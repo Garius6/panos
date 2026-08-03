@@ -19,6 +19,8 @@ pub const CheckResult = struct {
     expression_types: std.AutoHashMap(ast.ExprId, types.TypeId),
     symbol_types: std.AutoHashMap(symbols.SymbolId, types.TypeId),
     nominal_fields: std.AutoHashMap(symbols.SymbolId, []const NominalField),
+    type_aliases: std.AutoHashMap(symbols.SymbolId, types.TypeId),
+    alias_type_nodes: std.AutoHashMap(symbols.SymbolId, ast.TypeId),
 
     pub fn init(allocator: std.mem.Allocator) !CheckResult {
         return .{
@@ -28,10 +30,14 @@ pub const CheckResult = struct {
             .expression_types = .init(allocator),
             .symbol_types = .init(allocator),
             .nominal_fields = .init(allocator),
+            .type_aliases = .init(allocator),
+            .alias_type_nodes = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CheckResult) void {
+        self.alias_type_nodes.deinit();
+        self.type_aliases.deinit();
         self.nominal_fields.deinit();
         self.symbol_types.deinit();
         self.expression_types.deinit();
@@ -48,6 +54,7 @@ const Checker = struct {
     result: *CheckResult,
     current_return: ?types.TypeId = null,
     loop_depth: usize = 0,
+    resolving_aliases: std.AutoHashMap(symbols.SymbolId, void),
 
     fn report(self: *Checker, span: source.Span, comptime format: []const u8, args: anytype) !void {
         const message = try std.fmt.allocPrint(self.result.arena.allocator(), format, args);
@@ -70,6 +77,17 @@ const Checker = struct {
                 },
                 else => {},
             }
+        }
+    }
+
+    fn typeAliasPass(self: *Checker) !void {
+        for (self.tree.program.?.declarations) |declaration| {
+            const alias = switch (self.tree.decl(declaration).*) {
+                .type_alias => |value| value,
+                else => continue,
+            };
+            const symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
+            try self.result.alias_type_nodes.put(symbol, alias.aliased_type);
         }
     }
 
@@ -149,6 +167,7 @@ const Checker = struct {
                 if (expected) |type_id| {
                     if (!self.assignable(value_type, type_id)) try self.report(let.span, "Type Error: значение переменной не совпадает с аннотацией", .{});
                 }
+                if (self.isType(value_type, self.result.types.builtins.void)) try self.report(let.span, "Type Error: переменная не может иметь тип 'Пусто'", .{});
                 try self.bindStatementValue(statement, value_type, let.span, "Type Error: деструктуризация ожидает тупл с соответствующим числом значений");
                 break :blk self.result.types.builtins.void;
             },
@@ -634,7 +653,10 @@ const Checker = struct {
     fn resolveType(self: *Checker, type_node: ast.TypeId) !types.TypeId {
         return switch (self.tree.typeNode(type_node).*) {
             .ident => |ident| builtinType(&self.result.types, ident.name) orelse blk: {
-                if (self.findTypeSymbol(ident.name)) |symbol| break :blk try self.result.types.nominal(symbol, &.{});
+                if (self.findTypeSymbol(ident.name)) |symbol| {
+                    if (self.result.alias_type_nodes.contains(symbol)) break :blk try self.resolveAlias(symbol, ident.span);
+                    break :blk try self.result.types.nominal(symbol, &.{});
+                }
                 try self.report(ident.span, "Type Error: неизвестный тип '{s}'", .{ident.name});
                 break :blk try self.result.types.poison();
             },
@@ -679,12 +701,33 @@ const Checker = struct {
         }
         return null;
     }
+
+    fn resolveAlias(self: *Checker, symbol: symbols.SymbolId, span: source.Span) anyerror!types.TypeId {
+        if (self.result.type_aliases.get(symbol)) |resolved| return resolved;
+        const target = self.result.alias_type_nodes.get(symbol) orelse return self.result.types.poison();
+        if (self.resolving_aliases.contains(symbol)) {
+            try self.report(span, "Type Error: циклический псевдоним типа", .{});
+            return self.result.types.poison();
+        }
+        try self.resolving_aliases.put(symbol, {});
+        defer _ = self.resolving_aliases.remove(symbol);
+        const resolved = try self.resolveType(target);
+        try self.result.type_aliases.put(symbol, resolved);
+        return resolved;
+    }
 };
 
 pub fn check(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *const resolver.Resolution) !CheckResult {
     var result = try CheckResult.init(allocator);
     errdefer result.deinit();
-    var checker = Checker{ .tree = tree, .resolution = resolution, .result = &result };
+    var checker = Checker{
+        .tree = tree,
+        .resolution = resolution,
+        .result = &result,
+        .resolving_aliases = .init(allocator),
+    };
+    defer checker.resolving_aliases.deinit();
+    try checker.typeAliasPass();
     try checker.nominalPass();
     try checker.signaturePass();
     try checker.bodyPass();
@@ -893,4 +936,35 @@ test "type checker validates operators and assignment targets" {
     const function = parsed.ast.decl(parsed.ast.program.?.declarations[0]).function;
     const bitwise_value = parsed.ast.stmt(function.body[4]).let.value;
     try std.testing.expectEqual(checked.types.builtins.integer, checked.expression_types.get(bitwise_value).?);
+}
+
+test "type checker resolves aliases before and after their declaration" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Первый = Второй\nтип Второй = Число\nфунк взять(значение: Первый) -> Второй\nпер копия: Первый = значение\nкопия\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "type checker rejects local values of type void" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Пусто\nпер пусто: Пусто = пока ложь цикл\nконец\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: переменная не может иметь тип 'Пусто'", checked.diagnostics.items.items[0].message);
 }

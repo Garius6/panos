@@ -127,6 +127,44 @@ pub fn writeDiagnostics(writer: *std.Io.Writer, file: panos_core.source.SourceFi
     }
 }
 
+const FileReader = struct {
+    io: std.Io,
+
+    pub fn read(self: *const FileReader, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        return std.Io.Dir.cwd().readFileAlloc(self.io, path, allocator, .limited(16 * 1024 * 1024));
+    }
+};
+
+fn writeModuleDiagnostics(writer: *std.Io.Writer, graph: *const panos_core.module_loader.Graph) !void {
+    for (graph.diagnostics.items.items) |value| {
+        const module = graph.moduleForFile(value.span.file_id) orelse {
+            try writer.print("{s}\n", .{value.message});
+            continue;
+        };
+        const rendered = try formatDiagnostic(std.heap.page_allocator, module.file, value);
+        defer std.heap.page_allocator.free(rendered);
+        try writer.print("{s}\n", .{rendered});
+    }
+}
+
+fn hasErrors(diagnostics: *const panos_core.diagnostic.DiagnosticList) bool {
+    for (diagnostics.items.items) |value| {
+        if (value.severity == .err) return true;
+    }
+    return false;
+}
+
+fn reportUnsupportedModuleExecution(graph: *panos_core.module_loader.Graph) !void {
+    if (graph.imports.items.len == 0) return;
+    const import = graph.imports.items[0];
+    _ = try graph.diagnostics.appendUnique(graph.allocator, .{
+        .phase = .compiler,
+        .severity = .err,
+        .span = import.span,
+        .message = try graph.arena.allocator().dupe(u8, "Compiler Error: выполнение импортов ещё не поддержано Zig-версией"),
+    });
+}
+
 fn findStartFunction(resolution: *const panos_core.resolver.Resolution, compiled: *const panos_core.compiler.CompileResult) ?panos_core.bytecode.FunctionId {
     for (resolution.symbols.symbols.items, 0..) |symbol, index| {
         if (symbol.kind != .function or !std.mem.eql(u8, symbol.name, "старт")) continue;
@@ -174,6 +212,18 @@ pub fn main(init: std.process.Init) !void {
         try stderr.print("panos build: Zig AOT-сборка ещё не поддержана\n", .{});
         try stderr.flush();
         std.process.exit(1);
+    }
+
+    var graph = panos_core.module_loader.Graph.init(init.gpa);
+    defer graph.deinit();
+    try graph.load(&FileReader{ .io = init.io }, file_path);
+    if (!hasErrors(&graph.diagnostics) and graph.modules.items.len > 1) try reportUnsupportedModuleExecution(&graph);
+    if (graph.diagnostics.items.items.len != 0) {
+        try writeModuleDiagnostics(stderr, &graph);
+        if (hasErrors(&graph.diagnostics)) {
+            try stderr.flush();
+            std.process.exit(1);
+        }
     }
 
     const input = std.Io.Dir.cwd().readFileAlloc(init.io, file_path, init.gpa, .limited(16 * 1024 * 1024)) catch |err| {
@@ -251,6 +301,44 @@ test "CLI marks warnings without changing their Russian message" {
     defer std.testing.allocator.free(rendered);
 
     try std.testing.expectEqualStrings("main.ps:1:1: warning: неиспользуемая переменная 'x'", rendered);
+}
+
+test "CLI formats module-loader diagnostics at their source file" {
+    var graph = panos_core.module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    const bytes = try std.testing.allocator.dupe(u8, "x");
+    try graph.modules.append(std.testing.allocator, .{
+        .file = panos_core.source.SourceFile.init(0, "модуль.ps", bytes),
+        .tree = panos_core.ast.Ast.init(std.testing.allocator),
+    });
+    const message = try graph.arena.allocator().dupe(u8, "Module Loader Error: пример");
+    _ = try graph.diagnostics.appendUnique(std.testing.allocator, .{
+        .phase = .parser,
+        .severity = .err,
+        .span = .{ .file_id = 0, .start = 0, .end = 0 },
+        .message = message,
+    });
+    try std.testing.expect(hasErrors(&graph.diagnostics));
+    const module = graph.moduleForFile(0).?;
+    const rendered = try formatDiagnostic(std.testing.allocator, module.file, graph.diagnostics.items.items[0]);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("модуль.ps:1:1: Module Loader Error: пример", rendered);
+}
+
+test "CLI blocks execution before the module linker is available" {
+    var graph = panos_core.module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.imports.append(std.testing.allocator, .{
+        .importer = 0,
+        .declaration = @enumFromInt(0),
+        .target = 1,
+        .alias = "математика",
+        .span = .{ .file_id = 0, .start = 0, .end = 1 },
+    });
+    try reportUnsupportedModuleExecution(&graph);
+
+    try std.testing.expectEqual(@as(usize, 1), graph.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Compiler Error: выполнение импортов ещё не поддержано Zig-версией", graph.diagnostics.items.items[0].message);
 }
 
 test "CLI rejects diagnostics outside their source file" {

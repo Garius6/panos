@@ -103,6 +103,7 @@ pub const Vm = struct {
             .set_local => |slot| try self.setLocal(slot),
             .jump => |target| try self.jump(target),
             .jump_if_false => |target| try self.jumpIfFalse(target),
+            .match_enum => |name_constant| try self.matchEnum(compiled, name_constant),
             .pop => _ = try self.pop(),
             .call => |argument_count| try self.call(argument_count),
             .build_closure => |closure| try self.buildClosure(closure),
@@ -419,6 +420,33 @@ pub const Vm = struct {
             },
         };
         try self.buildAggregate(name, structure.field_count);
+    }
+
+    fn matchEnum(self: *Vm, compiled: *const bytecode.Function, name_constant: u16) anyerror!void {
+        if (name_constant >= compiled.constants.items.len) {
+            try self.fault("Runtime Error: имя варианта вне константного пула", .{});
+            return;
+        }
+        const expected_name = switch (compiled.constants.items[name_constant]) {
+            .string => |name| name,
+            else => {
+                try self.fault("Runtime Error: имя варианта имеет неверный тип", .{});
+                return;
+            },
+        };
+        const runtime_value = try self.pop();
+        const aggregate = switch (runtime_value) {
+            .aggregate => |aggregate_value| aggregate_value,
+            else => {
+                try self.fault("Runtime Error: сопоставление варианта ожидает перечисление", .{});
+                return;
+            },
+        };
+        const actual_name = aggregate.name orelse {
+            try self.fault("Runtime Error: сопоставление варианта ожидает перечисление", .{});
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .boolean = std.mem.eql(u8, actual_name, expected_name) });
     }
 
     fn buildArray(self: *Vm, count: u16) !void {
@@ -866,6 +894,35 @@ test "VM constructs enum variants" {
     }
 }
 
+test "VM matches generic enum variants" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Опция[T] = перечисление\nНет()\nЕсть(T)\nконец\nфунк извлечь[T](опция: Опция(T), запас: T) -> T\nвыбор опция\nОпция.Есть(значение) -> значение\nОпция.Нет() -> запас\nконец\nконец\nфунк старт() -> Строка\nизвлечь(Опция.Есть(\"готово\"), \"запас\")\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(1), &.{});
+    switch (outcome) {
+        .success => |runtime_value| try std.testing.expectEqualStrings("готово", runtime_value.stringBytes().?),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM executes compiled calls and control flow" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -1002,6 +1059,26 @@ test "VM reports division by zero without crashing" {
     const outcome = try vm.run(function_id, &.{});
     switch (outcome) {
         .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: деление на ноль", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM guards enum matches against non-enum values" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("выбор", 0);
+    const function = program.function(function_id).?;
+    const number = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    const variant = try function.addConstant(std.testing.allocator, .{ .string = "Опция.Есть" });
+    try function.emit(std.testing.allocator, .{ .constant = number });
+    try function.emit(std.testing.allocator, .{ .match_enum = variant });
+    try function.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: сопоставление варианта ожидает перечисление", message),
         .success => return error.TestUnexpectedResult,
     }
 }

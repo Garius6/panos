@@ -356,6 +356,7 @@ const FunctionCompiler = struct {
             .property => |property| try self.compileProperty(property),
             .if_expr => |conditional| try self.compileIf(conditional),
             .while_expr => |loop| try self.compileWhile(loop),
+            .match_expr => |match| try self.compileMatch(match),
             else => try self.unsupportedExpression(expressionSpan(self.compiler.tree, expression)),
         }
     }
@@ -509,6 +510,49 @@ const FunctionCompiler = struct {
         try self.emitVoid();
     }
 
+    fn compileMatch(self: *FunctionCompiler, match: anytype) !void {
+        const subject_slot = try self.allocateLocal();
+        try self.compileExpression(match.subject);
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = subject_slot });
+        var end_jumps: std.ArrayList(usize) = .empty;
+        defer end_jumps.deinit(self.compiler.result.allocator);
+        var fallback_seen = false;
+        for (match.arms) |arm| {
+            if (fallback_seen) break;
+            switch (self.compiler.tree.pattern(arm.pattern).*) {
+                .constructor => {
+                    const variant_name = try self.patternEnumVariantName(arm.pattern) orelse {
+                        try self.unsupportedExpression(arm.span);
+                        continue;
+                    };
+                    try self.function.emit(self.compiler.result.allocator, .{ .get_local = subject_slot });
+                    const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(variant_name) });
+                    try self.function.emit(self.compiler.result.allocator, .{ .match_enum = name_constant });
+                    const next_arm = self.function.instructions.items.len;
+                    try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+                    try self.compilePatternBindings(arm.pattern, subject_slot);
+                    try self.compileBlockValue(arm.body);
+                    const end_jump = self.function.instructions.items.len;
+                    try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+                    try end_jumps.append(self.compiler.result.allocator, end_jump);
+                    self.patchJump(next_arm, self.function.instructions.items.len);
+                },
+                .wildcard, .ident => {
+                    fallback_seen = true;
+                    try self.compilePatternBindings(arm.pattern, subject_slot);
+                    try self.compileBlockValue(arm.body);
+                    const end_jump = self.function.instructions.items.len;
+                    try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+                    try end_jumps.append(self.compiler.result.allocator, end_jump);
+                },
+                else => try self.unsupportedExpression(arm.span),
+            }
+        }
+        try self.emitVoid();
+        const end_target = self.function.instructions.items.len;
+        for (end_jumps.items) |jump| self.patchJump(jump, end_target);
+    }
+
     fn compileForRange(self: *FunctionCompiler, statement: ast.StmtId, range: anytype) !void {
         const bindings = self.compiler.resolution.stmt_bindings.get(statement) orelse &.{};
         if (bindings.len != 1) {
@@ -602,6 +646,26 @@ const FunctionCompiler = struct {
 
     fn compileBlockStatements(self: *FunctionCompiler, statements: []const ast.StmtId) !void {
         for (statements) |statement| _ = try self.compileStatement(statement, false);
+    }
+
+    fn compilePatternBindings(self: *FunctionCompiler, pattern: ast.PatternId, value_slot: u16) !void {
+        switch (self.compiler.tree.pattern(pattern).*) {
+            .ident => {
+                const binding = self.compiler.resolution.pattern_symbols.get(pattern) orelse return;
+                const binding_slot = try self.ensureLocal(binding);
+                try self.function.emit(self.compiler.result.allocator, .{ .get_local = value_slot });
+                try self.function.emit(self.compiler.result.allocator, .{ .set_local = binding_slot });
+            },
+            .constructor => |constructor| for (constructor.arguments, 0..) |argument, index| {
+                if (index > std.math.maxInt(u16)) return error.FieldLimitReached;
+                const field_slot = try self.allocateLocal();
+                try self.function.emit(self.compiler.result.allocator, .{ .get_local = value_slot });
+                try self.function.emit(self.compiler.result.allocator, .{ .get_property = @intCast(index) });
+                try self.function.emit(self.compiler.result.allocator, .{ .set_local = field_slot });
+                try self.compilePatternBindings(argument, field_slot);
+            },
+            .wildcard, .literal, .error_node => {},
+        }
     }
 
     fn patchJump(self: *FunctionCompiler, instruction_index: usize, target: usize) void {
@@ -757,6 +821,15 @@ const FunctionCompiler = struct {
 
     fn enumConstructor(self: *FunctionCompiler, callee: ast.ExprId) !?[]const u8 {
         const variant_symbol = self.compiler.resolution.expr_symbols.get(callee) orelse return null;
+        return self.enumVariantName(variant_symbol);
+    }
+
+    fn patternEnumVariantName(self: *FunctionCompiler, pattern: ast.PatternId) !?[]const u8 {
+        const variant_symbol = self.compiler.resolution.pattern_symbols.get(pattern) orelse return null;
+        return self.enumVariantName(variant_symbol);
+    }
+
+    fn enumVariantName(self: *FunctionCompiler, variant_symbol: symbols.SymbolId) !?[]const u8 {
         const variant = self.compiler.resolution.symbols.get(variant_symbol) orelse return null;
         if (variant.kind != .enum_variant) return null;
         const owner = self.compiler.resolution.symbols.get(variant.owner_type) orelse return null;

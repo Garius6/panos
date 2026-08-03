@@ -382,7 +382,28 @@ const Resolver = struct {
                 const symbol = try self.declareLocal(ident.name, ident.span, false, true);
                 try self.result.pattern_symbols.put(pattern, symbol);
             },
-            .constructor => |constructor| for (constructor.arguments) |argument| try self.resolvePattern(tree, argument),
+            .constructor => |constructor| {
+                if (constructor.module_name) |owner_name| {
+                    const owner_symbol = try self.scopes.lookupTrackingCaptures(&self.result.symbols, owner_name) orelse symbols.invalid_symbol;
+                    const owner = self.result.symbols.get(owner_symbol);
+                    if (owner) |entry| {
+                        if (entry.kind == .type) {
+                            if (self.result.findEnumVariant(owner_symbol, constructor.name)) |variant| {
+                                try self.result.pattern_symbols.put(pattern, variant);
+                            } else {
+                                try self.report(constructor.span, "Resolve Error: у перечисления '{s}' нет варианта '{s}'", .{ owner_name, constructor.name });
+                            }
+                        } else {
+                            try self.report(constructor.span, "Resolve Error: '{s}' не является перечислением", .{owner_name});
+                        }
+                    } else {
+                        try self.report(constructor.span, "Resolve Error: неопределённый тип перечисления '{s}'", .{owner_name});
+                    }
+                } else {
+                    try self.report(constructor.span, "Resolve Error: вариант в шаблоне должен быть квалифицирован именем перечисления", .{});
+                }
+                for (constructor.arguments) |argument| try self.resolvePattern(tree, argument);
+            },
             .wildcard, .error_node => {},
         }
     }

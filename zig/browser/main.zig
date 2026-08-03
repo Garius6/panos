@@ -56,7 +56,7 @@ pub export fn panos_check(source_len: i32) void {
         setResult("[]");
         return;
     };
-    var run = panos_core.runner.runSource(allocator, "плейграунд.ps", input) catch {
+    var run = panos_core.runner.checkSource(allocator, "плейграунд.ps", input) catch {
         setResult("[]");
         return;
     };
@@ -183,4 +183,12 @@ test "browser check serializes diagnostics for the editor contract" {
 
     try std.testing.expect(std.mem.startsWith(u8, result_buffer[0..result_len], "[{\"from\":22,\"to\":32,"));
     try std.testing.expect(std.mem.indexOf(u8, result_buffer[0..result_len], "Resolve Error: неопределённое имя 'неизвестно'") != null);
+}
+
+test "browser check does not require an entry function" {
+    const input = "экспорт функ значение() -> Число\n42\nконец";
+    @memcpy(source_buffer[0..input.len], input);
+    panos_check(@intCast(input.len));
+
+    try std.testing.expectEqualStrings("[]", result_buffer[0..result_len]);
 }

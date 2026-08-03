@@ -76,6 +76,29 @@ pub fn runSource(allocator: std.mem.Allocator, path: []const u8, input: []const 
     return runSourceWithVerbose(allocator, path, input, false);
 }
 
+pub fn checkSource(allocator: std.mem.Allocator, path: []const u8, input: []const u8) !SourceRun {
+    var result = SourceRun.init(allocator);
+    errdefer result.deinit();
+    const file = source.SourceFile.init(0, path, input);
+
+    var lexed = try lexer.tokenize(allocator, input, file.id);
+    defer lexed.deinit();
+    try result.appendDiagnostics(&lexed.diagnostics);
+
+    var parsed = try parser.parse(allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    try result.appendDiagnostics(&parsed.diagnostics);
+
+    var resolved = try resolver.resolve(allocator, &parsed.ast);
+    defer resolved.deinit();
+    try result.appendDiagnostics(&resolved.diagnostics);
+
+    var checked = try type_checker.check(allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try result.appendDiagnostics(&checked.diagnostics);
+    return result;
+}
+
 pub fn runSourceWithVerbose(allocator: std.mem.Allocator, path: []const u8, input: []const u8, verbose: bool) !SourceRun {
     var result = SourceRun.init(allocator);
     errdefer result.deinit();
@@ -156,5 +179,13 @@ test "runner accumulates frontend diagnostics without executing" {
     defer result.deinit();
 
     try std.testing.expect(result.hasErrors());
+    try std.testing.expect(result.execution == null);
+}
+
+test "checker accepts a valid program without an entry function" {
+    var result = try checkSource(std.testing.allocator, "библиотека.ps", "экспорт функ значение() -> Число\n42\nконец");
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
     try std.testing.expect(result.execution == null);
 }

@@ -16,6 +16,7 @@ pub const Resolution = struct {
     diagnostics: diagnostic.DiagnosticList = .{},
     decl_symbols: std.AutoHashMap(ast.DeclId, symbols.SymbolId),
     stmt_symbols: std.AutoHashMap(ast.StmtId, symbols.SymbolId),
+    stmt_bindings: std.AutoHashMap(ast.StmtId, []const symbols.SymbolId),
     expr_symbols: std.AutoHashMap(ast.ExprId, symbols.SymbolId),
     pattern_symbols: std.AutoHashMap(ast.PatternId, symbols.SymbolId),
     function_parameters: std.AutoHashMap(ast.DeclId, []const symbols.SymbolId),
@@ -30,6 +31,7 @@ pub const Resolution = struct {
             .symbols = try symbols.SymbolStore.init(allocator),
             .decl_symbols = .init(allocator),
             .stmt_symbols = .init(allocator),
+            .stmt_bindings = .init(allocator),
             .expr_symbols = .init(allocator),
             .pattern_symbols = .init(allocator),
             .function_parameters = .init(allocator),
@@ -46,6 +48,7 @@ pub const Resolution = struct {
         self.function_parameters.deinit();
         self.pattern_symbols.deinit();
         self.expr_symbols.deinit();
+        self.stmt_bindings.deinit();
         self.stmt_symbols.deinit();
         self.decl_symbols.deinit();
         self.diagnostics.deinit(self.allocator);
@@ -252,14 +255,18 @@ const Resolver = struct {
         switch (value) {
             .let => |let| {
                 try self.resolveExpression(self.tree, let.value);
+                var bindings: std.ArrayList(symbols.SymbolId) = .empty;
+                defer bindings.deinit(self.result.allocator);
                 if (let.name) |name| {
                     const symbol = try self.declareLocal(name, let.span, let.is_const, false);
                     try self.result.stmt_symbols.put(statement, symbol);
+                    try bindings.append(self.result.allocator, symbol);
                 } else {
                     for (let.destructure_names) |name| {
-                        _ = try self.declareLocal(name, let.span, let.is_const, false);
+                        try bindings.append(self.result.allocator, try self.declareLocal(name, let.span, let.is_const, false));
                     }
                 }
+                if (bindings.items.len != 0) try self.result.stmt_bindings.put(statement, try self.result.arena.allocator().dupe(symbols.SymbolId, bindings.items));
             },
             .return_stmt => |return_stmt| try self.resolveExpression(self.tree, return_stmt.value),
             .expr => |expression| try self.resolveExpression(self.tree, expression.value),
@@ -267,7 +274,10 @@ const Resolver = struct {
                 try self.resolveExpression(self.tree, loop.iterable);
                 _ = try self.scopes.push();
                 defer _ = self.scopes.pop() catch unreachable;
-                for (loop.names) |name| _ = try self.declareLocal(name, loop.span, false, false);
+                var bindings: std.ArrayList(symbols.SymbolId) = .empty;
+                defer bindings.deinit(self.result.allocator);
+                for (loop.names) |name| try bindings.append(self.result.allocator, try self.declareLocal(name, loop.span, false, false));
+                try self.result.stmt_bindings.put(statement, try self.result.arena.allocator().dupe(symbols.SymbolId, bindings.items));
                 try self.resolveStatements(loop.body);
             },
             .for_range => |range| {
@@ -275,7 +285,8 @@ const Resolver = struct {
                 try self.resolveExpression(self.tree, range.end);
                 _ = try self.scopes.push();
                 defer _ = self.scopes.pop() catch unreachable;
-                _ = try self.declareLocal(range.name, range.span, false, false);
+                const symbol = try self.declareLocal(range.name, range.span, false, false);
+                try self.result.stmt_bindings.put(statement, try self.result.arena.allocator().dupe(symbols.SymbolId, &.{symbol}));
                 try self.resolveStatements(range.body);
             },
             .continue_stmt, .break_stmt, .error_node => {},
@@ -468,4 +479,27 @@ test "resolver links qualified enum constructors to variant symbols" {
     const variant = resolved.expr_symbols.get(property).?;
     try std.testing.expectEqual(symbols.SymbolKind.enum_variant, resolved.symbols.get(variant).?.kind);
     try std.testing.expectEqualStrings("Да", resolved.symbols.get(variant).?.name);
+}
+
+test "resolver records all statement binders for destructuring and loops" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Пусто\nпер (ключ, значение) = (\"a\", 1)\nдля элемент в массив(1) цикл\nэлемент\nконец\nдля индекс = 1 по 2 цикл\nиндекс\nконец\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    const function = parsed.ast.decl(parsed.ast.program.?.declarations[0]).function;
+    const destructure = resolved.stmt_bindings.get(function.body[0]).?;
+    const for_in = resolved.stmt_bindings.get(function.body[1]).?;
+    const for_range = resolved.stmt_bindings.get(function.body[2]).?;
+    try std.testing.expectEqual(@as(usize, 2), destructure.len);
+    try std.testing.expectEqualStrings("ключ", resolved.symbols.get(destructure[0]).?.name);
+    try std.testing.expectEqual(@as(usize, 1), for_in.len);
+    try std.testing.expectEqualStrings("элемент", resolved.symbols.get(for_in[0]).?.name);
+    try std.testing.expectEqual(@as(usize, 1), for_range.len);
+    try std.testing.expectEqualStrings("индекс", resolved.symbols.get(for_range[0]).?.name);
 }

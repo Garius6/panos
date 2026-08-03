@@ -6,6 +6,7 @@ pub const compiler = @import("compiler.zig");
 pub const diagnostic = @import("diagnostic.zig");
 pub const gc = @import("gc.zig");
 pub const lexer = @import("lexer.zig");
+pub const module_loader = @import("module_loader.zig");
 pub const parser = @import("parser.zig");
 pub const resolver = @import("resolver.zig");
 pub const source = @import("source.zig");

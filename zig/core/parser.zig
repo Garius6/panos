@@ -1171,6 +1171,9 @@ const Parser = struct {
                 body = try self.result.ast.copySlice(ast.StmtId, &.{statement});
                 end = self.astExprSpan(value);
                 self.consumeSemicolons();
+                if (!self.at(.end) and !self.at(.eof) and !self.peek().nl_before) {
+                    try self.report(self.peek().span, "Синтаксическая ошибка: несколько выражений в одной строке ветки 'выбор' — используйте 'тогда ... конец' для нескольких операторов");
+                }
             }
             try arms.append(self.result.allocator, .{
                 .span = spanFrom(arm_start, end),
@@ -1665,4 +1668,22 @@ test "parser reports a missing assignment and resumes at the next statement" {
         .function => |function| try std.testing.expectEqual(@as(usize, 2), function.body.len),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "parser explains multi-statement match arms without тогда" {
+    const lexer = @import("lexer.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "функ выбрать() -> Число\nвыбор истина\nистина -> 1 пер значение = 2\nложь -> 3\nконец\nконец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.diagnostics.items.items.len > 0);
+    try std.testing.expectEqualStrings(
+        "Синтаксическая ошибка: несколько выражений в одной строке ветки 'выбор' — используйте 'тогда ... конец' для нескольких операторов",
+        parsed.diagnostics.items.items[0].message,
+    );
 }

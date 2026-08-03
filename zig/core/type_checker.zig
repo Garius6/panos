@@ -38,6 +38,7 @@ const Checker = struct {
     tree: *const ast.Ast,
     resolution: *const resolver.Resolution,
     result: *CheckResult,
+    current_return: ?types.TypeId = null,
 
     fn report(self: *Checker, span: source.Span, comptime format: []const u8, args: anytype) !void {
         const message = try std.fmt.allocPrint(self.result.arena.allocator(), format, args);
@@ -96,12 +97,14 @@ const Checker = struct {
         const function_symbol = self.resolution.decl_symbols.get(declaration) orelse return;
         const signature = self.result.symbol_types.get(function_symbol) orelse return;
         const function_type = self.result.types.get(signature).?.function;
+        const previous_return = self.current_return;
+        self.current_return = function_type.return_type;
+        defer self.current_return = previous_return;
         const parameter_symbols = self.resolution.function_parameters.get(declaration) orelse &.{};
         for (parameter_symbols, function_type.parameters) |parameter_symbol, parameter_type| {
             try self.result.symbol_types.put(parameter_symbol, parameter_type);
         }
-        var actual = self.result.types.builtins.void;
-        for (body) |statement| actual = try self.inferStatement(statement, function_type.return_type);
+        const actual = try self.inferBlock(body);
         if (!self.assignable(actual, function_type.return_type)) {
             const span = self.tree.decl(declaration).function.span;
             try self.report(span, "Type Error: функция должна возвращать объявленный тип", .{});
@@ -161,10 +164,41 @@ const Checker = struct {
                 const value = try self.infer(map.entries[0].value);
                 break :blk try self.result.types.map(key, value);
             },
+            .if_expr => |conditional| try self.inferIf(conditional),
+            .while_expr => |loop| try self.inferWhile(loop),
             else => try self.result.types.poison(),
         };
         try self.result.expression_types.put(expression, inferred);
         return inferred;
+    }
+
+    fn inferBlock(self: *Checker, statements: []const ast.StmtId) anyerror!types.TypeId {
+        var result_type = self.result.types.builtins.void;
+        for (statements) |statement| result_type = try self.inferStatement(statement, self.current_return orelse self.result.types.builtins.void);
+        return result_type;
+    }
+
+    fn inferIf(self: *Checker, conditional: anytype) anyerror!types.TypeId {
+        const condition = try self.infer(conditional.condition);
+        if (!self.assignable(condition, self.result.types.builtins.boolean)) {
+            try self.report(conditional.span, "Type Error: условие 'если' должно иметь тип Булево", .{});
+        }
+        const then_type = try self.inferBlock(conditional.then_branch);
+        const else_type = try self.inferBlock(conditional.else_branch);
+        if (!self.assignable(then_type, else_type) or !self.assignable(else_type, then_type)) {
+            try self.report(conditional.span, "Type Error: ветви 'если' возвращают разные типы", .{});
+            return self.result.types.poison();
+        }
+        return then_type;
+    }
+
+    fn inferWhile(self: *Checker, loop: anytype) anyerror!types.TypeId {
+        const condition = try self.infer(loop.condition);
+        if (!self.assignable(condition, self.result.types.builtins.boolean)) {
+            try self.report(loop.span, "Type Error: условие 'пока' должно иметь тип Булево", .{});
+        }
+        _ = try self.inferBlock(loop.body);
+        return self.result.types.builtins.void;
     }
 
     fn inferUnary(self: *Checker, unary: anytype) anyerror!types.TypeId {
@@ -295,4 +329,21 @@ test "type checker accumulates argument type diagnostics" {
 
     try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("Type Error: аргумент не совпадает с типом параметра", checked.diagnostics.items.items[0].message);
+}
+
+test "type checker checks control-flow conditions and branch results" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ выбрать(условие: Булево) -> Число\nесли условие тогда\n1\nиначе\n2\nконец\nконец\nфунк ошибка() -> Число\nесли 1 тогда\n\"нет\"\nиначе\n2\nконец\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: условие 'если' должно иметь тип Булево", checked.diagnostics.items.items[0].message);
+    try std.testing.expectEqualStrings("Type Error: ветви 'если' возвращают разные типы", checked.diagnostics.items.items[1].message);
 }

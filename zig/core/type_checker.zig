@@ -6,6 +6,11 @@ const source = @import("source.zig");
 const symbols = @import("symbols.zig");
 const types = @import("types.zig");
 
+pub const NominalField = struct {
+    name: []const u8,
+    typ: types.TypeId,
+};
+
 pub const CheckResult = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -13,6 +18,7 @@ pub const CheckResult = struct {
     diagnostics: diagnostic.DiagnosticList = .{},
     expression_types: std.AutoHashMap(ast.ExprId, types.TypeId),
     symbol_types: std.AutoHashMap(symbols.SymbolId, types.TypeId),
+    nominal_fields: std.AutoHashMap(symbols.SymbolId, []const NominalField),
 
     pub fn init(allocator: std.mem.Allocator) !CheckResult {
         return .{
@@ -21,10 +27,12 @@ pub const CheckResult = struct {
             .types = try types.TypeStore.init(allocator),
             .expression_types = .init(allocator),
             .symbol_types = .init(allocator),
+            .nominal_fields = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CheckResult) void {
+        self.nominal_fields.deinit();
         self.symbol_types.deinit();
         self.expression_types.deinit();
         self.diagnostics.deinit(self.allocator);
@@ -61,6 +69,27 @@ const Checker = struct {
                 },
                 else => {},
             }
+        }
+    }
+
+    fn nominalPass(self: *Checker) !void {
+        for (self.tree.program.?.declarations) |declaration| {
+            const structure = switch (self.tree.decl(declaration).*) {
+                .struct_decl => |value| value,
+                else => continue,
+            };
+            if (structure.is_ffi or structure.type_parameters.len != 0) continue;
+            const symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
+            var fields: std.ArrayList(NominalField) = .empty;
+            defer fields.deinit(self.result.allocator);
+            for (structure.fields) |field| {
+                const annotation = field.type_annotation orelse continue;
+                try fields.append(self.result.allocator, .{
+                    .name = field.name,
+                    .typ = try self.resolveType(annotation),
+                });
+            }
+            try self.result.nominal_fields.put(symbol, try self.result.arena.allocator().dupe(NominalField, fields.items));
         }
     }
 
@@ -139,6 +168,9 @@ const Checker = struct {
             .string => self.result.types.builtins.string,
             .ident => blk: {
                 const symbol = self.resolution.expr_symbols.get(expression) orelse break :blk try self.result.types.poison();
+                if (self.resolution.symbols.get(symbol)) |entry| {
+                    if (entry.kind == .type) break :blk try self.result.types.nominal(symbol, &.{});
+                }
                 break :blk self.result.symbol_types.get(symbol) orelse try self.result.types.poison();
             },
             .unary => |unary| try self.inferUnary(unary),
@@ -169,6 +201,7 @@ const Checker = struct {
                 break :blk try self.result.types.map(key, value);
             },
             .index => |index| try self.inferIndex(index),
+            .property => |property| try self.inferProperty(expression, property),
             .lambda => |lambda| try self.inferLambda(expression, lambda, null),
             .if_expr => |conditional| try self.inferIf(conditional),
             .while_expr => |loop| try self.inferWhile(loop),
@@ -234,6 +267,26 @@ const Checker = struct {
                 break :blk try self.result.types.poison();
             },
         };
+    }
+
+    fn inferProperty(self: *Checker, expression: ast.ExprId, property: anytype) anyerror!types.TypeId {
+        if (self.resolution.expr_symbols.get(expression)) |symbol| {
+            if (self.resolution.symbols.get(symbol)) |entry| {
+                if (entry.kind == .enum_variant) return self.result.types.poison();
+            }
+        }
+        const object_type = try self.infer(property.object);
+        const object = self.result.types.get(object_type) orelse return self.result.types.poison();
+        switch (object.*) {
+            .nominal => |nominal| if (self.result.nominal_fields.get(nominal.symbol)) |fields| {
+                for (fields) |field| {
+                    if (std.mem.eql(u8, field.name, property.property)) return field.typ;
+                }
+            },
+            else => {},
+        }
+        try self.report(property.span, "Type Error: у типа нет поля '{s}'", .{property.property});
+        return self.result.types.poison();
     }
 
     fn inferLambda(self: *Checker, expression: ast.ExprId, lambda: anytype, expected: ?types.TypeId) anyerror!types.TypeId {
@@ -317,6 +370,18 @@ const Checker = struct {
                 }
                 return function.return_type;
             },
+            .nominal => |nominal| {
+                if (self.result.nominal_fields.get(nominal.symbol)) |fields| {
+                    if (call.arguments.len != fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора структуры", .{});
+                    const shared = @min(call.arguments.len, fields.len);
+                    for (call.arguments[0..shared], fields[0..shared]) |argument, field| {
+                        if (!self.assignable(try self.infer(argument), field.typ)) try self.report(call.span, "Type Error: аргумент конструктора не совпадает с типом поля", .{});
+                    }
+                    return callee_type;
+                }
+                try self.report(call.span, "Type Error: вызвано значение, не являющееся функцией", .{});
+                return self.result.types.poison();
+            },
             else => {
                 try self.report(call.span, "Type Error: вызвано значение, не являющееся функцией", .{});
                 return self.result.types.poison();
@@ -378,6 +443,7 @@ pub fn check(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *co
     var result = try CheckResult.init(allocator);
     errdefer result.deinit();
     var checker = Checker{ .tree = tree, .resolution = resolution, .result = &result };
+    try checker.nominalPass();
     try checker.signaturePass();
     try checker.bodyPass();
     return result;
@@ -489,4 +555,22 @@ test "type checker preserves nominal user types in function signatures" {
     defer checked.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "type checker checks struct constructors and field access" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Точка = структура\nx: Число\ny: Число\nконец\nфунк взять_x() -> Число\nпер точка = Точка(3, 4)\nточка.x\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    const function = parsed.ast.decl(parsed.ast.program.?.declarations[1]).function;
+    const property = parsed.ast.stmt(function.body[1]).expr.value;
+    try std.testing.expectEqual(checked.types.builtins.number, checked.expression_types.get(property).?);
 }

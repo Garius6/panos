@@ -12,16 +12,19 @@ pub const CompileResult = struct {
     program: bytecode.Program,
     diagnostics: diagnostic.DiagnosticList = .{},
     function_ids: std.AutoHashMap(symbols.SymbolId, bytecode.FunctionId),
+    lambda_ids: std.AutoHashMap(ast.ExprId, bytecode.FunctionId),
 
     pub fn init(allocator: std.mem.Allocator) CompileResult {
         return .{
             .allocator = allocator,
             .program = bytecode.Program.init(allocator),
             .function_ids = .init(allocator),
+            .lambda_ids = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CompileResult) void {
+        self.lambda_ids.deinit();
         self.function_ids.deinit();
         self.diagnostics.deinit(self.allocator);
         self.program.deinit();
@@ -99,6 +102,45 @@ const Compiler = struct {
         }
     }
 
+    fn predeclareLambdas(self: *Compiler) !void {
+        for (self.tree.expressions.items, 0..) |expression, index| {
+            const lambda = switch (expression) {
+                .lambda => |value| value,
+                else => continue,
+            };
+            if (lambda.parameters.len > std.math.maxInt(u16)) {
+                try self.report(lambda.span, "Compiler Error: слишком много параметров лямбды", .{});
+                continue;
+            }
+            const expression_id: ast.ExprId = @enumFromInt(index);
+            const function_id = try self.result.program.addFunction("лямбда", @intCast(lambda.parameters.len));
+            try self.result.lambda_ids.put(expression_id, function_id);
+        }
+    }
+
+    fn compileLambdas(self: *Compiler) !void {
+        for (self.tree.expressions.items, 0..) |expression, index| {
+            const lambda = switch (expression) {
+                .lambda => |value| value,
+                else => continue,
+            };
+            const expression_id: ast.ExprId = @enumFromInt(index);
+            const captures = self.resolution.lambda_captures.get(expression_id) orelse &.{};
+            if (captures.len != 0) continue;
+            const function_id = self.result.lambda_ids.get(expression_id) orelse continue;
+            const compiled = self.result.program.function(function_id) orelse continue;
+            const lambda_type = self.checked.expression_types.get(expression_id) orelse continue;
+            const type_entry = self.checked.types.get(lambda_type) orelse continue;
+            const signature = switch (type_entry.*) {
+                .function => |value| value,
+                else => continue,
+            };
+            compiled.returns_value = !self.checked.types.eql(signature.return_type, self.checked.types.builtins.void);
+            const parameters = self.resolution.lambda_parameters.get(expression_id) orelse &.{};
+            try self.compileFunctionBody(compiled, parameters, lambda.body);
+        }
+    }
+
     fn compileFunction(self: *Compiler, declaration: ast.DeclId) !void {
         const function = self.tree.decl(declaration).function;
         const symbol = self.resolution.decl_symbols.get(declaration) orelse return;
@@ -111,18 +153,27 @@ const Compiler = struct {
             else => return,
         };
         compiled.returns_value = !self.checked.types.eql(function_type.return_type, self.checked.types.builtins.void);
+        const parameter_symbols = self.resolution.function_parameters.get(declaration) orelse &.{};
+        try self.compileFunctionBody(compiled, parameter_symbols, function.body);
+    }
 
+    fn compileFunctionBody(
+        self: *Compiler,
+        compiled: *bytecode.Function,
+        parameter_symbols: []const symbols.SymbolId,
+        body: []const ast.StmtId,
+    ) !void {
         var context = FunctionCompiler.init(self, compiled);
         defer context.deinit();
-        const parameter_symbols = self.resolution.function_parameters.get(declaration) orelse &.{};
         for (parameter_symbols) |parameter_symbol| _ = try context.ensureLocal(parameter_symbol);
 
-        if (function.body.len == 0) {
+        if (body.len == 0) {
             try compiled.emit(self.result.allocator, .{ .return_void = {} });
+            compiled.local_count = context.next_local;
             return;
         }
-        for (function.body[0 .. function.body.len - 1]) |statement| _ = try context.compileStatement(statement, false);
-        const leaves_value = try context.compileStatement(function.body[function.body.len - 1], compiled.returns_value);
+        for (body[0 .. body.len - 1]) |statement| _ = try context.compileStatement(statement, false);
+        const leaves_value = try context.compileStatement(body[body.len - 1], compiled.returns_value);
         if (compiled.returns_value and leaves_value) {
             try compiled.emit(self.result.allocator, .{ .return_value = {} });
         } else {
@@ -287,6 +338,7 @@ const FunctionCompiler = struct {
             .tuple => |tuple| try self.compileSequence(tuple.elements, .build_tuple),
             .array => |array| try self.compileSequence(array.elements, .build_array),
             .map => |map| try self.compileMap(map),
+            .lambda => |lambda| try self.compileLambda(expression, lambda),
             .index => |index| {
                 try self.compileExpression(index.object);
                 try self.compileExpression(index.index);
@@ -297,6 +349,21 @@ const FunctionCompiler = struct {
             .while_expr => |loop| try self.compileWhile(loop),
             else => try self.unsupportedExpression(expressionSpan(self.compiler.tree, expression)),
         }
+    }
+
+    fn compileLambda(self: *FunctionCompiler, expression: ast.ExprId, lambda: anytype) !void {
+        const captures = self.compiler.resolution.lambda_captures.get(expression) orelse &.{};
+        if (captures.len != 0) {
+            try self.compiler.report(lambda.span, "Compiler Error: замыкания пока не поддержаны", .{});
+            try self.emitVoid();
+            return;
+        }
+        const function_id = self.compiler.result.lambda_ids.get(expression) orelse {
+            try self.compiler.report(lambda.span, "Compiler Error: не удалось скомпилировать лямбду", .{});
+            try self.emitVoid();
+            return;
+        };
+        try self.emitConstant(.{ .function_ref = function_id });
     }
 
     fn compileCall(self: *FunctionCompiler, call: anytype) !void {
@@ -642,7 +709,9 @@ pub fn compile(
     var compiler = Compiler.init(tree, resolution, checked, &result);
     defer compiler.deinit();
     try compiler.predeclareFunctions();
+    try compiler.predeclareLambdas();
     try compiler.compileFunctions();
+    try compiler.compileLambdas();
     return result;
 }
 
@@ -778,4 +847,23 @@ test "compiler emits property and index assignments" {
     }
     try std.testing.expect(has_set_property);
     try std.testing.expect(has_set_index);
+}
+
+test "compiler rejects captured lambdas before runtime" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Число\nпер сдвиг = 2\nпер добавить: функ(Число) -> Число = функ(значение)\nзначение + сдвиг\nконец\nдобавить(3)\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), compiled.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Compiler Error: замыкания пока не поддержаны", compiled.diagnostics.items.items[0].message);
 }

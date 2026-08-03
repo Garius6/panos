@@ -509,6 +509,14 @@ const FunctionCompiler = struct {
             try self.compileAssignment(binary);
             return;
         }
+        if (binary.operator == .and_expr) {
+            try self.compileLogicalAnd(binary);
+            return;
+        }
+        if (binary.operator == .or_expr) {
+            try self.compileLogicalOr(binary);
+            return;
+        }
         try self.compileExpression(binary.left);
         try self.compileExpression(binary.right);
         const instruction: bytecode.Instruction = switch (binary.operator) {
@@ -531,6 +539,30 @@ const FunctionCompiler = struct {
             else => return self.unsupportedExpression(binary.span),
         };
         try self.function.emit(self.compiler.result.allocator, instruction);
+    }
+
+    fn compileLogicalAnd(self: *FunctionCompiler, binary: anytype) !void {
+        try self.compileExpression(binary.left);
+        const false_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.compileExpression(binary.right);
+        const end_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+        self.patchJump(false_jump, self.function.instructions.items.len);
+        try self.emitConstant(.{ .boolean = false });
+        self.patchJump(end_jump, self.function.instructions.items.len);
+    }
+
+    fn compileLogicalOr(self: *FunctionCompiler, binary: anytype) !void {
+        try self.compileExpression(binary.left);
+        const false_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.emitConstant(.{ .boolean = true });
+        const end_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+        self.patchJump(false_jump, self.function.instructions.items.len);
+        try self.compileExpression(binary.right);
+        self.patchJump(end_jump, self.function.instructions.items.len);
     }
 
     fn compileAssignment(self: *FunctionCompiler, binary: anytype) anyerror!void {

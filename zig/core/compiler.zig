@@ -426,6 +426,8 @@ const FunctionCompiler = struct {
                 .{ .map_length = {} }
             else if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 2)
                 .{ .map_get_or = {} }
+            else if (std.mem.eql(u8, property.property, "записи") and call.arguments.len == 0)
+                .{ .map_entries = {} }
             else if (std.mem.eql(u8, property.property, "есть") and call.arguments.len == 1)
                 .{ .map_has_key = {} }
             else if (std.mem.eql(u8, property.property, "удалить") and call.arguments.len == 1)
@@ -531,13 +533,13 @@ const FunctionCompiler = struct {
 
     fn compileForIn(self: *FunctionCompiler, statement: ast.StmtId, loop: anytype) !void {
         const bindings = self.compiler.resolution.stmt_bindings.get(statement) orelse &.{};
-        if (bindings.len != 1) {
-            try self.compiler.report(loop.span, "Compiler Error: цикл 'для ... в' ожидает одну переменную массива", .{});
+        if (bindings.len == 0) {
+            try self.compiler.report(loop.span, "Compiler Error: цикл 'для ... в' ожидает переменную массива", .{});
             return;
         }
         const array_slot = try self.allocateLocal();
         const index_slot = try self.allocateLocal();
-        const element_slot = try self.ensureLocal(bindings[0]);
+        const element_slot = if (bindings.len == 1) try self.ensureLocal(bindings[0]) else try self.allocateLocal();
         try self.compileExpression(loop.iterable);
         try self.function.emit(self.compiler.result.allocator, .{ .set_local = array_slot });
         try self.emitConstant(.{ .number = 0 });
@@ -554,6 +556,18 @@ const FunctionCompiler = struct {
         try self.function.emit(self.compiler.result.allocator, .{ .get_local = index_slot });
         try self.function.emit(self.compiler.result.allocator, .{ .get_index = {} });
         try self.function.emit(self.compiler.result.allocator, .{ .set_local = element_slot });
+        if (bindings.len > 1) {
+            for (bindings, 0..) |binding, field_index| {
+                if (field_index > std.math.maxInt(u16)) {
+                    try self.compiler.report(loop.span, "Compiler Error: слишком много элементов деструктуризации", .{});
+                    return;
+                }
+                const slot = try self.ensureLocal(binding);
+                try self.function.emit(self.compiler.result.allocator, .{ .get_local = element_slot });
+                try self.function.emit(self.compiler.result.allocator, .{ .get_property = @intCast(field_index) });
+                try self.function.emit(self.compiler.result.allocator, .{ .set_local = slot });
+            }
+        }
         try self.enterLoop();
         try self.compileBlockStatements(loop.body);
         const continue_target = self.function.instructions.items.len;

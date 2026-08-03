@@ -106,6 +106,7 @@ pub const Vm = struct {
             .build_map => |count| try self.buildMap(count),
             .map_length => try self.mapLength(),
             .map_get_or => try self.mapGetOr(),
+            .map_entries => try self.mapEntries(),
             .array_has_index => try self.arrayHasIndex(),
             .map_has_key => try self.mapHasKey(),
             .map_remove_key => try self.mapRemoveKey(),
@@ -506,6 +507,29 @@ pub const Vm = struct {
             return;
         }
         try self.stack.append(self.allocator, fallback);
+    }
+
+    fn mapEntries(self: *Vm) anyerror!void {
+        const runtime_value = try self.pop();
+        const map = switch (runtime_value) {
+            .map => |map| map,
+            else => {
+                try self.fault("Runtime Error: записи доступны только для соответствия", .{});
+                return;
+            },
+        };
+        const array = try self.arena.allocator().create(value.Array);
+        const elements = try self.arena.allocator().alloc(value.Value, map.entries.items.len);
+        for (map.entries.items, 0..) |entry, index| {
+            const pair = try self.arena.allocator().create(value.Aggregate);
+            const pair_elements = try self.arena.allocator().alloc(value.Value, 2);
+            pair_elements[0] = entry.key;
+            pair_elements[1] = entry.value;
+            pair.* = .{ .elements = pair_elements };
+            elements[index] = .{ .aggregate = pair };
+        }
+        array.* = .{ .elements = elements };
+        try self.stack.append(self.allocator, .{ .array = array });
     }
 
     fn arrayHasIndex(self: *Vm) anyerror!void {
@@ -961,6 +985,25 @@ test "VM guards safe map reads against non-map values" {
     }
 }
 
+test "VM guards map entries against non-map values" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("записи", 0);
+    const function = program.function(function_id).?;
+    const one = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    try function.emit(std.testing.allocator, .{ .constant = one });
+    try function.emit(std.testing.allocator, .{ .map_entries = {} });
+    try function.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: записи доступны только для соответствия", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM guards map deletion against non-map values" {
     var program = bytecode.Program.init(std.testing.allocator);
     defer program.deinit();
@@ -1206,6 +1249,36 @@ test "VM reads collection values with fallbacks" {
     switch (outcome) {
         .success => |runtime_value| switch (runtime_value) {
             .number => |number| try std.testing.expectEqual(@as(f64, 35), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM iterates map entries with destructuring" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ сумма() -> Число\nпер цены = соответствие(\"a\" = 1, \"b\" = 2, \"c\" = 3)\nпер результат = 0\nдля (ключ, значение) в цены.записи() цикл\nесли ключ == \"b\" тогда\nпродолжить\nконец\nрезультат = результат + значение\nконец\nрезультат\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 4), number),
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

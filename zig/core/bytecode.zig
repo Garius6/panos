@@ -43,6 +43,7 @@ pub const Opcode = enum {
     return_value,
     return_void,
     build_tuple,
+    build_struct,
     build_array,
     build_map,
     get_index,
@@ -82,6 +83,10 @@ pub const Instruction = union(Opcode) {
     return_value: void,
     return_void: void,
     build_tuple: u16,
+    build_struct: struct {
+        name_constant: u16,
+        field_count: u16,
+    },
     build_array: u16,
     build_map: u16,
     get_index: void,

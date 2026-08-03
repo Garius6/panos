@@ -230,16 +230,68 @@ const FunctionCompiler = struct {
                 try self.function.emit(self.compiler.result.allocator, instruction);
             },
             .binary => |binary| try self.compileBinary(binary),
-            .call => |call| {
-                if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
-                try self.compileExpression(call.callee);
-                for (call.arguments) |argument| try self.compileExpression(argument);
-                if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
-                try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(call.arguments.len) });
+            .call => |call| try self.compileCall(call),
+            .tuple => |tuple| try self.compileSequence(tuple.elements, .build_tuple),
+            .array => |array| try self.compileSequence(array.elements, .build_array),
+            .map => |map| try self.compileMap(map),
+            .index => |index| {
+                try self.compileExpression(index.object);
+                try self.compileExpression(index.index);
+                try self.function.emit(self.compiler.result.allocator, .{ .get_index = {} });
             },
+            .property => |property| try self.compileProperty(property),
             .if_expr => |conditional| try self.compileIf(conditional),
             .while_expr => |loop| try self.compileWhile(loop),
             else => try self.unsupportedExpression(expressionSpan(self.compiler.tree, expression)),
+        }
+    }
+
+    fn compileCall(self: *FunctionCompiler, call: anytype) !void {
+        if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
+        if (try self.structConstructor(call.callee)) |structure| {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
+            const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(structure) });
+            try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
+                .name_constant = name_constant,
+                .field_count = @intCast(call.arguments.len),
+            } });
+            return;
+        }
+        try self.compileExpression(call.callee);
+        for (call.arguments) |argument| try self.compileExpression(argument);
+        if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
+        try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(call.arguments.len) });
+    }
+
+    fn compileSequence(self: *FunctionCompiler, expressions: []const ast.ExprId, comptime tag: bytecode.Opcode) !void {
+        if (expressions.len > std.math.maxInt(u16)) return error.CollectionLimitReached;
+        for (expressions) |expression| try self.compileExpression(expression);
+        const count: u16 = @intCast(expressions.len);
+        try self.function.emit(self.compiler.result.allocator, switch (tag) {
+            .build_tuple => .{ .build_tuple = count },
+            .build_array => .{ .build_array = count },
+            else => unreachable,
+        });
+    }
+
+    fn compileMap(self: *FunctionCompiler, map: anytype) !void {
+        if (map.entries.len > std.math.maxInt(u16)) return error.CollectionLimitReached;
+        for (map.entries) |entry| {
+            try self.compileExpression(entry.key);
+            try self.compileExpression(entry.value);
+        }
+        try self.function.emit(self.compiler.result.allocator, .{ .build_map = @intCast(map.entries.len) });
+    }
+
+    fn compileProperty(self: *FunctionCompiler, property: anytype) !void {
+        try self.compileExpression(property.object);
+        const field_index = try self.propertyIndex(property.object, property.property);
+        if (field_index) |index| {
+            try self.function.emit(self.compiler.result.allocator, .{ .get_property = index });
+        } else {
+            try self.function.emit(self.compiler.result.allocator, .{ .pop = {} });
+            try self.unsupportedExpression(property.span);
         }
     }
 
@@ -330,14 +382,58 @@ const FunctionCompiler = struct {
     }
 
     fn compileAssignment(self: *FunctionCompiler, binary: anytype) anyerror!void {
-        const symbol = switch (self.compiler.tree.expr(binary.left).*) {
-            .ident => self.compiler.resolution.expr_symbols.get(binary.left) orelse return self.unsupportedExpression(binary.span),
-            else => return self.unsupportedExpression(binary.span),
+        switch (self.compiler.tree.expr(binary.left).*) {
+            .ident => {
+                const symbol = self.compiler.resolution.expr_symbols.get(binary.left) orelse return self.unsupportedExpression(binary.span);
+                const slot = self.locals.get(symbol) orelse return self.unsupportedExpression(binary.span);
+                try self.compileExpression(binary.right);
+                try self.function.emit(self.compiler.result.allocator, .{ .set_local = slot });
+                try self.emitVoid();
+            },
+            .index => |index| {
+                try self.compileExpression(index.object);
+                try self.compileExpression(index.index);
+                try self.compileExpression(binary.right);
+                try self.function.emit(self.compiler.result.allocator, .{ .set_index = {} });
+                try self.emitVoid();
+            },
+            .property => |property| {
+                const field_index = try self.propertyIndex(property.object, property.property) orelse return self.unsupportedExpression(binary.span);
+                try self.compileExpression(property.object);
+                try self.compileExpression(binary.right);
+                try self.function.emit(self.compiler.result.allocator, .{ .set_property = field_index });
+                try self.emitVoid();
+            },
+            else => try self.unsupportedExpression(binary.span),
+        }
+    }
+
+    fn structConstructor(self: *const FunctionCompiler, callee: ast.ExprId) !?[]const u8 {
+        const callee_type = self.compiler.checked.expression_types.get(callee) orelse return null;
+        const type_entry = self.compiler.checked.types.get(callee_type) orelse return null;
+        const nominal = switch (type_entry.*) {
+            .nominal => |value| value,
+            else => return null,
         };
-        const slot = self.locals.get(symbol) orelse return self.unsupportedExpression(binary.span);
-        try self.compileExpression(binary.right);
-        try self.function.emit(self.compiler.result.allocator, .{ .set_local = slot });
-        try self.emitVoid();
+        if (!self.compiler.checked.nominal_fields.contains(nominal.symbol)) return null;
+        const symbol = self.compiler.resolution.symbols.get(nominal.symbol) orelse return null;
+        return symbol.name;
+    }
+
+    fn propertyIndex(self: *FunctionCompiler, object: ast.ExprId, property: []const u8) !?u16 {
+        const object_type = self.compiler.checked.expression_types.get(object) orelse return null;
+        const type_entry = self.compiler.checked.types.get(object_type) orelse return null;
+        const nominal = switch (type_entry.*) {
+            .nominal => |value| value,
+            else => return null,
+        };
+        const fields = self.compiler.checked.nominal_fields.get(nominal.symbol) orelse return null;
+        for (fields, 0..) |field, index| {
+            if (!std.mem.eql(u8, field.name, property)) continue;
+            if (index > std.math.maxInt(u16)) return error.FieldLimitReached;
+            return @intCast(index);
+        }
+        return null;
     }
 
     fn expressionIsInteger(self: *const FunctionCompiler, expression: ast.ExprId) bool {
@@ -434,4 +530,68 @@ test "compiler emits absolute jumps for if and while expressions" {
     }
     try std.testing.expect(has_forward_exit);
     try std.testing.expect(has_backward_loop);
+}
+
+test "compiler emits structures and collections" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Точка = структура\nx: Число\ny: Число\nконец\nфунк получить() -> Число\nпер точка = Точка(3, 4)\nпер числа = массив(точка.x, 2)\nпер цены = соответствие(\"x\" = числа[0])\nцены[\"x\"]\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const function = compiled.program.functions.items[0];
+    var has_struct = false;
+    var has_array = false;
+    var has_map = false;
+    var index_reads: usize = 0;
+    for (function.instructions.items) |instruction| {
+        switch (instruction) {
+            .build_struct => has_struct = true,
+            .build_array => has_array = true,
+            .build_map => has_map = true,
+            .get_index => index_reads += 1,
+            else => {},
+        }
+    }
+    try std.testing.expect(has_struct);
+    try std.testing.expect(has_array);
+    try std.testing.expect(has_map);
+    try std.testing.expectEqual(@as(usize, 2), index_reads);
+}
+
+test "compiler emits property and index assignments" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Точка = структура\nx: Число\nконец\nфунк обновить() -> Число\nпер точка = Точка(1)\nточка.x = 2\nпер числа = массив(3)\nчисла[0] = 4\nточка.x + числа[0]\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const function = compiled.program.functions.items[0];
+    var has_set_property = false;
+    var has_set_index = false;
+    for (function.instructions.items) |instruction| {
+        switch (instruction) {
+            .set_property => has_set_property = true,
+            .set_index => has_set_index = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(has_set_property);
+    try std.testing.expect(has_set_index);
 }

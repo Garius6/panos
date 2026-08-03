@@ -40,6 +40,7 @@ pub const Opcode = enum {
     jump_if_false,
     pop,
     call,
+    build_closure,
     return_value,
     return_void,
     build_tuple,
@@ -81,6 +82,10 @@ pub const Instruction = union(Opcode) {
     jump_if_false: usize,
     pop: void,
     call: u16,
+    build_closure: struct {
+        function_id: FunctionId,
+        capture_count: u16,
+    },
     return_value: void,
     return_void: void,
     build_tuple: u16,
@@ -100,6 +105,7 @@ pub const Instruction = union(Opcode) {
 pub const Function = struct {
     name: []const u8,
     arity: u16,
+    capture_count: u16 = 0,
     returns_value: bool = true,
     local_count: u16 = 0,
     instructions: std.ArrayList(Instruction) = .empty,

@@ -10,6 +10,11 @@ pub const Array = struct {
     elements: []Value,
 };
 
+pub const Closure = struct {
+    function_id: bytecode.FunctionId,
+    captures: []Value,
+};
+
 pub const MapEntry = struct {
     key: Value,
     value: Value,
@@ -30,6 +35,7 @@ pub const Value = union(enum) {
     boolean: bool,
     string: []const u8,
     function_ref: bytecode.FunctionId,
+    closure: *Closure,
     aggregate: *Aggregate,
     array: *Array,
     map: *Map,
@@ -51,6 +57,10 @@ pub const Value = union(enum) {
             },
             .function_ref => |left_function| switch (right) {
                 .function_ref => |right_function| left_function == right_function,
+                else => false,
+            },
+            .closure => |left_closure| switch (right) {
+                .closure => |right_closure| left_closure == right_closure,
                 else => false,
             },
             .aggregate => |left_aggregate| switch (right) {

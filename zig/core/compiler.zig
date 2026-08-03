@@ -126,7 +126,10 @@ const Compiler = struct {
             };
             const expression_id: ast.ExprId = @enumFromInt(index);
             const captures = self.resolution.lambda_captures.get(expression_id) orelse &.{};
-            if (captures.len != 0) continue;
+            if (captures.len > std.math.maxInt(u16)) {
+                try self.report(lambda.span, "Compiler Error: лямбда захватывает слишком много значений", .{});
+                continue;
+            }
             const function_id = self.result.lambda_ids.get(expression_id) orelse continue;
             const compiled = self.result.program.function(function_id) orelse continue;
             const lambda_type = self.checked.expression_types.get(expression_id) orelse continue;
@@ -136,8 +139,9 @@ const Compiler = struct {
                 else => continue,
             };
             compiled.returns_value = !self.checked.types.eql(signature.return_type, self.checked.types.builtins.void);
+            compiled.capture_count = @intCast(captures.len);
             const parameters = self.resolution.lambda_parameters.get(expression_id) orelse &.{};
-            try self.compileFunctionBody(compiled, parameters, lambda.body);
+            try self.compileFunctionBody(compiled, captures, parameters, lambda.body);
         }
     }
 
@@ -154,17 +158,19 @@ const Compiler = struct {
         };
         compiled.returns_value = !self.checked.types.eql(function_type.return_type, self.checked.types.builtins.void);
         const parameter_symbols = self.resolution.function_parameters.get(declaration) orelse &.{};
-        try self.compileFunctionBody(compiled, parameter_symbols, function.body);
+        try self.compileFunctionBody(compiled, &.{}, parameter_symbols, function.body);
     }
 
     fn compileFunctionBody(
         self: *Compiler,
         compiled: *bytecode.Function,
+        capture_symbols: []const symbols.SymbolId,
         parameter_symbols: []const symbols.SymbolId,
         body: []const ast.StmtId,
     ) !void {
         var context = FunctionCompiler.init(self, compiled);
         defer context.deinit();
+        for (capture_symbols) |capture_symbol| _ = try context.ensureLocal(capture_symbol);
         for (parameter_symbols) |parameter_symbol| _ = try context.ensureLocal(parameter_symbol);
 
         if (body.len == 0) {
@@ -353,8 +359,8 @@ const FunctionCompiler = struct {
 
     fn compileLambda(self: *FunctionCompiler, expression: ast.ExprId, lambda: anytype) !void {
         const captures = self.compiler.resolution.lambda_captures.get(expression) orelse &.{};
-        if (captures.len != 0) {
-            try self.compiler.report(lambda.span, "Compiler Error: замыкания пока не поддержаны", .{});
+        if (captures.len > std.math.maxInt(u16)) {
+            try self.compiler.report(lambda.span, "Compiler Error: лямбда захватывает слишком много значений", .{});
             try self.emitVoid();
             return;
         }
@@ -363,7 +369,15 @@ const FunctionCompiler = struct {
             try self.emitVoid();
             return;
         };
-        try self.emitConstant(.{ .function_ref = function_id });
+        if (captures.len == 0) {
+            try self.emitConstant(.{ .function_ref = function_id });
+            return;
+        }
+        for (captures) |capture| try self.emitSymbolValue(capture, lambda.span);
+        try self.function.emit(self.compiler.result.allocator, .{ .build_closure = .{
+            .function_id = function_id,
+            .capture_count = @intCast(captures.len),
+        } });
     }
 
     fn compileCall(self: *FunctionCompiler, call: anytype) !void {
@@ -560,6 +574,10 @@ const FunctionCompiler = struct {
 
     fn compileIdentifier(self: *FunctionCompiler, expression: ast.ExprId) !void {
         const symbol = self.compiler.resolution.expr_symbols.get(expression) orelse return self.unsupportedExpression(expressionSpan(self.compiler.tree, expression));
+        try self.emitSymbolValue(symbol, expressionSpan(self.compiler.tree, expression));
+    }
+
+    fn emitSymbolValue(self: *FunctionCompiler, symbol: symbols.SymbolId, span: source.Span) !void {
         if (self.locals.get(symbol)) |slot| {
             try self.function.emit(self.compiler.result.allocator, .{ .get_local = slot });
             return;
@@ -568,7 +586,7 @@ const FunctionCompiler = struct {
             try self.emitConstant(.{ .function_ref = function_id });
             return;
         }
-        try self.unsupportedExpression(expressionSpan(self.compiler.tree, expression));
+        try self.unsupportedExpression(span);
     }
 
     fn compileBinary(self: *FunctionCompiler, binary: anytype) anyerror!void {
@@ -849,7 +867,7 @@ test "compiler emits property and index assignments" {
     try std.testing.expect(has_set_index);
 }
 
-test "compiler rejects captured lambdas before runtime" {
+test "compiler emits closures for captured lambdas" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
     var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Число\nпер сдвиг = 2\nпер добавить: функ(Число) -> Число = функ(значение)\nзначение + сдвиг\nконец\nдобавить(3)\nконец", 0);
@@ -864,6 +882,7 @@ test "compiler rejects captured lambdas before runtime" {
     defer compiled.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
-    try std.testing.expectEqual(@as(usize, 1), compiled.diagnostics.items.items.len);
-    try std.testing.expectEqualStrings("Compiler Error: замыкания пока не поддержаны", compiled.diagnostics.items.items[0].message);
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(u16, 1), compiled.program.functions.items[1].capture_count);
+    try std.testing.expectEqual(bytecode.Instruction{ .build_closure = .{ .function_id = @enumFromInt(1), .capture_count = 1 } }, compiled.program.functions.items[0].instructions.items[3]);
 }

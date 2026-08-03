@@ -40,7 +40,7 @@ pub const Vm = struct {
         self.failure = null;
         self.stack.clearRetainingCapacity();
         self.frames.clearRetainingCapacity();
-        self.pushFrame(entry, arguments) catch |err| switch (err) {
+        self.pushFrame(entry, &.{}, arguments) catch |err| switch (err) {
             error.RuntimeFault => return .{ .runtime_error = self.failure orelse "Runtime Error: неизвестная ошибка" },
             else => return err,
         };
@@ -94,6 +94,7 @@ pub const Vm = struct {
             .jump_if_false => |target| try self.jumpIfFalse(target),
             .pop => _ = try self.pop(),
             .call => |argument_count| try self.call(argument_count),
+            .build_closure => |closure| try self.buildClosure(closure),
             .return_value => return self.finishFrame(try self.pop()),
             .return_void => return self.finishFrame(.{ .void = {} }),
             .build_tuple => |count| try self.buildAggregate(null, count),
@@ -109,7 +110,7 @@ pub const Vm = struct {
         return null;
     }
 
-    fn pushFrame(self: *Vm, function_id: bytecode.FunctionId, arguments: []const value.Value) anyerror!void {
+    fn pushFrame(self: *Vm, function_id: bytecode.FunctionId, captures: []const value.Value, arguments: []const value.Value) anyerror!void {
         const compiled = self.program.functionConst(function_id) orelse {
             try self.fault("Runtime Error: неизвестная функция", .{});
             return;
@@ -118,13 +119,19 @@ pub const Vm = struct {
             try self.fault("Runtime Error: неверное количество аргументов функции", .{});
             return;
         }
-        if (compiled.local_count < compiled.arity) {
+        if (captures.len != compiled.capture_count) {
+            try self.fault("Runtime Error: неверное количество захватов замыкания", .{});
+            return;
+        }
+        const required_locals = @as(usize, compiled.capture_count) + @as(usize, compiled.arity);
+        if (compiled.local_count < required_locals) {
             try self.fault("Runtime Error: повреждённый фрейм функции", .{});
             return;
         }
         const locals = try self.arena.allocator().alloc(value.Value, compiled.local_count);
         for (locals) |*local| local.* = .{ .void = {} };
-        @memcpy(locals[0..arguments.len], arguments);
+        @memcpy(locals[0..captures.len], captures);
+        @memcpy(locals[captures.len .. captures.len + arguments.len], arguments);
         try self.frames.append(self.allocator, .{ .function_id = function_id, .locals = locals });
     }
 
@@ -345,16 +352,33 @@ pub const Vm = struct {
         }
         const function_index = self.stack.items.len - count - 1;
         const callee = self.stack.items[function_index];
-        const function_id = switch (callee) {
-            .function_ref => |function_id| function_id,
+        const arguments = try self.arena.allocator().dupe(value.Value, self.stack.items[function_index + 1 ..]);
+        self.stack.shrinkRetainingCapacity(function_index);
+        switch (callee) {
+            .function_ref => |function_id| try self.pushFrame(function_id, &.{}, arguments),
+            .closure => |closure| try self.pushFrame(closure.function_id, closure.captures, arguments),
             else => {
                 try self.fault("Runtime Error: попытка вызвать не функцию", .{});
                 return;
             },
+        }
+    }
+
+    fn buildClosure(self: *Vm, closure: anytype) anyerror!void {
+        const compiled = self.program.functionConst(closure.function_id) orelse {
+            try self.fault("Runtime Error: неизвестная функция замыкания", .{});
+            return;
         };
-        const arguments = try self.arena.allocator().dupe(value.Value, self.stack.items[function_index + 1 ..]);
-        self.stack.shrinkRetainingCapacity(function_index);
-        try self.pushFrame(function_id, arguments);
+        if (closure.capture_count != compiled.capture_count) {
+            try self.fault("Runtime Error: неверное количество захватов замыкания", .{});
+            return;
+        }
+        const runtime_closure = try self.arena.allocator().create(value.Closure);
+        runtime_closure.* = .{
+            .function_id = closure.function_id,
+            .captures = try self.arena.allocator().dupe(value.Value, try self.popValues(closure.capture_count)),
+        };
+        try self.stack.append(self.allocator, .{ .closure = runtime_closure });
     }
 
     fn buildAggregate(self: *Vm, name: ?[]const u8, count: u16) !void {
@@ -572,6 +596,36 @@ test "VM executes capture-free lambdas" {
     }
 }
 
+test "VM executes closures with captured locals" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Число\nпер сдвиг = 2\nпер добавить: функ(Число) -> Число = функ(значение)\nзначение + сдвиг\nконец\nдобавить(3)\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 5), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM short-circuits logical operators" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -638,6 +692,28 @@ test "VM guards array length against non-array values" {
     const outcome = try vm.run(function_id, &.{});
     switch (outcome) {
         .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: длина доступна только для массива", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM guards closure capture metadata" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const main_id = try program.addFunction("старт", 0);
+    const closure_id = try program.addFunction("лямбда", 0);
+    const closure = program.function(closure_id).?;
+    closure.capture_count = 1;
+    closure.local_count = 1;
+    try closure.emit(std.testing.allocator, .{ .return_void = {} });
+    const main = program.function(main_id).?;
+    try main.emit(std.testing.allocator, .{ .build_closure = .{ .function_id = closure_id, .capture_count = 0 } });
+    try main.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(main_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: неверное количество захватов замыкания", message),
         .success => return error.TestUnexpectedResult,
     }
 }

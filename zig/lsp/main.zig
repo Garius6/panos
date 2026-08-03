@@ -70,7 +70,7 @@ pub const Server = struct {
         const params = request.get("params");
 
         if (std.mem.eql(u8, method, "initialize")) {
-            if (id) |request_id| try writeResponse(output, request_id, "{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"foldingRangeProvider\":true,\"documentSymbolProvider\":true}}");
+            if (id) |request_id| try writeResponse(output, request_id, "{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"foldingRangeProvider\":true,\"documentSymbolProvider\":true}}");
             return true;
         }
         if (std.mem.eql(u8, method, "shutdown")) {
@@ -104,6 +104,18 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, method, "textDocument/documentSymbol")) {
             if (id) |request_id| try self.documentSymbol(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "textDocument/definition")) {
+            if (id) |request_id| try self.definition(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "textDocument/references")) {
+            if (id) |request_id| try self.references(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "textDocument/documentHighlight")) {
+            if (id) |request_id| try self.documentHighlight(params, request_id, output);
             return true;
         }
         if (id) |request_id| try writeError(output, request_id, -32601, "Метод ещё не поддержан Zig-версией");
@@ -285,6 +297,117 @@ pub const Server = struct {
         try writeDocumentSymbolsResponse(output, request_id, file, symbols.items);
     }
 
+    fn definition(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const context = self.documentPosition(params) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const file = panos_core.source.SourceFile.init(0, context.uri, context.text);
+        const byte_offset = file.utf16PositionToByteOffset(context.position) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        var analysis = panos_core.runner.analyzeSource(self.allocator, context.uri, context.text) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer analysis.deinit();
+        const tree = analysis.tree() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const resolved = analysis.resolution() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const expression = tree.findExpressionAt(0, byte_offset) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const symbol = resolved.expr_symbols.get(expression) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const entry = resolved.symbols.get(symbol) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const target_span = definitionSpan(tree, resolved, symbol, entry.span);
+        if (entry.kind == .builtin or !target_span.isValidFor(file)) {
+            try writeResponse(output, request_id, "null");
+            return;
+        }
+        try writeDefinitionResponse(output, request_id, context.uri, rangeForSpan(file, target_span));
+    }
+
+    fn references(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const context = self.documentPosition(params) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const file = panos_core.source.SourceFile.init(0, context.uri, context.text);
+        const byte_offset = file.utf16PositionToByteOffset(context.position) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        var analysis = panos_core.runner.analyzeSource(self.allocator, context.uri, context.text) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer analysis.deinit();
+        const tree = analysis.tree() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const resolved = analysis.resolution() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const expression = tree.findExpressionAt(0, byte_offset) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const symbol = resolved.expr_symbols.get(expression) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        try writeReferencesResponse(output, request_id, context.uri, file, tree, resolved, symbol, referenceIncludesDeclaration(params));
+    }
+
+    fn documentHighlight(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const context = self.documentPosition(params) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const file = panos_core.source.SourceFile.init(0, context.uri, context.text);
+        const byte_offset = file.utf16PositionToByteOffset(context.position) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        var analysis = panos_core.runner.analyzeSource(self.allocator, context.uri, context.text) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer analysis.deinit();
+        const tree = analysis.tree() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const resolved = analysis.resolution() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const expression = tree.findExpressionAt(0, byte_offset) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const symbol = resolved.expr_symbols.get(expression) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        try writeHighlightsResponse(output, request_id, file, tree, resolved, symbol);
+    }
+
     fn documentPosition(self: *const Server, params: ?std.json.Value) ?DocumentPosition {
         const params_object = objectValue(params orelse return null) orelse return null;
         const document = objectValue(params_object.get("textDocument") orelse return null) orelse return null;
@@ -340,6 +463,15 @@ fn unsignedValue(value: std.json.Value) ?u32 {
     };
 }
 
+fn referenceIncludesDeclaration(params: ?std.json.Value) bool {
+    const params_object = objectValue(params orelse return false) orelse return false;
+    const context = objectValue(params_object.get("context") orelse return false) orelse return false;
+    return switch (context.get("includeDeclaration") orelse return false) {
+        .bool => |include| include,
+        else => false,
+    };
+}
+
 fn writeResponse(output: *ResponseBuffer, id: std.json.Value, result: []const u8) !void {
     try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
     try appendJsonValue(output, id);
@@ -376,6 +508,78 @@ fn writeCompletionResponse(output: *ResponseBuffer, id: std.json.Value, checked:
         if (type_id) |value| try appendCompletionItems(output, result, value);
     }
     try output.appendSlice("]}}");
+}
+
+fn writeDefinitionResponse(output: *ResponseBuffer, id: std.json.Value, uri: []const u8, range: core_lsp.Range) !void {
+    try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+    try appendJsonValue(output, id);
+    try output.appendSlice(",\"result\":");
+    try appendLocation(output, uri, range);
+    try output.append('}');
+}
+
+fn writeReferencesResponse(output: *ResponseBuffer, id: std.json.Value, uri: []const u8, file: panos_core.source.SourceFile, tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId, include_declaration: bool) !void {
+    try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+    try appendJsonValue(output, id);
+    try output.appendSlice(",\"result\":[");
+    var first = true;
+    if (include_declaration) {
+        if (resolved.symbols.get(symbol)) |entry| {
+            const span = definitionSpan(tree, resolved, symbol, entry.span);
+            if (span.isValidFor(file)) {
+                try appendLocation(output, uri, rangeForSpan(file, span));
+                first = false;
+            }
+        }
+    }
+    var iterator = resolved.expr_symbols.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != symbol) continue;
+        if (!first) try output.append(',');
+        first = false;
+        const span = panos_core.ast.exprSpan(tree.expr(entry.key_ptr.*).*);
+        try appendLocation(output, uri, rangeForSpan(file, span));
+    }
+    try output.appendSlice("]}");
+}
+
+fn writeHighlightsResponse(output: *ResponseBuffer, id: std.json.Value, file: panos_core.source.SourceFile, tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId) !void {
+    try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+    try appendJsonValue(output, id);
+    try output.appendSlice(",\"result\":[");
+    var first = true;
+    var iterator = resolved.expr_symbols.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != symbol) continue;
+        if (!first) try output.append(',');
+        first = false;
+        try output.appendSlice("{\"range\":");
+        const span = panos_core.ast.exprSpan(tree.expr(entry.key_ptr.*).*);
+        try appendRange(output, rangeForSpan(file, span));
+        try output.appendSlice(",\"kind\":1}");
+    }
+    try output.appendSlice("]}");
+}
+
+fn appendLocation(output: *ResponseBuffer, uri: []const u8, range: core_lsp.Range) !void {
+    try output.appendSlice("{\"uri\":");
+    try appendJsonString(output, uri);
+    try output.appendSlice(",\"range\":");
+    try appendRange(output, range);
+    try output.append('}');
+}
+
+fn definitionSpan(tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId, fallback: panos_core.source.Span) panos_core.source.Span {
+    var declarations = resolved.decl_symbols.iterator();
+    while (declarations.next()) |entry| {
+        if (entry.value_ptr.* != symbol) continue;
+        return switch (tree.decl(entry.key_ptr.*).*) {
+            .function => |function| function.name_span,
+            .constant => |constant| constant.name_span,
+            else => fallback,
+        };
+    }
+    return fallback;
 }
 
 fn writeFoldingRangesResponse(output: *ResponseBuffer, id: std.json.Value, file: panos_core.source.SourceFile, ranges: *const core_lsp.FoldingRanges) !void {
@@ -624,7 +828,7 @@ test "LSP server publishes diagnostics for opened and changed documents" {
     defer output.deinit();
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}", &output));
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"foldingRangeProvider\":true,\"documentSymbolProvider\":true}}}", output.items());
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"foldingRangeProvider\":true,\"documentSymbolProvider\":true}}}", output.items());
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\",\"text\":\"экспорт функ старт() -> Число\\nнеизвестно\\nконец\"}}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"line\":1,\"character\":0") != null);
@@ -648,6 +852,18 @@ test "LSP server publishes diagnostics for opened and changed documents" {
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/foldingRange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"}}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"startLine\":0,\"endLine\":2") != null);
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"contentChanges\":[{\"text\":\"экспорт функ сложить(a: Число, b: Число) -> Число\\na + b\\nконец\\nэкспорт функ старт() -> Число\\nсложить(20, 22)\\nконец\"}]}}", &output));
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":4,\"character\":1}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"uri\":\"file:///пример.ps\",\"range\":{\"start\":{\"line\":0,\"character\":13}") != null);
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"textDocument/references\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":4,\"character\":1},\"context\":{\"includeDeclaration\":true}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"line\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"line\":4") != null);
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"textDocument/documentHighlight\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":4,\"character\":1}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"line\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"kind\":1") != null);
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"workspace/unsupported\",\"params\":{}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"code\":-32601") != null);

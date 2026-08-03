@@ -46,6 +46,7 @@ pub const InterfaceDefinition = struct {
 
 pub const InterfaceImplementation = struct {
     interface: symbols.SymbolId,
+    arguments: []const types.TypeId,
     target: symbols.SymbolId,
     methods: []const symbols.SymbolId,
 };
@@ -410,11 +411,6 @@ const Checker = struct {
             try self.report(implementation.span, "Type Error: интерфейс может реализовать только структура или перечисление", .{});
             return;
         }
-        if (definition.parameters.len != 0) {
-            try self.report(implementation.span, "Type Error: generic-интерфейсы пока не поддержаны", .{});
-            return;
-        }
-
         for (implementation.methods) |method| {
             const function = self.tree.decl(method).function;
             try self.defineMethodSignature(method, owner, interface_symbol, owner_parameters, function.type_parameters, function.parameters, function.return_type);
@@ -422,6 +418,8 @@ const Checker = struct {
 
         var implementation_methods: std.ArrayList(symbols.SymbolId) = .empty;
         defer implementation_methods.deinit(self.result.allocator);
+        var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+        defer substitutions.deinit();
         var valid = true;
         for (definition.methods) |interface_method| {
             var matched: ?ast.DeclId = null;
@@ -445,7 +443,26 @@ const Checker = struct {
                 continue;
             };
             try implementation_methods.append(self.result.allocator, method_symbol);
-            if (!try self.interfaceMethodMatches(interface_symbol, owner, owner_parameters, method_symbol, interface_method)) valid = false;
+            const signature_id = self.result.symbol_types.get(method_symbol) orelse {
+                valid = false;
+                continue;
+            };
+            const signature = self.result.types.get(signature_id) orelse {
+                valid = false;
+                continue;
+            };
+            const implementation_function = self.tree.decl(method).function;
+            const function = switch (signature.*) {
+                .function => |value| value,
+                else => continue,
+            };
+            if (function.parameters.len == interface_method.parameters.len + 1) {
+                for (interface_method.parameters, function.parameters[1..]) |expected, actual| {
+                    try self.inferGenericSubstitution(expected, actual, &substitutions, implementation_function.span);
+                }
+                try self.inferGenericSubstitution(interface_method.return_type, function.return_type, &substitutions, implementation_function.span);
+            }
+            if (!try self.interfaceMethodMatches(interface_symbol, owner, owner_parameters, method_symbol, interface_method, &substitutions)) valid = false;
         }
         for (implementation.methods) |method| {
             const function = self.tree.decl(method).function;
@@ -455,14 +472,24 @@ const Checker = struct {
             }
         }
         if (!valid or implementation_methods.items.len != definition.methods.len) return;
+        var arguments: std.ArrayList(types.TypeId) = .empty;
+        defer arguments.deinit(self.result.allocator);
+        for (definition.parameters) |parameter| {
+            const argument = substitutions.get(parameter.typ) orelse {
+                try self.report(implementation.span, "Type Error: не удалось вывести параметр типа интерфейса '{s}'", .{parameter.name});
+                return;
+            };
+            try arguments.append(self.result.allocator, argument);
+        }
         try self.result.interface_implementations.append(self.result.allocator, .{
             .interface = interface_symbol,
+            .arguments = try self.result.arena.allocator().dupe(types.TypeId, arguments.items),
             .target = owner,
             .methods = try self.result.arena.allocator().dupe(symbols.SymbolId, implementation_methods.items),
         });
     }
 
-    fn interfaceMethodMatches(self: *Checker, interface: symbols.SymbolId, owner: symbols.SymbolId, owner_parameters: []const GenericParameter, method_symbol: symbols.SymbolId, interface_method: InterfaceMethod) !bool {
+    fn interfaceMethodMatches(self: *Checker, interface: symbols.SymbolId, owner: symbols.SymbolId, owner_parameters: []const GenericParameter, method_symbol: symbols.SymbolId, interface_method: InterfaceMethod, substitutions: *const std.AutoHashMap(types.TypeId, types.TypeId)) !bool {
         const signature_id = self.result.symbol_types.get(method_symbol) orelse return false;
         const signature = self.result.types.get(signature_id) orelse return false;
         const function = switch (signature.*) {
@@ -489,12 +516,12 @@ const Checker = struct {
             return true;
         }
         for (function.parameters[1..], interface_method.parameters) |parameter, expected| {
-            if (!self.result.types.eql(parameter, expected)) {
+            if (!self.result.types.eql(parameter, try self.substituteGeneric(expected, substitutions))) {
                 try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: сигнатура метода не совпадает с интерфейсом", .{});
                 return false;
             }
         }
-        if (!self.result.types.eql(function.return_type, interface_method.return_type)) {
+        if (!self.result.types.eql(function.return_type, try self.substituteGeneric(interface_method.return_type, substitutions))) {
             try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: сигнатура метода не совпадает с интерфейсом", .{});
             return false;
         }
@@ -1820,7 +1847,7 @@ const Checker = struct {
         };
         if (self.result.interface_definitions.get(expected_nominal.symbol)) |interface| {
             if (interface.parameters.len != expected_nominal.arguments.len) return false;
-            return self.interfaceImplementation(expected_nominal.symbol, actual_nominal.symbol) != null;
+            return self.interfaceImplementation(expected_nominal.symbol, expected_nominal.arguments, actual_nominal.symbol) != null;
         }
         return false;
     }
@@ -1860,9 +1887,12 @@ const Checker = struct {
         return null;
     }
 
-    fn interfaceImplementation(self: *const Checker, interface: symbols.SymbolId, target: symbols.SymbolId) ?InterfaceImplementation {
+    fn interfaceImplementation(self: *const Checker, interface: symbols.SymbolId, arguments: []const types.TypeId, target: symbols.SymbolId) ?InterfaceImplementation {
         for (self.result.interface_implementations.items) |implementation| {
-            if (implementation.interface == interface and implementation.target == target) return implementation;
+            if (implementation.interface != interface or implementation.target != target or implementation.arguments.len != arguments.len) continue;
+            for (implementation.arguments, arguments) |actual, expected| {
+                if (!self.result.types.eql(actual, expected)) break;
+            } else return implementation;
         }
         return null;
     }
@@ -1886,7 +1916,7 @@ const Checker = struct {
             .nominal => |value| value,
             else => return false,
         };
-        return self.interfaceImplementation(interface, nominal.symbol) != null;
+        return self.interfaceImplementation(interface, &.{}, nominal.symbol) != null;
     }
 
     fn isImplementableNominal(self: *const Checker, symbol: symbols.SymbolId) bool {
@@ -1907,7 +1937,7 @@ const Checker = struct {
         };
         if (!self.result.interface_definitions.contains(expected_nominal.symbol)) return;
         if (self.result.interface_definitions.contains(actual_nominal.symbol)) return;
-        if (self.interfaceImplementation(expected_nominal.symbol, actual_nominal.symbol) == null) return;
+        if (self.interfaceImplementation(expected_nominal.symbol, expected_nominal.arguments, actual_nominal.symbol) == null) return;
         try self.result.interface_casts.put(expression, .{
             .interface = expected_nominal.symbol,
             .target = actual_nominal.symbol,

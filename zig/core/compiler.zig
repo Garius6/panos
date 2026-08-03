@@ -386,6 +386,16 @@ const FunctionCompiler = struct {
     fn compileCall(self: *FunctionCompiler, call: anytype) !void {
         if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
         if (try self.compileCollectionMethod(call)) return;
+        if (try self.enumConstructor(call.callee)) |enumeration| {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
+            const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(enumeration) });
+            try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
+                .name_constant = name_constant,
+                .field_count = @intCast(call.arguments.len),
+            } });
+            return;
+        }
         if (try self.structConstructor(call.callee)) |structure| {
             for (call.arguments) |argument| try self.compileExpression(argument);
             if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
@@ -743,6 +753,15 @@ const FunctionCompiler = struct {
         if (!self.compiler.checked.nominal_fields.contains(nominal.symbol) and !self.compiler.checked.generic_nominal_fields.contains(nominal.symbol)) return null;
         const symbol = self.compiler.resolution.symbols.get(nominal.symbol) orelse return null;
         return symbol.name;
+    }
+
+    fn enumConstructor(self: *FunctionCompiler, callee: ast.ExprId) !?[]const u8 {
+        const variant_symbol = self.compiler.resolution.expr_symbols.get(callee) orelse return null;
+        const variant = self.compiler.resolution.symbols.get(variant_symbol) orelse return null;
+        if (variant.kind != .enum_variant) return null;
+        const owner = self.compiler.resolution.symbols.get(variant.owner_type) orelse return null;
+        const name = try std.fmt.allocPrint(self.compiler.arena.allocator(), "{s}.{s}", .{ owner.name, variant.name });
+        return name;
     }
 
     fn propertyIndex(self: *FunctionCompiler, object: ast.ExprId, property: []const u8) !?u16 {

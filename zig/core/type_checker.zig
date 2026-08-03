@@ -21,6 +21,17 @@ pub const GenericNominal = struct {
     fields: []const NominalField,
 };
 
+pub const EnumVariant = struct {
+    symbol: symbols.SymbolId,
+    name: []const u8,
+    fields: []const types.TypeId,
+};
+
+pub const EnumDefinition = struct {
+    parameters: []const GenericParameter,
+    variants: []const EnumVariant,
+};
+
 pub const CheckResult = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -33,6 +44,7 @@ pub const CheckResult = struct {
     alias_type_nodes: std.AutoHashMap(symbols.SymbolId, ast.TypeId),
     generic_function_parameters: std.AutoHashMap(symbols.SymbolId, []const GenericParameter),
     generic_nominal_fields: std.AutoHashMap(symbols.SymbolId, GenericNominal),
+    enum_definitions: std.AutoHashMap(symbols.SymbolId, EnumDefinition),
 
     pub fn init(allocator: std.mem.Allocator) !CheckResult {
         return .{
@@ -46,10 +58,12 @@ pub const CheckResult = struct {
             .alias_type_nodes = .init(allocator),
             .generic_function_parameters = .init(allocator),
             .generic_nominal_fields = .init(allocator),
+            .enum_definitions = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CheckResult) void {
+        self.enum_definitions.deinit();
         self.generic_nominal_fields.deinit();
         self.generic_function_parameters.deinit();
         self.alias_type_nodes.deinit();
@@ -141,6 +155,37 @@ const Checker = struct {
                     .fields = resolved_fields,
                 });
             }
+        }
+    }
+
+    fn enumPass(self: *Checker) !void {
+        for (self.tree.program.?.declarations) |declaration| {
+            const enumeration = switch (self.tree.decl(declaration).*) {
+                .enum_decl => |value| value,
+                else => continue,
+            };
+            const symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
+            const parameters = try self.defineGenericEnumParameters(enumeration.type_parameters);
+            var variants: std.ArrayList(EnumVariant) = .empty;
+            defer variants.deinit(self.result.allocator);
+            const previous_generic_parameters = self.current_generic_parameters;
+            self.current_generic_parameters = parameters;
+            defer self.current_generic_parameters = previous_generic_parameters;
+            for (enumeration.variants) |variant| {
+                const variant_symbol = self.resolution.findEnumVariant(symbol, variant.name) orelse continue;
+                var fields: std.ArrayList(types.TypeId) = .empty;
+                defer fields.deinit(self.result.allocator);
+                for (variant.types) |field| try fields.append(self.result.allocator, try self.resolveType(field));
+                try variants.append(self.result.allocator, .{
+                    .symbol = variant_symbol,
+                    .name = variant.name,
+                    .fields = try self.result.arena.allocator().dupe(types.TypeId, fields.items),
+                });
+            }
+            try self.result.enum_definitions.put(symbol, .{
+                .parameters = parameters,
+                .variants = try self.result.arena.allocator().dupe(EnumVariant, variants.items),
+            });
         }
     }
 
@@ -535,7 +580,7 @@ const Checker = struct {
     fn inferProperty(self: *Checker, expression: ast.ExprId, property: anytype) anyerror!types.TypeId {
         if (self.resolution.expr_symbols.get(expression)) |symbol| {
             if (self.resolution.symbols.get(symbol)) |entry| {
-                if (entry.kind == .enum_variant) return self.result.types.poison();
+                if (entry.kind == .enum_variant) return self.result.types.nominal(entry.owner_type, &.{});
             }
         }
         const object_type = try self.infer(property.object);
@@ -718,6 +763,9 @@ const Checker = struct {
     }
 
     fn inferCall(self: *Checker, call: anytype) anyerror!types.TypeId {
+        if (self.resolution.expr_symbols.get(call.callee)) |symbol| {
+            if (self.enumVariant(symbol)) |variant| return self.inferEnumVariantCall(call, variant);
+        }
         switch (self.tree.expr(call.callee).*) {
             .property => |property| {
                 const object_type = try self.infer(property.object);
@@ -975,11 +1023,60 @@ const Checker = struct {
         return generic_parameters;
     }
 
+    fn defineGenericEnumParameters(self: *Checker, parameters: []const []const u8) ![]const GenericParameter {
+        const generic_parameters = try self.result.arena.allocator().alloc(GenericParameter, parameters.len);
+        for (parameters, generic_parameters) |parameter, *generic_parameter| {
+            generic_parameter.* = .{
+                .name = parameter,
+                .typ = try self.result.types.genericParameter(self.next_generic_parameter),
+            };
+            self.next_generic_parameter += 1;
+        }
+        return generic_parameters;
+    }
+
     fn findGenericParameter(self: *const Checker, name: []const u8) ?types.TypeId {
         for (self.current_generic_parameters) |parameter| {
             if (std.mem.eql(u8, parameter.name, name)) return parameter.typ;
         }
         return null;
+    }
+
+    fn enumVariant(self: *const Checker, symbol: symbols.SymbolId) ?EnumVariant {
+        const entry = self.resolution.symbols.get(symbol) orelse return null;
+        if (entry.kind != .enum_variant) return null;
+        const definition = self.result.enum_definitions.get(entry.owner_type) orelse return null;
+        for (definition.variants) |variant| {
+            if (variant.symbol == symbol) return variant;
+        }
+        return null;
+    }
+
+    fn inferEnumVariantCall(self: *Checker, call: anytype, variant: EnumVariant) !types.TypeId {
+        const entry = self.resolution.symbols.get(variant.symbol) orelse return self.result.types.poison();
+        const definition = self.result.enum_definitions.get(entry.owner_type) orelse return self.result.types.poison();
+        if (call.arguments.len != variant.fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора варианта", .{});
+        const shared = @min(call.arguments.len, variant.fields.len);
+        var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+        defer substitutions.deinit();
+        for (call.arguments[0..shared], variant.fields[0..shared]) |argument, field| {
+            try self.inferGenericSubstitution(field, try self.infer(argument), &substitutions, call.span);
+        }
+        var arguments: std.ArrayList(types.TypeId) = .empty;
+        defer arguments.deinit(self.result.allocator);
+        for (definition.parameters) |parameter| {
+            if (substitutions.get(parameter.typ)) |argument| {
+                try arguments.append(self.result.allocator, argument);
+            } else {
+                try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
+                try arguments.append(self.result.allocator, try self.result.types.poison());
+            }
+        }
+        for (call.arguments[0..shared], variant.fields[0..shared]) |argument, field| {
+            const expected = try self.substituteGeneric(field, &substitutions);
+            if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент конструктора варианта не совпадает с типом поля", .{});
+        }
+        return self.result.types.nominal(entry.owner_type, arguments.items);
     }
 
     fn inferGenericSubstitution(self: *Checker, parameter: types.TypeId, argument: types.TypeId, substitutions: *std.AutoHashMap(types.TypeId, types.TypeId), span: source.Span) !void {
@@ -1081,6 +1178,7 @@ pub fn check(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *co
     defer checker.resolving_aliases.deinit();
     try checker.typeAliasPass();
     try checker.nominalPass();
+    try checker.enumPass();
     try checker.signaturePass();
     try checker.bodyPass();
     return result;

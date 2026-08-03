@@ -412,6 +412,8 @@ const FunctionCompiler = struct {
         const instruction: bytecode.Instruction = switch (type_entry.*) {
             .array => if (std.mem.eql(u8, property.property, "длина") and call.arguments.len == 0)
                 .{ .array_length = {} }
+            else if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 2)
+                .{ .array_get_or = {} }
             else if (std.mem.eql(u8, property.property, "есть") and call.arguments.len == 1)
                 .{ .array_has_index = {} }
             else if (std.mem.eql(u8, property.property, "добавить") and call.arguments.len == 1)
@@ -422,6 +424,8 @@ const FunctionCompiler = struct {
                 return false,
             .map => if (std.mem.eql(u8, property.property, "длина") and call.arguments.len == 0)
                 .{ .map_length = {} }
+            else if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 2)
+                .{ .map_get_or = {} }
             else if (std.mem.eql(u8, property.property, "есть") and call.arguments.len == 1)
                 .{ .map_has_key = {} }
             else if (std.mem.eql(u8, property.property, "удалить") and call.arguments.len == 1)

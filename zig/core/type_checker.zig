@@ -697,6 +697,17 @@ const Checker = struct {
                             }
                             return self.result.types.builtins.boolean;
                         }
+                        if (std.mem.eql(u8, property.property, "получить")) {
+                            try self.checkMethodArity(call, "получить", 2);
+                            if (call.arguments.len != 0) {
+                                const index = try self.infer(call.arguments[0]);
+                                if (!self.isNumeric(index)) try self.report(call.span, "Type Error: индекс массива должен быть числом", .{});
+                            }
+                            if (call.arguments.len > 1 and !self.assignable(try self.inferExpected(call.arguments[1], element), element)) {
+                                try self.report(call.span, "Type Error: значение по умолчанию имеет неверный тип", .{});
+                            }
+                            return element;
+                        }
                         if (std.mem.eql(u8, property.property, "добавить")) {
                             try self.checkMethodArity(call, "добавить", 1);
                             if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], element), element)) {
@@ -723,6 +734,16 @@ const Checker = struct {
                                 try self.report(call.span, "Type Error: ключ соответствия имеет неверный тип", .{});
                             }
                             return self.result.types.builtins.boolean;
+                        }
+                        if (std.mem.eql(u8, property.property, "получить")) {
+                            try self.checkMethodArity(call, "получить", 2);
+                            if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], map.key), map.key)) {
+                                try self.report(call.span, "Type Error: ключ соответствия имеет неверный тип", .{});
+                            }
+                            if (call.arguments.len > 1 and !self.assignable(try self.inferExpected(call.arguments[1], map.value), map.value)) {
+                                try self.report(call.span, "Type Error: значение по умолчанию имеет неверный тип", .{});
+                            }
+                            return map.value;
                         }
                         if (std.mem.eql(u8, property.property, "удалить")) {
                             try self.checkMethodArity(call, "удалить", 1);

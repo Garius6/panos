@@ -1066,7 +1066,7 @@ const Parser = struct {
                 .span = value.span,
                 .name = try self.result.ast.copyText(value.lexeme),
             } }),
-            .minus, .negate => blk: {
+            .minus, .negate, .tilde => blk: {
                 const operand = try self.parseExpression(11);
                 break :blk self.result.ast.addExpr(.{ .unary = .{
                     .span = spanFrom(value.span, self.astExprSpan(operand)),
@@ -1510,6 +1510,20 @@ const Parser = struct {
         const property = self.next();
         if (property.kind != .ident and property.kind != .number) {
             try self.report(property.span, "Синтаксическая ошибка: после '.' ожидается имя свойства");
+        }
+        if (property.kind == .number) {
+            if (std.mem.indexOfScalar(u8, property.lexeme, '.')) |split| {
+                const first = try self.result.ast.addExpr(.{ .property = .{
+                    .span = spanFrom(self.astExprSpan(object), property.span),
+                    .object = object,
+                    .property = try self.result.ast.copyText(property.lexeme[0..split]),
+                } });
+                return self.result.ast.addExpr(.{ .property = .{
+                    .span = spanFrom(self.astExprSpan(object), property.span),
+                    .object = first,
+                    .property = try self.result.ast.copyText(property.lexeme[split + 1 ..]),
+                } });
+            }
         }
         return self.result.ast.addExpr(.{ .property = .{
             .span = spanFrom(self.astExprSpan(object), property.span),

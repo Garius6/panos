@@ -193,6 +193,42 @@ test "parser conformance fixture accepts binary operators after a line break" {
     }
 }
 
+test "parser conformance fixture preserves bitwise negation and tuple index chains" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/bitwise_tuple_index.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    const declaration = parsed.ast.decl(parsed.ast.program.?.declarations[0]);
+    switch (declaration.*) {
+        .function => |function| {
+            switch (parsed.ast.stmt(function.body[1]).*) {
+                .let => |statement| switch (parsed.ast.expr(statement.value).*) {
+                    .property => |outer| {
+                        try std.testing.expectEqualStrings("0", outer.property);
+                        switch (parsed.ast.expr(outer.object).*) {
+                            .property => |inner| try std.testing.expectEqualStrings("1", inner.property),
+                            else => return error.TestUnexpectedResult,
+                        }
+                    },
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (parsed.ast.stmt(function.body[2]).*) {
+                .expr => |statement| switch (parsed.ast.expr(statement.value).*) {
+                    .unary => |unary| try std.testing.expectEqual(panos.token.TokenKind.tilde, unary.operator),
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "parser conformance fixture preserves lambdas and spawn expressions" {
     var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/lambda_spawn.ps"), 0);
     defer lexed.deinit();

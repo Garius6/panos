@@ -557,8 +557,11 @@ const FunctionCompiler = struct {
 
     fn compileEnumFallback(self: *FunctionCompiler, object: ast.ExprId, fallback: ast.ExprId, variant_name: []const u8, result: EnumFallback) !void {
         const object_slot = try self.allocateLocal();
+        const fallback_slot = try self.allocateLocal();
         try self.compileExpression(object);
         try self.function.emit(self.compiler.result.allocator, .{ .set_local = object_slot });
+        try self.compileExpression(fallback);
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = fallback_slot });
         try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
         try self.emitEnumMatch(variant_name);
         const fallback_jump = self.function.instructions.items.len;
@@ -571,14 +574,20 @@ const FunctionCompiler = struct {
         const end_jump = self.function.instructions.items.len;
         try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
         self.patchJump(fallback_jump, self.function.instructions.items.len);
-        try self.compileExpression(fallback);
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = fallback_slot });
         self.patchJump(end_jump, self.function.instructions.items.len);
     }
 
     fn compileEnumStrict(self: *FunctionCompiler, object: ast.ExprId, message: ?ast.ExprId, variant_name: []const u8, default_message: []const u8) !void {
         const object_slot = try self.allocateLocal();
+        var message_slot: ?u16 = null;
         try self.compileExpression(object);
         try self.function.emit(self.compiler.result.allocator, .{ .set_local = object_slot });
+        if (message) |value| {
+            message_slot = try self.allocateLocal();
+            try self.compileExpression(value);
+            try self.function.emit(self.compiler.result.allocator, .{ .set_local = message_slot.? });
+        }
         try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
         try self.emitEnumMatch(variant_name);
         const panic_jump = self.function.instructions.items.len;
@@ -588,8 +597,8 @@ const FunctionCompiler = struct {
         const end_jump = self.function.instructions.items.len;
         try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
         self.patchJump(panic_jump, self.function.instructions.items.len);
-        if (message) |value| {
-            try self.compileExpression(value);
+        if (message_slot) |slot| {
+            try self.function.emit(self.compiler.result.allocator, .{ .get_local = slot });
         } else {
             try self.emitConstant(.{ .string = try self.compiler.result.program.copyString(default_message) });
         }

@@ -114,10 +114,10 @@ const Checker = struct {
     fn inferStatement(self: *Checker, statement: ast.StmtId, expected_return: types.TypeId) anyerror!types.TypeId {
         return switch (self.tree.stmt(statement).*) {
             .let => |let| blk: {
-                const value_type = try self.infer(let.value);
-                if (let.type_annotation) |annotation| {
-                    const expected = try self.resolveType(annotation);
-                    if (!self.assignable(value_type, expected)) try self.report(let.span, "Type Error: значение переменной не совпадает с аннотацией", .{});
+                const expected = if (let.type_annotation) |annotation| try self.resolveType(annotation) else null;
+                const value_type = if (expected) |type_id| try self.inferExpected(let.value, type_id) else try self.infer(let.value);
+                if (expected) |type_id| {
+                    if (!self.assignable(value_type, type_id)) try self.report(let.span, "Type Error: значение переменной не совпадает с аннотацией", .{});
                 }
                 if (self.resolution.stmt_symbols.get(statement)) |symbol| try self.result.symbol_types.put(symbol, value_type);
                 break :blk self.result.types.builtins.void;
@@ -169,12 +169,20 @@ const Checker = struct {
                 break :blk try self.result.types.map(key, value);
             },
             .index => |index| try self.inferIndex(index),
+            .lambda => |lambda| try self.inferLambda(expression, lambda, null),
             .if_expr => |conditional| try self.inferIf(conditional),
             .while_expr => |loop| try self.inferWhile(loop),
             else => try self.result.types.poison(),
         };
         try self.result.expression_types.put(expression, inferred);
         return inferred;
+    }
+
+    fn inferExpected(self: *Checker, expression: ast.ExprId, expected: types.TypeId) anyerror!types.TypeId {
+        if (self.tree.expr(expression).* == .lambda) {
+            return self.inferLambda(expression, self.tree.expr(expression).lambda, expected);
+        }
+        return self.infer(expression);
     }
 
     fn inferBlock(self: *Checker, statements: []const ast.StmtId) anyerror!types.TypeId {
@@ -226,6 +234,52 @@ const Checker = struct {
                 break :blk try self.result.types.poison();
             },
         };
+    }
+
+    fn inferLambda(self: *Checker, expression: ast.ExprId, lambda: anytype, expected: ?types.TypeId) anyerror!types.TypeId {
+        var parameter_types: std.ArrayList(types.TypeId) = .empty;
+        defer parameter_types.deinit(self.result.allocator);
+        var return_type = self.result.types.builtins.void;
+        if (expected) |expected_type| {
+            const signature = self.result.types.get(expected_type) orelse return self.result.types.poison();
+            switch (signature.*) {
+                .function => |function| {
+                    if (lambda.parameters.len != function.parameters.len) {
+                        try self.report(lambda.span, "Type Error: лямбда имеет неверное количество параметров", .{});
+                    }
+                    for (lambda.parameters, 0..) |parameter, index| {
+                        if (index < function.parameters.len) {
+                            try parameter_types.append(self.result.allocator, function.parameters[index]);
+                        } else {
+                            try parameter_types.append(self.result.allocator, try self.result.types.poison());
+                        }
+                        if (parameter.type_annotation) |annotation| {
+                            const declared = try self.resolveType(annotation);
+                            if (!self.assignable(declared, parameter_types.items[index])) try self.report(parameter.span, "Type Error: параметр лямбды не совпадает с ожидаемым типом", .{});
+                        }
+                    }
+                    return_type = function.return_type;
+                },
+                else => {
+                    try self.report(lambda.span, "Type Error: лямбда ожидает тип функции", .{});
+                    return self.result.types.poison();
+                },
+            }
+        } else {
+            for (lambda.parameters) |parameter| {
+                try parameter_types.append(self.result.allocator, if (parameter.type_annotation) |annotation| try self.resolveType(annotation) else try self.result.types.poison());
+            }
+            return_type = if (lambda.return_type) |annotation| try self.resolveType(annotation) else try self.result.types.poison();
+        }
+
+        const parameter_symbols = self.resolution.lambda_parameters.get(expression) orelse &.{};
+        for (parameter_symbols, parameter_types.items) |symbol, parameter_type| try self.result.symbol_types.put(symbol, parameter_type);
+        const previous_return = self.current_return;
+        self.current_return = return_type;
+        defer self.current_return = previous_return;
+        const body_type = try self.inferBlock(lambda.body);
+        if (!self.assignable(body_type, return_type)) try self.report(lambda.span, "Type Error: тело лямбды не совпадает с типом возврата", .{});
+        return self.result.types.function(parameter_types.items, return_type);
     }
 
     fn inferUnary(self: *Checker, unary: anytype) anyerror!types.TypeId {
@@ -391,4 +445,19 @@ test "type checker infers collection elements through indexing" {
     const function = parsed.ast.decl(parsed.ast.program.?.declarations[0]).function;
     const index = parsed.ast.stmt(function.body[2]).expr.value;
     try std.testing.expectEqual(checked.types.builtins.number, checked.expression_types.get(index).?);
+}
+
+test "type checker infers lambda parameters from a function annotation" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ применить(f: функ(Число) -> Число, x: Число) -> Число\nf(x)\nконец\nфунк старт() -> Число\nпер удвоить: функ(Число) -> Число = функ(значение)\nзначение * 2\nконец\nприменить(удвоить, 3)\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }

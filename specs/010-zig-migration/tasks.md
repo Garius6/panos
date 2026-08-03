@@ -60,7 +60,7 @@ syntactic, semantic and runtime success/error cases matches reference outcomes.
 - [x] T022 [US1] Implement symbols, lexical scopes and closure-capture metadata in `zig/core/symbols.zig`.
 - [x] T023 [US1] Implement primitive, tuple, function, nominal and collection types in `zig/core/types.zig`.
 - [x] T024 [US1] Implement resolver and accumulated semantic diagnostics in `zig/core/resolver.zig`.
-- [ ] T025 [US1] Implement type inference and checking for expressions, control flow and function calls in `zig/core/type_checker.zig`.
+- [x] T025 [US1] Implement type inference and checking for expressions, control flow and function calls in `zig/core/type_checker.zig`.
 - [ ] T026 [US1] Implement bytecode instruction model and compiler for typed core expressions in `zig/core/bytecode.zig` and `zig/core/compiler.zig`.
 - [ ] T027 [US1] Implement `Value`, frames, calls, collections and runtime errors in `zig/core/value.zig` and `zig/core/vm.zig`.
 - [ ] T028 [US1] Implement non-moving mark-and-sweep heap and root enumeration in `zig/core/gc.zig`.

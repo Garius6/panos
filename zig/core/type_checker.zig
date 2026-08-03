@@ -162,8 +162,13 @@ const Checker = struct {
                 if (map.entries.len == 0) break :blk try self.result.types.map(try self.result.types.poison(), try self.result.types.poison());
                 const key = try self.infer(map.entries[0].key);
                 const value = try self.infer(map.entries[0].value);
+                for (map.entries[1..]) |entry| {
+                    if (!self.assignable(try self.infer(entry.key), key)) try self.report(entry.span, "Type Error: ключи соответствия имеют разные типы", .{});
+                    if (!self.assignable(try self.infer(entry.value), value)) try self.report(entry.span, "Type Error: значения соответствия имеют разные типы", .{});
+                }
                 break :blk try self.result.types.map(key, value);
             },
+            .index => |index| try self.inferIndex(index),
             .if_expr => |conditional| try self.inferIf(conditional),
             .while_expr => |loop| try self.inferWhile(loop),
             else => try self.result.types.poison(),
@@ -199,6 +204,28 @@ const Checker = struct {
         }
         _ = try self.inferBlock(loop.body);
         return self.result.types.builtins.void;
+    }
+
+    fn inferIndex(self: *Checker, index: anytype) anyerror!types.TypeId {
+        const object_type = try self.infer(index.object);
+        const index_type = try self.infer(index.index);
+        const object = self.result.types.get(object_type) orelse return self.result.types.poison();
+        return switch (object.*) {
+            .array => |element| blk: {
+                if (!self.assignable(index_type, self.result.types.builtins.integer) and !self.assignable(index_type, self.result.types.builtins.number)) {
+                    try self.report(index.span, "Type Error: индекс массива должен быть числом", .{});
+                }
+                break :blk element;
+            },
+            .map => |map| blk: {
+                if (!self.assignable(index_type, map.key)) try self.report(index.span, "Type Error: ключ соответствия имеет неверный тип", .{});
+                break :blk map.value;
+            },
+            else => blk: {
+                try self.report(index.span, "Type Error: индексирование поддержано только для массива и соответствия", .{});
+                break :blk try self.result.types.poison();
+            },
+        };
     }
 
     fn inferUnary(self: *Checker, unary: anytype) anyerror!types.TypeId {
@@ -346,4 +373,22 @@ test "type checker checks control-flow conditions and branch results" {
     try std.testing.expectEqual(@as(usize, 2), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("Type Error: условие 'если' должно иметь тип Булево", checked.diagnostics.items.items[0].message);
     try std.testing.expectEqualStrings("Type Error: ветви 'если' возвращают разные типы", checked.diagnostics.items.items[1].message);
+}
+
+test "type checker infers collection elements through indexing" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ элемент() -> Число\nпер числа = массив(1, 2)\nпер цены = соответствие(\"яблоко\" = числа[0])\nцены[\"яблоко\"]\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    const function = parsed.ast.decl(parsed.ast.program.?.declarations[0]).function;
+    const index = parsed.ast.stmt(function.body[2]).expr.value;
+    try std.testing.expectEqual(checked.types.builtins.number, checked.expression_types.get(index).?);
 }

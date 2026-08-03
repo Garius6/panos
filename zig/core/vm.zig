@@ -1388,6 +1388,80 @@ test "VM matches generic enum variants" {
     }
 }
 
+test "VM matches literals and structure patterns" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "тип Точка = структура\n" ++
+            "x: Число\n" ++
+            "y: Число\n" ++
+            "конец\n" ++
+            "функ число(x: Число) -> Строка\n" ++
+            "выбор x\n" ++
+            "1 -> \"один\"\n" ++
+            "2 -> \"два\"\n" ++
+            "_ -> \"другое\"\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "функ код(x: Строка) -> Число\n" ++
+            "выбор x\n" ++
+            "\"да\" -> 1\n" ++
+            "остальное -> 0\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "функ булево(x: Булево) -> Строка\n" ++
+            "выбор x\n" ++
+            "истина -> \"да\"\n" ++
+            "ложь -> \"нет\"\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "функ ось(точка: Точка) -> Число\n" ++
+            "выбор точка\n" ++
+            "Точка(0, y) -> y\n" ++
+            "Точка(x, 0) -> x\n" ++
+            "Точка(_, _) -> -1\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "функ ось_именованно(точка: Точка) -> Число\n" ++
+            "выбор точка\n" ++
+            "Точка(y: 0) -> точка.x\n" ++
+            "Точка(_, _) -> -1\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "функ старт() -> Булево\n" ++
+            "число(2) == \"два\" и код(\"нет\") == 0 и булево(ложь) == \"нет\" и ось(Точка(0, 7)) == 7 и ось_именованно(Точка(5, 0)) == 5\n" ++
+            "конец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(5), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .boolean => |matched| try std.testing.expect(matched),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM executes compiled calls and control flow" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");

@@ -90,6 +90,7 @@ pub const CheckResult = struct {
     interface_definitions: std.AutoHashMap(symbols.SymbolId, InterfaceDefinition),
     interface_implementations: std.ArrayList(InterfaceImplementation) = .empty,
     pattern_variants: std.AutoHashMap(ast.PatternId, symbols.SymbolId),
+    pattern_types: std.AutoHashMap(ast.PatternId, types.TypeId),
     methods: std.ArrayList(MethodDefinition) = .empty,
     method_calls: std.AutoHashMap(ast.ExprId, symbols.SymbolId),
     interface_calls: std.AutoHashMap(ast.ExprId, InterfaceCall),
@@ -110,6 +111,7 @@ pub const CheckResult = struct {
             .enum_definitions = .init(allocator),
             .interface_definitions = .init(allocator),
             .pattern_variants = .init(allocator),
+            .pattern_types = .init(allocator),
             .method_calls = .init(allocator),
             .interface_calls = .init(allocator),
             .interface_casts = .init(allocator),
@@ -121,6 +123,7 @@ pub const CheckResult = struct {
         self.interface_calls.deinit();
         self.method_calls.deinit();
         self.methods.deinit(self.allocator);
+        self.pattern_types.deinit();
         self.pattern_variants.deinit();
         self.interface_implementations.deinit(self.allocator);
         self.interface_definitions.deinit();
@@ -789,34 +792,42 @@ const Checker = struct {
     fn inferMatchExpected(self: *Checker, match: anytype, expected: ?types.TypeId) anyerror!types.TypeId {
         const subject_type = try self.infer(match.subject);
         const subject_entry = self.result.types.get(subject_type) orelse return self.result.types.poison();
-        const nominal = switch (subject_entry.*) {
-            .nominal => |value| value,
-            else => {
-                try self.report(match.span, "Type Error: выбор поддерживает только перечисления", .{});
-                return self.result.types.poison();
-            },
+        const enum_definition = switch (subject_entry.*) {
+            .nominal => |nominal| self.result.enum_definitions.get(nominal.symbol),
+            else => null,
         };
-        const definition = self.result.enum_definitions.get(nominal.symbol) orelse {
-            try self.report(match.span, "Type Error: выбор поддерживает только перечисления", .{});
+        const supports_patterns = switch (subject_entry.*) {
+            .primitive => |primitive| primitive == .number or primitive == .integer or primitive == .boolean or primitive == .string,
+            .nominal => |nominal| enum_definition != null or (try self.fieldsForNominal(nominal)) != null,
+            .poison => true,
+            else => false,
+        };
+        if (!supports_patterns) {
+            try self.report(match.span, "Type Error: выбор не поддерживает этот тип", .{});
             return self.result.types.poison();
-        };
+        }
         var covered = std.AutoHashMap(symbols.SymbolId, void).init(self.result.allocator);
         defer covered.deinit();
         var fallback_seen = false;
+        var true_covered = false;
+        var false_covered = false;
         var result_type: ?types.TypeId = null;
         for (match.arms) |arm| {
-            const pattern = self.tree.pattern(arm.pattern).*;
             if (fallback_seen) try self.report(arm.span, "Type Error: шаблон после универсальной ветки недостижим", .{});
             if (try self.inferMatchPattern(arm.pattern, subject_type, true)) |variant| {
-                if (covered.contains(variant)) {
-                    try self.report(arm.span, "Type Error: вариант перечисления повторён в выборе", .{});
-                } else {
-                    try covered.put(variant, {});
+                if (enum_definition != null) {
+                    if (covered.contains(variant)) {
+                        try self.report(arm.span, "Type Error: вариант перечисления повторён в выборе", .{});
+                    } else {
+                        try covered.put(variant, {});
+                    }
                 }
-            } else {
-                switch (pattern) {
-                    .wildcard, .ident => fallback_seen = true,
-                    else => {},
+            }
+            if (self.isCatchAllPattern(arm.pattern)) {
+                fallback_seen = true;
+            } else if (subject_entry.* == .primitive and subject_entry.primitive == .boolean) {
+                if (patternBooleanLiteral(self.tree, arm.pattern)) |value| {
+                    if (value) true_covered = true else false_covered = true;
                 }
             }
             const arm_type = try self.inferBlockExpected(arm.body, expected);
@@ -832,14 +843,22 @@ const Checker = struct {
             }
         }
         if (!fallback_seen) {
-            for (definition.variants) |variant| {
-                if (!covered.contains(variant.symbol)) try self.report(match.span, "Type Error: выбор не исчерпывает вариант '{s}'", .{variant.name});
+            if (enum_definition) |definition| {
+                for (definition.variants) |variant| {
+                    if (!covered.contains(variant.symbol)) try self.report(match.span, "Type Error: выбор не исчерпывает вариант '{s}'", .{variant.name});
+                }
+            } else if (subject_entry.* == .primitive and subject_entry.primitive == .boolean) {
+                if (!true_covered) try self.report(match.span, "Type Error: выбор не исчерпывает значение 'истина'", .{});
+                if (!false_covered) try self.report(match.span, "Type Error: выбор не исчерпывает значение 'ложь'", .{});
+            } else {
+                try self.report(match.span, "Type Error: выбор требует универсальную ветку", .{});
             }
         }
         return expected orelse result_type orelse self.result.types.builtins.void;
     }
 
     fn inferMatchPattern(self: *Checker, pattern_id: ast.PatternId, subject_type: types.TypeId, allow_short_variant: bool) !?symbols.SymbolId {
+        try self.result.pattern_types.put(pattern_id, subject_type);
         switch (self.tree.pattern(pattern_id).*) {
             .wildcard => return null,
             .ident => |ident| {
@@ -861,45 +880,99 @@ const Checker = struct {
                 return null;
             },
             .literal => |literal| {
-                _ = try self.infer(literal.value);
-                try self.report(literal.span, "Type Error: литеральные шаблоны пока не поддержаны", .{});
+                const literal_type = try self.inferExpected(literal.value, subject_type);
+                if (!self.assignable(literal_type, subject_type)) try self.report(literal.span, "Type Error: литеральный шаблон не совпадает с типом значения выбора", .{});
                 return null;
             },
             .constructor => |constructor| {
-                if (constructor.field_names != null) try self.report(constructor.span, "Type Error: именованные поля шаблона перечисления пока не поддержаны", .{});
                 const subject_entry = self.result.types.get(subject_type) orelse return null;
                 const subject = switch (subject_entry.*) {
                     .nominal => |value| value,
                     else => {
-                        try self.report(constructor.span, "Type Error: шаблон-конструктор ожидает перечисление", .{});
+                        try self.report(constructor.span, "Type Error: шаблон-конструктор ожидает структуру или перечисление", .{});
                         return null;
                     },
                 };
-                const resolved_variant = self.resolution.pattern_symbols.get(pattern_id) orelse (if (constructor.module_name == null) self.resolution.findEnumVariant(subject.symbol, constructor.name) else null);
-                const variant_symbol = resolved_variant orelse {
-                    try self.report(constructor.span, "Type Error: неизвестный вариант перечисления в шаблоне", .{});
+                if (self.result.enum_definitions.contains(subject.symbol)) {
+                    if (constructor.field_names != null) try self.report(constructor.span, "Type Error: именованные поля шаблона перечисления пока не поддержаны", .{});
+                    const resolved_variant = self.resolution.pattern_symbols.get(pattern_id) orelse (if (constructor.module_name == null) self.resolution.findEnumVariant(subject.symbol, constructor.name) else null);
+                    const variant_symbol = resolved_variant orelse {
+                        try self.report(constructor.span, "Type Error: неизвестный вариант перечисления в шаблоне", .{});
+                        return null;
+                    };
+                    const variant_entry = self.resolution.symbols.get(variant_symbol) orelse return null;
+                    if (variant_entry.kind != .enum_variant or variant_entry.owner_type != subject.symbol) {
+                        try self.report(constructor.span, "Type Error: вариант шаблона не принадлежит типу значения выбора", .{});
+                        return null;
+                    }
+                    try self.result.pattern_variants.put(pattern_id, variant_symbol);
+                    const variant = self.enumVariant(variant_symbol) orelse return null;
+                    const fields = try self.enumVariantFields(variant, subject_type) orelse return null;
+                    if (constructor.arguments.len != fields.len) try self.report(constructor.span, "Type Error: неверное количество полей шаблона варианта", .{});
+                    const shared = @min(constructor.arguments.len, fields.len);
+                    for (constructor.arguments[0..shared], fields[0..shared]) |argument, field| {
+                        _ = try self.inferMatchPattern(argument, field, false);
+                    }
+                    return variant_symbol;
+                }
+                const constructor_symbol = self.findTypeSymbol(constructor.name) orelse {
+                    try self.report(constructor.span, "Type Error: неизвестный тип структуры в шаблоне", .{});
                     return null;
                 };
-                const variant_entry = self.resolution.symbols.get(variant_symbol) orelse return null;
-                if (variant_entry.kind != .enum_variant or variant_entry.owner_type != subject.symbol) {
-                    try self.report(constructor.span, "Type Error: вариант шаблона не принадлежит типу значения выбора", .{});
+                if (constructor_symbol != subject.symbol or constructor.module_name != null) {
+                    try self.report(constructor.span, "Type Error: шаблон структуры не совпадает с типом значения выбора", .{});
                     return null;
                 }
-                try self.result.pattern_variants.put(pattern_id, variant_symbol);
-                const variant = self.enumVariant(variant_symbol) orelse return null;
-                const fields = try self.enumVariantFields(variant, subject_type) orelse return null;
-                if (constructor.arguments.len != fields.len) try self.report(constructor.span, "Type Error: неверное количество полей шаблона варианта", .{});
-                const shared = @min(constructor.arguments.len, fields.len);
-                for (constructor.arguments[0..shared], fields[0..shared]) |argument, field| {
-                    switch (self.tree.pattern(argument).*) {
-                        .constructor, .literal => try self.report(constructor.span, "Type Error: вложенные и литеральные шаблоны пока не поддержаны", .{}),
-                        else => _ = try self.inferMatchPattern(argument, field, false),
+                const fields = try self.fieldsForNominal(subject) orelse {
+                    try self.report(constructor.span, "Type Error: шаблон-конструктор ожидает структуру", .{});
+                    return null;
+                };
+                if (constructor.field_names) |field_names| {
+                    if (field_names.len != constructor.arguments.len) try self.report(constructor.span, "Type Error: некорректные именованные поля шаблона", .{});
+                    var seen = std.StringHashMap(void).init(self.result.allocator);
+                    defer seen.deinit();
+                    const shared = @min(field_names.len, constructor.arguments.len);
+                    for (field_names[0..shared], constructor.arguments[0..shared]) |field_name, argument| {
+                        if (seen.contains(field_name)) {
+                            try self.report(constructor.span, "Type Error: поле '{s}' повторено в шаблоне", .{field_name});
+                            continue;
+                        }
+                        try seen.put(field_name, {});
+                        const field = findNominalField(fields, field_name) orelse {
+                            try self.report(constructor.span, "Type Error: у структуры нет поля '{s}'", .{field_name});
+                            continue;
+                        };
+                        _ = try self.inferMatchPattern(argument, field.typ, false);
+                    }
+                } else {
+                    if (constructor.arguments.len != fields.len) try self.report(constructor.span, "Type Error: неверное количество полей шаблона структуры", .{});
+                    const shared = @min(constructor.arguments.len, fields.len);
+                    for (constructor.arguments[0..shared], fields[0..shared]) |argument, field| {
+                        _ = try self.inferMatchPattern(argument, field.typ, false);
                     }
                 }
-                return variant_symbol;
+                return null;
             },
             .error_node => return null,
         }
+    }
+
+    fn isCatchAllPattern(self: *const Checker, pattern_id: ast.PatternId) bool {
+        if (self.patternVariant(pattern_id) != null) return false;
+        return switch (self.tree.pattern(pattern_id).*) {
+            .wildcard, .ident => true,
+            .constructor => |constructor| blk: {
+                for (constructor.arguments) |argument| {
+                    if (!self.isCatchAllPattern(argument)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
+    fn patternVariant(self: *const Checker, pattern_id: ast.PatternId) ?symbols.SymbolId {
+        return self.result.pattern_variants.get(pattern_id);
     }
 
     fn recordExpressionType(self: *Checker, expression: ast.ExprId, inferred: types.TypeId) !types.TypeId {
@@ -2056,6 +2129,24 @@ pub fn check(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *co
 fn tuplePropertyIndex(property: []const u8) ?usize {
     if (property.len == 0) return null;
     return std.fmt.parseInt(usize, property, 10) catch null;
+}
+
+fn findNominalField(fields: []const NominalField, name: []const u8) ?NominalField {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) return field;
+    }
+    return null;
+}
+
+fn patternBooleanLiteral(tree: *const ast.Ast, pattern: ast.PatternId) ?bool {
+    const literal = switch (tree.pattern(pattern).*) {
+        .literal => |value| value,
+        else => return null,
+    };
+    return switch (tree.expr(literal.value).*) {
+        .boolean => |value| value.value,
+        else => null,
+    };
 }
 
 fn builtinType(store: *types.TypeStore, name: []const u8) ?types.TypeId {

@@ -848,31 +848,25 @@ const FunctionCompiler = struct {
         var fallback_seen = false;
         for (match.arms) |arm| {
             if (fallback_seen) break;
-            if (try self.patternEnumVariantName(arm.pattern)) |variant_name| {
-                try self.function.emit(self.compiler.result.allocator, .{ .get_local = subject_slot });
-                const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(variant_name) });
-                try self.function.emit(self.compiler.result.allocator, .{ .match_enum = name_constant });
-                const next_arm = self.function.instructions.items.len;
-                try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
-                if (self.compiler.tree.pattern(arm.pattern).* == .constructor) try self.compilePatternBindings(arm.pattern, subject_slot);
+            if (self.isCatchAllPattern(arm.pattern)) {
+                fallback_seen = true;
+                try self.compilePatternBindings(arm.pattern, subject_slot);
                 try self.compileBlockValue(arm.body);
                 const end_jump = self.function.instructions.items.len;
                 try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
                 try end_jumps.append(self.compiler.result.allocator, end_jump);
-                self.patchJump(next_arm, self.function.instructions.items.len);
                 continue;
             }
-            switch (self.compiler.tree.pattern(arm.pattern).*) {
-                .wildcard, .ident => {
-                    fallback_seen = true;
-                    try self.compilePatternBindings(arm.pattern, subject_slot);
-                    try self.compileBlockValue(arm.body);
-                    const end_jump = self.function.instructions.items.len;
-                    try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
-                    try end_jumps.append(self.compiler.result.allocator, end_jump);
-                },
-                else => try self.unsupportedExpression(arm.span),
-            }
+            var next_arm_jumps: std.ArrayList(usize) = .empty;
+            defer next_arm_jumps.deinit(self.compiler.result.allocator);
+            try self.compilePatternGuards(arm.pattern, subject_slot, &next_arm_jumps);
+            try self.compilePatternBindings(arm.pattern, subject_slot);
+            try self.compileBlockValue(arm.body);
+            const end_jump = self.function.instructions.items.len;
+            try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+            try end_jumps.append(self.compiler.result.allocator, end_jump);
+            const next_arm = self.function.instructions.items.len;
+            for (next_arm_jumps.items) |jump| self.patchJump(jump, next_arm);
         }
         try self.emitVoid();
         const end_target = self.function.instructions.items.len;
@@ -983,15 +977,88 @@ const FunctionCompiler = struct {
                 try self.function.emit(self.compiler.result.allocator, .{ .set_local = binding_slot });
             },
             .constructor => |constructor| for (constructor.arguments, 0..) |argument, index| {
-                if (index > std.math.maxInt(u16)) return error.FieldLimitReached;
+                const field = try self.patternFieldIndex(pattern, constructor, index) orelse return self.unsupportedExpression(patternSpan(self.compiler.tree, pattern));
                 const field_slot = try self.allocateLocal();
                 try self.function.emit(self.compiler.result.allocator, .{ .get_local = value_slot });
-                try self.function.emit(self.compiler.result.allocator, .{ .get_property = @intCast(index) });
+                try self.function.emit(self.compiler.result.allocator, .{ .get_property = field });
                 try self.function.emit(self.compiler.result.allocator, .{ .set_local = field_slot });
                 try self.compilePatternBindings(argument, field_slot);
             },
             .wildcard, .literal, .error_node => {},
         }
+    }
+
+    fn compilePatternGuards(self: *FunctionCompiler, pattern: ast.PatternId, value_slot: u16, next_arm_jumps: *std.ArrayList(usize)) !void {
+        if (try self.patternEnumVariantName(pattern)) |variant_name| {
+            try self.function.emit(self.compiler.result.allocator, .{ .get_local = value_slot });
+            const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(variant_name) });
+            try self.function.emit(self.compiler.result.allocator, .{ .match_enum = name_constant });
+            const next_arm = self.function.instructions.items.len;
+            try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+            try next_arm_jumps.append(self.compiler.result.allocator, next_arm);
+        }
+        switch (self.compiler.tree.pattern(pattern).*) {
+            .literal => |literal| {
+                try self.function.emit(self.compiler.result.allocator, .{ .get_local = value_slot });
+                try self.compileExpression(literal.value);
+                try self.function.emit(self.compiler.result.allocator, .{ .equal = {} });
+                const next_arm = self.function.instructions.items.len;
+                try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+                try next_arm_jumps.append(self.compiler.result.allocator, next_arm);
+            },
+            .constructor => |constructor| for (constructor.arguments, 0..) |argument, index| {
+                const field = try self.patternFieldIndex(pattern, constructor, index) orelse return self.unsupportedExpression(patternSpan(self.compiler.tree, pattern));
+                const field_slot = try self.allocateLocal();
+                try self.function.emit(self.compiler.result.allocator, .{ .get_local = value_slot });
+                try self.function.emit(self.compiler.result.allocator, .{ .get_property = field });
+                try self.function.emit(self.compiler.result.allocator, .{ .set_local = field_slot });
+                try self.compilePatternGuards(argument, field_slot, next_arm_jumps);
+            },
+            .wildcard, .ident, .error_node => {},
+        }
+    }
+
+    fn isCatchAllPattern(self: *FunctionCompiler, pattern: ast.PatternId) bool {
+        if (self.compiler.checked.pattern_variants.contains(pattern)) return false;
+        return switch (self.compiler.tree.pattern(pattern).*) {
+            .wildcard, .ident => true,
+            .constructor => |constructor| blk: {
+                for (constructor.arguments) |argument| {
+                    if (!self.isCatchAllPattern(argument)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
+    fn patternFieldIndex(self: *FunctionCompiler, pattern: ast.PatternId, constructor: anytype, argument_index: usize) !?u16 {
+        const pattern_type = self.compiler.checked.pattern_types.get(pattern) orelse return null;
+        const entry = self.compiler.checked.types.get(pattern_type) orelse return null;
+        const nominal = switch (entry.*) {
+            .nominal => |value| value,
+            else => return null,
+        };
+        if (self.compiler.checked.enum_definitions.contains(nominal.symbol)) {
+            if (argument_index > std.math.maxInt(u16)) return error.FieldLimitReached;
+            return @intCast(argument_index);
+        }
+        const fields = if (self.compiler.checked.nominal_fields.get(nominal.symbol)) |normal|
+            normal
+        else if (self.compiler.checked.generic_nominal_fields.get(nominal.symbol)) |generic|
+            generic.fields
+        else
+            return null;
+        const name = if (constructor.field_names) |field_names| blk: {
+            if (argument_index >= field_names.len) return null;
+            break :blk field_names[argument_index];
+        } else return if (argument_index <= std.math.maxInt(u16)) @intCast(argument_index) else error.FieldLimitReached;
+        for (fields, 0..) |field, index| {
+            if (!std.mem.eql(u8, field.name, name)) continue;
+            if (index > std.math.maxInt(u16)) return error.FieldLimitReached;
+            return @intCast(index);
+        }
+        return null;
     }
 
     fn patchJump(self: *FunctionCompiler, instruction_index: usize, target: usize) void {
@@ -1244,6 +1311,13 @@ fn expressionSpan(tree: *const ast.Ast, expression: ast.ExprId) source.Span {
 fn statementSpan(tree: *const ast.Ast, statement: ast.StmtId) source.Span {
     return switch (tree.stmt(statement).*) {
         .continue_stmt, .break_stmt, .error_node => |span| span,
+        inline else => |value| value.span,
+    };
+}
+
+fn patternSpan(tree: *const ast.Ast, pattern: ast.PatternId) source.Span {
+    return switch (tree.pattern(pattern).*) {
+        .wildcard, .error_node => |span| span,
         inline else => |value| value.span,
     };
 }

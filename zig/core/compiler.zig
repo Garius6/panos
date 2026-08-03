@@ -13,6 +13,7 @@ pub const CompileResult = struct {
     diagnostics: diagnostic.DiagnosticList = .{},
     function_ids: std.AutoHashMap(symbols.SymbolId, bytecode.FunctionId),
     lambda_ids: std.AutoHashMap(ast.ExprId, bytecode.FunctionId),
+    top_level_constants: std.AutoHashMap(symbols.SymbolId, bytecode.Constant),
 
     pub fn init(allocator: std.mem.Allocator) CompileResult {
         return .{
@@ -20,10 +21,12 @@ pub const CompileResult = struct {
             .program = bytecode.Program.init(allocator),
             .function_ids = .init(allocator),
             .lambda_ids = .init(allocator),
+            .top_level_constants = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CompileResult) void {
+        self.top_level_constants.deinit();
         self.lambda_ids.deinit();
         self.function_ids.deinit();
         self.diagnostics.deinit(self.allocator);
@@ -80,6 +83,34 @@ const Compiler = struct {
                 else => {},
             }
         }
+    }
+
+    fn predeclareConstants(self: *Compiler) !void {
+        for (self.tree.program.?.declarations) |declaration| {
+            const constant = switch (self.tree.decl(declaration).*) {
+                .constant => |value| value,
+                else => continue,
+            };
+            const symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
+            const value = try self.topLevelConstant(constant.value) orelse {
+                try self.report(constant.span, "Compiler Error: top-level константа должна быть литералом", .{});
+                continue;
+            };
+            try self.result.top_level_constants.put(symbol, value);
+        }
+    }
+
+    fn topLevelConstant(self: *Compiler, expression: ast.ExprId) !?bytecode.Constant {
+        return switch (self.tree.expr(expression).*) {
+            .number => |number| .{ .number = number.value },
+            .boolean => |boolean| .{ .boolean = boolean.value },
+            .string => |string| .{ .string = try self.result.program.copyString(string.value) },
+            .unary => |unary| if (unary.operator == .minus) switch (self.tree.expr(unary.operand).*) {
+                .number => |number| .{ .number = -number.value },
+                else => null,
+            } else null,
+            else => null,
+        };
     }
 
     fn predeclareFunction(self: *Compiler, declaration: ast.DeclId, name: []const u8, parameter_count: usize) !void {
@@ -1278,6 +1309,10 @@ const FunctionCompiler = struct {
             try self.emitConstant(.{ .function_ref = function_id });
             return;
         }
+        if (self.compiler.result.top_level_constants.get(symbol)) |constant| {
+            try self.emitConstant(constant);
+            return;
+        }
         try self.unsupportedExpression(span);
     }
 
@@ -1463,6 +1498,7 @@ pub fn compile(
     errdefer result.deinit();
     var compiler = Compiler.init(tree, resolution, checked, &result);
     defer compiler.deinit();
+    try compiler.predeclareConstants();
     try compiler.predeclareFunctions();
     try compiler.predeclareLambdas();
     try compiler.registerComparableMethods();

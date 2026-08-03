@@ -558,10 +558,6 @@ const Checker = struct {
         for (self.tree.program.?.declarations) |declaration| {
             switch (self.tree.decl(declaration).*) {
                 .function => |function| try self.checkFunction(declaration, function.body),
-                .constant => |constant| {
-                    const value_type = try self.infer(constant.value);
-                    if (self.resolution.decl_symbols.get(declaration)) |symbol| try self.result.symbol_types.put(symbol, value_type);
-                },
                 .impl => |implementation| for (implementation.methods) |method| {
                     const function = self.tree.decl(method).function;
                     _ = function;
@@ -570,6 +566,28 @@ const Checker = struct {
                 else => {},
             }
         }
+    }
+
+    fn constantPass(self: *Checker) !void {
+        for (self.tree.program.?.declarations) |declaration| {
+            const constant = switch (self.tree.decl(declaration).*) {
+                .constant => |value| value,
+                else => continue,
+            };
+            if (!self.isTopLevelConstantLiteral(constant.value)) {
+                try self.report(constant.span, "Type Error: top-level константа должна быть числовым, строковым или булевым литералом", .{});
+            }
+            const value_type = try self.infer(constant.value);
+            if (self.resolution.decl_symbols.get(declaration)) |symbol| try self.result.symbol_types.put(symbol, value_type);
+        }
+    }
+
+    fn isTopLevelConstantLiteral(self: *const Checker, expression: ast.ExprId) bool {
+        return switch (self.tree.expr(expression).*) {
+            .number, .boolean, .string => true,
+            .unary => |unary| unary.operator == .minus and self.tree.expr(unary.operand).* == .number,
+            else => false,
+        };
     }
 
     fn checkFunction(self: *Checker, declaration: ast.DeclId, body: []const ast.StmtId) !void {
@@ -2472,6 +2490,7 @@ pub fn check(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *co
     try checker.enumPass();
     try checker.interfacePass();
     try checker.signaturePass();
+    try checker.constantPass();
     try checker.bodyPass();
     return result;
 }
@@ -2701,6 +2720,22 @@ test "type checker validates operators and assignment targets" {
     const function = parsed.ast.decl(parsed.ast.program.?.declarations[0]).function;
     const bitwise_value = parsed.ast.stmt(function.body[4]).let.value;
     try std.testing.expectEqual(checked.types.builtins.integer, checked.expression_types.get(bitwise_value).?);
+}
+
+test "type checker restricts top-level constants to literals" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "конст ПЛОХО = массив(1)\nконст НОРМА = -1\nфунк старт() -> Число\nНОРМА\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: top-level константа должна быть числовым, строковым или булевым литералом", checked.diagnostics.items.items[0].message);
 }
 
 test "type checker resolves aliases before and after their declaration" {

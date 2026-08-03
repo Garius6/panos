@@ -61,6 +61,16 @@ pub const InterfaceCall = struct {
     method_index: u16,
 };
 
+pub const ForInKind = enum {
+    array,
+    iterator,
+};
+
+pub const ForInInfo = struct {
+    kind: ForInKind,
+    next_method: symbols.SymbolId = symbols.invalid_symbol,
+};
+
 pub const MethodDefinition = struct {
     owner: symbols.SymbolId,
     interface: ?symbols.SymbolId,
@@ -98,6 +108,7 @@ pub const CheckResult = struct {
     interface_calls: std.AutoHashMap(ast.ExprId, InterfaceCall),
     interface_casts: std.AutoHashMap(ast.ExprId, InterfaceCast),
     call_arguments: std.AutoHashMap(ast.ExprId, []const ast.ExprId),
+    for_in_infos: std.AutoHashMap(ast.StmtId, ForInInfo),
 
     pub fn init(allocator: std.mem.Allocator) !CheckResult {
         return .{
@@ -119,10 +130,12 @@ pub const CheckResult = struct {
             .interface_calls = .init(allocator),
             .interface_casts = .init(allocator),
             .call_arguments = .init(allocator),
+            .for_in_infos = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CheckResult) void {
+        self.for_in_infos.deinit();
         self.call_arguments.deinit();
         self.interface_casts.deinit();
         self.interface_calls.deinit();
@@ -304,6 +317,7 @@ const Checker = struct {
         const option_symbol = self.findTypeSymbol("Опция") orelse return;
         const result_symbol = self.findTypeSymbol("Результат") orelse return;
         const comparable_symbol = self.findTypeSymbol("Сравниваемое") orelse return;
+        const iterable_symbol = self.findTypeSymbol("Итерируемое") orelse return;
         const option_parameters = try self.defineGenericEnumParameters(&.{"T"});
         const result_parameters = try self.defineGenericEnumParameters(&.{ "T", "E" });
         const option_variants = try self.result.arena.allocator().alloc(EnumVariant, 2);
@@ -345,6 +359,17 @@ const Checker = struct {
         try self.result.interface_definitions.put(comparable_symbol, .{
             .parameters = &.{},
             .methods = comparable_methods,
+        });
+        const iterable_parameters = try self.defineGenericEnumParameters(&.{"T"});
+        const iterable_methods = try self.result.arena.allocator().alloc(InterfaceMethod, 1);
+        iterable_methods[0] = .{
+            .name = "следующий",
+            .parameters = &.{},
+            .return_type = try self.result.types.nominal(option_symbol, &.{iterable_parameters[0].typ}),
+        };
+        try self.result.interface_definitions.put(iterable_symbol, .{
+            .parameters = iterable_parameters,
+            .methods = iterable_methods,
         });
     }
 
@@ -1074,21 +1099,53 @@ const Checker = struct {
         const iterable_type = try self.infer(loop.iterable);
         const iterable = self.result.types.get(iterable_type) orelse return self.result.types.builtins.void;
         switch (iterable.*) {
-            .array => |element| try self.bindStatementValue(statement, element, loop.span, "Type Error: шаблон 'для (...)' не совпадает с элементом массива"),
+            .array => |element| {
+                try self.bindStatementValue(statement, element, loop.span, "Type Error: шаблон 'для (...)' не совпадает с элементом массива");
+                try self.result.for_in_infos.put(statement, .{ .kind = .array });
+            },
             .map => {
                 try self.report(loop.span, "Type Error: Соответствие не поддерживает позиционный доступ; для перебора элементов используйте .записи() и 'для (ключ, значение) в ...'", .{});
                 try self.bindStatementPoison(statement);
             },
             .poison => try self.bindStatementPoison(statement),
             else => {
-                try self.report(loop.span, "Type Error: тип не поддерживает 'для x в' (нужен Массив или Итерируемое)", .{});
-                try self.bindStatementPoison(statement);
+                if (try self.iterableForIn(iterable_type)) |info| {
+                    try self.bindStatementValue(statement, info.element_type, loop.span, "Type Error: шаблон 'для (...)' не совпадает со значением Итерируемое");
+                    try self.result.for_in_infos.put(statement, .{ .kind = .iterator, .next_method = info.next_method });
+                } else {
+                    try self.report(loop.span, "Type Error: тип не поддерживает 'для x в' (нужен Массив или Итерируемое)", .{});
+                    try self.bindStatementPoison(statement);
+                }
             },
         }
         self.loop_depth += 1;
         defer self.loop_depth -= 1;
         _ = try self.inferBlock(loop.body);
         return self.result.types.builtins.void;
+    }
+
+    const IterableForIn = struct {
+        element_type: types.TypeId,
+        next_method: symbols.SymbolId,
+    };
+
+    fn iterableForIn(self: *Checker, iterable_type: types.TypeId) !?IterableForIn {
+        const iterable_entry = self.result.types.get(iterable_type) orelse return null;
+        const target = switch (iterable_entry.*) {
+            .nominal => |nominal| nominal.symbol,
+            else => return null,
+        };
+        const iterable = self.findTypeSymbol("Итерируемое") orelse return null;
+        const definition = self.result.interface_definitions.get(iterable) orelse return null;
+        if (definition.parameters.len != 1 or definition.methods.len != 1 or !std.mem.eql(u8, definition.methods[0].name, "следующий")) return null;
+        for (self.result.interface_implementations.items) |implementation| {
+            if (implementation.interface != iterable or implementation.target != target or implementation.arguments.len != 1 or implementation.methods.len != 1) continue;
+            return .{
+                .element_type = implementation.arguments[0],
+                .next_method = implementation.methods[0],
+            };
+        }
+        return null;
     }
 
     fn inferForRange(self: *Checker, statement: ast.StmtId, range: anytype) anyerror!types.TypeId {

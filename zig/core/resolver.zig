@@ -119,6 +119,7 @@ const Resolver = struct {
         try self.installPreludeEnum("Опция", &.{ "Нет", "Есть" });
         try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });
         try self.installPreludeInterface("Сравниваемое");
+        try self.installPreludeInterface("Итерируемое");
     }
 
     fn installPreludeInterface(self: *Resolver, name: []const u8) !void {
@@ -484,6 +485,7 @@ fn isReservedBuiltin(name: []const u8) bool {
         "встроку",
         "Целое",
         "Число",
+        "Итерируемое",
     };
     for (names) |reserved| {
         if (std.mem.eql(u8, name, reserved)) return true;

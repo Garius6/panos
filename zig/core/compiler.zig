@@ -1019,6 +1019,17 @@ const FunctionCompiler = struct {
     }
 
     fn compileForIn(self: *FunctionCompiler, statement: ast.StmtId, loop: anytype) !void {
+        const info = self.compiler.checked.for_in_infos.get(statement) orelse {
+            try self.compiler.report(loop.span, "Compiler Error: не удалось определить форму цикла 'для ... в'", .{});
+            return;
+        };
+        switch (info.kind) {
+            .array => try self.compileArrayForIn(statement, loop),
+            .iterator => try self.compileIteratorForIn(statement, loop, info.next_method),
+        }
+    }
+
+    fn compileArrayForIn(self: *FunctionCompiler, statement: ast.StmtId, loop: anytype) !void {
         const bindings = self.compiler.resolution.stmt_bindings.get(statement) orelse &.{};
         if (bindings.len == 0) {
             try self.compiler.report(loop.span, "Compiler Error: цикл 'для ... в' ожидает переменную массива", .{});
@@ -1043,18 +1054,7 @@ const FunctionCompiler = struct {
         try self.function.emit(self.compiler.result.allocator, .{ .get_local = index_slot });
         try self.function.emit(self.compiler.result.allocator, .{ .get_index = {} });
         try self.function.emit(self.compiler.result.allocator, .{ .set_local = element_slot });
-        if (bindings.len > 1) {
-            for (bindings, 0..) |binding, field_index| {
-                if (field_index > std.math.maxInt(u16)) {
-                    try self.compiler.report(loop.span, "Compiler Error: слишком много элементов деструктуризации", .{});
-                    return;
-                }
-                const slot = try self.ensureLocal(binding);
-                try self.function.emit(self.compiler.result.allocator, .{ .get_local = element_slot });
-                try self.function.emit(self.compiler.result.allocator, .{ .get_property = @intCast(field_index) });
-                try self.function.emit(self.compiler.result.allocator, .{ .set_local = slot });
-            }
-        }
+        try self.compileForInBindings(bindings, element_slot, loop.span);
         try self.enterLoop();
         try self.compileBlockStatements(loop.body);
         const continue_target = self.function.instructions.items.len;
@@ -1066,6 +1066,59 @@ const FunctionCompiler = struct {
         const exit_target = self.function.instructions.items.len;
         self.patchJump(exit_jump, exit_target);
         self.leaveLoop(continue_target, exit_target);
+    }
+
+    fn compileIteratorForIn(self: *FunctionCompiler, statement: ast.StmtId, loop: anytype, next_method: symbols.SymbolId) !void {
+        const bindings = self.compiler.resolution.stmt_bindings.get(statement) orelse &.{};
+        if (bindings.len == 0) {
+            try self.compiler.report(loop.span, "Compiler Error: цикл 'для ... в' ожидает переменную", .{});
+            return;
+        }
+        const function_id = self.compiler.result.function_ids.get(next_method) orelse {
+            try self.compiler.report(loop.span, "Compiler Error: не удалось найти метод следующий()", .{});
+            return;
+        };
+        const iterable_slot = try self.allocateLocal();
+        const option_slot = try self.allocateLocal();
+        const element_slot = if (bindings.len == 1) try self.ensureLocal(bindings[0]) else try self.allocateLocal();
+        try self.compileExpression(loop.iterable);
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = iterable_slot });
+
+        const loop_start = self.function.instructions.items.len;
+        try self.emitConstant(.{ .function_ref = function_id });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = iterable_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .call = 1 });
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = option_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = option_slot });
+        const option_name = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString("Опция.Есть") });
+        try self.function.emit(self.compiler.result.allocator, .{ .match_enum = option_name });
+        const exit_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = option_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_property = 0 });
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = element_slot });
+        try self.compileForInBindings(bindings, element_slot, loop.span);
+        try self.enterLoop();
+        try self.compileBlockStatements(loop.body);
+        const continue_target = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = loop_start });
+        const exit_target = self.function.instructions.items.len;
+        self.patchJump(exit_jump, exit_target);
+        self.leaveLoop(continue_target, exit_target);
+    }
+
+    fn compileForInBindings(self: *FunctionCompiler, bindings: []const symbols.SymbolId, element_slot: u16, span: source.Span) !void {
+        if (bindings.len <= 1) return;
+        for (bindings, 0..) |binding, field_index| {
+            if (field_index > std.math.maxInt(u16)) {
+                try self.compiler.report(span, "Compiler Error: слишком много элементов деструктуризации", .{});
+                return;
+            }
+            const slot = try self.ensureLocal(binding);
+            try self.function.emit(self.compiler.result.allocator, .{ .get_local = element_slot });
+            try self.function.emit(self.compiler.result.allocator, .{ .get_property = @intCast(field_index) });
+            try self.function.emit(self.compiler.result.allocator, .{ .set_local = slot });
+        }
     }
 
     fn compileBlockValue(self: *FunctionCompiler, statements: []const ast.StmtId) !void {

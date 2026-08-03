@@ -565,6 +565,11 @@ const FunctionCompiler = struct {
             try self.function.emit(self.compiler.result.allocator, .{ .current_process = {} });
             return true;
         }
+        if (std.mem.eql(u8, name, "убить") and call.arguments.len == 1) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .kill_process = {} });
+            return true;
+        }
         if (std.mem.eql(u8, name, "наблюдать") and call.arguments.len == 1) {
             try self.compileExpression(call.arguments[0]);
             try self.function.emit(self.compiler.result.allocator, .{ .observe = {} });

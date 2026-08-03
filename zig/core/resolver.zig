@@ -9,6 +9,23 @@ const EnumVariants = struct {
     values: std.StringHashMap(symbols.SymbolId),
 };
 
+pub const ImportedExport = struct {
+    name: []const u8,
+    kind: symbols.SymbolKind,
+    span: source.Span,
+};
+
+pub const ImportedModule = struct {
+    alias: []const u8,
+    span: source.Span,
+    exports: []const ImportedExport,
+};
+
+const ModuleMembers = struct {
+    module: symbols.SymbolId,
+    values: std.StringHashMap(symbols.SymbolId),
+};
+
 pub const Resolution = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -69,6 +86,7 @@ const Resolver = struct {
     result: *Resolution,
     scopes: symbols.ScopeStack,
     tree: *const ast.Ast = undefined,
+    module_members: std.ArrayList(ModuleMembers) = .empty,
 
     fn init(result: *Resolution) !Resolver {
         return .{
@@ -78,6 +96,8 @@ const Resolver = struct {
     }
 
     fn deinit(self: *Resolver) void {
+        for (self.module_members.items) |*members| members.values.deinit();
+        self.module_members.deinit(self.result.allocator);
         self.scopes.deinit();
         self.* = undefined;
     }
@@ -120,6 +140,47 @@ const Resolver = struct {
         try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });
         try self.installPreludeInterface("Сравниваемое");
         try self.installPreludeInterface("Итерируемое");
+    }
+
+    fn predeclareImports(self: *Resolver, imports: []const ImportedModule) !void {
+        for (imports) |import| {
+            const module = try self.result.symbols.add(.{
+                .name = import.alias,
+                .kind = .module,
+                .span = import.span,
+            });
+            self.scopes.declare(&self.result.symbols, module) catch |err| switch (err) {
+                error.DuplicateSymbol => try self.report(import.span, "Resolve Error: символ '{s}' уже объявлен", .{import.alias}),
+                else => return err,
+            };
+            var members = ModuleMembers{
+                .module = module,
+                .values = .init(self.result.allocator),
+            };
+            errdefer members.values.deinit();
+            for (import.exports) |exported| {
+                const member = try self.result.symbols.add(.{
+                    .name = exported.name,
+                    .kind = exported.kind,
+                    .module_path = import.alias,
+                    .is_exported = true,
+                    .span = exported.span,
+                });
+                if (members.values.contains(exported.name)) {
+                    try self.report(exported.span, "Resolve Error: экспорт '{s}' повторён в модуле '{s}'", .{ exported.name, import.alias });
+                } else {
+                    try members.values.put(exported.name, member);
+                }
+            }
+            try self.module_members.append(self.result.allocator, members);
+        }
+    }
+
+    fn moduleMember(self: *const Resolver, module: symbols.SymbolId, name: []const u8) ?symbols.SymbolId {
+        for (self.module_members.items) |members| {
+            if (members.module == module) return members.values.get(name);
+        }
+        return null;
     }
 
     fn installPreludeInterface(self: *Resolver, name: []const u8) !void {
@@ -367,7 +428,13 @@ const Resolver = struct {
                 try self.resolveExpression(tree, property.object);
                 if (self.result.expr_symbols.get(property.object)) |object_symbol| {
                     const entry = self.result.symbols.get(object_symbol) orelse return;
-                    if (entry.kind == .type) {
+                    if (entry.kind == .module) {
+                        if (self.moduleMember(object_symbol, property.property)) |member| {
+                            try self.result.expr_symbols.put(expression, member);
+                        } else {
+                            try self.report(property.span, "Resolve Error: у модуля '{s}' нет экспорта '{s}'", .{ entry.name, property.property });
+                        }
+                    } else if (entry.kind == .type) {
                         if (self.result.findEnumVariant(object_symbol, property.property)) |variant| {
                             try self.result.expr_symbols.put(expression, variant);
                         }
@@ -458,6 +525,10 @@ const Resolver = struct {
 };
 
 pub fn resolve(allocator: std.mem.Allocator, tree: *const ast.Ast) !Resolution {
+    return resolveWithImports(allocator, tree, &.{});
+}
+
+pub fn resolveWithImports(allocator: std.mem.Allocator, tree: *const ast.Ast, imports: []const ImportedModule) !Resolution {
     var result = try Resolution.init(allocator);
     errdefer result.deinit();
     var resolver = try Resolver.init(&result);
@@ -465,6 +536,7 @@ pub fn resolve(allocator: std.mem.Allocator, tree: *const ast.Ast) !Resolution {
     resolver.tree = tree;
 
     try resolver.installBuiltins();
+    try resolver.predeclareImports(imports);
     try resolver.predeclare(tree);
     try resolver.resolveDeclarations(tree);
     return result;
@@ -549,6 +621,54 @@ test "resolver links qualified enum constructors to variant symbols" {
     const variant = resolved.expr_symbols.get(property).?;
     try std.testing.expectEqual(symbols.SymbolKind.enum_variant, resolved.symbols.get(variant).?.kind);
     try std.testing.expectEqualStrings("Да", resolved.symbols.get(variant).?.name);
+}
+
+test "resolver links qualified module exports without global leakage" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "импорт \"./математика\" как мат\nфунк старт() -> Число\nмат.сложить(1, 2)\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    const imports = [_]ImportedModule{.{
+        .alias = "мат",
+        .span = .{ .file_id = 0, .start = 0, .end = 1 },
+        .exports = &.{.{
+            .name = "сложить",
+            .kind = .function,
+            .span = .{ .file_id = 1, .start = 0, .end = 7 },
+        }},
+    }};
+    var resolved = try resolveWithImports(std.testing.allocator, &parsed.ast, &imports);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    const start = parsed.ast.decl(parsed.ast.program.?.declarations[1]).function;
+    const callee = parsed.ast.stmt(start.body[0]).expr.value;
+    const call = parsed.ast.expr(callee).call;
+    const symbol = resolved.expr_symbols.get(call.callee).?;
+    const entry = resolved.symbols.get(symbol).?;
+    try std.testing.expectEqual(symbols.SymbolKind.function, entry.kind);
+    try std.testing.expectEqualStrings("мат::сложить", entry.full_name);
+}
+
+test "resolver reports unknown qualified module exports" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "импорт \"./математика\" как мат\nфунк старт() -> Число\nмат.нет(1)\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    const imports = [_]ImportedModule{.{
+        .alias = "мат",
+        .span = .{ .file_id = 0, .start = 0, .end = 1 },
+        .exports = &.{},
+    }};
+    var resolved = try resolveWithImports(std.testing.allocator, &parsed.ast, &imports);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), resolved.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Resolve Error: у модуля 'мат' нет экспорта 'нет'", resolved.diagnostics.items.items[0].message);
 }
 
 test "resolver records all statement binders for destructuring and loops" {

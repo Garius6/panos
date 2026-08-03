@@ -90,3 +90,37 @@ test "parser conformance fixture preserves structs interfaces and generic ADTs" 
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture preserves nested control-flow blocks" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/control_flow.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    const declaration = parsed.ast.decl(parsed.ast.program.?.declarations[0]);
+    switch (declaration.*) {
+        .function => |function| {
+            try std.testing.expectEqual(@as(usize, 4), function.body.len);
+            switch (parsed.ast.stmt(function.body[2]).*) {
+                .expr => |statement| switch (parsed.ast.expr(statement.value).*) {
+                    .while_expr => |loop| try std.testing.expectEqual(@as(usize, 2), loop.body.len),
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (parsed.ast.stmt(function.body[3]).*) {
+                .expr => |statement| switch (parsed.ast.expr(statement.value).*) {
+                    .if_expr => |conditional| {
+                        try std.testing.expectEqual(@as(usize, 1), conditional.then_branch.len);
+                        try std.testing.expectEqual(@as(usize, 1), conditional.else_branch.len);
+                    },
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

@@ -727,11 +727,53 @@ const Parser = struct {
                 } });
             },
             .l_paren => self.parseGrouped(value),
+            .if_expr => self.parseIfExpression(value),
+            .while_expr => self.parseWhileExpression(value),
             else => blk: {
                 try self.report(value.span, "Синтаксическая ошибка: ожидается выражение");
                 break :blk self.result.ast.addExpr(.{ .error_node = value.span });
             },
         };
+    }
+
+    fn parseIfExpression(self: *Parser, start: token.Token) anyerror!ast.ExprId {
+        const condition = try self.parseExpression(0);
+        _ = try self.expect(.then, "Синтаксическая ошибка: после условия 'если' ожидается 'тогда'");
+        const then_branch = try self.parseStatementBlock(.else_expr);
+        var else_branch: []const ast.StmtId = &.{};
+        if (self.at(.else_expr)) {
+            _ = self.next();
+            else_branch = try self.parseStatementBlock(null);
+        }
+        const end = try self.expect(.end, "Синтаксическая ошибка: 'если' не закрыт 'конец'");
+        return self.result.ast.addExpr(.{ .if_expr = .{
+            .span = spanFrom(start.span, end.span),
+            .condition = condition,
+            .then_branch = then_branch,
+            .else_branch = else_branch,
+        } });
+    }
+
+    fn parseWhileExpression(self: *Parser, start: token.Token) anyerror!ast.ExprId {
+        const condition = try self.parseExpression(0);
+        _ = try self.expect(.loop, "Синтаксическая ошибка: после условия 'пока' ожидается 'цикл'");
+        const body = try self.parseStatementBlock(null);
+        const end = try self.expect(.end, "Синтаксическая ошибка: 'пока' не закрыт 'конец'");
+        return self.result.ast.addExpr(.{ .while_expr = .{
+            .span = spanFrom(start.span, end.span),
+            .condition = condition,
+            .body = body,
+        } });
+    }
+
+    fn parseStatementBlock(self: *Parser, alternate_terminator: ?token.TokenKind) ![]const ast.StmtId {
+        var statements: std.ArrayList(ast.StmtId) = .empty;
+        defer statements.deinit(self.result.allocator);
+        while (!self.at(.end) and (alternate_terminator == null or !self.at(alternate_terminator.?)) and !self.at(.eof)) {
+            try statements.append(self.result.allocator, try self.parseStatement());
+            self.consumeSemicolons();
+        }
+        return self.result.ast.copySlice(ast.StmtId, statements.items);
     }
 
     fn parseNumber(self: *Parser, value: token.Token) !ast.ExprId {

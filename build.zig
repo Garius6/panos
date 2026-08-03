@@ -75,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("zig/conformance/manifest.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "panos_core", .module = core_module }},
     });
     const manifest_tests = b.addTest(.{
         .root_module = b.createModule(.{

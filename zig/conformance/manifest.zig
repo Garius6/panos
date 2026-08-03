@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const outcome = @import("outcome.zig");
+
 pub const manifest_version: u32 = 1;
 
 pub const Manifest = struct {

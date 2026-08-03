@@ -70,7 +70,7 @@ pub const Server = struct {
         const params = request.get("params");
 
         if (std.mem.eql(u8, method, "initialize")) {
-            if (id) |request_id| try writeResponse(output, request_id, "{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}}}");
+            if (id) |request_id| try writeResponse(output, request_id, "{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"foldingRangeProvider\":true,\"documentSymbolProvider\":true}}");
             return true;
         }
         if (std.mem.eql(u8, method, "shutdown")) {
@@ -96,6 +96,14 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, method, "textDocument/completion")) {
             if (id) |request_id| try self.completion(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "textDocument/foldingRange")) {
+            if (id) |request_id| try self.foldingRange(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "textDocument/documentSymbol")) {
+            if (id) |request_id| try self.documentSymbol(params, request_id, output);
             return true;
         }
         if (id) |request_id| try writeError(output, request_id, -32601, "Метод ещё не поддержан Zig-версией");
@@ -223,6 +231,60 @@ pub const Server = struct {
         try writeCompletionResponse(output, request_id, checked, type_id);
     }
 
+    fn foldingRange(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const uri = documentUri(params) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const text = self.documents.sourceText(uri) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        var analysis = panos_core.runner.analyzeSource(self.allocator, uri, text) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer analysis.deinit();
+        const tree = analysis.tree() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        var ranges = panos_core.lsp.foldingRanges(self.allocator, tree) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer ranges.deinit();
+        const file = panos_core.source.SourceFile.init(0, uri, text);
+        try writeFoldingRangesResponse(output, request_id, file, &ranges);
+    }
+
+    fn documentSymbol(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const uri = documentUri(params) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const text = self.documents.sourceText(uri) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        var analysis = panos_core.runner.analyzeSource(self.allocator, uri, text) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer analysis.deinit();
+        const tree = analysis.tree() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        var symbols = panos_core.lsp.documentSymbols(self.allocator, tree) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer symbols.deinit();
+        const file = panos_core.source.SourceFile.init(0, uri, text);
+        try writeDocumentSymbolsResponse(output, request_id, file, symbols.items);
+    }
+
     fn documentPosition(self: *const Server, params: ?std.json.Value) ?DocumentPosition {
         const params_object = objectValue(params orelse return null) orelse return null;
         const document = objectValue(params_object.get("textDocument") orelse return null) orelse return null;
@@ -244,6 +306,12 @@ pub const Server = struct {
         try writePublish(output, uri, &diagnostics);
     }
 };
+
+fn documentUri(params: ?std.json.Value) ?[]const u8 {
+    const params_object = objectValue(params orelse return null) orelse return null;
+    const document = objectValue(params_object.get("textDocument") orelse return null) orelse return null;
+    return stringValue(document.get("uri") orelse return null);
+}
 
 fn stringValue(value: std.json.Value) ?[]const u8 {
     return switch (value) {
@@ -308,6 +376,78 @@ fn writeCompletionResponse(output: *ResponseBuffer, id: std.json.Value, checked:
         if (type_id) |value| try appendCompletionItems(output, result, value);
     }
     try output.appendSlice("]}}");
+}
+
+fn writeFoldingRangesResponse(output: *ResponseBuffer, id: std.json.Value, file: panos_core.source.SourceFile, ranges: *const core_lsp.FoldingRanges) !void {
+    try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+    try appendJsonValue(output, id);
+    try output.appendSlice(",\"result\":[");
+    var first = true;
+    for (ranges.items.items) |item| {
+        const range = rangeForSpan(file, item.span);
+        if (range.end.line <= range.start.line) continue;
+        if (!first) try output.append(',');
+        first = false;
+        try output.appendSlice("{\"startLine\":");
+        try appendNumber(output, range.start.line);
+        try output.appendSlice(",\"endLine\":");
+        try appendNumber(output, range.end.line);
+        try output.append('}');
+    }
+    try output.appendSlice("]}");
+}
+
+fn writeDocumentSymbolsResponse(output: *ResponseBuffer, id: std.json.Value, file: panos_core.source.SourceFile, symbols: []const core_lsp.DocumentSymbol) !void {
+    try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+    try appendJsonValue(output, id);
+    try output.appendSlice(",\"result\":[");
+    for (symbols, 0..) |symbol, index| {
+        if (index != 0) try output.append(',');
+        try appendDocumentSymbol(output, file, symbol);
+    }
+    try output.appendSlice("]}");
+}
+
+fn appendDocumentSymbol(output: *ResponseBuffer, file: panos_core.source.SourceFile, symbol: core_lsp.DocumentSymbol) !void {
+    try output.appendSlice("{\"name\":");
+    try appendJsonString(output, symbol.name);
+    try output.appendSlice(",\"kind\":");
+    try appendNumber(output, documentSymbolKind(symbol.kind));
+    try output.appendSlice(",\"range\":");
+    try appendRange(output, rangeForSpan(file, symbol.range));
+    try output.appendSlice(",\"selectionRange\":");
+    try appendRange(output, rangeForSpan(file, symbol.selection_range));
+    if (symbol.children.len != 0) {
+        try output.appendSlice(",\"children\":[");
+        for (symbol.children, 0..) |child, index| {
+            if (index != 0) try output.append(',');
+            try appendDocumentSymbol(output, file, child);
+        }
+        try output.append(']');
+    }
+    try output.append('}');
+}
+
+fn rangeForSpan(file: panos_core.source.SourceFile, span: panos_core.source.Span) core_lsp.Range {
+    return .{
+        .start = file.byteOffsetToUtf16Position(span.start),
+        .end = file.byteOffsetToUtf16Position(span.end),
+    };
+}
+
+fn documentSymbolKind(kind: core_lsp.DocumentSymbolKind) u8 {
+    return switch (kind) {
+        .structure => 23,
+        .enumeration => 10,
+        .interface => 11,
+        .function => 12,
+        .method => 6,
+        .field => 8,
+        .enum_member => 22,
+        .implementation => 5,
+        .constant => 14,
+        .type_alias => 26,
+    };
 }
 
 fn writePublish(output: *ResponseBuffer, uri: []const u8, diagnostics: ?*const core_lsp.DocumentDiagnostics) !void {
@@ -484,7 +624,7 @@ test "LSP server publishes diagnostics for opened and changed documents" {
     defer output.deinit();
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}", &output));
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}}}}", output.items());
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"foldingRangeProvider\":true,\"documentSymbolProvider\":true}}}", output.items());
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\",\"text\":\"экспорт функ старт() -> Число\\nнеизвестно\\nконец\"}}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"line\":1,\"character\":0") != null);
@@ -500,6 +640,14 @@ test "LSP server publishes diagnostics for opened and changed documents" {
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"contentChanges\":[{\"text\":\"экспорт функ старт() -> Пусто\\nпер числа: Массив(Число) = массив()\\nчисла.\\nконец\"}]}}", &output));
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":2,\"character\":6}}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"label\":\"добавить\",\"kind\":2") != null);
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"contentChanges\":[{\"text\":\"тип Точка = структура\\nx: Число\\nконец\\nфунк старт() -> Число\\nесли истина тогда\\n1\\nиначе\\n2\\nконец\\nконец\"}]}}", &output));
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"name\":\"Точка\",\"kind\":23") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"children\":[{\"name\":\"x\",\"kind\":8") != null);
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/foldingRange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"startLine\":0,\"endLine\":2") != null);
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"workspace/unsupported\",\"params\":{}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"code\":-32601") != null);

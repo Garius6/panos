@@ -1002,6 +1002,7 @@ const Checker = struct {
         switch (self.tree.expr(call.callee).*) {
             .property => |property| {
                 const object_type = try self.infer(property.object);
+                if (try self.inferPreludeEnumMethod(call, property, object_type)) |method_type| return method_type;
                 if (try self.inferMethodCall(expression, call, property, object_type)) |method_type| return method_type;
                 const object = self.result.types.get(object_type) orelse return self.result.types.poison();
                 switch (object.*) {
@@ -1284,6 +1285,58 @@ const Checker = struct {
         }
         try self.result.method_calls.put(expression, method.symbol);
         return @as(?types.TypeId, try self.substituteGeneric(function.return_type, &substitutions));
+    }
+
+    fn inferPreludeEnumMethod(self: *Checker, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
+        const object = self.result.types.get(object_type) orelse return null;
+        const nominal = switch (object.*) {
+            .nominal => |value| value,
+            else => return null,
+        };
+        const owner = self.resolution.symbols.get(nominal.symbol) orelse return null;
+        if (std.mem.eql(u8, owner.name, "Опция")) {
+            if (nominal.arguments.len != 1) return null;
+            const element = nominal.arguments[0];
+            if (std.mem.eql(u8, property.property, "есть") or std.mem.eql(u8, property.property, "пусто")) {
+                try self.checkMethodArity(call, property.property, 0);
+                return self.result.types.builtins.boolean;
+            }
+            if (std.mem.eql(u8, property.property, "получить")) {
+                try self.checkMethodArity(call, "получить", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], element), element)) try self.report(call.span, "Type Error: значение по умолчанию имеет неверный тип", .{});
+                return element;
+            }
+            if (std.mem.eql(u8, property.property, "запас")) {
+                try self.checkMethodArity(call, "запас", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], object_type), object_type)) try self.report(call.span, "Type Error: запасная опция имеет неверный тип", .{});
+                return object_type;
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Результат")) {
+            if (nominal.arguments.len != 2) return null;
+            const success = nominal.arguments[0];
+            const failure = nominal.arguments[1];
+            if (std.mem.eql(u8, property.property, "успех") or std.mem.eql(u8, property.property, "ошибка")) {
+                try self.checkMethodArity(call, property.property, 0);
+                return self.result.types.builtins.boolean;
+            }
+            if (std.mem.eql(u8, property.property, "получить")) {
+                try self.checkMethodArity(call, "получить", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], success), success)) try self.report(call.span, "Type Error: значение по умолчанию имеет неверный тип", .{});
+                return success;
+            }
+            if (std.mem.eql(u8, property.property, "получить_ошибку")) {
+                try self.checkMethodArity(call, "получить_ошибку", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], failure), failure)) try self.report(call.span, "Type Error: ошибка по умолчанию имеет неверный тип", .{});
+                return failure;
+            }
+            if (std.mem.eql(u8, property.property, "запас")) {
+                try self.checkMethodArity(call, "запас", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], object_type), object_type)) try self.report(call.span, "Type Error: запасной результат имеет неверный тип", .{});
+                return object_type;
+            }
+        }
+        return null;
     }
 
     fn resolveAlias(self: *Checker, symbol: symbols.SymbolId, span: source.Span) anyerror!types.TypeId {

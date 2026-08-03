@@ -960,6 +960,38 @@ test "VM provides option and result from the prelude" {
     }
 }
 
+test "VM executes safe prelude option and result methods" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Число\nпер нет: Опция(Число) = Опция.Нет()\nпер неудача: Результат(Число, Строка) = Результат.Неудача(\"нет\")\nесли нет.пусто() и не нет.есть() и нет.получить(4) == 4 и нет.запас(Опция.Есть(5)).получить(0) == 5 и неудача.ошибка() и не неудача.успех() и неудача.получить(6) == 6 и неудача.получить_ошибку(\"запас\") == \"нет\" и неудача.запас(Результат.Успех(7)).получить(0) == 7 тогда\n1\nиначе\n0\nконец\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 1), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM matches generic enum variants" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");

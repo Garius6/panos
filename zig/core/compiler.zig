@@ -387,6 +387,7 @@ const FunctionCompiler = struct {
     fn compileCall(self: *FunctionCompiler, expression: ast.ExprId, call: anytype) !void {
         if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
         if (try self.compileCollectionMethod(call)) return;
+        if (try self.compilePreludeEnumMethod(call)) return;
         if (self.compiler.checked.method_calls.get(expression)) |method| {
             const property = switch (self.compiler.tree.expr(call.callee).*) {
                 .property => |value| value,
@@ -467,6 +468,92 @@ const FunctionCompiler = struct {
         for (call.arguments) |argument| try self.compileExpression(argument);
         try self.function.emit(self.compiler.result.allocator, instruction);
         return true;
+    }
+
+    fn compilePreludeEnumMethod(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const object_type = self.compiler.checked.expression_types.get(property.object) orelse return false;
+        const type_entry = self.compiler.checked.types.get(object_type) orelse return false;
+        const nominal = switch (type_entry.*) {
+            .nominal => |value| value,
+            else => return false,
+        };
+        const owner = self.compiler.resolution.symbols.get(nominal.symbol) orelse return false;
+        if (std.mem.eql(u8, owner.name, "Опция")) {
+            if (std.mem.eql(u8, property.property, "есть") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.emitEnumMatch("Опция.Есть");
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "пусто") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.emitEnumMatch("Опция.Нет");
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 1) {
+                try self.compileEnumFallback(property.object, call.arguments[0], "Опция.Есть", .field);
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "запас") and call.arguments.len == 1) {
+                try self.compileEnumFallback(property.object, call.arguments[0], "Опция.Есть", .receiver);
+                return true;
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Результат")) {
+            if (std.mem.eql(u8, property.property, "успех") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.emitEnumMatch("Результат.Успех");
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "ошибка") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.emitEnumMatch("Результат.Неудача");
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 1) {
+                try self.compileEnumFallback(property.object, call.arguments[0], "Результат.Успех", .field);
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "получить_ошибку") and call.arguments.len == 1) {
+                try self.compileEnumFallback(property.object, call.arguments[0], "Результат.Неудача", .field);
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "запас") and call.arguments.len == 1) {
+                try self.compileEnumFallback(property.object, call.arguments[0], "Результат.Успех", .receiver);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    const EnumFallback = enum { field, receiver };
+
+    fn compileEnumFallback(self: *FunctionCompiler, object: ast.ExprId, fallback: ast.ExprId, variant_name: []const u8, result: EnumFallback) !void {
+        const object_slot = try self.allocateLocal();
+        try self.compileExpression(object);
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = object_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
+        try self.emitEnumMatch(variant_name);
+        const fallback_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
+        switch (result) {
+            .field => try self.function.emit(self.compiler.result.allocator, .{ .get_property = 0 }),
+            .receiver => {},
+        }
+        const end_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+        self.patchJump(fallback_jump, self.function.instructions.items.len);
+        try self.compileExpression(fallback);
+        self.patchJump(end_jump, self.function.instructions.items.len);
+    }
+
+    fn emitEnumMatch(self: *FunctionCompiler, variant_name: []const u8) !void {
+        const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(variant_name) });
+        try self.function.emit(self.compiler.result.allocator, .{ .match_enum = name_constant });
     }
 
     fn compileSequence(self: *FunctionCompiler, expressions: []const ast.ExprId, comptime tag: bytecode.Opcode) !void {

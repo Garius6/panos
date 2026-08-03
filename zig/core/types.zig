@@ -43,7 +43,7 @@ pub const Type = union(enum) {
     },
     process: TypeId,
     pointer: TypeId,
-    generic_parameter: symbols.SymbolId,
+    generic_parameter: u32,
     poison: void,
 };
 
@@ -119,8 +119,8 @@ pub const TypeStore = struct {
         return self.add(.{ .pointer = pointee });
     }
 
-    pub fn genericParameter(self: *TypeStore, symbol: symbols.SymbolId) !TypeId {
-        return self.add(.{ .generic_parameter = symbol });
+    pub fn genericParameter(self: *TypeStore, identifier: u32) !TypeId {
+        return self.add(.{ .generic_parameter = identifier });
     }
 
     pub fn poison(self: *TypeStore) !TypeId {

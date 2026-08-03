@@ -11,6 +11,11 @@ pub const NominalField = struct {
     typ: types.TypeId,
 };
 
+pub const GenericParameter = struct {
+    name: []const u8,
+    typ: types.TypeId,
+};
+
 pub const CheckResult = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -21,6 +26,7 @@ pub const CheckResult = struct {
     nominal_fields: std.AutoHashMap(symbols.SymbolId, []const NominalField),
     type_aliases: std.AutoHashMap(symbols.SymbolId, types.TypeId),
     alias_type_nodes: std.AutoHashMap(symbols.SymbolId, ast.TypeId),
+    generic_function_parameters: std.AutoHashMap(symbols.SymbolId, []const GenericParameter),
 
     pub fn init(allocator: std.mem.Allocator) !CheckResult {
         return .{
@@ -32,10 +38,12 @@ pub const CheckResult = struct {
             .nominal_fields = .init(allocator),
             .type_aliases = .init(allocator),
             .alias_type_nodes = .init(allocator),
+            .generic_function_parameters = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CheckResult) void {
+        self.generic_function_parameters.deinit();
         self.alias_type_nodes.deinit();
         self.type_aliases.deinit();
         self.nominal_fields.deinit();
@@ -53,7 +61,9 @@ const Checker = struct {
     resolution: *const resolver.Resolution,
     result: *CheckResult,
     current_return: ?types.TypeId = null,
+    current_generic_parameters: []const GenericParameter = &.{},
     loop_depth: usize = 0,
+    next_generic_parameter: u32 = 1,
     resolving_aliases: std.AutoHashMap(symbols.SymbolId, void),
 
     fn report(self: *Checker, span: source.Span, comptime format: []const u8, args: anytype) !void {
@@ -69,11 +79,11 @@ const Checker = struct {
     fn signaturePass(self: *Checker) !void {
         for (self.tree.program.?.declarations) |declaration| {
             switch (self.tree.decl(declaration).*) {
-                .function => |function| try self.defineFunctionSignature(declaration, function.parameters, function.return_type),
+                .function => |function| try self.defineFunctionSignature(declaration, function.type_parameters, function.parameters, function.return_type),
                 .foreign => {},
                 .impl => |implementation| for (implementation.methods) |method| {
                     const function = self.tree.decl(method).function;
-                    try self.defineFunctionSignature(method, function.parameters, function.return_type);
+                    try self.defineFunctionSignature(method, function.type_parameters, function.parameters, function.return_type);
                 },
                 else => {},
             }
@@ -112,14 +122,18 @@ const Checker = struct {
         }
     }
 
-    fn defineFunctionSignature(self: *Checker, declaration: ast.DeclId, parameters: []const ast.ParamDecl, return_type: ast.TypeId) !void {
+    fn defineFunctionSignature(self: *Checker, declaration: ast.DeclId, type_parameters: []const ast.TypeParameter, parameters: []const ast.ParamDecl, return_type: ast.TypeId) !void {
+        const symbol = self.resolution.decl_symbols.get(declaration) orelse return;
+        const generic_parameters = try self.defineGenericParameters(symbol, type_parameters);
+        const previous_generic_parameters = self.current_generic_parameters;
+        self.current_generic_parameters = generic_parameters;
+        defer self.current_generic_parameters = previous_generic_parameters;
         var parameter_types: std.ArrayList(types.TypeId) = .empty;
         defer parameter_types.deinit(self.result.allocator);
         for (parameters) |parameter| {
             try parameter_types.append(self.result.allocator, try self.resolveType(parameter.type_annotation.?));
         }
         const signature = try self.result.types.function(parameter_types.items, try self.resolveType(return_type));
-        const symbol = self.resolution.decl_symbols.get(declaration) orelse return;
         try self.result.symbol_types.put(symbol, signature);
     }
 
@@ -145,6 +159,9 @@ const Checker = struct {
         const function_symbol = self.resolution.decl_symbols.get(declaration) orelse return;
         const signature = self.result.symbol_types.get(function_symbol) orelse return;
         const function_type = self.result.types.get(signature).?.function;
+        const previous_generic_parameters = self.current_generic_parameters;
+        self.current_generic_parameters = self.result.generic_function_parameters.get(function_symbol) orelse &.{};
+        defer self.current_generic_parameters = previous_generic_parameters;
         const previous_return = self.current_return;
         self.current_return = function_type.return_type;
         defer self.current_return = previous_return;
@@ -769,6 +786,25 @@ const Checker = struct {
             .function => |function| {
                 if (call.arguments.len != function.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов функции", .{});
                 const shared = @min(call.arguments.len, function.parameters.len);
+                const generic_parameters: []const GenericParameter = if (self.resolution.expr_symbols.get(call.callee)) |symbol|
+                    self.result.generic_function_parameters.get(symbol) orelse &.{}
+                else
+                    &.{};
+                if (generic_parameters.len != 0) {
+                    var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+                    defer substitutions.deinit();
+                    for (call.arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
+                        try self.inferGenericSubstitution(parameter, try self.infer(argument), &substitutions, call.span);
+                    }
+                    for (generic_parameters) |parameter| {
+                        if (!substitutions.contains(parameter.typ)) try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
+                    }
+                    for (call.arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
+                        const expected = try self.substituteGeneric(parameter, &substitutions);
+                        if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
+                    }
+                    return self.substituteGeneric(function.return_type, &substitutions);
+                }
                 for (call.arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
                     if (!self.assignable(try self.inferExpected(argument, parameter), parameter)) try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
                 }
@@ -801,7 +837,7 @@ const Checker = struct {
 
     fn resolveType(self: *Checker, type_node: ast.TypeId) !types.TypeId {
         return switch (self.tree.typeNode(type_node).*) {
-            .ident => |ident| builtinType(&self.result.types, ident.name) orelse blk: {
+            .ident => |ident| self.findGenericParameter(ident.name) orelse builtinType(&self.result.types, ident.name) orelse blk: {
                 if (self.findTypeSymbol(ident.name)) |symbol| {
                     if (self.result.alias_type_nodes.contains(symbol)) break :blk try self.resolveAlias(symbol, ident.span);
                     break :blk try self.result.types.nominal(symbol, &.{});
@@ -863,6 +899,86 @@ const Checker = struct {
         const resolved = try self.resolveType(target);
         try self.result.type_aliases.put(symbol, resolved);
         return resolved;
+    }
+
+    fn defineGenericParameters(self: *Checker, symbol: symbols.SymbolId, parameters: []const ast.TypeParameter) ![]const GenericParameter {
+        if (self.result.generic_function_parameters.get(symbol)) |existing| return existing;
+        const generic_parameters = try self.result.arena.allocator().alloc(GenericParameter, parameters.len);
+        for (parameters, generic_parameters) |parameter, *generic_parameter| {
+            generic_parameter.* = .{
+                .name = parameter.name,
+                .typ = try self.result.types.genericParameter(self.next_generic_parameter),
+            };
+            self.next_generic_parameter += 1;
+        }
+        try self.result.generic_function_parameters.put(symbol, generic_parameters);
+        return generic_parameters;
+    }
+
+    fn findGenericParameter(self: *const Checker, name: []const u8) ?types.TypeId {
+        for (self.current_generic_parameters) |parameter| {
+            if (std.mem.eql(u8, parameter.name, name)) return parameter.typ;
+        }
+        return null;
+    }
+
+    fn inferGenericSubstitution(self: *Checker, parameter: types.TypeId, argument: types.TypeId, substitutions: *std.AutoHashMap(types.TypeId, types.TypeId), span: source.Span) !void {
+        const parameter_type = self.result.types.get(parameter) orelse return;
+        switch (parameter_type.*) {
+            .generic_parameter => {
+                if (substitutions.get(parameter)) |existing| {
+                    if (!self.assignable(argument, existing) or !self.assignable(existing, argument)) try self.report(span, "Type Error: type-параметр выведен неоднозначно", .{});
+                } else {
+                    try substitutions.put(parameter, argument);
+                }
+            },
+            .tuple => |parameters| {
+                const argument_type = self.result.types.get(argument) orelse return;
+                if (argument_type.* != .tuple or argument_type.tuple.len != parameters.len) return;
+                for (parameters, argument_type.tuple) |nested_parameter, nested_argument| try self.inferGenericSubstitution(nested_parameter, nested_argument, substitutions, span);
+            },
+            .array => |element| {
+                const argument_type = self.result.types.get(argument) orelse return;
+                if (argument_type.* == .array) try self.inferGenericSubstitution(element, argument_type.array, substitutions, span);
+            },
+            .map => |map| {
+                const argument_type = self.result.types.get(argument) orelse return;
+                if (argument_type.* != .map) return;
+                try self.inferGenericSubstitution(map.key, argument_type.map.key, substitutions, span);
+                try self.inferGenericSubstitution(map.value, argument_type.map.value, substitutions, span);
+            },
+            else => {},
+        }
+    }
+
+    fn substituteGeneric(self: *Checker, type_id: types.TypeId, substitutions: *const std.AutoHashMap(types.TypeId, types.TypeId)) !types.TypeId {
+        const entry = self.result.types.get(type_id) orelse return self.result.types.poison();
+        return switch (entry.*) {
+            .generic_parameter => substitutions.get(type_id) orelse type_id,
+            .tuple => |elements| blk: {
+                var substituted: std.ArrayList(types.TypeId) = .empty;
+                defer substituted.deinit(self.result.allocator);
+                for (elements) |element| try substituted.append(self.result.allocator, try self.substituteGeneric(element, substitutions));
+                break :blk self.result.types.tuple(substituted.items);
+            },
+            .function => |function| blk: {
+                var parameters: std.ArrayList(types.TypeId) = .empty;
+                defer parameters.deinit(self.result.allocator);
+                for (function.parameters) |parameter| try parameters.append(self.result.allocator, try self.substituteGeneric(parameter, substitutions));
+                break :blk self.result.types.function(parameters.items, try self.substituteGeneric(function.return_type, substitutions));
+            },
+            .nominal => |nominal| blk: {
+                var arguments: std.ArrayList(types.TypeId) = .empty;
+                defer arguments.deinit(self.result.allocator);
+                for (nominal.arguments) |argument| try arguments.append(self.result.allocator, try self.substituteGeneric(argument, substitutions));
+                break :blk self.result.types.nominal(nominal.symbol, arguments.items);
+            },
+            .array => |element| self.result.types.array(try self.substituteGeneric(element, substitutions)),
+            .map => |map| self.result.types.map(try self.substituteGeneric(map.key, substitutions), try self.substituteGeneric(map.value, substitutions)),
+            .process => |message| self.result.types.process(try self.substituteGeneric(message, substitutions)),
+            .pointer => |pointee| self.result.types.pointer(try self.substituteGeneric(pointee, substitutions)),
+            else => type_id,
+        };
     }
 };
 

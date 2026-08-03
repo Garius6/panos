@@ -5,6 +5,7 @@ pub const FunctionId = enum(u32) { _ };
 pub const invalid_function: FunctionId = @enumFromInt(std.math.maxInt(u32));
 
 pub const Constant = union(enum) {
+    void: void,
     number: f64,
     boolean: bool,
     string: []const u8,
@@ -25,6 +26,7 @@ pub const Opcode = enum {
     bit_not,
     shift_left,
     shift_right,
+    negate_number,
     logical_not,
     less,
     less_equal,
@@ -63,6 +65,7 @@ pub const Instruction = union(Opcode) {
     bit_not: void,
     shift_left: void,
     shift_right: void,
+    negate_number: void,
     logical_not: void,
     less: void,
     less_equal: void,
@@ -90,6 +93,7 @@ pub const Instruction = union(Opcode) {
 pub const Function = struct {
     name: []const u8,
     arity: u16,
+    returns_value: bool = true,
     local_count: u16 = 0,
     instructions: std.ArrayList(Instruction) = .empty,
     constants: std.ArrayList(Constant) = .empty,

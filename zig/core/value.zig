@@ -2,15 +2,18 @@ const std = @import("std");
 const bytecode = @import("bytecode.zig");
 
 pub const Aggregate = struct {
+    header: GcHeader = .{},
     name: ?[]const u8 = null,
     elements: []Value,
 };
 
 pub const Array = struct {
+    header: GcHeader = .{},
     elements: []Value,
 };
 
 pub const Closure = struct {
+    header: GcHeader = .{},
     function_id: bytecode.FunctionId,
     captures: []Value,
 };
@@ -21,12 +24,17 @@ pub const MapEntry = struct {
 };
 
 pub const Map = struct {
+    header: GcHeader = .{},
     entries: std.ArrayList(MapEntry) = .empty,
 
     pub fn deinit(self: *Map, allocator: std.mem.Allocator) void {
         self.entries.deinit(allocator);
         self.* = undefined;
     }
+};
+
+pub const GcHeader = struct {
+    marked: bool = false,
 };
 
 pub const Value = union(enum) {

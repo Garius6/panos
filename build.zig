@@ -84,14 +84,23 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "panos_conformance", .module = conformance_module }},
         }),
     });
+    const reference_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/conformance/reference.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
 
     const run_core_tests = b.addRunArtifact(core_tests);
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const run_manifest_tests = b.addRunArtifact(manifest_tests);
+    const run_reference_tests = b.addRunArtifact(reference_tests);
     const test_step = b.step("test", "Run Zig unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_manifest_tests.step);
+    test_step.dependOn(&run_reference_tests.step);
 
     const conformance_step = b.step("conformance", "Validate the local conformance manifest");
     conformance_step.dependOn(&run_manifest_tests.step);

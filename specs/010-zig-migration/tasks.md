@@ -18,7 +18,7 @@ SC-001 требуют измеримой совместимости с этал�
 - [x] T005 [P] Define conformance corpus format and fixture policy in `tests/conformance/README.md`.
 - [x] T006 [P] Create versioned empty conformance manifest in `tests/conformance/manifest.json`.
 - [x] T007 Add conformance manifest parser/validator tests in `zig/conformance/manifest.zig`.
-- [ ] T008 Add reference-runner boundary that is the only pre-cutover Odin invocation in `zig/conformance/reference.zig`.
+- [x] T008 Add reference-runner boundary that is the only pre-cutover Odin invocation in `zig/conformance/reference.zig`.
 - [ ] T009 Classify existing core tests and fixtures into deterministic, controlled-external and target-specific rows in `tests/conformance/inventory.md`.
 - [x] T010 Add Zig cache/artifact ignores in `.gitignore` without changing existing Odin artifact rules.
 

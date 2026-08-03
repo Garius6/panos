@@ -9,3 +9,7 @@ Zig-реализации Panos. До заполнения самого corpus `m
 `specs/010-zig-migration/contracts/conformance.md`: устойчивый `id`, tier,
 target profile, вход и нормализованный outcome. Сценарии с сетью, часами или
 внешними процессами добавляются только с контролируемой подменой окружения.
+
+`zig/conformance/reference.zig` — единственная граница, которая до cutover
+может вызвать Odin. Обычный `zig build test` компилирует и проверяет её
+аргументы, но не запускает reference runtime.

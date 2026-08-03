@@ -386,6 +386,11 @@ const Checker = struct {
                 }
                 break :blk self.recordExpressionType(expression, expected);
             },
+            .call => |call| blk: {
+                const variant = if (self.resolution.expr_symbols.get(call.callee)) |symbol| self.enumVariant(symbol) else null;
+                if (variant) |value| break :blk self.recordExpressionType(expression, try self.inferEnumVariantCallExpected(call, value, expected));
+                break :blk self.infer(expression);
+            },
             .if_expr => |conditional| self.recordExpressionType(expression, try self.inferIfExpected(conditional, expected)),
             .match_expr => |match| self.recordExpressionType(expression, try self.inferMatchExpected(match, expected)),
             else => self.infer(expression),
@@ -1205,6 +1210,33 @@ const Checker = struct {
             if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент конструктора варианта не совпадает с типом поля", .{});
         }
         return self.result.types.nominal(entry.owner_type, arguments.items);
+    }
+
+    fn inferEnumVariantCallExpected(self: *Checker, call: anytype, variant: EnumVariant, expected: types.TypeId) !types.TypeId {
+        const entry = self.resolution.symbols.get(variant.symbol) orelse return self.result.types.poison();
+        const expected_entry = self.result.types.get(expected) orelse return self.inferEnumVariantCall(call, variant);
+        const nominal = switch (expected_entry.*) {
+            .nominal => |value| value,
+            else => return self.inferEnumVariantCall(call, variant),
+        };
+        if (nominal.symbol != entry.owner_type) return self.inferEnumVariantCall(call, variant);
+        const definition = self.result.enum_definitions.get(entry.owner_type) orelse return self.result.types.poison();
+        if (definition.parameters.len != nominal.arguments.len) {
+            try self.report(call.span, "Type Error: неверное количество параметров типа перечисления", .{});
+            return self.result.types.poison();
+        }
+        if (call.arguments.len != variant.fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора варианта", .{});
+        var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+        defer substitutions.deinit();
+        for (definition.parameters, nominal.arguments) |parameter, argument| {
+            try substitutions.put(parameter.typ, argument);
+        }
+        const shared = @min(call.arguments.len, variant.fields.len);
+        for (call.arguments[0..shared], variant.fields[0..shared]) |argument, field| {
+            const expected_field = try self.substituteGeneric(field, &substitutions);
+            if (!self.assignable(try self.inferExpected(argument, expected_field), expected_field)) try self.report(call.span, "Type Error: аргумент конструктора варианта не совпадает с типом поля", .{});
+        }
+        return expected;
     }
 
     fn inferGenericSubstitution(self: *Checker, parameter: types.TypeId, argument: types.TypeId, substitutions: *std.AutoHashMap(types.TypeId, types.TypeId), span: source.Span) !void {

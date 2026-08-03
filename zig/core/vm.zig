@@ -855,7 +855,7 @@ test "VM constructs enum variants" {
     const parser = @import("parser.zig");
     const resolver = @import("resolver.zig");
     const type_checker = @import("type_checker.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "тип Ответ = перечисление\nДа(Строка)\nконец\nтип Опция[T] = перечисление\nЕсть(T)\nконец\nфунк ответ() -> Ответ\nОтвет.Да(\"да\")\nконец\nфунк опция() -> Опция(Строка)\nОпция.Есть(\"готово\")\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Ответ = перечисление\nДа(Строка)\nконец\nтип Опция[T] = перечисление\nЕсть(T)\nНет()\nконец\nфунк ответ() -> Ответ\nОтвет.Да(\"да\")\nконец\nфунк опция() -> Опция(Строка)\nОпция.Есть(\"готово\")\nконец\nфунк пусто() -> Опция(Строка)\nОпция.Нет()\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -888,6 +888,14 @@ test "VM constructs enum variants" {
                 try std.testing.expectEqualStrings("Опция.Есть", aggregate.name.?);
                 try std.testing.expectEqualStrings("готово", aggregate.elements[0].stringBytes().?);
             },
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+    const third_outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (third_outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .aggregate => |aggregate| try std.testing.expectEqualStrings("Опция.Нет", aggregate.name.?),
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

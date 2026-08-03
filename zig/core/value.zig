@@ -48,6 +48,32 @@ pub const Interface = struct {
     methods: []const bytecode.FunctionId,
 };
 
+pub const ProcessStatus = enum {
+    ready,
+    completed,
+    failed,
+};
+
+pub const Process = struct {
+    id: u64,
+    function_id: bytecode.FunctionId,
+    captures: []Value,
+    arguments: []Value,
+    mailbox: std.ArrayList(Value) = .empty,
+    signals: std.ArrayList(Value) = .empty,
+    watchers: std.ArrayList(*Process) = .empty,
+    status: ProcessStatus = .ready,
+
+    pub fn deinit(self: *Process, allocator: std.mem.Allocator) void {
+        self.watchers.deinit(allocator);
+        self.signals.deinit(allocator);
+        self.mailbox.deinit(allocator);
+        allocator.free(self.captures);
+        allocator.free(self.arguments);
+        self.* = undefined;
+    }
+};
+
 pub const Value = union(enum) {
     void: void,
     number: f64,
@@ -57,6 +83,7 @@ pub const Value = union(enum) {
     function_ref: bytecode.FunctionId,
     closure: *Closure,
     interface: *Interface,
+    process: *Process,
     aggregate: *Aggregate,
     array: *Array,
     map: *Map,
@@ -96,6 +123,10 @@ pub const Value = union(enum) {
             },
             .interface => |left_interface| switch (right) {
                 .interface => |right_interface| left_interface.receiver.eql(right_interface.receiver),
+                else => false,
+            },
+            .process => |left_process| switch (right) {
+                .process => |right_process| left_process.id == right_process.id,
                 else => false,
             },
             .aggregate => |left_aggregate| switch (right) {

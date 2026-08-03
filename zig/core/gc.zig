@@ -96,6 +96,7 @@ pub const Heap = struct {
             .array => |array| self.mark(.{ .array = array }),
             .closure => |closure| self.mark(.{ .closure = closure }),
             .interface => |interface| self.mark(.{ .interface = interface }),
+            .process => {},
             .map => |map| self.mark(.{ .map = map }),
             else => {},
         }

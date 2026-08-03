@@ -20,6 +20,10 @@ pub const Vm = struct {
     program: *const bytecode.Program,
     stack: std.ArrayList(value.Value) = .empty,
     frames: std.ArrayList(Frame) = .empty,
+    processes: std.ArrayList(*value.Process) = .empty,
+    current_process: ?*value.Process = null,
+    current_message: ?value.Value = null,
+    next_process_id: u64 = 0,
     failure: ?*value.HeapString = null,
 
     pub fn init(allocator: std.mem.Allocator, program: *const bytecode.Program) Vm {
@@ -34,15 +38,23 @@ pub const Vm = struct {
         self.clearFrames();
         self.frames.deinit(self.allocator);
         self.stack.deinit(self.allocator);
+        self.clearProcesses();
+        self.processes.deinit(self.allocator);
         self.heap.deinit();
         self.* = undefined;
     }
 
     pub fn run(self: *Vm, entry: bytecode.FunctionId, arguments: []const value.Value) !Execution {
         self.failure = null;
+        self.current_process = null;
+        self.current_message = null;
         self.stack.clearRetainingCapacity();
         self.clearFrames();
+        self.clearProcesses();
+        self.next_process_id = 0;
         self.collect();
+        const root = try self.createProcess(entry, &.{}, arguments);
+        self.current_process = root;
         self.pushFrame(entry, &.{}, arguments) catch |err| switch (err) {
             error.RuntimeFault => return .{ .runtime_error = if (self.failure) |failure| failure.bytes else "Runtime Error: неизвестная ошибка" },
             else => return err,
@@ -62,6 +74,13 @@ pub const Vm = struct {
         self.heap.clearMarks();
         self.heap.markValues(self.stack.items);
         for (self.frames.items) |frame| self.heap.markValues(frame.locals);
+        for (self.processes.items) |process| {
+            self.heap.markValues(process.captures);
+            self.heap.markValues(process.arguments);
+            self.heap.markValues(process.mailbox.items);
+            self.heap.markValues(process.signals.items);
+        }
+        if (self.current_message) |message| self.heap.markValue(message);
         if (self.failure) |failure| self.heap.markValue(.{ .heap_string = failure });
         self.heap.sweep();
     }
@@ -109,6 +128,12 @@ pub const Vm = struct {
             .call => |argument_count| try self.call(argument_count),
             .cast_interface => |vtable| try self.castInterface(compiled, vtable),
             .call_interface => |interface_call| try self.callInterface(interface_call),
+            .spawn => |argument_count| try self.spawn(argument_count),
+            .send => try self.send(),
+            .receive => try self.receive(),
+            .observe => try self.observe(),
+            .get_signal => try self.getSignal(),
+            .process_id => try self.processId(),
             .build_closure => |closure| try self.buildClosure(closure),
             .return_value => return self.finishFrame(try self.pop()),
             .return_void => return self.finishFrame(.{ .void = {} }),
@@ -442,6 +467,190 @@ pub const Vm = struct {
         self.stack.items[interface_index] = .{ .function_ref = interface.methods[call_info.method_index] };
         try self.stack.insert(self.allocator, interface_index + 1, interface.receiver);
         try self.call(@intCast(argument_count + 1));
+    }
+
+    fn spawn(self: *Vm, argument_count: u16) anyerror!void {
+        const count: usize = argument_count;
+        if (self.stack.items.len < count + 1) {
+            try self.fault("Runtime Error: недостаточно аргументов процесса", .{});
+            return;
+        }
+        const callee_index = self.stack.items.len - count - 1;
+        const callee = self.stack.items[callee_index];
+        const process = switch (callee) {
+            .function_ref => |function_id| try self.createProcess(function_id, &.{}, self.stack.items[callee_index + 1 ..]),
+            .closure => |closure| try self.createProcess(closure.function_id, closure.captures, self.stack.items[callee_index + 1 ..]),
+            else => {
+                try self.fault("Runtime Error: запусти ожидает функцию", .{});
+                return;
+            },
+        };
+        self.stack.shrinkRetainingCapacity(callee_index);
+        try self.stack.append(self.allocator, .{ .process = process });
+    }
+
+    fn send(self: *Vm) anyerror!void {
+        const message = try self.pop();
+        const target = switch (try self.pop()) {
+            .process => |process| process,
+            else => {
+                try self.fault("Runtime Error: отправить() ожидает Процесс(T) первым аргументом", .{});
+                return;
+            },
+        };
+        if (target.status == .ready) {
+            try target.mailbox.append(self.allocator, message);
+            try self.runProcess(target);
+        }
+        try self.stack.append(self.allocator, .{ .void = {} });
+    }
+
+    fn receive(self: *Vm) anyerror!void {
+        if (self.current_message) |message| {
+            self.current_message = null;
+            try self.stack.append(self.allocator, message);
+            return;
+        }
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: получить() вызвано вне процесса", .{});
+            return;
+        };
+        if (process.mailbox.items.len == 0) {
+            try self.fault("Runtime Error: получить() ожидает сообщение", .{});
+            return;
+        }
+        const message = process.mailbox.orderedRemove(0);
+        try self.stack.append(self.allocator, message);
+    }
+
+    fn observe(self: *Vm) anyerror!void {
+        const target = switch (try self.pop()) {
+            .process => |process| process,
+            else => {
+                try self.fault("Runtime Error: наблюдать() ожидает Процесс(T) первым аргументом", .{});
+                return;
+            },
+        };
+        const watcher = self.current_process orelse {
+            try self.fault("Runtime Error: наблюдать() вызвано вне процесса", .{});
+            return;
+        };
+        if (target.status == .ready) {
+            try target.watchers.append(self.allocator, watcher);
+        } else {
+            const reason = try self.heap.formatString("процесс уже не существует", .{});
+            try self.queueSignal(watcher, target.id, .{ .heap_string = reason });
+        }
+        try self.stack.append(self.allocator, .{ .void = {} });
+    }
+
+    fn getSignal(self: *Vm) anyerror!void {
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: получить_сигнал() вызвано вне процесса", .{});
+            return;
+        };
+        if (process.signals.items.len == 0) {
+            try self.fault("Runtime Error: нет доступных сигналов процесса", .{});
+            return;
+        }
+        const signal = process.signals.orderedRemove(0);
+        try self.stack.append(self.allocator, signal);
+    }
+
+    fn processId(self: *Vm) anyerror!void {
+        const process = switch (try self.pop()) {
+            .process => |value_process| value_process,
+            else => {
+                try self.fault("Runtime Error: номер() доступен только для Процесс(T)", .{});
+                return;
+            },
+        };
+        try self.stack.append(self.allocator, .{ .number = @floatFromInt(process.id) });
+    }
+
+    fn createProcess(self: *Vm, function_id: bytecode.FunctionId, captures: []const value.Value, arguments: []const value.Value) !*value.Process {
+        const owned_captures = try self.allocator.dupe(value.Value, captures);
+        errdefer self.allocator.free(owned_captures);
+        const owned_arguments = try self.allocator.dupe(value.Value, arguments);
+        errdefer self.allocator.free(owned_arguments);
+        const process = try self.allocator.create(value.Process);
+        errdefer self.allocator.destroy(process);
+        process.* = .{
+            .id = self.next_process_id,
+            .function_id = function_id,
+            .captures = owned_captures,
+            .arguments = owned_arguments,
+        };
+        try self.processes.append(self.allocator, process);
+        self.next_process_id += 1;
+        return process;
+    }
+
+    fn runProcess(self: *Vm, process: *value.Process) anyerror!void {
+        if (process.status != .ready or process.mailbox.items.len == 0) return;
+        const message = process.mailbox.orderedRemove(0);
+        const saved_stack = self.stack;
+        const saved_frames = self.frames;
+        const saved_failure = self.failure;
+        const saved_process = self.current_process;
+        const saved_message = self.current_message;
+        self.stack = .empty;
+        self.frames = .empty;
+        self.failure = null;
+        self.current_process = process;
+        self.current_message = message;
+        defer {
+            self.clearFrames();
+            self.frames.deinit(self.allocator);
+            self.stack.deinit(self.allocator);
+            self.stack = saved_stack;
+            self.frames = saved_frames;
+            self.failure = saved_failure;
+            self.current_process = saved_process;
+            self.current_message = saved_message;
+        }
+
+        self.pushFrame(process.function_id, process.captures, process.arguments) catch |err| switch (err) {
+            error.RuntimeFault => {
+                process.status = .failed;
+                try self.notifyWatchers(process, if (self.failure) |failure| .{ .heap_string = failure } else null);
+                return;
+            },
+            else => return err,
+        };
+        while (self.frames.items.len != 0) {
+            const completed = self.step() catch |err| switch (err) {
+                error.RuntimeFault => {
+                    process.status = .failed;
+                    try self.notifyWatchers(process, if (self.failure) |failure| .{ .heap_string = failure } else null);
+                    return;
+                },
+                else => return err,
+            };
+            if (completed != null) {
+                process.status = .completed;
+                try self.notifyWatchers(process, null);
+                return;
+            }
+        }
+        process.status = .completed;
+        try self.notifyWatchers(process, null);
+    }
+
+    fn notifyWatchers(self: *Vm, process: *value.Process, reason: ?value.Value) !void {
+        for (process.watchers.items) |watcher| try self.queueSignal(watcher, process.id, reason);
+        process.watchers.clearRetainingCapacity();
+    }
+
+    fn queueSignal(self: *Vm, watcher: *value.Process, process_id: u64, reason: ?value.Value) !void {
+        const option_elements = try self.allocator.alloc(value.Value, if (reason == null) 0 else 1);
+        if (reason) |failure| option_elements[0] = failure;
+        const option = try self.heap.createAggregate(if (reason == null) "Опция.Нет" else "Опция.Есть", option_elements);
+        const signal_elements = try self.allocator.alloc(value.Value, 2);
+        signal_elements[0] = .{ .number = @floatFromInt(process_id) };
+        signal_elements[1] = .{ .aggregate = option };
+        const signal = try self.heap.createAggregate(null, signal_elements);
+        try watcher.signals.append(self.allocator, .{ .aggregate = signal });
     }
 
     fn buildClosure(self: *Vm, closure: anytype) anyerror!void {
@@ -840,6 +1049,13 @@ pub const Vm = struct {
 
     fn clearFrames(self: *Vm) void {
         while (self.frames.pop()) |frame| self.allocator.free(frame.locals);
+    }
+
+    fn clearProcesses(self: *Vm) void {
+        while (self.processes.pop()) |process| {
+            process.deinit(self.allocator);
+            self.allocator.destroy(process);
+        }
     }
 
     fn fault(self: *Vm, comptime format: []const u8, args: anytype) anyerror!void {
@@ -2340,6 +2556,90 @@ test "VM reports an array bounds error without crashing" {
     const outcome = try vm.run(function_id, &.{});
     switch (outcome) {
         .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: индекс массива вне границ", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM delivers process completion and failure signals" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Задача = перечисление
+        \\    Выполнить
+        \\конец
+        \\функ спокойный() -> Пусто
+        \\    выбор получить()
+        \\        Задача.Выполнить -> 0
+        \\    конец
+        \\конец
+        \\функ рабочий() -> Пусто
+        \\    выбор получить()
+        \\        Задача.Выполнить -> паника("не справился")
+        \\    конец
+        \\конец
+        \\функ проверка() -> Булево
+        \\    пер тихий: Процесс(Задача) = запусти спокойный()
+        \\    наблюдать(тихий)
+        \\    отправить(тихий, Задача.Выполнить)
+        \\    пер (id1, причина1) = получить_сигнал()
+        \\    пер штатно = выбор причина1
+        \\        Нет -> id1 == тихий.номер()
+        \\        Есть(_) -> ложь
+        \\    конец
+        \\    пер плохой: Процесс(Задача) = запусти рабочий()
+        \\    наблюдать(плохой)
+        \\    отправить(плохой, Задача.Выполнить)
+        \\    пер (id2, причина2) = получить_сигнал()
+        \\    пер авария = выбор причина2
+        \\        Нет -> ложь
+        \\        Есть(_) -> id2 == плохой.номер()
+        \\    конец
+        \\    штатно и авария
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .boolean => |result| try std.testing.expect(result),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM guards process sends against non-process values" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("отправить", 0);
+    const function = program.function(function_id).?;
+    const number = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    try function.emit(std.testing.allocator, .{ .constant = number });
+    try function.emit(std.testing.allocator, .{ .constant = number });
+    try function.emit(std.testing.allocator, .{ .send = {} });
+    try function.emit(std.testing.allocator, .{ .return_void = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: отправить() ожидает Процесс(T) первым аргументом", message),
         .success => return error.TestUnexpectedResult,
     }
 }

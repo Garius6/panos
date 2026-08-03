@@ -515,8 +515,9 @@ const Checker = struct {
         for (parameter_symbols, function_type.parameters) |parameter_symbol, parameter_type| {
             try self.result.symbol_types.put(parameter_symbol, parameter_type);
         }
-        const actual = try self.inferBlockExpected(body, function_type.return_type);
-        if (!self.assignable(actual, function_type.return_type)) {
+        const expected_body = if (self.isType(function_type.return_type, self.result.types.builtins.void)) null else function_type.return_type;
+        const actual = try self.inferBlockExpected(body, expected_body);
+        if (!self.isType(function_type.return_type, self.result.types.builtins.void) and !self.assignable(actual, function_type.return_type)) {
             const span = self.tree.decl(declaration).function.span;
             try self.report(span, "Type Error: функция должна возвращать объявленный тип", .{});
         }
@@ -615,6 +616,7 @@ const Checker = struct {
             .lambda => |lambda| try self.inferLambda(expression, lambda, null),
             .if_expr => |conditional| try self.inferIf(conditional),
             .while_expr => |loop| try self.inferWhile(loop),
+            .spawn => |spawn| try self.inferSpawn(spawn),
             .try_expr => |try_expression| try self.inferTry(try_expression),
             .match_expr => |match| try self.inferMatch(match),
             else => try self.result.types.poison(),
@@ -677,6 +679,18 @@ const Checker = struct {
         }
         try self.report(try_expression.span, "Type Error: оператор '?' ожидает Опцию или Результат", .{});
         return self.result.types.poison();
+    }
+
+    fn inferSpawn(self: *Checker, spawn: anytype) !types.TypeId {
+        const call = switch (self.tree.expr(spawn.call).*) {
+            .call => |value| value,
+            else => {
+                try self.report(spawn.span, "Type Error: 'запусти' ожидает вызов функции", .{});
+                return self.result.types.process(try self.result.types.poison());
+            },
+        };
+        _ = try self.inferCall(spawn.call, call);
+        return self.result.types.process(try self.result.types.poison());
     }
 
     fn inferExpected(self: *Checker, expression: ast.ExprId, expected: types.TypeId) anyerror!types.TypeId {
@@ -743,6 +757,12 @@ const Checker = struct {
             },
             .if_expr => |conditional| self.recordExpressionType(expression, try self.inferIfExpected(conditional, expected)),
             .match_expr => |match| self.recordExpressionType(expression, try self.inferMatchExpected(match, expected)),
+            .spawn => |spawn| blk: {
+                _ = try self.inferSpawn(spawn);
+                const expected_entry = self.result.types.get(expected) orelse break :blk self.infer(expression);
+                if (expected_entry.* != .process) break :blk self.infer(expression);
+                break :blk self.recordExpressionType(expression, expected);
+            },
             else => self.infer(expression),
         };
     }
@@ -845,7 +865,7 @@ const Checker = struct {
                 if (!self.assignable(arm_type, expected_type)) try self.report(arm.span, "Type Error: ветвь выбора не совпадает с ожидаемым типом", .{});
             }
         }
-        if (!fallback_seen) {
+        if (!fallback_seen and subject_entry.* != .poison) {
             if (enum_definition) |definition| {
                 for (definition.variants) |variant| {
                     if (!covered.contains(variant.symbol)) try self.report(match.span, "Type Error: выбор не исчерпывает вариант '{s}'", .{variant.name});
@@ -889,6 +909,13 @@ const Checker = struct {
             },
             .constructor => |constructor| {
                 const subject_entry = self.result.types.get(subject_type) orelse return null;
+                if (subject_entry.* == .poison) {
+                    if (self.resolution.pattern_symbols.get(pattern_id)) |variant| {
+                        try self.result.pattern_variants.put(pattern_id, variant);
+                        return variant;
+                    }
+                    return null;
+                }
                 const subject = switch (subject_entry.*) {
                     .nominal => |value| value,
                     else => {
@@ -1343,6 +1370,11 @@ const Checker = struct {
         return entry.kind == .builtin and std.mem.eql(u8, entry.name, "паника");
     }
 
+    fn isBuiltin(self: *const Checker, symbol: symbols.SymbolId, name: []const u8) bool {
+        const entry = self.resolution.symbols.get(symbol) orelse return false;
+        return entry.kind == .builtin and std.mem.eql(u8, entry.name, name);
+    }
+
     fn inferCall(self: *Checker, expression: ast.ExprId, call: anytype) anyerror!types.TypeId {
         if (self.resolution.expr_symbols.get(call.callee)) |symbol| {
             if (self.enumVariant(symbol)) |variant| return self.inferEnumVariantCall(call, variant);
@@ -1370,6 +1402,28 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.never;
             }
+            if (self.isBuiltin(symbol, "получить")) {
+                if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить() не принимает аргументы", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.result.types.poison();
+            }
+            if (self.isBuiltin(symbol, "отправить")) {
+                if (call.arguments.len != 2) try self.report(call.span, "Type Error: отправить() ожидает 2 аргумент(а)", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.result.types.builtins.void;
+            }
+            if (self.isBuiltin(symbol, "наблюдать")) {
+                if (call.arguments.len != 1) try self.report(call.span, "Type Error: наблюдать() ожидает 1 аргумент", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.result.types.builtins.void;
+            }
+            if (self.isBuiltin(symbol, "получить_сигнал")) {
+                if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить_сигнал() не принимает аргументы", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                const option = self.findTypeSymbol("Опция") orelse return self.result.types.poison();
+                const reason = try self.result.types.nominal(option, &.{self.result.types.builtins.string});
+                return self.result.types.tuple(&.{ self.result.types.builtins.number, reason });
+            }
             if (self.isLengthBuiltin(symbol)) {
                 if (call.arguments.len != 1) {
                     try self.report(call.span, "Type Error: длина ожидает 1 аргумент", .{});
@@ -1391,6 +1445,7 @@ const Checker = struct {
         switch (self.tree.expr(call.callee).*) {
             .property => |property| {
                 const object_type = try self.infer(property.object);
+                if (try self.inferProcessMethod(call, property, object_type)) |method_type| return method_type;
                 if (try self.inferPreludeEnumMethod(call, property, object_type)) |method_type| return method_type;
                 if (try self.inferInterfaceCall(expression, call, property, object_type)) |method_type| return method_type;
                 if (try self.inferMethodCall(expression, call, property, object_type)) |method_type| return method_type;
@@ -1586,6 +1641,7 @@ const Checker = struct {
             .generic => |generic| blk: {
                 if (std.mem.eql(u8, generic.name, "Массив") and generic.parameters.len == 1) break :blk try self.result.types.array(try self.resolveType(generic.parameters[0]));
                 if (std.mem.eql(u8, generic.name, "Соответствие") and generic.parameters.len == 2) break :blk try self.result.types.map(try self.resolveType(generic.parameters[0]), try self.resolveType(generic.parameters[1]));
+                if (std.mem.eql(u8, generic.name, "Процесс") and generic.parameters.len == 1) break :blk try self.result.types.process(try self.resolveType(generic.parameters[0]));
                 if (self.findTypeSymbol(generic.name)) |symbol| {
                     var arguments: std.ArrayList(types.TypeId) = .empty;
                     defer arguments.deinit(self.result.allocator);
@@ -1616,6 +1672,7 @@ const Checker = struct {
         const expected_type = self.result.types.get(expected) orelse return true;
         if (actual_type.* == .poison or expected_type.* == .poison) return true;
         if (actual == self.result.types.builtins.never) return true;
+        if (actual_type.* == .process and self.isPoison(actual_type.process)) return true;
         if (self.result.types.eql(actual, expected)) return true;
         const actual_nominal = switch (actual_type.*) {
             .nominal => |value| value,
@@ -1739,6 +1796,14 @@ const Checker = struct {
             .method_index = @intCast(index),
         });
         return @as(?types.TypeId, try self.substituteGeneric(method.return_type, &substitutions));
+    }
+
+    fn inferProcessMethod(self: *Checker, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
+        const object = self.result.types.get(object_type) orelse return null;
+        if (object.* != .process) return null;
+        if (!std.mem.eql(u8, property.property, "номер")) return null;
+        try self.checkMethodArity(call, "номер", 0);
+        return self.result.types.builtins.number;
     }
 
     fn inferMethodCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {

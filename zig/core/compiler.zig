@@ -353,9 +353,10 @@ const FunctionCompiler = struct {
                 try self.compileExpression(index.index);
                 try self.function.emit(self.compiler.result.allocator, .{ .get_index = {} });
             },
-            .property => |property| try self.compileProperty(property),
+            .property => |property| try self.compileProperty(expression, property),
             .if_expr => |conditional| try self.compileIf(conditional),
             .while_expr => |loop| try self.compileWhile(loop),
+            .spawn => |spawn| try self.compileSpawn(spawn),
             .try_expr => |try_expression| try self.compileTry(try_expression),
             .match_expr => |match| try self.compileMatch(match),
             else => try self.unsupportedExpression(expressionSpan(self.compiler.tree, expression)),
@@ -441,9 +442,11 @@ const FunctionCompiler = struct {
         if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
         if (try self.compileErrorConstructor(call)) return;
         if (try self.compilePanicBuiltin(call)) return;
+        if (try self.compileProcessBuiltin(call)) return;
         if (try self.compileLengthBuiltin(call)) return;
         if (try self.compileCollectionMethod(call)) return;
         if (try self.compilePreludeEnumMethod(call)) return;
+        if (try self.compileProcessMethod(call)) return;
         if (self.compiler.checked.interface_calls.get(expression)) |interface_call| {
             const property = switch (self.compiler.tree.expr(call.callee).*) {
                 .property => |value| value,
@@ -525,6 +528,55 @@ const FunctionCompiler = struct {
         try self.compileExpression(call.arguments[0]);
         try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
         return true;
+    }
+
+    fn compileProcessBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const name = switch (self.compiler.tree.expr(call.callee).*) {
+            .ident => |ident| ident.name,
+            else => return false,
+        };
+        if (std.mem.eql(u8, name, "отправить") and call.arguments.len == 2) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .send = {} });
+            return true;
+        }
+        if (std.mem.eql(u8, name, "получить") and call.arguments.len == 0) {
+            try self.function.emit(self.compiler.result.allocator, .{ .receive = {} });
+            return true;
+        }
+        if (std.mem.eql(u8, name, "наблюдать") and call.arguments.len == 1) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .observe = {} });
+            return true;
+        }
+        if (std.mem.eql(u8, name, "получить_сигнал") and call.arguments.len == 0) {
+            try self.function.emit(self.compiler.result.allocator, .{ .get_signal = {} });
+            return true;
+        }
+        return false;
+    }
+
+    fn compileProcessMethod(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        if (!std.mem.eql(u8, property.property, "номер") or call.arguments.len != 0) return false;
+        try self.compileExpression(property.object);
+        try self.function.emit(self.compiler.result.allocator, .{ .process_id = {} });
+        return true;
+    }
+
+    fn compileSpawn(self: *FunctionCompiler, spawn: anytype) !void {
+        const call = switch (self.compiler.tree.expr(spawn.call).*) {
+            .call => |value| value,
+            else => return self.unsupportedExpression(spawn.span),
+        };
+        if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
+        if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
+        try self.compileExpression(call.callee);
+        for (call.arguments) |argument| try self.compileExpression(argument);
+        try self.function.emit(self.compiler.result.allocator, .{ .spawn = @intCast(call.arguments.len) });
     }
 
     fn compileLengthBuiltin(self: *FunctionCompiler, call: anytype) !bool {
@@ -817,7 +869,17 @@ const FunctionCompiler = struct {
         try self.function.emit(self.compiler.result.allocator, .{ .build_map = @intCast(map.entries.len) });
     }
 
-    fn compileProperty(self: *FunctionCompiler, property: anytype) !void {
+    fn compileProperty(self: *FunctionCompiler, expression: ast.ExprId, property: anytype) !void {
+        if (self.compiler.resolution.expr_symbols.get(expression)) |symbol| {
+            if (try self.enumVariantName(symbol)) |name| {
+                const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(name) });
+                try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
+                    .name_constant = name_constant,
+                    .field_count = 0,
+                } });
+                return;
+            }
+        }
         try self.compileExpression(property.object);
         const field_index = try self.propertyIndex(property.object, property.property);
         if (field_index) |index| {

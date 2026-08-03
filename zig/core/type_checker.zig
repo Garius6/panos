@@ -679,6 +679,20 @@ const Checker = struct {
     }
 
     fn inferCall(self: *Checker, call: anytype) anyerror!types.TypeId {
+        switch (self.tree.expr(call.callee).*) {
+            .property => |property| {
+                if (std.mem.eql(u8, property.property, "длина")) {
+                    if (call.arguments.len != 0) try self.report(call.span, "Type Error: метод 'длина' не принимает аргументы", .{});
+                    const object_type = try self.infer(property.object);
+                    const object = self.result.types.get(object_type) orelse return self.result.types.poison();
+                    switch (object.*) {
+                        .array, .map => return self.result.types.builtins.integer,
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
         const callee_type = try self.infer(call.callee);
         const entry = self.result.types.get(callee_type) orelse return self.result.types.poison();
         switch (entry.*) {

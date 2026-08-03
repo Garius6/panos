@@ -385,6 +385,7 @@ const FunctionCompiler = struct {
 
     fn compileCall(self: *FunctionCompiler, call: anytype) !void {
         if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
+        if (try self.compileCollectionLength(call)) return;
         if (try self.structConstructor(call.callee)) |structure| {
             for (call.arguments) |argument| try self.compileExpression(argument);
             if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
@@ -399,6 +400,24 @@ const FunctionCompiler = struct {
         for (call.arguments) |argument| try self.compileExpression(argument);
         if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
         try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(call.arguments.len) });
+    }
+
+    fn compileCollectionLength(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        if (!std.mem.eql(u8, property.property, "длина") or call.arguments.len != 0) return false;
+        const object_type = self.compiler.checked.expression_types.get(property.object) orelse return false;
+        const type_entry = self.compiler.checked.types.get(object_type) orelse return false;
+        const instruction: bytecode.Instruction = switch (type_entry.*) {
+            .array => .{ .array_length = {} },
+            .map => .{ .map_length = {} },
+            else => return false,
+        };
+        try self.compileExpression(property.object);
+        try self.function.emit(self.compiler.result.allocator, instruction);
+        return true;
     }
 
     fn compileSequence(self: *FunctionCompiler, expressions: []const ast.ExprId, comptime tag: bytecode.Opcode) !void {

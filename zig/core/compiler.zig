@@ -237,7 +237,53 @@ const FunctionCompiler = struct {
                 if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
                 try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(call.arguments.len) });
             },
+            .if_expr => |conditional| try self.compileIf(conditional),
+            .while_expr => |loop| try self.compileWhile(loop),
             else => try self.unsupportedExpression(expressionSpan(self.compiler.tree, expression)),
+        }
+    }
+
+    fn compileIf(self: *FunctionCompiler, conditional: anytype) !void {
+        try self.compileExpression(conditional.condition);
+        const false_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.compileBlockValue(conditional.then_branch);
+        const end_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+        self.patchJump(false_jump, self.function.instructions.items.len);
+        try self.compileBlockValue(conditional.else_branch);
+        self.patchJump(end_jump, self.function.instructions.items.len);
+    }
+
+    fn compileWhile(self: *FunctionCompiler, loop: anytype) !void {
+        const loop_start = self.function.instructions.items.len;
+        try self.compileExpression(loop.condition);
+        const exit_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.compileBlockStatements(loop.body);
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = loop_start });
+        self.patchJump(exit_jump, self.function.instructions.items.len);
+        try self.emitVoid();
+    }
+
+    fn compileBlockValue(self: *FunctionCompiler, statements: []const ast.StmtId) !void {
+        if (statements.len == 0) {
+            try self.emitVoid();
+            return;
+        }
+        for (statements[0 .. statements.len - 1]) |statement| _ = try self.compileStatement(statement, false);
+        if (!try self.compileStatement(statements[statements.len - 1], true)) try self.emitVoid();
+    }
+
+    fn compileBlockStatements(self: *FunctionCompiler, statements: []const ast.StmtId) !void {
+        for (statements) |statement| _ = try self.compileStatement(statement, false);
+    }
+
+    fn patchJump(self: *FunctionCompiler, instruction_index: usize, target: usize) void {
+        switch (self.function.instructions.items[instruction_index]) {
+            .jump => self.function.instructions.items[instruction_index].jump = target,
+            .jump_if_false => self.function.instructions.items[instruction_index].jump_if_false = target,
+            else => unreachable,
         }
     }
 
@@ -356,4 +402,36 @@ test "compiler emits locals, arithmetic and direct calls" {
     try std.testing.expectEqual(bytecode.Instruction{ .set_local = 0 }, entry.instructions.items[4]);
     try std.testing.expectEqual(bytecode.Instruction{ .multiply = {} }, entry.instructions.items[7]);
     try std.testing.expectEqual(bytecode.Instruction{ .return_value = {} }, entry.instructions.items[8]);
+}
+
+test "compiler emits absolute jumps for if and while expressions" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ выбрать(условие: Булево) -> Число\nесли условие тогда\n1\nиначе\n2\nконец\nконец\nфунк посчитать(предел: Число) -> Число\nпер счётчик = 0\nпока счётчик < предел цикл\nсчётчик = счётчик + 1\nконец\nсчётчик\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const choose = compiled.program.functions.items[0];
+    try std.testing.expectEqual(bytecode.Instruction{ .jump_if_false = 4 }, choose.instructions.items[1]);
+    try std.testing.expectEqual(bytecode.Instruction{ .jump = 5 }, choose.instructions.items[3]);
+    const count = compiled.program.functions.items[1];
+    var has_forward_exit = false;
+    var has_backward_loop = false;
+    for (count.instructions.items, 0..) |instruction, index| {
+        switch (instruction) {
+            .jump_if_false => |target| has_forward_exit = has_forward_exit or target > index,
+            .jump => |target| has_backward_loop = has_backward_loop or target < index,
+            else => {},
+        }
+    }
+    try std.testing.expect(has_forward_exit);
+    try std.testing.expect(has_backward_loop);
 }

@@ -1,5 +1,8 @@
 const std = @import("std");
 
+pub const diagnostic = @import("diagnostic.zig");
+pub const source = @import("source.zig");
+
 pub const migration_stage = "phase-0";
 
 pub fn version() []const u8 {

@@ -7,6 +7,11 @@ pub const LineColumn = struct {
     column: u32,
 };
 
+pub const Utf16Position = struct {
+    line: u32,
+    character: u32,
+};
+
 pub const Span = struct {
     file_id: FileId,
     start: u32,
@@ -53,6 +58,69 @@ pub const SourceFile = struct {
         }
         return .{ .line = line, .column = column };
     }
+
+    pub fn byteOffsetToUtf16Position(self: SourceFile, offset: u32) Utf16Position {
+        const limit = @min(@as(usize, @intCast(offset)), self.bytes.len);
+        var byte_index: usize = 0;
+        var line: u32 = 0;
+        var character: u32 = 0;
+        while (byte_index < limit) {
+            if (self.bytes[byte_index] == '\n') {
+                byte_index += 1;
+                line += 1;
+                character = 0;
+                continue;
+            }
+            const sequence_len = std.unicode.utf8ByteSequenceLength(self.bytes[byte_index]) catch {
+                byte_index += 1;
+                character += 1;
+                continue;
+            };
+            const end = byte_index + @as(usize, sequence_len);
+            if (end > limit) break;
+            const codepoint = std.unicode.utf8Decode(self.bytes[byte_index..end]) catch {
+                byte_index += 1;
+                character += 1;
+                continue;
+            };
+            character += if (codepoint > 0xffff) 2 else 1;
+            byte_index = end;
+        }
+        return .{ .line = line, .character = character };
+    }
+
+    pub fn utf16PositionToByteOffset(self: SourceFile, position: Utf16Position) ?u32 {
+        var byte_index: usize = 0;
+        var line: u32 = 0;
+        var character: u32 = 0;
+        while (byte_index < self.bytes.len) {
+            if (line == position.line and character == position.character) return @intCast(byte_index);
+            if (self.bytes[byte_index] == '\n') {
+                byte_index += 1;
+                line += 1;
+                character = 0;
+                continue;
+            }
+            const sequence_len = std.unicode.utf8ByteSequenceLength(self.bytes[byte_index]) catch {
+                byte_index += 1;
+                character += 1;
+                continue;
+            };
+            const end = byte_index + @as(usize, sequence_len);
+            if (end > self.bytes.len) return null;
+            const codepoint = std.unicode.utf8Decode(self.bytes[byte_index..end]) catch {
+                byte_index += 1;
+                character += 1;
+                continue;
+            };
+            const width: u32 = if (codepoint > 0xffff) 2 else 1;
+            if (line == position.line and character + width > position.character) return null;
+            character += width;
+            byte_index = end;
+        }
+        if (line == position.line and character == position.character) return @intCast(byte_index);
+        return null;
+    }
 };
 
 test "source positions use byte columns and one-based lines" {
@@ -78,4 +146,16 @@ test "source reports invalid UTF-8 without decoding it" {
     const source = SourceFile.init(0, "broken.ps", "\xff");
 
     try std.testing.expect(!source.isUtf8());
+}
+
+test "source converts positions between bytes and UTF-16" {
+    const source = SourceFile.init(0, "пример.ps", "а😀\nб");
+
+    try std.testing.expectEqualDeep(Utf16Position{ .line = 0, .character = 0 }, source.byteOffsetToUtf16Position(0));
+    try std.testing.expectEqualDeep(Utf16Position{ .line = 0, .character = 1 }, source.byteOffsetToUtf16Position(2));
+    try std.testing.expectEqualDeep(Utf16Position{ .line = 0, .character = 3 }, source.byteOffsetToUtf16Position(6));
+    try std.testing.expectEqualDeep(Utf16Position{ .line = 1, .character = 0 }, source.byteOffsetToUtf16Position(7));
+    try std.testing.expectEqual(@as(?u32, 6), source.utf16PositionToByteOffset(.{ .line = 0, .character = 3 }));
+    try std.testing.expectEqual(@as(?u32, 7), source.utf16PositionToByteOffset(.{ .line = 1, .character = 0 }));
+    try std.testing.expect(source.utf16PositionToByteOffset(.{ .line = 0, .character = 2 }) == null);
 }

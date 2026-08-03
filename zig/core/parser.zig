@@ -764,6 +764,7 @@ const Parser = struct {
             .while_expr => self.parseWhileExpression(value),
             .function => self.parseLambdaExpression(value),
             .spawn => self.parseSpawnExpression(value),
+            .match => self.parseMatchExpression(value),
             else => blk: {
                 try self.report(value.span, "Синтаксическая ошибка: ожидается выражение");
                 break :blk self.result.ast.addExpr(.{ .error_node = value.span });
@@ -818,6 +819,143 @@ const Parser = struct {
         return self.result.ast.addExpr(.{ .spawn = .{
             .span = spanFrom(start.span, self.astExprSpan(call)),
             .call = call,
+        } });
+    }
+
+    fn parseMatchExpression(self: *Parser, start: token.Token) anyerror!ast.ExprId {
+        const subject = try self.parseExpression(0);
+        var arms: std.ArrayList(ast.MatchArm) = .empty;
+        defer arms.deinit(self.result.allocator);
+
+        while (!self.at(.end) and !self.at(.eof)) {
+            const arm_start = self.peek().span;
+            const pattern = try self.parsePattern();
+            var body: []const ast.StmtId = undefined;
+            var end = self.astPatternSpan(pattern);
+            if (self.at(.then)) {
+                _ = self.next();
+                body = try self.parseStatementBlock(null);
+                end = (try self.expect(.end, "Синтаксическая ошибка: блок ветки 'выбор' не закрыт 'конец'")).span;
+            } else {
+                _ = try self.expect(.arrow, "Синтаксическая ошибка: после шаблона 'выбор' ожидается '->'");
+                const value = try self.parseExpression(0);
+                const statement = try self.result.ast.addStmt(.{ .expr = .{
+                    .span = self.astExprSpan(value),
+                    .value = value,
+                } });
+                body = try self.result.ast.copySlice(ast.StmtId, &.{statement});
+                end = self.astExprSpan(value);
+                self.consumeSemicolons();
+            }
+            try arms.append(self.result.allocator, .{
+                .span = spanFrom(arm_start, end),
+                .pattern = pattern,
+                .body = body,
+            });
+        }
+
+        const end = try self.expect(.end, "Синтаксическая ошибка: 'выбор' не закрыт 'конец'");
+        if (arms.items.len == 0) {
+            try self.report(start.span, "Синтаксическая ошибка: выбор должен содержать хотя бы одну ветку");
+        }
+        return self.result.ast.addExpr(.{ .match_expr = .{
+            .span = spanFrom(start.span, end.span),
+            .subject = subject,
+            .arms = try self.result.ast.copySlice(ast.MatchArm, arms.items),
+        } });
+    }
+
+    fn parsePattern(self: *Parser) anyerror!ast.PatternId {
+        const value = self.next();
+        switch (value.kind) {
+            .number => {
+                const literal = try self.parseNumber(value);
+                return self.result.ast.addPattern(.{ .literal = .{
+                    .span = value.span,
+                    .value = literal,
+                } });
+            },
+            .string => {
+                const literal = try self.result.ast.addExpr(.{ .string = .{
+                    .span = value.span,
+                    .value = try self.result.ast.copyText(value.lexeme),
+                } });
+                return self.result.ast.addPattern(.{ .literal = .{
+                    .span = value.span,
+                    .value = literal,
+                } });
+            },
+            .boolean => {
+                const literal = try self.result.ast.addExpr(.{ .boolean = .{
+                    .span = value.span,
+                    .value = std.mem.eql(u8, value.lexeme, "истина"),
+                } });
+                return self.result.ast.addPattern(.{ .literal = .{
+                    .span = value.span,
+                    .value = literal,
+                } });
+            },
+            .ident => {},
+            else => {
+                try self.report(value.span, "Синтаксическая ошибка: такой шаблон в выборе не поддержан");
+                return self.result.ast.addPattern(.{ .error_node = value.span });
+            },
+        }
+
+        if (std.mem.eql(u8, value.lexeme, "_")) {
+            return self.result.ast.addPattern(.{ .wildcard = value.span });
+        }
+
+        var module_name: ?[]const u8 = null;
+        var name = try self.result.ast.copyText(value.lexeme);
+        var end = value.span;
+        if (self.at(.dot)) {
+            _ = self.next();
+            const member = try self.expect(.ident, "Синтаксическая ошибка: после '.' в шаблоне ожидается идентификатор");
+            module_name = name;
+            name = try self.result.ast.copyText(member.lexeme);
+            end = member.span;
+        }
+
+        if (!self.at(.l_paren)) {
+            if (module_name) |module| {
+                return self.result.ast.addPattern(.{ .constructor = .{
+                    .span = spanFrom(value.span, end),
+                    .module_name = module,
+                    .name = name,
+                } });
+            }
+            return self.result.ast.addPattern(.{ .ident = .{
+                .span = value.span,
+                .name = name,
+            } });
+        }
+
+        _ = self.next();
+        var arguments: std.ArrayList(ast.PatternId) = .empty;
+        defer arguments.deinit(self.result.allocator);
+        var field_names: std.ArrayList([]const u8) = .empty;
+        defer field_names.deinit(self.result.allocator);
+        const named = self.at(.ident) and self.peekSecond().kind == .colon;
+        while (!self.at(.r_paren) and !self.at(.eof)) {
+            if (named) {
+                const field = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя поля шаблона");
+                _ = try self.expect(.colon, "Синтаксическая ошибка: после имени поля шаблона ожидается ':'");
+                try field_names.append(self.result.allocator, try self.result.ast.copyText(field.lexeme));
+            } else if (self.at(.ident) and self.peekSecond().kind == .colon) {
+                try self.report(self.peek().span, "Синтаксическая ошибка: нельзя смешивать позиционные и именованные поля в шаблоне");
+            }
+            try arguments.append(self.result.allocator, try self.parsePattern());
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        end = (try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' после шаблона-конструктора")).span;
+        return self.result.ast.addPattern(.{ .constructor = .{
+            .span = spanFrom(value.span, end),
+            .module_name = module_name,
+            .name = name,
+            .arguments = try self.result.ast.copySlice(ast.PatternId, arguments.items),
+            .field_names = if (named) try self.result.ast.copySlice([]const u8, field_names.items) else null,
         } });
     }
 
@@ -976,6 +1114,15 @@ const Parser = struct {
 
     fn astTypeSpan(self: *const Parser, id: ast.TypeId) source.Span {
         return switch (self.result.ast.typeNode(id).*) {
+            inline else => |value| switch (@TypeOf(value)) {
+                source.Span => value,
+                else => value.span,
+            },
+        };
+    }
+
+    fn astPatternSpan(self: *const Parser, id: ast.PatternId) source.Span {
+        return switch (self.result.ast.pattern(id).*) {
             inline else => |value| switch (@TypeOf(value)) {
                 source.Span => value,
                 else => value.span,

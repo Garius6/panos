@@ -180,3 +180,38 @@ test "parser conformance fixture preserves lambdas and spawn expressions" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture preserves match patterns and both arm forms" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/match.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    const declaration = parsed.ast.decl(parsed.ast.program.?.declarations[0]);
+    switch (declaration.*) {
+        .function => |function| switch (parsed.ast.stmt(function.body[0]).*) {
+            .expr => |statement| switch (parsed.ast.expr(statement.value).*) {
+                .match_expr => |match| {
+                    try std.testing.expectEqual(@as(usize, 3), match.arms.len);
+                    try std.testing.expectEqual(@as(usize, 1), match.arms[1].body.len);
+                    switch (parsed.ast.pattern(match.arms[0].pattern).*) {
+                        .constructor => |pattern| {
+                            try std.testing.expectEqualStrings("Фигура", pattern.module_name.?);
+                            try std.testing.expectEqualStrings("Круг", pattern.name);
+                        },
+                        else => return error.TestUnexpectedResult,
+                    }
+                    switch (parsed.ast.pattern(match.arms[2].pattern).*) {
+                        .wildcard => {},
+                        else => return error.TestUnexpectedResult,
+                    }
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

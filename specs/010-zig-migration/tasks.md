@@ -55,7 +55,7 @@ syntactic, semantic and runtime success/error cases matches reference outcomes.
 - [x] T017 [P] [US1] Port token kinds and Russian keyword lookup to `zig/core/token.zig` with lexical golden tests.
 - [x] T018 [US1] Implement UTF-8 lexer and recovery diagnostics in `zig/core/lexer.zig` with corpus tests in `tests/conformance/lexer/`.
 - [x] T019 [P] [US1] Define AST nodes, annotations and arena ownership in `zig/core/ast.zig`.
-- [ ] T020 [US1] Implement expressions, statements, declarations, patterns and type syntax parser in `zig/core/parser.zig`.
+- [x] T020 [US1] Implement expressions, statements, declarations, patterns and type syntax parser in `zig/core/parser.zig`.
 - [ ] T021 [US1] Add parser recovery and span conformance tests in `tests/conformance/parser/`.
 - [ ] T022 [US1] Implement symbols, lexical scopes and closure-capture metadata in `zig/core/symbols.zig`.
 - [ ] T023 [US1] Implement primitive, tuple, function, nominal and collection types in `zig/core/types.zig`.

@@ -257,3 +257,27 @@ test "module compiler executes a transitive imported function" {
         .runtime_error => return error.TestUnexpectedResult,
     }
 }
+
+test "module compiler retains imported string constants in the shared program" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./сообщения\" как сообщ\nэкспорт функ старт() -> Строка\nсообщ.ПРИВЕТ + \"!\"\nконец" },
+        .{ .path = "проект/сообщения.ps", .bytes = "экспорт конст ПРИВЕТ = \"привет\"" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| {
+            const rendered = result.stringBytes() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("привет!", rendered);
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}

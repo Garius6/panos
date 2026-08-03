@@ -88,6 +88,22 @@ const Parser = struct {
                 continue;
             }
 
+            if (self.at(.import)) {
+                if (exported) try self.report(self.peek().span, "Синтаксическая ошибка: 'экспорт' недопустим для импорта");
+                try declarations.append(self.result.allocator, try self.parseImport());
+                continue;
+            }
+
+            if (self.at(.constant)) {
+                try declarations.append(self.result.allocator, try self.parseTopLevelConst(exported, doc));
+                continue;
+            }
+
+            if (self.at(.type_decl)) {
+                try declarations.append(self.result.allocator, try self.parseTypeAlias(exported, doc));
+                continue;
+            }
+
             if (exported) {
                 try self.report(self.peek().span, "Синтаксическая ошибка: после 'экспорт' ожидается 'функ'");
             } else {
@@ -103,6 +119,7 @@ const Parser = struct {
         const start = try self.expect(.function, "Синтаксическая ошибка: ожидается 'функ'");
         const name_token = try self.expect(.ident, "Синтаксическая ошибка: после 'функ' ожидается имя");
         const name = try self.result.ast.copyText(name_token.lexeme);
+        const type_parameters = try self.parseTypeParameters();
 
         var parameters: std.ArrayList(ast.ParamDecl) = .empty;
         defer parameters.deinit(self.result.allocator);
@@ -137,7 +154,7 @@ const Parser = struct {
             .name = name,
             .name_span = name_token.span,
             .doc = try self.result.ast.copyText(doc),
-            .type_parameters = &.{},
+            .type_parameters = type_parameters,
             .parameters = try self.result.ast.copySlice(ast.ParamDecl, parameters.items),
             .return_type = return_type,
             .body = try self.result.ast.copySlice(ast.StmtId, body.items),
@@ -145,18 +162,181 @@ const Parser = struct {
         } });
     }
 
-    fn parseType(self: *Parser) !ast.TypeId {
+    fn parseType(self: *Parser) anyerror!ast.TypeId {
         const value = self.next();
+        if (value.kind == .function) return self.parseFunctionType(value);
+        if (value.kind == .l_paren) return self.parseTupleType(value);
         if (value.kind != .ident) {
             try self.report(value.span, "Синтаксическая ошибка: ожидается тип");
             return self.result.ast.addType(.{ .error_node = value.span });
         }
 
         const name = try self.result.ast.copyText(value.lexeme);
-        if (!self.at(.l_paren) or self.peek().nl_before) {
-            return self.result.ast.addType(.{ .ident = .{ .span = value.span, .name = name } });
+        if (self.at(.dot)) {
+            _ = self.next();
+            const member = try self.expect(.ident, "Синтаксическая ошибка: после '.' ожидается имя типа");
+            const parameters = try self.parseTypeArguments();
+            const end = if (parameters.end) |span| span else member.span;
+            return self.result.ast.addType(.{ .qualified = .{
+                .span = spanFrom(value.span, end),
+                .module_name = name,
+                .name = try self.result.ast.copyText(member.lexeme),
+                .parameters = parameters.values,
+            } });
         }
 
+        const parameters = try self.parseTypeArguments();
+        if (parameters.values.len == 0) {
+            return self.result.ast.addType(.{ .ident = .{ .span = value.span, .name = name } });
+        }
+        return self.result.ast.addType(.{ .generic = .{
+            .span = spanFrom(value.span, parameters.end.?),
+            .name = name,
+            .parameters = parameters.values,
+        } });
+    }
+
+    fn parseImport(self: *Parser) !ast.DeclId {
+        const start = try self.expect(.import, "Синтаксическая ошибка: ожидается 'импорт'");
+        const path = self.next();
+        if (path.kind != .ident and path.kind != .string) {
+            try self.report(path.span, "Синтаксическая ошибка: после 'импорт' ожидается имя модуля или строка пути");
+        }
+
+        var alias: ?[]const u8 = null;
+        var end = path.span;
+        if (self.at(.as)) {
+            _ = self.next();
+            const alias_token = try self.expect(.ident, "Синтаксическая ошибка: после 'как' ожидается псевдоним");
+            alias = try self.result.ast.copyText(alias_token.lexeme);
+            end = alias_token.span;
+        }
+        self.consumeSemicolons();
+        return self.result.ast.addDecl(.{ .import = .{
+            .span = spanFrom(start.span, end),
+            .path = try self.result.ast.copyText(path.lexeme),
+            .alias = alias,
+        } });
+    }
+
+    fn parseTopLevelConst(self: *Parser, is_exported: bool, doc: []const u8) !ast.DeclId {
+        const start = try self.expect(.constant, "Синтаксическая ошибка: ожидается 'конст'");
+        const name = try self.expect(.ident, "Синтаксическая ошибка: после 'конст' ожидается имя");
+        _ = try self.expect(.assign, "Синтаксическая ошибка: после имени константы ожидается '='");
+        const value = try self.parseExpression(0);
+        self.consumeSemicolons();
+        return self.result.ast.addDecl(.{ .constant = .{
+            .span = spanFrom(start.span, self.astExprSpan(value)),
+            .name = try self.result.ast.copyText(name.lexeme),
+            .name_span = name.span,
+            .doc = try self.result.ast.copyText(doc),
+            .value = value,
+            .is_exported = is_exported,
+        } });
+    }
+
+    fn parseTypeAlias(self: *Parser, is_exported: bool, doc: []const u8) !ast.DeclId {
+        const start = try self.expect(.type_decl, "Синтаксическая ошибка: ожидается 'тип'");
+        const name = try self.expect(.ident, "Синтаксическая ошибка: после 'тип' ожидается имя");
+        if (self.at(.l_bracket)) {
+            try self.report(self.peek().span, "Синтаксическая ошибка: generic type alias пока не поддержан");
+            self.skipBracketedTypeParameters();
+        }
+        _ = try self.expect(.assign, "Синтаксическая ошибка: после имени типа ожидается '='");
+        const aliased_type = try self.parseType();
+        self.consumeSemicolons();
+        return self.result.ast.addDecl(.{ .type_alias = .{
+            .span = spanFrom(start.span, self.astTypeSpan(aliased_type)),
+            .name = try self.result.ast.copyText(name.lexeme),
+            .doc = try self.result.ast.copyText(doc),
+            .is_exported = is_exported,
+            .aliased_type = aliased_type,
+        } });
+    }
+
+    fn parseTypeParameters(self: *Parser) ![]const ast.TypeParameter {
+        if (!self.at(.l_bracket)) return &.{};
+        _ = self.next();
+        var parameters: std.ArrayList(ast.TypeParameter) = .empty;
+        defer parameters.deinit(self.result.allocator);
+
+        while (!self.at(.r_bracket) and !self.at(.eof)) {
+            const name = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя type-параметра");
+            var bounds: std.ArrayList([]const u8) = .empty;
+            defer bounds.deinit(self.result.allocator);
+            if (self.at(.colon)) {
+                _ = self.next();
+                while (true) {
+                    const bound = try self.expect(.ident, "Синтаксическая ошибка: ожидается интерфейс-ограничение");
+                    try bounds.append(self.result.allocator, try self.result.ast.copyText(bound.lexeme));
+                    if (!self.at(.plus)) break;
+                    _ = self.next();
+                }
+            }
+            try parameters.append(self.result.allocator, .{
+                .name = try self.result.ast.copyText(name.lexeme),
+                .bounds = try self.result.ast.copySlice([]const u8, bounds.items),
+            });
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        _ = try self.expect(.r_bracket, "Синтаксическая ошибка: ожидается ']' после type-параметров");
+        return self.result.ast.copySlice(ast.TypeParameter, parameters.items);
+    }
+
+    fn skipBracketedTypeParameters(self: *Parser) void {
+        var depth: usize = 0;
+        while (!self.at(.eof)) {
+            const value = self.next();
+            if (value.kind == .l_bracket) depth += 1;
+            if (value.kind == .r_bracket) {
+                depth -= 1;
+                if (depth == 0) return;
+            }
+        }
+    }
+
+    fn parseFunctionType(self: *Parser, start: token.Token) !ast.TypeId {
+        _ = try self.expect(.l_paren, "Синтаксическая ошибка: после 'функ' ожидается '('");
+        var parameters: std.ArrayList(ast.TypeId) = .empty;
+        defer parameters.deinit(self.result.allocator);
+        while (!self.at(.r_paren) and !self.at(.eof)) {
+            try parameters.append(self.result.allocator, try self.parseType());
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        _ = try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' после параметров типа функции");
+        _ = try self.expect(.arrow, "Синтаксическая ошибка: после параметров типа функции ожидается '->'");
+        const return_type = try self.parseType();
+        return self.result.ast.addType(.{ .function = .{
+            .span = spanFrom(start.span, self.astTypeSpan(return_type)),
+            .parameters = try self.result.ast.copySlice(ast.TypeId, parameters.items),
+            .return_type = return_type,
+        } });
+    }
+
+    fn parseTupleType(self: *Parser, start: token.Token) !ast.TypeId {
+        var elements: std.ArrayList(ast.TypeId) = .empty;
+        defer elements.deinit(self.result.allocator);
+        while (!self.at(.r_paren) and !self.at(.eof)) {
+            try elements.append(self.result.allocator, try self.parseType());
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        const end = try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' после type-тупла");
+        return self.result.ast.addType(.{ .tuple = .{
+            .span = spanFrom(start.span, end.span),
+            .elements = try self.result.ast.copySlice(ast.TypeId, elements.items),
+        } });
+    }
+
+    const ParsedTypeArguments = struct {
+        values: []const ast.TypeId,
+        end: ?source.Span,
+    };
+
+    fn parseTypeArguments(self: *Parser) !ParsedTypeArguments {
+        if (!self.at(.l_paren) or self.peek().nl_before) return .{ .values = &.{}, .end = null };
         _ = self.next();
         var parameters: std.ArrayList(ast.TypeId) = .empty;
         defer parameters.deinit(self.result.allocator);
@@ -166,11 +346,10 @@ const Parser = struct {
             _ = self.next();
         }
         const end = try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' после параметров типа");
-        return self.result.ast.addType(.{ .generic = .{
-            .span = spanFrom(value.span, end.span),
-            .name = name,
-            .parameters = try self.result.ast.copySlice(ast.TypeId, parameters.items),
-        } });
+        return .{
+            .values = try self.result.ast.copySlice(ast.TypeId, parameters.items),
+            .end = end.span,
+        };
     }
 
     fn parseStatement(self: *Parser) !ast.StmtId {

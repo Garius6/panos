@@ -771,7 +771,8 @@ const Checker = struct {
         }
         const then_type = try self.inferBlockExpected(conditional.then_branch, expected);
         const else_type = try self.inferBlockExpected(conditional.else_branch, expected);
-        if (!self.assignable(then_type, else_type) or !self.assignable(else_type, then_type)) {
+        const joined = if (self.isNever(then_type)) else_type else if (self.isNever(else_type)) then_type else null;
+        if (joined == null and (!self.assignable(then_type, else_type) or !self.assignable(else_type, then_type))) {
             try self.report(conditional.span, "Type Error: ветви 'если' возвращают разные типы", .{});
             return self.result.types.poison();
         }
@@ -782,7 +783,7 @@ const Checker = struct {
             }
             return expected_type;
         }
-        return then_type;
+        return joined orelse then_type;
     }
 
     fn inferMatch(self: *Checker, match: anytype) anyerror!types.TypeId {
@@ -832,7 +833,9 @@ const Checker = struct {
             }
             const arm_type = try self.inferBlockExpected(arm.body, expected);
             if (result_type) |previous| {
-                if (!self.assignable(previous, arm_type) or !self.assignable(arm_type, previous)) {
+                if (self.isNever(previous)) {
+                    result_type = arm_type;
+                } else if (!self.isNever(arm_type) and (!self.assignable(previous, arm_type) or !self.assignable(arm_type, previous))) {
                     try self.report(arm.span, "Type Error: ветви выбора возвращают разные типы", .{});
                 }
             } else {
@@ -1321,6 +1324,10 @@ const Checker = struct {
         return entry.* == .poison;
     }
 
+    fn isNever(self: *const Checker, type_id: types.TypeId) bool {
+        return self.isType(type_id, self.result.types.builtins.never);
+    }
+
     fn isErrorConstructor(self: *const Checker, symbol: symbols.SymbolId) bool {
         const entry = self.resolution.symbols.get(symbol) orelse return false;
         return entry.kind == .builtin and std.mem.eql(u8, entry.name, "Ошибка");
@@ -1329,6 +1336,11 @@ const Checker = struct {
     fn isLengthBuiltin(self: *const Checker, symbol: symbols.SymbolId) bool {
         const entry = self.resolution.symbols.get(symbol) orelse return false;
         return entry.kind == .builtin and std.mem.eql(u8, entry.name, "длина");
+    }
+
+    fn isPanicBuiltin(self: *const Checker, symbol: symbols.SymbolId) bool {
+        const entry = self.resolution.symbols.get(symbol) orelse return false;
+        return entry.kind == .builtin and std.mem.eql(u8, entry.name, "паника");
     }
 
     fn inferCall(self: *Checker, expression: ast.ExprId, call: anytype) anyerror!types.TypeId {
@@ -1346,6 +1358,17 @@ const Checker = struct {
                     }
                 }
                 return self.result.types.builtins.error_value;
+            }
+            if (self.isPanicBuiltin(symbol)) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: паника ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.never;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: паника ожидает строку", .{});
+                }
+                return self.result.types.builtins.never;
             }
             if (self.isLengthBuiltin(symbol)) {
                 if (call.arguments.len != 1) {
@@ -1592,6 +1615,7 @@ const Checker = struct {
         const actual_type = self.result.types.get(actual) orelse return true;
         const expected_type = self.result.types.get(expected) orelse return true;
         if (actual_type.* == .poison or expected_type.* == .poison) return true;
+        if (actual == self.result.types.builtins.never) return true;
         if (self.result.types.eql(actual, expected)) return true;
         const actual_nominal = switch (actual_type.*) {
             .nominal => |value| value,

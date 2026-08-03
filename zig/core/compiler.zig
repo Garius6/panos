@@ -440,6 +440,7 @@ const FunctionCompiler = struct {
     fn compileCall(self: *FunctionCompiler, expression: ast.ExprId, call: anytype) !void {
         if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
         if (try self.compileErrorConstructor(call)) return;
+        if (try self.compilePanicBuiltin(call)) return;
         if (try self.compileLengthBuiltin(call)) return;
         if (try self.compileCollectionMethod(call)) return;
         if (try self.compilePreludeEnumMethod(call)) return;
@@ -509,6 +510,20 @@ const FunctionCompiler = struct {
             .name_constant = name_constant,
             .field_count = 2,
         } });
+        return true;
+    }
+
+    fn compilePanicBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or !std.mem.eql(u8, entry.name, "паника")) return false;
+        if (call.arguments.len != 1) {
+            try self.compiler.report(call.span, "Compiler Error: паника ожидает 1 аргумент", .{});
+            try self.emitVoid();
+            return true;
+        }
+        try self.compileExpression(call.arguments[0]);
+        try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
         return true;
     }
 

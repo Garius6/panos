@@ -48,10 +48,14 @@ Odin-бинарники и не смешивает состояния runtime'о
   функций и literal constants со структурными сигнатурами (`Число`,
   `Строка`, `Булево`, `Пусто`, кортежи, функции, массивы, maps, процессы и
   указатели). Проверка аргументов проходит в importing module.
-- Номинальные типы, generic parameters, методы и interface implementations
-  через module boundary пока выдаются как контролируемая type diagnostic при
-  использовании. Это намеренная граница: Zig пока хранит отдельные symbol и
-  type stores для каждого модуля.
+- Экспортированный nominal type получает graph-wide identity по origin
+  декларации. Значение можно создать/вернуть в исходном модуле и передать в
+  другую его экспортированную функцию как opaque value; одноимённые типы
+  разных модулей остаются несовместимы.
+- Квалифицированные type annotations, constructors/fields/methods,
+  enum variants, generic parameters и interface implementations через module
+  boundary пока не поддержаны. Эти случаи остаются контролируемой границей,
+  пока отдельные symbol/type stores не получат полную shared semantic model.
 - CLI использует graph compiler и выполняет локальные multi-file программы.
   Browser/LSP остаются на single-source API и по-прежнему не выполняют
   импорты без filesystem/document graph.
@@ -136,13 +140,12 @@ Odin-файлах: они не относятся к Zig-срезам и не д
 идентичность пользовательских типов. Следующие инварианты нужны до
 полноценного cutover:
 
-1. Дать imported nominal types стабильную graph-wide identity, а не
-   пересоздавать их в каждом `TypeStore`.
-2. Расширить `ImportContext` на generic definitions, enum variants, methods
-   и interface vtables; не допускать несовместимых копий generic parameter
-   IDs.
-3. Подтвердить цепочки из трёх и более файлов, скрытые/private exports,
-   missing export, import cycle и runtime diagnostics в dependency.
+1. Раскрыть imported nominal types в qualified annotations,
+   constructors/fields и enum variants, сохраняя уже введённую origin identity.
+2. Расширить `ImportContext` на generic definitions, methods и interface
+   vtables; не допускать несовместимых копий generic parameter IDs.
+3. Подтвердить hidden/private exports, missing export, import cycle и runtime
+   diagnostics в dependency; цепочка из трёх файлов уже покрыта e2e-тестом.
 4. Спроектировать unsaved document graph поверх этой модели для browser/LSP.
 
 ### Builtin'ы и target guards

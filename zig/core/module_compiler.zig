@@ -29,18 +29,22 @@ pub const GraphCompileResult = struct {
     program: bytecode.Program,
     modules: []ModuleCompilation = &.{},
     start: ?bytecode.FunctionId = null,
+    nominal_identities: std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
+    next_nominal_identity: u32 = 1,
 
     pub fn init(allocator: std.mem.Allocator) GraphCompileResult {
         return .{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
             .program = bytecode.Program.init(allocator),
+            .nominal_identities = .init(allocator),
         };
     }
 
     pub fn deinit(self: *GraphCompileResult) void {
         for (self.modules) |*module| module.deinit();
         if (self.modules.len != 0) self.allocator.free(self.modules);
+        self.nominal_identities.deinit();
         self.program.deinit();
         self.diagnostics.deinit(self.allocator);
         self.arena.deinit();
@@ -69,6 +73,7 @@ pub const GraphCompileResult = struct {
 const ImportContext = struct {
     allocator: std.mem.Allocator,
     imported_types: std.ArrayList(type_checker.ImportedSymbolType) = .empty,
+    nominals: std.ArrayList(type_checker.ImportedNominal) = .empty,
     functions: std.ArrayList(compiler.ImportedFunction) = .empty,
     constants: std.ArrayList(compiler.ImportedConstant) = .empty,
 
@@ -79,11 +84,18 @@ const ImportContext = struct {
     fn deinit(self: *ImportContext) void {
         self.constants.deinit(self.allocator);
         self.functions.deinit(self.allocator);
+        self.nominals.deinit(self.allocator);
         self.imported_types.deinit(self.allocator);
         self.* = undefined;
     }
 
-    fn collect(self: *ImportContext, resolution: *const resolver.Resolution, modules: []const ModuleCompilation) !void {
+    fn collect(
+        self: *ImportContext,
+        resolution: *const resolver.Resolution,
+        modules: []const ModuleCompilation,
+        nominal_identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
+        next_nominal_identity: *u32,
+    ) !void {
         var imported_symbols = resolution.imported_symbols.iterator();
         while (imported_symbols.next()) |entry| {
             const imported_symbol = entry.key_ptr.*;
@@ -94,10 +106,19 @@ const ImportContext = struct {
             const target_checked = if (target.checked) |*value| value else return error.ImportNotChecked;
             const target_compiled = if (target.compiled) |*value| value else return error.ImportNotCompiled;
             const target_symbol = target_resolution.decl_symbols.get(origin.declaration) orelse continue;
-            const signature = target_checked.symbol_types.get(target_symbol) orelse continue;
 
             switch (exported.kind) {
+                .type => {
+                    const identity = try nominalIdentity(nominal_identities, next_nominal_identity, origin);
+                    try self.nominals.append(self.allocator, .{
+                        .store = &target_checked.types,
+                        .source_symbol = target_symbol,
+                        .local_symbol = imported_symbol,
+                        .identity = identity,
+                    });
+                },
                 .function => {
+                    const signature = target_checked.symbol_types.get(target_symbol) orelse continue;
                     const function_id = target_compiled.function_ids.get(target_symbol) orelse continue;
                     try self.imported_types.append(self.allocator, .{
                         .symbol = imported_symbol,
@@ -110,6 +131,7 @@ const ImportContext = struct {
                     });
                 },
                 .constant => {
+                    const signature = target_checked.symbol_types.get(target_symbol) orelse continue;
                     const value = target_compiled.top_level_constants.get(target_symbol) orelse continue;
                     try self.imported_types.append(self.allocator, .{
                         .symbol = imported_symbol,
@@ -126,6 +148,19 @@ const ImportContext = struct {
         }
     }
 };
+
+fn nominalIdentity(
+    identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
+    next_identity: *u32,
+    origin: resolver.ImportedSymbolOrigin,
+) !u32 {
+    if (identities.get(origin)) |identity| return identity;
+    if (next_identity.* == 0) return error.NominalIdentityLimitReached;
+    const identity = next_identity.*;
+    next_identity.* += 1;
+    try identities.put(origin, identity);
+    return identity;
+}
 
 pub fn compileGraph(allocator: std.mem.Allocator, graph: *const module_loader.Graph) !GraphCompileResult {
     var result = GraphCompileResult.init(allocator);
@@ -147,9 +182,12 @@ pub fn compileGraph(allocator: std.mem.Allocator, graph: *const module_loader.Gr
 
         var imports = ImportContext.init(allocator);
         defer imports.deinit();
-        try imports.collect(resolution, result.modules);
+        try imports.collect(resolution, result.modules, &result.nominal_identities, &result.next_nominal_identity);
 
-        result.modules[module_index].checked = try type_checker.checkWithImports(allocator, &module.tree, resolution, imports.imported_types.items);
+        result.modules[module_index].checked = try type_checker.checkWithImportContext(allocator, &module.tree, resolution, .{
+            .symbols = imports.imported_types.items,
+            .nominals = imports.nominals.items,
+        });
         const checked = &result.modules[module_index].checked.?;
         try result.appendDiagnostics(&checked.diagnostics);
         if (result.hasErrors()) return result;
@@ -280,4 +318,44 @@ test "module compiler retains imported string constants in the shared program" {
         },
         .runtime_error => return error.TestUnexpectedResult,
     }
+}
+
+test "module compiler preserves opaque exported nominal types across function calls" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка = точки.создать(40)\nточки.добавить(точка, 2)\nконец" },
+        .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nэкспорт функ создать(x: Число) -> Точка\nТочка(x)\nконец\nэкспорт функ добавить(точка: Точка, значение: Число) -> Число\nточка.x + значение\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "module compiler keeps same-named nominal exports distinct" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./левый\" как лев\nимпорт \"./правый\" как прав\nэкспорт функ старт() -> Число\nлев.значение(прав.создать(1))\nконец" },
+        .{ .path = "проект/левый.ps", .bytes = "экспорт тип Значение = структура\nx: Число\nконец\nэкспорт функ значение(значение: Значение) -> Число\nзначение.x\nконец" },
+        .{ .path = "проект/правый.ps", .bytes = "экспорт тип Значение = структура\nx: Число\nконец\nэкспорт функ создать(x: Число) -> Значение\nЗначение(x)\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expect(compiled.hasErrors());
+    try std.testing.expectEqualStrings("Type Error: аргумент не совпадает с типом параметра", compiled.diagnostics.items.items[0].message);
 }

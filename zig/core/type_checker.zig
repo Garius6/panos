@@ -74,6 +74,18 @@ pub const ImportedSymbolType = struct {
     type_id: types.TypeId,
 };
 
+pub const ImportedNominal = struct {
+    store: *const types.TypeStore,
+    source_symbol: symbols.SymbolId,
+    local_symbol: symbols.SymbolId,
+    identity: u32,
+};
+
+pub const ImportContext = struct {
+    symbols: []const ImportedSymbolType = &.{},
+    nominals: []const ImportedNominal = &.{},
+};
+
 pub const IteratorDispatch = enum {
     direct,
     interface,
@@ -224,9 +236,9 @@ const Checker = struct {
         }
     }
 
-    fn importSignaturePass(self: *Checker, imports: []const ImportedSymbolType) !void {
-        for (imports) |imported| {
-            const copied = self.copyImportedType(imported.store, imported.type_id) catch |err| switch (err) {
+    fn importSignaturePass(self: *Checker, imports: ImportContext) !void {
+        for (imports.symbols) |imported| {
+            const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals) catch |err| switch (err) {
                 error.UnsupportedImportedType => {
                     try self.result.unsupported_imports.put(imported.symbol, {});
                     continue;
@@ -237,7 +249,7 @@ const Checker = struct {
         }
     }
 
-    fn copyImportedType(self: *Checker, external_store: *const types.TypeStore, external_type: types.TypeId) !types.TypeId {
+    fn copyImportedType(self: *Checker, external_store: *const types.TypeStore, external_type: types.TypeId, nominals: []const ImportedNominal) !types.TypeId {
         const entry = external_store.get(external_type) orelse return error.UnsupportedImportedType;
         return switch (entry.*) {
             .primitive => |primitive| switch (primitive) {
@@ -252,23 +264,33 @@ const Checker = struct {
             .tuple => |elements| blk: {
                 var copied: std.ArrayList(types.TypeId) = .empty;
                 defer copied.deinit(self.result.allocator);
-                for (elements) |element| try copied.append(self.result.allocator, try self.copyImportedType(external_store, element));
+                for (elements) |element| try copied.append(self.result.allocator, try self.copyImportedType(external_store, element, nominals));
                 break :blk self.result.types.tuple(copied.items);
             },
             .function => |function| blk: {
                 var copied: std.ArrayList(types.TypeId) = .empty;
                 defer copied.deinit(self.result.allocator);
-                for (function.parameters) |parameter| try copied.append(self.result.allocator, try self.copyImportedType(external_store, parameter));
-                break :blk self.result.types.function(copied.items, try self.copyImportedType(external_store, function.return_type));
+                for (function.parameters) |parameter| try copied.append(self.result.allocator, try self.copyImportedType(external_store, parameter, nominals));
+                break :blk self.result.types.function(copied.items, try self.copyImportedType(external_store, function.return_type, nominals));
             },
-            .array => |element| self.result.types.array(try self.copyImportedType(external_store, element)),
+            .nominal => |nominal| blk: {
+                for (nominals) |imported| {
+                    if (imported.store != external_store or imported.source_symbol != nominal.symbol) continue;
+                    var arguments: std.ArrayList(types.TypeId) = .empty;
+                    defer arguments.deinit(self.result.allocator);
+                    for (nominal.arguments) |argument| try arguments.append(self.result.allocator, try self.copyImportedType(external_store, argument, nominals));
+                    break :blk self.result.types.nominalWithIdentity(imported.local_symbol, imported.identity, arguments.items);
+                }
+                return error.UnsupportedImportedType;
+            },
+            .array => |element| self.result.types.array(try self.copyImportedType(external_store, element, nominals)),
             .map => |map| self.result.types.map(
-                try self.copyImportedType(external_store, map.key),
-                try self.copyImportedType(external_store, map.value),
+                try self.copyImportedType(external_store, map.key, nominals),
+                try self.copyImportedType(external_store, map.value, nominals),
             ),
-            .process => |message| self.result.types.process(try self.copyImportedType(external_store, message)),
-            .pointer => |pointee| self.result.types.pointer(try self.copyImportedType(external_store, pointee)),
-            .nominal, .generic_parameter, .poison => error.UnsupportedImportedType,
+            .process => |message| self.result.types.process(try self.copyImportedType(external_store, message, nominals)),
+            .pointer => |pointee| self.result.types.pointer(try self.copyImportedType(external_store, pointee, nominals)),
+            .generic_parameter, .poison => error.UnsupportedImportedType,
         };
     }
 
@@ -2611,7 +2633,7 @@ pub fn checkWithImports(
     resolution: *const resolver.Resolution,
     imports: []const ImportedSymbolType,
 ) !CheckResult {
-    return checkWithImportsForTarget(allocator, tree, resolution, imports, .native);
+    return checkWithImportContextForTarget(allocator, tree, resolution, .{ .symbols = imports }, .native);
 }
 
 pub fn checkWithImportsForTarget(
@@ -2619,6 +2641,25 @@ pub fn checkWithImportsForTarget(
     tree: *const ast.Ast,
     resolution: *const resolver.Resolution,
     imports: []const ImportedSymbolType,
+    target_profile: target_policy.TargetProfile,
+) !CheckResult {
+    return checkWithImportContextForTarget(allocator, tree, resolution, .{ .symbols = imports }, target_profile);
+}
+
+pub fn checkWithImportContext(
+    allocator: std.mem.Allocator,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    imports: ImportContext,
+) !CheckResult {
+    return checkWithImportContextForTarget(allocator, tree, resolution, imports, .native);
+}
+
+pub fn checkWithImportContextForTarget(
+    allocator: std.mem.Allocator,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    imports: ImportContext,
     target_profile: target_policy.TargetProfile,
 ) !CheckResult {
     var result = try CheckResult.init(allocator);

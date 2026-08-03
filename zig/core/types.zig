@@ -34,6 +34,7 @@ pub const Type = union(enum) {
     },
     nominal: struct {
         symbol: symbols.SymbolId,
+        identity: u32 = 0,
         arguments: []const TypeId,
     },
     array: TypeId,
@@ -97,8 +98,13 @@ pub const TypeStore = struct {
     }
 
     pub fn nominal(self: *TypeStore, symbol: symbols.SymbolId, arguments: []const TypeId) !TypeId {
+        return self.nominalWithIdentity(symbol, 0, arguments);
+    }
+
+    pub fn nominalWithIdentity(self: *TypeStore, symbol: symbols.SymbolId, identity: u32, arguments: []const TypeId) !TypeId {
         return self.add(.{ .nominal = .{
             .symbol = symbol,
+            .identity = identity,
             .arguments = try self.arena.allocator().dupe(TypeId, arguments),
         } });
     }
@@ -145,7 +151,10 @@ pub const TypeStore = struct {
                 else => false,
             },
             .nominal => |left_nominal| switch (right_type.*) {
-                .nominal => |right_nominal| left_nominal.symbol == right_nominal.symbol and self.eqlSlices(left_nominal.arguments, right_nominal.arguments),
+                .nominal => |right_nominal| (if (left_nominal.identity != 0 or right_nominal.identity != 0)
+                    left_nominal.identity != 0 and left_nominal.identity == right_nominal.identity
+                else
+                    left_nominal.symbol == right_nominal.symbol) and self.eqlSlices(left_nominal.arguments, right_nominal.arguments),
                 else => false,
             },
             .array => |left_element| switch (right_type.*) {
@@ -240,4 +249,20 @@ test "nominal types compare declaration identity and generic arguments" {
     try std.testing.expect(type_store.eql(option_number, option_number));
     try std.testing.expect(!type_store.eql(option_number, option_string));
     try std.testing.expect(!type_store.eql(option_number, result_number));
+}
+
+test "imported nominal types compare graph identities instead of local symbols" {
+    var symbol_store = try symbols.SymbolStore.init(std.testing.allocator);
+    defer symbol_store.deinit();
+    var type_store = try TypeStore.init(std.testing.allocator);
+    defer type_store.deinit();
+
+    const left_symbol = try symbol_store.add(.{ .name = "Значение", .kind = .type, .span = .{ .file_id = 0, .start = 0, .end = 0 } });
+    const right_symbol = try symbol_store.add(.{ .name = "Значение", .kind = .type, .span = .{ .file_id = 1, .start = 0, .end = 0 } });
+    const left = try type_store.nominalWithIdentity(left_symbol, 1, &.{});
+    const same_origin = try type_store.nominalWithIdentity(right_symbol, 1, &.{});
+    const other_origin = try type_store.nominalWithIdentity(right_symbol, 2, &.{});
+
+    try std.testing.expect(type_store.eql(left, same_origin));
+    try std.testing.expect(!type_store.eql(left, other_origin));
 }

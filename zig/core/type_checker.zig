@@ -681,14 +681,37 @@ const Checker = struct {
     fn inferCall(self: *Checker, call: anytype) anyerror!types.TypeId {
         switch (self.tree.expr(call.callee).*) {
             .property => |property| {
-                if (std.mem.eql(u8, property.property, "длина")) {
-                    if (call.arguments.len != 0) try self.report(call.span, "Type Error: метод 'длина' не принимает аргументы", .{});
-                    const object_type = try self.infer(property.object);
-                    const object = self.result.types.get(object_type) orelse return self.result.types.poison();
-                    switch (object.*) {
-                        .array, .map => return self.result.types.builtins.integer,
-                        else => {},
-                    }
+                const object_type = try self.infer(property.object);
+                const object = self.result.types.get(object_type) orelse return self.result.types.poison();
+                switch (object.*) {
+                    .array => {
+                        if (std.mem.eql(u8, property.property, "длина")) {
+                            try self.checkMethodArity(call, "длина", 0);
+                            return self.result.types.builtins.integer;
+                        }
+                        if (std.mem.eql(u8, property.property, "есть")) {
+                            try self.checkMethodArity(call, "есть", 1);
+                            if (call.arguments.len != 0) {
+                                const index = try self.infer(call.arguments[0]);
+                                if (!self.isNumeric(index)) try self.report(call.span, "Type Error: индекс массива должен быть числом", .{});
+                            }
+                            return self.result.types.builtins.boolean;
+                        }
+                    },
+                    .map => |map| {
+                        if (std.mem.eql(u8, property.property, "длина")) {
+                            try self.checkMethodArity(call, "длина", 0);
+                            return self.result.types.builtins.integer;
+                        }
+                        if (std.mem.eql(u8, property.property, "есть")) {
+                            try self.checkMethodArity(call, "есть", 1);
+                            if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], map.key), map.key)) {
+                                try self.report(call.span, "Type Error: ключ соответствия имеет неверный тип", .{});
+                            }
+                            return self.result.types.builtins.boolean;
+                        }
+                    },
+                    else => {},
                 }
             },
             else => {},
@@ -721,6 +744,12 @@ const Checker = struct {
                 return self.result.types.poison();
             },
         }
+    }
+
+    fn checkMethodArity(self: *Checker, call: anytype, name: []const u8, expected: usize) !void {
+        if (call.arguments.len == expected) return;
+        try self.report(call.span, "Type Error: метод '{s}' ожидает {d} аргумент(а)", .{ name, expected });
+        for (call.arguments) |argument| _ = try self.infer(argument);
     }
 
     fn resolveType(self: *Checker, type_node: ast.TypeId) !types.TypeId {

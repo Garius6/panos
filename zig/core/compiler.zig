@@ -385,7 +385,7 @@ const FunctionCompiler = struct {
 
     fn compileCall(self: *FunctionCompiler, call: anytype) !void {
         if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
-        if (try self.compileCollectionLength(call)) return;
+        if (try self.compileCollectionMethod(call)) return;
         if (try self.structConstructor(call.callee)) |structure| {
             for (call.arguments) |argument| try self.compileExpression(argument);
             if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
@@ -402,20 +402,30 @@ const FunctionCompiler = struct {
         try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(call.arguments.len) });
     }
 
-    fn compileCollectionLength(self: *FunctionCompiler, call: anytype) !bool {
+    fn compileCollectionMethod(self: *FunctionCompiler, call: anytype) !bool {
         const property = switch (self.compiler.tree.expr(call.callee).*) {
             .property => |value| value,
             else => return false,
         };
-        if (!std.mem.eql(u8, property.property, "длина") or call.arguments.len != 0) return false;
         const object_type = self.compiler.checked.expression_types.get(property.object) orelse return false;
         const type_entry = self.compiler.checked.types.get(object_type) orelse return false;
         const instruction: bytecode.Instruction = switch (type_entry.*) {
-            .array => .{ .array_length = {} },
-            .map => .{ .map_length = {} },
+            .array => if (std.mem.eql(u8, property.property, "длина") and call.arguments.len == 0)
+                .{ .array_length = {} }
+            else if (std.mem.eql(u8, property.property, "есть") and call.arguments.len == 1)
+                .{ .array_has_index = {} }
+            else
+                return false,
+            .map => if (std.mem.eql(u8, property.property, "длина") and call.arguments.len == 0)
+                .{ .map_length = {} }
+            else if (std.mem.eql(u8, property.property, "есть") and call.arguments.len == 1)
+                .{ .map_has_key = {} }
+            else
+                return false,
             else => return false,
         };
         try self.compileExpression(property.object);
+        for (call.arguments) |argument| try self.compileExpression(argument);
         try self.function.emit(self.compiler.result.allocator, instruction);
         return true;
     }

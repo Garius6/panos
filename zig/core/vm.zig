@@ -103,6 +103,8 @@ pub const Vm = struct {
             .array_length => try self.arrayLength(),
             .build_map => |count| try self.buildMap(count),
             .map_length => try self.mapLength(),
+            .array_has_index => try self.arrayHasIndex(),
+            .map_has_key => try self.mapHasKey(),
             .get_index => try self.getIndex(),
             .set_index => try self.setIndex(),
             .get_property => |field| try self.getProperty(field),
@@ -449,6 +451,38 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .number = @floatFromInt(map.entries.items.len) });
     }
 
+    fn arrayHasIndex(self: *Vm) anyerror!void {
+        const index = try self.number(try self.pop());
+        const runtime_value = try self.pop();
+        const array = switch (runtime_value) {
+            .array => |array| array,
+            else => {
+                try self.fault("Runtime Error: проверка индекса доступна только для массива", .{});
+                return;
+            },
+        };
+        const exists = index >= 0 and index == std.math.trunc(index) and index < @as(f64, @floatFromInt(array.elements.len));
+        try self.stack.append(self.allocator, .{ .boolean = exists });
+    }
+
+    fn mapHasKey(self: *Vm) anyerror!void {
+        const key = try self.pop();
+        const runtime_value = try self.pop();
+        const map = switch (runtime_value) {
+            .map => |map| map,
+            else => {
+                try self.fault("Runtime Error: проверка ключа доступна только для соответствия", .{});
+                return;
+            },
+        };
+        for (map.entries.items) |entry| {
+            if (!entry.key.eql(key)) continue;
+            try self.stack.append(self.allocator, .{ .boolean = true });
+            return;
+        }
+        try self.stack.append(self.allocator, .{ .boolean = false });
+    }
+
     fn getIndex(self: *Vm) anyerror!void {
         const index = try self.pop();
         const object = try self.pop();
@@ -728,6 +762,26 @@ test "VM guards map length against non-map values" {
     }
 }
 
+test "VM guards collection presence checks" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const array_id = try program.addFunction("массив", 0);
+    const array = program.function(array_id).?;
+    const one = try array.addConstant(std.testing.allocator, .{ .number = 1 });
+    try array.emit(std.testing.allocator, .{ .constant = one });
+    try array.emit(std.testing.allocator, .{ .constant = one });
+    try array.emit(std.testing.allocator, .{ .array_has_index = {} });
+    try array.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(array_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: проверка индекса доступна только для массива", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM guards closure capture metadata" {
     var program = bytecode.Program.init(std.testing.allocator);
     defer program.deinit();
@@ -803,6 +857,36 @@ test "VM executes collection length methods" {
     switch (outcome) {
         .success => |runtime_value| switch (runtime_value) {
             .number => |number| try std.testing.expectEqual(@as(f64, 5), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM executes collection presence methods" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ проверить() -> Булево\nпер числа = массив(10)\nпер цены = соответствие(\"a\" = 1)\nчисла.есть(0) и не числа.есть(1) и цены.есть(\"a\") и не цены.есть(\"b\")\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .boolean => |boolean| try std.testing.expect(boolean),
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

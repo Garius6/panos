@@ -231,6 +231,30 @@ pub const Expr = union(enum) {
     error_node: source.Span,
 };
 
+pub fn exprSpan(expression: Expr) source.Span {
+    return switch (expression) {
+        .number => |value| value.span,
+        .boolean => |value| value.span,
+        .string => |value| value.span,
+        .ident => |value| value.span,
+        .unary => |value| value.span,
+        .binary => |value| value.span,
+        .call => |value| value.span,
+        .spawn => |value| value.span,
+        .property => |value| value.span,
+        .if_expr => |value| value.span,
+        .while_expr => |value| value.span,
+        .tuple => |value| value.span,
+        .lambda => |value| value.span,
+        .array => |value| value.span,
+        .map => |value| value.span,
+        .index => |value| value.span,
+        .try_expr => |value| value.span,
+        .match_expr => |value| value.span,
+        .error_node => |span| span,
+    };
+}
+
 pub const Stmt = union(enum) {
     return_stmt: struct {
         span: source.Span,
@@ -439,6 +463,20 @@ pub const Ast = struct {
     pub fn pattern(self: *const Ast, id: PatternId) *const Pattern {
         return &self.patterns.items[@intFromEnum(id)];
     }
+
+    pub fn findExpressionAt(self: *const Ast, file_id: source.FileId, offset: u32) ?ExprId {
+        var result: ?ExprId = null;
+        var result_size: u32 = std.math.maxInt(u32);
+        for (self.expressions.items, 0..) |expression, index| {
+            const span = exprSpan(expression);
+            if (!span.contains(file_id, offset)) continue;
+            const size = span.end - span.start;
+            if (size >= result_size) continue;
+            result = @enumFromInt(index);
+            result_size = size;
+        }
+        return result;
+    }
 };
 
 test "AST IDs remain stable when storage grows" {
@@ -490,4 +528,24 @@ test "AST owns copied text and program child IDs" {
     try ast.setProgram(&declarations);
     try std.testing.expectEqual(@as(usize, 1), ast.program.?.declarations.len);
     try std.testing.expectEqual(declaration, ast.program.?.declarations[0]);
+}
+
+test "AST finds the most nested expression at a source offset" {
+    var ast = Ast.init(std.testing.allocator);
+    defer ast.deinit();
+
+    const left = try ast.addExpr(.{ .number = .{ .span = .{ .file_id = 2, .start = 4, .end = 5 }, .value = 1 } });
+    const right = try ast.addExpr(.{ .number = .{ .span = .{ .file_id = 2, .start = 8, .end = 9 }, .value = 2 } });
+    const binary = try ast.addExpr(.{ .binary = .{
+        .span = .{ .file_id = 2, .start = 4, .end = 9 },
+        .left = left,
+        .operator = .plus,
+        .right = right,
+    } });
+
+    try std.testing.expectEqual(left, ast.findExpressionAt(2, 4).?);
+    try std.testing.expectEqual(binary, ast.findExpressionAt(2, 6).?);
+    try std.testing.expectEqual(right, ast.findExpressionAt(2, 8).?);
+    try std.testing.expect(ast.findExpressionAt(2, 9) == null);
+    try std.testing.expect(ast.findExpressionAt(3, 4) == null);
 }

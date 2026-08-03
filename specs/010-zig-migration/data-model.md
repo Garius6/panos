@@ -69,6 +69,12 @@ compared directly.
 Opaque resource methods carry the same profile validation in their native
 adapter because they are not ordinary builtin calls.
 
+`aot_wasm_only` denotes the current JS-hosted AOT surface (`DOM::*` and
+sync HTTP); it is unavailable to `aot_wasi`, whose host ABI has no DOM/XHR
+imports. `browser_interpreter` runs bytecode and therefore accepts only
+`all`; it must reject AOT-only calls both statically and at its runtime
+boundary.
+
 ## Execution model
 
 ### `Value` and `Heap_Object`

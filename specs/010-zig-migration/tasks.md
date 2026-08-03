@@ -34,7 +34,7 @@ Odin.
 
 - [x] T011 Implement immutable source files and UTF-8 byte spans in `zig/core/source.zig`.
 - [x] T012 [P] Implement accumulated Russian diagnostics in `zig/core/diagnostic.zig`.
-- [ ] T013 [P] Implement canonical target profiles and builtin availability in `zig/core/target.zig`.
+- [x] T013 [P] Implement canonical target profiles and builtin availability in `zig/core/target.zig`.
 - [ ] T014 Implement normalized conformance outcomes in `zig/conformance/outcome.zig`.
 - [ ] T015 Add source, span, diagnostic and outcome unit tests in `zig/core/source.zig` and `zig/conformance/outcome.zig`.
 - [ ] T016 Add CLI diagnostic formatting contract tests in `zig/cli/main.zig` from `specs/010-zig-migration/contracts/cli.md`.

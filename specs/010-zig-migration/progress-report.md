@@ -12,9 +12,8 @@ Odin-бинарники и не смешивает состояния runtime'о
 `core/*.odin`, `main.odin` и документации остаются пользовательскими и не
 включались в Zig-коммиты.
 
-Цель следующего большого этапа — не расширять отдельные однофайловые кейсы,
-а безопасно выполнить реальный module graph с общими идентичностями символов,
-типов и функций.
+Следующий большой этап — расширить уже работающий минимальный module graph до
+номинальных типов, generic'ов, методов и общей prelude/stdlib-семантики.
 
 ## Реализовано
 
@@ -33,7 +32,7 @@ Odin-бинарники и не смешивает состояния runtime'о
 - `zig build run -- test.ps` успешно выполняет основной демонстрационный
   файл на момент этого отчёта.
 
-### Модули: загрузка и семантическая граница
+### Модули: загрузка, linking и исполнение
 
 - `zig/core/module_loader.zig` строит локальный граф импортов, нормализует
   пути, собирает exports, сортирует зависимости и диагностирует циклы и
@@ -41,10 +40,21 @@ Odin-бинарники и не смешивает состояния runtime'о
 - `zig/core/module_linker.zig` передаёт каталог экспортов в
   `resolver.resolveWithImports`; квалифицированные имена импортов
   семантически распознаются.
-- Исполнение импортов намеренно **не включено**. CLI и browser сообщают
-  контролируемую ошибку
-  `Compiler Error: выполнение импортов ещё не поддержано Zig-версией`,
-  вместо выполнения только entry-модуля с неверной семантикой.
+- `zig/core/module_compiler.zig` компилирует graph в topological порядке в
+  один `bytecode.Program`. Он сохраняет origin импортированного символа,
+  подставляет реальный `FunctionId` экспортированной функции и literal
+  constant, а затем запускает `старт` entry-модуля.
+- Первый исполнимый срез покрывает квалифицированные вызовы экспортированных
+  функций и literal constants со структурными сигнатурами (`Число`,
+  `Строка`, `Булево`, `Пусто`, кортежи, функции, массивы, maps, процессы и
+  указатели). Проверка аргументов проходит в importing module.
+- Номинальные типы, generic parameters, методы и interface implementations
+  через module boundary пока выдаются как контролируемая type diagnostic при
+  использовании. Это намеренная граница: Zig пока хранит отдельные symbol и
+  type stores для каждого модуля.
+- CLI использует graph compiler и выполняет локальные multi-file программы.
+  Browser/LSP остаются на single-source API и по-прежнему не выполняют
+  импорты без filesystem/document graph.
 
 ### Target policy и runtime guards
 
@@ -102,6 +112,9 @@ zig build run -- test.ps
 zig build lsp --summary none
 ```
 
+Также выполнен реальный запуск CLI временного двухфайлового graph: импорт
+`мат.сложить(мат.ОТВЕТ, 2)` вывел `42`.
+
 Кроме unit-тестов, LSP запускался как отдельный процесс. Проверены настоящие
 `Content-Length` кадры и JSON-RPC ответы для diagnostics, hover, completion,
 outline, folding ranges, definition, references, highlights и signature help.
@@ -111,25 +124,20 @@ Odin-файлах: они не относятся к Zig-срезам и не д
 
 ## Оставшаяся работа
 
-### Критичный P1: настоящее выполнение module graph
+### Критичный P1: расширение module graph
 
-Текущие `module_loader` и import scopes — только фундамент. Для выполнения
-нужен отдельный linker/compilation context со следующими инвариантами:
+Минимальный linker уже подтверждён, но module boundaries ещё не сохраняют
+идентичность пользовательских типов. Следующие инварианты нужны до
+полноценного cutover:
 
-1. Один graph-wide `SymbolStore` и `TypeStore`, а не новые ID в каждом
-   отдельном module analysis.
-2. У imported export должна быть стабильная связь с исходной декларацией,
-   типом и будущим `FunctionId`.
-3. Компилятор должен predeclare функции всего graph до компиляции тел, чтобы
-   bytecode вызов зависимости не получал неверный локальный ID.
-4. Entry function запускается после topological compilation; diagnostics
-   сохраняют исходный `file_id` и путь каждого модуля.
-5. Первый вертикальный срез должен ограничиться экспортированными функциями
-   с явными типами и literal constants; generic types, methods и полная
-   prelude/stdlib интегрируются после подтверждения identity model.
-
-Нужно добавить e2e fixture как минимум из трёх файлов: entry → dependency →
-dependency, затем отрицательные cases для missing export и import cycle.
+1. Дать imported nominal types стабильную graph-wide identity, а не
+   пересоздавать их в каждом `TypeStore`.
+2. Расширить `ImportContext` на generic definitions, enum variants, methods
+   и interface vtables; не допускать несовместимых копий generic parameter
+   IDs.
+3. Подтвердить цепочки из трёх и более файлов, скрытые/private exports,
+   missing export, import cycle и runtime diagnostics в dependency.
+4. Спроектировать unsaved document graph поверх этой модели для browser/LSP.
 
 ### Builtin'ы и target guards
 
@@ -175,9 +183,8 @@ dependency, затем отрицательные cases для missing export и
 
 ## Рекомендуемый порядок продолжения
 
-1. Спроектировать и реализовать минимальный graph-wide linker для функций и
-   literal constants; не пытаться «склеивать» независимые `CompileResult`.
-2. Расширить этот linker на nominal types, methods, generics и prelude/stdlib.
+1. Расширить существующий graph compiler на nominal types, methods, generics
+   и prelude/stdlib без копирования идентичностей типов.
 3. Добавить первые native builtin adapters вместе с static + runtime target
    guards из `target.zig`.
 4. На общей semantic model завершить cross-document LSP и rename/reference

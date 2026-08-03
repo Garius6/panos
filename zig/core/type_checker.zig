@@ -704,6 +704,13 @@ const Checker = struct {
                             }
                             return self.result.types.builtins.void;
                         }
+                        if (std.mem.eql(u8, property.property, "содержит")) {
+                            try self.checkMethodArity(call, "содержит", 1);
+                            if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], element), element)) {
+                                try self.report(call.span, "Type Error: элемент массива имеет неверный тип", .{});
+                            }
+                            return self.result.types.builtins.boolean;
+                        }
                     },
                     .map => |map| {
                         if (std.mem.eql(u8, property.property, "длина")) {

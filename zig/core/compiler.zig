@@ -416,6 +416,8 @@ const FunctionCompiler = struct {
                 .{ .array_has_index = {} }
             else if (std.mem.eql(u8, property.property, "добавить") and call.arguments.len == 1)
                 .{ .array_append = {} }
+            else if (std.mem.eql(u8, property.property, "содержит") and call.arguments.len == 1)
+                .{ .array_contains = {} }
             else
                 return false,
             .map => if (std.mem.eql(u8, property.property, "длина") and call.arguments.len == 0)

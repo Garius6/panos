@@ -101,6 +101,7 @@ pub const Vm = struct {
             .build_struct => |structure| try self.buildStruct(compiled, structure),
             .build_array => |count| try self.buildArray(count),
             .array_length => try self.arrayLength(),
+            .array_contains => try self.arrayContains(),
             .build_map => |count| try self.buildMap(count),
             .map_length => try self.mapLength(),
             .array_has_index => try self.arrayHasIndex(),
@@ -426,6 +427,24 @@ pub const Vm = struct {
             },
         };
         try self.stack.append(self.allocator, .{ .number = @floatFromInt(array.elements.len) });
+    }
+
+    fn arrayContains(self: *Vm) anyerror!void {
+        const sought = try self.pop();
+        const runtime_value = try self.pop();
+        const array = switch (runtime_value) {
+            .array => |array| array,
+            else => {
+                try self.fault("Runtime Error: поиск значения доступен только для массива", .{});
+                return;
+            },
+        };
+        for (array.elements) |element| {
+            if (!element.eql(sought)) continue;
+            try self.stack.append(self.allocator, .{ .boolean = true });
+            return;
+        }
+        try self.stack.append(self.allocator, .{ .boolean = false });
     }
 
     fn buildMap(self: *Vm, count: u16) !void {
@@ -840,6 +859,26 @@ test "VM guards array append against non-array values" {
     }
 }
 
+test "VM guards array containment against non-array values" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("содержит", 0);
+    const function = program.function(function_id).?;
+    const one = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    try function.emit(std.testing.allocator, .{ .constant = one });
+    try function.emit(std.testing.allocator, .{ .constant = one });
+    try function.emit(std.testing.allocator, .{ .array_contains = {} });
+    try function.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: поиск значения доступен только для массива", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM guards map deletion against non-map values" {
     var program = bytecode.Program.init(std.testing.allocator);
     defer program.deinit();
@@ -995,6 +1034,36 @@ test "VM appends array elements" {
     switch (outcome) {
         .success => |runtime_value| switch (runtime_value) {
             .number => |number| try std.testing.expectEqual(@as(f64, 4), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM searches array elements structurally" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ содержит() -> Булево\nпер числа = массив((1, \"a\"), (2, \"b\"))\nчисла.содержит((2, \"b\")) и не числа.содержит((3, \"c\"))\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .boolean => |boolean| try std.testing.expect(boolean),
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

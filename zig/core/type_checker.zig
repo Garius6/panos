@@ -16,6 +16,11 @@ pub const GenericParameter = struct {
     typ: types.TypeId,
 };
 
+pub const GenericNominal = struct {
+    parameters: []const GenericParameter,
+    fields: []const NominalField,
+};
+
 pub const CheckResult = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -27,6 +32,7 @@ pub const CheckResult = struct {
     type_aliases: std.AutoHashMap(symbols.SymbolId, types.TypeId),
     alias_type_nodes: std.AutoHashMap(symbols.SymbolId, ast.TypeId),
     generic_function_parameters: std.AutoHashMap(symbols.SymbolId, []const GenericParameter),
+    generic_nominal_fields: std.AutoHashMap(symbols.SymbolId, GenericNominal),
 
     pub fn init(allocator: std.mem.Allocator) !CheckResult {
         return .{
@@ -39,10 +45,12 @@ pub const CheckResult = struct {
             .type_aliases = .init(allocator),
             .alias_type_nodes = .init(allocator),
             .generic_function_parameters = .init(allocator),
+            .generic_nominal_fields = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CheckResult) void {
+        self.generic_nominal_fields.deinit();
         self.generic_function_parameters.deinit();
         self.alias_type_nodes.deinit();
         self.type_aliases.deinit();
@@ -107,18 +115,32 @@ const Checker = struct {
                 .struct_decl => |value| value,
                 else => continue,
             };
-            if (structure.is_ffi or structure.type_parameters.len != 0) continue;
+            if (structure.is_ffi) continue;
             const symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
             var fields: std.ArrayList(NominalField) = .empty;
             defer fields.deinit(self.result.allocator);
-            for (structure.fields) |field| {
-                const annotation = field.type_annotation orelse continue;
-                try fields.append(self.result.allocator, .{
-                    .name = field.name,
-                    .typ = try self.resolveType(annotation),
+            const generic_parameters = try self.defineGenericNominalParameters(symbol, structure.type_parameters);
+            const resolved_fields = blk: {
+                const previous_generic_parameters = self.current_generic_parameters;
+                self.current_generic_parameters = generic_parameters;
+                defer self.current_generic_parameters = previous_generic_parameters;
+                for (structure.fields) |field| {
+                    const annotation = field.type_annotation orelse continue;
+                    try fields.append(self.result.allocator, .{
+                        .name = field.name,
+                        .typ = try self.resolveType(annotation),
+                    });
+                }
+                break :blk try self.result.arena.allocator().dupe(NominalField, fields.items);
+            };
+            if (generic_parameters.len == 0) {
+                try self.result.nominal_fields.put(symbol, resolved_fields);
+            } else {
+                try self.result.generic_nominal_fields.put(symbol, .{
+                    .parameters = generic_parameters,
+                    .fields = resolved_fields,
                 });
             }
-            try self.result.nominal_fields.put(symbol, try self.result.arena.allocator().dupe(NominalField, fields.items));
         }
     }
 
@@ -457,7 +479,7 @@ const Checker = struct {
             try self.bindStatementPoison(statement);
             return;
         }
-        const fields = self.result.nominal_fields.get(nominal.symbol) orelse {
+        const fields = try self.fieldsForNominal(nominal) orelse {
             try self.report(let.span, "Type Error: тип '{s}' нельзя деструктурировать", .{expected_name});
             try self.bindStatementPoison(statement);
             return;
@@ -522,7 +544,7 @@ const Checker = struct {
             .tuple => |elements| if (tuplePropertyIndex(property.property)) |index| {
                 if (index < elements.len) return elements[index];
             },
-            .nominal => |nominal| if (self.result.nominal_fields.get(nominal.symbol)) |fields| {
+            .nominal => |nominal| if (try self.fieldsForNominal(nominal)) |fields| {
                 for (fields) |field| {
                     if (std.mem.eql(u8, field.name, property.property)) return field.typ;
                 }
@@ -811,6 +833,31 @@ const Checker = struct {
                 return function.return_type;
             },
             .nominal => |nominal| {
+                if (self.result.generic_nominal_fields.get(nominal.symbol)) |generic_nominal| {
+                    if (call.arguments.len != generic_nominal.fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора структуры", .{});
+                    const shared = @min(call.arguments.len, generic_nominal.fields.len);
+                    var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+                    defer substitutions.deinit();
+                    for (call.arguments[0..shared], generic_nominal.fields[0..shared]) |argument, field| {
+                        try self.inferGenericSubstitution(field.typ, try self.infer(argument), &substitutions, call.span);
+                    }
+                    var arguments: std.ArrayList(types.TypeId) = .empty;
+                    defer arguments.deinit(self.result.allocator);
+                    for (generic_nominal.parameters) |parameter| {
+                        if (substitutions.get(parameter.typ)) |argument| {
+                            try arguments.append(self.result.allocator, argument);
+                        } else {
+                            try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
+                            try arguments.append(self.result.allocator, try self.result.types.poison());
+                        }
+                    }
+                    const constructor_type = try self.result.types.nominal(nominal.symbol, arguments.items);
+                    for (call.arguments[0..shared], generic_nominal.fields[0..shared]) |argument, field| {
+                        const expected = try self.substituteGeneric(field.typ, &substitutions);
+                        if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент конструктора не совпадает с типом поля", .{});
+                    }
+                    return constructor_type;
+                }
                 if (self.result.nominal_fields.get(nominal.symbol)) |fields| {
                     if (call.arguments.len != fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора структуры", .{});
                     const shared = @min(call.arguments.len, fields.len);
@@ -915,6 +962,19 @@ const Checker = struct {
         return generic_parameters;
     }
 
+    fn defineGenericNominalParameters(self: *Checker, symbol: symbols.SymbolId, parameters: []const []const u8) ![]const GenericParameter {
+        if (self.result.generic_nominal_fields.get(symbol)) |existing| return existing.parameters;
+        const generic_parameters = try self.result.arena.allocator().alloc(GenericParameter, parameters.len);
+        for (parameters, generic_parameters) |parameter, *generic_parameter| {
+            generic_parameter.* = .{
+                .name = parameter,
+                .typ = try self.result.types.genericParameter(self.next_generic_parameter),
+            };
+            self.next_generic_parameter += 1;
+        }
+        return generic_parameters;
+    }
+
     fn findGenericParameter(self: *const Checker, name: []const u8) ?types.TypeId {
         for (self.current_generic_parameters) |parameter| {
             if (std.mem.eql(u8, parameter.name, name)) return parameter.typ;
@@ -947,8 +1007,35 @@ const Checker = struct {
                 try self.inferGenericSubstitution(map.key, argument_type.map.key, substitutions, span);
                 try self.inferGenericSubstitution(map.value, argument_type.map.value, substitutions, span);
             },
+            .nominal => |nominal| {
+                const argument_type = self.result.types.get(argument) orelse return;
+                if (argument_type.* != .nominal or argument_type.nominal.symbol != nominal.symbol or argument_type.nominal.arguments.len != nominal.arguments.len) return;
+                for (nominal.arguments, argument_type.nominal.arguments) |nested_parameter, nested_argument| {
+                    try self.inferGenericSubstitution(nested_parameter, nested_argument, substitutions, span);
+                }
+            },
             else => {},
         }
+    }
+
+    fn fieldsForNominal(self: *Checker, nominal: anytype) !?[]const NominalField {
+        if (self.result.nominal_fields.get(nominal.symbol)) |fields| return fields;
+        const generic_nominal = self.result.generic_nominal_fields.get(nominal.symbol) orelse return null;
+        if (nominal.arguments.len != generic_nominal.parameters.len) return null;
+        var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+        defer substitutions.deinit();
+        for (generic_nominal.parameters, nominal.arguments) |parameter, argument| {
+            try substitutions.put(parameter.typ, argument);
+        }
+        var fields: std.ArrayList(NominalField) = .empty;
+        defer fields.deinit(self.result.allocator);
+        for (generic_nominal.fields) |field| {
+            try fields.append(self.result.allocator, .{
+                .name = field.name,
+                .typ = try self.substituteGeneric(field.typ, &substitutions),
+            });
+        }
+        return try self.result.arena.allocator().dupe(NominalField, fields.items);
     }
 
     fn substituteGeneric(self: *Checker, type_id: types.TypeId, substitutions: *const std.AutoHashMap(types.TypeId, types.TypeId)) !types.TypeId {

@@ -740,7 +740,7 @@ const FunctionCompiler = struct {
             .nominal => |value| value,
             else => return null,
         };
-        if (!self.compiler.checked.nominal_fields.contains(nominal.symbol)) return null;
+        if (!self.compiler.checked.nominal_fields.contains(nominal.symbol) and !self.compiler.checked.generic_nominal_fields.contains(nominal.symbol)) return null;
         const symbol = self.compiler.resolution.symbols.get(nominal.symbol) orelse return null;
         return symbol.name;
     }
@@ -760,7 +760,12 @@ const FunctionCompiler = struct {
             .nominal => |value| value,
             else => return null,
         };
-        const fields = self.compiler.checked.nominal_fields.get(nominal.symbol) orelse return null;
+        const fields = if (self.compiler.checked.nominal_fields.get(nominal.symbol)) |normal|
+            normal
+        else if (self.compiler.checked.generic_nominal_fields.get(nominal.symbol)) |generic|
+            generic.fields
+        else
+            return null;
         for (fields, 0..) |field, index| {
             if (!std.mem.eql(u8, field.name, property)) continue;
             if (index > std.math.maxInt(u16)) return error.FieldLimitReached;

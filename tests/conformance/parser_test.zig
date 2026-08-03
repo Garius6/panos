@@ -124,3 +124,26 @@ test "parser conformance fixture preserves nested control-flow blocks" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture preserves for-in bindings" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/for_in.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    const declaration = parsed.ast.decl(parsed.ast.program.?.declarations[0]);
+    switch (declaration.*) {
+        .function => |function| switch (parsed.ast.stmt(function.body[1]).*) {
+            .for_in => |loop| {
+                try std.testing.expectEqual(@as(usize, 2), loop.names.len);
+                try std.testing.expectEqualStrings("ключ", loop.names[0]);
+                try std.testing.expectEqualStrings("значение", loop.names[1]);
+                try std.testing.expectEqual(@as(usize, 1), loop.body.len);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

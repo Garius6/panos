@@ -609,8 +609,41 @@ const Parser = struct {
             .return_expr => self.parseReturn(),
             .continue_expr => self.parseMarker(.continue_stmt),
             .break_expr => self.parseMarker(.break_stmt),
+            .for_expr => self.parseForIn(),
             else => self.parseExprStatement(),
         };
+    }
+
+    fn parseForIn(self: *Parser) !ast.StmtId {
+        const start = try self.expect(.for_expr, "Синтаксическая ошибка: ожидается 'для'");
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(self.result.allocator);
+
+        if (self.at(.l_paren)) {
+            _ = self.next();
+            while (!self.at(.r_paren) and !self.at(.eof)) {
+                const name = try self.expect(.ident, "Синтаксическая ошибка: в 'для' ожидается имя переменной");
+                try names.append(self.result.allocator, try self.result.ast.copyText(name.lexeme));
+                if (!self.at(.comma)) break;
+                _ = self.next();
+            }
+            _ = try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' в 'для'");
+        } else {
+            const name = try self.expect(.ident, "Синтаксическая ошибка: после 'для' ожидается имя переменной");
+            try names.append(self.result.allocator, try self.result.ast.copyText(name.lexeme));
+        }
+
+        _ = try self.expect(.in, "Синтаксическая ошибка: после переменной 'для' ожидается 'в'");
+        const iterable = try self.parseExpression(0);
+        _ = try self.expect(.loop, "Синтаксическая ошибка: после итерируемого значения ожидается 'цикл'");
+        const body = try self.parseStatementBlock(null);
+        const end = try self.expect(.end, "Синтаксическая ошибка: 'для' не закрыт 'конец'");
+        return self.result.ast.addStmt(.{ .for_in = .{
+            .span = spanFrom(start.span, end.span),
+            .names = try self.result.ast.copySlice([]const u8, names.items),
+            .iterable = iterable,
+            .body = body,
+        } });
     }
 
     fn parseLet(self: *Parser) !ast.StmtId {

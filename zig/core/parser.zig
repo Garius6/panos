@@ -867,6 +867,7 @@ const Parser = struct {
         } else {
             const name = try self.expect(.ident, "Синтаксическая ошибка: после 'для' ожидается имя переменной");
             try names.append(self.result.allocator, try self.result.ast.copyText(name.lexeme));
+            if (self.at(.assign)) return self.parseForRange(start, name);
         }
 
         _ = try self.expect(.in, "Синтаксическая ошибка: после переменной 'для' ожидается 'в'");
@@ -878,6 +879,26 @@ const Parser = struct {
             .span = spanFrom(start.span, end.span),
             .names = try self.result.ast.copySlice([]const u8, names.items),
             .iterable = iterable,
+            .body = body,
+        } });
+    }
+
+    fn parseForRange(self: *Parser, start: token.Token, name: token.Token) !ast.StmtId {
+        _ = try self.expect(.assign, "Синтаксическая ошибка: после переменной диапазона ожидается '='");
+        const range_start = try self.parseExpression(0);
+        const through = self.next();
+        if (through.kind != .ident or !std.mem.eql(u8, through.lexeme, "по")) {
+            try self.report(through.span, "Синтаксическая ошибка: после начала диапазона 'для X = ...' ожидается 'по'");
+        }
+        const range_end = try self.parseExpression(0);
+        _ = try self.expect(.loop, "Синтаксическая ошибка: после конца диапазона ожидается 'цикл'");
+        const body = try self.parseStatementBlock(null);
+        const end = try self.expect(.end, "Синтаксическая ошибка: диапазон 'для' не закрыт 'конец'");
+        return self.result.ast.addStmt(.{ .for_range = .{
+            .span = spanFrom(start.span, end.span),
+            .name = try self.result.ast.copyText(name.lexeme),
+            .start = range_start,
+            .end = range_end,
             .body = body,
         } });
     }
@@ -988,26 +1009,28 @@ const Parser = struct {
     fn parseExpression(self: *Parser, minimum_precedence: u8) anyerror!ast.ExprId {
         var left = try self.parsePrefix();
 
-        while (!self.peek().nl_before) {
-            if (self.at(.l_paren)) {
-                left = try self.parseCall(left);
-                continue;
-            }
-            if (self.at(.dot)) {
-                left = try self.parseProperty(left);
-                continue;
-            }
-            if (self.at(.l_bracket)) {
-                left = try self.parseIndex(left);
-                continue;
-            }
-            if (self.at(.question)) {
-                const question = self.next();
-                left = try self.result.ast.addExpr(.{ .try_expr = .{
-                    .span = spanFrom(self.astExprSpan(left), question.span),
-                    .value = left,
-                } });
-                continue;
+        while (true) {
+            if (!self.peek().nl_before) {
+                if (self.at(.l_paren)) {
+                    left = try self.parseCall(left);
+                    continue;
+                }
+                if (self.at(.dot)) {
+                    left = try self.parseProperty(left);
+                    continue;
+                }
+                if (self.at(.l_bracket)) {
+                    left = try self.parseIndex(left);
+                    continue;
+                }
+                if (self.at(.question)) {
+                    const question = self.next();
+                    left = try self.result.ast.addExpr(.{ .try_expr = .{
+                        .span = spanFrom(self.astExprSpan(left), question.span),
+                        .value = left,
+                    } });
+                    continue;
+                }
             }
 
             const precedence = binaryPrecedence(self.peek().kind);

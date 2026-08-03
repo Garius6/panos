@@ -130,6 +130,14 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "panos_core", .module = core_module }},
         }),
     });
+    const demo_parser_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test_ps_parser_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
 
     const run_core_tests = b.addRunArtifact(core_tests);
     const run_frontend_unit_tests = b.addRunArtifact(frontend_unit_tests);
@@ -140,6 +148,7 @@ pub fn build(b: *std.Build) void {
     const run_outcome_tests = b.addRunArtifact(outcome_tests);
     const run_lexer_conformance_tests = b.addRunArtifact(lexer_conformance_tests);
     const run_parser_conformance_tests = b.addRunArtifact(parser_conformance_tests);
+    const run_demo_parser_tests = b.addRunArtifact(demo_parser_tests);
     const test_step = b.step("test", "Run Zig unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_frontend_unit_tests.step);
@@ -150,11 +159,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_outcome_tests.step);
     test_step.dependOn(&run_lexer_conformance_tests.step);
     test_step.dependOn(&run_parser_conformance_tests.step);
+    test_step.dependOn(&run_demo_parser_tests.step);
 
     const conformance_step = b.step("conformance", "Validate the local conformance manifest");
     conformance_step.dependOn(&run_manifest_tests.step);
     conformance_step.dependOn(&run_lexer_conformance_tests.step);
     conformance_step.dependOn(&run_parser_conformance_tests.step);
+    conformance_step.dependOn(&run_demo_parser_tests.step);
 }
 
 fn addWasmRuntime(

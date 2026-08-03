@@ -148,6 +148,51 @@ test "parser conformance fixture preserves for-in bindings" {
     }
 }
 
+test "parser conformance fixture preserves inclusive numeric ranges" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/for_range.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    const declaration = parsed.ast.decl(parsed.ast.program.?.declarations[0]);
+    switch (declaration.*) {
+        .function => |function| switch (parsed.ast.stmt(function.body[1]).*) {
+            .for_range => |range| {
+                try std.testing.expectEqualStrings("счётчик", range.name);
+                try std.testing.expectEqual(@as(usize, 1), range.body.len);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parser conformance fixture accepts binary operators after a line break" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/wrapped_binary.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    const declaration = parsed.ast.decl(parsed.ast.program.?.declarations[0]);
+    switch (declaration.*) {
+        .function => |function| switch (parsed.ast.stmt(function.body[0]).*) {
+            .expr => |statement| switch (parsed.ast.expr(statement.value).*) {
+                .if_expr => |conditional| switch (parsed.ast.expr(conditional.condition).*) {
+                    .binary => |binary| try std.testing.expectEqual(panos.token.TokenKind.and_expr, binary.operator),
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "parser conformance fixture preserves lambdas and spawn expressions" {
     var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/lambda_spawn.ps"), 0);
     defer lexed.deinit();

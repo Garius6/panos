@@ -258,6 +258,13 @@ pub const Stmt = union(enum) {
         iterable: ExprId,
         body: []const StmtId,
     },
+    for_range: struct {
+        span: source.Span,
+        name: []const u8,
+        start: ExprId,
+        end: ExprId,
+        body: []const StmtId,
+    },
     error_node: source.Span,
 };
 

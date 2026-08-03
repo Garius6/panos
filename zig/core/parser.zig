@@ -1276,6 +1276,14 @@ const Parser = struct {
     fn parseCall(self: *Parser, callee: ast.ExprId) !ast.ExprId {
         const start = self.astExprSpan(callee);
         _ = self.next();
+        switch (self.result.ast.expr(callee).*) {
+            .ident => |ident| {
+                if (std.mem.eql(u8, ident.name, "массив")) return self.parseArrayLiteral(start);
+                if (std.mem.eql(u8, ident.name, "соответствие")) return self.parseMapLiteral(start);
+            },
+            else => {},
+        }
+
         var arguments: std.ArrayList(ast.ExprId) = .empty;
         defer arguments.deinit(self.result.allocator);
         var argument_names: std.ArrayList([]const u8) = .empty;
@@ -1308,6 +1316,44 @@ const Parser = struct {
                 try self.result.ast.copySlice([]const u8, argument_names.items)
             else
                 null,
+        } });
+    }
+
+    fn parseArrayLiteral(self: *Parser, start: source.Span) !ast.ExprId {
+        var elements: std.ArrayList(ast.ExprId) = .empty;
+        defer elements.deinit(self.result.allocator);
+        while (!self.at(.r_paren) and !self.at(.eof)) {
+            try elements.append(self.result.allocator, try self.parseExpression(0));
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        const end = try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' после элементов массива");
+        return self.result.ast.addExpr(.{ .array = .{
+            .span = spanFrom(start, end.span),
+            .elements = try self.result.ast.copySlice(ast.ExprId, elements.items),
+        } });
+    }
+
+    fn parseMapLiteral(self: *Parser, start: source.Span) !ast.ExprId {
+        var entries: std.ArrayList(ast.MapEntry) = .empty;
+        defer entries.deinit(self.result.allocator);
+        while (!self.at(.r_paren) and !self.at(.eof)) {
+            const entry_start = self.peek().span;
+            const key = try self.parseExpression(12);
+            _ = try self.expect(.assign, "Синтаксическая ошибка: после ключа соответствия ожидается '='");
+            const value = try self.parseExpression(0);
+            try entries.append(self.result.allocator, .{
+                .span = spanFrom(entry_start, self.astExprSpan(value)),
+                .key = key,
+                .value = value,
+            });
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        const end = try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' после пар соответствия");
+        return self.result.ast.addExpr(.{ .map = .{
+            .span = spanFrom(start, end.span),
+            .entries = try self.result.ast.copySlice(ast.MapEntry, entries.items),
         } });
     }
 

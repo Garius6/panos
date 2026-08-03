@@ -301,3 +301,33 @@ test "parser conformance fixture preserves declaration and field annotations" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture lowers collection constructor literals" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/collections.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    const declaration = parsed.ast.decl(parsed.ast.program.?.declarations[0]);
+    switch (declaration.*) {
+        .function => |function| {
+            switch (parsed.ast.stmt(function.body[0]).*) {
+                .let => |statement| switch (parsed.ast.expr(statement.value).*) {
+                    .array => |array| try std.testing.expectEqual(@as(usize, 2), array.elements.len),
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (parsed.ast.stmt(function.body[1]).*) {
+                .let => |statement| switch (parsed.ast.expr(statement.value).*) {
+                    .map => |map| try std.testing.expectEqual(@as(usize, 2), map.entries.len),
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

@@ -11,11 +11,19 @@ pub const Execution = union(enum) {
     runtime_error: []const u8,
 };
 
+pub const VerboseInfo = struct {
+    declarations: usize = 0,
+    symbols: ?usize = null,
+    types: ?usize = null,
+    functions: ?usize = null,
+};
+
 pub const SourceRun = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     diagnostics: panos_core.diagnostic.DiagnosticList = .{},
     execution: ?Execution = null,
+    verbose: ?VerboseInfo = null,
 
     fn init(allocator: std.mem.Allocator) SourceRun {
         return .{
@@ -80,6 +88,10 @@ pub fn formatDiagnostic(
 }
 
 pub fn runSource(allocator: std.mem.Allocator, path: []const u8, input: []const u8) !SourceRun {
+    return runSourceWithVerbose(allocator, path, input, false);
+}
+
+pub fn runSourceWithVerbose(allocator: std.mem.Allocator, path: []const u8, input: []const u8, verbose: bool) !SourceRun {
     var result = SourceRun.init(allocator);
     errdefer result.deinit();
     const file = panos_core.source.SourceFile.init(0, path, input);
@@ -91,19 +103,23 @@ pub fn runSource(allocator: std.mem.Allocator, path: []const u8, input: []const 
     var parsed = try panos_core.parser.parse(allocator, lexed.tokens.items);
     defer parsed.deinit();
     try result.appendDiagnostics(&parsed.diagnostics);
+    if (verbose) result.verbose = .{ .declarations = parsed.ast.program.?.declarations.len };
 
     var resolved = try panos_core.resolver.resolve(allocator, &parsed.ast);
     defer resolved.deinit();
     try result.appendDiagnostics(&resolved.diagnostics);
+    if (result.verbose) |*info| info.symbols = resolved.symbols.symbols.items.len - 1;
 
     var checked = try panos_core.type_checker.check(allocator, &parsed.ast, &resolved);
     defer checked.deinit();
     try result.appendDiagnostics(&checked.diagnostics);
+    if (result.verbose) |*info| info.types = checked.types.types.items.len - 1;
     if (result.hasErrors()) return result;
 
     var compiled = try panos_core.compiler.compile(allocator, &parsed.ast, &resolved, &checked);
     defer compiled.deinit();
     try result.appendDiagnostics(&compiled.diagnostics);
+    if (result.verbose) |*info| info.functions = compiled.program.functions.items.len;
     if (result.hasErrors()) return result;
 
     const start = findStartFunction(&resolved, &compiled) orelse {
@@ -124,6 +140,18 @@ pub fn writeDiagnostics(writer: *std.Io.Writer, file: panos_core.source.SourceFi
         const rendered = try formatDiagnostic(std.heap.page_allocator, file, value);
         defer std.heap.page_allocator.free(rendered);
         try writer.print("{s}\n", .{rendered});
+    }
+}
+
+pub fn writeVerboseInfo(writer: *std.Io.Writer, info: VerboseInfo) !void {
+    try writer.print("AST\n--------------------------\nдеклараций: {d}\n\n", .{info.declarations});
+    if (info.symbols) |symbols| {
+        try writer.print("TYPE CHECK\n--------------------------\nсимволов: {d}\n", .{symbols});
+        if (info.types) |types| try writer.print("типов: {d}\n", .{types});
+        try writer.print("\n", .{});
+    }
+    if (info.functions) |functions| {
+        try writer.print("BYTECODE\n--------------------------\nфункций: {d}\n\n", .{functions});
     }
 }
 
@@ -196,12 +224,14 @@ pub fn main(init: std.process.Init) !void {
     var arguments = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer arguments.deinit();
     _ = arguments.next();
+    var verbose = false;
     var file_path = arguments.next() orelse {
         try stdout.print("Panos REPL ещё не поддержан Zig-версией\n", .{});
         try stdout.flush();
         return;
     };
     if (std.mem.eql(u8, file_path, "-v") or std.mem.eql(u8, file_path, "--verbose")) {
+        verbose = true;
         file_path = arguments.next() orelse {
             try stderr.print("panos [-v|--verbose] [file.ps] [program arguments...]\n", .{});
             try stderr.flush();
@@ -232,9 +262,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer init.gpa.free(input);
-    var result = try runSource(init.gpa, file_path, input);
+    var result = try runSourceWithVerbose(init.gpa, file_path, input, verbose);
     defer result.deinit();
     const file = panos_core.source.SourceFile.init(0, file_path, input);
+    if (result.verbose) |info| try writeVerboseInfo(stdout, info);
     try writeDiagnostics(stderr, file, &result.diagnostics);
     if (result.hasErrors()) {
         try stderr.flush();
@@ -242,6 +273,7 @@ pub fn main(init: std.process.Init) !void {
     }
     switch (result.execution orelse unreachable) {
         .success => |output| {
+            if (result.verbose != null) try stdout.print("EXECUTION\n--------------------------\n", .{});
             try stdout.print("{s}\n", .{output});
             try stdout.flush();
         },
@@ -265,6 +297,17 @@ test "CLI runs exported start through the Zig pipeline" {
         .success => |output| try std.testing.expectEqualStrings("5", output),
         .runtime_error => return error.TestUnexpectedResult,
     }
+}
+
+test "CLI records stable verbose pipeline summaries" {
+    var result = try runSourceWithVerbose(std.testing.allocator, "пример.ps", "функ старт() -> Число\n42\nконец", true);
+    defer result.deinit();
+
+    const info = result.verbose orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), info.declarations);
+    try std.testing.expect(info.symbols != null);
+    try std.testing.expect(info.types != null);
+    try std.testing.expectEqual(@as(?usize, 1), info.functions);
 }
 
 test "CLI returns frontend diagnostics without executing" {

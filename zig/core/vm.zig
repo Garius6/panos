@@ -931,13 +931,42 @@ test "VM constructs enum variants" {
     }
 }
 
+test "VM provides option and result from the prelude" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Строка\nпер опция: Опция(Строка) = Опция.Есть(\"готово\")\nпер результат: Результат(Строка, Строка) = Результат.Успех(\"готово\")\nвыбор опция\nЕсть(значение) -> выбор результат\nУспех(_) -> значение\nНеудача(_) -> \"ошибка\"\nконец\nНет -> \"пусто\"\nконец\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| try std.testing.expectEqualStrings("готово", runtime_value.stringBytes().?),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM matches generic enum variants" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
     const resolver = @import("resolver.zig");
     const type_checker = @import("type_checker.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "тип Опция[T] = перечисление\nНет()\nЕсть(T)\nконец\nфунк извлечь[T](опция: Опция(T), запас: T) -> T\nвыбор опция\nЕсть(значение) -> значение\nНет -> запас\nконец\nконец\nфунк старт() -> Строка\nизвлечь(Опция.Есть(\"готово\"), \"запас\")\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Ячейка[T] = перечисление\nНет()\nЕсть(T)\nконец\nфунк извлечь[T](ячейка: Ячейка(T), запас: T) -> T\nвыбор ячейка\nЕсть(значение) -> значение\nНет -> запас\nконец\nконец\nфунк старт() -> Строка\nизвлечь(Ячейка.Есть(\"готово\"), \"запас\")\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

@@ -116,6 +116,34 @@ const Resolver = struct {
             });
             try self.scopes.declare(&self.result.symbols, symbol);
         }
+        try self.installPreludeEnum("Опция", &.{ "Нет", "Есть" });
+        try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });
+    }
+
+    fn installPreludeEnum(self: *Resolver, name: []const u8, variant_names: []const []const u8) !void {
+        const owner = try self.result.symbols.add(.{
+            .name = name,
+            .kind = .type,
+            .is_exported = true,
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+        });
+        try self.scopes.declare(&self.result.symbols, owner);
+        var variants = EnumVariants{
+            .owner = owner,
+            .values = .init(self.result.allocator),
+        };
+        errdefer variants.values.deinit();
+        for (variant_names) |variant_name| {
+            const variant = try self.result.symbols.add(.{
+                .name = variant_name,
+                .kind = .enum_variant,
+                .is_exported = true,
+                .owner_type = owner,
+                .span = .{ .file_id = 0, .start = 0, .end = 0 },
+            });
+            try variants.values.put(variant_name, variant);
+        }
+        try self.result.enum_variants.append(self.result.allocator, variants);
     }
 
     fn predeclare(self: *Resolver, tree: *const ast.Ast) !void {

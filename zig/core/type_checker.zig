@@ -220,6 +220,43 @@ const Checker = struct {
         }
     }
 
+    fn preludePass(self: *Checker) !void {
+        const option_symbol = self.findTypeSymbol("Опция") orelse return;
+        const result_symbol = self.findTypeSymbol("Результат") orelse return;
+        const option_parameters = try self.defineGenericEnumParameters(&.{"T"});
+        const result_parameters = try self.defineGenericEnumParameters(&.{ "T", "E" });
+        const option_variants = try self.result.arena.allocator().alloc(EnumVariant, 2);
+        option_variants[0] = .{
+            .symbol = self.resolution.findEnumVariant(option_symbol, "Нет") orelse return,
+            .name = "Нет",
+            .fields = &.{},
+        };
+        option_variants[1] = .{
+            .symbol = self.resolution.findEnumVariant(option_symbol, "Есть") orelse return,
+            .name = "Есть",
+            .fields = try self.result.arena.allocator().dupe(types.TypeId, &.{option_parameters[0].typ}),
+        };
+        try self.result.enum_definitions.put(option_symbol, .{
+            .parameters = option_parameters,
+            .variants = option_variants,
+        });
+        const result_variants = try self.result.arena.allocator().alloc(EnumVariant, 2);
+        result_variants[0] = .{
+            .symbol = self.resolution.findEnumVariant(result_symbol, "Успех") orelse return,
+            .name = "Успех",
+            .fields = try self.result.arena.allocator().dupe(types.TypeId, &.{result_parameters[0].typ}),
+        };
+        result_variants[1] = .{
+            .symbol = self.resolution.findEnumVariant(result_symbol, "Неудача") orelse return,
+            .name = "Неудача",
+            .fields = try self.result.arena.allocator().dupe(types.TypeId, &.{result_parameters[1].typ}),
+        };
+        try self.result.enum_definitions.put(result_symbol, .{
+            .parameters = result_parameters,
+            .variants = result_variants,
+        });
+    }
+
     fn defineFunctionSignature(self: *Checker, declaration: ast.DeclId, type_parameters: []const ast.TypeParameter, parameters: []const ast.ParamDecl, return_type: ast.TypeId) !void {
         const symbol = self.resolution.decl_symbols.get(declaration) orelse return;
         const generic_parameters = try self.defineGenericParameters(symbol, type_parameters);
@@ -1493,6 +1530,7 @@ pub fn check(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *co
     defer checker.resolving_aliases.deinit();
     try checker.typeAliasPass();
     try checker.nominalPass();
+    try checker.preludePass();
     try checker.enumPass();
     try checker.signaturePass();
     try checker.bodyPass();

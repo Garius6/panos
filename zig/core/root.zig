@@ -5,6 +5,7 @@ pub const diagnostic = @import("diagnostic.zig");
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
 pub const source = @import("source.zig");
+pub const symbols = @import("symbols.zig");
 pub const target = @import("target.zig");
 pub const token = @import("token.zig");
 

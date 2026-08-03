@@ -93,7 +93,7 @@ const Compiler = struct {
             };
             const symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
             const value = try self.topLevelConstant(constant.value) orelse {
-                try self.report(constant.span, "Compiler Error: top-level константа должна быть литералом", .{});
+                try self.report(constant.span, "Compiler Error: константа верхнего уровня должна быть литералом", .{});
                 continue;
             };
             try self.result.top_level_constants.put(symbol, value);

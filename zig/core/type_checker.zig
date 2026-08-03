@@ -581,7 +581,7 @@ const Checker = struct {
                 else => continue,
             };
             if (!self.isTopLevelConstantLiteral(constant.value)) {
-                try self.report(constant.span, "Type Error: top-level константа должна быть числовым, строковым или булевым литералом", .{});
+                try self.report(constant.span, "Type Error: константа верхнего уровня должна быть числовым, строковым или булевым литералом", .{});
             }
             const value_type = try self.infer(constant.value);
             if (self.resolution.decl_symbols.get(declaration)) |symbol| try self.result.symbol_types.put(symbol, value_type);
@@ -2757,7 +2757,7 @@ test "type checker restricts top-level constants to literals" {
     defer checked.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
-    try std.testing.expectEqualStrings("Type Error: top-level константа должна быть числовым, строковым или булевым литералом", checked.diagnostics.items.items[0].message);
+    try std.testing.expectEqualStrings("Type Error: константа верхнего уровня должна быть числовым, строковым или булевым литералом", checked.diagnostics.items.items[0].message);
 }
 
 test "type checker resolves aliases before and after their declaration" {

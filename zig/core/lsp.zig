@@ -78,6 +78,11 @@ pub const DocumentStore = struct {
         return true;
     }
 
+    pub fn sourceText(self: *const DocumentStore, uri: []const u8) ?[]const u8 {
+        const document = self.documents.get(uri) orelse return null;
+        return document.text;
+    }
+
     pub fn diagnose(self: *const DocumentStore, uri: []const u8) !?DocumentDiagnostics {
         const document = self.documents.get(uri) orelse return null;
         return @as(?DocumentDiagnostics, try diagnoseDocument(self.allocator, uri, document.text));

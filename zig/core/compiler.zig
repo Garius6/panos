@@ -450,7 +450,13 @@ const FunctionCompiler = struct {
     }
 
     fn compileCall(self: *FunctionCompiler, expression: ast.ExprId, call: anytype) !void {
-        if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
+        const ordered_arguments = self.compiler.checked.call_arguments.get(expression);
+        if (call.argument_names != null and ordered_arguments == null) {
+            try self.compiler.report(call.span, "Compiler Error: именованные аргументы не поддержаны для этого вызова", .{});
+            try self.emitVoid();
+            return;
+        }
+        const arguments = ordered_arguments orelse call.arguments;
         if (try self.compileErrorConstructor(call)) return;
         if (try self.compilePanicBuiltin(call)) return;
         if (try self.compileProcessBuiltin(call)) return;
@@ -508,9 +514,9 @@ const FunctionCompiler = struct {
             return;
         }
         try self.compileExpression(call.callee);
-        for (call.arguments) |argument| try self.compileExpression(argument);
-        if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
-        try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(call.arguments.len) });
+        for (arguments) |argument| try self.compileExpression(argument);
+        if (arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
+        try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(arguments.len) });
     }
 
     fn compileErrorConstructor(self: *FunctionCompiler, call: anytype) !bool {

@@ -96,6 +96,7 @@ pub const CheckResult = struct {
     method_calls: std.AutoHashMap(ast.ExprId, symbols.SymbolId),
     interface_calls: std.AutoHashMap(ast.ExprId, InterfaceCall),
     interface_casts: std.AutoHashMap(ast.ExprId, InterfaceCast),
+    call_arguments: std.AutoHashMap(ast.ExprId, []const ast.ExprId),
 
     pub fn init(allocator: std.mem.Allocator) !CheckResult {
         return .{
@@ -116,10 +117,12 @@ pub const CheckResult = struct {
             .method_calls = .init(allocator),
             .interface_calls = .init(allocator),
             .interface_casts = .init(allocator),
+            .call_arguments = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CheckResult) void {
+        self.call_arguments.deinit();
         self.interface_casts.deinit();
         self.interface_calls.deinit();
         self.method_calls.deinit();
@@ -1564,16 +1567,28 @@ const Checker = struct {
         const entry = self.result.types.get(callee_type) orelse return self.result.types.poison();
         switch (entry.*) {
             .function => |function| {
-                if (call.arguments.len != function.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов функции", .{});
-                const shared = @min(call.arguments.len, function.parameters.len);
-                const generic_parameters: []const GenericParameter = if (self.resolution.expr_symbols.get(call.callee)) |symbol|
+                const callee_symbol = self.resolution.expr_symbols.get(call.callee);
+                const arguments = if (call.argument_names) |_| blk: {
+                    const symbol = callee_symbol orelse {
+                        try self.report(call.span, "Type Error: именованные аргументы не поддержаны для этого вызова", .{});
+                        break :blk call.arguments;
+                    };
+                    const parameter_names = (try self.functionParameterNames(symbol)) orelse {
+                        try self.report(call.span, "Type Error: именованные аргументы не поддержаны для этого вызова", .{});
+                        break :blk call.arguments;
+                    };
+                    break :blk try self.reorderNamedArguments(expression, call, parameter_names);
+                } else call.arguments;
+                if (arguments.len != function.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов функции", .{});
+                const shared = @min(arguments.len, function.parameters.len);
+                const generic_parameters: []const GenericParameter = if (callee_symbol) |symbol|
                     self.result.generic_function_parameters.get(symbol) orelse &.{}
                 else
                     &.{};
                 if (generic_parameters.len != 0) {
                     var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
                     defer substitutions.deinit();
-                    for (call.arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
+                    for (arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
                         try self.inferGenericSubstitution(parameter, try self.infer(argument), &substitutions, call.span);
                     }
                     for (generic_parameters) |parameter| {
@@ -1588,7 +1603,7 @@ const Checker = struct {
                             }
                         }
                     }
-                    for (call.arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
+                    for (arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
                         const expected = try self.substituteGeneric(parameter, &substitutions);
                         const actual = try self.inferExpected(argument, expected);
                         if (!self.assignable(actual, expected)) {
@@ -1599,7 +1614,7 @@ const Checker = struct {
                     }
                     return self.substituteGeneric(function.return_type, &substitutions);
                 }
-                for (call.arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
+                for (arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
                     const actual = try self.inferExpected(argument, parameter);
                     if (!self.assignable(actual, parameter)) {
                         try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
@@ -1657,6 +1672,57 @@ const Checker = struct {
         if (call.arguments.len == expected) return;
         try self.report(call.span, "Type Error: метод '{s}' ожидает {d} аргумент(а)", .{ name, expected });
         for (call.arguments) |argument| _ = try self.infer(argument);
+    }
+
+    fn functionParameterNames(self: *Checker, symbol: symbols.SymbolId) !?[]const []const u8 {
+        var functions = self.resolution.function_parameters.iterator();
+        while (functions.next()) |entry| {
+            const declaration = entry.key_ptr.*;
+            const function_symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
+            if (function_symbol != symbol) continue;
+            const parameters = entry.value_ptr.*;
+            const names = try self.result.arena.allocator().alloc([]const u8, parameters.len);
+            for (parameters, names) |parameter, *name| name.* = self.resolution.symbols.get(parameter).?.name;
+            return names;
+        }
+        return null;
+    }
+
+    fn reorderNamedArguments(self: *Checker, expression: ast.ExprId, call: anytype, parameter_names: []const []const u8) ![]const ast.ExprId {
+        const argument_names = call.argument_names orelse return call.arguments;
+        if (argument_names.len != parameter_names.len) {
+            try self.report(call.span, "Type Error: ожидалось {d} именованных аргументов, получено {d}", .{ parameter_names.len, argument_names.len });
+            return call.arguments;
+        }
+        const ordered = try self.result.arena.allocator().alloc(ast.ExprId, argument_names.len);
+        const matched = try self.result.allocator.alloc(bool, parameter_names.len);
+        defer self.result.allocator.free(matched);
+        @memset(matched, false);
+        var valid = true;
+        for (argument_names, call.arguments) |argument_name, argument| {
+            var parameter_index: ?usize = null;
+            for (parameter_names, 0..) |parameter_name, index| {
+                if (std.mem.eql(u8, argument_name, parameter_name)) {
+                    parameter_index = index;
+                    break;
+                }
+            }
+            const index = parameter_index orelse {
+                try self.report(call.span, "Type Error: неизвестный именованный аргумент '{s}'", .{argument_name});
+                valid = false;
+                continue;
+            };
+            if (matched[index]) {
+                try self.report(call.span, "Type Error: именованный аргумент '{s}' указан повторно", .{argument_name});
+                valid = false;
+                continue;
+            }
+            matched[index] = true;
+            ordered[index] = argument;
+        }
+        if (!valid) return call.arguments;
+        try self.result.call_arguments.put(expression, ordered);
+        return ordered;
     }
 
     fn resolveType(self: *Checker, type_node: ast.TypeId) !types.TypeId {

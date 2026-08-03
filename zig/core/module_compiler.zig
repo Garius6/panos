@@ -232,3 +232,28 @@ test "module compiler checks imported function arguments" {
     try std.testing.expect(compiled.hasErrors());
     try std.testing.expectEqualStrings("Type Error: аргумент не совпадает с типом параметра", compiled.diagnostics.items.items[0].message);
 }
+
+test "module compiler executes a transitive imported function" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./удвоение\" как удв\nэкспорт функ старт() -> Число\nудв.применить(21)\nконец" },
+        .{ .path = "проект/удвоение.ps", .bytes = "импорт \"./математика\" как мат\nэкспорт функ применить(x: Число) -> Число\nмат.сложить(x, x)\nконец" },
+        .{ .path = "проект/математика.ps", .bytes = "экспорт функ сложить(a: Число, b: Число) -> Число\na + b\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}

@@ -1630,6 +1630,64 @@ test "VM iterates values through Итерируемое" {
     }
 }
 
+test "VM iterates interface-typed Итерируемое values" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип СчётчикДо = структура
+        \\    текущее: Число
+        \\    предел: Число
+        \\конец
+        \\реализация Итерируемое для СчётчикДо
+        \\    функ следующий(это: СчётчикДо) -> Опция(Число)
+        \\        если это.текущее >= это.предел тогда
+        \\            Опция.Нет()
+        \\        иначе
+        \\            это.текущее = это.текущее + 1
+        \\            Опция.Есть(это.текущее)
+        \\        конец
+        \\    конец
+        \\конец
+        \\функ сумма(значения: Итерируемое(Число)) -> Число
+        \\    пер результат = 0
+        \\    для значение в значения цикл
+        \\        результат = результат + значение
+        \\    конец
+        \\    результат
+        \\конец
+        \\функ старт() -> Число
+        \\    сумма(СчётчикДо(0, 3))
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 6), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM constructs enum variants" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");

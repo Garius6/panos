@@ -1059,7 +1059,7 @@ const FunctionCompiler = struct {
         };
         switch (info.kind) {
             .array => try self.compileArrayForIn(statement, loop),
-            .iterator => try self.compileIteratorForIn(statement, loop, info.next_method),
+            .iterator => try self.compileIteratorForIn(statement, loop, info),
         }
     }
 
@@ -1102,16 +1102,16 @@ const FunctionCompiler = struct {
         self.leaveLoop(continue_target, exit_target);
     }
 
-    fn compileIteratorForIn(self: *FunctionCompiler, statement: ast.StmtId, loop: anytype, next_method: symbols.SymbolId) !void {
+    fn compileIteratorForIn(self: *FunctionCompiler, statement: ast.StmtId, loop: anytype, info: type_checker.ForInInfo) !void {
         const bindings = self.compiler.resolution.stmt_bindings.get(statement) orelse &.{};
         if (bindings.len == 0) {
             try self.compiler.report(loop.span, "Compiler Error: цикл 'для ... в' ожидает переменную", .{});
             return;
         }
-        const function_id = self.compiler.result.function_ids.get(next_method) orelse {
+        const function_id = if (info.iterator_dispatch == .direct) self.compiler.result.function_ids.get(info.next_method) orelse {
             try self.compiler.report(loop.span, "Compiler Error: не удалось найти метод следующий()", .{});
             return;
-        };
+        } else bytecode.invalid_function;
         const iterable_slot = try self.allocateLocal();
         const option_slot = try self.allocateLocal();
         const element_slot = if (bindings.len == 1) try self.ensureLocal(bindings[0]) else try self.allocateLocal();
@@ -1119,9 +1119,20 @@ const FunctionCompiler = struct {
         try self.function.emit(self.compiler.result.allocator, .{ .set_local = iterable_slot });
 
         const loop_start = self.function.instructions.items.len;
-        try self.emitConstant(.{ .function_ref = function_id });
-        try self.function.emit(self.compiler.result.allocator, .{ .get_local = iterable_slot });
-        try self.function.emit(self.compiler.result.allocator, .{ .call = 1 });
+        switch (info.iterator_dispatch) {
+            .direct => {
+                try self.emitConstant(.{ .function_ref = function_id });
+                try self.function.emit(self.compiler.result.allocator, .{ .get_local = iterable_slot });
+                try self.function.emit(self.compiler.result.allocator, .{ .call = 1 });
+            },
+            .interface => {
+                try self.function.emit(self.compiler.result.allocator, .{ .get_local = iterable_slot });
+                try self.function.emit(self.compiler.result.allocator, .{ .call_interface = .{
+                    .method_index = 0,
+                    .argument_count = 0,
+                } });
+            },
+        }
         try self.function.emit(self.compiler.result.allocator, .{ .set_local = option_slot });
         try self.function.emit(self.compiler.result.allocator, .{ .get_local = option_slot });
         const option_name = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString("Опция.Есть") });

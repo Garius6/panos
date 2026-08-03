@@ -67,8 +67,14 @@ pub const ForInKind = enum {
     iterator,
 };
 
+pub const IteratorDispatch = enum {
+    direct,
+    interface,
+};
+
 pub const ForInInfo = struct {
     kind: ForInKind,
+    iterator_dispatch: IteratorDispatch = .direct,
     next_method: symbols.SymbolId = symbols.invalid_symbol,
 };
 
@@ -1131,6 +1137,9 @@ const Checker = struct {
                 if (try self.iterableForIn(iterable_type)) |info| {
                     try self.bindStatementValue(statement, info.element_type, loop.span, "Type Error: шаблон 'для (...)' не совпадает со значением Итерируемое");
                     try self.result.for_in_infos.put(statement, .{ .kind = .iterator, .next_method = info.next_method });
+                } else if (try self.interfaceIterableElement(iterable_type)) |element_type| {
+                    try self.bindStatementValue(statement, element_type, loop.span, "Type Error: шаблон 'для (...)' не совпадает со значением Итерируемое");
+                    try self.result.for_in_infos.put(statement, .{ .kind = .iterator, .iterator_dispatch = .interface });
                 } else {
                     try self.report(loop.span, "Type Error: тип не поддерживает 'для x в' (нужен Массив или Итерируемое)", .{});
                     try self.bindStatementPoison(statement);
@@ -1165,6 +1174,19 @@ const Checker = struct {
             };
         }
         return null;
+    }
+
+    fn interfaceIterableElement(self: *Checker, iterable_type: types.TypeId) !?types.TypeId {
+        const iterable_entry = self.result.types.get(iterable_type) orelse return null;
+        const nominal = switch (iterable_entry.*) {
+            .nominal => |value| value,
+            else => return null,
+        };
+        const iterable = self.findTypeSymbol("Итерируемое") orelse return null;
+        if (nominal.symbol != iterable or nominal.arguments.len != 1) return null;
+        const definition = self.result.interface_definitions.get(iterable) orelse return null;
+        if (definition.parameters.len != 1 or definition.methods.len != 1 or !std.mem.eql(u8, definition.methods[0].name, "следующий")) return null;
+        return nominal.arguments[0];
     }
 
     fn inferForRange(self: *Checker, statement: ast.StmtId, range: anytype) anyerror!types.TypeId {

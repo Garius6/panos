@@ -24,6 +24,20 @@ pub const Import = struct {
     span: source.Span,
 };
 
+pub const ExportKind = enum {
+    function,
+    constant,
+    type,
+};
+
+pub const Export = struct {
+    module: usize,
+    declaration: ast.DeclId,
+    name: []const u8,
+    kind: ExportKind,
+    span: source.Span,
+};
+
 pub const Graph = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -32,6 +46,7 @@ pub const Graph = struct {
     loading: std.StringHashMap(void),
     order: std.ArrayList(usize) = .empty,
     imports: std.ArrayList(Import) = .empty,
+    exports: std.ArrayList(Export) = .empty,
     diagnostics: diagnostic.DiagnosticList = .{},
 
     pub fn init(allocator: std.mem.Allocator) Graph {
@@ -46,6 +61,7 @@ pub const Graph = struct {
     pub fn deinit(self: *Graph) void {
         for (self.modules.items) |*module| module.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
+        self.exports.deinit(self.allocator);
         self.imports.deinit(self.allocator);
         self.order.deinit(self.allocator);
         self.loading.deinit();
@@ -69,6 +85,13 @@ pub const Graph = struct {
     pub fn importForDeclaration(self: *const Graph, importer: usize, declaration: ast.DeclId) ?Import {
         for (self.imports.items) |entry| {
             if (entry.importer == importer and entry.declaration == declaration) return entry;
+        }
+        return null;
+    }
+
+    pub fn exportForName(self: *const Graph, module: usize, name: []const u8) ?Export {
+        for (self.exports.items) |entry| {
+            if (entry.module == module and std.mem.eql(u8, entry.name, name)) return entry;
         }
         return null;
     }
@@ -123,6 +146,7 @@ pub const Graph = struct {
             module.deinit(self.allocator);
         }
         try self.module_indices.put(stored_path, index);
+        try self.collectExports(index);
 
         const declarations = self.modules.items[index].tree.program.?.declarations;
         for (declarations) |declaration| {
@@ -143,6 +167,58 @@ pub const Graph = struct {
         }
         try self.order.append(self.allocator, index);
         return index;
+    }
+
+    fn collectExports(self: *Graph, module: usize) !void {
+        const tree = &self.modules.items[module].tree;
+        for (tree.program.?.declarations) |declaration| {
+            const entry: ?Export = switch (tree.decl(declaration).*) {
+                .function => |value| if (value.is_exported) .{
+                    .module = module,
+                    .declaration = declaration,
+                    .name = value.name,
+                    .kind = .function,
+                    .span = value.name_span,
+                } else null,
+                .constant => |value| if (value.is_exported) .{
+                    .module = module,
+                    .declaration = declaration,
+                    .name = value.name,
+                    .kind = .constant,
+                    .span = value.name_span,
+                } else null,
+                .struct_decl => |value| if (value.is_exported) .{
+                    .module = module,
+                    .declaration = declaration,
+                    .name = value.name,
+                    .kind = .type,
+                    .span = value.span,
+                } else null,
+                .interface_decl => |value| if (value.is_exported) .{
+                    .module = module,
+                    .declaration = declaration,
+                    .name = value.name,
+                    .kind = .type,
+                    .span = value.span,
+                } else null,
+                .enum_decl => |value| if (value.is_exported) .{
+                    .module = module,
+                    .declaration = declaration,
+                    .name = value.name,
+                    .kind = .type,
+                    .span = value.span,
+                } else null,
+                .type_alias => |value| if (value.is_exported) .{
+                    .module = module,
+                    .declaration = declaration,
+                    .name = value.name,
+                    .kind = .type,
+                    .span = value.span,
+                } else null,
+                else => null,
+            };
+            if (entry) |value| try self.exports.append(self.allocator, value);
+        }
     }
 
     fn appendDiagnostics(self: *Graph, values: *const diagnostic.DiagnosticList) !void {
@@ -267,6 +343,10 @@ test "module loader orders local imports before their importers" {
     try std.testing.expectEqual(@as(usize, 2), graph.imports.items.len);
     try std.testing.expectEqualStrings("арифметика", graph.imports.items[1].alias);
     try std.testing.expectEqual(@as(?usize, 1), graph.imports.items[1].target);
+    const answer = graph.exportForName(1, "ответ").?;
+    try std.testing.expectEqual(ExportKind.function, answer.kind);
+    try std.testing.expectEqual(@as(usize, 1), answer.module);
+    try std.testing.expectEqual(@as(usize, 3), graph.exports.items.len);
     try std.testing.expectEqual(@as(usize, 0), graph.diagnostics.items.items.len);
 }
 

@@ -16,6 +16,14 @@ pub const Module = struct {
     }
 };
 
+pub const Import = struct {
+    importer: usize,
+    declaration: ast.DeclId,
+    target: ?usize,
+    alias: []const u8,
+    span: source.Span,
+};
+
 pub const Graph = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -23,6 +31,7 @@ pub const Graph = struct {
     module_indices: std.StringHashMap(usize),
     loading: std.StringHashMap(void),
     order: std.ArrayList(usize) = .empty,
+    imports: std.ArrayList(Import) = .empty,
     diagnostics: diagnostic.DiagnosticList = .{},
 
     pub fn init(allocator: std.mem.Allocator) Graph {
@@ -37,6 +46,7 @@ pub const Graph = struct {
     pub fn deinit(self: *Graph) void {
         for (self.modules.items) |*module| module.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
+        self.imports.deinit(self.allocator);
         self.order.deinit(self.allocator);
         self.loading.deinit();
         self.module_indices.deinit();
@@ -54,6 +64,13 @@ pub const Graph = struct {
         const index: usize = file_id;
         if (index >= self.modules.items.len) return null;
         return &self.modules.items[index];
+    }
+
+    pub fn importForDeclaration(self: *const Graph, importer: usize, declaration: ast.DeclId) ?Import {
+        for (self.imports.items) |entry| {
+            if (entry.importer == importer and entry.declaration == declaration) return entry;
+        }
+        return null;
     }
 
     pub fn load(self: *Graph, reader: anytype, entry_path: []const u8) !void {
@@ -115,7 +132,14 @@ pub const Graph = struct {
             };
             const import_path = try resolveImportPath(self.allocator, import.path, stored_path);
             defer self.allocator.free(import_path);
-            _ = try self.loadRecursive(reader, import_path, import.span);
+            const target = try self.loadRecursive(reader, import_path, import.span);
+            try self.imports.append(self.allocator, .{
+                .importer = index,
+                .declaration = declaration,
+                .target = target,
+                .alias = import.alias orelse moduleBaseName(import.path),
+                .span = import.span,
+            });
         }
         try self.order.append(self.allocator, index);
         return index;
@@ -167,6 +191,11 @@ fn isAbsolute(path: []const u8) bool {
 fn moduleDirectory(path: []const u8) []const u8 {
     const separator = std.mem.lastIndexOfScalar(u8, path, '/') orelse return "";
     return path[0..separator];
+}
+
+fn moduleBaseName(path: []const u8) []const u8 {
+    const file_name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |separator| path[separator + 1 ..] else path;
+    return if (std.mem.endsWith(u8, file_name, ".ps")) file_name[0 .. file_name.len - 3] else file_name;
 }
 
 fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -235,6 +264,9 @@ test "module loader orders local imports before their importers" {
     try std.testing.expectEqualStrings("проект/детали/числа.ps", graph.modules.items[graph.order.items[0]].file.path);
     try std.testing.expectEqualStrings("проект/арифметика.ps", graph.modules.items[graph.order.items[1]].file.path);
     try std.testing.expectEqualStrings("проект/main.ps", graph.modules.items[graph.order.items[2]].file.path);
+    try std.testing.expectEqual(@as(usize, 2), graph.imports.items.len);
+    try std.testing.expectEqualStrings("арифметика", graph.imports.items[1].alias);
+    try std.testing.expectEqual(@as(?usize, 1), graph.imports.items[1].target);
     try std.testing.expectEqual(@as(usize, 0), graph.diagnostics.items.items.len);
 }
 

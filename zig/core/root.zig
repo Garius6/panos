@@ -8,6 +8,7 @@ pub const source = @import("source.zig");
 pub const symbols = @import("symbols.zig");
 pub const target = @import("target.zig");
 pub const token = @import("token.zig");
+pub const types = @import("types.zig");
 
 pub const migration_stage = "phase-0";
 

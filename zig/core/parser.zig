@@ -104,6 +104,12 @@ const Parser = struct {
                 continue;
             }
 
+            if (self.at(.impl)) {
+                if (exported) try self.report(self.peek().span, "Синтаксическая ошибка: 'экспорт' недопустим для реализации");
+                try declarations.append(self.result.allocator, try self.parseImplDeclaration());
+                continue;
+            }
+
             if (exported) {
                 try self.report(self.peek().span, "Синтаксическая ошибка: после 'экспорт' ожидается 'функ'");
             } else {
@@ -304,6 +310,73 @@ const Parser = struct {
             .fields = try self.result.ast.copySlice(ast.FieldDecl, fields.items),
             .is_exported = is_exported,
         } });
+    }
+
+    fn parseImplDeclaration(self: *Parser) !ast.DeclId {
+        const start = try self.expect(.impl, "Синтаксическая ошибка: ожидается 'реализация'");
+        const first = try self.parseQualifiedName("Синтаксическая ошибка: после 'реализация' ожидается тип или интерфейс");
+
+        var interface_module: ?[]const u8 = null;
+        var interface_name: ?[]const u8 = null;
+        var target_module: ?[]const u8 = null;
+        var target_type: []const u8 = undefined;
+        if (self.at(.for_expr)) {
+            _ = self.next();
+            const target = try self.parseQualifiedName("Синтаксическая ошибка: после 'для' ожидается целевой тип");
+            interface_module = first.module_name;
+            interface_name = first.name;
+            target_module = target.module_name;
+            target_type = target.name;
+        } else {
+            target_module = first.module_name;
+            target_type = first.name;
+        }
+
+        var methods: std.ArrayList(ast.DeclId) = .empty;
+        defer methods.deinit(self.result.allocator);
+        while (!self.at(.end) and !self.at(.eof)) {
+            const doc = self.peek().doc;
+            if (!self.at(.function)) {
+                try self.report(self.peek().span, "Синтаксическая ошибка: в реализации ожидается 'функ'");
+                _ = self.next();
+                continue;
+            }
+            try methods.append(self.result.allocator, try self.parseFunction(false, doc));
+        }
+        const end = try self.expect(.end, "Синтаксическая ошибка: реализация не закрыта 'конец'");
+        return self.result.ast.addDecl(.{ .impl = .{
+            .span = spanFrom(start.span, end.span),
+            .interface_module = interface_module,
+            .interface_name = interface_name,
+            .target_module = target_module,
+            .target_type = target_type,
+            .methods = try self.result.ast.copySlice(ast.DeclId, methods.items),
+        } });
+    }
+
+    const QualifiedName = struct {
+        span: source.Span,
+        module_name: ?[]const u8,
+        name: []const u8,
+    };
+
+    fn parseQualifiedName(self: *Parser, message: []const u8) !QualifiedName {
+        const first = try self.expect(.ident, message);
+        const first_name = try self.result.ast.copyText(first.lexeme);
+        if (!self.at(.dot)) {
+            return .{
+                .span = first.span,
+                .module_name = null,
+                .name = first_name,
+            };
+        }
+        _ = self.next();
+        const member = try self.expect(.ident, "Синтаксическая ошибка: после '.' ожидается имя");
+        return .{
+            .span = spanFrom(first.span, member.span),
+            .module_name = first_name,
+            .name = try self.result.ast.copyText(member.lexeme),
+        };
     }
 
     fn parseInterfaceDeclaration(

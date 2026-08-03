@@ -59,7 +59,7 @@ test "parser conformance fixture preserves structs interfaces and generic ADTs" 
 
     try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
     try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
-    try std.testing.expectEqual(@as(usize, 3), parsed.ast.program.?.declarations.len);
+    try std.testing.expectEqual(@as(usize, 4), parsed.ast.program.?.declarations.len);
 
     switch (parsed.ast.decl(parsed.ast.program.?.declarations[0]).*) {
         .struct_decl => |decl| {
@@ -74,6 +74,14 @@ test "parser conformance fixture preserves structs interfaces and generic ADTs" 
         else => return error.TestUnexpectedResult,
     }
     switch (parsed.ast.decl(parsed.ast.program.?.declarations[2]).*) {
+        .impl => |decl| {
+            try std.testing.expectEqualStrings("Печатаемый", decl.interface_name.?);
+            try std.testing.expectEqualStrings("Точка", decl.target_type);
+            try std.testing.expectEqual(@as(usize, 1), decl.methods.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[3]).*) {
         .enum_decl => |decl| {
             try std.testing.expectEqualStrings("T", decl.type_parameters[0]);
             try std.testing.expectEqual(@as(usize, 2), decl.variants.len);

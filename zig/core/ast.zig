@@ -38,7 +38,7 @@ pub const TypeParameter = struct {
 pub const ParamDecl = struct {
     span: source.Span,
     name: []const u8,
-    type_annotation: TypeId,
+    type_annotation: ?TypeId = null,
 };
 
 pub const MethodSignature = struct {

@@ -762,11 +762,63 @@ const Parser = struct {
             .l_paren => self.parseGrouped(value),
             .if_expr => self.parseIfExpression(value),
             .while_expr => self.parseWhileExpression(value),
+            .function => self.parseLambdaExpression(value),
+            .spawn => self.parseSpawnExpression(value),
             else => blk: {
                 try self.report(value.span, "Синтаксическая ошибка: ожидается выражение");
                 break :blk self.result.ast.addExpr(.{ .error_node = value.span });
             },
         };
+    }
+
+    fn parseLambdaExpression(self: *Parser, start: token.Token) anyerror!ast.ExprId {
+        const parameters = try self.parseLambdaParameters();
+        var return_type: ?ast.TypeId = null;
+        if (self.at(.arrow)) {
+            _ = self.next();
+            return_type = try self.parseType();
+        }
+        const body = try self.parseStatementBlock(null);
+        const end = try self.expect(.end, "Синтаксическая ошибка: лямбда не закрыта 'конец'");
+        return self.result.ast.addExpr(.{ .lambda = .{
+            .span = spanFrom(start.span, end.span),
+            .parameters = parameters,
+            .return_type = return_type,
+            .body = body,
+        } });
+    }
+
+    fn parseLambdaParameters(self: *Parser) ![]const ast.ParamDecl {
+        var parameters: std.ArrayList(ast.ParamDecl) = .empty;
+        defer parameters.deinit(self.result.allocator);
+        _ = try self.expect(.l_paren, "Синтаксическая ошибка: после 'функ' ожидается '('");
+        while (!self.at(.r_paren) and !self.at(.eof)) {
+            const name = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя параметра лямбды");
+            var type_annotation: ?ast.TypeId = null;
+            var end = name.span;
+            if (self.at(.colon)) {
+                _ = self.next();
+                type_annotation = try self.parseType();
+                end = self.astTypeSpan(type_annotation.?);
+            }
+            try parameters.append(self.result.allocator, .{
+                .span = spanFrom(name.span, end),
+                .name = try self.result.ast.copyText(name.lexeme),
+                .type_annotation = type_annotation,
+            });
+            if (!self.at(.comma)) break;
+            _ = self.next();
+        }
+        _ = try self.expect(.r_paren, "Синтаксическая ошибка: ожидается ')' после параметров лямбды");
+        return self.result.ast.copySlice(ast.ParamDecl, parameters.items);
+    }
+
+    fn parseSpawnExpression(self: *Parser, start: token.Token) anyerror!ast.ExprId {
+        const call = try self.parseExpression(12);
+        return self.result.ast.addExpr(.{ .spawn = .{
+            .span = spanFrom(start.span, self.astExprSpan(call)),
+            .call = call,
+        } });
     }
 
     fn parseIfExpression(self: *Parser, start: token.Token) anyerror!ast.ExprId {

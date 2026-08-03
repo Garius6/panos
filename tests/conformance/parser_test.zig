@@ -147,3 +147,36 @@ test "parser conformance fixture preserves for-in bindings" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture preserves lambdas and spawn expressions" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/lambda_spawn.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[0]).*) {
+        .function => |function| switch (parsed.ast.stmt(function.body[0]).*) {
+            .expr => |statement| switch (parsed.ast.expr(statement.value).*) {
+                .lambda => |lambda| {
+                    try std.testing.expectEqual(@as(usize, 1), lambda.parameters.len);
+                    try std.testing.expect(lambda.parameters[0].type_annotation == null);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[1]).*) {
+        .function => |function| switch (parsed.ast.stmt(function.body[0]).*) {
+            .expr => |statement| switch (parsed.ast.expr(statement.value).*) {
+                .spawn => {},
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

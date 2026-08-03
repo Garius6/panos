@@ -2,6 +2,7 @@ const std = @import("std");
 const value = @import("value.zig");
 
 const Object = union(enum) {
+    string: *value.HeapString,
     aggregate: *value.Aggregate,
     array: *value.Array,
     closure: *value.Closure,
@@ -29,6 +30,19 @@ pub const Heap = struct {
         aggregate.* = .{ .name = name, .elements = elements };
         try self.objects.append(self.allocator, .{ .aggregate = aggregate });
         return aggregate;
+    }
+
+    pub fn createString(self: *Heap, bytes: []u8) !*value.HeapString {
+        const string = try self.allocator.create(value.HeapString);
+        errdefer self.allocator.destroy(string);
+        errdefer self.allocator.free(bytes);
+        string.* = .{ .bytes = bytes };
+        try self.objects.append(self.allocator, .{ .string = string });
+        return string;
+    }
+
+    pub fn formatString(self: *Heap, comptime format: []const u8, args: anytype) !*value.HeapString {
+        return self.createString(try std.fmt.allocPrint(self.allocator, format, args));
     }
 
     pub fn createArray(self: *Heap, elements: []value.Value) !*value.Array {
@@ -67,6 +81,7 @@ pub const Heap = struct {
 
     pub fn markValue(self: *Heap, runtime_value: value.Value) void {
         switch (runtime_value) {
+            .heap_string => |string| self.mark(.{ .string = string }),
             .aggregate => |aggregate| self.mark(.{ .aggregate = aggregate }),
             .array => |array| self.mark(.{ .array = array }),
             .closure => |closure| self.mark(.{ .closure = closure }),
@@ -103,6 +118,7 @@ pub const Heap = struct {
         if (object_header.marked) return;
         object_header.marked = true;
         switch (object) {
+            .string => {},
             .aggregate => |aggregate| self.markValues(aggregate.elements),
             .array => |array| self.markValues(array.elements),
             .closure => |closure| self.markValues(closure.captures),
@@ -115,6 +131,10 @@ pub const Heap = struct {
 
     fn destroy(self: *Heap, object: Object) void {
         switch (object) {
+            .string => |string| {
+                self.allocator.free(string.bytes);
+                self.allocator.destroy(string);
+            },
             .aggregate => |aggregate| {
                 self.allocator.free(aggregate.elements);
                 self.allocator.destroy(aggregate);
@@ -137,11 +157,24 @@ pub const Heap = struct {
 
 fn header(object: Object) *value.GcHeader {
     return switch (object) {
+        .string => |string| &string.header,
         .aggregate => |aggregate| &aggregate.header,
         .array => |array| &array.header,
         .closure => |closure| &closure.header,
         .map => |map| &map.header,
     };
+}
+
+test "heap collects unreachable dynamic strings" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    const string = try heap.formatString("значение {d}", .{1});
+    heap.collect(&.{.{ .heap_string = string }});
+    try std.testing.expectEqual(@as(usize, 1), heap.objectCount());
+
+    heap.collect(&.{});
+    try std.testing.expectEqual(@as(usize, 0), heap.objectCount());
 }
 
 test "heap collects unreachable array cycles and retains roots" {

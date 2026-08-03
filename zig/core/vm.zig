@@ -16,17 +16,15 @@ const Frame = struct {
 
 pub const Vm = struct {
     allocator: std.mem.Allocator,
-    arena: std.heap.ArenaAllocator,
     heap: gc.Heap,
     program: *const bytecode.Program,
     stack: std.ArrayList(value.Value) = .empty,
     frames: std.ArrayList(Frame) = .empty,
-    failure: ?[]const u8 = null,
+    failure: ?*value.HeapString = null,
 
     pub fn init(allocator: std.mem.Allocator, program: *const bytecode.Program) Vm {
         return .{
             .allocator = allocator,
-            .arena = std.heap.ArenaAllocator.init(allocator),
             .heap = gc.Heap.init(allocator),
             .program = program,
         };
@@ -37,7 +35,6 @@ pub const Vm = struct {
         self.frames.deinit(self.allocator);
         self.stack.deinit(self.allocator);
         self.heap.deinit();
-        self.arena.deinit();
         self.* = undefined;
     }
 
@@ -47,13 +44,13 @@ pub const Vm = struct {
         self.clearFrames();
         self.collect();
         self.pushFrame(entry, &.{}, arguments) catch |err| switch (err) {
-            error.RuntimeFault => return .{ .runtime_error = self.failure orelse "Runtime Error: неизвестная ошибка" },
+            error.RuntimeFault => return .{ .runtime_error = if (self.failure) |failure| failure.bytes else "Runtime Error: неизвестная ошибка" },
             else => return err,
         };
 
         while (self.frames.items.len != 0) {
             const completed = self.step() catch |err| switch (err) {
-                error.RuntimeFault => return .{ .runtime_error = self.failure orelse "Runtime Error: неизвестная ошибка" },
+                error.RuntimeFault => return .{ .runtime_error = if (self.failure) |failure| failure.bytes else "Runtime Error: неизвестная ошибка" },
                 else => return err,
             };
             if (completed) |result| return .{ .success = result };
@@ -65,6 +62,7 @@ pub const Vm = struct {
         self.heap.clearMarks();
         self.heap.markValues(self.stack.items);
         for (self.frames.items) |frame| self.heap.markValues(frame.locals);
+        if (self.failure) |failure| self.heap.markValue(.{ .heap_string = failure });
         self.heap.sweep();
     }
 
@@ -223,18 +221,21 @@ pub const Vm = struct {
     fn add(self: *Vm) anyerror!void {
         const right = try self.pop();
         const left = try self.pop();
+        if (left.stringBytes()) |left_string| {
+            const right_string = right.stringBytes() orelse {
+                try self.fault("Runtime Error: оператор '+' ожидает два числа или две строки", .{});
+                return;
+            };
+            const joined = try self.heap.formatString("{s}{s}", .{ left_string, right_string });
+            try self.stack.append(self.allocator, .{ .heap_string = joined });
+            return;
+        }
         switch (left) {
             .number => |left_number| {
                 const right_number = try self.number(right);
                 try self.stack.append(self.allocator, .{ .number = left_number + right_number });
             },
-            .string => |left_string| switch (right) {
-                .string => |right_string| {
-                    const joined = try std.fmt.allocPrint(self.arena.allocator(), "{s}{s}", .{ left_string, right_string });
-                    try self.stack.append(self.allocator, .{ .string = joined });
-                },
-                else => try self.fault("Runtime Error: оператор '+' ожидает два числа или две строки", .{}),
-            },
+            .string, .heap_string => unreachable,
             else => try self.fault("Runtime Error: оператор '+' ожидает два числа или две строки", .{}),
         }
     }
@@ -710,7 +711,7 @@ pub const Vm = struct {
     }
 
     fn fault(self: *Vm, comptime format: []const u8, args: anytype) anyerror!void {
-        self.failure = try std.fmt.allocPrint(self.arena.allocator(), format, args);
+        self.failure = try self.heap.formatString(format, args);
         return error.RuntimeFault;
     }
 };
@@ -738,6 +739,30 @@ test "VM collection retains stack and frame roots" {
     vm.clearFrames();
     vm.collect();
     try std.testing.expectEqual(@as(usize, 0), vm.heap.objectCount());
+}
+
+test "VM stores concatenated strings in the managed heap" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("строка", 0);
+    const function = program.function(function_id).?;
+    const first = try function.addConstant(std.testing.allocator, .{ .string = "Пано" });
+    const second = try function.addConstant(std.testing.allocator, .{ .string = "с" });
+    try function.emit(std.testing.allocator, .{ .constant = first });
+    try function.emit(std.testing.allocator, .{ .constant = second });
+    try function.emit(std.testing.allocator, .{ .add = {} });
+    try function.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .success => |runtime_value| {
+            try std.testing.expectEqualStrings("Панос", runtime_value.stringBytes().?);
+            try std.testing.expectEqual(@as(usize, 1), vm.heap.objectCount());
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
 }
 
 test "VM executes compiled calls and control flow" {

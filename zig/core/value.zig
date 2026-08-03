@@ -37,18 +37,37 @@ pub const GcHeader = struct {
     marked: bool = false,
 };
 
+pub const HeapString = struct {
+    header: GcHeader = .{},
+    bytes: []u8,
+};
+
 pub const Value = union(enum) {
     void: void,
     number: f64,
     boolean: bool,
     string: []const u8,
+    heap_string: *HeapString,
     function_ref: bytecode.FunctionId,
     closure: *Closure,
     aggregate: *Aggregate,
     array: *Array,
     map: *Map,
 
+    pub fn stringBytes(runtime_value: Value) ?[]const u8 {
+        return switch (runtime_value) {
+            .string => |string| string,
+            .heap_string => |string| string.bytes,
+            else => null,
+        };
+    }
+
     pub fn eql(left: Value, right: Value) bool {
+        if (left.stringBytes()) |left_string| {
+            const right_string = right.stringBytes() orelse return false;
+            return std.mem.eql(u8, left_string, right_string);
+        }
+        if (right.stringBytes() != null) return false;
         return switch (left) {
             .void => right == .void,
             .number => |left_number| switch (right) {
@@ -59,10 +78,7 @@ pub const Value = union(enum) {
                 .boolean => |right_boolean| left_boolean == right_boolean,
                 else => false,
             },
-            .string => |left_string| switch (right) {
-                .string => |right_string| std.mem.eql(u8, left_string, right_string),
-                else => false,
-            },
+            .string, .heap_string => unreachable,
             .function_ref => |left_function| switch (right) {
                 .function_ref => |right_function| left_function == right_function,
                 else => false,

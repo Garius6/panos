@@ -142,6 +142,7 @@ fn renderValue(allocator: std.mem.Allocator, runtime_value: panos_core.value.Val
         .number => |number| std.fmt.allocPrint(allocator, "{d}", .{number}),
         .boolean => |boolean| std.fmt.allocPrint(allocator, "{}", .{boolean}),
         .string => |string| allocator.dupe(u8, string),
+        .heap_string => |string| allocator.dupe(u8, string.bytes),
         else => allocator.dupe(u8, "<составное значение>"),
     };
 }

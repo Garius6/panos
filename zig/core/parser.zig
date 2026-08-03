@@ -177,10 +177,20 @@ const Parser = struct {
             } else {
                 try self.report(self.peek().span, "Синтаксическая ошибка: ожидается top-level декларация");
             }
-            _ = self.next();
+            try declarations.append(self.result.allocator, try self.result.ast.addDecl(.{ .error_node = self.peek().span }));
+            self.synchronizeTopLevel();
         }
 
         try self.result.ast.setProgram(declarations.items);
+    }
+
+    fn synchronizeTopLevel(self: *Parser) void {
+        while (!self.at(.eof)) {
+            switch (self.peek().kind) {
+                .function, .type_decl, .impl, .import, .export_decl, .constant, .foreign => return,
+                else => _ = self.next(),
+            }
+        }
     }
 
     fn parseFunction(self: *Parser, is_exported: bool, doc: []const u8, annotations: []const ast.Annotation) !ast.DeclId {

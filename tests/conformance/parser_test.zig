@@ -229,6 +229,35 @@ test "parser conformance fixture preserves bitwise negation and tuple index chai
     }
 }
 
+test "parser conformance fixture recovers at the next top-level declaration" {
+    const input = @embedFile("parser/recovery.ps");
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, input, 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.diagnostics.items.items.len);
+    try std.testing.expectEqual(panos.diagnostic.Phase.parser, parsed.diagnostics.items.items[0].phase);
+    try std.testing.expectEqualDeep(panos.source.Span{
+        .file_id = 0,
+        .start = 0,
+        .end = "неожиданная".len,
+    }, parsed.diagnostics.items.items[0].span);
+    try std.testing.expectEqual(@as(usize, 2), parsed.ast.program.?.declarations.len);
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[0]).*) {
+        .error_node => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[1]).*) {
+        .function => |function| {
+            try std.testing.expectEqualStrings("рабочая", function.name);
+            try std.testing.expectEqual(@as(usize, std.mem.indexOf(u8, input, "функ").?), function.span.start);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "parser conformance fixture preserves lambdas and spawn expressions" {
     var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/lambda_spawn.ps"), 0);
     defer lexed.deinit();

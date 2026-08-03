@@ -257,6 +257,7 @@ const Parser = struct {
             .struct_decl => self.parseStructDeclaration(start, name, type_parameters, is_exported, doc),
             .interface => self.parseInterfaceDeclaration(start, name, type_parameters, is_exported, doc),
             .enum_decl => self.parseEnumDeclaration(start, name, type_parameters, is_exported, doc),
+            .ff_struct => self.parseFfiStructDeclaration(start, name, type_parameters, is_exported, doc),
             else => self.parseTypeAliasAfterHeader(start, name, type_parameters, is_exported, doc),
         };
     }
@@ -315,6 +316,52 @@ const Parser = struct {
             .type_parameters = type_parameters,
             .fields = try self.result.ast.copySlice(ast.FieldDecl, fields.items),
             .is_exported = is_exported,
+        } });
+    }
+
+    fn parseFfiStructDeclaration(
+        self: *Parser,
+        start: token.Token,
+        name: token.Token,
+        type_parameters: []const []const u8,
+        is_exported: bool,
+        doc: []const u8,
+    ) !ast.DeclId {
+        _ = try self.expect(.ff_struct, "Синтаксическая ошибка: ожидается 'ff_структура'");
+        if (type_parameters.len != 0) {
+            try self.report(name.span, "Синтаксическая ошибка: ff_структура не поддерживает type-параметры");
+        }
+
+        var fields: std.ArrayList(ast.FieldDecl) = .empty;
+        defer fields.deinit(self.result.allocator);
+        while (!self.at(.end) and !self.at(.eof)) {
+            const field_start = self.peek().span;
+            const field_name = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя поля ff_структура");
+            _ = try self.expect(.colon, "Синтаксическая ошибка: после имени поля ff_структура ожидается ':'");
+            const field_type = try self.parseForeignMarshalType();
+            const supported = switch (field_type.marshal) {
+                .int8, .int32, .int64, .float32, .float64 => true,
+                else => false,
+            };
+            if (!supported) {
+                try self.report(field_name.span, "Синтаксическая ошибка: поле ff_структура поддерживает только Целое(8|32|64)/Число(32|64)");
+            }
+            try fields.append(self.result.allocator, .{
+                .span = spanFrom(field_start, field_type.span),
+                .name = try self.result.ast.copyText(field_name.lexeme),
+                .marshal = if (supported) field_type.marshal else .int32,
+            });
+            self.consumeSemicolons();
+        }
+        const end = try self.expect(.end, "Синтаксическая ошибка: ff_структура не закрыта 'конец'");
+        return self.result.ast.addDecl(.{ .struct_decl = .{
+            .span = spanFrom(start.span, end.span),
+            .name = try self.result.ast.copyText(name.lexeme),
+            .doc = try self.result.ast.copyText(doc),
+            .type_parameters = &.{},
+            .fields = try self.result.ast.copySlice(ast.FieldDecl, fields.items),
+            .is_exported = is_exported,
+            .is_ffi = true,
         } });
     }
 

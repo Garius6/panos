@@ -243,3 +243,28 @@ test "parser conformance fixture preserves foreign ABI declarations" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "parser conformance fixture preserves FFI structs and values by ABI" {
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/ffi_struct.ps"), 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lexed.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[0]).*) {
+        .struct_decl => |decl| {
+            try std.testing.expect(decl.is_ffi);
+            try std.testing.expectEqual(@as(usize, 2), decl.fields.len);
+            try std.testing.expectEqual(panos.ast.ForeignMarshalKind.float32, decl.fields[0].marshal.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parsed.ast.decl(parsed.ast.program.?.declarations[1]).*) {
+        .foreign => |decl| {
+            try std.testing.expectEqual(panos.ast.ForeignMarshalKind.struct_value, decl.parameters[0].marshal);
+            try std.testing.expectEqualStrings("Вектор2", decl.return_struct_type_name.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

@@ -168,7 +168,11 @@ const Checker = struct {
                     if (!self.assignable(value_type, type_id)) try self.report(let.span, "Type Error: значение переменной не совпадает с аннотацией", .{});
                 }
                 if (self.isType(value_type, self.result.types.builtins.void)) try self.report(let.span, "Type Error: переменная не может иметь тип 'Пусто'", .{});
-                try self.bindStatementValue(statement, value_type, let.span, "Type Error: деструктуризация ожидает тупл с соответствующим числом значений");
+                if (let.destructure_type != null) {
+                    try self.bindNominalDestructure(statement, let, value_type);
+                } else {
+                    try self.bindStatementValue(statement, value_type, let.span, "Type Error: деструктуризация ожидает тупл с соответствующим числом значений");
+                }
                 break :blk self.result.types.builtins.void;
             },
             .return_stmt => |return_statement| blk: {
@@ -413,6 +417,58 @@ const Checker = struct {
         const bindings = self.resolution.stmt_bindings.get(statement) orelse return;
         const poison = try self.result.types.poison();
         for (bindings) |symbol| try self.result.symbol_types.put(symbol, poison);
+    }
+
+    fn bindNominalDestructure(self: *Checker, statement: ast.StmtId, let: anytype, value_type: types.TypeId) !void {
+        const bindings = self.resolution.stmt_bindings.get(statement) orelse return;
+        const expected_name = let.destructure_type orelse return;
+        const value = self.result.types.get(value_type) orelse return;
+        const nominal = switch (value.*) {
+            .nominal => |entry| entry,
+            else => {
+                try self.report(let.span, "Type Error: деструктуризация '{s}' ожидает структуру", .{expected_name});
+                try self.bindStatementPoison(statement);
+                return;
+            },
+        };
+        const symbol = self.resolution.symbols.get(nominal.symbol) orelse {
+            try self.bindStatementPoison(statement);
+            return;
+        };
+        if (!std.mem.eql(u8, symbol.name, expected_name)) {
+            try self.report(let.span, "Type Error: деструктуризация ожидает структуру '{s}'", .{expected_name});
+            try self.bindStatementPoison(statement);
+            return;
+        }
+        const fields = self.result.nominal_fields.get(nominal.symbol) orelse {
+            try self.report(let.span, "Type Error: тип '{s}' нельзя деструктурировать", .{expected_name});
+            try self.bindStatementPoison(statement);
+            return;
+        };
+        if (let.destructure_field_names) |names| {
+            if (names.len != bindings.len) {
+                try self.report(let.span, "Type Error: именованная деструктуризация имеет неверное число полей", .{});
+                try self.bindStatementPoison(statement);
+                return;
+            }
+            for (bindings, names) |binding, name| {
+                for (fields) |field| {
+                    if (!std.mem.eql(u8, field.name, name)) continue;
+                    try self.result.symbol_types.put(binding, field.typ);
+                    break;
+                } else {
+                    try self.report(let.span, "Type Error: у структуры '{s}' нет поля '{s}'", .{ expected_name, name });
+                    try self.result.symbol_types.put(binding, try self.result.types.poison());
+                }
+            }
+            return;
+        }
+        if (fields.len != bindings.len) {
+            try self.report(let.span, "Type Error: деструктуризация структуры ожидает все поля по порядку", .{});
+            try self.bindStatementPoison(statement);
+            return;
+        }
+        for (bindings, fields) |binding, field| try self.result.symbol_types.put(binding, field.typ);
     }
 
     fn inferIndex(self: *Checker, index: anytype) anyerror!types.TypeId {

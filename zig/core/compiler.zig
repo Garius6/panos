@@ -260,10 +260,13 @@ const FunctionCompiler = struct {
                     const aggregate_slot = try self.allocateLocal();
                     try self.function.emit(self.compiler.result.allocator, .{ .set_local = aggregate_slot });
                     for (bindings, 0..) |binding, index| {
-                        if (index > std.math.maxInt(u16)) return error.CollectionLimitReached;
+                        const field_index = try self.destructureFieldIndex(let, index) orelse {
+                            try self.compiler.report(let.span, "Compiler Error: поле деструктуризации не найдено", .{});
+                            continue;
+                        };
                         const slot = try self.ensureLocal(binding);
                         try self.function.emit(self.compiler.result.allocator, .{ .get_local = aggregate_slot });
-                        try self.function.emit(self.compiler.result.allocator, .{ .get_property = @intCast(index) });
+                        try self.function.emit(self.compiler.result.allocator, .{ .get_property = field_index });
                         try self.function.emit(self.compiler.result.allocator, .{ .set_local = slot });
                     }
                 }
@@ -711,6 +714,15 @@ const FunctionCompiler = struct {
             return @intCast(index);
         }
         return null;
+    }
+
+    fn destructureFieldIndex(self: *FunctionCompiler, let: anytype, index: usize) !?u16 {
+        if (let.destructure_field_names) |names| {
+            if (index >= names.len) return null;
+            return self.propertyIndex(let.value, names[index]);
+        }
+        if (index > std.math.maxInt(u16)) return null;
+        return @intCast(index);
     }
 
     fn expressionIsInteger(self: *const FunctionCompiler, expression: ast.ExprId) bool {

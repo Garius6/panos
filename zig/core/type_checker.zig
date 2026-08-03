@@ -327,12 +327,19 @@ const Checker = struct {
     fn resolveType(self: *Checker, type_node: ast.TypeId) !types.TypeId {
         return switch (self.tree.typeNode(type_node).*) {
             .ident => |ident| builtinType(&self.result.types, ident.name) orelse blk: {
+                if (self.findTypeSymbol(ident.name)) |symbol| break :blk try self.result.types.nominal(symbol, &.{});
                 try self.report(ident.span, "Type Error: неизвестный тип '{s}'", .{ident.name});
                 break :blk try self.result.types.poison();
             },
             .generic => |generic| blk: {
                 if (std.mem.eql(u8, generic.name, "Массив") and generic.parameters.len == 1) break :blk try self.result.types.array(try self.resolveType(generic.parameters[0]));
                 if (std.mem.eql(u8, generic.name, "Соответствие") and generic.parameters.len == 2) break :blk try self.result.types.map(try self.resolveType(generic.parameters[0]), try self.resolveType(generic.parameters[1]));
+                if (self.findTypeSymbol(generic.name)) |symbol| {
+                    var arguments: std.ArrayList(types.TypeId) = .empty;
+                    defer arguments.deinit(self.result.allocator);
+                    for (generic.parameters) |parameter| try arguments.append(self.result.allocator, try self.resolveType(parameter));
+                    break :blk try self.result.types.nominal(symbol, arguments.items);
+                }
                 try self.report(generic.span, "Type Error: неизвестный generic-тип '{s}'", .{generic.name});
                 break :blk try self.result.types.poison();
             },
@@ -357,6 +364,13 @@ const Checker = struct {
         const expected_type = self.result.types.get(expected) orelse return true;
         if (actual_type.* == .poison or expected_type.* == .poison) return true;
         return self.result.types.eql(actual, expected);
+    }
+
+    fn findTypeSymbol(self: *const Checker, name: []const u8) ?symbols.SymbolId {
+        for (self.resolution.symbols.symbols.items[1..], 1..) |entry, index| {
+            if (entry.kind == .type and std.mem.eql(u8, entry.name, name)) return @enumFromInt(index);
+        }
+        return null;
     }
 };
 
@@ -451,6 +465,21 @@ test "type checker infers lambda parameters from a function annotation" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
     var lexed = try lexer.tokenize(std.testing.allocator, "функ применить(f: функ(Число) -> Число, x: Число) -> Число\nf(x)\nконец\nфунк старт() -> Число\nпер удвоить: функ(Число) -> Число = функ(значение)\nзначение * 2\nконец\nприменить(удвоить, 3)\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "type checker preserves nominal user types in function signatures" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Точка = структура\nx: Число\nконец\nфунк та_же(точка: Точка) -> Точка\nточка\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

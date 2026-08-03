@@ -67,6 +67,12 @@ pub const ForInKind = enum {
     iterator,
 };
 
+pub const ImportedSymbolType = struct {
+    symbol: symbols.SymbolId,
+    store: *const types.TypeStore,
+    type_id: types.TypeId,
+};
+
 pub const IteratorDispatch = enum {
     direct,
     interface,
@@ -100,6 +106,7 @@ pub const CheckResult = struct {
     diagnostics: diagnostic.DiagnosticList = .{},
     expression_types: std.AutoHashMap(ast.ExprId, types.TypeId),
     symbol_types: std.AutoHashMap(symbols.SymbolId, types.TypeId),
+    unsupported_imports: std.AutoHashMap(symbols.SymbolId, void),
     nominal_fields: std.AutoHashMap(symbols.SymbolId, []const NominalField),
     type_aliases: std.AutoHashMap(symbols.SymbolId, types.TypeId),
     alias_type_nodes: std.AutoHashMap(symbols.SymbolId, ast.TypeId),
@@ -124,6 +131,7 @@ pub const CheckResult = struct {
             .types = try types.TypeStore.init(allocator),
             .expression_types = .init(allocator),
             .symbol_types = .init(allocator),
+            .unsupported_imports = .init(allocator),
             .nominal_fields = .init(allocator),
             .type_aliases = .init(allocator),
             .alias_type_nodes = .init(allocator),
@@ -158,6 +166,7 @@ pub const CheckResult = struct {
         self.alias_type_nodes.deinit();
         self.type_aliases.deinit();
         self.nominal_fields.deinit();
+        self.unsupported_imports.deinit();
         self.symbol_types.deinit();
         self.expression_types.deinit();
         self.diagnostics.deinit(self.allocator);
@@ -211,6 +220,54 @@ const Checker = struct {
                 else => {},
             }
         }
+    }
+
+    fn importSignaturePass(self: *Checker, imports: []const ImportedSymbolType) !void {
+        for (imports) |imported| {
+            const copied = self.copyImportedType(imported.store, imported.type_id) catch |err| switch (err) {
+                error.UnsupportedImportedType => {
+                    try self.result.unsupported_imports.put(imported.symbol, {});
+                    continue;
+                },
+                else => return err,
+            };
+            try self.result.symbol_types.put(imported.symbol, copied);
+        }
+    }
+
+    fn copyImportedType(self: *Checker, external_store: *const types.TypeStore, external_type: types.TypeId) !types.TypeId {
+        const entry = external_store.get(external_type) orelse return error.UnsupportedImportedType;
+        return switch (entry.*) {
+            .primitive => |primitive| switch (primitive) {
+                .number => self.result.types.builtins.number,
+                .integer => self.result.types.builtins.integer,
+                .boolean => self.result.types.builtins.boolean,
+                .void => self.result.types.builtins.void,
+                .never => self.result.types.builtins.never,
+                .string => self.result.types.builtins.string,
+                .error_value => self.result.types.builtins.error_value,
+            },
+            .tuple => |elements| blk: {
+                var copied: std.ArrayList(types.TypeId) = .empty;
+                defer copied.deinit(self.result.allocator);
+                for (elements) |element| try copied.append(self.result.allocator, try self.copyImportedType(external_store, element));
+                break :blk self.result.types.tuple(copied.items);
+            },
+            .function => |function| blk: {
+                var copied: std.ArrayList(types.TypeId) = .empty;
+                defer copied.deinit(self.result.allocator);
+                for (function.parameters) |parameter| try copied.append(self.result.allocator, try self.copyImportedType(external_store, parameter));
+                break :blk self.result.types.function(copied.items, try self.copyImportedType(external_store, function.return_type));
+            },
+            .array => |element| self.result.types.array(try self.copyImportedType(external_store, element)),
+            .map => |map| self.result.types.map(
+                try self.copyImportedType(external_store, map.key),
+                try self.copyImportedType(external_store, map.value),
+            ),
+            .process => |message| self.result.types.process(try self.copyImportedType(external_store, message)),
+            .pointer => |pointee| self.result.types.pointer(try self.copyImportedType(external_store, pointee)),
+            .nominal, .generic_parameter, .poison => error.UnsupportedImportedType,
+        };
     }
 
     fn typeAliasPass(self: *Checker) !void {
@@ -676,10 +733,13 @@ const Checker = struct {
             .number => self.result.types.builtins.number,
             .boolean => self.result.types.builtins.boolean,
             .string => self.result.types.builtins.string,
-            .ident => blk: {
+            .ident => |ident| blk: {
                 const symbol = self.resolution.expr_symbols.get(expression) orelse break :blk try self.result.types.poison();
                 if (self.resolution.symbols.get(symbol)) |entry| {
                     if (entry.kind == .type) break :blk try self.result.types.nominal(symbol, &.{});
+                }
+                if (self.result.unsupported_imports.contains(symbol)) {
+                    try self.report(ident.span, "Type Error: импортированный экспорт '{s}' использует пока неподдерживаемый тип", .{self.resolution.symbols.get(symbol).?.name});
                 }
                 break :blk self.result.symbol_types.get(symbol) orelse try self.result.types.poison();
             },
@@ -1314,7 +1374,12 @@ const Checker = struct {
         if (self.resolution.expr_symbols.get(expression)) |symbol| {
             if (self.resolution.symbols.get(symbol)) |entry| {
                 if (entry.kind == .enum_variant) return self.result.types.nominal(entry.owner_type, &.{});
+                if (self.result.unsupported_imports.contains(symbol)) {
+                    try self.report(property.span, "Type Error: импортированный экспорт '{s}' использует пока неподдерживаемый тип", .{entry.name});
+                    return self.result.types.poison();
+                }
             }
+            if (self.result.symbol_types.get(symbol)) |typ| return typ;
         }
         const object_type = try self.infer(property.object);
         if (self.isType(object_type, self.result.types.builtins.error_value)) {
@@ -2497,6 +2562,15 @@ const Checker = struct {
 };
 
 pub fn check(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *const resolver.Resolution) !CheckResult {
+    return checkWithImports(allocator, tree, resolution, &.{});
+}
+
+pub fn checkWithImports(
+    allocator: std.mem.Allocator,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    imports: []const ImportedSymbolType,
+) !CheckResult {
     var result = try CheckResult.init(allocator);
     errdefer result.deinit();
     var checker = Checker{
@@ -2512,6 +2586,7 @@ pub fn check(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *co
     try checker.enumPass();
     try checker.interfacePass();
     try checker.signaturePass();
+    try checker.importSignaturePass(imports);
     try checker.constantPass();
     try checker.bodyPass();
     return result;

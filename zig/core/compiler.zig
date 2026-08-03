@@ -10,6 +10,7 @@ const type_checker = @import("type_checker.zig");
 pub const CompileResult = struct {
     allocator: std.mem.Allocator,
     program: bytecode.Program,
+    shared_program: ?*bytecode.Program = null,
     diagnostics: diagnostic.DiagnosticList = .{},
     function_ids: std.AutoHashMap(symbols.SymbolId, bytecode.FunctionId),
     lambda_ids: std.AutoHashMap(ast.ExprId, bytecode.FunctionId),
@@ -25,6 +26,10 @@ pub const CompileResult = struct {
         };
     }
 
+    fn activeProgram(self: *CompileResult) *bytecode.Program {
+        return self.shared_program orelse &self.program;
+    }
+
     pub fn deinit(self: *CompileResult) void {
         self.top_level_constants.deinit();
         self.lambda_ids.deinit();
@@ -33,6 +38,22 @@ pub const CompileResult = struct {
         self.program.deinit();
         self.* = undefined;
     }
+};
+
+pub const ImportedFunction = struct {
+    symbol: symbols.SymbolId,
+    function_id: bytecode.FunctionId,
+};
+
+pub const ImportedConstant = struct {
+    symbol: symbols.SymbolId,
+    value: bytecode.Constant,
+};
+
+pub const CompileOptions = struct {
+    program: ?*bytecode.Program = null,
+    functions: []const ImportedFunction = &.{},
+    constants: []const ImportedConstant = &.{},
 };
 
 const Compiler = struct {
@@ -60,6 +81,10 @@ const Compiler = struct {
     fn deinit(self: *Compiler) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    fn program(self: *Compiler) *bytecode.Program {
+        return self.result.activeProgram();
     }
 
     fn report(self: *Compiler, span: source.Span, comptime format: []const u8, args: anytype) !void {
@@ -104,7 +129,7 @@ const Compiler = struct {
         return switch (self.tree.expr(expression).*) {
             .number => |number| .{ .number = number.value },
             .boolean => |boolean| .{ .boolean = boolean.value },
-            .string => |string| .{ .string = try self.result.program.copyString(string.value) },
+            .string => |string| .{ .string = try self.program().copyString(string.value) },
             .unary => |unary| if (unary.operator == .minus) switch (self.tree.expr(unary.operand).*) {
                 .number => |number| .{ .number = -number.value },
                 else => null,
@@ -119,7 +144,7 @@ const Compiler = struct {
             try self.report(self.tree.decl(declaration).function.span, "Compiler Error: слишком много параметров функции", .{});
             return;
         }
-        const function_id = try self.result.program.addFunction(name, @intCast(parameter_count));
+        const function_id = try self.program().addFunction(name, @intCast(parameter_count));
         try self.result.function_ids.put(symbol, function_id);
     }
 
@@ -144,7 +169,7 @@ const Compiler = struct {
                 continue;
             }
             const expression_id: ast.ExprId = @enumFromInt(index);
-            const function_id = try self.result.program.addFunction("лямбда", @intCast(lambda.parameters.len));
+            const function_id = try self.program().addFunction("лямбда", @intCast(lambda.parameters.len));
             try self.result.lambda_ids.put(expression_id, function_id);
         }
     }
@@ -156,7 +181,7 @@ const Compiler = struct {
             const target = self.resolution.symbols.get(implementation.target) orelse continue;
             const method_symbol = implementation.methods[0];
             const method = self.result.function_ids.get(method_symbol) orelse continue;
-            try self.result.program.addComparableMethod(target.name, method);
+            try self.program().addComparableMethod(target.name, method);
         }
     }
 
@@ -173,7 +198,7 @@ const Compiler = struct {
                 continue;
             }
             const function_id = self.result.lambda_ids.get(expression_id) orelse continue;
-            const compiled = self.result.program.function(function_id) orelse continue;
+            const compiled = self.program().function(function_id) orelse continue;
             const lambda_type = self.checked.expression_types.get(expression_id) orelse continue;
             const type_entry = self.checked.types.get(lambda_type) orelse continue;
             const signature = switch (type_entry.*) {
@@ -191,7 +216,7 @@ const Compiler = struct {
         const function = self.tree.decl(declaration).function;
         const symbol = self.resolution.decl_symbols.get(declaration) orelse return;
         const function_id = self.result.function_ids.get(symbol) orelse return;
-        const compiled = self.result.program.function(function_id) orelse return;
+        const compiled = self.program().function(function_id) orelse return;
         const signature_id = self.checked.symbol_types.get(symbol) orelse return;
         const signature = self.checked.types.get(signature_id) orelse return;
         const function_type = switch (signature.*) {
@@ -372,7 +397,7 @@ const FunctionCompiler = struct {
         switch (self.compiler.tree.expr(expression).*) {
             .number => |number| try self.emitConstant(.{ .number = number.value }),
             .boolean => |boolean| try self.emitConstant(.{ .boolean = boolean.value }),
-            .string => |string| try self.emitConstant(.{ .string = try self.compiler.result.program.copyString(string.value) }),
+            .string => |string| try self.emitConstant(.{ .string = try self.compiler.program().copyString(string.value) }),
             .ident => try self.compileIdentifier(expression),
             .unary => |unary| {
                 try self.compileExpression(unary.operand);
@@ -418,7 +443,7 @@ const FunctionCompiler = struct {
             try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти реализацию интерфейса", .{});
             return;
         };
-        const methods = try self.compiler.result.program.arena.allocator().alloc(bytecode.FunctionId, implementation.methods.len);
+        const methods = try self.compiler.program().arena.allocator().alloc(bytecode.FunctionId, implementation.methods.len);
         for (implementation.methods, methods) |method, *function_id| {
             function_id.* = self.compiler.result.function_ids.get(method) orelse {
                 try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти метод интерфейса", .{});
@@ -530,7 +555,7 @@ const FunctionCompiler = struct {
         if (try self.enumConstructor(call.callee)) |enumeration| {
             for (call.arguments) |argument| try self.compileExpression(argument);
             if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
-            const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(enumeration) });
+            const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(enumeration) });
             try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
                 .name_constant = name_constant,
                 .field_count = @intCast(call.arguments.len),
@@ -540,7 +565,7 @@ const FunctionCompiler = struct {
         if (try self.structConstructor(call.callee)) |structure| {
             for (call.arguments) |argument| try self.compileExpression(argument);
             if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
-            const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(structure) });
+            const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(structure) });
             try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
                 .name_constant = name_constant,
                 .field_count = @intCast(call.arguments.len),
@@ -559,7 +584,7 @@ const FunctionCompiler = struct {
         const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
         if (entry.kind != .builtin or !std.mem.eql(u8, entry.name, "Ошибка")) return false;
         for (call.arguments) |argument| try self.compileExpression(argument);
-        const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString("Ошибка") });
+        const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString("Ошибка") });
         try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
             .name_constant = name_constant,
             .field_count = 2,
@@ -866,7 +891,7 @@ const FunctionCompiler = struct {
         if (message_slot) |slot| {
             try self.function.emit(self.compiler.result.allocator, .{ .get_local = slot });
         } else {
-            try self.emitConstant(.{ .string = try self.compiler.result.program.copyString(default_message) });
+            try self.emitConstant(.{ .string = try self.compiler.program().copyString(default_message) });
         }
         try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
         self.patchJump(end_jump, self.function.instructions.items.len);
@@ -907,7 +932,7 @@ const FunctionCompiler = struct {
             },
             .none => 0,
         };
-        const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(branch.variant_name) });
+        const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(branch.variant_name) });
         try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
             .name_constant = name_constant,
             .field_count = field_count,
@@ -915,7 +940,7 @@ const FunctionCompiler = struct {
     }
 
     fn emitEnumMatch(self: *FunctionCompiler, variant_name: []const u8) !void {
-        const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(variant_name) });
+        const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(variant_name) });
         try self.function.emit(self.compiler.result.allocator, .{ .match_enum = name_constant });
     }
 
@@ -942,11 +967,16 @@ const FunctionCompiler = struct {
     fn compileProperty(self: *FunctionCompiler, expression: ast.ExprId, property: anytype) !void {
         if (self.compiler.resolution.expr_symbols.get(expression)) |symbol| {
             if (try self.enumVariantName(symbol)) |name| {
-                const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(name) });
+                const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(name) });
                 try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
                     .name_constant = name_constant,
                     .field_count = 0,
                 } });
+                return;
+            }
+            const entry = self.compiler.resolution.symbols.get(symbol) orelse return self.unsupportedExpression(property.span);
+            if (entry.module_path != null) {
+                try self.emitSymbolValue(symbol, property.span);
                 return;
             }
         }
@@ -1135,7 +1165,7 @@ const FunctionCompiler = struct {
         }
         try self.function.emit(self.compiler.result.allocator, .{ .set_local = option_slot });
         try self.function.emit(self.compiler.result.allocator, .{ .get_local = option_slot });
-        const option_name = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString("Опция.Есть") });
+        const option_name = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString("Опция.Есть") });
         try self.function.emit(self.compiler.result.allocator, .{ .match_enum = option_name });
         const exit_jump = self.function.instructions.items.len;
         try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
@@ -1202,7 +1232,7 @@ const FunctionCompiler = struct {
     fn compilePatternGuards(self: *FunctionCompiler, pattern: ast.PatternId, value_slot: u16, next_arm_jumps: *std.ArrayList(usize)) !void {
         if (try self.patternEnumVariantName(pattern)) |variant_name| {
             try self.function.emit(self.compiler.result.allocator, .{ .get_local = value_slot });
-            const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(variant_name) });
+            const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(variant_name) });
             try self.function.emit(self.compiler.result.allocator, .{ .match_enum = name_constant });
             const next_arm = self.function.instructions.items.len;
             try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
@@ -1505,8 +1535,21 @@ pub fn compile(
     resolution: *const resolver.Resolution,
     checked: *const type_checker.CheckResult,
 ) !CompileResult {
+    return compileWithOptions(allocator, tree, resolution, checked, .{});
+}
+
+pub fn compileWithOptions(
+    allocator: std.mem.Allocator,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    checked: *const type_checker.CheckResult,
+    options: CompileOptions,
+) !CompileResult {
     var result = CompileResult.init(allocator);
     errdefer result.deinit();
+    result.shared_program = options.program;
+    for (options.functions) |function| try result.function_ids.put(function.symbol, function.function_id);
+    for (options.constants) |constant| try result.top_level_constants.put(constant.symbol, constant.value);
     var compiler = Compiler.init(tree, resolution, checked, &result);
     defer compiler.deinit();
     try compiler.predeclareConstants();

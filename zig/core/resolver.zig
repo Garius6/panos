@@ -13,6 +13,12 @@ pub const ImportedExport = struct {
     name: []const u8,
     kind: symbols.SymbolKind,
     span: source.Span,
+    origin: ?ImportedSymbolOrigin = null,
+};
+
+pub const ImportedSymbolOrigin = struct {
+    module: usize,
+    declaration: ast.DeclId,
 };
 
 pub const ImportedModule = struct {
@@ -39,6 +45,7 @@ pub const Resolution = struct {
     function_parameters: std.AutoHashMap(ast.DeclId, []const symbols.SymbolId),
     lambda_parameters: std.AutoHashMap(ast.ExprId, []const symbols.SymbolId),
     lambda_captures: std.AutoHashMap(ast.ExprId, []const symbols.SymbolId),
+    imported_symbols: std.AutoHashMap(symbols.SymbolId, ImportedSymbolOrigin),
     enum_variants: std.ArrayList(EnumVariants) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) !Resolution {
@@ -54,12 +61,14 @@ pub const Resolution = struct {
             .function_parameters = .init(allocator),
             .lambda_parameters = .init(allocator),
             .lambda_captures = .init(allocator),
+            .imported_symbols = .init(allocator),
         };
     }
 
     pub fn deinit(self: *Resolution) void {
         for (self.enum_variants.items) |*variants| variants.values.deinit();
         self.enum_variants.deinit(self.allocator);
+        self.imported_symbols.deinit();
         self.lambda_captures.deinit();
         self.lambda_parameters.deinit();
         self.function_parameters.deinit();
@@ -166,6 +175,7 @@ const Resolver = struct {
                     .is_exported = true,
                     .span = exported.span,
                 });
+                if (exported.origin) |origin| try self.result.imported_symbols.put(member, origin);
                 if (members.values.contains(exported.name)) {
                     try self.report(exported.span, "Resolve Error: экспорт '{s}' повторён в модуле '{s}'", .{ exported.name, import.alias });
                 } else {

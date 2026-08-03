@@ -29,6 +29,10 @@ pub const ImportScope = struct {
                         .type => .type,
                     },
                     .span = exported.span,
+                    .origin = .{
+                        .module = target,
+                        .declaration = exported.declaration,
+                    },
                 });
             }
             try modules.append(allocator, .{

@@ -37,7 +37,7 @@ Odin.
 - [x] T013 [P] Implement canonical target profiles and builtin availability in `zig/core/target.zig`.
 - [x] T014 Implement normalized conformance outcomes in `zig/conformance/outcome.zig`.
 - [x] T015 Add source, span, diagnostic and outcome unit tests in `zig/core/source.zig` and `zig/conformance/outcome.zig`.
-- [ ] T016 Add CLI diagnostic formatting contract tests in `zig/cli/main.zig` from `specs/010-zig-migration/contracts/cli.md`.
+- [x] T016 Add CLI diagnostic formatting contract tests in `zig/cli/main.zig` from `specs/010-zig-migration/contracts/cli.md`.
 
 **Checkpoint**: source positions, target checks and normalized diagnostics can
 be tested independently of a parser.

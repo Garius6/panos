@@ -193,12 +193,22 @@ const FunctionCompiler = struct {
             .let => |let| blk: {
                 try self.compileExpression(let.value);
                 const bindings = self.compiler.resolution.stmt_bindings.get(statement) orelse &.{};
-                if (bindings.len != 1) {
+                if (bindings.len == 0) {
                     try self.compiler.report(let.span, "Compiler Error: деструктуризация пока не поддержана", .{});
                     try self.function.emit(self.compiler.result.allocator, .{ .pop = {} });
-                } else {
+                } else if (bindings.len == 1) {
                     const slot = try self.ensureLocal(bindings[0]);
                     try self.function.emit(self.compiler.result.allocator, .{ .set_local = slot });
+                } else {
+                    const aggregate_slot = try self.allocateLocal();
+                    try self.function.emit(self.compiler.result.allocator, .{ .set_local = aggregate_slot });
+                    for (bindings, 0..) |binding, index| {
+                        if (index > std.math.maxInt(u16)) return error.CollectionLimitReached;
+                        const slot = try self.ensureLocal(binding);
+                        try self.function.emit(self.compiler.result.allocator, .{ .get_local = aggregate_slot });
+                        try self.function.emit(self.compiler.result.allocator, .{ .get_property = @intCast(index) });
+                        try self.function.emit(self.compiler.result.allocator, .{ .set_local = slot });
+                    }
                 }
                 if (keep_value) {
                     try self.emitVoid();

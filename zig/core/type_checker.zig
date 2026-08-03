@@ -1320,6 +1320,17 @@ const Checker = struct {
                 if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], object_type), object_type)) try self.report(call.span, "Type Error: запасная опция имеет неверный тип", .{});
                 return object_type;
             }
+            if (std.mem.eql(u8, property.property, "заменить_значение")) {
+                try self.checkMethodArity(call, "заменить_значение", 1);
+                if (call.arguments.len == 0) return @as(?types.TypeId, try self.result.types.poison());
+                return @as(?types.TypeId, try self.result.types.nominal(nominal.symbol, &.{try self.infer(call.arguments[0])}));
+            }
+            if (std.mem.eql(u8, property.property, "результат_или")) {
+                try self.checkMethodArity(call, "результат_или", 1);
+                if (call.arguments.len == 0) return @as(?types.TypeId, try self.result.types.poison());
+                const result_symbol = self.findTypeSymbol("Результат") orelse return @as(?types.TypeId, try self.result.types.poison());
+                return @as(?types.TypeId, try self.result.types.nominal(result_symbol, &.{ element, try self.infer(call.arguments[0]) }));
+            }
         }
         if (std.mem.eql(u8, owner.name, "Результат")) {
             if (nominal.arguments.len != 2) return null;
@@ -1361,6 +1372,26 @@ const Checker = struct {
                 try self.checkMethodArity(call, "запас", 1);
                 if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], object_type), object_type)) try self.report(call.span, "Type Error: запасной результат имеет неверный тип", .{});
                 return object_type;
+            }
+            if (std.mem.eql(u8, property.property, "заменить_значение")) {
+                try self.checkMethodArity(call, "заменить_значение", 1);
+                if (call.arguments.len == 0) return @as(?types.TypeId, try self.result.types.poison());
+                return @as(?types.TypeId, try self.result.types.nominal(nominal.symbol, &.{ try self.infer(call.arguments[0]), failure }));
+            }
+            if (std.mem.eql(u8, property.property, "заменить_ошибку")) {
+                try self.checkMethodArity(call, "заменить_ошибку", 1);
+                if (call.arguments.len == 0) return @as(?types.TypeId, try self.result.types.poison());
+                return @as(?types.TypeId, try self.result.types.nominal(nominal.symbol, &.{ success, try self.infer(call.arguments[0]) }));
+            }
+            if (std.mem.eql(u8, property.property, "опция")) {
+                try self.checkMethodArity(call, "опция", 0);
+                const option_symbol = self.findTypeSymbol("Опция") orelse return @as(?types.TypeId, try self.result.types.poison());
+                return @as(?types.TypeId, try self.result.types.nominal(option_symbol, &.{success}));
+            }
+            if (std.mem.eql(u8, property.property, "ошибка_опция")) {
+                try self.checkMethodArity(call, "ошибка_опция", 0);
+                const option_symbol = self.findTypeSymbol("Опция") orelse return @as(?types.TypeId, try self.result.types.poison());
+                return @as(?types.TypeId, try self.result.types.nominal(option_symbol, &.{failure}));
             }
         }
         return null;

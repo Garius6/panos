@@ -509,6 +509,14 @@ const FunctionCompiler = struct {
                 try self.compileEnumFallback(property.object, call.arguments[0], "Опция.Есть", .receiver);
                 return true;
             }
+            if (std.mem.eql(u8, property.property, "заменить_значение") and call.arguments.len == 1) {
+                try self.compileEnumTransform(property.object, call.arguments[0], "Опция.Есть", .{ .variant_name = "Опция.Есть", .value = .argument }, .{ .variant_name = "Опция.Нет", .value = .none });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "результат_или") and call.arguments.len == 1) {
+                try self.compileEnumTransform(property.object, call.arguments[0], "Опция.Есть", .{ .variant_name = "Результат.Успех", .value = .field }, .{ .variant_name = "Результат.Неудача", .value = .argument });
+                return true;
+            }
         }
         if (std.mem.eql(u8, owner.name, "Результат")) {
             if (std.mem.eql(u8, property.property, "успех") and call.arguments.len == 0) {
@@ -549,11 +557,32 @@ const FunctionCompiler = struct {
                 try self.compileEnumFallback(property.object, call.arguments[0], "Результат.Успех", .receiver);
                 return true;
             }
+            if (std.mem.eql(u8, property.property, "заменить_значение") and call.arguments.len == 1) {
+                try self.compileEnumTransform(property.object, call.arguments[0], "Результат.Успех", .{ .variant_name = "Результат.Успех", .value = .argument }, .{ .variant_name = "Результат.Неудача", .value = .field });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "заменить_ошибку") and call.arguments.len == 1) {
+                try self.compileEnumTransform(property.object, call.arguments[0], "Результат.Неудача", .{ .variant_name = "Результат.Неудача", .value = .argument }, .{ .variant_name = "Результат.Успех", .value = .field });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "опция") and call.arguments.len == 0) {
+                try self.compileEnumTransform(property.object, null, "Результат.Успех", .{ .variant_name = "Опция.Есть", .value = .field }, .{ .variant_name = "Опция.Нет", .value = .none });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "ошибка_опция") and call.arguments.len == 0) {
+                try self.compileEnumTransform(property.object, null, "Результат.Неудача", .{ .variant_name = "Опция.Есть", .value = .field }, .{ .variant_name = "Опция.Нет", .value = .none });
+                return true;
+            }
         }
         return false;
     }
 
     const EnumFallback = enum { field, receiver };
+    const EnumTransformValue = enum { field, argument, none };
+    const EnumTransformBranch = struct {
+        variant_name: []const u8,
+        value: EnumTransformValue,
+    };
 
     fn compileEnumFallback(self: *FunctionCompiler, object: ast.ExprId, fallback: ast.ExprId, variant_name: []const u8, result: EnumFallback) !void {
         const object_slot = try self.allocateLocal();
@@ -604,6 +633,48 @@ const FunctionCompiler = struct {
         }
         try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
         self.patchJump(end_jump, self.function.instructions.items.len);
+    }
+
+    fn compileEnumTransform(self: *FunctionCompiler, object: ast.ExprId, argument: ?ast.ExprId, match_variant: []const u8, matching_branch: EnumTransformBranch, fallback_branch: EnumTransformBranch) !void {
+        const object_slot = try self.allocateLocal();
+        var argument_slot: ?u16 = null;
+        try self.compileExpression(object);
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = object_slot });
+        if (argument) |value| {
+            argument_slot = try self.allocateLocal();
+            try self.compileExpression(value);
+            try self.function.emit(self.compiler.result.allocator, .{ .set_local = argument_slot.? });
+        }
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
+        try self.emitEnumMatch(match_variant);
+        const fallback_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.compileEnumTransformBranch(object_slot, argument_slot, matching_branch);
+        const end_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
+        self.patchJump(fallback_jump, self.function.instructions.items.len);
+        try self.compileEnumTransformBranch(object_slot, argument_slot, fallback_branch);
+        self.patchJump(end_jump, self.function.instructions.items.len);
+    }
+
+    fn compileEnumTransformBranch(self: *FunctionCompiler, object_slot: u16, argument_slot: ?u16, branch: EnumTransformBranch) !void {
+        const field_count: u16 = switch (branch.value) {
+            .field => blk: {
+                try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
+                try self.function.emit(self.compiler.result.allocator, .{ .get_property = 0 });
+                break :blk 1;
+            },
+            .argument => blk: {
+                try self.function.emit(self.compiler.result.allocator, .{ .get_local = argument_slot orelse unreachable });
+                break :blk 1;
+            },
+            .none => 0,
+        };
+        const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.result.program.copyString(branch.variant_name) });
+        try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
+            .name_constant = name_constant,
+            .field_count = field_count,
+        } });
     }
 
     fn emitEnumMatch(self: *FunctionCompiler, variant_name: []const u8) !void {

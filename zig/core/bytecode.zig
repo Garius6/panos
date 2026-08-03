@@ -51,6 +51,7 @@ pub const Opcode = enum {
     observe,
     get_signal,
     process_id,
+    current_process,
     build_closure,
     return_value,
     return_void,
@@ -116,6 +117,7 @@ pub const Instruction = union(Opcode) {
     observe: void,
     get_signal: void,
     process_id: void,
+    current_process: void,
     build_closure: struct {
         function_id: FunctionId,
         capture_count: u16,

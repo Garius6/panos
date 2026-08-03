@@ -1440,6 +1440,11 @@ const Checker = struct {
                 for (call.arguments) |argument| _ = try self.infer(argument);
                 return self.result.types.poison();
             }
+            if (self.isBuiltin(symbol, "себя")) {
+                if (call.arguments.len != 0) try self.report(call.span, "Type Error: себя() не принимает аргументы", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.result.types.process(try self.result.types.poison());
+            }
             if (self.isBuiltin(symbol, "отправить")) {
                 if (call.arguments.len != 2) try self.report(call.span, "Type Error: отправить() ожидает 2 аргумент(а)", .{});
                 for (call.arguments) |argument| _ = try self.infer(argument);

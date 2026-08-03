@@ -134,6 +134,7 @@ pub const Vm = struct {
             .observe => try self.observe(),
             .get_signal => try self.getSignal(),
             .process_id => try self.processId(),
+            .current_process => try self.currentProcess(),
             .build_closure => |closure| try self.buildClosure(closure),
             .return_value => return self.finishFrame(try self.pop()),
             .return_void => return self.finishFrame(.{ .void = {} }),
@@ -643,6 +644,14 @@ pub const Vm = struct {
             },
         };
         try self.stack.append(self.allocator, .{ .number = @floatFromInt(process.id) });
+    }
+
+    fn currentProcess(self: *Vm) anyerror!void {
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: себя() вызвано вне процесса", .{});
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .process = process });
     }
 
     fn createProcess(self: *Vm, function_id: bytecode.FunctionId, captures: []const value.Value, arguments: []const value.Value) !*value.Process {
@@ -2827,6 +2836,37 @@ test "VM partially destructures a named structure field" {
     switch (outcome) {
         .success => |runtime_value| switch (runtime_value) {
             .number => |number| try std.testing.expectEqual(@as(f64, 2), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM returns the current process" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ номер_себя() -> Число\nсебя().номер()\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 0), number),
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

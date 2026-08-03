@@ -487,24 +487,117 @@ const Checker = struct {
     fn inferUnary(self: *Checker, unary: anytype) anyerror!types.TypeId {
         const operand = try self.infer(unary.operand);
         return switch (unary.operator) {
-            .negate => self.result.types.builtins.boolean,
-            .tilde => self.result.types.builtins.integer,
+            .negate => blk: {
+                if (!self.isType(operand, self.result.types.builtins.boolean)) try self.report(unary.span, "Type Error: оператор 'не' ожидает Булево", .{});
+                break :blk self.result.types.builtins.boolean;
+            },
+            .tilde => blk: {
+                if (!self.isType(operand, self.result.types.builtins.integer)) try self.report(unary.span, "Type Error: оператор '~' ожидает Целое", .{});
+                break :blk self.result.types.builtins.integer;
+            },
+            .minus => blk: {
+                if (!self.isNumeric(operand)) {
+                    try self.report(unary.span, "Type Error: унарный '-' ожидает число", .{});
+                    break :blk try self.result.types.poison();
+                }
+                break :blk operand;
+            },
             else => operand,
         };
     }
 
     fn inferBinary(self: *Checker, binary: anytype) anyerror!types.TypeId {
-        const left = try self.infer(binary.left);
-        const right = try self.infer(binary.right);
+        var left = try self.infer(binary.left);
+        var right = try self.infer(binary.right);
+        left = try self.narrowIntegerLiteral(binary.left, left, right);
+        right = try self.narrowIntegerLiteral(binary.right, right, left);
         return switch (binary.operator) {
             .assign => blk: {
+                try self.checkAssignmentTarget(binary.left, binary.span);
                 if (!self.assignable(right, left)) try self.report(binary.span, "Type Error: присваивание несовместимых типов", .{});
                 break :blk self.result.types.builtins.void;
             },
-            .equal, .not_equal, .less, .less_equal, .greater, .greater_equal, .and_expr, .or_expr => self.result.types.builtins.boolean,
-            .plus => if (self.assignable(left, self.result.types.builtins.string) and self.assignable(right, self.result.types.builtins.string)) self.result.types.builtins.string else left,
-            else => left,
+            .equal, .not_equal => blk: {
+                if (!self.isPoison(left) and !self.isPoison(right) and !self.result.types.eql(left, right)) {
+                    try self.report(binary.span, "Type Error: оператор сравнения ожидает значения одного типа", .{});
+                }
+                break :blk self.result.types.builtins.boolean;
+            },
+            .less, .less_equal, .greater, .greater_equal => blk: {
+                if (!self.isPoison(left) and !self.isPoison(right) and (!self.isNumeric(left) or !self.isNumeric(right) or !self.result.types.eql(left, right))) {
+                    try self.report(binary.span, "Type Error: оператор сравнения ожидает два числа одного типа", .{});
+                }
+                break :blk self.result.types.builtins.boolean;
+            },
+            .and_expr, .or_expr => blk: {
+                if (!self.isPoison(left) and !self.isPoison(right) and (!self.isType(left, self.result.types.builtins.boolean) or !self.isType(right, self.result.types.builtins.boolean))) {
+                    try self.report(binary.span, "Type Error: логический оператор ожидает два значения Булево", .{});
+                }
+                break :blk self.result.types.builtins.boolean;
+            },
+            .plus => blk: {
+                if (self.isType(left, self.result.types.builtins.string) and self.isType(right, self.result.types.builtins.string)) break :blk self.result.types.builtins.string;
+                if (self.isPoison(left) or self.isPoison(right)) break :blk try self.result.types.poison();
+                if (!self.isNumeric(left) or !self.isNumeric(right) or !self.result.types.eql(left, right)) {
+                    try self.report(binary.span, "Type Error: оператор '+' ожидает два числа одного типа или две строки", .{});
+                    break :blk try self.result.types.poison();
+                }
+                break :blk left;
+            },
+            .minus, .star, .slash => blk: {
+                if (self.isPoison(left) or self.isPoison(right)) break :blk try self.result.types.poison();
+                if (!self.isNumeric(left) or !self.isNumeric(right) or !self.result.types.eql(left, right)) {
+                    try self.report(binary.span, "Type Error: арифметический оператор ожидает два числа одного типа", .{});
+                    break :blk try self.result.types.poison();
+                }
+                break :blk left;
+            },
+            .percent, .ampersand, .pipe, .caret, .less_less, .greater_greater => blk: {
+                if (self.isPoison(left) or self.isPoison(right)) break :blk try self.result.types.poison();
+                if (!self.isType(left, self.result.types.builtins.integer) or !self.isType(right, self.result.types.builtins.integer)) {
+                    try self.report(binary.span, "Type Error: целочисленный оператор ожидает два значения Целое", .{});
+                    break :blk try self.result.types.poison();
+                }
+                break :blk self.result.types.builtins.integer;
+            },
+            else => try self.result.types.poison(),
         };
+    }
+
+    fn narrowIntegerLiteral(self: *Checker, expression: ast.ExprId, inferred: types.TypeId, other: types.TypeId) !types.TypeId {
+        if (self.isType(inferred, self.result.types.builtins.number) and self.isType(other, self.result.types.builtins.integer)) {
+            return self.inferExpected(expression, self.result.types.builtins.integer);
+        }
+        return inferred;
+    }
+
+    fn checkAssignmentTarget(self: *Checker, expression: ast.ExprId, span: source.Span) !void {
+        switch (self.tree.expr(expression).*) {
+            .ident => {
+                const symbol = self.resolution.expr_symbols.get(expression) orelse return;
+                const entry = self.resolution.symbols.get(symbol) orelse return;
+                if (entry.kind == .constant or entry.is_const) {
+                    try self.report(span, "Type Error: нельзя присваивать константе", .{});
+                } else if (entry.kind != .variable) {
+                    try self.report(span, "Type Error: присваивание возможно только переменной, полю или индексу", .{});
+                }
+            },
+            .property, .index => {},
+            else => try self.report(span, "Type Error: присваивание возможно только переменной, полю или индексу", .{}),
+        }
+    }
+
+    fn isType(self: *const Checker, actual: types.TypeId, expected: types.TypeId) bool {
+        return self.result.types.eql(actual, expected);
+    }
+
+    fn isNumeric(self: *const Checker, type_id: types.TypeId) bool {
+        return self.isType(type_id, self.result.types.builtins.number) or self.isType(type_id, self.result.types.builtins.integer);
+    }
+
+    fn isPoison(self: *const Checker, type_id: types.TypeId) bool {
+        const entry = self.result.types.get(type_id) orelse return true;
+        return entry.* == .poison;
     }
 
     fn inferCall(self: *Checker, call: anytype) anyerror!types.TypeId {
@@ -515,7 +608,7 @@ const Checker = struct {
                 if (call.arguments.len != function.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов функции", .{});
                 const shared = @min(call.arguments.len, function.parameters.len);
                 for (call.arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
-                    if (!self.assignable(try self.infer(argument), parameter)) try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
+                    if (!self.assignable(try self.inferExpected(argument, parameter), parameter)) try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
                 }
                 return function.return_type;
             },
@@ -524,7 +617,7 @@ const Checker = struct {
                     if (call.arguments.len != fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора структуры", .{});
                     const shared = @min(call.arguments.len, fields.len);
                     for (call.arguments[0..shared], fields[0..shared]) |argument, field| {
-                        if (!self.assignable(try self.infer(argument), field.typ)) try self.report(call.span, "Type Error: аргумент конструктора не совпадает с типом поля", .{});
+                        if (!self.assignable(try self.inferExpected(argument, field.typ), field.typ)) try self.report(call.span, "Type Error: аргумент конструктора не совпадает с типом поля", .{});
                     }
                     return callee_type;
                 }
@@ -727,7 +820,7 @@ test "type checker checks struct constructors and field access" {
 test "type checker types destructuring and loop binders" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ сумма() -> Число\nпер (x, y) = (1, 2)\nпер результат = 0\nдля значение в массив(x, y) цикл\nрезультат = результат + значение\nконец\nдля индекс = 1 по 2 цикл\nрезультат = результат + индекс\nконец\nрезультат\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ сумма() -> Число\nпер (x, y) = (1, 2)\nпер результат = 0\nдля значение в массив(x, y) цикл\nрезультат = результат + значение\nконец\nпер целый_результат: Целое = 0\nдля индекс = 1 по 2 цикл\nцелый_результат = целый_результат + индекс\nконец\nрезультат\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -739,7 +832,7 @@ test "type checker types destructuring and loop binders" {
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
     const function = parsed.ast.decl(parsed.ast.program.?.declarations[0]).function;
     const for_in_binder = resolved.stmt_bindings.get(function.body[2]).?[0];
-    const for_range_binder = resolved.stmt_bindings.get(function.body[3]).?[0];
+    const for_range_binder = resolved.stmt_bindings.get(function.body[4]).?[0];
     try std.testing.expectEqual(checked.types.builtins.number, checked.symbol_types.get(for_in_binder).?);
     try std.testing.expectEqual(checked.types.builtins.integer, checked.symbol_types.get(for_range_binder).?);
 }
@@ -778,4 +871,26 @@ test "type checker narrows integer literals in an expected context" {
     const sum = parsed.ast.decl(parsed.ast.program.?.declarations[1]).function;
     const expression = parsed.ast.stmt(sum.body[1]).expr.value;
     try std.testing.expectEqual(checked.types.builtins.integer, checked.expression_types.get(expression).?);
+}
+
+test "type checker validates operators and assignment targets" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ проверить(целое: Целое) -> Пусто\nконст неизменно = 1\nнеизменно = 2\nпер отрицание = не 1\nпер сумма = 1 + истина\nпер биты = целое & 2\nесли 1 и ложь тогда\n0\nиначе\n0\nконец\nпер финал = 0\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: нельзя присваивать константе", checked.diagnostics.items.items[0].message);
+    try std.testing.expectEqualStrings("Type Error: оператор 'не' ожидает Булево", checked.diagnostics.items.items[1].message);
+    try std.testing.expectEqualStrings("Type Error: оператор '+' ожидает два числа одного типа или две строки", checked.diagnostics.items.items[2].message);
+    try std.testing.expectEqualStrings("Type Error: логический оператор ожидает два значения Булево", checked.diagnostics.items.items[3].message);
+    const function = parsed.ast.decl(parsed.ast.program.?.declarations[0]).function;
+    const bitwise_value = parsed.ast.stmt(function.body[4]).let.value;
+    try std.testing.expectEqual(checked.types.builtins.integer, checked.expression_types.get(bitwise_value).?);
 }

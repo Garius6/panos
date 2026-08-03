@@ -65,8 +65,48 @@ pub export fn panos_check(source_len: i32) void {
     writeDiagnostics(&run, input, true);
 }
 
-pub export fn panos_hover(_: i32, _: i32) void {
-    setResult("null");
+pub export fn panos_hover(source_len: i32, utf16_offset: i32) void {
+    const input = sourceFromBuffer(source_len) orelse {
+        setResult("null");
+        return;
+    };
+    const byte_offset = utf16OffsetToByte(input, utf16_offset) orelse {
+        setResult("null");
+        return;
+    };
+    var analysis = panos_core.runner.analyzeSource(allocator, "плейграунд.ps", input) catch {
+        setResult("null");
+        return;
+    };
+    defer analysis.deinit();
+    if (analysis.hasErrors()) {
+        setResult("null");
+        return;
+    }
+    const tree = analysis.tree() orelse {
+        setResult("null");
+        return;
+    };
+    const expression = tree.findExpressionAt(0, @intCast(byte_offset)) orelse {
+        setResult("null");
+        return;
+    };
+    const type_name = analysis.expressionTypeName(expression) catch {
+        setResult("null");
+        return;
+    } orelse {
+        setResult("null");
+        return;
+    };
+    const span = panos_core.ast.exprSpan(tree.expr(expression).*);
+    result_len = 0;
+    appendResult("{\"type\":");
+    appendJsonString(type_name);
+    appendResult(",\"from\":");
+    appendNumber(byteOffsetToUtf16(input, span.start));
+    appendResult(",\"to\":");
+    appendNumber(byteOffsetToUtf16(input, span.end));
+    appendResult("}");
 }
 
 pub export fn panos_complete(_: i32, _: i32) void {
@@ -128,6 +168,33 @@ fn byteOffsetToUtf16(input: []const u8, byte_offset: u32) usize {
         byte_index = end;
     }
     return utf16_offset;
+}
+
+fn utf16OffsetToByte(input: []const u8, utf16_offset: i32) ?usize {
+    if (utf16_offset < 0) return null;
+    const target: usize = @intCast(utf16_offset);
+    var byte_index: usize = 0;
+    var current_offset: usize = 0;
+    while (byte_index < input.len) {
+        if (current_offset == target) return byte_index;
+        const sequence_len = std.unicode.utf8ByteSequenceLength(input[byte_index]) catch {
+            byte_index += 1;
+            current_offset += 1;
+            continue;
+        };
+        const end = byte_index + @as(usize, sequence_len);
+        if (end > input.len) return null;
+        const codepoint = std.unicode.utf8Decode(input[byte_index..end]) catch {
+            byte_index += 1;
+            current_offset += 1;
+            continue;
+        };
+        const units: usize = if (codepoint > 0xffff) 2 else 1;
+        if (current_offset + units > target) return byte_index;
+        current_offset += units;
+        byte_index = end;
+    }
+    return if (current_offset == target) byte_index else null;
 }
 
 fn appendNumber(number: anytype) void {
@@ -199,4 +266,12 @@ test "browser check rejects unsupported imports" {
     panos_check(@intCast(input.len));
 
     try std.testing.expect(std.mem.indexOf(u8, result_buffer[0..result_len], "выполнение импортов ещё не поддержано Zig-версией") != null);
+}
+
+test "browser hover returns an inferred type at a UTF-16 offset" {
+    const input = "экспорт функ старт() -> Число\n42\nконец";
+    @memcpy(source_buffer[0..input.len], input);
+    panos_hover(@intCast(input.len), 30);
+
+    try std.testing.expectEqualStrings("{\"type\":\"Число\",\"from\":30,\"to\":32}", result_buffer[0..result_len]);
 }

@@ -118,6 +118,17 @@ const Compiler = struct {
         }
     }
 
+    fn registerComparableMethods(self: *Compiler) !void {
+        for (self.checked.interface_implementations.items) |implementation| {
+            const interface = self.resolution.symbols.get(implementation.interface) orelse continue;
+            if (!std.mem.eql(u8, interface.name, "Сравниваемое")) continue;
+            const target = self.resolution.symbols.get(implementation.target) orelse continue;
+            const method_symbol = implementation.methods[0];
+            const method = self.result.function_ids.get(method_symbol) orelse continue;
+            try self.result.program.addComparableMethod(target.name, method);
+        }
+    }
+
     fn compileLambdas(self: *Compiler) !void {
         for (self.tree.expressions.items, 0..) |expression, index| {
             const lambda = switch (expression) {
@@ -1373,6 +1384,7 @@ pub fn compile(
     defer compiler.deinit();
     try compiler.predeclareFunctions();
     try compiler.predeclareLambdas();
+    try compiler.registerComparableMethods();
     try compiler.compileFunctions();
     try compiler.compileLambdas();
     return result;

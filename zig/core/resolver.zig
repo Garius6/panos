@@ -118,6 +118,17 @@ const Resolver = struct {
         }
         try self.installPreludeEnum("Опция", &.{ "Нет", "Есть" });
         try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });
+        try self.installPreludeInterface("Сравниваемое");
+    }
+
+    fn installPreludeInterface(self: *Resolver, name: []const u8) !void {
+        const symbol = try self.result.symbols.add(.{
+            .name = name,
+            .kind = .type,
+            .is_exported = true,
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+        });
+        try self.scopes.declare(&self.result.symbols, symbol);
     }
 
     fn installPreludeEnum(self: *Resolver, name: []const u8, variant_names: []const []const u8) !void {

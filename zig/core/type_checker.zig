@@ -14,6 +14,7 @@ pub const NominalField = struct {
 pub const GenericParameter = struct {
     name: []const u8,
     typ: types.TypeId,
+    bounds: []const symbols.SymbolId = &.{},
 };
 
 pub const GenericNominal = struct {
@@ -298,6 +299,7 @@ const Checker = struct {
     fn preludePass(self: *Checker) !void {
         const option_symbol = self.findTypeSymbol("Опция") orelse return;
         const result_symbol = self.findTypeSymbol("Результат") orelse return;
+        const comparable_symbol = self.findTypeSymbol("Сравниваемое") orelse return;
         const option_parameters = try self.defineGenericEnumParameters(&.{"T"});
         const result_parameters = try self.defineGenericEnumParameters(&.{ "T", "E" });
         const option_variants = try self.result.arena.allocator().alloc(EnumVariant, 2);
@@ -329,6 +331,16 @@ const Checker = struct {
         try self.result.enum_definitions.put(result_symbol, .{
             .parameters = result_parameters,
             .variants = result_variants,
+        });
+        const comparable_methods = try self.result.arena.allocator().alloc(InterfaceMethod, 1);
+        comparable_methods[0] = .{
+            .name = "сравнить",
+            .parameters = &.{self.result.types.builtins.never},
+            .return_type = self.result.types.builtins.number,
+        };
+        try self.result.interface_definitions.put(comparable_symbol, .{
+            .parameters = &.{},
+            .methods = comparable_methods,
         });
     }
 
@@ -430,7 +442,7 @@ const Checker = struct {
                 continue;
             };
             try implementation_methods.append(self.result.allocator, method_symbol);
-            if (!try self.interfaceMethodMatches(owner, owner_parameters, method_symbol, interface_method)) valid = false;
+            if (!try self.interfaceMethodMatches(interface_symbol, owner, owner_parameters, method_symbol, interface_method)) valid = false;
         }
         for (implementation.methods) |method| {
             const function = self.tree.decl(method).function;
@@ -447,7 +459,7 @@ const Checker = struct {
         });
     }
 
-    fn interfaceMethodMatches(self: *Checker, owner: symbols.SymbolId, owner_parameters: []const GenericParameter, method_symbol: symbols.SymbolId, interface_method: InterfaceMethod) !bool {
+    fn interfaceMethodMatches(self: *Checker, interface: symbols.SymbolId, owner: symbols.SymbolId, owner_parameters: []const GenericParameter, method_symbol: symbols.SymbolId, interface_method: InterfaceMethod) !bool {
         const signature_id = self.result.symbol_types.get(method_symbol) orelse return false;
         const signature = self.result.types.get(signature_id) orelse return false;
         const function = switch (signature.*) {
@@ -465,6 +477,13 @@ const Checker = struct {
         if (!self.result.types.eql(function.parameters[0], receiver)) {
             try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: первый аргумент метода должен иметь тип реализующего типа", .{});
             return false;
+        }
+        if (self.isComparableInterface(interface)) {
+            if (function.parameters.len != 2 or !self.result.types.eql(function.parameters[1], receiver) or !self.result.types.eql(function.return_type, self.result.types.builtins.number)) {
+                try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: сигнатура метода 'сравнить' должна принимать реализующий тип и возвращать Число", .{});
+                return false;
+            }
+            return true;
         }
         for (function.parameters[1..], interface_method.parameters) |parameter, expected| {
             if (!self.result.types.eql(parameter, expected)) {
@@ -1275,7 +1294,8 @@ const Checker = struct {
                 break :blk self.result.types.builtins.boolean;
             },
             .less, .less_equal, .greater, .greater_equal => blk: {
-                if (!self.isPoison(left) and !self.isPoison(right) and (!self.isNumeric(left) or !self.isNumeric(right) or !self.result.types.eql(left, right))) {
+                const comparable = self.isComparableGeneric(left) and self.result.types.eql(left, right);
+                if (!self.isPoison(left) and !self.isPoison(right) and !comparable and (!self.isNumeric(left) or !self.isNumeric(right) or !self.result.types.eql(left, right))) {
                     try self.report(binary.span, "Type Error: оператор сравнения ожидает два числа одного типа", .{});
                 }
                 break :blk self.result.types.builtins.boolean;
@@ -1344,6 +1364,16 @@ const Checker = struct {
 
     fn isNumeric(self: *const Checker, type_id: types.TypeId) bool {
         return self.isType(type_id, self.result.types.builtins.number) or self.isType(type_id, self.result.types.builtins.integer);
+    }
+
+    fn isComparableGeneric(self: *const Checker, type_id: types.TypeId) bool {
+        for (self.current_generic_parameters) |parameter| {
+            if (parameter.typ != type_id) continue;
+            for (parameter.bounds) |bound| {
+                if (self.isComparableInterface(bound)) return true;
+            }
+        }
+        return false;
     }
 
     fn isPoison(self: *const Checker, type_id: types.TypeId) bool {
@@ -1549,6 +1579,15 @@ const Checker = struct {
                     for (generic_parameters) |parameter| {
                         if (!substitutions.contains(parameter.typ)) try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
                     }
+                    for (generic_parameters) |parameter| {
+                        const actual = substitutions.get(parameter.typ) orelse continue;
+                        for (parameter.bounds) |bound| {
+                            if (!self.satisfiesInterfaceBound(actual, bound)) {
+                                const interface = self.resolution.symbols.get(bound) orelse continue;
+                                try self.report(call.span, "Type Error: тип аргумента не реализует ограничение '{s}'", .{interface.name});
+                            }
+                        }
+                    }
                     for (call.arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
                         const expected = try self.substituteGeneric(parameter, &substitutions);
                         const actual = try self.inferExpected(argument, expected);
@@ -1729,6 +1768,28 @@ const Checker = struct {
             if (implementation.interface == interface and implementation.target == target) return implementation;
         }
         return null;
+    }
+
+    fn isComparableInterface(self: *const Checker, interface: symbols.SymbolId) bool {
+        const entry = self.resolution.symbols.get(interface) orelse return false;
+        return std.mem.eql(u8, entry.name, "Сравниваемое");
+    }
+
+    fn satisfiesInterfaceBound(self: *const Checker, actual: types.TypeId, interface: symbols.SymbolId) bool {
+        if (self.isComparableInterface(interface) and self.isNumeric(actual)) return true;
+        const actual_entry = self.result.types.get(actual) orelse return false;
+        if (actual_entry.* == .generic_parameter) {
+            for (self.current_generic_parameters) |parameter| {
+                if (parameter.typ != actual) continue;
+                for (parameter.bounds) |bound| if (bound == interface) return true;
+            }
+            return false;
+        }
+        const nominal = switch (actual_entry.*) {
+            .nominal => |value| value,
+            else => return false,
+        };
+        return self.interfaceImplementation(interface, nominal.symbol) != null;
     }
 
     fn isImplementableNominal(self: *const Checker, symbol: symbols.SymbolId) bool {
@@ -1981,9 +2042,23 @@ const Checker = struct {
         if (self.result.generic_function_parameters.get(symbol)) |existing| return existing;
         const generic_parameters = try self.result.arena.allocator().alloc(GenericParameter, parameters.len);
         for (parameters, generic_parameters) |parameter, *generic_parameter| {
+            var bounds: std.ArrayList(symbols.SymbolId) = .empty;
+            defer bounds.deinit(self.result.allocator);
+            for (parameter.bounds) |bound_name| {
+                const bound = self.findTypeSymbol(bound_name) orelse {
+                    try self.report(self.resolution.symbols.get(symbol).?.span, "Type Error: неизвестный интерфейс '{s}'", .{bound_name});
+                    continue;
+                };
+                if (!self.result.interface_definitions.contains(bound)) {
+                    try self.report(self.resolution.symbols.get(symbol).?.span, "Type Error: ограничение '{s}' должно быть интерфейсом", .{bound_name});
+                    continue;
+                }
+                try bounds.append(self.result.allocator, bound);
+            }
             generic_parameter.* = .{
                 .name = parameter.name,
                 .typ = try self.result.types.genericParameter(self.next_generic_parameter),
+                .bounds = try self.result.arena.allocator().dupe(symbols.SymbolId, bounds.items),
             };
             self.next_generic_parameter += 1;
         }
@@ -2527,4 +2602,20 @@ test "type checker restricts try expressions to compatible return envelopes" {
     try std.testing.expectEqual(@as(usize, 2), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("Type Error: оператор '?' для Опции можно использовать только в функции, возвращающей Опцию", checked.diagnostics.items.items[0].message);
     try std.testing.expectEqualStrings("Type Error: оператор '?' возвращает ошибку другого типа", checked.diagnostics.items.items[1].message);
+}
+
+test "type checker enforces Comparable generic bounds" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ макс[T: Сравниваемое](a: T, b: T) -> T\nесли a > b тогда a иначе b конец\nконец\nфунк неверно() -> Строка\nмакс(\"a\", \"b\")\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: тип аргумента не реализует ограничение 'Сравниваемое'", checked.diagnostics.items.items[0].message);
 }

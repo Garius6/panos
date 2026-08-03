@@ -173,10 +173,16 @@ pub const Function = struct {
     }
 };
 
+pub const ComparableMethod = struct {
+    type_name: []const u8,
+    function_id: FunctionId,
+};
+
 pub const Program = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     functions: std.ArrayList(Function) = .empty,
+    comparable_methods: std.ArrayList(ComparableMethod) = .empty,
     entry: FunctionId = invalid_function,
 
     pub fn init(allocator: std.mem.Allocator) Program {
@@ -188,6 +194,7 @@ pub const Program = struct {
 
     pub fn deinit(self: *Program) void {
         for (self.functions.items) |*compiled_function| compiled_function.deinit(self.allocator);
+        self.comparable_methods.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.arena.deinit();
         self.* = undefined;
@@ -217,6 +224,25 @@ pub const Program = struct {
 
     pub fn copyString(self: *Program, value: []const u8) ![]const u8 {
         return self.arena.allocator().dupe(u8, value);
+    }
+
+    pub fn addComparableMethod(self: *Program, type_name: []const u8, function_id: FunctionId) !void {
+        try self.comparable_methods.append(self.allocator, .{
+            .type_name = try self.copyString(type_name),
+            .function_id = function_id,
+        });
+    }
+
+    pub fn comparableMethod(self: *const Program, type_name: []const u8) ?FunctionId {
+        for (self.comparable_methods.items) |method| {
+            if (std.mem.eql(u8, method.type_name, type_name)) return method.function_id;
+        }
+        const separator = std.mem.indexOfScalar(u8, type_name, '.') orelse return null;
+        const owner = type_name[0..separator];
+        for (self.comparable_methods.items) |method| {
+            if (std.mem.eql(u8, method.type_name, owner)) return method.function_id;
+        }
+        return null;
     }
 };
 

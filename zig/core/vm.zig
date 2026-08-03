@@ -353,15 +353,92 @@ pub const Vm = struct {
     const Comparison = enum { less, less_equal, greater, greater_equal };
 
     fn compare(self: *Vm, comparison: Comparison) anyerror!void {
-        const right = try self.number(try self.pop());
-        const left = try self.number(try self.pop());
-        const result = switch (comparison) {
-            .less => left < right,
-            .less_equal => left <= right,
-            .greater => left > right,
-            .greater_equal => left >= right,
+        const right_value = try self.pop();
+        const left_value = try self.pop();
+        const result = switch (right_value) {
+            .number => |right| blk: {
+                const left = try self.number(left_value);
+                break :blk switch (comparison) {
+                    .less => left < right,
+                    .less_equal => left <= right,
+                    .greater => left > right,
+                    .greater_equal => left >= right,
+                };
+            },
+            else => blk: {
+                const left_aggregate = switch (left_value) {
+                    .aggregate => |aggregate| aggregate,
+                    else => {
+                        try self.fault("Runtime Error: оператор сравнения ожидает числа или Сравниваемое", .{});
+                        return;
+                    },
+                };
+                const right_aggregate = switch (right_value) {
+                    .aggregate => |aggregate| aggregate,
+                    else => {
+                        try self.fault("Runtime Error: оператор сравнения ожидает числа или Сравниваемое", .{});
+                        return;
+                    },
+                };
+                const type_name = left_aggregate.name orelse {
+                    try self.fault("Runtime Error: оператор сравнения ожидает числа или Сравниваемое", .{});
+                    return;
+                };
+                if (right_aggregate.name == null or !std.mem.eql(u8, type_name, right_aggregate.name.?)) {
+                    try self.fault("Runtime Error: оператор сравнения ожидает значения одного типа", .{});
+                    return;
+                }
+                const method = self.program.comparableMethod(type_name) orelse {
+                    try self.fault("Runtime Error: тип не реализует Сравниваемое", .{});
+                    return;
+                };
+                const ordering = try self.number(try self.invokeComparable(method, left_value, right_value));
+                break :blk switch (comparison) {
+                    .less => ordering < 0,
+                    .less_equal => ordering <= 0,
+                    .greater => ordering > 0,
+                    .greater_equal => ordering >= 0,
+                };
+            },
         };
         try self.stack.append(self.allocator, .{ .boolean = result });
+    }
+
+    fn invokeComparable(self: *Vm, function_id: bytecode.FunctionId, receiver: value.Value, other: value.Value) anyerror!value.Value {
+        const saved_stack = self.stack;
+        const saved_frames = self.frames;
+        const saved_failure = self.failure;
+        var nested_failure: ?*value.HeapString = null;
+        self.stack = .empty;
+        self.frames = .empty;
+        self.failure = null;
+        defer {
+            self.clearFrames();
+            self.frames.deinit(self.allocator);
+            self.stack.deinit(self.allocator);
+            self.stack = saved_stack;
+            self.frames = saved_frames;
+            self.failure = nested_failure orelse saved_failure;
+        }
+
+        self.pushFrame(function_id, &.{}, &.{ receiver, other }) catch |err| switch (err) {
+            error.RuntimeFault => {
+                nested_failure = self.failure;
+                return err;
+            },
+            else => return err,
+        };
+        while (self.frames.items.len != 0) {
+            const completed = self.step() catch |err| switch (err) {
+                error.RuntimeFault => {
+                    nested_failure = self.failure;
+                    return err;
+                },
+                else => return err,
+            };
+            if (completed) |result| return result;
+        }
+        return .{ .void = {} };
     }
 
     fn equal(self: *Vm, negate: bool) anyerror!void {
@@ -2641,5 +2718,55 @@ test "VM guards process sends against non-process values" {
     switch (outcome) {
         .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: отправить() ожидает Процесс(T) первым аргументом", message),
         .success => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM compares bounded generic values through Comparable" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Точка = структура
+        \\    x: Число
+        \\конец
+        \\реализация Сравниваемое для Точка
+        \\    функ сравнить(это: Точка, другое: Точка) -> Число
+        \\        это.x - другое.x
+        \\    конец
+        \\конец
+        \\функ макс[T: Сравниваемое](a: T, b: T) -> T
+        \\    если a > b тогда a иначе b конец
+        \\конец
+        \\функ проверить() -> Булево
+        \\    пер максимум_чисел = макс(3, 7)
+        \\    пер максимум_точек = макс(Точка(1), Точка(2))
+        \\    максимум_чисел == 7 и максимум_точек.x == 2
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    try std.testing.expect(compiled.program.comparableMethod("Точка") != null);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .boolean => |result| try std.testing.expect(result),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
     }
 }

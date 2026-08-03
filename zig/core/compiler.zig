@@ -221,6 +221,14 @@ const FunctionCompiler = struct {
                 if (!keep_value) try self.function.emit(self.compiler.result.allocator, .{ .pop = {} });
                 break :blk keep_value;
             },
+            .for_in => |loop| blk: {
+                try self.compileForIn(statement, loop);
+                if (keep_value) {
+                    try self.emitVoid();
+                    break :blk true;
+                }
+                break :blk false;
+            },
             .for_range => |range| blk: {
                 try self.compileForRange(statement, range);
                 if (keep_value) {
@@ -377,6 +385,44 @@ const FunctionCompiler = struct {
         try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
         try self.enterLoop();
         try self.compileBlockStatements(range.body);
+        const continue_target = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = index_slot });
+        try self.emitConstant(.{ .number = 1 });
+        try self.function.emit(self.compiler.result.allocator, .{ .add = {} });
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = index_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .jump = loop_start });
+        const exit_target = self.function.instructions.items.len;
+        self.patchJump(exit_jump, exit_target);
+        self.leaveLoop(continue_target, exit_target);
+    }
+
+    fn compileForIn(self: *FunctionCompiler, statement: ast.StmtId, loop: anytype) !void {
+        const bindings = self.compiler.resolution.stmt_bindings.get(statement) orelse &.{};
+        if (bindings.len != 1) {
+            try self.compiler.report(loop.span, "Compiler Error: цикл 'для ... в' ожидает одну переменную массива", .{});
+            return;
+        }
+        const array_slot = try self.allocateLocal();
+        const index_slot = try self.allocateLocal();
+        const element_slot = try self.ensureLocal(bindings[0]);
+        try self.compileExpression(loop.iterable);
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = array_slot });
+        try self.emitConstant(.{ .number = 0 });
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = index_slot });
+
+        const loop_start = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = index_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = array_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .array_length = {} });
+        try self.function.emit(self.compiler.result.allocator, .{ .less = {} });
+        const exit_jump = self.function.instructions.items.len;
+        try self.function.emit(self.compiler.result.allocator, .{ .jump_if_false = 0 });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = array_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_local = index_slot });
+        try self.function.emit(self.compiler.result.allocator, .{ .get_index = {} });
+        try self.function.emit(self.compiler.result.allocator, .{ .set_local = element_slot });
+        try self.enterLoop();
+        try self.compileBlockStatements(loop.body);
         const continue_target = self.function.instructions.items.len;
         try self.function.emit(self.compiler.result.allocator, .{ .get_local = index_slot });
         try self.emitConstant(.{ .number = 1 });

@@ -99,6 +99,7 @@ pub const Vm = struct {
             .build_tuple => |count| try self.buildAggregate(null, count),
             .build_struct => |structure| try self.buildStruct(compiled, structure),
             .build_array => |count| try self.buildArray(count),
+            .array_length => try self.arrayLength(),
             .build_map => |count| try self.buildMap(count),
             .get_index => try self.getIndex(),
             .set_index => try self.setIndex(),
@@ -386,6 +387,18 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .array = array });
     }
 
+    fn arrayLength(self: *Vm) anyerror!void {
+        const runtime_value = try self.pop();
+        const array = switch (runtime_value) {
+            .array => |array| array,
+            else => {
+                try self.fault("Runtime Error: длина доступна только для массива", .{});
+                return;
+            },
+        };
+        try self.stack.append(self.allocator, .{ .number = @floatFromInt(array.elements.len) });
+    }
+
     fn buildMap(self: *Vm, count: u16) !void {
         const values = try self.popValues(@as(usize, count) * 2);
         const map = try self.arena.allocator().create(value.Map);
@@ -550,6 +563,25 @@ test "VM reports division by zero without crashing" {
     }
 }
 
+test "VM guards array length against non-array values" {
+    var program = bytecode.Program.init(std.testing.allocator);
+    defer program.deinit();
+    const function_id = try program.addFunction("длина", 0);
+    const function = program.function(function_id).?;
+    const number = try function.addConstant(std.testing.allocator, .{ .number = 1 });
+    try function.emit(std.testing.allocator, .{ .constant = number });
+    try function.emit(std.testing.allocator, .{ .array_length = {} });
+    try function.emit(std.testing.allocator, .{ .return_value = {} });
+
+    var vm = Vm.init(std.testing.allocator, &program);
+    defer vm.deinit();
+    const outcome = try vm.run(function_id, &.{});
+    switch (outcome) {
+        .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Error: длина доступна только для массива", message),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM executes structures and mutable collections" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -603,6 +635,36 @@ test "VM executes numeric ranges with continue and break" {
     switch (outcome) {
         .success => |runtime_value| switch (runtime_value) {
             .number => |number| try std.testing.expectEqual(@as(f64, 4), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM executes array loops with continue and break" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ сумма() -> Число\nпер числа = массив(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)\nпер итог = 0\nпер посещено = 0\nдля число в числа цикл\nпосещено = посещено + 1\nесли посещено == 8 тогда\nпрервать\nконец\nесли число == 3 тогда\nпродолжить\nконец\nитог = итог + число\nконец\nитог\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 25), number),
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

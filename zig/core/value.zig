@@ -3,7 +3,7 @@ const bytecode = @import("bytecode.zig");
 
 pub const Aggregate = struct {
     name: ?[]const u8 = null,
-    elements: []const Value,
+    elements: []Value,
 };
 
 pub const Array = struct {
@@ -94,7 +94,7 @@ fn mapEql(left: *const Map, right: *const Map) bool {
 }
 
 test "values compare scalars and aggregates structurally" {
-    const tuple_values = [_]Value{ .{ .number = 1 }, .{ .string = "один" } };
+    var tuple_values = [_]Value{ .{ .number = 1 }, .{ .string = "один" } };
     var left = Aggregate{ .elements = &tuple_values };
     var right = Aggregate{ .elements = &tuple_values };
     var different_name = Aggregate{ .name = "Точка", .elements = &tuple_values };

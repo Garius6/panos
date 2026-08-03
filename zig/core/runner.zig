@@ -1,4 +1,5 @@
 const std = @import("std");
+const ast = @import("ast.zig");
 const bytecode = @import("bytecode.zig");
 const compiler = @import("compiler.zig");
 const diagnostic = @import("diagnostic.zig");
@@ -88,6 +89,7 @@ pub fn checkSource(allocator: std.mem.Allocator, path: []const u8, input: []cons
     var parsed = try parser.parse(allocator, lexed.tokens.items);
     defer parsed.deinit();
     try result.appendDiagnostics(&parsed.diagnostics);
+    if (try reportUnsupportedImports(&result, &parsed.ast)) return result;
 
     var resolved = try resolver.resolve(allocator, &parsed.ast);
     defer resolved.deinit();
@@ -112,6 +114,7 @@ pub fn runSourceWithVerbose(allocator: std.mem.Allocator, path: []const u8, inpu
     defer parsed.deinit();
     try result.appendDiagnostics(&parsed.diagnostics);
     if (verbose) result.verbose = .{ .declarations = parsed.ast.program.?.declarations.len };
+    if (try reportUnsupportedImports(&result, &parsed.ast)) return result;
 
     var resolved = try resolver.resolve(allocator, &parsed.ast);
     defer resolved.deinit();
@@ -141,6 +144,17 @@ pub fn runSourceWithVerbose(allocator: std.mem.Allocator, path: []const u8, inpu
         .runtime_error => |message| result.execution = .{ .runtime_error = try result.arena.allocator().dupe(u8, message) },
     }
     return result;
+}
+
+fn reportUnsupportedImports(result: *SourceRun, tree: *const ast.Ast) !bool {
+    for (tree.program.?.declarations) |declaration| {
+        const import = switch (tree.decl(declaration).*) {
+            .import => |entry| entry,
+            else => continue,
+        };
+        try result.report(.compiler, import.span, "Compiler Error: выполнение импортов ещё не поддержано Zig-версией");
+    }
+    return result.hasErrors();
 }
 
 fn findStartFunction(resolution: *const resolver.Resolution, compiled: *const compiler.CompileResult) ?bytecode.FunctionId {
@@ -187,5 +201,15 @@ test "checker accepts a valid program without an entry function" {
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
+    try std.testing.expect(result.execution == null);
+}
+
+test "runner rejects imports before a single-file execution" {
+    var result = try runSource(std.testing.allocator, "main.ps", "импорт \"математика\"\nэкспорт функ старт() -> Число\n1\nконец");
+    defer result.deinit();
+
+    try std.testing.expect(result.hasErrors());
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Compiler Error: выполнение импортов ещё не поддержано Zig-версией", result.diagnostics.items.items[0].message);
     try std.testing.expect(result.execution == null);
 }

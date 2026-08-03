@@ -192,3 +192,11 @@ test "browser check does not require an entry function" {
 
     try std.testing.expectEqualStrings("[]", result_buffer[0..result_len]);
 }
+
+test "browser check rejects unsupported imports" {
+    const input = "импорт \"математика\"";
+    @memcpy(source_buffer[0..input.len], input);
+    panos_check(@intCast(input.len));
+
+    try std.testing.expect(std.mem.indexOf(u8, result_buffer[0..result_len], "выполнение импортов ещё не поддержано Zig-версией") != null);
+}

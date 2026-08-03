@@ -157,6 +157,12 @@ pub const Program = struct {
         return &self.functions.items[index];
     }
 
+    pub fn functionConst(self: *const Program, id: FunctionId) ?*const Function {
+        const index = @intFromEnum(id);
+        if (index >= self.functions.items.len) return null;
+        return &self.functions.items[index];
+    }
+
     pub fn copyString(self: *Program, value: []const u8) ![]const u8 {
         return self.arena.allocator().dupe(u8, value);
     }

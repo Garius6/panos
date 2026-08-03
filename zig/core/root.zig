@@ -13,6 +13,7 @@ pub const target = @import("target.zig");
 pub const token = @import("token.zig");
 pub const type_checker = @import("type_checker.zig");
 pub const types = @import("types.zig");
+pub const value = @import("value.zig");
 
 pub const migration_stage = "phase-0";
 

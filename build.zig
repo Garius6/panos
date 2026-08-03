@@ -126,6 +126,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const value_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/value.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
     const cli_tests = b.addTest(.{ .root_module = panos.root_module });
     const conformance_module = b.addModule("panos_conformance", .{
         .root_source_file = b.path("zig/conformance/manifest.zig"),
@@ -190,6 +197,7 @@ pub fn build(b: *std.Build) void {
     const run_type_checker_unit_tests = b.addRunArtifact(type_checker_unit_tests);
     const run_bytecode_unit_tests = b.addRunArtifact(bytecode_unit_tests);
     const run_compiler_unit_tests = b.addRunArtifact(compiler_unit_tests);
+    const run_value_unit_tests = b.addRunArtifact(value_unit_tests);
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const run_manifest_tests = b.addRunArtifact(manifest_tests);
     const run_reference_tests = b.addRunArtifact(reference_tests);
@@ -207,6 +215,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_type_checker_unit_tests.step);
     test_step.dependOn(&run_bytecode_unit_tests.step);
     test_step.dependOn(&run_compiler_unit_tests.step);
+    test_step.dependOn(&run_value_unit_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_manifest_tests.step);
     test_step.dependOn(&run_reference_tests.step);

@@ -109,8 +109,52 @@ pub export fn panos_hover(source_len: i32, utf16_offset: i32) void {
     appendResult("}");
 }
 
-pub export fn panos_complete(_: i32, _: i32) void {
-    setResult("[]");
+pub export fn panos_complete(source_len: i32, utf16_offset: i32) void {
+    const input = sourceFromBuffer(source_len) orelse {
+        setResult("[]");
+        return;
+    };
+    const byte_offset = utf16OffsetToByte(input, utf16_offset) orelse {
+        setResult("[]");
+        return;
+    };
+    if (byte_offset < 2 or input[byte_offset - 1] != '.') {
+        setResult("[]");
+        return;
+    }
+    const placeholder = "__panos_completion__";
+    var patched_input: ?[]u8 = null;
+    defer if (patched_input) |bytes| allocator.free(bytes);
+    const analysis_input = blk: {
+        const bytes = allocator.alloc(u8, input.len + placeholder.len) catch break :blk input;
+        patched_input = bytes;
+        @memcpy(bytes[0..byte_offset], input[0..byte_offset]);
+        @memcpy(bytes[byte_offset .. byte_offset + placeholder.len], placeholder);
+        @memcpy(bytes[byte_offset + placeholder.len ..], input[byte_offset..]);
+        break :blk bytes;
+    };
+    var analysis = panos_core.runner.analyzeSource(allocator, "плейграунд.ps", analysis_input) catch {
+        setResult("[]");
+        return;
+    };
+    defer analysis.deinit();
+    const tree = analysis.tree() orelse {
+        setResult("[]");
+        return;
+    };
+    const expression = tree.findExpressionAt(0, @intCast(byte_offset - 2)) orelse {
+        setResult("[]");
+        return;
+    };
+    const checked = analysis.checkedResult() orelse {
+        setResult("[]");
+        return;
+    };
+    const type_id = checked.expression_types.get(expression) orelse {
+        setResult("[]");
+        return;
+    };
+    writeCompletions(checked, type_id);
 }
 
 fn sourceFromBuffer(source_len: i32) ?[]const u8 {
@@ -223,6 +267,57 @@ fn appendControlByte(byte: u8) void {
     appendResult(&.{ hex[byte >> 4], hex[byte & 0x0f] });
 }
 
+fn writeCompletions(checked: *const panos_core.type_checker.CheckResult, type_id: panos_core.types.TypeId) void {
+    result_len = 0;
+    appendResult("[");
+    var first = true;
+    const entry = checked.types.get(type_id) orelse {
+        appendResult("]");
+        return;
+    };
+    switch (entry.*) {
+        .array => {
+            appendCompletion(&first, "длина", "method");
+            appendCompletion(&first, "добавить", "method");
+            appendCompletion(&first, "получить", "method");
+            appendCompletion(&first, "есть", "method");
+            appendCompletion(&first, "содержит", "method");
+        },
+        .map => {
+            appendCompletion(&first, "длина", "method");
+            appendCompletion(&first, "есть", "method");
+            appendCompletion(&first, "получить", "method");
+            appendCompletion(&first, "удалить", "method");
+        },
+        .nominal => |nominal| {
+            if (checked.nominal_fields.get(nominal.symbol)) |fields| {
+                for (fields) |field| appendCompletion(&first, field.name, "field");
+            }
+            for (checked.methods.items) |method| {
+                if (method.owner == nominal.symbol) appendCompletion(&first, method.name, "method");
+            }
+            if (checked.interface_definitions.get(nominal.symbol)) |interface| {
+                for (interface.methods) |method| appendCompletion(&first, method.name, "method");
+            }
+            if (checked.enum_definitions.get(nominal.symbol)) |enumeration| {
+                for (enumeration.variants) |variant| appendCompletion(&first, variant.name, "variant");
+            }
+        },
+        else => {},
+    }
+    appendResult("]");
+}
+
+fn appendCompletion(first: *bool, label: []const u8, kind: []const u8) void {
+    if (!first.*) appendResult(",");
+    first.* = false;
+    appendResult("{\"label\":");
+    appendJsonString(label);
+    appendResult(",\"kind\":");
+    appendJsonString(kind);
+    appendResult("}");
+}
+
 fn setResult(value: []const u8) void {
     result_len = 0;
     appendResult(value);
@@ -274,4 +369,13 @@ test "browser hover returns an inferred type at a UTF-16 offset" {
     panos_hover(@intCast(input.len), 30);
 
     try std.testing.expectEqualStrings("{\"type\":\"Число\",\"from\":30,\"to\":32}", result_buffer[0..result_len]);
+}
+
+test "browser completion exposes array methods after a dot" {
+    const input = "экспорт функ старт() -> Пусто\nпер числа: Массив(Число) = массив()\nчисла.\nконец";
+    @memcpy(source_buffer[0..input.len], input);
+    const cursor = std.mem.indexOf(u8, input, "числа.").? + "числа.".len;
+    panos_complete(@intCast(input.len), @intCast(byteOffsetToUtf16(input, @intCast(cursor))));
+
+    try std.testing.expect(std.mem.indexOf(u8, result_buffer[0..result_len], "{\"label\":\"добавить\",\"kind\":\"method\"}") != null);
 }

@@ -9,6 +9,7 @@ const type_checker = @import("type_checker.zig");
 
 pub const CompileResult = struct {
     allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
     program: bytecode.Program,
     shared_program: ?*bytecode.Program = null,
     diagnostics: diagnostic.DiagnosticList = .{},
@@ -19,6 +20,7 @@ pub const CompileResult = struct {
     pub fn init(allocator: std.mem.Allocator) CompileResult {
         return .{
             .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
             .program = bytecode.Program.init(allocator),
             .function_ids = .init(allocator),
             .lambda_ids = .init(allocator),
@@ -36,6 +38,7 @@ pub const CompileResult = struct {
         self.function_ids.deinit();
         self.diagnostics.deinit(self.allocator);
         self.program.deinit();
+        self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -61,7 +64,6 @@ const Compiler = struct {
     resolution: *const resolver.Resolution,
     checked: *const type_checker.CheckResult,
     result: *CompileResult,
-    arena: std.heap.ArenaAllocator,
 
     fn init(
         tree: *const ast.Ast,
@@ -74,12 +76,10 @@ const Compiler = struct {
             .resolution = resolution,
             .checked = checked,
             .result = result,
-            .arena = std.heap.ArenaAllocator.init(result.allocator),
         };
     }
 
     fn deinit(self: *Compiler) void {
-        self.arena.deinit();
         self.* = undefined;
     }
 
@@ -88,7 +88,7 @@ const Compiler = struct {
     }
 
     fn report(self: *Compiler, span: source.Span, comptime format: []const u8, args: anytype) !void {
-        const message = try std.fmt.allocPrint(self.arena.allocator(), format, args);
+        const message = try std.fmt.allocPrint(self.result.arena.allocator(), format, args);
         _ = try self.result.diagnostics.appendUnique(self.result.allocator, .{
             .phase = .compiler,
             .severity = .err,
@@ -1486,7 +1486,7 @@ const FunctionCompiler = struct {
         const variant = self.compiler.resolution.symbols.get(variant_symbol) orelse return null;
         if (variant.kind != .enum_variant) return null;
         const owner = self.compiler.resolution.symbols.get(variant.owner_type) orelse return null;
-        const name = try std.fmt.allocPrint(self.compiler.arena.allocator(), "{s}.{s}", .{ owner.name, variant.name });
+        const name = try std.fmt.allocPrint(self.compiler.result.arena.allocator(), "{s}.{s}", .{ owner.name, variant.name });
         return name;
     }
 
@@ -1735,4 +1735,19 @@ test "compiler emits closures for captured lambdas" {
     try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
     try std.testing.expectEqual(@as(u16, 1), compiled.program.functions.items[1].capture_count);
     try std.testing.expectEqual(bytecode.Instruction{ .build_closure = .{ .function_id = @enumFromInt(1), .capture_count = 1 } }, compiled.program.functions.items[0].instructions.items[3]);
+}
+
+test "compiler diagnostics outlive the compilation pass" {
+    var result = CompileResult.init(std.testing.allocator);
+    defer result.deinit();
+    var compiler = Compiler{
+        .tree = undefined,
+        .resolution = undefined,
+        .checked = undefined,
+        .result = &result,
+    };
+    try compiler.report(.{ .file_id = 0, .start = 0, .end = 0 }, "Compiler Error: тестовое сообщение", .{});
+    compiler.deinit();
+
+    try std.testing.expectEqualStrings("Compiler Error: тестовое сообщение", result.diagnostics.items.items[0].message);
 }

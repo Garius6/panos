@@ -142,7 +142,7 @@ const Resolver = struct {
                 },
                 .impl => |value| for (value.methods) |method| {
                     const function = tree.decl(method).function;
-                    _ = try self.registerDeclaration(method, function.name, .function, function.span, false, false);
+                    _ = try self.registerMethod(method, function.name, function.span);
                 },
                 .import, .error_node => {},
             }
@@ -193,6 +193,16 @@ const Resolver = struct {
             error.DuplicateSymbol => try self.report(span, "Resolve Error: символ '{s}' уже объявлен", .{name}),
             else => return err,
         };
+        try self.result.decl_symbols.put(declaration, symbol);
+        return symbol;
+    }
+
+    fn registerMethod(self: *Resolver, declaration: ast.DeclId, name: []const u8, span: source.Span) !symbols.SymbolId {
+        const symbol = try self.result.symbols.add(.{
+            .name = name,
+            .kind = .function,
+            .span = span,
+        });
         try self.result.decl_symbols.put(declaration, symbol);
         return symbol;
     }

@@ -849,6 +849,35 @@ test "VM constructs generic structures" {
     }
 }
 
+test "VM executes generic structure methods" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Коробка[T] = структура\nзначение: T\nконец\nреализация Коробка\nфунк получить(это: Коробка) -> T\nэто.значение\nконец\nфунк обернуть[U](это: Коробка, значение: U) -> U\nзначение\nконец\nконец\nфунк старт() -> Строка\nпер коробка = Коробка(\"готово\")\nкоробка.получить() + коробка.обернуть(\"!\")\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| try std.testing.expectEqualStrings("готово!", runtime_value.stringBytes().?),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "VM constructs enum variants" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");

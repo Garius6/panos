@@ -343,7 +343,7 @@ const FunctionCompiler = struct {
                 try self.function.emit(self.compiler.result.allocator, instruction);
             },
             .binary => |binary| try self.compileBinary(binary),
-            .call => |call| try self.compileCall(call),
+            .call => |call| try self.compileCall(expression, call),
             .tuple => |tuple| try self.compileSequence(tuple.elements, .build_tuple),
             .array => |array| try self.compileSequence(array.elements, .build_array),
             .map => |map| try self.compileMap(map),
@@ -384,9 +384,25 @@ const FunctionCompiler = struct {
         } });
     }
 
-    fn compileCall(self: *FunctionCompiler, call: anytype) !void {
+    fn compileCall(self: *FunctionCompiler, expression: ast.ExprId, call: anytype) !void {
         if (call.argument_names != null) try self.compiler.report(call.span, "Compiler Error: именованные аргументы пока не поддержаны", .{});
         if (try self.compileCollectionMethod(call)) return;
+        if (self.compiler.checked.method_calls.get(expression)) |method| {
+            const property = switch (self.compiler.tree.expr(call.callee).*) {
+                .property => |value| value,
+                else => return self.unsupportedExpression(call.span),
+            };
+            const function_id = self.compiler.result.function_ids.get(method) orelse {
+                try self.compiler.report(call.span, "Compiler Error: не удалось найти метод", .{});
+                return self.emitVoid();
+            };
+            try self.emitConstant(.{ .function_ref = function_id });
+            try self.compileExpression(property.object);
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            if (call.arguments.len == std.math.maxInt(u16)) return error.ArgumentLimitReached;
+            try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(call.arguments.len + 1) });
+            return;
+        }
         if (try self.enumConstructor(call.callee)) |enumeration| {
             for (call.arguments) |argument| try self.compileExpression(argument);
             if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;

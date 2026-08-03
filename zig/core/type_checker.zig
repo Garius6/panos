@@ -32,6 +32,20 @@ pub const EnumDefinition = struct {
     variants: []const EnumVariant,
 };
 
+pub const MethodDefinition = struct {
+    owner: symbols.SymbolId,
+    symbol: symbols.SymbolId,
+    name: []const u8,
+    owner_parameters: []const GenericParameter,
+    function_parameters: []const GenericParameter,
+    all_parameters: []const GenericParameter,
+};
+
+const NominalOwner = struct {
+    symbol: symbols.SymbolId,
+    parameters: []const GenericParameter,
+};
+
 pub const CheckResult = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -46,6 +60,8 @@ pub const CheckResult = struct {
     generic_nominal_fields: std.AutoHashMap(symbols.SymbolId, GenericNominal),
     enum_definitions: std.AutoHashMap(symbols.SymbolId, EnumDefinition),
     pattern_variants: std.AutoHashMap(ast.PatternId, symbols.SymbolId),
+    methods: std.ArrayList(MethodDefinition) = .empty,
+    method_calls: std.AutoHashMap(ast.ExprId, symbols.SymbolId),
 
     pub fn init(allocator: std.mem.Allocator) !CheckResult {
         return .{
@@ -61,10 +77,13 @@ pub const CheckResult = struct {
             .generic_nominal_fields = .init(allocator),
             .enum_definitions = .init(allocator),
             .pattern_variants = .init(allocator),
+            .method_calls = .init(allocator),
         };
     }
 
     pub fn deinit(self: *CheckResult) void {
+        self.method_calls.deinit();
+        self.methods.deinit(self.allocator);
         self.pattern_variants.deinit();
         self.enum_definitions.deinit();
         self.generic_nominal_fields.deinit();
@@ -87,6 +106,7 @@ const Checker = struct {
     result: *CheckResult,
     current_return: ?types.TypeId = null,
     current_generic_parameters: []const GenericParameter = &.{},
+    current_nominal_owner: ?NominalOwner = null,
     loop_depth: usize = 0,
     next_generic_parameter: u32 = 1,
     resolving_aliases: std.AutoHashMap(symbols.SymbolId, void),
@@ -106,9 +126,17 @@ const Checker = struct {
             switch (self.tree.decl(declaration).*) {
                 .function => |function| try self.defineFunctionSignature(declaration, function.type_parameters, function.parameters, function.return_type),
                 .foreign => {},
-                .impl => |implementation| for (implementation.methods) |method| {
-                    const function = self.tree.decl(method).function;
-                    try self.defineFunctionSignature(method, function.type_parameters, function.parameters, function.return_type);
+                .impl => |implementation| {
+                    if (implementation.interface_name != null) continue;
+                    const owner = self.findTypeSymbol(implementation.target_type) orelse {
+                        try self.report(implementation.span, "Type Error: неизвестный тип реализации '{s}'", .{implementation.target_type});
+                        continue;
+                    };
+                    const owner_parameters = self.nominalParameters(owner);
+                    for (implementation.methods) |method| {
+                        const function = self.tree.decl(method).function;
+                        try self.defineMethodSignature(method, owner, owner_parameters, function.type_parameters, function.parameters, function.return_type);
+                    }
                 },
                 else => {},
             }
@@ -198,6 +226,9 @@ const Checker = struct {
         const previous_generic_parameters = self.current_generic_parameters;
         self.current_generic_parameters = generic_parameters;
         defer self.current_generic_parameters = previous_generic_parameters;
+        const previous_nominal_owner = self.current_nominal_owner;
+        self.current_nominal_owner = null;
+        defer self.current_nominal_owner = previous_nominal_owner;
         var parameter_types: std.ArrayList(types.TypeId) = .empty;
         defer parameter_types.deinit(self.result.allocator);
         for (parameters) |parameter| {
@@ -205,6 +236,37 @@ const Checker = struct {
         }
         const signature = try self.result.types.function(parameter_types.items, try self.resolveType(return_type));
         try self.result.symbol_types.put(symbol, signature);
+    }
+
+    fn defineMethodSignature(self: *Checker, declaration: ast.DeclId, owner: symbols.SymbolId, owner_parameters: []const GenericParameter, function_parameters: []const ast.TypeParameter, parameters: []const ast.ParamDecl, return_type: ast.TypeId) !void {
+        const symbol = self.resolution.decl_symbols.get(declaration) orelse return;
+        const method_parameters = try self.defineGenericParameters(symbol, function_parameters);
+        var all_parameters: std.ArrayList(GenericParameter) = .empty;
+        defer all_parameters.deinit(self.result.allocator);
+        try all_parameters.appendSlice(self.result.allocator, owner_parameters);
+        try all_parameters.appendSlice(self.result.allocator, method_parameters);
+        const parameter_scope = try self.result.arena.allocator().dupe(GenericParameter, all_parameters.items);
+        const previous_generic_parameters = self.current_generic_parameters;
+        self.current_generic_parameters = parameter_scope;
+        defer self.current_generic_parameters = previous_generic_parameters;
+        const previous_nominal_owner = self.current_nominal_owner;
+        self.current_nominal_owner = .{ .symbol = owner, .parameters = owner_parameters };
+        defer self.current_nominal_owner = previous_nominal_owner;
+        var parameter_types: std.ArrayList(types.TypeId) = .empty;
+        defer parameter_types.deinit(self.result.allocator);
+        for (parameters) |parameter| {
+            try parameter_types.append(self.result.allocator, try self.resolveType(parameter.type_annotation.?));
+        }
+        const signature = try self.result.types.function(parameter_types.items, try self.resolveType(return_type));
+        try self.result.symbol_types.put(symbol, signature);
+        try self.result.methods.append(self.result.allocator, .{
+            .owner = owner,
+            .symbol = symbol,
+            .name = self.tree.decl(declaration).function.name,
+            .owner_parameters = owner_parameters,
+            .function_parameters = method_parameters,
+            .all_parameters = parameter_scope,
+        });
     }
 
     fn bodyPass(self: *Checker) !void {
@@ -229,9 +291,13 @@ const Checker = struct {
         const function_symbol = self.resolution.decl_symbols.get(declaration) orelse return;
         const signature = self.result.symbol_types.get(function_symbol) orelse return;
         const function_type = self.result.types.get(signature).?.function;
+        const method = self.methodBySymbol(function_symbol);
         const previous_generic_parameters = self.current_generic_parameters;
-        self.current_generic_parameters = self.result.generic_function_parameters.get(function_symbol) orelse &.{};
+        self.current_generic_parameters = if (method) |definition| definition.all_parameters else self.result.generic_function_parameters.get(function_symbol) orelse &.{};
         defer self.current_generic_parameters = previous_generic_parameters;
+        const previous_nominal_owner = self.current_nominal_owner;
+        self.current_nominal_owner = if (method) |definition| .{ .symbol = definition.owner, .parameters = definition.owner_parameters } else null;
+        defer self.current_nominal_owner = previous_nominal_owner;
         const previous_return = self.current_return;
         self.current_return = function_type.return_type;
         defer self.current_return = previous_return;
@@ -296,7 +362,7 @@ const Checker = struct {
             },
             .unary => |unary| try self.inferUnary(unary),
             .binary => |binary| try self.inferBinary(binary),
-            .call => |call| try self.inferCall(call),
+            .call => |call| try self.inferCall(expression, call),
             .tuple => |tuple| blk: {
                 var element_types: std.ArrayList(types.TypeId) = .empty;
                 defer element_types.deinit(self.result.allocator);
@@ -892,13 +958,14 @@ const Checker = struct {
         return entry.* == .poison;
     }
 
-    fn inferCall(self: *Checker, call: anytype) anyerror!types.TypeId {
+    fn inferCall(self: *Checker, expression: ast.ExprId, call: anytype) anyerror!types.TypeId {
         if (self.resolution.expr_symbols.get(call.callee)) |symbol| {
             if (self.enumVariant(symbol)) |variant| return self.inferEnumVariantCall(call, variant);
         }
         switch (self.tree.expr(call.callee).*) {
             .property => |property| {
                 const object_type = try self.infer(property.object);
+                if (try self.inferMethodCall(expression, call, property, object_type)) |method_type| return method_type;
                 const object = self.result.types.get(object_type) orelse return self.result.types.poison();
                 switch (object.*) {
                     .array => |element| {
@@ -1065,6 +1132,14 @@ const Checker = struct {
             .ident => |ident| self.findGenericParameter(ident.name) orelse builtinType(&self.result.types, ident.name) orelse blk: {
                 if (self.findTypeSymbol(ident.name)) |symbol| {
                     if (self.result.alias_type_nodes.contains(symbol)) break :blk try self.resolveAlias(symbol, ident.span);
+                    if (self.current_nominal_owner) |owner| {
+                        if (owner.symbol == symbol) {
+                            var arguments: std.ArrayList(types.TypeId) = .empty;
+                            defer arguments.deinit(self.result.allocator);
+                            for (owner.parameters) |parameter| try arguments.append(self.result.allocator, parameter.typ);
+                            break :blk try self.result.types.nominal(symbol, arguments.items);
+                        }
+                    }
                     break :blk try self.result.types.nominal(symbol, &.{});
                 }
                 try self.report(ident.span, "Type Error: неизвестный тип '{s}'", .{ident.name});
@@ -1110,6 +1185,68 @@ const Checker = struct {
             if (entry.kind == .type and std.mem.eql(u8, entry.name, name)) return @enumFromInt(index);
         }
         return null;
+    }
+
+    fn nominalParameters(self: *const Checker, symbol: symbols.SymbolId) []const GenericParameter {
+        if (self.result.generic_nominal_fields.get(symbol)) |nominal| return nominal.parameters;
+        if (self.result.enum_definitions.get(symbol)) |enumeration| return enumeration.parameters;
+        return &.{};
+    }
+
+    fn methodBySymbol(self: *const Checker, symbol: symbols.SymbolId) ?MethodDefinition {
+        for (self.result.methods.items) |method| {
+            if (method.symbol == symbol) return method;
+        }
+        return null;
+    }
+
+    fn inherentMethod(self: *const Checker, owner: symbols.SymbolId, name: []const u8) ?MethodDefinition {
+        for (self.result.methods.items) |method| {
+            if (method.owner == owner and std.mem.eql(u8, method.name, name)) return method;
+        }
+        return null;
+    }
+
+    fn inferMethodCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
+        const object = self.result.types.get(object_type) orelse return null;
+        const nominal = switch (object.*) {
+            .nominal => |value| value,
+            else => return null,
+        };
+        const method = self.inherentMethod(nominal.symbol, property.property) orelse return null;
+        const signature_id = self.result.symbol_types.get(method.symbol) orelse return null;
+        const signature = self.result.types.get(signature_id) orelse return null;
+        const function = switch (signature.*) {
+            .function => |value| value,
+            else => return null,
+        };
+        if (function.parameters.len == 0) {
+            try self.report(call.span, "Type Error: метод '{s}' должен принимать получатель первым параметром", .{property.property});
+            return @as(?types.TypeId, try self.result.types.poison());
+        }
+        if (call.arguments.len != function.parameters.len - 1) try self.report(call.span, "Type Error: неверное количество аргументов метода", .{});
+        if (nominal.arguments.len != method.owner_parameters.len) {
+            try self.report(call.span, "Type Error: неверное количество параметров типа получателя", .{});
+            return @as(?types.TypeId, try self.result.types.poison());
+        }
+        var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+        defer substitutions.deinit();
+        for (method.owner_parameters, nominal.arguments) |parameter, argument| try substitutions.put(parameter.typ, argument);
+        const shared = @min(call.arguments.len, function.parameters.len - 1);
+        for (call.arguments[0..shared], function.parameters[1 .. shared + 1]) |argument, parameter| {
+            try self.inferGenericSubstitution(parameter, try self.infer(argument), &substitutions, call.span);
+        }
+        for (method.function_parameters) |parameter| {
+            if (!substitutions.contains(parameter.typ)) try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
+        }
+        const receiver = try self.substituteGeneric(function.parameters[0], &substitutions);
+        if (!self.assignable(object_type, receiver)) try self.report(call.span, "Type Error: получатель метода имеет неверный тип", .{});
+        for (call.arguments[0..shared], function.parameters[1 .. shared + 1]) |argument, parameter| {
+            const expected = try self.substituteGeneric(parameter, &substitutions);
+            if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент метода не совпадает с типом параметра", .{});
+        }
+        try self.result.method_calls.put(expression, method.symbol);
+        return @as(?types.TypeId, try self.substituteGeneric(function.return_type, &substitutions));
     }
 
     fn resolveAlias(self: *Checker, symbol: symbols.SymbolId, span: source.Span) anyerror!types.TypeId {

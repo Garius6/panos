@@ -363,7 +363,7 @@ test "module compiler keeps same-named nominal exports distinct" {
 
 test "module compiler constructs and reads exported structure fields" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.Точка(40)\nточка.x + 2\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.Точка(1)\nточка.x = 40\nточка.x + 2\nконец" },
         .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);

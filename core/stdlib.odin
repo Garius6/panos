@@ -147,6 +147,8 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_1(TY_NUM, TY_STRING)
 	case "строки::из_целого":
 		return builtin_function_type_1(TY_INT, TY_STRING)
+	// `найти` возвращает рановый индекс. Не передавайте его в байтовые
+	// `срез_байт`/`длина_байт`: для не-ASCII текста используйте `срез`.
 	case "строки::найти":
 		return builtin_function_type_3(TY_STRING, TY_STRING, TY_INT, TY_INT)
 	case "строки::содержит":
@@ -171,6 +173,7 @@ builtin_export_type :: proc(graph: ^Module_Graph, full_name: string) -> ^Type {
 		return builtin_function_type_2(TY_STRING, TY_STRING, TY_NUM)
 	case "строки::байт":
 		return builtin_function_type_2(TY_STRING, TY_INT, TY_INT)
+	// Аргументы/результат этих функций — байтовые индексы, не рановые.
 	case "строки::длина_байт":
 		return builtin_function_type_1(TY_STRING, TY_INT)
 	case "строки::срез_байт":

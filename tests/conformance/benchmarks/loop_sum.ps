@@ -1,0 +1,11 @@
+// Tight iterative loop — assignment/comparison/branch overhead, no
+// allocation, no function calls. Exercises `пока` + local mutation.
+экспорт функ старт() -> Целое
+    пер итог: Целое = 0
+    пер i: Целое = 0
+    пока i < 5000000 цикл
+        итог = итог + i
+        i = i + 1
+    конец
+    итог
+конец

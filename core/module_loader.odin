@@ -142,7 +142,7 @@ Module_Result :: struct {
 // порядке". Не гейтит и не прерывается на diagnostics — это решает
 // вызывающий код (CLI хочет print+exit до компиляции, LSP хочет копить и
 // публиковать per-file, без exit).
-resolve_and_typecheck_all :: proc(graph: ^Module_Graph) -> [dynamic]Module_Result {
+resolve_and_typecheck_all :: proc(graph: ^Module_Graph, wasm_target: bool = false) -> [dynamic]Module_Result {
 	// Ёмкость выставлена сразу под len(graph.order) — append() ниже не
 	// реаллоцирует backing-массив, что важно: Type_Ctx.res указывает на
 	// Resolver_Ctx, ВСТРОЕННЫЙ В ТОТ ЖЕ элемент results, и это
@@ -152,7 +152,7 @@ resolve_and_typecheck_all :: proc(graph: ^Module_Graph) -> [dynamic]Module_Resul
 	// указатели.
 	results := make([dynamic]Module_Result, 0, len(graph.order))
 	for module in graph.order {
-		res_ctx := resolve_module(graph, module)
+		res_ctx := resolve_module(graph, module, wasm_target)
 		tc_ctx := new_type_ctx(&res_ctx)
 		typecheck_program(&tc_ctx, module.ast)
 		append(&results, Module_Result{module = module, res_ctx = res_ctx, tc_ctx = tc_ctx})

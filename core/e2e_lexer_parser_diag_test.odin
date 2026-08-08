@@ -106,6 +106,29 @@ test_lexer_unknown_escape_recovers_as_literal :: proc(t: ^testing.T) {
 	)
 }
 
+@(test)
+test_string_method_access_reports_guidance :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			"текст".длина()
+		конец
+	`)
+	expect_diagnostic(t, diags, "Type Error: у Строки нет методов — используйте строки.длина(x, ...)")
+}
+
+@(test)
+test_match_single_line_multiple_statements_reports_guidance :: proc(t: ^testing.T) {
+	diags := typecheck_only(`
+		функ старт() -> Число
+			выбор истина
+				истина -> пер x = 1 x
+				ложь -> 0
+			конец
+		конец
+	`)
+	expect_diagnostic(t, diags, "Синтаксическая ошибка: несколько выражений в одной строке ветки выбор — используйте 'тогда ... конец' для нескольких операторов")
+}
+
 // Именованные аргументы (`f(x = 1, y = 2)`) — везде, где есть позиционные
 // параметры/поля: функции, конструкторы структур, методы. Порядок в
 // вызове может отличаться от объявления — сверяется по именам.

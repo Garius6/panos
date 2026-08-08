@@ -1,0 +1,13 @@
+// String allocation/GC pressure — every `+` allocates a NEW string (panos
+// strings are not interned/mutable, see docs/src/architecture/memory-and-
+// gc.md), so this repeatedly stresses the allocator/GC, unlike the other
+// two fixtures which allocate nothing.
+экспорт функ старт() -> Целое
+    пер текст: Строка = ""
+    пер i: Целое = 0
+    пока i < 20000 цикл
+        текст = текст + "x"
+        i = i + 1
+    конец
+    длина(текст)
+конец

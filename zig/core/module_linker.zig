@@ -8,41 +8,89 @@ pub const ImportScope = struct {
     modules: []const resolver.ImportedModule = &.{},
 
     pub fn init(allocator: std.mem.Allocator, graph: *const module_loader.Graph, importer: usize) !ImportScope {
+        return initWithPrelude(allocator, graph, importer, null);
+    }
+
+    // `prelude_module`, if set and not the importer itself, gets merged as
+    // an UNQUALIFIED implicit import (no `импорт`/alias) ahead of the
+    // importer's own explicit imports — see `resolver.zig`'s
+    // `predeclareUnqualifiedImports`.
+    pub fn initWithPrelude(allocator: std.mem.Allocator, graph: *const module_loader.Graph, importer: usize, prelude_module: ?usize) !ImportScope {
         var result = ImportScope{
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
         errdefer result.deinit();
         var modules: std.ArrayList(resolver.ImportedModule) = .empty;
         defer modules.deinit(allocator);
+
+        if (prelude_module) |target| {
+            if (target != importer) {
+                const exports = try buildExportsForTarget(allocator, &result.arena, graph, target);
+                try modules.append(allocator, .{
+                    .alias = "",
+                    .span = .{ .file_id = 0, .start = 0, .end = 0 },
+                    .exports = exports,
+                    .unqualified = true,
+                });
+            }
+        }
         for (graph.imports.items) |import| {
             if (import.importer != importer) continue;
             const target = import.target orelse continue;
-            var exports: std.ArrayList(resolver.ImportedExport) = .empty;
-            defer exports.deinit(allocator);
-            for (graph.exports.items) |exported| {
-                if (exported.module != target) continue;
-                try exports.append(allocator, .{
-                    .name = exported.name,
-                    .kind = switch (exported.kind) {
-                        .function => .function,
-                        .constant => .constant,
-                        .type => .type,
-                    },
-                    .span = exported.span,
-                    .origin = .{
-                        .module = target,
-                        .declaration = exported.declaration,
-                    },
-                });
-            }
+            const exports = try buildExportsForTarget(allocator, &result.arena, graph, target);
             try modules.append(allocator, .{
                 .alias = import.alias,
                 .span = import.span,
-                .exports = try result.arena.allocator().dupe(resolver.ImportedExport, exports.items),
+                .exports = exports,
             });
         }
         result.modules = try result.arena.allocator().dupe(resolver.ImportedModule, modules.items);
         return result;
+    }
+
+    fn buildExportsForTarget(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator, graph: *const module_loader.Graph, target: usize) ![]const resolver.ImportedExport {
+        var exports: std.ArrayList(resolver.ImportedExport) = .empty;
+        defer exports.deinit(allocator);
+        for (graph.exports.items) |exported| {
+            if (exported.module != target) continue;
+            var methods: std.ArrayList(resolver.ImportedMethodExport) = .empty;
+            defer methods.deinit(allocator);
+            var variants: std.ArrayList(resolver.ImportedVariantExport) = .empty;
+            defer variants.deinit(allocator);
+            if (exported.kind == .type) {
+                for (graph.methods.items) |method| {
+                    if (method.module != target or method.owner_declaration != exported.declaration) continue;
+                    try methods.append(allocator, .{
+                        .name = method.name,
+                        .declaration = method.declaration,
+                        .span = method.span,
+                    });
+                }
+                for (graph.variants.items) |variant| {
+                    if (variant.module != target or variant.owner_declaration != exported.declaration) continue;
+                    try variants.append(allocator, .{
+                        .name = variant.name,
+                        .span = variant.span,
+                    });
+                }
+            }
+            try exports.append(allocator, .{
+                .name = exported.name,
+                .kind = switch (exported.kind) {
+                    .function => .function,
+                    .constant => .constant,
+                    .type => .type,
+                },
+                .span = exported.span,
+                .origin = .{
+                    .module = target,
+                    .declaration = exported.declaration,
+                },
+                .methods = try arena.allocator().dupe(resolver.ImportedMethodExport, methods.items),
+                .variants = try arena.allocator().dupe(resolver.ImportedVariantExport, variants.items),
+            });
+        }
+        return arena.allocator().dupe(resolver.ImportedExport, exports.items);
     }
 
     pub fn deinit(self: *ImportScope) void {

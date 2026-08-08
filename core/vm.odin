@@ -1029,22 +1029,7 @@ format_number :: proc(num: f64) -> string {
 }
 
 call_builtin :: proc(vm: ^VM, name: string, args: []Value) -> (Value, bool) {
-	// DOM::* — ТОЛЬКО AOT WASM-вывод (core/wasm_emit.odin) реально вызывает
-	// document.*; байткод-VM (нативный ИЛИ сам собранный в js_wasm32 —
-	// интерактивный плейграунд) не имеет доступа к DOM вообще, паникуем
-	// ЗДЕСЬ, в общем диспетчере, ОДИН раз — не дублируем проверку в
-	// vm_io_native.odin И vm_io_wasm.odin по отдельности.
-	if strings.has_prefix(name, "DOM::") {
-		fmt.panicf("Runtime Panic: '%s' доступно только в AOT WASM-выводе, не в байткод-VM", name)
-	}
-	// сеть::http_запрос_sync (план todo-демо) — синхронный XHR, реален
-	// только в браузере через JS-грузчик, той же причине, что DOM выше.
-	// Байткод-VM (нативная ИЛИ сама в js_wasm32 — интерактивный
-	// плейграунд) уже имеет свой (АСИНХРОННЫЙ) сеть::http_запрос — не
-	// путать с этим.
-	if name == "сеть::http_запрос_sync" {
-		fmt.panicf("Runtime Panic: '%s' доступно только в AOT WASM-выводе, не в байткод-VM", name)
-	}
+	ensure_builtin_available_in_bytecode_vm(name)
 	// фс::*/ос::окружение*/ввод_вывод::прочитать_строку/поток/сеть::подключиться
 	// — в vm_io_native.odin/vm_io_wasm.odin (#+build split, трогают
 	// os.exists/os.open/os.lookup_env/net.dial_tcp...). Остальные builtin'ы
@@ -1889,6 +1874,7 @@ execute :: proc(vm: ^VM) -> Exec_Result {
 			args_start := len(vm.stack) - arg_count
 			args := vm.stack[args_start:]
 			target_id := vm.processes[vm.current_process].id
+			ensure_builtin_available_in_bytecode_vm(name)
 			submit_async_io(vm, name, args, target_id)
 			resize(&vm.stack, args_start)
 

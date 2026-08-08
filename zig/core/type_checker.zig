@@ -80,11 +80,58 @@ pub const ImportedNominal = struct {
     local_symbol: symbols.SymbolId,
     identity: u32,
     fields: ?[]const NominalField = null,
+    // References the source module's own `EnumDefinition.variants` directly
+    // (alive for the whole graph compile) — only `.name`/`.fields` are used;
+    // `.symbol` is the source module's own variant symbol, irrelevant here
+    // since the local variant symbol is looked up by name instead.
+    enum_variants: ?[]const EnumVariant = null,
+    // Non-null for a generic owner (struct, enum or interface) — the source
+    // module's own generic-parameter TypeIds; importSignaturePass mints fresh
+    // local ones, remaps through them for `fields`/`enum_variants`/
+    // `interface_methods`, and reuses the same remap for that owner's
+    // imported methods.
+    generic_parameters: ?[]const GenericParameter = null,
+    // References the source module's own `InterfaceDefinition.methods`
+    // directly (alive for the whole graph compile), non-null when this
+    // nominal is itself an INTERFACE declared in another module — lets a
+    // THIRD module implement/bound-check against an interface it never
+    // declared itself (`реализация чужой_модуль.Интерфейс для Тип`).
+    interface_methods: ?[]const InterfaceMethod = null,
+};
+
+pub const ImportedMethod = struct {
+    owner: symbols.SymbolId,
+    name: []const u8,
+    symbol: symbols.SymbolId,
+    store: *const types.TypeStore,
+    type_id: types.TypeId,
+};
+
+// An owner's interface implementation, re-hosted from the source module.
+// `interface_name` is resolved by name in the IMPORTER's own scope (every
+// file gets its own local prelude "Сравниваемое" symbol, so the source
+// module's raw interface Symbol_Id is never valid here) — `method_names`
+// are matched by name against methods already registered via `ImportContext.
+// methods` (interface-impl methods are ordinary inherent methods too, see
+// `module_loader.zig`'s `collectMethods`), so no separate FunctionId
+// re-hosting is needed for this list itself.
+pub const ImportedImpl = struct {
+    owner: symbols.SymbolId,
+    interface_name: []const u8,
+    // References the source module's own `InterfaceImplementation.methods`
+    // and `Resolution` directly (both alive for the whole graph compile) —
+    // names are looked up on demand, no separate name-list allocation.
+    method_symbols: []const symbols.SymbolId,
+    target_resolution: *const resolver.Resolution,
+    store: *const types.TypeStore,
+    argument_type_ids: []const types.TypeId,
 };
 
 pub const ImportContext = struct {
     symbols: []const ImportedSymbolType = &.{},
     nominals: []const ImportedNominal = &.{},
+    methods: []const ImportedMethod = &.{},
+    impls: []const ImportedImpl = &.{},
 };
 
 pub const IteratorDispatch = enum {
@@ -219,15 +266,18 @@ const Checker = struct {
         for (self.tree.program.?.declarations) |declaration| {
             switch (self.tree.decl(declaration).*) {
                 .function => |function| try self.defineFunctionSignature(declaration, function.type_parameters, function.parameters, function.return_type),
-                .foreign => {},
+                .foreign => |foreign| try self.defineForeignSignature(declaration, foreign),
                 .impl => |implementation| {
-                    const owner = self.findTypeSymbol(implementation.target_type) orelse {
+                    const owner = (if (implementation.target_module) |module_name|
+                        self.findQualifiedTypeSymbol(module_name, implementation.target_type)
+                    else
+                        self.findTypeSymbol(implementation.target_type)) orelse {
                         try self.report(implementation.span, "Type Error: неизвестный тип реализации '{s}'", .{implementation.target_type});
                         continue;
                     };
                     const owner_parameters = self.nominalParameters(owner);
                     if (implementation.interface_name) |interface_name| {
-                        try self.defineInterfaceImplementation(implementation, owner, owner_parameters, interface_name);
+                        try self.defineInterfaceImplementation(implementation, owner, owner_parameters, interface_name, implementation.interface_module);
                     } else {
                         for (implementation.methods) |method| {
                             const function = self.tree.decl(method).function;
@@ -240,22 +290,139 @@ const Checker = struct {
         }
     }
 
-    fn importSignaturePass(self: *Checker, imports: ImportContext) !void {
+    // Registers opaque cross-module identity for every imported nominal type
+    // BEFORE `signaturePass` runs — `signaturePass` already resolves qualified
+    // type annotations (e.g. an impl's receiver parameter, `это: точки.Точка`)
+    // via `nominalType`, which reads `imported_nominal_identities`; running
+    // this after `signaturePass` (as `importSignaturePass` does for
+    // fields/methods, which don't need it that early) left every qualified
+    // annotation resolved during `signaturePass` silently defaulting to
+    // identity=0 instead of the real opaque identity, causing "получатель
+    // метода имеет неверный тип" for a same-module qualified impl target
+    // (`реализация точки.Точка ... конец`) — the annotation and the call
+    // site's own value ended up with DIFFERENT identities for the same type.
+    // Also builds the per-owner generic-parameter remap and, for an imported
+    // INTERFACE type, its `InterfaceDefinition` — both must exist before
+    // `signaturePass` runs, since it resolves qualified impl targets
+    // (`реализация чужой_модуль.Интерфейс для Тип`) and needs
+    // `interface_definitions` to validate the implementation right away.
+    // `owner_remaps`/`owner_parameters_by_symbol` are then reused as-is by
+    // `importSignaturePass` for fields/enum variants/methods/impls, which
+    // don't need to run this early.
+    fn importIdentityPass(
+        self: *Checker,
+        imports: ImportContext,
+        owner_remaps: *std.AutoHashMap(symbols.SymbolId, std.AutoHashMap(types.TypeId, types.TypeId)),
+        owner_parameters_by_symbol: *std.AutoHashMap(symbols.SymbolId, []const GenericParameter),
+    ) !void {
         for (imports.nominals) |imported| {
             try self.result.imported_nominal_identities.put(imported.local_symbol, imported.identity);
-            const source_fields = imported.fields orelse continue;
-            var fields: std.ArrayList(NominalField) = .empty;
-            defer fields.deinit(self.result.allocator);
-            for (source_fields) |field| {
-                try fields.append(self.result.allocator, .{
-                    .name = try self.result.arena.allocator().dupe(u8, field.name),
-                    .typ = try self.copyImportedType(imported.store, field.typ, imports.nominals),
+            if (imported.generic_parameters) |source_parameters| {
+                var remap = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+                var owner_parameters: std.ArrayList(GenericParameter) = .empty;
+                defer owner_parameters.deinit(self.result.allocator);
+                for (source_parameters) |parameter| {
+                    const local_typ = try self.result.types.genericParameter(self.next_generic_parameter);
+                    self.next_generic_parameter += 1;
+                    try remap.put(parameter.typ, local_typ);
+                    try owner_parameters.append(self.result.allocator, .{
+                        .name = try self.result.arena.allocator().dupe(u8, parameter.name),
+                        .typ = local_typ,
+                    });
+                }
+                try owner_remaps.put(imported.local_symbol, remap);
+                try owner_parameters_by_symbol.put(imported.local_symbol, try self.result.arena.allocator().dupe(GenericParameter, owner_parameters.items));
+            }
+            const owner_remap = owner_remaps.getPtr(imported.local_symbol);
+            if (imported.interface_methods) |source_methods| {
+                var methods: std.ArrayList(InterfaceMethod) = .empty;
+                defer methods.deinit(self.result.allocator);
+                var unsupported = false;
+                for (source_methods) |source_method| {
+                    var parameters: std.ArrayList(types.TypeId) = .empty;
+                    defer parameters.deinit(self.result.allocator);
+                    for (source_method.parameters) |parameter| {
+                        const copied = self.copyImportedType(imported.store, parameter, imports.nominals, owner_remap) catch |err| switch (err) {
+                            error.UnsupportedImportedType => {
+                                unsupported = true;
+                                break;
+                            },
+                            else => return err,
+                        };
+                        try parameters.append(self.result.allocator, copied);
+                    }
+                    if (unsupported) break;
+                    const return_type = self.copyImportedType(imported.store, source_method.return_type, imports.nominals, owner_remap) catch |err| switch (err) {
+                        error.UnsupportedImportedType => {
+                            unsupported = true;
+                            break;
+                        },
+                        else => return err,
+                    };
+                    try methods.append(self.result.allocator, .{
+                        .name = try self.result.arena.allocator().dupe(u8, source_method.name),
+                        .parameters = try self.result.arena.allocator().dupe(types.TypeId, parameters.items),
+                        .return_type = return_type,
+                    });
+                }
+                if (!unsupported) {
+                    const parameters = owner_parameters_by_symbol.get(imported.local_symbol) orelse &.{};
+                    try self.result.interface_definitions.put(imported.local_symbol, .{
+                        .parameters = parameters,
+                        .methods = try self.result.arena.allocator().dupe(InterfaceMethod, methods.items),
+                    });
+                }
+            }
+        }
+    }
+
+    fn importSignaturePass(
+        self: *Checker,
+        imports: ImportContext,
+        owner_remaps: *std.AutoHashMap(symbols.SymbolId, std.AutoHashMap(types.TypeId, types.TypeId)),
+        owner_parameters_by_symbol: *std.AutoHashMap(symbols.SymbolId, []const GenericParameter),
+    ) !void {
+        for (imports.nominals) |imported| {
+            const owner_remap = owner_remaps.getPtr(imported.local_symbol);
+            if (imported.fields) |source_fields| {
+                var fields: std.ArrayList(NominalField) = .empty;
+                defer fields.deinit(self.result.allocator);
+                for (source_fields) |field| {
+                    try fields.append(self.result.allocator, .{
+                        .name = try self.result.arena.allocator().dupe(u8, field.name),
+                        .typ = try self.copyImportedType(imported.store, field.typ, imports.nominals, owner_remap),
+                    });
+                }
+                const copied_fields = try self.result.arena.allocator().dupe(NominalField, fields.items);
+                if (owner_parameters_by_symbol.get(imported.local_symbol)) |parameters| {
+                    try self.result.generic_nominal_fields.put(imported.local_symbol, .{ .parameters = parameters, .fields = copied_fields });
+                } else {
+                    try self.result.nominal_fields.put(imported.local_symbol, copied_fields);
+                }
+            }
+            if (imported.enum_variants) |source_variants| {
+                var variants: std.ArrayList(EnumVariant) = .empty;
+                defer variants.deinit(self.result.allocator);
+                for (source_variants) |source_variant| {
+                    const variant_symbol = self.resolution.findEnumVariant(imported.local_symbol, source_variant.name) orelse continue;
+                    var fields: std.ArrayList(types.TypeId) = .empty;
+                    defer fields.deinit(self.result.allocator);
+                    for (source_variant.fields) |field| try fields.append(self.result.allocator, try self.copyImportedType(imported.store, field, imports.nominals, owner_remap));
+                    try variants.append(self.result.allocator, .{
+                        .symbol = variant_symbol,
+                        .name = try self.result.arena.allocator().dupe(u8, source_variant.name),
+                        .fields = try self.result.arena.allocator().dupe(types.TypeId, fields.items),
+                    });
+                }
+                const parameters = owner_parameters_by_symbol.get(imported.local_symbol) orelse &.{};
+                try self.result.enum_definitions.put(imported.local_symbol, .{
+                    .parameters = parameters,
+                    .variants = try self.result.arena.allocator().dupe(EnumVariant, variants.items),
                 });
             }
-            try self.result.nominal_fields.put(imported.local_symbol, try self.result.arena.allocator().dupe(NominalField, fields.items));
         }
         for (imports.symbols) |imported| {
-            const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals) catch |err| switch (err) {
+            const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals, null) catch |err| switch (err) {
                 error.UnsupportedImportedType => {
                     try self.result.unsupported_imports.put(imported.symbol, {});
                     continue;
@@ -264,9 +431,65 @@ const Checker = struct {
             };
             try self.result.symbol_types.put(imported.symbol, copied);
         }
+        for (imports.methods) |imported| {
+            const owner_remap = owner_remaps.getPtr(imported.owner);
+            const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals, owner_remap) catch |err| switch (err) {
+                error.UnsupportedImportedType => continue,
+                else => return err,
+            };
+            try self.result.symbol_types.put(imported.symbol, copied);
+            const owner_parameters = owner_parameters_by_symbol.get(imported.owner) orelse &.{};
+            try self.result.methods.append(self.result.allocator, .{
+                .owner = imported.owner,
+                .interface = null,
+                .symbol = imported.symbol,
+                .name = imported.name,
+                .owner_parameters = owner_parameters,
+                .function_parameters = &.{},
+                .all_parameters = owner_parameters,
+            });
+        }
+        for (imports.impls) |imported| {
+            const interface_symbol = self.findTypeSymbol(imported.interface_name) orelse continue;
+            const owner_remap = owner_remaps.getPtr(imported.owner);
+            var arguments: std.ArrayList(types.TypeId) = .empty;
+            defer arguments.deinit(self.result.allocator);
+            var unsupported = false;
+            for (imported.argument_type_ids) |argument| {
+                const copied = self.copyImportedType(imported.store, argument, imports.nominals, owner_remap) catch |err| switch (err) {
+                    error.UnsupportedImportedType => {
+                        unsupported = true;
+                        break;
+                    },
+                    else => return err,
+                };
+                try arguments.append(self.result.allocator, copied);
+            }
+            if (unsupported) continue;
+            var methods: std.ArrayList(symbols.SymbolId) = .empty;
+            defer methods.deinit(self.result.allocator);
+            for (imported.method_symbols) |source_method_symbol| {
+                const source_method = imported.target_resolution.symbols.get(source_method_symbol) orelse continue;
+                const method = self.inherentMethod(imported.owner, source_method.name) orelse continue;
+                try methods.append(self.result.allocator, method.symbol);
+            }
+            if (methods.items.len != imported.method_symbols.len) continue;
+            try self.result.interface_implementations.append(self.result.allocator, .{
+                .interface = interface_symbol,
+                .arguments = try self.result.arena.allocator().dupe(types.TypeId, arguments.items),
+                .target = imported.owner,
+                .methods = try self.result.arena.allocator().dupe(symbols.SymbolId, methods.items),
+            });
+        }
     }
 
-    fn copyImportedType(self: *Checker, external_store: *const types.TypeStore, external_type: types.TypeId, nominals: []const ImportedNominal) !types.TypeId {
+    // `generic_remap` maps an external generic-parameter TypeId to a FRESH
+    // local generic-parameter TypeId, minted once per imported generic owner
+    // and reused across that owner's fields/variants/methods so `T` in a
+    // struct field and `T` in one of its imported methods land on the SAME
+    // local type — without it (null), `.generic_parameter` stays unsupported,
+    // preserving prior behavior for non-generic imports.
+    fn copyImportedType(self: *Checker, external_store: *const types.TypeStore, external_type: types.TypeId, nominals: []const ImportedNominal, generic_remap: ?*const std.AutoHashMap(types.TypeId, types.TypeId)) !types.TypeId {
         const entry = external_store.get(external_type) orelse return error.UnsupportedImportedType;
         return switch (entry.*) {
             .primitive => |primitive| switch (primitive) {
@@ -281,33 +504,37 @@ const Checker = struct {
             .tuple => |elements| blk: {
                 var copied: std.ArrayList(types.TypeId) = .empty;
                 defer copied.deinit(self.result.allocator);
-                for (elements) |element| try copied.append(self.result.allocator, try self.copyImportedType(external_store, element, nominals));
+                for (elements) |element| try copied.append(self.result.allocator, try self.copyImportedType(external_store, element, nominals, generic_remap));
                 break :blk self.result.types.tuple(copied.items);
             },
             .function => |function| blk: {
                 var copied: std.ArrayList(types.TypeId) = .empty;
                 defer copied.deinit(self.result.allocator);
-                for (function.parameters) |parameter| try copied.append(self.result.allocator, try self.copyImportedType(external_store, parameter, nominals));
-                break :blk self.result.types.function(copied.items, try self.copyImportedType(external_store, function.return_type, nominals));
+                for (function.parameters) |parameter| try copied.append(self.result.allocator, try self.copyImportedType(external_store, parameter, nominals, generic_remap));
+                break :blk self.result.types.function(copied.items, try self.copyImportedType(external_store, function.return_type, nominals, generic_remap));
             },
             .nominal => |nominal| blk: {
                 for (nominals) |imported| {
                     if (imported.store != external_store or imported.source_symbol != nominal.symbol) continue;
                     var arguments: std.ArrayList(types.TypeId) = .empty;
                     defer arguments.deinit(self.result.allocator);
-                    for (nominal.arguments) |argument| try arguments.append(self.result.allocator, try self.copyImportedType(external_store, argument, nominals));
+                    for (nominal.arguments) |argument| try arguments.append(self.result.allocator, try self.copyImportedType(external_store, argument, nominals, generic_remap));
                     break :blk self.result.types.nominalWithIdentity(imported.local_symbol, imported.identity, arguments.items);
                 }
                 return error.UnsupportedImportedType;
             },
-            .array => |element| self.result.types.array(try self.copyImportedType(external_store, element, nominals)),
+            .array => |element| self.result.types.array(try self.copyImportedType(external_store, element, nominals, generic_remap)),
             .map => |map| self.result.types.map(
-                try self.copyImportedType(external_store, map.key, nominals),
-                try self.copyImportedType(external_store, map.value, nominals),
+                try self.copyImportedType(external_store, map.key, nominals, generic_remap),
+                try self.copyImportedType(external_store, map.value, nominals, generic_remap),
             ),
-            .process => |message| self.result.types.process(try self.copyImportedType(external_store, message, nominals)),
-            .pointer => |pointee| self.result.types.pointer(try self.copyImportedType(external_store, pointee, nominals)),
-            .generic_parameter, .poison => error.UnsupportedImportedType,
+            .process => |message| self.result.types.process(try self.copyImportedType(external_store, message, nominals, generic_remap)),
+            .pointer => |pointee| self.result.types.pointer(try self.copyImportedType(external_store, pointee, nominals, generic_remap)),
+            .generic_parameter => blk: {
+                const remap = generic_remap orelse return error.UnsupportedImportedType;
+                break :blk remap.get(external_type) orelse return error.UnsupportedImportedType;
+            },
+            .poison => error.UnsupportedImportedType,
         };
     }
 
@@ -478,6 +705,53 @@ const Checker = struct {
         });
     }
 
+    // Panos-side type for a `внешний` parameter/return marshal kind —
+    // marshal kind is purely ABI metadata (which C width to pack into),
+    // the panos type it appears as is independent of that width: Int8/32/
+    // 64 are all plain `Целое` (same `Число` int flavor a `для`-loop
+    // counter uses, matching Odin's `TY_INT` choice here), Float32/64 are
+    // both `Число`, `CString` is an ordinary `Строка` (copied into a real
+    // GC string on return, borrowed on the way in — see `vm.zig`).
+    // `.struct_value` (struct-by-value marshaling) isn't ported yet —
+    // mirrors Odin's own history, where it was a later addition on top
+    // of the scalar-only first slice, not a from-day-one requirement.
+    fn foreignMarshalType(self: *Checker, marshal: ast.ForeignMarshalKind, pointee: ?ast.TypeId, span: source.Span) anyerror!types.TypeId {
+        return switch (marshal) {
+            .void => self.result.types.builtins.void,
+            .int8, .int32, .int64 => self.result.types.builtins.integer,
+            .float32, .float64 => self.result.types.builtins.number,
+            .c_string => self.result.types.builtins.string,
+            // Both real, well-defined marshal kinds — rejected here only
+            // because this VM has no `Указатель`/struct-by-value RUNTIME
+            // value representation yet to marshal them into (the type
+            // system already models `Указатель(T)`, e.g. `types.zig`'s
+            // `.pointer` — nothing constructs a live value of it yet).
+            // Matches Odin's own history: `внешний` shipped scalar-only
+            // first, pointers/structs were later, separate additions.
+            .pointer => blk: {
+                _ = pointee;
+                try self.report(span, "Type Error: 'внешний' с Указатель(T) ещё не поддержан Zig-версией", .{});
+                break :blk try self.result.types.poison();
+            },
+            .struct_value => blk: {
+                try self.report(span, "Type Error: 'внешний' с передачей структуры по значению ещё не поддержан Zig-версией", .{});
+                break :blk try self.result.types.poison();
+            },
+        };
+    }
+
+    fn defineForeignSignature(self: *Checker, declaration: ast.DeclId, foreign: anytype) !void {
+        const symbol = self.resolution.decl_symbols.get(declaration) orelse return;
+        var parameter_types: std.ArrayList(types.TypeId) = .empty;
+        defer parameter_types.deinit(self.result.allocator);
+        for (foreign.parameters) |parameter| {
+            try parameter_types.append(self.result.allocator, try self.foreignMarshalType(parameter.marshal, parameter.pointee, parameter.span));
+        }
+        const return_type = try self.foreignMarshalType(foreign.return_marshal, foreign.return_pointee, foreign.span);
+        const signature = try self.result.types.function(parameter_types.items, return_type);
+        try self.result.symbol_types.put(symbol, signature);
+    }
+
     fn defineFunctionSignature(self: *Checker, declaration: ast.DeclId, type_parameters: []const ast.TypeParameter, parameters: []const ast.ParamDecl, return_type: ast.TypeId) !void {
         const symbol = self.resolution.decl_symbols.get(declaration) orelse return;
         const generic_parameters = try self.defineGenericParameters(symbol, type_parameters);
@@ -528,8 +802,11 @@ const Checker = struct {
         });
     }
 
-    fn defineInterfaceImplementation(self: *Checker, implementation: anytype, owner: symbols.SymbolId, owner_parameters: []const GenericParameter, interface_name: []const u8) !void {
-        const interface_symbol = self.findTypeSymbol(interface_name) orelse {
+    fn defineInterfaceImplementation(self: *Checker, implementation: anytype, owner: symbols.SymbolId, owner_parameters: []const GenericParameter, interface_name: []const u8, interface_module: ?[]const u8) !void {
+        const interface_symbol = (if (interface_module) |module_name|
+            self.findQualifiedTypeSymbol(module_name, interface_name)
+        else
+            self.findTypeSymbol(interface_name)) orelse {
             try self.report(implementation.span, "Type Error: неизвестный интерфейс '{s}'", .{interface_name});
             return;
         };
@@ -1645,6 +1922,24 @@ const Checker = struct {
         return entry.kind == .builtin and entry.module_path != null and std.mem.eql(u8, entry.module_path.?, module) and std.mem.eql(u8, entry.name, name);
     }
 
+    // `Результат(value_type, Ошибка)` for a native builtin that can fail —
+    // `Результат` is prelude-provided (hardcoded for direct pipelines,
+    // real-and-imported once a graph merges the embedded prelude, see
+    // `zig/core/prelude.zig`); `nominalType` picks the right identity for
+    // either case.
+    fn resultOfString(self: *Checker, value_type: types.TypeId) ?types.TypeId {
+        const result_symbol = self.findTypeSymbol("Результат") orelse return null;
+        return self.nominalType(result_symbol, &.{ value_type, self.result.types.builtins.error_value }) catch null;
+    }
+
+    // `Опция(value_type)` — symmetric to `resultOfString` above, for native
+    // builtins whose "failure" is absence rather than an `Ошибка` (`ос.
+    // окружение`, matching Odin's `stdlib_option_type`).
+    fn optionOf(self: *Checker, value_type: types.TypeId) ?types.TypeId {
+        const option_symbol = self.findTypeSymbol("Опция") orelse return null;
+        return self.nominalType(option_symbol, &.{value_type}) catch null;
+    }
+
     fn rejectUnavailableBuiltin(self: *Checker, callee: ast.ExprId, span: source.Span) !bool {
         const symbol = self.resolution.expr_symbols.get(callee) orelse return false;
         const entry = self.resolution.symbols.get(symbol) orelse return false;
@@ -1704,6 +1999,316 @@ const Checker = struct {
                     try self.report(call.span, "Type Error: фс.есть() ожидает путь типа Строка", .{});
                 }
                 return self.result.types.builtins.boolean;
+            }
+            if (self.isBuiltinModule(symbol, "фс", "удалить")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: фс.удалить() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.boolean;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: фс.удалить() ожидает путь типа Строка", .{});
+                }
+                return self.result.types.builtins.boolean;
+            }
+            if (self.isBuiltinModule(symbol, "фс", "прочитать")) {
+                const result_type = self.resultOfString(self.result.types.builtins.string) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: фс.прочитать() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: фс.прочитать() ожидает путь типа Строка", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "фс", "записать")) {
+                const result_type = self.resultOfString(self.result.types.builtins.number) orelse return self.result.types.poison();
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: фс.записать() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: фс.записать() ожидает путь и содержимое типа Строка", .{});
+                    }
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "фс", "открыть")) {
+                const file_symbol = self.findTypeSymbol("Файл") orelse return self.result.types.poison();
+                const file_type = try self.nominalType(file_symbol, &.{});
+                const result_type = self.resultOfString(file_type) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: фс.открыть() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: фс.открыть() ожидает путь типа Строка", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "фс", "это_директория")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: фс.это_директория() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.boolean;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: фс.это_директория() ожидает путь типа Строка", .{});
+                }
+                return self.result.types.builtins.boolean;
+            }
+            if (self.isBuiltinModule(symbol, "фс", "создать_директорию")) {
+                const result_type = self.resultOfString(self.result.types.builtins.number) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: фс.создать_директорию() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: фс.создать_директорию() ожидает путь типа Строка", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "фс", "список_директории")) {
+                const array_type = try self.result.types.array(self.result.types.builtins.string);
+                const result_type = self.resultOfString(array_type) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: фс.список_директории() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: фс.список_директории() ожидает путь типа Строка", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "фс", "удалить_директорию")) {
+                const result_type = self.resultOfString(self.result.types.builtins.number) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: фс.удалить_директорию() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: фс.удалить_директорию() ожидает путь типа Строка", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "ос", "аргументы")) {
+                if (call.arguments.len != 0) try self.report(call.span, "Type Error: ос.аргументы() не принимает аргументы", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.result.types.array(self.result.types.builtins.string);
+            }
+            if (self.isBuiltinModule(symbol, "ос", "версия_паноса")) {
+                if (call.arguments.len != 0) try self.report(call.span, "Type Error: ос.версия_паноса() не принимает аргументы", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "ос", "окружение")) {
+                const option_type = self.optionOf(self.result.types.builtins.string) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: ос.окружение() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return option_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: ос.окружение() ожидает имя переменной типа Строка", .{});
+                }
+                return option_type;
+            }
+            if (self.isBuiltinModule(symbol, "ос", "установить_окружение")) {
+                const result_type = self.resultOfString(self.result.types.builtins.number) orelse return self.result.types.poison();
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: ос.установить_окружение() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: ос.установить_окружение() ожидает имя и значение типа Строка", .{});
+                    }
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "ос", "удалить_окружение")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: ос.удалить_окружение() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.boolean;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: ос.удалить_окружение() ожидает имя переменной типа Строка", .{});
+                }
+                return self.result.types.builtins.boolean;
+            }
+            if (self.isBuiltinModule(symbol, "ос", "выполнить")) {
+                // (код_завершения, stdout, stderr) — плоский tuple, тот же
+                // паттерн, что и у Odin (`builtin_export_type`, `core/
+                // stdlib.odin`): core-builtin возвращает сырые данные,
+                // именованная обёртка (если понадобится) — задача panos-
+                // уровня, не системы типов.
+                const exec_tuple = try self.result.types.tuple(&.{ self.result.types.builtins.number, self.result.types.builtins.string, self.result.types.builtins.string });
+                const result_type = self.resultOfString(exec_tuple) orelse return self.result.types.poison();
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: ос.выполнить() ожидает 3 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: ос.выполнить() ожидает программу типа Строка первым аргументом", .{});
+                }
+                const args_array = try self.result.types.array(self.result.types.builtins.string);
+                if (!self.assignable(try self.inferExpected(call.arguments[1], args_array), args_array)) {
+                    try self.report(call.span, "Type Error: ос.выполнить() ожидает Массив(Строка) вторым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[2], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: ос.выполнить() ожидает рабочую директорию типа Строка третьим аргументом", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "ос", "завершить")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: ос.завершить() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.never;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.number), self.result.types.builtins.number)) {
+                    try self.report(call.span, "Type Error: ос.завершить() ожидает код завершения типа Число", .{});
+                }
+                return self.result.types.builtins.never;
+            }
+            if (self.isBuiltinModule(symbol, "сжатие", "разжать_gzip")) {
+                const result_type = self.resultOfString(self.result.types.builtins.string) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: сжатие.разжать_gzip() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: сжатие.разжать_gzip() ожидает Строку", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "синтаксис", "структуры")) {
+                const array_type = try self.result.types.array(self.result.types.builtins.string);
+                const result_type = self.resultOfString(array_type) orelse return self.result.types.poison();
+                return self.checkStringArgsBuiltin(call, "синтаксис.структуры", 1, result_type);
+            }
+            if (self.isBuiltinModule(symbol, "синтаксис", "поля")) {
+                const field_pair = try self.result.types.tuple(&.{ self.result.types.builtins.string, self.result.types.builtins.string });
+                const array_type = try self.result.types.array(field_pair);
+                const result_type = self.resultOfString(array_type) orelse return self.result.types.poison();
+                return self.checkStringArgsBuiltin(call, "синтаксис.поля", 2, result_type);
+            }
+            if (self.isBuiltinModule(symbol, "синтаксис", "аннотации")) {
+                const array_type = try self.result.types.array(self.result.types.builtins.string);
+                const result_type = self.resultOfString(array_type) orelse return self.result.types.poison();
+                return self.checkStringArgsBuiltin(call, "синтаксис.аннотации", 2, result_type);
+            }
+            if (self.isBuiltinModule(symbol, "синтаксис", "аргумент_аннотации")) {
+                const option_type = self.optionOf(self.result.types.builtins.string) orelse return self.result.types.poison();
+                const result_type = self.resultOfString(option_type) orelse return self.result.types.poison();
+                return self.checkStringArgsBuiltin(call, "синтаксис.аргумент_аннотации", 3, result_type);
+            }
+            if (self.isBuiltinModule(symbol, "синтаксис", "аннотации_поля")) {
+                const array_type = try self.result.types.array(self.result.types.builtins.string);
+                const result_type = self.resultOfString(array_type) orelse return self.result.types.poison();
+                return self.checkStringArgsBuiltin(call, "синтаксис.аннотации_поля", 3, result_type);
+            }
+            if (self.isBuiltinModule(symbol, "синтаксис", "аргумент_аннотации_поля")) {
+                const option_type = self.optionOf(self.result.types.builtins.string) orelse return self.result.types.poison();
+                const result_type = self.resultOfString(option_type) orelse return self.result.types.poison();
+                return self.checkStringArgsBuiltin(call, "синтаксис.аргумент_аннотации_поля", 4, result_type);
+            }
+            if (self.isBuiltinModule(symbol, "сеть", "подключиться")) {
+                const connection_symbol = self.findTypeSymbol("Соединение") orelse return self.result.types.poison();
+                const connection_type = try self.nominalType(connection_symbol, &.{});
+                const result_type = self.resultOfString(connection_type) orelse return self.result.types.poison();
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: сеть.подключиться() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: сеть.подключиться() ожидает хост типа Строка первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.number), self.result.types.builtins.number)) {
+                    try self.report(call.span, "Type Error: сеть.подключиться() ожидает порт типа Число вторым аргументом", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "сеть", "кодировать_url")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: сеть.кодировать_url() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: сеть.кодировать_url() ожидает Строку", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "сеть", "http_запрос")) {
+                // (статус, заголовки, тело) — плоский tuple, тот же
+                // паттерн, что и у `ос.выполнить`: сырые данные, не
+                // именованная структура (см. Odin's `core/stdlib.odin`
+                // комментарий про `сеть::http_запрос`).
+                const pair_type = try self.result.types.tuple(&.{ self.result.types.builtins.string, self.result.types.builtins.string });
+                const headers_array = try self.result.types.array(pair_type);
+                const success_type = try self.result.types.tuple(&.{ self.result.types.builtins.integer, headers_array, self.result.types.builtins.string });
+                const result_type = self.resultOfString(success_type) orelse return self.result.types.poison();
+                if (call.arguments.len != 4) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос() ожидает 4 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос() ожидает метод типа Строка первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос() ожидает url типа Строка вторым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[2], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос() ожидает тело типа Строка третьим аргументом", .{});
+                }
+                const headers_map_type = try self.result.types.map(self.result.types.builtins.string, self.result.types.builtins.string);
+                if (!self.assignable(try self.inferExpected(call.arguments[3], headers_map_type), headers_map_type)) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос() ожидает Соответствие(Строка, Строка) четвёртым аргументом", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "сеть", "http_сервер_слушать")) {
+                const listener_symbol = self.findTypeSymbol("Слушатель") orelse return self.result.types.poison();
+                const listener_type = try self.nominalType(listener_symbol, &.{});
+                const result_type = self.resultOfString(listener_type) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: сеть.http_сервер_слушать() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.number), self.result.types.builtins.number)) {
+                    try self.report(call.span, "Type Error: сеть.http_сервер_слушать() ожидает порт типа Число", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "бд", "открыть")) {
+                const connection_symbol = self.findTypeSymbol("Соединение_БД") orelse return self.result.types.poison();
+                const connection_type = try self.nominalType(connection_symbol, &.{});
+                const result_type = self.resultOfString(connection_type) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: бд.открыть() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: бд.открыть() ожидает путь типа Строка", .{});
+                }
+                return result_type;
             }
             if (self.isBuiltin(symbol, "получить")) {
                 if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить() не принимает аргументы", .{});
@@ -1944,7 +2549,7 @@ const Checker = struct {
                             try arguments.append(self.result.allocator, try self.result.types.poison());
                         }
                     }
-                    const constructor_type = try self.result.types.nominal(nominal.symbol, arguments.items);
+                    const constructor_type = try self.nominalType(nominal.symbol, arguments.items);
                     for (call.arguments[0..shared], generic_nominal.fields[0..shared]) |argument, field| {
                         const expected = try self.substituteGeneric(field.typ, &substitutions);
                         if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент конструктора не совпадает с типом поля", .{});
@@ -1973,6 +2578,24 @@ const Checker = struct {
         if (call.arguments.len == expected) return;
         try self.report(call.span, "Type Error: метод '{s}' ожидает {d} аргумент(а)", .{ name, expected });
         for (call.arguments) |argument| _ = try self.infer(argument);
+    }
+
+    // Shared arity+all-Строка-arguments check for `синтаксис.*` (2-4
+    // plain `Строка` path/name arguments, no per-argument distinctions
+    // worth spelling out individually — unlike `ос.выполнить`, which
+    // mixes `Строка`/`Массив(Строка)`).
+    fn checkStringArgsBuiltin(self: *Checker, call: anytype, name: []const u8, expected_arity: usize, result_type: types.TypeId) !types.TypeId {
+        if (call.arguments.len != expected_arity) {
+            try self.report(call.span, "Type Error: {s}() ожидает {d} аргумент(а)", .{ name, expected_arity });
+            for (call.arguments) |argument| _ = try self.infer(argument);
+            return result_type;
+        }
+        for (call.arguments) |argument| {
+            if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                try self.report(call.span, "Type Error: {s}() ожидает аргументы типа Строка", .{name});
+            }
+        }
+        return result_type;
     }
 
     fn functionParameterNames(self: *Checker, symbol: symbols.SymbolId) !?[]const []const u8 {
@@ -2418,7 +3041,108 @@ const Checker = struct {
                 return @as(?types.TypeId, try self.result.types.nominal(option_symbol, &.{failure}));
             }
         }
+        if (std.mem.eql(u8, owner.name, "Файл")) {
+            if (std.mem.eql(u8, property.property, "прочитать") or std.mem.eql(u8, property.property, "прочитать_строку")) {
+                try self.checkMethodArity(call, property.property, 0);
+                return @as(?types.TypeId, self.resultOfString(self.result.types.builtins.string) orelse try self.result.types.poison());
+            }
+            if (std.mem.eql(u8, property.property, "записать")) {
+                try self.checkMethodArity(call, "записать", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: Файл.записать() ожидает содержимое типа Строка", .{});
+                }
+                return @as(?types.TypeId, self.resultOfString(self.result.types.builtins.number) orelse try self.result.types.poison());
+            }
+            if (std.mem.eql(u8, property.property, "закрыть")) {
+                try self.checkMethodArity(call, "закрыть", 0);
+                return self.result.types.builtins.void;
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Соединение")) {
+            if (std.mem.eql(u8, property.property, "получить") or std.mem.eql(u8, property.property, "получить_строку")) {
+                try self.checkMethodArity(call, property.property, 0);
+                return @as(?types.TypeId, self.resultOfString(self.result.types.builtins.string) orelse try self.result.types.poison());
+            }
+            if (std.mem.eql(u8, property.property, "отправить")) {
+                try self.checkMethodArity(call, "отправить", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: Соединение.отправить() ожидает содержимое типа Строка", .{});
+                }
+                return @as(?types.TypeId, self.resultOfString(self.result.types.builtins.number) orelse try self.result.types.poison());
+            }
+            if (std.mem.eql(u8, property.property, "закрыть")) {
+                try self.checkMethodArity(call, "закрыть", 0);
+                return self.result.types.builtins.void;
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Слушатель")) {
+            if (std.mem.eql(u8, property.property, "принять_запрос")) {
+                try self.checkMethodArity(call, "принять_запрос", 0);
+                const request_symbol = self.findTypeSymbol("Запрос") orelse return @as(?types.TypeId, try self.result.types.poison());
+                const request_type = try self.nominalType(request_symbol, &.{});
+                return @as(?types.TypeId, self.resultOfString(request_type) orelse try self.result.types.poison());
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Запрос")) {
+            if (std.mem.eql(u8, property.property, "метод") or std.mem.eql(u8, property.property, "путь")) {
+                try self.checkMethodArity(call, property.property, 0);
+                return @as(?types.TypeId, self.result.types.builtins.string);
+            }
+            if (std.mem.eql(u8, property.property, "заголовок")) {
+                try self.checkMethodArity(call, "заголовок", 1);
+                if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: Запрос.заголовок() ожидает имя типа Строка", .{});
+                }
+                const option_type = self.optionOf(self.result.types.builtins.string) orelse return @as(?types.TypeId, try self.result.types.poison());
+                return @as(?types.TypeId, option_type);
+            }
+            if (std.mem.eql(u8, property.property, "ответить")) {
+                try self.checkMethodArity(call, "ответить", 3);
+                if (call.arguments.len == 3) {
+                    if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.number), self.result.types.builtins.number)) {
+                        try self.report(call.span, "Type Error: Запрос.ответить() ожидает статус типа Число первым аргументом", .{});
+                    }
+                    if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: Запрос.ответить() ожидает тип содержимого типа Строка вторым аргументом", .{});
+                    }
+                    if (!self.assignable(try self.inferExpected(call.arguments[2], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: Запрос.ответить() ожидает тело типа Строка третьим аргументом", .{});
+                    }
+                }
+                return @as(?types.TypeId, self.result.types.builtins.void);
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Соединение_БД")) {
+            if (std.mem.eql(u8, property.property, "выполнить")) {
+                try self.checkMethodArity(call, "выполнить", 2);
+                if (call.arguments.len == 2) try self.checkSqlArgs(call);
+                return @as(?types.TypeId, self.resultOfString(self.result.types.builtins.number) orelse try self.result.types.poison());
+            }
+            if (std.mem.eql(u8, property.property, "запрос")) {
+                try self.checkMethodArity(call, "запрос", 2);
+                if (call.arguments.len == 2) try self.checkSqlArgs(call);
+                const row_type = try self.result.types.map(self.result.types.builtins.string, self.result.types.builtins.string);
+                const rows_type = try self.result.types.array(row_type);
+                return @as(?types.TypeId, self.resultOfString(rows_type) orelse try self.result.types.poison());
+            }
+            if (std.mem.eql(u8, property.property, "закрыть")) {
+                try self.checkMethodArity(call, "закрыть", 0);
+                return self.result.types.builtins.void;
+            }
+        }
         return null;
+    }
+
+    // Shared arg-type check for `Соединение_БД.выполнить`/`.запрос` —
+    // both take `(sql: Строка, параметры: Массив(Строка))`.
+    fn checkSqlArgs(self: *Checker, call: anytype) !void {
+        if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+            try self.report(call.span, "Type Error: ожидается SQL типа Строка первым аргументом", .{});
+        }
+        const params_type = try self.result.types.array(self.result.types.builtins.string);
+        if (!self.assignable(try self.inferExpected(call.arguments[1], params_type), params_type)) {
+            try self.report(call.span, "Type Error: ожидается Массив(Строка) вторым аргументом", .{});
+        }
     }
 
     fn resolveAlias(self: *Checker, symbol: symbols.SymbolId, span: source.Span) anyerror!types.TypeId {
@@ -2656,7 +3380,7 @@ const Checker = struct {
                 var arguments: std.ArrayList(types.TypeId) = .empty;
                 defer arguments.deinit(self.result.allocator);
                 for (nominal.arguments) |argument| try arguments.append(self.result.allocator, try self.substituteGeneric(argument, substitutions));
-                break :blk self.result.types.nominal(nominal.symbol, arguments.items);
+                break :blk self.result.types.nominalWithIdentity(nominal.symbol, nominal.identity, arguments.items);
             },
             .array => |element| self.result.types.array(try self.substituteGeneric(element, substitutions)),
             .map => |map| self.result.types.map(try self.substituteGeneric(map.key, substitutions), try self.substituteGeneric(map.value, substitutions)),
@@ -2716,13 +3440,22 @@ pub fn checkWithImportContextForTarget(
         .resolving_aliases = .init(allocator),
     };
     defer checker.resolving_aliases.deinit();
+    var owner_remaps = std.AutoHashMap(symbols.SymbolId, std.AutoHashMap(types.TypeId, types.TypeId)).init(allocator);
+    defer {
+        var it = owner_remaps.valueIterator();
+        while (it.next()) |remap| remap.deinit();
+        owner_remaps.deinit();
+    }
+    var owner_parameters_by_symbol = std.AutoHashMap(symbols.SymbolId, []const GenericParameter).init(allocator);
+    defer owner_parameters_by_symbol.deinit();
     try checker.typeAliasPass();
     try checker.nominalPass();
     try checker.preludePass();
     try checker.enumPass();
     try checker.interfacePass();
+    try checker.importIdentityPass(imports, &owner_remaps, &owner_parameters_by_symbol);
     try checker.signaturePass();
-    try checker.importSignaturePass(imports);
+    try checker.importSignaturePass(imports, &owner_remaps, &owner_parameters_by_symbol);
     try checker.constantPass();
     try checker.bodyPass();
     return result;

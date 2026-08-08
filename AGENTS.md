@@ -205,4 +205,14 @@ odin test . -debug -vet -strict-style -vet-tabs -warnings-as-errors
 
 - Zig `0.16.0` — целевой toolchain; Odin остаётся эталонной реализацией до
   завершения cutover.
-- План совместимого переноса: `specs/010-zig-migration/plan.md`.
+- План совместимого переноса: `specs/010-zig-migration/plan.md`, статус —
+  `specs/010-zig-migration/tasks.md` и `progress-report.md` (актуальнее
+  tasks.md — обновляется после каждого среза).
+- `zig build test`/`conformance`/`lsp`/`browser`/`run -- <file.ps>` — см.
+  `docs/src/architecture/toolchain-and-testing.md` § "Zig-тулчейн" за
+  полным разбором команд и известных ловушек (особенно про
+  `if`/`else`-устранение мёртвой ветки для `wasm32-freestanding`).
+- Перед коммитом Zig-изменений: `zig build test`, `zig build conformance`,
+  `zig build lsp`, `zig build browser` — ВСЕ четыре, не только `test`
+  (browser — единственная проверка компиляции под wasm, легко сломать
+  случайно).

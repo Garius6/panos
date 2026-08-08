@@ -519,6 +519,12 @@ const FunctionCompiler = struct {
         if (try self.compileErrorConstructor(call)) return;
         if (try self.compilePanicBuiltin(call)) return;
         if (try self.compileFilesystemBuiltin(call)) return;
+        if (try self.compileOsBuiltin(call)) return;
+        if (try self.compileCompressBuiltin(call)) return;
+        if (try self.compileSyntaxBuiltin(call)) return;
+        if (try self.compileNetBuiltin(call)) return;
+        if (try self.compileSqlBuiltin(call)) return;
+        if (try self.compileForeignCall(call)) return;
         if (try self.compileProcessBuiltin(call)) return;
         if (try self.compileLengthBuiltin(call)) return;
         if (try self.compileCollectionMethod(call)) return;
@@ -608,17 +614,252 @@ const FunctionCompiler = struct {
     }
 
     fn compileFilesystemBuiltin(self: *FunctionCompiler, call: anytype) !bool {
-        if (call.arguments.len != 1) return false;
         const property = switch (self.compiler.tree.expr(call.callee).*) {
             .property => |value| value,
             else => return false,
         };
         const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
         const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
-        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "фс") or !std.mem.eql(u8, property.property, "есть")) return false;
-        try self.compileExpression(call.arguments[0]);
-        try self.function.emit(self.compiler.result.allocator, .{ .file_exists = {} });
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "фс")) return false;
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "есть")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .file_exists = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "удалить")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .file_delete = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "прочитать")) {
+            try self.compileExpression(call.arguments[0]);
+            // Неблокирующий I/O: submit кладёт задачу в воркер-пул и
+            // возвращает управление немедленно, await_async — единственная
+            // точка настоящей приостановки процесса (см. bytecode.zig).
+            try self.function.emit(self.compiler.result.allocator, .{ .file_read_submit = {} });
+            try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+            return true;
+        }
+        if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "записать")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.compileExpression(call.arguments[1]);
+            try self.function.emit(self.compiler.result.allocator, .{ .file_write_submit = {} });
+            try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "открыть")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .file_open = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "это_директория")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .dir_is_dir = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "создать_директорию")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .dir_create = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "список_директории")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .dir_list = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "удалить_директорию")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .dir_delete = {} });
+            return true;
+        }
+        return false;
+    }
+
+    fn compileOsBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "ос")) return false;
+        if (call.arguments.len == 0 and std.mem.eql(u8, property.property, "аргументы")) {
+            try self.function.emit(self.compiler.result.allocator, .{ .os_args = {} });
+            return true;
+        }
+        if (call.arguments.len == 0 and std.mem.eql(u8, property.property, "версия_паноса")) {
+            try self.function.emit(self.compiler.result.allocator, .{ .os_version = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "окружение")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .os_env_get = {} });
+            return true;
+        }
+        if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "установить_окружение")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.compileExpression(call.arguments[1]);
+            try self.function.emit(self.compiler.result.allocator, .{ .os_env_set = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "удалить_окружение")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .os_env_unset = {} });
+            return true;
+        }
+        if (call.arguments.len == 3 and std.mem.eql(u8, property.property, "выполнить")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.compileExpression(call.arguments[1]);
+            try self.compileExpression(call.arguments[2]);
+            try self.function.emit(self.compiler.result.allocator, .{ .os_exec = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "завершить")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .os_exit = {} });
+            return true;
+        }
+        return false;
+    }
+
+    fn compileCompressBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "сжатие")) return false;
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "разжать_gzip")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .gzip_decompress = {} });
+            return true;
+        }
+        return false;
+    }
+
+    fn compileSyntaxBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "синтаксис")) return false;
+        const instruction: bytecode.Instruction = if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "структуры"))
+            .{ .syntax_structs = {} }
+        else if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "поля"))
+            .{ .syntax_fields = {} }
+        else if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "аннотации"))
+            .{ .syntax_annotations = {} }
+        else if (call.arguments.len == 3 and std.mem.eql(u8, property.property, "аргумент_аннотации"))
+            .{ .syntax_annotation_arg = {} }
+        else if (call.arguments.len == 3 and std.mem.eql(u8, property.property, "аннотации_поля"))
+            .{ .syntax_field_annotations = {} }
+        else if (call.arguments.len == 4 and std.mem.eql(u8, property.property, "аргумент_аннотации_поля"))
+            .{ .syntax_field_annotation_arg = {} }
+        else
+            return false;
+        for (call.arguments) |argument| try self.compileExpression(argument);
+        try self.function.emit(self.compiler.result.allocator, instruction);
         return true;
+    }
+
+    fn compileNetBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "сеть")) return false;
+        if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "подключиться")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .net_connect_submit = {} });
+            try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "кодировать_url")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .url_encode = {} });
+            return true;
+        }
+        if (call.arguments.len == 4 and std.mem.eql(u8, property.property, "http_запрос")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .http_request_submit = {} });
+            try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "http_сервер_слушать")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .http_listen = {} });
+            return true;
+        }
+        return false;
+    }
+
+    fn compileSqlBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "бд")) return false;
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "открыть")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .sql_open_submit = {} });
+            try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+            return true;
+        }
+        return false;
+    }
+
+    fn compileForeignCall(self: *FunctionCompiler, call: anytype) !bool {
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const foreign = self.findForeignDecl(symbol) orelse return false;
+        if (call.arguments.len != foreign.parameters.len) {
+            try self.compiler.report(call.span, "Compiler Error: неверное количество аргументов 'внешний'-вызова", .{});
+            try self.emitVoid();
+            return true;
+        }
+        for (call.arguments) |argument| try self.compileExpression(argument);
+        const param_kinds = try self.compiler.program().arena.allocator().alloc(ast.ForeignMarshalKind, foreign.parameters.len);
+        for (foreign.parameters, param_kinds) |parameter, *kind| kind.* = parameter.marshal;
+        // `0` (never a valid function pointer) if the resolver already
+        // failed to load the library/symbol — that's already a reported
+        // diagnostic by this point, this call is unreachable in a
+        // program that actually passed resolution cleanly.
+        const fn_ptr = self.compiler.resolution.foreign_functions.get(symbol) orelse 0;
+        const constant_index = try self.function.addConstant(self.compiler.result.allocator, .{ .foreign_function = .{
+            .fn_ptr = fn_ptr,
+            .param_kinds = param_kinds,
+            .return_kind = foreign.return_marshal,
+        } });
+        if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
+        try self.function.emit(self.compiler.result.allocator, .{ .call_foreign = .{
+            .constant_index = constant_index,
+            .argument_count = @intCast(call.arguments.len),
+        } });
+        return true;
+    }
+
+    // Reverse `decl_symbols` lookup (same linear-scan pattern already
+    // used by the LSP's `definitionSpan`/`preciseDeclarationSpan`,
+    // compile-time-only cost) — `внешний` decls are registered as plain
+    // `.function`-kind symbols (see `resolver.zig`'s `predeclare`), so
+    // there's no symbol-kind shortcut to tell a foreign call apart from
+    // an ordinary one without checking the actual declaration.
+    fn findForeignDecl(self: *FunctionCompiler, symbol: symbols.SymbolId) ?@FieldType(ast.Decl, "foreign") {
+        var iterator = self.compiler.resolution.decl_symbols.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.* != symbol) continue;
+            return switch (self.compiler.tree.decl(entry.key_ptr.*).*) {
+                .foreign => |foreign| foreign,
+                else => null,
+            };
+        }
+        return null;
     }
 
     fn compileProcessBuiltin(self: *FunctionCompiler, call: anytype) !bool {
@@ -848,6 +1089,115 @@ const FunctionCompiler = struct {
             }
             if (std.mem.eql(u8, property.property, "ошибка_опция") and call.arguments.len == 0) {
                 try self.compileEnumTransform(property.object, null, "Результат.Неудача", .{ .variant_name = "Опция.Есть", .value = .field }, .{ .variant_name = "Опция.Нет", .value = .none });
+                return true;
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Файл")) {
+            if (std.mem.eql(u8, property.property, "прочитать") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .file_handle_read_submit = {} });
+                try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "прочитать_строку") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .file_handle_read_line_submit = {} });
+                try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "записать") and call.arguments.len == 1) {
+                try self.compileExpression(property.object);
+                try self.compileExpression(call.arguments[0]);
+                try self.function.emit(self.compiler.result.allocator, .{ .file_handle_write_submit = {} });
+                try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "закрыть") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .file_handle_close = {} });
+                return true;
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Соединение")) {
+            if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .connection_read_submit = {} });
+                try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "получить_строку") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .connection_read_line_submit = {} });
+                try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "отправить") and call.arguments.len == 1) {
+                try self.compileExpression(property.object);
+                try self.compileExpression(call.arguments[0]);
+                try self.function.emit(self.compiler.result.allocator, .{ .connection_write_submit = {} });
+                try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "закрыть") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .connection_close = {} });
+                return true;
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Соединение_БД")) {
+            if (std.mem.eql(u8, property.property, "выполнить") and call.arguments.len == 2) {
+                try self.compileExpression(property.object);
+                try self.compileExpression(call.arguments[0]);
+                try self.compileExpression(call.arguments[1]);
+                try self.function.emit(self.compiler.result.allocator, .{ .sql_exec_submit = {} });
+                try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "запрос") and call.arguments.len == 2) {
+                try self.compileExpression(property.object);
+                try self.compileExpression(call.arguments[0]);
+                try self.compileExpression(call.arguments[1]);
+                try self.function.emit(self.compiler.result.allocator, .{ .sql_query_submit = {} });
+                try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "закрыть") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .sql_close = {} });
+                return true;
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Слушатель")) {
+            if (std.mem.eql(u8, property.property, "принять_запрос") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .http_accept_submit = {} });
+                try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+                return true;
+            }
+        }
+        if (std.mem.eql(u8, owner.name, "Запрос")) {
+            if (std.mem.eql(u8, property.property, "метод") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .http_request_method = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "путь") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .http_request_path = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "заголовок") and call.arguments.len == 1) {
+                try self.compileExpression(property.object);
+                try self.compileExpression(call.arguments[0]);
+                try self.function.emit(self.compiler.result.allocator, .{ .http_request_header = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "ответить") and call.arguments.len == 3) {
+                try self.compileExpression(property.object);
+                try self.compileExpression(call.arguments[0]);
+                try self.compileExpression(call.arguments[1]);
+                try self.compileExpression(call.arguments[2]);
+                try self.function.emit(self.compiler.result.allocator, .{ .http_request_respond = {} });
                 return true;
             }
         }

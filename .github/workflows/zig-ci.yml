@@ -1,0 +1,90 @@
+name: Zig CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zig-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: zig build test (${{ matrix.suffix }})
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            suffix: linux-amd64
+
+          - os: macos-14
+            suffix: macos-arm64
+
+          - os: windows-2022
+            suffix: windows-amd64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Установить Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: "0.16.0"
+
+      # Реальные `.wasm`-модули (`panos build --target=wasm`, T048) и
+      # runtime-тесты (T044) исполняются через настоящий `wasmtime run
+      # --invoke`, не просто структурно проверяются — но каждый такой тест
+      # имеет `catch |err| { if (err == error.FileNotFound) return
+      # error.SkipZigTest; ... }`, так что отсутствие wasmtime в PATH не
+      # роняет CI, только скипает подмножество тестов молча. Устанавливаем
+      # его здесь явно, чтобы CI реально гонял эти тесты, а не полагался на
+      # скип. Официальные install-скрипты (не сторонний Action —
+      # проверяемое, стабильное поведение) сами PATH не расширяют за
+      # пределы своего собственного шага — `$GITHUB_PATH` дописывается
+      # явно ниже.
+      - name: Установить wasmtime (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          # Официальный установщик только пишет PATH-экспорт в shell-профиль
+          # (`~/.bashrc` и т.п.) — следующий шаг workflow это не прочитает,
+          # нужно явно продлить `$GITHUB_PATH` на весь остаток job'а.
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: Установить wasmtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm https://wasmtime.dev/install.ps1 | iex
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.wasmtime\bin"
+
+      - name: zig build test
+        run: zig build test --summary all
+
+      - name: zig build conformance
+        run: zig build conformance --summary all
+
+      - name: zig build lsp
+        run: zig build lsp
+
+      - name: zig build browser
+        run: zig build browser
+
+      - name: zig build aot-runtime-wasi
+        run: zig build aot-runtime-wasi
+
+      - name: zig build aot-runtime-js
+        run: zig build aot-runtime-js

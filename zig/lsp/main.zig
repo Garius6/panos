@@ -70,7 +70,7 @@ pub const Server = struct {
         const params = request.get("params");
 
         if (std.mem.eql(u8, method, "initialize")) {
-            if (id) |request_id| try writeResponse(output, request_id, "{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"foldingRangeProvider\":true,\"documentSymbolProvider\":true}}");
+            if (id) |request_id| try writeResponse(output, request_id, "{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"foldingRangeProvider\":true,\"documentSymbolProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"selectionRangeProvider\":true,\"codeLensProvider\":{},\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"enumMember\",\"function\",\"variable\",\"parameter\"],\"tokenModifiers\":[]},\"full\":true}}}");
             return true;
         }
         if (std.mem.eql(u8, method, "shutdown")) {
@@ -120,6 +120,30 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, method, "textDocument/signatureHelp")) {
             if (id) |request_id| try self.signatureHelp(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "textDocument/prepareRename")) {
+            if (id) |request_id| try self.prepareRename(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "textDocument/rename")) {
+            if (id) |request_id| try self.rename(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "textDocument/selectionRange")) {
+            if (id) |request_id| try self.selectionRange(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "textDocument/codeLens")) {
+            if (id) |request_id| try self.codeLens(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "workspace/symbol")) {
+            if (id) |request_id| try self.workspaceSymbol(params, request_id, output);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "textDocument/semanticTokens/full")) {
+            if (id) |request_id| try self.semanticTokensFull(params, request_id, output);
             return true;
         }
         if (id) |request_id| try writeError(output, request_id, -32601, "Метод ещё не поддержан Zig-версией");
@@ -412,6 +436,103 @@ pub const Server = struct {
         try writeHighlightsResponse(output, request_id, file, tree, resolved, symbol);
     }
 
+    fn prepareRename(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const context = self.documentPosition(params) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const file = panos_core.source.SourceFile.init(0, context.uri, context.text);
+        const byte_offset = file.utf16PositionToByteOffset(context.position) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        var analysis = panos_core.runner.analyzeSource(self.allocator, context.uri, context.text) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer analysis.deinit();
+        const tree = analysis.tree() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const resolved = analysis.resolution() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const expression = tree.findExpressionAt(0, byte_offset) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const symbol = resolved.expr_symbols.get(expression) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const entry = resolved.symbols.get(symbol) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        if (entry.kind == .builtin) {
+            try writeResponse(output, request_id, "null");
+            return;
+        }
+        const span = panos_core.ast.exprSpan(tree.expr(expression).*);
+        if (!span.isValidFor(file)) {
+            try writeResponse(output, request_id, "null");
+            return;
+        }
+        try writeRangeResponse(output, request_id, rangeForSpan(file, span));
+    }
+
+    fn rename(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const context = self.documentPosition(params) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const new_name = renameNewName(params) orelse {
+            try writeError(output, request_id, -32602, "Отсутствует или пустое имя newName");
+            return;
+        };
+        if (!isValidIdentifier(new_name)) {
+            try writeError(output, request_id, -32602, "newName не является допустимым идентификатором panos");
+            return;
+        }
+        const file = panos_core.source.SourceFile.init(0, context.uri, context.text);
+        const byte_offset = file.utf16PositionToByteOffset(context.position) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        var analysis = panos_core.runner.analyzeSource(self.allocator, context.uri, context.text) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer analysis.deinit();
+        const tree = analysis.tree() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const resolved = analysis.resolution() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const expression = tree.findExpressionAt(0, byte_offset) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const symbol = resolved.expr_symbols.get(expression) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const entry = resolved.symbols.get(symbol) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        if (entry.kind == .builtin) {
+            try writeResponse(output, request_id, "null");
+            return;
+        }
+        try writeRenameResponse(output, request_id, context.uri, file, tree, resolved, symbol, new_name);
+    }
+
     fn signatureHelp(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
         const context = self.documentPosition(params) orelse {
             try writeResponse(output, request_id, "null");
@@ -458,6 +579,240 @@ pub const Server = struct {
         try writeResponse(output, request_id, "null");
     }
 
+    // Coarse but real: innermost tier is the exact expression at the
+    // cursor (`findExpressionAt`'s own span), next tier is the smallest
+    // top-level declaration containing it, outermost is the whole file —
+    // not full AST-statement-level granularity (this AST has no parent
+    // pointers to walk block/statement nesting), but a genuine 2-3-level
+    // chain, not a single flat range.
+    fn selectionRange(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const params_value = params orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const params_object = objectValue(params_value) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const document_value = params_object.get("textDocument") orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const document = objectValue(document_value) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const uri_value = document.get("uri") orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const uri = stringValue(uri_value) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const positions_value = params_object.get("positions") orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const positions = arrayValue(positions_value) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const text = self.documents.sourceText(uri) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const file = panos_core.source.SourceFile.init(0, uri, text);
+        var analysis = panos_core.runner.analyzeSource(self.allocator, uri, text) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer analysis.deinit();
+        const tree = analysis.tree() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        var symbols = panos_core.lsp.documentSymbols(self.allocator, tree) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer symbols.deinit();
+
+        try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+        try appendJsonValue(output, request_id);
+        try output.appendSlice(",\"result\":[");
+        for (positions.items, 0..) |position_value, index| {
+            if (index != 0) try output.append(',');
+            const position_object = objectValue(position_value) orelse {
+                try output.appendSlice("null");
+                continue;
+            };
+            const line = if (position_object.get("line")) |v| (unsignedValue(v) orelse 0) else 0;
+            const character = if (position_object.get("character")) |v| (unsignedValue(v) orelse 0) else 0;
+            const byte_offset = file.utf16PositionToByteOffset(.{ .line = line, .character = character }) orelse {
+                try output.appendSlice("null");
+                continue;
+            };
+            try appendSelectionRangeChain(output, file, tree, symbols.items, byte_offset);
+        }
+        try output.appendSlice("]}");
+    }
+
+    fn codeLens(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const uri = documentUri(params) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const text = self.documents.sourceText(uri) orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const file = panos_core.source.SourceFile.init(0, uri, text);
+        var analysis = panos_core.runner.analyzeSource(self.allocator, uri, text) catch {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        defer analysis.deinit();
+        const tree = analysis.tree() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        const resolved = analysis.resolution() orelse {
+            try writeResponse(output, request_id, "null");
+            return;
+        };
+        try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+        try appendJsonValue(output, request_id);
+        try output.appendSlice(",\"result\":[");
+        var first = true;
+        const program = tree.program orelse {
+            try output.appendSlice("]}");
+            return;
+        };
+        for (program.declarations) |decl_id| {
+            const function = switch (tree.decl(decl_id).*) {
+                .function => |value| value,
+                else => continue,
+            };
+            const symbol = resolved.decl_symbols.get(decl_id) orelse continue;
+            const count = countReferences(resolved, symbol);
+            if (!first) try output.append(',');
+            first = false;
+            try output.appendSlice("{\"range\":");
+            try appendRange(output, rangeForSpan(file, function.name_span));
+            try output.appendSlice(",\"command\":{\"title\":");
+            var title_buffer: [64]u8 = undefined;
+            const title = std.fmt.bufPrint(&title_buffer, "{d} ссылок", .{count}) catch "ссылки";
+            try appendJsonString(output, title);
+            try output.appendSlice(",\"command\":\"\"}}");
+        }
+        try output.appendSlice("]}");
+    }
+
+    // `textDocument/semanticTokens/full` — relative encoding per the LSP
+    // spec: each token is `(deltaLine, deltaChar, length, tokenType,
+    // tokenModifiers)`, `deltaChar` measured from the PREVIOUS token's
+    // start ONLY when both are on the same line, otherwise from column 0.
+    // Ported from `lsp/lsp_server.odin`'s `handle_semantic_tokens`.
+    fn semanticTokensFull(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const uri = documentUri(params) orelse {
+            try writeResponse(output, request_id, "{\"data\":[]}");
+            return;
+        };
+        const text = self.documents.sourceText(uri) orelse {
+            try writeResponse(output, request_id, "{\"data\":[]}");
+            return;
+        };
+        const file = panos_core.source.SourceFile.init(0, uri, text);
+        var analysis = panos_core.runner.analyzeSource(self.allocator, uri, text) catch {
+            try writeResponse(output, request_id, "{\"data\":[]}");
+            return;
+        };
+        defer analysis.deinit();
+        const tree = analysis.tree() orelse {
+            try writeResponse(output, request_id, "{\"data\":[]}");
+            return;
+        };
+        const resolved = analysis.resolution() orelse {
+            try writeResponse(output, request_id, "{\"data\":[]}");
+            return;
+        };
+
+        const raw = panos_core.semantic_tokens.computeSemanticTokens(self.allocator, tree, resolved) catch {
+            try writeResponse(output, request_id, "{\"data\":[]}");
+            return;
+        };
+        defer self.allocator.free(raw);
+
+        const PositionedToken = struct { line: u32, character: u32, length: u32, token_type: u32 };
+        var items: std.ArrayList(PositionedToken) = .empty;
+        defer items.deinit(self.allocator);
+        for (raw) |token| {
+            const start = file.byteOffsetToUtf16Position(token.span.start);
+            const end = file.byteOffsetToUtf16Position(token.span.end);
+            // panos identifiers are always single-line — this guards
+            // against ever emitting a token that violates the spec's
+            // "a semantic token cannot span more than one line" invariant,
+            // rather than assuming the source data always agrees.
+            if (end.line != start.line or end.character <= start.character) continue;
+            try items.append(self.allocator, .{
+                .line = start.line,
+                .character = start.character,
+                .length = end.character - start.character,
+                .token_type = @intFromEnum(token.token_type),
+            });
+        }
+        std.mem.sort(PositionedToken, items.items, {}, struct {
+            fn lessThan(_: void, a: PositionedToken, b: PositionedToken) bool {
+                if (a.line != b.line) return a.line < b.line;
+                return a.character < b.character;
+            }
+        }.lessThan);
+
+        try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+        try appendJsonValue(output, request_id);
+        try output.appendSlice(",\"result\":{\"data\":[");
+        var prev_line: u32 = 0;
+        var prev_character: u32 = 0;
+        for (items.items, 0..) |item, index| {
+            const delta_line = item.line - prev_line;
+            const delta_character = if (delta_line == 0) item.character - prev_character else item.character;
+            if (index != 0) try output.append(',');
+            var buffer: [64]u8 = undefined;
+            const encoded = std.fmt.bufPrint(&buffer, "{d},{d},{d},{d},0", .{ delta_line, delta_character, item.length, item.token_type }) catch unreachable;
+            try output.appendSlice(encoded);
+            prev_line = item.line;
+            prev_character = item.character;
+        }
+        try output.appendSlice("]}}");
+    }
+
+    fn workspaceSymbol(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
+        const params_object = if (params) |value| objectValue(value) else null;
+        const query = blk: {
+            const object = params_object orelse break :blk "";
+            const query_value = object.get("query") orelse break :blk "";
+            break :blk stringValue(query_value) orelse "";
+        };
+        try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+        try appendJsonValue(output, request_id);
+        try output.appendSlice(",\"result\":[");
+        var first = true;
+        var iterator = self.documents.documents.iterator();
+        while (iterator.next()) |entry| {
+            const uri = entry.key_ptr.*;
+            const text = entry.value_ptr.text;
+            var analysis = panos_core.runner.analyzeSource(self.allocator, uri, text) catch continue;
+            defer analysis.deinit();
+            const tree = analysis.tree() orelse continue;
+            var symbols = panos_core.lsp.documentSymbols(self.allocator, tree) catch continue;
+            defer symbols.deinit();
+            const file = panos_core.source.SourceFile.init(0, uri, text);
+            try appendMatchingSymbols(output, &first, file, uri, symbols.items, query, null);
+        }
+        try output.appendSlice("]}");
+    }
+
     fn documentPosition(self: *const Server, params: ?std.json.Value) ?DocumentPosition {
         const params_object = objectValue(params orelse return null) orelse return null;
         const document = objectValue(params_object.get("textDocument") orelse return null) orelse return null;
@@ -500,6 +855,13 @@ fn objectValue(value: std.json.Value) ?std.json.ObjectMap {
     };
 }
 
+fn arrayValue(value: std.json.Value) ?std.json.Array {
+    return switch (value) {
+        .array => |array| array,
+        else => null,
+    };
+}
+
 const DocumentPosition = struct {
     uri: []const u8,
     text: []const u8,
@@ -520,6 +882,45 @@ fn referenceIncludesDeclaration(params: ?std.json.Value) bool {
         .bool => |include| include,
         else => false,
     };
+}
+
+fn renameNewName(params: ?std.json.Value) ?[]const u8 {
+    const params_object = objectValue(params orelse return null) orelse return null;
+    const new_name = stringValue(params_object.get("newName") orelse return null) orelse return null;
+    if (new_name.len == 0) return null;
+    return new_name;
+}
+
+fn isValidIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    var pos: usize = 0;
+    var first = true;
+    while (pos < name.len) {
+        const width = std.unicode.utf8ByteSequenceLength(name[pos]) catch return false;
+        if (pos + width > name.len) return false;
+        const codepoint = std.unicode.utf8Decode(name[pos .. pos + width]) catch return false;
+        if (first) {
+            if (!isIdentifierStartCodepoint(codepoint)) return false;
+            first = false;
+        } else if (!isIdentifierContinueCodepoint(codepoint)) {
+            return false;
+        }
+        pos += width;
+    }
+    return true;
+}
+
+fn isIdentifierStartCodepoint(codepoint: u21) bool {
+    if (codepoint <= 0x7F) return std.ascii.isAlphabetic(@intCast(codepoint)) or codepoint == '_';
+    return switch (codepoint) {
+        0x0400...0x052F, 0x2DE0...0x2DFF, 0xA640...0xA69F => true,
+        else => false,
+    };
+}
+
+fn isIdentifierContinueCodepoint(codepoint: u21) bool {
+    if (isIdentifierStartCodepoint(codepoint)) return true;
+    return codepoint <= 0x7F and std.ascii.isDigit(@intCast(codepoint));
 }
 
 fn writeResponse(output: *ResponseBuffer, id: std.json.Value, result: []const u8) !void {
@@ -611,12 +1012,153 @@ fn writeHighlightsResponse(output: *ResponseBuffer, id: std.json.Value, file: pa
     try output.appendSlice("]}");
 }
 
+fn writeRangeResponse(output: *ResponseBuffer, id: std.json.Value, range: core_lsp.Range) !void {
+    try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+    try appendJsonValue(output, id);
+    try output.appendSlice(",\"result\":");
+    try appendRange(output, range);
+    try output.append('}');
+}
+
+fn writeRenameResponse(output: *ResponseBuffer, id: std.json.Value, uri: []const u8, file: panos_core.source.SourceFile, tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId, new_name: []const u8) !void {
+    try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+    try appendJsonValue(output, id);
+    try output.appendSlice(",\"result\":{\"changes\":{");
+    try appendJsonString(output, uri);
+    try output.appendSlice(":[");
+    var first = true;
+    // Only include the declaration site itself when we have a PRECISE
+    // name-only span for it (`decl_symbols`, function/constant) — a local
+    // `пер`/`конст` binding's recorded span covers the WHOLE statement
+    // (`ast.zig`'s `Stmt.let` has no separate name sub-span), so including
+    // it here would replace `пер a: Число = 1` with just the new name,
+    // corrupting the statement. Local declarations are therefore
+    // deliberately left out of the edit set for now — only their actual
+    // uses (via `expr_symbols` below) get renamed.
+    if (preciseDeclarationSpan(tree, resolved, symbol)) |span| {
+        if (span.isValidFor(file)) {
+            try appendTextEdit(output, rangeForSpan(file, span), new_name);
+            first = false;
+        }
+    }
+    var iterator = resolved.expr_symbols.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != symbol) continue;
+        if (!first) try output.append(',');
+        first = false;
+        const span = panos_core.ast.exprSpan(tree.expr(entry.key_ptr.*).*);
+        try appendTextEdit(output, rangeForSpan(file, span), new_name);
+    }
+    try output.appendSlice("]}}}");
+}
+
+fn appendTextEdit(output: *ResponseBuffer, range: core_lsp.Range, new_text: []const u8) !void {
+    try output.appendSlice("{\"range\":");
+    try appendRange(output, range);
+    try output.appendSlice(",\"newText\":");
+    try appendJsonString(output, new_text);
+    try output.append('}');
+}
+
 fn appendLocation(output: *ResponseBuffer, uri: []const u8, range: core_lsp.Range) !void {
     try output.appendSlice("{\"uri\":");
     try appendJsonString(output, uri);
     try output.appendSlice(",\"range\":");
     try appendRange(output, range);
     try output.append('}');
+}
+
+fn countReferences(resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId) usize {
+    var count: usize = 0;
+    var iterator = resolved.expr_symbols.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* == symbol) count += 1;
+    }
+    return count;
+}
+
+// Deepest `DocumentSymbol` (by nesting) whose `range` contains `offset` —
+// `null` if none does (cursor sits in top-level whitespace/outside any decl).
+fn smallestSymbolContaining(symbols: []const core_lsp.DocumentSymbol, offset: u32) ?core_lsp.DocumentSymbol {
+    for (symbols) |symbol| {
+        if (offset < symbol.range.start or offset > symbol.range.end) continue;
+        return smallestSymbolContaining(symbol.children, offset) orelse symbol;
+    }
+    return null;
+}
+
+// See `selectionRange`'s doc comment for why this is a 2-3-tier chain, not
+// full statement-level AST nesting.
+fn appendSelectionRangeChain(
+    output: *ResponseBuffer,
+    file: panos_core.source.SourceFile,
+    tree: *const panos_core.ast.Ast,
+    symbols: []const core_lsp.DocumentSymbol,
+    offset: u32,
+) !void {
+    const whole_file_span = panos_core.source.Span{ .file_id = 0, .start = 0, .end = @intCast(file.bytes.len) };
+    const enclosing_symbol = smallestSymbolContaining(symbols, offset);
+    const innermost_span: ?panos_core.source.Span = blk: {
+        const expression = tree.findExpressionAt(0, offset) orelse break :blk null;
+        break :blk panos_core.ast.exprSpan(tree.expr(expression).*);
+    };
+
+    try output.appendSlice("{\"range\":");
+    if (innermost_span) |span| {
+        try appendRange(output, rangeForSpan(file, span));
+    } else if (enclosing_symbol) |symbol| {
+        try appendRange(output, rangeForSpan(file, symbol.range));
+    } else {
+        try appendRange(output, rangeForSpan(file, whole_file_span));
+    }
+    if (innermost_span != null) {
+        try output.appendSlice(",\"parent\":{\"range\":");
+        if (enclosing_symbol) |symbol| {
+            try appendRange(output, rangeForSpan(file, symbol.range));
+        } else {
+            try appendRange(output, rangeForSpan(file, whole_file_span));
+        }
+        if (enclosing_symbol != null) {
+            try output.appendSlice(",\"parent\":{\"range\":");
+            try appendRange(output, rangeForSpan(file, whole_file_span));
+            try output.append('}');
+        }
+        try output.append('}');
+    } else if (enclosing_symbol != null) {
+        try output.appendSlice(",\"parent\":{\"range\":");
+        try appendRange(output, rangeForSpan(file, whole_file_span));
+        try output.append('}');
+    }
+    try output.append('}');
+}
+
+fn appendMatchingSymbols(
+    output: *ResponseBuffer,
+    first: *bool,
+    file: panos_core.source.SourceFile,
+    uri: []const u8,
+    symbols: []const core_lsp.DocumentSymbol,
+    query: []const u8,
+    container: ?[]const u8,
+) !void {
+    for (symbols) |symbol| {
+        if (query.len == 0 or std.ascii.indexOfIgnoreCasePos(symbol.name, 0, query) != null) {
+            if (!first.*) try output.append(',');
+            first.* = false;
+            try output.appendSlice("{\"name\":");
+            try appendJsonString(output, symbol.name);
+            try output.appendSlice(",\"kind\":");
+            try appendNumber(output, documentSymbolKind(symbol.kind));
+            if (container) |name| {
+                try output.appendSlice(",\"containerName\":");
+                try appendJsonString(output, name);
+            }
+            try output.appendSlice(",\"location\":");
+            try appendLocation(output, uri, rangeForSpan(file, symbol.range));
+            try output.append('}');
+        }
+        try appendMatchingSymbols(output, first, file, uri, symbol.children, query, symbol.name);
+    }
 }
 
 fn definitionSpan(tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId, fallback: panos_core.source.Span) panos_core.source.Span {
@@ -630,6 +1172,22 @@ fn definitionSpan(tree: *const panos_core.ast.Ast, resolved: *const panos_core.r
         };
     }
     return fallback;
+}
+
+// Same `decl_symbols` walk as `definitionSpan`, but returns `null` instead
+// of a whole-statement fallback span when no precise name-only span
+// exists (see the comment at its call site in `writeRenameResponse`).
+fn preciseDeclarationSpan(tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId) ?panos_core.source.Span {
+    var declarations = resolved.decl_symbols.iterator();
+    while (declarations.next()) |entry| {
+        if (entry.value_ptr.* != symbol) continue;
+        return switch (tree.decl(entry.key_ptr.*).*) {
+            .function => |function| function.name_span,
+            .constant => |constant| constant.name_span,
+            else => null,
+        };
+    }
+    return null;
 }
 
 fn findCallAt(tree: *const panos_core.ast.Ast, offset: u32) ?panos_core.ast.ExprId {
@@ -950,7 +1508,26 @@ pub fn main(init: std.process.Init) !void {
     var output = ResponseBuffer.init(init.gpa);
     defer output.deinit();
 
-    while (try readMessage(init.gpa, stdin)) |message| {
+    while (true) {
+        // A transport-framing error (missing/invalid `Content-Length`, a
+        // message past `max_message_size`, an unexpected EOF mid-header)
+        // used to propagate straight through this `while`'s `try` into
+        // `main`'s own `!void` return, crashing the ENTIRE server process
+        // on a single malformed frame — found via `specs/010-zig-migration`
+        // T055's contract validation (`contracts/lsp.md`: "[invalid input]
+        // ... never terminate the server"). A real LSP client always sends
+        // well-formed frames, so this is unlikely to trigger in practice —
+        // but "the whole editor's language server dies" on any transport
+        // hiccup is a strictly worse failure mode than a clean shutdown, so
+        // this now logs to stderr and exits the loop (ending the process
+        // with a normal, successful exit) instead of an uncaught error.
+        const message = readMessage(init.gpa, stdin) catch |err| {
+            var stderr_buffer: [256]u8 = undefined;
+            var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
+            stderr_file_writer.interface.print("panos-lsp: транспортная ошибка, останавливаюсь: {t}\n", .{err}) catch {};
+            stderr_file_writer.interface.flush() catch {};
+            break;
+        } orelse break;
         defer init.gpa.free(message);
         const keep_running = try server.handle(message, &output);
         if (output.items().len != 0) try writeMessage(stdout, output.items());
@@ -965,7 +1542,7 @@ test "LSP server publishes diagnostics for opened and changed documents" {
     defer output.deinit();
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}", &output));
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"foldingRangeProvider\":true,\"documentSymbolProvider\":true}}}", output.items());
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"foldingRangeProvider\":true,\"documentSymbolProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"selectionRangeProvider\":true,\"codeLensProvider\":{},\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"enumMember\",\"function\",\"variable\",\"parameter\"],\"tokenModifiers\":[]},\"full\":true}}}}", output.items());
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\",\"text\":\"экспорт функ старт() -> Число\\nнеизвестно\\nконец\"}}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"line\":1,\"character\":0") != null);
@@ -1006,8 +1583,62 @@ test "LSP server publishes diagnostics for opened and changed documents" {
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"label\":\"сложить(a: Число, b: Число) -> Число\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"activeParameter\":0") != null);
 
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"textDocument/prepareRename\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":4,\"character\":1}}}", &output));
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{\"start\":{\"line\":4,\"character\":0},\"end\":{\"line\":4,\"character\":7}}}", output.items());
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"textDocument/prepareRename\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":5,\"character\":0}}}", &output));
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":12,\"result\":null}", output.items());
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"textDocument/rename\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":4,\"character\":1},\"newName\":\"сумма\"}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"changes\":{\"file:///пример.ps\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"start\":{\"line\":0,\"character\":13},\"end\":{\"line\":0,\"character\":20}},\"newText\":\"сумма\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"start\":{\"line\":4,\"character\":0},\"end\":{\"line\":4,\"character\":7}},\"newText\":\"сумма\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "line\":1") == null);
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"textDocument/rename\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":4,\"character\":1},\"newName\":\"1неверно\"}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"error\":{\"code\":-32602") != null);
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"contentChanges\":[{\"text\":\"экспорт функ старт() -> Число\\nпер a: Число = 1\\nесли истина тогда\\nпер a: Число = 2\\na\\nконец\\na\\nконец\"}]}}", &output));
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"textDocument/rename\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":6,\"character\":0},\"newName\":\"внешняя\"}}", &output));
+    // The `пер a: Число = 1` declaration itself is deliberately NOT in the
+    // edit set — a local binding's recorded span covers the whole
+    // statement, not just the name, so there is no safe sub-span to emit
+    // (see `writeRenameResponse`'s comment). Only its actual USES get
+    // renamed: line 6 (outer scope) but not line 4 (shadowed by the inner
+    // `пер a: Число = 2`, a different symbol).
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"start\":{\"line\":1,\"character\":4}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"start\":{\"line\":6,\"character\":0},\"end\":{\"line\":6,\"character\":1}},\"newText\":\"внешняя\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"start\":{\"line\":4,\"character\":0},\"end\":{\"line\":4,\"character\":1}},\"newText\":\"внешняя\"") == null);
+
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"workspace/unsupported\",\"params\":{}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"code\":-32601") != null);
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"contentChanges\":[{\"text\":\"экспорт функ сложить(a: Число, b: Число) -> Число\\na + b\\nконец\\nэкспорт функ старт() -> Число\\nсложить(20, 22)\\nконец\"}]}}", &output));
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"textDocument/selectionRange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"positions\":[{\"line\":4,\"character\":1}]}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"result\":[{\"range\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"parent\":") != null);
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"textDocument/codeLens\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"1 ссылок\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"0 ссылок\"") != null);
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"workspace/symbol\",\"params\":{\"query\":\"слож\"}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"name\":\"сложить\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"location\":{\"uri\":\"file:///пример.ps\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"name\":\"старт\"") == null);
+
+    // Document is `сложить(a, b) -> a + b` / `старт() -> сложить(20, 22)`.
+    // `сложить`/`старт` themselves are DECLARATION names (not `.ident`
+    // expressions, so not classified — see `semantic_tokens.zig`'s doc
+    // comment); only USES land in `expr_symbols`: `a`/`b` inside `a + b`
+    // (parameter, token type 5) and the `сложить` call inside `старт`
+    // (function, token type 3).
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"textDocument/semanticTokens/full\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"result\":{\"data\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"data\":[]}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), ",5,0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), ",3,0") != null);
 }
 
 test "LSP transport reads Content-Length frames" {

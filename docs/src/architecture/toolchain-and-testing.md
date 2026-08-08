@@ -2,19 +2,27 @@
 
 ## Что
 
-Три независимые сборочные цели, все определены в `Justfile` (корень
-репозитория):
+Начиная с T057 (`specs/010-zig-migration/`) три основные сборочные цели в
+`Justfile` (корень репозитория) собирают через Zig-тулчейн (`build.zig`):
 
-- `just build` → `odin build . -out:panos` — нативный интерпретатор.
-- `just build-lsp` → `odin build ./lsp -out:panos-lsp` — LSP-сервер,
+- `just build` → `zig build -Doptimize=ReleaseFast` + копия `zig-out/bin/
+  panos` в `./panos` — нативный интерпретатор.
+- `just build-lsp` → `zig build lsp` + копия в `./panos-lsp` — LSP-сервер,
   отдельный бинарник (см. [LSP-сервер](./lsp.md)).
-- `just build-wasm` → `odin build wasm -target:js_wasm32 -o:size -out:demo/panos.wasm`
-  — wasm-сборка для браузера/демо.
+- `just build-wasm` → `zig build browser` + копия
+  `zig-out/bin/panos-browser.wasm` в `demo/panos.wasm` — wasm-сборка для
+  браузера/демо.
 - `just build-all` — все три разом.
-- `just build-lsp-debug` → `odin build ./lsp -out:panos-lsp -debug -o:none`
-  — DWARF-символы без оптимизаций, для отладки через lldb-dap; НЕ заменяет
-  `build-lsp` (релизная сборка не должна тащить `-debug`/`-o:none`).
-- `just test` → `odin test ./core` — весь набор тестов.
+
+Odin-эквиваленты СОХРАНЕНЫ, переименованы `build-odin`/`build-lsp-odin`/
+`build-wasm-odin`/`build-all-odin`/`build-lsp-debug` (последний — Odin-only,
+DWARF-символы без оптимизаций для lldb-dap, у Zig-стороны свой отдельный
+debug-путь — `zig build -Doptimize=Debug`) — Odin остаётся собираемым по
+требованию (см. "Судьба Odin-исходников" ниже), просто больше не
+дефолтный/релизный путь.
+
+- `just test` → `odin test ./core` — весь Odin-набор тестов (Zig-набор —
+  `zig build test`, см. "Zig-тулчейн" ниже).
 - `just debug-file <path>` → запуск одного `.ps`-файла с vet/debug-флагами
   (`odin run . -debug -vet -strict-style -vet-tabs -warnings-as-errors`).
 
@@ -82,13 +90,260 @@ VS Code) — свежий бинарник нужно скопировать и 
 (или `vim.fn.exepath('panos-lsp')` в Neovim) покажет, что реально
 подхватывает ваш клиент.
 
-## Точки входа для типичной правки
+## Точки входа для типичной Odin-правки
+
+С T057 `build`/`build-lsp`/`build-wasm` в `Justfile` собирают Zig — эта
+таблица про Odin-специфичные рецепты/файлы (`*-odin`, `build-lsp-debug`,
+сам Odin-код).
 
 | Изменение | Файл/команда |
 |---|---|
-| Изменить флаги сборки нативного интерпретатора | `Justfile` → `build` |
-| Изменить флаги сборки LSP | `Justfile` → `build-lsp`/`build-lsp-debug` |
-| Изменить флаги wasm-сборки | `Justfile` → `build-wasm` |
+| Изменить флаги Odin-сборки нативного интерпретатора | `Justfile` → `build-odin` |
+| Изменить флаги Odin-сборки LSP | `Justfile` → `build-lsp-odin`/`build-lsp-debug` |
+| Изменить флаги Odin-сборки wasm | `Justfile` → `build-wasm-odin` |
 | Обновить протокольный слой LSP из апстрима спеки | `Justfile` → `sync-lsp-protocol` (тянет `lsp/protocol/lsp_types.odin` из `Garius6/odin-lsp-protocol`) |
 | Добавить e2e-тест | `core/e2e_test.odin`, обёртка `run_code`/`run_code_with_args` |
 | Добавить тест, дергающий полный граф модулей | НЕ через `run_code` — нужен `core/module_loader.odin` напрямую или LSP-тестовый путь |
+
+## Zig-тулчейн (миграция, `specs/010-zig-migration/`)
+
+Полный перенос интерпретатора на Zig `0.16.0` (`zig/`) — начиная с T057
+(cutover, см. `specs/010-zig-migration/tasks.md`), Zig — РЕЛИЗНЫЙ тулчейн:
+`Justfile`'s `build`/`build-lsp`/`build-wasm`/`build-all` и
+`.github/workflows/release-binaries.yml`/`deploy-pages.yml` все собирают
+через `zig build`, не `odin build`. Собственно Zig-сборка всё ещё
+определена в одном `build.zig` в корне репозитория (не `Justfile` — у
+Zig-стороны свой build-граф, `zig build` читает `build.zig` напрямую) —
+`Justfile`'s `build`/`build-lsp`/`build-wasm` теперь тонкие обёртки над
+ним (`zig build ...` + `cp` артефакта на путь, который раньше давала
+Odin-версия, см. ниже). Odin-рецепты НЕ удалены — переименованы
+`build-odin`/`build-lsp-odin`/`build-wasm-odin`/`build-all-odin`, Odin
+остаётся собираемым по требованию для reference/comparison-задач (см.
+`specs/010-zig-migration/tasks.md` T053) — но CI/релизный путь на него
+больше НЕ полагается (T058). Судьба самих Odin-исходников (`core/*.odin`,
+`main.odin`, `lsp/`, `wasm/`) отдельно решена в T059 — см. запись T059 в
+`specs/010-zig-migration/progress-report.md`: они ОСТАЮТСЯ в дереве, не
+удалены прямо сейчас.
+
+### Команды
+
+- `zig build test` — весь набор Zig-юнит-тестов: ~35 отдельных `addTest`
+  целей (по одному на каждый значимый файл `zig/core/*.zig`, плюс
+  CLI/LSP/browser-обёртки, все `tests/conformance/*`, `tests/integration/
+  native_test.zig`, `tests/wasm/aot_runtime_test.zig`), все нативной сборки
+  — больше 1100 отдельных `test`-блоков суммарно (см. `--summary all`).
+- `zig build conformance` — подмножество `test` (manifest/lexer/parser/
+  modules conformance corpus, `tests/conformance/`, плюс
+  `native_integration_tests`) — быстрее полного `test`, когда меняется
+  только фронтенд/модульная система.
+- `zig build lsp` — собирает `panos-lsp`, устанавливает в
+  `zig-out/bin/panos-lsp` (НЕ в корень репозитория напрямую). `just
+  build-lsp` (T057, теперь тоже Zig под капотом) копирует его оттуда в
+  `./panos-lsp` — тот же путь, что раньше давала Odin-версия, так что
+  "Ритуал редеплоя" выше применяется одинаково для обоих `just`-рецептов;
+  только голый `zig build lsp` без обёртки `just` оставляет бинарник в
+  `zig-out/bin/`.
+- `zig build browser` — собирает `panos-browser` под `wasm32-freestanding`
+  (`-fno-entry -rdynamic --export-memory`, ReleaseSmall) — ТОЛЬКО
+  компиляция+установка артефакта, не запускает никаких тестов на wasm (в
+  отличие от `zig build test`, чей `browser_tests`-шаг компилирует
+  `zig/browser/main.zig` под НАТИВНЫЙ таргет для юнит-тестов самой логики,
+  не под wasm — так исторически проще тестировать browser-специфичный код
+  без wasm-рантайма).
+- `zig build run -- <file.ps> [-v|--verbose] [program args...]` —
+  запускает файл через нативный Zig CLI (`zig/cli/main.zig`); `-v`
+  печатает промежуточную статистику пайплайна (AST/типы/байткод), всё
+  после пути к файлу становится `ос.аргументы()` внутри самой программы.
+- `zig build run -- build --target=wasm <file.ps> [-o выход.wasm]` (или
+  собранный `zig-out/bin/panos build --target=wasm ...` напрямую) — AOT
+  MIR→WASM сборка одного файла (T048, см. новый раздел ниже) — НЕ то же
+  самое, что `zig build browser` (которая собирает сам ИНТЕРПРЕТАТОР под
+  wasm, а не компилирует пользовательскую `.ps`-программу в отдельный
+  `.wasm`-модуль).
+- `zig build aot-runtime-js` / `zig build aot-runtime-wasi` — сборка
+  рантайм-модулей для AOT-пути (`zig/wasm_runtime/`) — РЕАЛЬНЫЕ, не
+  заглушки: `pw_monotonic_ms`/`pw_now_ms` работают на обеих платформах
+  (проверено настоящим `wasmtime run --invoke` в `tests/wasm/
+  aot_runtime_test.zig`); `pw_print_string`/`pw_println_string` пока не
+  портированы (см. "Границы AOT-рантайма" ниже). ВАЖНО: `addWasmRuntime`
+  (`build.zig`) обязан выставлять `.rdynamic = true` — без этого `wasm-ld`
+  тихо вычищает КАЖДУЮ `pub export fn` как неиспользуемую (реальный баг,
+  найденный только запуском собранного бинарника через `wasmtime`, не
+  чтением кода — см. `specs/010-zig-migration/progress-report.md`, раздел
+  T044).
+
+## MIR→WASM AOT-пайплайн (Zig, T043/T048) — новый пайплайн и границы рантайма
+
+Помимо обычного bytecode-пайплайна (AST → байткод → `vm.zig`, тот же
+принцип, что у Odin), Zig-сторона добавляет ВТОРОЙ, полностью независимый
+пайплайн: AST → MIR (mid-level IR) → WASM-бинарник, минуя байткод-VM целиком
+— компилирует программу в САМОСТОЯТЕЛЬНЫЙ `.wasm`-модуль, исполняемый БЕЗ
+самого интерпретатора (`panos build --target=wasm`, в отличие от
+`vm.Vm.run`, который всегда исполняет байткод внутри работающего
+процесса-интерпретатора).
+
+### Файлы и роли
+
+- `zig/core/mir.zig` — данные: `Instruction`/`Terminator` union(enum),
+  индексные `ValueId`/`LocalId`/`BlockId`/`FunctionId` (`enum(u32)`, НЕ
+  указатели — `append` на growable-массиве может реаллоцировать и обнулить
+  сырые указатели).
+- `zig/core/mir_builder.zig` — тонкий builder поверх ОДНОЙ функции: `emit`/
+  `terminate` паникуют при попытке дописать в уже завершённый блок.
+- `zig/core/mir_cfg.zig` — `computeCfgInfo`: predecessors/reachable/
+  reverse-postorder, всегда пересчитывается на лету из terminator'ов, НЕ
+  кэшируется (риск рассинхронизации после мутации terminator'а).
+  ПРЕДУСЛОВИЕ: каждый Jump/Branch-target обязан быть в допустимом
+  диапазоне — индексирует `predecessors[]` напрямую по сырому id, без
+  проверки границ (осознанный выбор производительности, раз эта функция
+  гоняется на КАЖДОЙ лоуренной функции).
+- `zig/core/mir_lowering.zig` — AST → MIR, сужено до "Фазы 1a": числа/
+  булевы/строки-литералы, локали (включая присваивание — `lowerAssign`,
+  только для простых `Ident`-целей), унарные/бинарные операторы
+  (короткое замыкание `и`/`или` через non-SSA "merge через temp-локаль"),
+  если/иначе, пока (+ прервать/продолжить), прямые вызовы функций, возврат.
+  ВСЁ остальное (выбор/ADT, замыкания, интерфейсы, акторы, дженерики, для,
+  деструктуризация, builtin'ы, методы, внешний, присваивание в
+  структуры/массивы) — `unsupported()` = `@panic` с понятным сообщением, а
+  не молчаливая генерация некорректного MIR.
+- `zig/core/mir_validate.zig` — структурный верификатор ПОСЛЕ лоуринга:
+  диапазоны Value_Id/Local_Id, согласованность Return с типом результата,
+  корректность числа аргументов Call, и главное — **single-use инвариант**
+  (каждый Value_Id используется как операнд НЕ БОЛЕЕ одного раза за всю
+  функцию — на этом инварианте держится весь `wasm_emit.zig`, позволяя
+  чисто стековую эмиссию БЕЗ register allocator'а). Вызывается
+  автоматически из `wasm_emit.emitModule` — сломанный MIR даёт чистый
+  `error.InvalidMir`, а не панику где-то в середине эмиссии.
+- `zig/core/wasm_stackify.zig` — dominance-based relooper-запросы
+  (`isLoopHeader`/`identifyLoopBodyAndExit`/`computeIdom`/`findMerge`) —
+  panos как ЯЗЫК не имеет goto, граф всегда reducible, поэтому полноценный
+  Emscripten-style relooper не нужен, но НАИВНАЯ эвристика "больше одного
+  predecessor" путает "слияние ЭТОГО если/иначе" с точкой, разделяемой с
+  внешним кодом (например exit цикла) — нужна честная доминация.
+- `zig/core/wasm_module.zig` — LEB128, f64 little-endian, секции. Число/
+  Целое → WASM `f64`, Булево → WASM `i32` — та же конвенция, что у Odin.
+- `zig/core/wasm_emit.zig` — `processFrom`, структурный драйвер эмиссии
+  (`loop`/`if`/`br`/`br_if`, никакого goto). `Function_Ref_Instr` не имеет
+  собственного WASM-стекового представления — записывается в
+  `value_to_function`-карту, `call_value` находит по ней статический
+  callee (безопасно ТОЛЬКО потому, что `mir_lowering.zig` всегда эмитит эту
+  пару смежно — реального динамического/closure-callee тут ещё нет).
+
+### Границы AOT-рантайма (`zig/wasm_runtime/`)
+
+`runtime_wasi.zig`/`runtime_js.zig` — минимальный ABI, который эмитированный
+`.wasm`-модуль мог бы импортировать извне (сейчас САМ `panos build
+--target=wasm` не эмитирует НИКАКИХ импортов — Phase-1a модули полностью
+самодостаточны, без вызовов в рантайм). На сегодня портированы ТОЛЬКО
+`pw_monotonic_ms`/`pw_now_ms` (WASI — `std.os.wasi.clock_time_get`; JS —
+`extern "js_runtime" fn now_ms/monotonic_ms`, тот же контракт модуля/имён,
+что Odin-оригинал). `pw_print_string`/`pw_println_string` НЕ портированы —
+обеим нужен object-table рантайм (arena/obj_offsets/obj_sizes), а
+`wasm_emit.zig`'s Phase-1a вообще никогда не лоурит строковую константу —
+нечего печатать, пока Фаза 2 не добавит агрегаты/строки в лоуринг.
+
+### Точки входа для типичной правки MIR/WASM-пайплайна
+
+| Изменение | Файл |
+|---|---|
+| Добавить новый вид MIR-инструкции | `mir.zig` (`Instruction` union) → `mir_lowering.zig` (эмиссия) → `mir_validate.zig`'s `instrRefs` (ИСЧЕРПЫВАЮЩИЙ switch — не скомпилируется без нового case) → `wasm_emit.zig`'s `emitMirInstr`/`computeUseCount` |
+| Расширить Phase-1a лоуринг (новая конструкция языка) | `mir_lowering.zig` — снять `unsupported()` для конкретного случая, добавить тест с реальным `wasmtime`-запуском (не только структурная проверка) |
+| Добавить функцию в AOT-рантайм | `zig/wasm_runtime/runtime_wasi.zig` + `runtime_js.zig` (симметрично, тот же экспортируемый ABI) — ПРОВЕРИТЬ экспорт побайтовым дампом/`wasm-objdump` после сборки, `wasm-ld` тихо вычищает неиспользуемые `export fn` без `rdynamic` |
+| Проверить итог сквозного среза | Реальный `wasmtime run --invoke <функция> <файл.wasm> <аргументы>`, НЕ только "файл распарсился как валидный WASM" |
+
+### Известная ловушка: `if (comptime cond) { ... }` без `else` НЕ убирает недостижимую ветку
+
+Многие native builtin'ы в `zig/core/vm.zig` (`фс.*`, `ос.*`, `сеть.*`,
+`бд.*`) должны компилироваться для ТРЁХ таргетов из одного файла —
+нативного, LSP и `wasm32-freestanding` (браузер) — даже если конкретный
+builtin недоступен на wasm по `target.zig`-политике (проверяется в
+рантайме, не на этапе компиляции): диспетчер опкодов в `execute()`
+безусловно вызывает функцию для каждого варианта, так что Zig обязан
+успешно скомпилировать её тело для ЛЮБОГО таргета, на который собирается
+`vm.zig`.
+
+Форма `if (comptime builtin.target.os.tag == .freestanding) { return; }`,
+за которой следует НЕ обёрнутый в `else` код — НЕ защищает этот код от
+семантического анализа под wasm, даже если условие истинно и `return`
+гарантированно происходит раньше. Только настоящий `if`/`else` С ОБЕИМИ
+ветками даёт Zig'у устранение недостижимой ветки на этапе Sema. Ошибка в
+этом месте проявляется как непонятная ошибка компиляции глубоко в
+стандартной библиотеке (например, `RandomFile`/`getrandom` не существует
+на freestanding) — при виде такой ошибки в `zig build browser` первым
+делом проверяйте именно форму `if`, а не саму стандартную библиотеку.
+Подробный разбор — `specs/010-zig-migration/progress-report.md`, разделы
+про файловый дескриптор и про модуль `ос`.
+
+### Точки входа для типичной Zig-правки
+
+| Изменение | Файл/команда |
+|---|---|
+| Добавить новый native builtin (`модуль.функция`) | Вертикальный срез: `zig/core/resolver.zig` (`installBuiltinModule`) → `zig/core/type_checker.zig` (сигнатура в `inferCall`) → `zig/core/bytecode.zig` (опкод) → `zig/core/compiler.zig` (диспетчеризация) → `zig/core/vm.zig` (реализация) |
+| Добавить opaque-тип ресурса (как `Файл`/`Соединение`) | `resolver.zig` (`installBuiltinType`) + метод-диспетчеризация в `type_checker.zig`/`compiler.zig` (`inferPreludeEnumMethod`/`compilePreludeEnumMethod`, ветка по `owner.name`) |
+| Проверить, что новый builtin не ломает браузерную сборку | `zig build browser` — обязательно перед тем, как считать срез готовым |
+| Добавить e2e-тест на новый builtin | `zig/core/runner.zig`, паттерн `test "runner ..."` с `runSource(...)`/`checkSourceForTarget(...)` |
+| Добавить LSP-возможность | `zig/lsp/main.zig` (диспетчер + JSON-формирование) + `zig/core/lsp.zig` (чистая логика без I/O) |
+
+## Судьба Odin-исходников (T059)
+
+**Решение: Odin-исходники (`core/*.odin`, `main.odin`, `lsp/`, `wasm/`,
+`wasm_runtime/*.odin`, ~47.6К строк) ОСТАЮТСЯ в дереве репозитория,
+НЕ удаляются на данный момент.** Только их роль меняется: с T057/T058 они
+больше не являются CI/релизным путём (см. выше) — статус понижен до
+"reference-only, не поставляется", доступны по требованию через
+`build-odin`/`build-lsp-odin`/`build-wasm-odin`/`just test`.
+
+### Почему не удалить прямо сейчас
+
+- **Odin всё ещё активно ПОЛЕЗЕН, не просто исторический балласт.**
+  T053's conformance-матрица (`tests/conformance/manifest.json`) была
+  заполнена РЕАЛЬНЫМ сравнением свежесобранного Odin-бинарника с Zig
+  бок о бок — это нашло два реальных, ранее незадокументированных
+  расхождения (форматирование чисел, детализация сообщения об ошибке
+  типа) и одно архитектурное отличие (ambient builtin-модули). T053
+  заполнил только `semantic`/`runtime` tiers — `native`/`browser`/`aot`/
+  `lsp` tiers ЕЩЁ НЕ имеют манифест-кейсов вообще. Удаление Odin-исходников
+  сейчас закрыло бы единственный сегодняшний способ находить подобные
+  расхождения для ОСТАВШИХСЯ tier'ов.
+- **Удаление ~47.6К строк — по сути необратимое по ощущению действие**,
+  даже с учётом того, что git-история технически всё сохраняет (сама
+  историческая ссылка на "тот самый живой рабочий каталог" теряется).
+  Разница между "статус понижен, физически доступен" и "полностью удалён"
+  — это разница между "можно тут же откатиться и сравнить" и "нужно рыться
+  в git log на старом коммите" — ощутимо разный уровень трения для будущей
+  диагностики регрессии.
+- **Естественный триггер удаления ещё не наступил.** T053-T056 (валидация
+  контрактов/матрицы) выполнены лишь ЧАСТИЧНО в этой сессии — реальные,
+  найденные при валидации пробелы (REPL, warning-диагностики, cross-document
+  LSP, native/browser/aot/lsp manifest-tiers) всё ещё открыты. Удаление
+  reference-реализации ДО того, как все известные пробелы либо закрыты,
+  либо явно приняты как not-fixing-now, убрало бы возможность в будущем
+  быстро проверить "а как это было устроено у Odin" при их разборе.
+
+### Что удалено уже сейчас (T058)
+
+`zig/conformance/reference.zig` (тонкий helper, шеллившийся в живой
+`odin run ...` для ad hoc сравнения) — единственный код, который
+ЗАВИСЕЛ от наличия установленного Odin в мандаторном пути. Само по себе
+это уже полностью отвязывает `zig build test`/`conformance`/CI/релизы от
+Odin (проверено — см. T058) — то, что реально требовал контракт "remove
+Odin from MANDATORY dependencies", не требуя удаления исходников целиком.
+
+### Рекомендованное условие для будущего реального удаления
+
+Не привязано к конкретной дате — привязано к состоянию:
+
+1. `tests/conformance/manifest.json` заполнен по ВСЕМ tier'ам (`lexer`/
+   `parser`/`semantic`/`runtime`/`native`/`browser`/`aot`/`lsp`), каждый —
+   через реальное сравнение с Odin, как в T053.
+2. Каждая известная, найденная в T053-T056 расходимость — либо
+   исправлена, либо явно принята как постоянный `ApprovedDeviation` с
+   rationale (не просто "пока не исправлено").
+3. Zig-бинарник прожил хотя бы один полный релизный цикл (тег + реальные
+   пользователи) без регрессии, найденной сравнением с Odin.
+
+Когда все три условия выполнены — рекомендуется архивировать (не просто
+удалить: тег вроде `odin-reference-final` + отдельная ветка/архивный
+репозиторий, чтобы история и рабочее состояние оставались легко
+достижимыми) Odin-исходники и убрать их из основной ветки отдельным,
+явно запрошенным действием — не бандлом с другой работой.

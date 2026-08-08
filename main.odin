@@ -37,11 +37,87 @@ main :: proc() {
 		idx += 1
 	}
 
+	if len(args) > idx && args[idx] == "build" {
+		run_build(args[idx + 1:])
+		return
+	}
+
 	if len(args) <= idx {
 		repl()
 	} else {
 		run_file(args[idx], args[idx + 1:], verbose)
 	}
+}
+
+// run_build реализует `panos build --target=wasm <файл> [-o выход.wasm]` —
+// использует файловый module graph, поэтому поддерживает обычные
+// `импорт`ы. Inline check_source остаётся отдельным no-FS путём для LSP
+// и браузерных сценариев.
+run_build :: proc(args: []string) {
+	target := ""
+	input := ""
+	output := ""
+
+	i := 0
+	for i < len(args) {
+		arg := args[i]
+		switch {
+		case arg == "--target" && i + 1 < len(args):
+			target = args[i + 1]
+			i += 2
+		case len(arg) > len("--target=") && arg[:len("--target=")] == "--target=":
+			target = arg[len("--target="):]
+			i += 1
+		case arg == "-o" && i + 1 < len(args):
+			output = args[i + 1]
+			i += 2
+		case:
+			input = arg
+			i += 1
+		}
+	}
+
+	if target != "wasm" {
+		fmt.eprintf("panos build: поддерживается только --target=wasm (получено: %q)\n", target)
+		os.exit(1)
+	}
+	if input == "" {
+		fmt.eprintf("panos build --target=wasm <файл.ps> [-o выход.wasm]\n")
+		os.exit(1)
+	}
+	if output == "" {
+		base := input
+		if len(input) > 3 && input[len(input) - 3:] == ".ps" {
+			base = input[:len(input) - 3]
+		}
+		output = fmt.tprintf("%s.wasm", base)
+	}
+
+	graph := core.load_module_graph(input)
+	entry_path := core.resolve_import_path(input, "")
+	if graph.modules[entry_path] == nil {
+		fmt.eprintf("panos build: не удалось загрузить входной модуль %s\n", input)
+		os.exit(1)
+	}
+
+	results := core.resolve_and_typecheck_all(&graph, true)
+	all_diags := make([dynamic]core.Diagnostic)
+	for d in graph.parse_diagnostics do append(&all_diags, d)
+	for r in results {
+		for d in r.res_ctx.diagnostics do append(&all_diags, d)
+		for d in r.tc_ctx.diagnostics do append(&all_diags, d)
+	}
+	print_diagnostics_and_exit(&graph, all_diags)
+
+	module := core.lower_program_graph(results)
+	bytes := core.lower_module_to_wasm(&module)
+
+	write_err := os.write_entire_file(output, bytes)
+	if write_err != nil {
+		fmt.eprintf("panos build: не удалось записать %s: %v\n", output, write_err)
+		os.exit(1)
+	}
+	fmt.printf("panos build: записан %s\n", output)
 }
 
 // Печатает diagnostic'и (parser/resolver/typechecker — все три копят в

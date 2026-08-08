@@ -129,7 +129,8 @@ http_on_body_read :: proc(user_data: rawptr, body: http.Body, err: http.Body_Err
 	if rline, has_line := bridge_ctx.req.line.(http.Requestline); has_line {
 		method_str = http.method_string(rline.method)
 	}
-	path_str = bridge_ctx.req.url.path
+	decoded_path, decode_ok := net.percent_decode(bridge_ctx.req.url.path, context.allocator)
+	path_str = decoded_path if decode_ok else bridge_ctx.req.url.path
 
 	header_keys := make([dynamic]string, heap)
 	header_values := make([dynamic]string, heap)

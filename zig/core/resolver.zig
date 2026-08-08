@@ -1,8 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("ast.zig");
 const diagnostic = @import("diagnostic.zig");
 const source = @import("source.zig");
 const symbols = @import("symbols.zig");
+const target_policy = @import("target.zig");
 
 const EnumVariants = struct {
     owner: symbols.SymbolId,
@@ -14,6 +16,16 @@ pub const ImportedExport = struct {
     kind: symbols.SymbolKind,
     span: source.Span,
     origin: ?ImportedSymbolOrigin = null,
+    methods: []const ImportedMethodExport = &.{},
+    variants: []const ImportedVariantExport = &.{},
+};
+
+// A variant of an imported enum type — construction/matching is entirely
+// name-string-based at compile time, so unlike methods no declaration or
+// FunctionId needs to travel with it, just the bare name.
+pub const ImportedVariantExport = struct {
+    name: []const u8,
+    span: source.Span,
 };
 
 pub const ImportedSymbolOrigin = struct {
@@ -21,10 +33,35 @@ pub const ImportedSymbolOrigin = struct {
     declaration: ast.DeclId,
 };
 
+// A method declared on an imported owner type — dispatched structurally on
+// the owner's value (`точка.метод()`), never bound to a name in scope, so it
+// needs its own local Symbol_Id minted alongside the owner's, not a scope
+// declaration like other imported exports.
+pub const ImportedMethodExport = struct {
+    name: []const u8,
+    declaration: ast.DeclId,
+    span: source.Span,
+};
+
 pub const ImportedModule = struct {
     alias: []const u8,
     span: source.Span,
     exports: []const ImportedExport,
+    // True only for the implicit prelude import — merges `exports` DIRECTLY
+    // into the importer's own bare scope (`Опция(T)`, not `alias.Опция`)
+    // instead of nesting them under an `alias`-qualified module symbol.
+    unqualified: bool = false,
+};
+
+// Binds a freshly-minted local Symbol_Id for an imported method to the owner
+// type's own local Symbol_Id and the method's origin declaration in the
+// exporting module — mirrors `imported_symbols` but keyed by owner+name
+// instead of a scope-visible qualified name.
+pub const ImportedMethodBinding = struct {
+    owner: symbols.SymbolId,
+    name: []const u8,
+    symbol: symbols.SymbolId,
+    origin: ImportedSymbolOrigin,
 };
 
 const ModuleMembers = struct {
@@ -46,7 +83,21 @@ pub const Resolution = struct {
     lambda_parameters: std.AutoHashMap(ast.ExprId, []const symbols.SymbolId),
     lambda_captures: std.AutoHashMap(ast.ExprId, []const symbols.SymbolId),
     imported_symbols: std.AutoHashMap(symbols.SymbolId, ImportedSymbolOrigin),
+    imported_methods: std.ArrayList(ImportedMethodBinding) = .empty,
     enum_variants: std.ArrayList(EnumVariants) = .empty,
+    // `внешний` (FFI) — resolved function pointer per symbol, as a plain
+    // `usize` (0 = lookup failed, already reported as a diagnostic at
+    // that point) rather than an actual pointer type or `std.DynLib`
+    // value: this `Resolution` struct is compiled into the shared
+    // `core_module`, which the wasm32-freestanding browser build also
+    // imports, and `std.DynLib` doesn't need to (and shouldn't) ever
+    // become a stored field type here — `predeclare`'s `.foreign`
+    // handling only ever uses it as a local inside a real `if`/`else` on
+    // `builtin.target.os.tag == .freestanding`, then deliberately lets it
+    // go out of scope WITHOUT closing (the loaded library must outlive
+    // this resolution pass — matches Odin's `module_graph.
+    // foreign_libraries`, never explicitly unloaded either).
+    foreign_functions: std.AutoHashMap(symbols.SymbolId, usize),
 
     pub fn init(allocator: std.mem.Allocator) !Resolution {
         return .{
@@ -62,10 +113,13 @@ pub const Resolution = struct {
             .lambda_parameters = .init(allocator),
             .lambda_captures = .init(allocator),
             .imported_symbols = .init(allocator),
+            .foreign_functions = .init(allocator),
         };
     }
 
     pub fn deinit(self: *Resolution) void {
+        self.foreign_functions.deinit();
+        self.imported_methods.deinit(self.allocator);
         for (self.enum_variants.items) |*variants| variants.values.deinit();
         self.enum_variants.deinit(self.allocator);
         self.imported_symbols.deinit();
@@ -96,6 +150,7 @@ const Resolver = struct {
     scopes: symbols.ScopeStack,
     tree: *const ast.Ast = undefined,
     module_members: std.ArrayList(ModuleMembers) = .empty,
+    target_profile: target_policy.TargetProfile = .native,
 
     fn init(result: *Resolution) !Resolver {
         return .{
@@ -121,7 +176,14 @@ const Resolver = struct {
         });
     }
 
-    fn installBuiltins(self: *Resolver) !void {
+    // `skip_prelude_hardcode` is true ONLY when resolving the embedded
+    // prelude module itself (see `module_compiler.zig`'s `compileGraph`) —
+    // its own real `тип Опция[T] = перечисление ...` declarations would
+    // otherwise collide with these hand-installed duplicates. Every other
+    // caller keeps the hardcode until the single-file (non-graph) pipeline
+    // also merges the real prelude module (see `Recent Changes`/tasks.md
+    // T032 for the remaining single-file-path work).
+    fn installBuiltins(self: *Resolver, skip_prelude_hardcode: bool) !void {
         const builtin_names = [_][]const u8{
             "Ошибка",
             "длина",
@@ -145,7 +207,35 @@ const Resolver = struct {
             });
             try self.scopes.declare(&self.result.symbols, symbol);
         }
-        try self.installBuiltinModule("фс", &.{"есть"});
+        try self.installBuiltinModule("фс", &.{ "есть", "удалить", "прочитать", "записать", "открыть", "это_директория", "создать_директорию", "список_директории", "удалить_директорию" });
+        // `Файл` — непараметрический opaque-тип открытого файлового
+        // дескриптора (`фс.открыть`), симметрично Odin'овскому TY_FILE
+        // (core/type_cheker.odin) — никогда не парсится из исходника
+        // (нет ни структуры, ни перечисления), поэтому объявляется прямо
+        // здесь, как и модуль `фс` выше, а не через встроенную прелюдию.
+        try self.installBuiltinType("Файл");
+        try self.installBuiltinModule("ос", &.{ "аргументы", "версия_паноса", "окружение", "установить_окружение", "удалить_окружение", "выполнить", "завершить" });
+        try self.installBuiltinModule("сжатие", &.{"разжать_gzip"});
+        try self.installBuiltinModule("синтаксис", &.{ "структуры", "поля", "аннотации", "аргумент_аннотации", "аннотации_поля", "аргумент_аннотации_поля" });
+        try self.installBuiltinModule("сеть", &.{ "подключиться", "кодировать_url", "http_запрос", "http_сервер_слушать" });
+        // `Соединение` — открытый TCP-сокет (`сеть.подключиться`), тот же
+        // opaque-тип принцип, что `Файл` (см. коммент там) — но, в отличие
+        // от `Файл`, здесь ДЕЙСТВИТЕЛЬНО хранится живой OS-дескриптор
+        // (сокет нельзя "переоткрыть по пути" между вызовами, как файл —
+        // соединение либо живое, либо разорвано навсегда).
+        try self.installBuiltinType("Соединение");
+        // `Слушатель`/`Запрос` — TCP-сервер (`сеть.http_сервер_слушать`) и
+        // один принятый HTTP-запрос (`Слушатель.принять_запрос()`), тем же
+        // opaque-типом принципом, что `Соединение` выше.
+        try self.installBuiltinType("Слушатель");
+        try self.installBuiltinType("Запрос");
+        try self.installBuiltinModule("бд", &.{"открыть"});
+        // `Соединение_БД` — открытое SQLite-соединение (`бд.открыть`),
+        // тем же принципом opaque-типа, что `Файл`/`Соединение` — но, как
+        // и `Соединение`, хранит живой ресурс (открытый `sqlite3*`), не
+        // "путь для переоткрытия".
+        try self.installBuiltinType("Соединение_БД");
+        if (skip_prelude_hardcode) return;
         try self.installPreludeEnum("Опция", &.{ "Нет", "Есть" });
         try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });
         try self.installPreludeInterface("Сравниваемое");
@@ -176,8 +266,21 @@ const Resolver = struct {
         try self.module_members.append(self.result.allocator, members);
     }
 
+    fn installBuiltinType(self: *Resolver, name: []const u8) !void {
+        const symbol = try self.result.symbols.add(.{
+            .name = name,
+            .kind = .type,
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+        });
+        try self.scopes.declare(&self.result.symbols, symbol);
+    }
+
     fn predeclareImports(self: *Resolver, imports: []const ImportedModule) !void {
         for (imports) |import| {
+            if (import.unqualified) {
+                try self.predeclareUnqualifiedImport(import);
+                continue;
+            }
             const module = try self.result.symbols.add(.{
                 .name = import.alias,
                 .kind = .module,
@@ -206,8 +309,93 @@ const Resolver = struct {
                 } else {
                     try members.values.put(exported.name, member);
                 }
+                const owner_origin = exported.origin orelse continue;
+                for (exported.methods) |method| {
+                    const method_symbol = try self.result.symbols.add(.{
+                        .name = method.name,
+                        .kind = .function,
+                        .span = method.span,
+                    });
+                    try self.result.imported_methods.append(self.result.allocator, .{
+                        .owner = member,
+                        .name = method.name,
+                        .symbol = method_symbol,
+                        .origin = .{ .module = owner_origin.module, .declaration = method.declaration },
+                    });
+                }
+                if (exported.variants.len != 0) {
+                    var variants = EnumVariants{
+                        .owner = member,
+                        .values = .init(self.result.allocator),
+                    };
+                    errdefer variants.values.deinit();
+                    for (exported.variants) |variant| {
+                        const variant_symbol = try self.result.symbols.add(.{
+                            .name = variant.name,
+                            .kind = .enum_variant,
+                            .owner_type = member,
+                            .span = variant.span,
+                        });
+                        try variants.values.put(variant.name, variant_symbol);
+                    }
+                    try self.result.enum_variants.append(self.result.allocator, variants);
+                }
             }
             try self.module_members.append(self.result.allocator, members);
+        }
+    }
+
+    // Merges the implicit prelude import's exports DIRECTLY into the current
+    // scope — no module wrapper, no `alias.Имя` qualification, matching how
+    // panos resolves a top-level local declaration (`Опция(T)`, not
+    // `прелюдия.Опция(T)`). Methods/variants use the exact same mechanism as
+    // `predeclareImports`'s qualified path (mint a local symbol per method/
+    // variant, keyed by owner) — only the owner-type symbol's OWN visibility
+    // differs.
+    fn predeclareUnqualifiedImport(self: *Resolver, import: ImportedModule) !void {
+        for (import.exports) |exported| {
+            const member = try self.result.symbols.add(.{
+                .name = exported.name,
+                .kind = exported.kind,
+                .is_exported = true,
+                .span = exported.span,
+            });
+            self.scopes.declare(&self.result.symbols, member) catch |err| switch (err) {
+                error.DuplicateSymbol => try self.report(exported.span, "Resolve Error: символ '{s}' уже объявлен", .{exported.name}),
+                else => return err,
+            };
+            if (exported.origin) |origin| try self.result.imported_symbols.put(member, origin);
+            const owner_origin = exported.origin orelse continue;
+            for (exported.methods) |method| {
+                const method_symbol = try self.result.symbols.add(.{
+                    .name = method.name,
+                    .kind = .function,
+                    .span = method.span,
+                });
+                try self.result.imported_methods.append(self.result.allocator, .{
+                    .owner = member,
+                    .name = method.name,
+                    .symbol = method_symbol,
+                    .origin = .{ .module = owner_origin.module, .declaration = method.declaration },
+                });
+            }
+            if (exported.variants.len != 0) {
+                var variants = EnumVariants{
+                    .owner = member,
+                    .values = .init(self.result.allocator),
+                };
+                errdefer variants.values.deinit();
+                for (exported.variants) |variant| {
+                    const variant_symbol = try self.result.symbols.add(.{
+                        .name = variant.name,
+                        .kind = .enum_variant,
+                        .owner_type = member,
+                        .span = variant.span,
+                    });
+                    try variants.values.put(variant.name, variant_symbol);
+                }
+                try self.result.enum_variants.append(self.result.allocator, variants);
+            }
         }
     }
 
@@ -274,7 +462,8 @@ const Resolver = struct {
                 },
                 .enum_decl => |value| try self.registerEnumDeclaration(declaration, value),
                 .foreign => |value| {
-                    _ = try self.registerDeclaration(declaration, value.name, .function, value.span, false, false);
+                    const symbol = try self.registerDeclaration(declaration, value.name, .function, value.span, false, false);
+                    try self.resolveForeignFunction(symbol, value);
                 },
                 .impl => |value| for (value.methods) |method| {
                     const function = tree.decl(method).function;
@@ -331,6 +520,55 @@ const Resolver = struct {
         };
         try self.result.decl_symbols.put(declaration, symbol);
         return symbol;
+    }
+
+    // Loads `foreign.library` (an ARBITRARY, user-named shared library —
+    // not one of this project's own vendored dependencies) and resolves
+    // `foreign.name` in it, caching the resulting function pointer on
+    // `symbol` for `compiler.zig`/`vm.zig` to embed into the compiled
+    // `Program` later. Mirrors Odin's `core/resolver.odin` `^Foreign_Decl`
+    // case exactly (same load-once-per-declaration timing, same "leak the
+    // library, never unload" contract) — see `Resolution.foreign_
+    // functions`'s doc comment for why nothing here becomes a stored
+    // field on `Resolution` itself.
+    fn resolveForeignFunction(self: *Resolver, symbol: symbols.SymbolId, foreign: anytype) !void {
+        // Two separate guards, not one: `comptime` handles the REAL
+        // wasm32-freestanding compile (browser build) — Sema-eliminates
+        // the `std.DynLib` branch entirely, see `Resolution.foreign_
+        // functions`'s doc comment. The runtime `target_profile` check
+        // handles every OTHER case that ALSO shouldn't load a native
+        // library — e.g. the LSP/`checkSourceForTarget`-style "would this
+        // program pass for `.browser_interpreter`" queries, which run
+        // inside an ordinary NATIVE binary (so the comptime check alone
+        // never fires for them).
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
+        } else if (self.target_profile != .native) {
+            try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
+        } else {
+            const filename = try foreignLibraryFilename(self.result.arena.allocator(), foreign.library);
+            const filename_z = try self.result.arena.allocator().dupeZ(u8, filename);
+            var library = std.DynLib.openZ(filename_z) catch {
+                try self.report(foreign.span, "Resolve Error: библиотека '{s}' не найдена ({s})", .{ foreign.library, filename });
+                return;
+            };
+            const name_z = try self.result.arena.allocator().dupeZ(u8, foreign.name);
+            const fn_ptr = library.lookup(*anyopaque, name_z) orelse {
+                try self.report(foreign.span, "Resolve Error: библиотека '{s}' не экспортирует символ '{s}'", .{ foreign.library, foreign.name });
+                return;
+            };
+            try self.result.foreign_functions.put(symbol, @intFromPtr(fn_ptr));
+        }
+    }
+
+    fn foreignLibraryFilename(allocator: std.mem.Allocator, logical_name: []const u8) ![]const u8 {
+        const suffix = switch (builtin.target.os.tag) {
+            .macos, .ios, .tvos, .watchos => ".dylib",
+            .windows => ".dll",
+            else => ".so",
+        };
+        if (std.mem.endsWith(u8, logical_name, suffix)) return allocator.dupe(u8, logical_name);
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ logical_name, suffix });
     }
 
     fn registerMethod(self: *Resolver, declaration: ast.DeclId, name: []const u8, span: source.Span) !symbols.SymbolId {
@@ -564,13 +802,22 @@ pub fn resolve(allocator: std.mem.Allocator, tree: *const ast.Ast) !Resolution {
 }
 
 pub fn resolveWithImports(allocator: std.mem.Allocator, tree: *const ast.Ast, imports: []const ImportedModule) !Resolution {
+    return resolveModule(allocator, tree, imports, false);
+}
+
+pub fn resolveModule(allocator: std.mem.Allocator, tree: *const ast.Ast, imports: []const ImportedModule, skip_prelude_hardcode: bool) !Resolution {
+    return resolveModuleForTarget(allocator, tree, imports, skip_prelude_hardcode, .native);
+}
+
+pub fn resolveModuleForTarget(allocator: std.mem.Allocator, tree: *const ast.Ast, imports: []const ImportedModule, skip_prelude_hardcode: bool, target_profile: target_policy.TargetProfile) !Resolution {
     var result = try Resolution.init(allocator);
     errdefer result.deinit();
     var resolver = try Resolver.init(&result);
     defer resolver.deinit();
     resolver.tree = tree;
+    resolver.target_profile = target_profile;
 
-    try resolver.installBuiltins();
+    try resolver.installBuiltins(skip_prelude_hardcode);
     try resolver.predeclareImports(imports);
     try resolver.predeclare(tree);
     try resolver.resolveDeclarations(tree);

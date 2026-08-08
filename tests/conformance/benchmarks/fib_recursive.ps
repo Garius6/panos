@@ -1,0 +1,13 @@
+// Recursive function-call overhead (stack frames, VM dispatch per call) —
+// no loops, no allocation, exercises the call/return path in isolation.
+функ фиб(n: Целое) -> Целое
+    если n < 2 тогда
+        n
+    иначе
+        фиб(n - 1) + фиб(n - 2)
+    конец
+конец
+
+экспорт функ старт() -> Целое
+    фиб(30)
+конец

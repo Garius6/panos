@@ -93,6 +93,122 @@ fn hasErrors(diagnostics: *const panos_core.diagnostic.DiagnosticList) bool {
     return false;
 }
 
+fn writeAnalysisDiagnostics(writer: *std.Io.Writer, analysis: *const panos_core.runner.SourceAnalysis) !void {
+    // `analysis.graph` is null only when `reportUnsupportedImports` rejects
+    // the source before a graph is ever built (`runner.zig`) — there's no
+    // module/file to resolve a span against in that case, so fall back to
+    // the bare message (same fallback `writeGraphDiagnostics` itself
+    // already uses when a specific file lookup fails).
+    if (analysis.graph) |*graph| {
+        try writeGraphDiagnostics(writer, graph, &analysis.diagnostics);
+    } else {
+        for (analysis.diagnostics.items.items) |item| try writer.print("{s}\n", .{item.message});
+    }
+}
+
+// `panos build --target=wasm <файл.ps> [-o выход.wasm]` — T048. Deliberately
+// single-file only: `mir_lowering.zig` lowers exactly ONE `ast.Ast` (see its
+// own scope note), and `runner.analyzeSource`'s single-file entry point
+// already rejects `импорт` up front — the two constraints line up, this
+// isn't an artificial narrowing added just for this command. Unlike Odin's
+// `run_build` (`main.odin`, full multi-file module graph via
+// `lower_program_graph`), there is no cross-module wasm build support yet;
+// that would need `mir_lowering.zig` to grow module-graph awareness first.
+fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writer, arguments: *std.process.Args.Iterator) !void {
+    var target: []const u8 = "";
+    var input: []const u8 = "";
+    var output: []const u8 = "";
+
+    while (arguments.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--target")) {
+            target = arguments.next() orelse "";
+        } else if (std.mem.startsWith(u8, arg, "--target=")) {
+            target = arg["--target=".len..];
+        } else if (std.mem.eql(u8, arg, "-o")) {
+            output = arguments.next() orelse "";
+        } else {
+            input = arg;
+        }
+    }
+
+    if (!std.mem.eql(u8, target, "wasm")) {
+        try stderr.print("panos build: поддерживается только --target=wasm (получено: \"{s}\")\n", .{target});
+        try stderr.flush();
+        std.process.exit(1);
+    }
+    if (input.len == 0) {
+        try stderr.print("panos build --target=wasm <файл.ps> [-o выход.wasm]\n", .{});
+        try stderr.flush();
+        std.process.exit(1);
+    }
+
+    var output_owned: ?[]u8 = null;
+    defer if (output_owned) |owned| init.gpa.free(owned);
+    if (output.len == 0) {
+        const base = if (std.mem.endsWith(u8, input, ".ps")) input[0 .. input.len - 3] else input;
+        output_owned = try std.fmt.allocPrint(init.gpa, "{s}.wasm", .{base});
+        output = output_owned.?;
+    }
+
+    const reader = FileReader{ .io = init.io };
+    const bytes = reader.read(init.gpa, input) catch |err| {
+        try stderr.print("panos build: не удалось прочитать {s}: {t}\n", .{ input, err });
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    defer init.gpa.free(bytes);
+
+    var analysis = try panos_core.runner.analyzeSource(init.gpa, input, bytes);
+    defer analysis.deinit();
+    if (analysis.diagnostics.items.items.len != 0) {
+        try writeAnalysisDiagnostics(stderr, &analysis);
+        if (analysis.hasErrors()) {
+            try stderr.flush();
+            std.process.exit(1);
+        }
+    }
+
+    const tree = analysis.tree() orelse {
+        try stderr.print("panos build: не удалось разобрать {s}\n", .{input});
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    const resolution = analysis.resolution() orelse {
+        try stderr.print("panos build: резолвер не выполнился для {s}\n", .{input});
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    const checked = analysis.checkedResult() orelse {
+        try stderr.print("panos build: тайпчекер не выполнился для {s}\n", .{input});
+        try stderr.flush();
+        std.process.exit(1);
+    };
+
+    // `mir_lowering.zig`'s `unsupported()` is an uncatchable `@panic` for
+    // anything outside the Phase-1a subset (see that file's own scope
+    // note) — a source file using ADTs/closures/interfaces/`для`/methods/
+    // etc. will crash the build with that message rather than fail
+    // gracefully. Documented current limitation, not something this
+    // command works around.
+    var module = try panos_core.mir_lowering.lowerModule(init.gpa, tree, resolution, checked);
+    defer module.deinit(init.gpa);
+
+    const wasm_bytes = panos_core.wasm_emit.emitModule(init.gpa, checked, &module) catch |err| {
+        try stderr.print("panos build: не удалось эмитировать WASM для {s}: {t}\n", .{ input, err });
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    defer init.gpa.free(wasm_bytes);
+
+    std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output, .data = wasm_bytes }) catch |err| {
+        try stderr.print("panos build: не удалось записать {s}: {t}\n", .{ output, err });
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    try stdout.print("panos build: записан {s}\n", .{output});
+    try stdout.flush();
+}
+
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [256]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
@@ -119,10 +235,22 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     if (std.mem.eql(u8, file_path, "build")) {
-        try stderr.print("panos build: Zig AOT-сборка ещё не поддержана\n", .{});
-        try stderr.flush();
-        std.process.exit(1);
+        try runBuild(init, stdout, stderr, &arguments);
+        return;
     }
+
+    // Everything left on the command line after the script path — `ос.
+    // аргументы()` (`vm.zig`'s `Vm.program_args`), symmetric to Odin's
+    // `run_file(filename, program_args, ...)` (`main.odin`). Duped with
+    // `init.gpa` because `arguments.next()` points into the iterator's own
+    // buffer, which `arguments.deinit()` below invalidates — but these
+    // strings need to outlive that, through the whole VM run.
+    var program_args: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (program_args.items) |argument| init.gpa.free(argument);
+        program_args.deinit(init.gpa);
+    }
+    while (arguments.next()) |argument| try program_args.append(init.gpa, try init.gpa.dupe(u8, argument));
 
     var graph = panos_core.module_loader.Graph.init(init.gpa);
     defer graph.deinit();
@@ -161,6 +289,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var machine = panos_core.vm.Vm.init(init.gpa, &compiled.program);
+    machine.program_args = program_args.items;
     defer machine.deinit();
     switch (try machine.run(start, &.{})) {
         .success => |runtime_value| {
@@ -200,7 +329,11 @@ test "CLI records stable verbose pipeline summaries" {
     try std.testing.expectEqual(@as(usize, 1), info.declarations);
     try std.testing.expect(info.symbols != null);
     try std.testing.expect(info.types != null);
-    try std.testing.expectEqual(@as(?usize, 1), info.functions);
+    // The embedded prelude module now shares the same bytecode.Program (see
+    // module_compiler.compileGraph), so this count includes its real
+    // compiled functions (Опция/Результат methods etc) alongside the user's
+    // own — no longer just the one function this program itself declares.
+    try std.testing.expect((info.functions orelse 0) > 1);
 }
 
 test "CLI returns frontend diagnostics without executing" {

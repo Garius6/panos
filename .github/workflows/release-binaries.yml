@@ -39,23 +39,27 @@ jobs:
       - name: Получить исходники
         uses: actions/checkout@v4
 
-      - name: Установить Odin
-        uses: laytan/setup-odin@v2
+      # T057 (specs/010-zig-migration): release binaries now come from the
+      # Zig toolchain (`build.zig`), not Odin — same 3-platform matrix
+      # `zig-ci.yml` (T051) already validates on every push/PR, so a
+      # release build is never the FIRST time this exact platform/optimize
+      # combination has been compiled.
+      - name: Установить Zig
+        uses: mlugg/setup-zig@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          version: "0.16.0"
 
       - name: Собрать panos
         shell: bash
         run: |
           set -euo pipefail
-          odin build . -o:speed -out:panos${{ matrix.ext }}
+          zig build -Doptimize=ReleaseFast
 
       - name: Собрать panos-lsp
         shell: bash
         run: |
           set -euo pipefail
-          odin build ./lsp -o:speed -out:panos-lsp${{ matrix.ext }}
+          zig build lsp -Doptimize=ReleaseFast
 
       - name: Подготовить файлы релиза
         shell: bash
@@ -65,11 +69,11 @@ jobs:
           mkdir -p dist
 
           cp \
-            "panos${{ matrix.ext }}" \
+            "zig-out/bin/panos${{ matrix.ext }}" \
             "dist/panos-${{ matrix.suffix }}${{ matrix.ext }}"
 
           cp \
-            "panos-lsp${{ matrix.ext }}" \
+            "zig-out/bin/panos-lsp${{ matrix.ext }}" \
             "dist/panos-lsp-${{ matrix.suffix }}${{ matrix.ext }}"
 
       - name: Сохранить результат сборки

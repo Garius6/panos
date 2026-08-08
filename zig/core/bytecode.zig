@@ -1,8 +1,22 @@
 const std = @import("std");
+const ast = @import("ast.zig");
 
 pub const FunctionId = enum(u32) { _ };
 
 pub const invalid_function: FunctionId = @enumFromInt(std.math.maxInt(u32));
+
+// A `внешний` call target — `fn_ptr` is resolved once, at resolve time
+// (`resolver.zig`'s `resolveForeignFunction`, via `std.DynLib`), and
+// copied here (arena-owned, independent of `Resolution`'s lifetime) so
+// the compiled `Program` is fully self-contained, matching every other
+// `Constant` variant. `0` means the resolver already reported a
+// diagnostic (library/symbol not found) — `vm.zig` treats it as a
+// runtime panic, unreachable if the program actually type-checked clean.
+pub const ForeignFunctionConstant = struct {
+    fn_ptr: usize,
+    param_kinds: []const ast.ForeignMarshalKind,
+    return_kind: ast.ForeignMarshalKind,
+};
 
 pub const Constant = union(enum) {
     void: void,
@@ -11,6 +25,7 @@ pub const Constant = union(enum) {
     string: []const u8,
     function_ref: FunctionId,
     interface_vtable: []const FunctionId,
+    foreign_function: ForeignFunctionConstant,
 };
 
 pub const Opcode = enum {
@@ -77,6 +92,60 @@ pub const Opcode = enum {
     get_property,
     set_property,
     file_exists,
+    file_delete,
+    file_read,
+    file_write,
+    dir_is_dir,
+    dir_create,
+    dir_list,
+    dir_delete,
+    file_open,
+    file_handle_read_submit,
+    file_handle_read_line_submit,
+    file_handle_write_submit,
+    file_handle_close,
+    os_args,
+    os_version,
+    os_env_get,
+    os_env_set,
+    os_env_unset,
+    os_exec,
+    os_exit,
+    gzip_decompress,
+    syntax_structs,
+    syntax_fields,
+    syntax_annotations,
+    syntax_annotation_arg,
+    syntax_field_annotations,
+    syntax_field_annotation_arg,
+    connection_read_submit,
+    connection_read_line_submit,
+    connection_write_submit,
+    connection_close,
+    url_encode,
+    http_request_submit,
+    sql_open_submit,
+    sql_exec_submit,
+    sql_query_submit,
+    sql_close,
+    call_foreign,
+    // Неблокирующий I/O: submit-опкоды кладут задачу в воркер-пул и
+    // возвращают управление сразу (не блокируют) — компилятор ВСЕГДА
+    // эмитит await_async сразу после (compiler.zig, compileFilesystemBuiltin)
+    // — та же пара, что Odin's Call_Builtin_Async/Await_Async
+    // (core/vm.odin). await_async — ОДНА инструкция на ВСЕ async-builtin'ы
+    // (результат приходит из process.async_results, FIFO — порядок
+    // гарантирован тем, что submit и await всегда эмитятся смежной парой).
+    file_read_submit,
+    file_write_submit,
+    net_connect_submit,
+    await_async,
+    http_listen,
+    http_accept_submit,
+    http_request_method,
+    http_request_path,
+    http_request_header,
+    http_request_respond,
 };
 
 pub const Instruction = union(Opcode) {
@@ -152,6 +221,60 @@ pub const Instruction = union(Opcode) {
     get_property: u16,
     set_property: u16,
     file_exists: void,
+    file_delete: void,
+    file_read: void,
+    file_write: void,
+    dir_is_dir: void,
+    dir_create: void,
+    dir_list: void,
+    dir_delete: void,
+    file_open: void,
+    file_handle_read_submit: void,
+    file_handle_read_line_submit: void,
+    file_handle_write_submit: void,
+    file_handle_close: void,
+    os_args: void,
+    os_version: void,
+    os_env_get: void,
+    os_env_set: void,
+    os_env_unset: void,
+    os_exec: void,
+    os_exit: void,
+    gzip_decompress: void,
+    syntax_structs: void,
+    syntax_fields: void,
+    syntax_annotations: void,
+    syntax_annotation_arg: void,
+    syntax_field_annotations: void,
+    syntax_field_annotation_arg: void,
+    connection_read_submit: void,
+    connection_read_line_submit: void,
+    connection_write_submit: void,
+    connection_close: void,
+    url_encode: void,
+    http_request_submit: void,
+    sql_open_submit: void,
+    sql_exec_submit: void,
+    sql_query_submit: void,
+    sql_close: void,
+    // `constant_index` — the pool slot holding this call's
+    // `ForeignFunctionConstant`; `argument_count` — how many already-
+    // compiled argument values are on the stack below it, same
+    // convention as `call`.
+    call_foreign: struct {
+        constant_index: u16,
+        argument_count: u16,
+    },
+    file_read_submit: void,
+    file_write_submit: void,
+    net_connect_submit: void,
+    await_async: void,
+    http_listen: void,
+    http_accept_submit: void,
+    http_request_method: void,
+    http_request_path: void,
+    http_request_header: void,
+    http_request_respond: void,
 };
 
 pub const Function = struct {

@@ -10,15 +10,42 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // `бд.*` (`zig/core/sqlite3_bindings.zig`, referenced from `vm.zig`)
+    // needs `external/sqlite3/sqlite3.c` linked in — built into its own
+    // small static library rather than added directly to `core_module`,
+    // because `core_module` is ALSO imported by the `wasm32-freestanding`
+    // `browser` executable below, which can't compile/link a real C
+    // amalgamation (no libc there) — this library, and `.link_libc =
+    // true`/`.linkLibrary(sqlite_lib)`, are only ever attached to
+    // NATIVE-target `Compile` steps that actually exercise `vm.zig`.
+    const sqlite_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sqlite_module.addCSourceFile(.{ .file = b.path("external/sqlite3/sqlite3.c"), .flags = &.{} });
+    const sqlite_lib = b.addLibrary(.{ .name = "sqlite3", .root_module = sqlite_module });
+
+    // `внешний` (`zig/core/ffi_bindings.zig`, referenced from `vm.zig`) —
+    // unlike sqlite3, libffi ships here as a PREBUILT per-platform static
+    // archive (no source to compile), so it's added directly to each
+    // consuming module via `addObjectFile` rather than wrapped in its own
+    // `addLibrary` step. Same native-only-target restriction as sqlite —
+    // never attached to `core_module`/`browser`.
+    const libffi_archive = libffiArchivePath(b, target);
+
     const panos = b.addExecutable(.{
         .name = "panos",
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/cli/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{.{ .name = "panos_core", .module = core_module }},
         }),
     });
+    panos.root_module.linkLibrary(sqlite_lib);
+    panos.root_module.addObjectFile(libffi_archive);
     b.installArtifact(panos);
 
     const run_step = b.step("run", "Run the native Panos CLI");
@@ -33,9 +60,12 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("zig/lsp/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{.{ .name = "panos_core", .module = core_module }},
         }),
     });
+    lsp.root_module.linkLibrary(sqlite_lib);
+    lsp.root_module.addObjectFile(libffi_archive);
     const install_lsp = b.addInstallArtifact(lsp, .{});
     const lsp_step = b.step("lsp", "Build the Panos LSP server");
     lsp_step.dependOn(&install_lsp.step);
@@ -66,13 +96,28 @@ pub fn build(b: *std.Build) void {
     });
     const runtime_js = addWasmRuntime(b, "panos-aot-runtime-js", "zig/wasm_runtime/runtime_js.zig", wasm_target);
     const runtime_wasi = addWasmRuntime(b, "panos-aot-runtime-wasi", "zig/wasm_runtime/runtime_wasi.zig", wasi_target);
+    const install_runtime_js = b.addInstallArtifact(runtime_js, .{});
+    const install_runtime_wasi = b.addInstallArtifact(runtime_wasi, .{});
 
     const runtime_js_step = b.step("aot-runtime-js", "Build the JS AOT runtime scaffold");
-    runtime_js_step.dependOn(&b.addInstallArtifact(runtime_js, .{}).step);
+    runtime_js_step.dependOn(&install_runtime_js.step);
     const runtime_wasi_step = b.step("aot-runtime-wasi", "Build the WASI AOT runtime scaffold");
-    runtime_wasi_step.dependOn(&b.addInstallArtifact(runtime_wasi, .{}).step);
+    runtime_wasi_step.dependOn(&install_runtime_wasi.step);
 
-    const core_tests = b.addTest(.{ .root_module = core_module });
+    // A SEPARATE module from `core_module` (same source, same target) —
+    // `core_module` is shared with the wasm32-freestanding `browser`
+    // executable above and must not gain `.link_libc`/`сsqlite`; this one
+    // exists only so `core_tests` (which needs both, to exercise `бд.*`)
+    // doesn't mutate the shared module.
+    const core_test_module = b.createModule(.{
+        .root_source_file = b.path("zig/core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const core_tests = b.addTest(.{ .root_module = core_test_module });
+    core_tests.root_module.linkLibrary(sqlite_lib);
+    core_tests.root_module.addObjectFile(libffi_archive);
     const frontend_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/core/parser.zig"),
@@ -90,6 +135,69 @@ pub fn build(b: *std.Build) void {
     const symbols_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/core/symbols.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const mir_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/mir.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const mir_builder_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/mir_builder.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const mir_cfg_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/mir_cfg.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const mir_lowering_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/mir_lowering.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const mir_validate_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/mir_validate.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const semantic_tokens_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/semantic_tokens.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const wasm_stackify_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/wasm_stackify.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const wasm_module_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/wasm_module.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const wasm_emit_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/wasm_emit.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -141,8 +249,45 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("zig/core/vm.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
+    vm_unit_tests.root_module.linkLibrary(sqlite_lib);
+    vm_unit_tests.root_module.addObjectFile(libffi_archive);
+    const module_loader_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/module_loader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const module_linker_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/module_linker.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const module_compiler_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/module_compiler.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    module_compiler_unit_tests.root_module.linkLibrary(sqlite_lib);
+    module_compiler_unit_tests.root_module.addObjectFile(libffi_archive);
+    const runner_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/runner.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    runner_unit_tests.root_module.linkLibrary(sqlite_lib);
+    runner_unit_tests.root_module.addObjectFile(libffi_archive);
     const cli_tests = b.addTest(.{ .root_module = panos.root_module });
     const lsp_tests = b.addTest(.{ .root_module = lsp.root_module });
     const browser_tests = b.addTest(.{
@@ -150,9 +295,12 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("zig/browser/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{.{ .name = "panos_core", .module = core_module }},
         }),
     });
+    browser_tests.root_module.linkLibrary(sqlite_lib);
+    browser_tests.root_module.addObjectFile(libffi_archive);
     const conformance_module = b.addModule("panos_conformance", .{
         .root_source_file = b.path("zig/conformance/manifest.zig"),
         .target = target,
@@ -167,13 +315,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "panos_conformance", .module = conformance_module }},
         }),
     });
-    const reference_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("zig/conformance/reference.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
     const outcome_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/conformance/outcome.zig"),
@@ -182,6 +323,17 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "panos_core", .module = core_module }},
         }),
     });
+    const matrix_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/conformance/matrix_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    matrix_tests.root_module.linkLibrary(sqlite_lib);
+    matrix_tests.root_module.addObjectFile(libffi_archive);
     const lexer_conformance_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/conformance/lexer_test.zig"),
@@ -198,6 +350,17 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "panos_core", .module = core_module }},
         }),
     });
+    const modules_conformance_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/conformance/modules_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    modules_conformance_tests.root_module.linkLibrary(sqlite_lib);
+    modules_conformance_tests.root_module.addObjectFile(libffi_archive);
     const demo_parser_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test_ps_parser_test.zig"),
@@ -206,11 +369,35 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "panos_core", .module = core_module }},
         }),
     });
+    // Native-resource fixtures (`tests/integration/native/*.ps`) exercise
+    // `бд.*`/`внешний` — needs the same sqlite/libffi linking as
+    // `core_tests` above, on a module SEPARATE from the shared
+    // `core_module` for the same reason (must not gain `.link_libc` on the
+    // module the wasm32-freestanding `browser` executable also imports).
+    const native_integration_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/integration/native_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "panos_core", .module = core_module }},
+    });
+    const native_integration_tests = b.addTest(.{ .root_module = native_integration_test_module });
+    native_integration_tests.root_module.linkLibrary(sqlite_lib);
+    native_integration_tests.root_module.addObjectFile(libffi_archive);
 
     const run_core_tests = b.addRunArtifact(core_tests);
     const run_frontend_unit_tests = b.addRunArtifact(frontend_unit_tests);
     const run_target_unit_tests = b.addRunArtifact(target_unit_tests);
     const run_symbols_unit_tests = b.addRunArtifact(symbols_unit_tests);
+    const run_mir_unit_tests = b.addRunArtifact(mir_unit_tests);
+    const run_mir_builder_unit_tests = b.addRunArtifact(mir_builder_unit_tests);
+    const run_mir_cfg_unit_tests = b.addRunArtifact(mir_cfg_unit_tests);
+    const run_mir_lowering_unit_tests = b.addRunArtifact(mir_lowering_unit_tests);
+    const run_mir_validate_unit_tests = b.addRunArtifact(mir_validate_unit_tests);
+    const run_semantic_tokens_unit_tests = b.addRunArtifact(semantic_tokens_unit_tests);
+    const run_wasm_stackify_unit_tests = b.addRunArtifact(wasm_stackify_unit_tests);
+    const run_wasm_module_unit_tests = b.addRunArtifact(wasm_module_unit_tests);
+    const run_wasm_emit_unit_tests = b.addRunArtifact(wasm_emit_unit_tests);
     const run_types_unit_tests = b.addRunArtifact(types_unit_tests);
     const run_resolver_unit_tests = b.addRunArtifact(resolver_unit_tests);
     const run_type_checker_unit_tests = b.addRunArtifact(type_checker_unit_tests);
@@ -218,20 +405,48 @@ pub fn build(b: *std.Build) void {
     const run_compiler_unit_tests = b.addRunArtifact(compiler_unit_tests);
     const run_value_unit_tests = b.addRunArtifact(value_unit_tests);
     const run_vm_unit_tests = b.addRunArtifact(vm_unit_tests);
+    const run_module_loader_unit_tests = b.addRunArtifact(module_loader_unit_tests);
+    const run_module_linker_unit_tests = b.addRunArtifact(module_linker_unit_tests);
+    const run_module_compiler_unit_tests = b.addRunArtifact(module_compiler_unit_tests);
+    const run_runner_unit_tests = b.addRunArtifact(runner_unit_tests);
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const run_lsp_tests = b.addRunArtifact(lsp_tests);
     const run_browser_tests = b.addRunArtifact(browser_tests);
     const run_manifest_tests = b.addRunArtifact(manifest_tests);
-    const run_reference_tests = b.addRunArtifact(reference_tests);
     const run_outcome_tests = b.addRunArtifact(outcome_tests);
+    const run_matrix_tests = b.addRunArtifact(matrix_tests);
     const run_lexer_conformance_tests = b.addRunArtifact(lexer_conformance_tests);
     const run_parser_conformance_tests = b.addRunArtifact(parser_conformance_tests);
+    const run_modules_conformance_tests = b.addRunArtifact(modules_conformance_tests);
     const run_demo_parser_tests = b.addRunArtifact(demo_parser_tests);
+    const run_native_integration_tests = b.addRunArtifact(native_integration_tests);
+    const aot_runtime_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/wasm/aot_runtime_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_aot_runtime_tests = b.addRunArtifact(aot_runtime_tests);
+    // The runtime `.wasm` files must exist in `zig-out/bin/` before this
+    // test runs — it shells out to `wasmtime` against them, it doesn't
+    // compile them itself.
+    run_aot_runtime_tests.step.dependOn(&install_runtime_wasi.step);
+    run_aot_runtime_tests.step.dependOn(&install_runtime_js.step);
     const test_step = b.step("test", "Run Zig unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_frontend_unit_tests.step);
     test_step.dependOn(&run_target_unit_tests.step);
     test_step.dependOn(&run_symbols_unit_tests.step);
+    test_step.dependOn(&run_mir_unit_tests.step);
+    test_step.dependOn(&run_mir_builder_unit_tests.step);
+    test_step.dependOn(&run_mir_cfg_unit_tests.step);
+    test_step.dependOn(&run_mir_lowering_unit_tests.step);
+    test_step.dependOn(&run_mir_validate_unit_tests.step);
+    test_step.dependOn(&run_semantic_tokens_unit_tests.step);
+    test_step.dependOn(&run_wasm_stackify_unit_tests.step);
+    test_step.dependOn(&run_wasm_module_unit_tests.step);
+    test_step.dependOn(&run_wasm_emit_unit_tests.step);
     test_step.dependOn(&run_types_unit_tests.step);
     test_step.dependOn(&run_resolver_unit_tests.step);
     test_step.dependOn(&run_type_checker_unit_tests.step);
@@ -239,21 +454,40 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_compiler_unit_tests.step);
     test_step.dependOn(&run_value_unit_tests.step);
     test_step.dependOn(&run_vm_unit_tests.step);
+    test_step.dependOn(&run_module_loader_unit_tests.step);
+    test_step.dependOn(&run_module_linker_unit_tests.step);
+    test_step.dependOn(&run_module_compiler_unit_tests.step);
+    test_step.dependOn(&run_runner_unit_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_lsp_tests.step);
     test_step.dependOn(&run_browser_tests.step);
     test_step.dependOn(&run_manifest_tests.step);
-    test_step.dependOn(&run_reference_tests.step);
     test_step.dependOn(&run_outcome_tests.step);
+    test_step.dependOn(&run_matrix_tests.step);
     test_step.dependOn(&run_lexer_conformance_tests.step);
     test_step.dependOn(&run_parser_conformance_tests.step);
+    test_step.dependOn(&run_modules_conformance_tests.step);
     test_step.dependOn(&run_demo_parser_tests.step);
+    test_step.dependOn(&run_native_integration_tests.step);
+    test_step.dependOn(&run_aot_runtime_tests.step);
 
     const conformance_step = b.step("conformance", "Validate the local conformance manifest");
     conformance_step.dependOn(&run_manifest_tests.step);
+    conformance_step.dependOn(&run_matrix_tests.step);
     conformance_step.dependOn(&run_lexer_conformance_tests.step);
     conformance_step.dependOn(&run_parser_conformance_tests.step);
+    conformance_step.dependOn(&run_modules_conformance_tests.step);
     conformance_step.dependOn(&run_demo_parser_tests.step);
+    conformance_step.dependOn(&run_native_integration_tests.step);
+}
+
+fn libffiArchivePath(b: *std.Build, resolved_target: std.Build.ResolvedTarget) std.Build.LazyPath {
+    const os_tag = resolved_target.result.os.tag;
+    const arch = resolved_target.result.cpu.arch;
+    if (os_tag == .macos and arch == .aarch64) return b.path("external/libffi/lib/darwin-arm64/libffi.a");
+    if (os_tag == .linux and arch == .x86_64) return b.path("external/libffi/lib/linux-amd64/libffi.a");
+    if (os_tag == .windows and arch == .x86_64) return b.path("external/libffi/lib/windows-amd64/libffi.lib");
+    @panic("libffi: unsupported platform for vendored archive");
 }
 
 fn addWasmRuntime(
@@ -271,5 +505,13 @@ fn addWasmRuntime(
         }),
     });
     runtime.entry = .disabled;
+    // Without this, wasm-ld strips every `pub export fn` that nothing in
+    // this same compilation unit calls — which is ALL of them here, since
+    // the whole point of this module is to be called FROM the outside (a
+    // separately emitted `panos build --target=wasm` module, or wasmtime/
+    // the browser loader directly). Confirmed empirically: before this
+    // flag, the built `.wasm` had a `memory` export and NOTHING else — see
+    // `tests/wasm/aot_runtime_test.zig`.
+    runtime.rdynamic = true;
     return runtime;
 }

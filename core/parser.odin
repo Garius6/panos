@@ -2966,6 +2966,15 @@ parse_match_expr :: proc(p: ^Parser) -> ^Match_Expr {
 				if nxt == .End || nxt == .EOF do break
 				break
 			}
+			nxt_tok := peek_token(p.stream)
+			last_tok := p.stream.tokens[p.stream.current_idx - 1]
+			if nxt_tok.kind != .End && nxt_tok.kind != .EOF && !nxt_tok.nl_before && last_tok.kind != .Semicolon {
+				report_parse(
+					p,
+					nxt_tok.span,
+					"Синтаксическая ошибка: несколько выражений в одной строке ветки выбор — используйте 'тогда ... конец' для нескольких операторов",
+				)
+			}
 		}
 		arm.span = span_from(p, arm_start)
 		append(&m.arms, arm)

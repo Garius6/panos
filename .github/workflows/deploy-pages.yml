@@ -23,41 +23,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # release: nightly подтягивал ПОСЛЕДНИЙ ночной билд на момент запуска
-      # CI, а не тот, что стоит локально (dev-2026-06:285f6d87b) — расхождение
-      # в месяц+ уже один раз сломало сборку: core:mem's dynamic_arena_init
-      # между версиями поменял набор именованных параметров ("No parameter
-      # named 'alignment'"). Пиним конкретный тег релиза, совпадающий с
-      # локальным тулчейном, вместо плавающего "nightly".
-      - uses: laytan/setup-odin@v2
+      # T057 (specs/010-zig-migration): panos.wasm теперь собирается Zig-
+      # тулчейном (`zig build browser` — `panos-browser.wasm`, ReleaseSmall
+      # уже задан в build.zig, тот же принцип "маленький размер обязателен",
+      # что у Odin's -o:size — см. build.zig's browser executable). Zig сам
+      # тащит свой линкер (нет отдельного system-пакета вроде lld/wasm-ld,
+      # который нужен был Odin) — шаг "Установить wasm-ld" больше не нужен.
+      - name: Установить Zig
+        uses: mlugg/setup-zig@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          version: "0.16.0"
 
-      # wasm-ld (линкер под -target:js_wasm32) — не в дефолтном ubuntu-
-      # раннере, ставится отдельно пакетом lld.
-      - name: Установить wasm-ld
-        run: sudo apt-get update && sudo apt-get install -y lld
-
-      # demo/panos.wasm — build-артефакт (.gitignore), собирается только
-      # здесь (см. `just build-wasm`). -o:size обязателен: дефолтный
-      # -o:minimal даёт модуль, на JIT-компиляции которого падает
-      # JavaScriptCore (Safari/WebKit) — см. комментарий в wasm/main.odin.
       # mkdir обязателен: demo/ не содержит других отслеживаемых файлов
       # (index.html/odin.js убраны из git) — git не хранит пустые
       # директории, значит на чистом checkout'е demo/ физически не
-      # существует, и -out:demo/panos.wasm падает "LLVM Error: No such
-      # file or directory" на попытке открыть файл в несуществующей
-      # директории (локально не воспроизводится — рабочая копия просто
-      # физически хранит папку с прошлых сборок).
+      # существует.
       - name: Собрать panos.wasm
         run: |
           mkdir -p demo
-          odin build wasm -target:js_wasm32 -o:size -out:demo/panos.wasm
+          zig build browser
+          cp zig-out/bin/panos-browser.wasm demo/panos.wasm
 
       # mdBook публикует готовые бинарники в своих GitHub Releases — проще
       # и надёжнее скачать напрямую, чем тянуть отдельный marketplace-экшен
-      # ради одной команды. Версия пинится (как и Odin выше) вместо
+      # ради одной команды. Версия пинится (как и Zig выше) вместо
       # "latest", чтобы сборка не ломалась незамеченным апдейтом.
       - name: Установить mdbook
         run: |

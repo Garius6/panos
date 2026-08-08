@@ -1,0 +1,8 @@
+// `есть_но_не_экспортирована` exists in this module but is NOT exported —
+// referencing it via `библ.` (missing_export/main.ps) hits the exact same
+// "у модуля 'X' нет экспорта 'Y'" diagnostic as referencing a name that
+// doesn't exist here at all (`collectExports` only ever tracks exported
+// names — there's no separate "found but private" code path to test).
+функ есть_но_не_экспортирована() -> Число
+    1
+конец

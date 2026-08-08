@@ -24,6 +24,51 @@ lower_wasm_from_source :: proc(t: ^testing.T, source: string) -> []u8 {
 }
 
 @(test)
+test_wasm_module_from_file_graph_with_import :: proc(t: ^testing.T) {
+	graph := load_module_graph("fixtures/module_fixture_main.ps")
+	results := resolve_and_typecheck_all(&graph, true)
+	diag_count := len(graph.parse_diagnostics)
+	for r in results {
+		diag_count += len(r.res_ctx.diagnostics)
+		diag_count += len(r.tc_ctx.diagnostics)
+	}
+	testing.expectf(t, diag_count == 0, "module graph diagnostics: %v", diag_count)
+	if diag_count > 0 do return
+
+	module := lower_program_graph(results)
+	bytes := lower_module_to_wasm(&module)
+	testing.expectf(t, len(bytes) >= 8, "WASM-модуль с файловым импортом короче заголовка: %d", len(bytes))
+}
+
+@(test)
+test_wasm_typecheck_rejects_native_only_builtin :: proc(t: ^testing.T) {
+	result := check_source(`
+		импорт фс
+
+		функ старт() -> Булево
+			фс.есть("данные.txt")
+		конец
+	`, wasm_target = true)
+	testing.expectf(t, len(result.diags) == 1, "ожидалась одна diagnostics, получено: %v", result.diags)
+	if len(result.diags) == 0 do return
+	testing.expectf(t, result.diags[0].message == "Type Error: builtin 'фс::есть' недоступен для WASM-таргета", "неверная diagnostics: %s", result.diags[0].message)
+}
+
+@(test)
+test_native_typecheck_rejects_wasm_aot_only_builtin :: proc(t: ^testing.T) {
+	result := check_source(`
+		импорт DOM
+
+		функ старт() -> Пусто
+			DOM.текст("root")
+		конец
+	`)
+	testing.expectf(t, len(result.diags) == 1, "ожидалась одна diagnostics, получено: %v", result.diags)
+	if len(result.diags) == 0 do return
+	testing.expectf(t, result.diags[0].message == "Type Error: builtin 'DOM::текст' доступен только для AOT WASM-таргета", "неверная diagnostics: %s", result.diags[0].message)
+}
+
+@(test)
 test_wasm_module_has_valid_header :: proc(t: ^testing.T) {
 	bytes := lower_wasm_from_source(t, `
 		функ старт() -> Число
@@ -70,6 +115,35 @@ test_wasm_module_exports_entry_function :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, found, "имя функции 'старт' не найдено в байтах модуля")
+}
+
+@(test)
+test_wasm_module_exports_function_with_for_in_array :: proc(t: ^testing.T) {
+	bytes := lower_wasm_from_source(t, `
+		функ старт() -> Число
+			пер сумма = 0
+			для x в массив(1, 2, 3) цикл
+				сумма = сумма + x
+			конец
+			сумма
+		конец
+	`)
+	name := transmute([]u8)string("старт")
+	found := false
+	for i := 0; i <= len(bytes) - len(name); i += 1 {
+		matches := true
+		for j in 0 ..< len(name) {
+			if bytes[i + j] != name[j] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			found = true
+			break
+		}
+	}
+	testing.expectf(t, found, "функция с for-in по массиву не экспортирована в wasm-модуль")
 }
 
 @(test)

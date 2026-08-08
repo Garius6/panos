@@ -3,23 +3,50 @@ set positional-arguments
 debug-file file:
 	odin run . -debug -vet -strict-style -vet-tabs  -warnings-as-errors -- $1
 
+# T057 (specs/010-zig-migration): `build`/`build-lsp`/`build-wasm` now build
+# the ZIG toolchain (`build.zig` at repo root), not Odin — this is the
+# documented release/Pages path from here on (`.github/workflows/release-
+# binaries.yml`/`deploy-pages.yml` both switched the same way). Each copies
+# its `zig-out/bin/...` artifact to the SAME path the Odin recipes used to
+# produce (`./panos`, `./panos-lsp`, `demo/panos.wasm`) — every existing
+# consumer (editor LSP configs pointed at repo-root `./panos-lsp`, this
+# Justfile's own `build-all`, deploy-pages' `cp -r demo/.`) keeps working
+# unchanged. The Odin recipes are NOT deleted — Odin remains buildable
+# on-demand for reference/comparison work (see `specs/010-zig-migration/
+# tasks.md` T053's conformance-matrix use of a freshly built Odin binary),
+# just renamed `*-odin` and no longer the default/release path.
 build:
-	odin build . -out:panos
+	zig build -Doptimize=ReleaseFast
+	cp zig-out/bin/panos panos
 
 build-lsp:
+	zig build lsp
+	cp zig-out/bin/panos-lsp panos-lsp
+
+build-wasm:
+	zig build browser
+	mkdir -p demo
+	cp zig-out/bin/panos-browser.wasm demo/panos.wasm
+
+build-all: build build-lsp build-wasm
+
+build-odin:
+	odin build . -out:panos
+
+build-lsp-odin:
 	odin build ./lsp -out:panos-lsp
 
 # DWARF-символы + без оптимизаций — для lldb-dap (см. nvim DAP-конфиг).
-# Не заменяет build-lsp: релизная сборка не должна тащить -debug/-o:none.
+# Не заменяет build-lsp-odin: релизная сборка не должна тащить -debug/-o:none.
 build-lsp-debug:
 	odin build ./lsp -out:panos-lsp -debug -o:none
 
 # -o:size обязателен: дефолтный -o:minimal даёт модуль, на котором падает
 # JIT-компилятор Safari/WebKit (см. wasm/main.odin).
-build-wasm:
+build-wasm-odin:
 	odin build wasm -target:js_wasm32 -o:size -out:demo/panos.wasm
 
-build-all: build build-lsp build-wasm
+build-all-odin: build-odin build-lsp-odin build-wasm-odin
 
 sync-lsp-protocol:
 	curl -sL https://raw.githubusercontent.com/Garius6/odin-lsp-protocol/v0.1.1/generated/lsp_types.odin \
@@ -101,13 +128,20 @@ test-wasm-backend: build-wasm-runtime
 # "chore: версия X.Y.Z", тегирует vX.Y.Z, пушит main и тег — тот же
 # ручной semver, что описан в комментарии у PANOS_VERSION. Версию
 # передавать БЕЗ "v": just bump-and-push 0.2.9
-# odin test ./core падает ненулевым кодом на провале — just останавливает
+# T057: гейт теперь `zig build`/`zig build test` (Zig — релизный тулчейн),
+# а не `odin build`/`odin test ./core`. Версия хранится в ДВУХ местах, пока
+# обе реализации сосуществуют (см. `zig/core/vm.zig`'s `osVersion` doc
+# comment — "there is no single source of truth shared between the two
+# implementations during the migration") — оба обновляются одним рецептом,
+# чтобы не разъезжались.
+# zig build test падает ненулевым кодом на провале — just останавливает
 # рецепт на первой упавшей строке, коммит/тег/push не происходят.
 bump-and-push version:
 	sed -i '' 's/PANOS_VERSION :: "[^"]*"/PANOS_VERSION :: "{{version}}"/' core/vm.odin
-	odin build . -out:panos
-	odin test ./core
-	git add core/vm.odin
+	sed -i '' 's/createString(try self.allocator.dupe(u8, "[^"]*"))/createString(try self.allocator.dupe(u8, "{{version}}"))/' zig/core/vm.zig
+	zig build
+	zig build test
+	git add core/vm.odin zig/core/vm.zig
 	git commit -m "chore: версия {{version}}"
 	git tag v{{version}}
 	git push origin main

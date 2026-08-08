@@ -1561,7 +1561,8 @@ lower_for_in_stmt :: proc(ctx: ^Lowering_Context, stmt: Stmt, s: ^For_In_Stmt) -
 		emit(&ctx.b, new_load_local(iter_v_idx, iter_local))
 		idx_v3 := new_value(&ctx.b, TY_NUM)
 		emit(&ctx.b, new_load_local(idx_v3, idx_local))
-		elem_v := new_value(&ctx.b, nil)
+		iter_type := prune_type(ctx.tc.node_types[s.iterable])
+		elem_v := new_value(&ctx.b, iter_type.element_type)
 		gi := new(Get_Index_Instr)
 		gi.dst = elem_v
 		gi.object = iter_v_idx
@@ -1645,7 +1646,7 @@ lower_for_in_stmt :: proc(ctx: ^Lowering_Context, stmt: Stmt, s: ^For_In_Stmt) -
 @(private = "file")
 lower_for_in_bind_names :: proc(ctx: ^Lowering_Context, names_syms: [dynamic]Symbol_Id, elem_v: Value_Id) {
 	if len(names_syms) == 1 {
-		binder := new_local(&ctx.b, names_syms[0], "", nil)
+		binder := new_local(&ctx.b, names_syms[0], "", value_type(&ctx.b, elem_v))
 		ctx.symbol_to_local[names_syms[0]] = binder
 		emit(&ctx.b, new_store_local(binder, elem_v))
 		return

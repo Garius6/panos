@@ -5547,6 +5547,12 @@ infer_call_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Call_Expr) -> ^Type {
 					)
 				}
 				export_sym := symbol_at(ctx.res.symbol_store, export_sym_id)
+				if export_sym.kind == .Builtin {
+					full_name := resolve_interned(export_sym.full_name)
+					if !builtin_available_for_target(full_name, ctx.res.wasm_target) {
+						return report(ctx, e.span, builtin_unavailable_type_message(full_name, ctx.res.wasm_target))
+					}
+				}
 
 				// Стадия 23 (Печатаемое): ввод_вывод::печать/строка обходят
 				// обычную unификацию параметров ниже (жёстко TY_STRING через
@@ -6549,6 +6555,13 @@ infer_property_expr :: proc(ctx: ^Type_Ctx, expr: Expr, e: ^Property_Expr) -> ^T
 			ctx,
 			e.span,
 			"Type Error: метод коллекции '%s' нужно вызвать через ()",
+			e.property,
+		)
+	} else if obj_type.kind == .String {
+		return report(
+			ctx,
+			e.span,
+			"Type Error: у Строки нет методов — используйте строки.%s(x, ...)",
 			e.property,
 		)
 

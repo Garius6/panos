@@ -4,16 +4,1088 @@ const bytecode = @import("bytecode.zig");
 const gc = @import("gc.zig");
 const target_policy = @import("target.zig");
 const value = @import("value.zig");
+// Renamed (not `ast`/`lexer`/`parser`) — many existing tests below already
+// locally shadow those three names with their own `@import(...)` (written
+// before any module-scope import of them existed here); a plain top-level
+// import under the obvious name would conflict with every one of them.
+const ast_types = @import("ast.zig");
+const syntax_lexer = @import("lexer.zig");
+const syntax_parser = @import("parser.zig");
+const sqlite3 = @import("sqlite3_bindings.zig");
+const ffi = @import("ffi_bindings.zig");
 
 pub const Execution = union(enum) {
     success: value.Value,
     runtime_error: []const u8,
 };
 
-const Frame = struct {
-    function_id: bytecode.FunctionId,
-    ip: usize = 0,
-    locals: []value.Value,
+// Persistent per-process continuation state now lives on value.Process
+// itself (see value.zig) so a process can be suspended mid-frame and
+// resumed later by the round-robin scheduler — kept as a local alias since
+// most of this file already refers to it as plain `Frame`.
+const Frame = value.Frame;
+
+// Outcome of a single step() dispatch. `.suspended` means the current
+// instruction could not complete yet (empty mailbox/signals/async_results)
+// and must be re-dispatched from the SAME frame.ip on the next scheduling
+// slice — the handful of suspend-capable instructions (получить,
+// получить_сигнал, Await_Async) roll frame.ip back by one before returning
+// this, since step() unconditionally advances ip before dispatch.
+const StepOutcome = union(enum) {
+    none,
+    completed: value.Value,
+    suspended,
+};
+
+// Неблокирующий I/O. Payload — ТОЛЬКО плоские данные (никогда Value/GC-
+// указатели) — воркер-поток никогда не трогает vm.heap (не потокобезопасен,
+// см. gc.zig). content/err_message выделены на std.heap.page_allocator
+// (см. AsyncQueue ниже), не на Vm.allocator — освобождаются сразу после
+// копирования в GC-строку на главном потоке (deliverAsyncResult).
+const HttpHeaderPair = struct { name: []u8, value: []u8 };
+
+const HttpRequestResult = struct {
+    status: u16,
+    headers: []HttpHeaderPair,
+    body: []u8,
+};
+
+const AsyncPayload = union(enum) {
+    file_read: struct { content: ?[]u8, err_message: ?[]u8 },
+    file_write: struct { bytes_written: usize, err_message: ?[]u8 },
+    net_connect: struct { stream: ?std.Io.net.Stream, err_message: ?[]u8 },
+    http_request: struct { result: ?HttpRequestResult, err_message: ?[]u8 },
+    // `connection` — gc_pinned for the whole flight (see submitConnectionRead)
+    // so it's safe to identify by raw pointer here; the worker never
+    // dereferences its GC header, only the copied `stream` value it was
+    // handed.
+    connection_read: struct { connection: *value.Connection, content: ?[]u8, err_message: ?[]u8 },
+    connection_write: struct { connection: *value.Connection, bytes_written: usize, err_message: ?[]u8 },
+    // `new_pending` is ALWAYS set (even on error) — whatever the worker had
+    // accumulated but not yet consumed into a line must be written back to
+    // `connection.pending` at delivery, so a retried `.получить_строку()`
+    // after a transient error doesn't lose already-buffered bytes.
+    connection_read_line: struct { connection: *value.Connection, line: ?[]u8, new_pending: []const u8, err_message: ?[]u8 },
+    file_handle_read: struct { handle: *value.FileHandle, content: ?[]u8, new_offset: usize, err_message: ?[]u8 },
+    file_handle_write: struct { handle: *value.FileHandle, bytes_written: usize, new_offset: usize, err_message: ?[]u8 },
+    sql_open: struct { db: ?*sqlite3.sqlite3, err_message: ?[]u8 },
+    sql_exec: struct { connection: *value.SqlConnection, rows_affected: i64, err_message: ?[]u8 },
+    // `column_names`/`rows` — positional, not per-row named (same layout as
+    // Odin's `Sql_Query_Result_Data`). Each row is `?[]u8` per column: null
+    // = SQL NULL (omitted from the delivered `Соответствие` entirely, same
+    // convention as the old synchronous `sqlReadRow`).
+    sql_query: struct { connection: *value.SqlConnection, column_names: [][]u8, rows: [][]?[]u8, err_message: ?[]u8 },
+    // `listener` — pinned ONCE per in-flight accept (see submitHttpAccept);
+    // `Heap.pin`/`unpin` already support multiple concurrent pins of the
+    // same value, unlike Connection/FileHandle/SqlConnection's single
+    // `in_flight` flag.
+    http_accept: struct { listener: *value.Listener, stream: ?std.Io.net.Stream, method: ?[]u8, path: ?[]u8, headers: []HttpHeaderPair, err_message: ?[]u8 },
+};
+
+const AsyncCompletion = struct {
+    target_id: u64,
+    payload: AsyncPayload,
+};
+
+fn freeAsyncPayload(payload: AsyncPayload) void {
+    switch (payload) {
+        .file_read => |data| {
+            if (data.content) |bytes| std.heap.page_allocator.free(bytes);
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .file_write => |data| {
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .net_connect => |data| {
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .http_request => |data| {
+            if (data.result) |result| {
+                for (result.headers) |header| {
+                    std.heap.page_allocator.free(header.name);
+                    std.heap.page_allocator.free(header.value);
+                }
+                std.heap.page_allocator.free(result.headers);
+                std.heap.page_allocator.free(result.body);
+            }
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .connection_read => |data| {
+            if (data.content) |bytes| std.heap.page_allocator.free(bytes);
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .connection_write => |data| {
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .file_handle_read => |data| {
+            if (data.content) |bytes| std.heap.page_allocator.free(bytes);
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .file_handle_write => |data| {
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .connection_read_line => |data| {
+            if (data.line) |bytes| std.heap.page_allocator.free(bytes);
+            std.heap.page_allocator.free(data.new_pending);
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .sql_open => |data| {
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .sql_exec => |data| {
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .sql_query => |data| {
+            for (data.column_names) |name| std.heap.page_allocator.free(name);
+            std.heap.page_allocator.free(data.column_names);
+            for (data.rows) |row| {
+                for (row) |cell| if (cell) |bytes| std.heap.page_allocator.free(bytes);
+                std.heap.page_allocator.free(row);
+            }
+            std.heap.page_allocator.free(data.rows);
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .http_accept => |data| {
+            if (data.method) |bytes| std.heap.page_allocator.free(bytes);
+            if (data.path) |bytes| std.heap.page_allocator.free(bytes);
+            for (data.headers) |header| {
+                std.heap.page_allocator.free(header.name);
+                std.heap.page_allocator.free(header.value);
+            }
+            std.heap.page_allocator.free(data.headers);
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+    }
+}
+
+// Живёт ЦЕЛИКОМ на std.heap.page_allocator — не на Vm.allocator, который
+// может (и в панос-CLI является) не потокобезопасным bump/arena-
+// аллокатором. Та же причина, что у Odin's vm_heap_allocator()
+// (core/gc.odin) — воркер-потоки и главный поток никогда не должны делить
+// один неатомарный аллокатор. outstanding — число задач, отправленных в
+// пул, но ещё не доложивших результат push()'ом (аналог Odin's
+// thread.pool_num_outstanding), нужен для различения "никто не готов, но
+// I/O в полёте" (настоящий idle-wait) от "дедлок" в run_scheduler.
+// Zig 0.16 moved Mutex/Condition off `std.Thread` onto `std.Io` (`lock`/
+// `wait` now take an `Io` handle, routed through `io.futexWait`/
+// `futexWake`) — there is no longer a raw OS mutex usable without one.
+// Each method below builds a throwaway `std.Io.Threaded` purely to obtain
+// that handle; the futex itself is keyed by the shared atomic's ADDRESS,
+// not by which `Threaded` instance issued the call, so a fresh one per
+// call from either the main thread or a worker thread still correctly
+// synchronizes through the same underlying `Mutex`/`Condition` state. Same
+// throwaway-Io-per-call pattern already used everywhere else in this file
+// for real I/O. `lock`/`wait` return `Cancelable!void` but a throwaway,
+// never-cancelled `Threaded` can never actually report cancellation.
+const AsyncQueue = struct {
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    items: std.ArrayList(AsyncCompletion) = .empty,
+    outstanding: usize = 0,
+
+    fn beginSubmit(self: *AsyncQueue) void {
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        self.mutex.lock(io) catch unreachable;
+        defer self.mutex.unlock(io);
+        self.outstanding += 1;
+    }
+
+    fn push(self: *AsyncQueue, completion: AsyncCompletion) void {
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        self.mutex.lock(io) catch unreachable;
+        defer self.mutex.unlock(io);
+        self.items.append(std.heap.page_allocator, completion) catch @panic("OOM: очередь завершений async I/O");
+        self.outstanding -= 1;
+        self.condition.signal(io);
+    }
+
+    // These four are called UNCONDITIONALLY from run()/run_scheduler for
+    // every target (there is no per-call-site freestanding guard, unlike
+    // beginSubmit/push — those are only ever reached through
+    // submitFileRead/submitFileWrite, themselves behind fileReadSubmit's/
+    // fileWriteSubmit's own freestanding `if`/`else`). A real `if`/`else`
+    // here is therefore required so the wasm32-freestanding `browser`
+    // build never has to resolve `std.Io.Threaded` (its `RandomFile` pulls
+    // in `posix.system.getrandom`, missing on freestanding) — outstanding/
+    // items are always 0 there anyway, since no async job is ever
+    // submitted on that target.
+    fn drain(self: *AsyncQueue, out: *std.ArrayList(AsyncCompletion)) void {
+        if (comptime builtin.target.os.tag == .freestanding) {
+            return;
+        } else {
+            var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+            self.mutex.lock(io) catch unreachable;
+            defer self.mutex.unlock(io);
+            out.appendSlice(std.heap.page_allocator, self.items.items) catch @panic("OOM: слив очереди завершений async I/O");
+            self.items.clearRetainingCapacity();
+        }
+    }
+
+    fn hasPending(self: *AsyncQueue) bool {
+        if (comptime builtin.target.os.tag == .freestanding) {
+            return false;
+        } else {
+            var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+            self.mutex.lock(io) catch unreachable;
+            defer self.mutex.unlock(io);
+            return self.outstanding > 0 or self.items.items.len > 0;
+        }
+    }
+
+    // Блокируется (без busy-spin) до хотя бы ОДНОГО результата в очереди —
+    // вызывается из run_scheduler ТОЛЬКО когда ни один процесс не готов и
+    // hasPending() уже подтвердил, что есть что ждать.
+    fn waitForOne(self: *AsyncQueue) void {
+        if (comptime builtin.target.os.tag == .freestanding) {
+            return;
+        } else {
+            var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+            self.mutex.lock(io) catch unreachable;
+            defer self.mutex.unlock(io);
+            while (self.items.items.len == 0 and self.outstanding > 0) {
+                self.condition.wait(io, &self.mutex) catch unreachable;
+            }
+        }
+    }
+
+    // Аналог Odin's thread.pool_join — блокируется, пока ВСЕ отправленные
+    // задачи не доложат результат. Вызывается перед выходом из
+    // run_scheduler (программа завершается немедленно при завершении
+    // корневого процесса — недоставленные результаты для осиротевших
+    // процессов просто остаются в items и утекают на page_allocator до
+    // конца процесса, тот же trade-off, что у Odin).
+    fn joinAll(self: *AsyncQueue) void {
+        if (comptime builtin.target.os.tag == .freestanding) {
+            return;
+        } else {
+            var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+            self.mutex.lock(io) catch unreachable;
+            defer self.mutex.unlock(io);
+            while (self.outstanding > 0) {
+                self.condition.wait(io, &self.mutex) catch unreachable;
+            }
+        }
+    }
+};
+
+fn submitFileRead(vm: *Vm, path: []const u8, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const owned_path = std.heap.page_allocator.dupe(u8, path) catch @panic("OOM: путь для async фс.прочитать");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        path: []u8,
+
+        fn run(job: @This()) void {
+            var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io.io(), job.path, std.heap.page_allocator, .unlimited);
+            std.heap.page_allocator.free(job.path);
+            const payload: AsyncPayload = if (bytes) |content|
+                .{ .file_read = .{ .content = content, .err_message = null } }
+            else |err| .{ .file_read = .{
+                .content = null,
+                .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
+            } };
+            job.queue.push(.{ .target_id = job.target_id, .payload = payload });
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{ .queue = &vm.async_queue, .target_id = target_id, .path = owned_path }}) catch @panic("не удалось запустить фоновый поток фс.прочитать");
+    thread.detach();
+}
+
+fn submitFileWrite(vm: *Vm, path: []const u8, content: []const u8, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const owned_path = std.heap.page_allocator.dupe(u8, path) catch @panic("OOM: путь для async фс.записать");
+    const owned_content = std.heap.page_allocator.dupe(u8, content) catch @panic("OOM: содержимое для async фс.записать");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        path: []u8,
+        content: []u8,
+
+        fn run(job: @This()) void {
+            var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            const write_error = std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = job.path, .data = job.content });
+            const bytes_written = job.content.len;
+            std.heap.page_allocator.free(job.path);
+            std.heap.page_allocator.free(job.content);
+            const payload: AsyncPayload = if (write_error) |_|
+                .{ .file_write = .{ .bytes_written = bytes_written, .err_message = null } }
+            else |err| .{ .file_write = .{
+                .bytes_written = 0,
+                .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
+            } };
+            job.queue.push(.{ .target_id = job.target_id, .payload = payload });
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{ .queue = &vm.async_queue, .target_id = target_id, .path = owned_path, .content = owned_content }}) catch @panic("не удалось запустить фоновый поток фс.записать");
+    thread.detach();
+}
+
+fn submitNetConnect(vm: *Vm, host: []const u8, port: u16, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const owned_host = std.heap.page_allocator.dupe(u8, host) catch @panic("OOM: хост для async сеть.подключиться");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        host: []u8,
+        port: u16,
+
+        fn run(job: @This()) void {
+            var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            const payload: AsyncPayload = blk: {
+                const address = std.Io.net.IpAddress.resolve(io.io(), job.host, job.port) catch |err| {
+                    break :blk .{ .net_connect = .{
+                        .stream = null,
+                        .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
+                    } };
+                };
+                const stream = std.Io.net.IpAddress.connect(&address, io.io(), .{ .mode = .stream }) catch |err| {
+                    break :blk .{ .net_connect = .{
+                        .stream = null,
+                        .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
+                    } };
+                };
+                break :blk .{ .net_connect = .{ .stream = stream, .err_message = null } };
+            };
+            std.heap.page_allocator.free(job.host);
+            job.queue.push(.{ .target_id = job.target_id, .payload = payload });
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{ .queue = &vm.async_queue, .target_id = target_id, .host = owned_host, .port = port }}) catch @panic("не удалось запустить фоновый поток сеть.подключиться");
+    thread.detach();
+}
+
+// `owned_headers` — already cloned onto page_allocator by the caller
+// (httpRequestSubmit, on the main thread) — this function takes ownership
+// of it (frees it itself, worker-side) along with the method/url/body
+// clones it makes here.
+fn submitHttpRequest(vm: *Vm, method_text: []const u8, url: []const u8, body: []const u8, owned_headers: []HttpHeaderPair, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        method_text: []u8,
+        url: []u8,
+        body: []u8,
+        headers: []HttpHeaderPair,
+
+        fn fail(job: @This(), comptime format: []const u8, args: anytype) void {
+            const message = std.fmt.allocPrint(std.heap.page_allocator, format, args) catch @panic("OOM");
+            job.cleanupOwned();
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .http_request = .{ .result = null, .err_message = message } } });
+        }
+
+        fn cleanupOwned(job: @This()) void {
+            std.heap.page_allocator.free(job.method_text);
+            std.heap.page_allocator.free(job.url);
+            std.heap.page_allocator.free(job.body);
+            for (job.headers) |header| {
+                std.heap.page_allocator.free(header.name);
+                std.heap.page_allocator.free(header.value);
+            }
+            std.heap.page_allocator.free(job.headers);
+        }
+
+        fn run(job: @This()) void {
+            var method_buffer: [16]u8 = undefined;
+            if (job.method_text.len == 0 or job.method_text.len > method_buffer.len) {
+                return job.fail("неизвестный HTTP-метод", .{});
+            }
+            for (job.method_text, 0..) |character, index| method_buffer[index] = std.ascii.toUpper(character);
+            const method = std.meta.stringToEnum(std.http.Method, method_buffer[0..job.method_text.len]) orelse {
+                return job.fail("неизвестный HTTP-метод", .{});
+            };
+            const uri = std.Uri.parse(job.url) catch |err| return job.fail("{s}", .{@errorName(err)});
+            var extra_headers: std.ArrayList(std.http.Header) = .empty;
+            defer extra_headers.deinit(std.heap.page_allocator);
+            for (job.headers) |header| {
+                extra_headers.append(std.heap.page_allocator, .{ .name = header.name, .value = header.value }) catch @panic("OOM");
+            }
+            var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = io.io() };
+            defer client.deinit();
+            var request = client.request(method, uri, .{ .extra_headers = extra_headers.items }) catch |err| {
+                return job.fail("{s}", .{@errorName(err)});
+            };
+            defer request.deinit();
+            if (job.body.len != 0) {
+                request.transfer_encoding = .{ .content_length = job.body.len };
+                var request_body = request.sendBodyUnflushed(&.{}) catch |err| return job.fail("{s}", .{@errorName(err)});
+                request_body.writer.writeAll(job.body) catch |err| return job.fail("{s}", .{@errorName(err)});
+                request_body.end() catch |err| return job.fail("{s}", .{@errorName(err)});
+                request.connection.?.flush() catch |err| return job.fail("{s}", .{@errorName(err)});
+            } else {
+                request.sendBodiless() catch |err| return job.fail("{s}", .{@errorName(err)});
+            }
+            const redirect_buffer = std.heap.page_allocator.alloc(u8, 8192) catch @panic("OOM");
+            defer std.heap.page_allocator.free(redirect_buffer);
+            var response = request.receiveHead(redirect_buffer) catch |err| return job.fail("{s}", .{@errorName(err)});
+            var header_pairs: std.ArrayList(HttpHeaderPair) = .empty;
+            defer header_pairs.deinit(std.heap.page_allocator);
+            var header_iterator = response.head.iterateHeaders();
+            while (header_iterator.next()) |header| {
+                header_pairs.append(std.heap.page_allocator, .{
+                    .name = std.heap.page_allocator.dupe(u8, header.name) catch @panic("OOM"),
+                    .value = std.heap.page_allocator.dupe(u8, header.value) catch @panic("OOM"),
+                }) catch @panic("OOM");
+            }
+            const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+                .identity => &.{},
+                .zstd => std.heap.page_allocator.alloc(u8, std.compress.zstd.default_window_len) catch @panic("OOM"),
+                .deflate, .gzip => std.heap.page_allocator.alloc(u8, std.compress.flate.max_window_len) catch @panic("OOM"),
+                .compress => return job.fail("неподдержанный Content-Encoding", .{}),
+            };
+            defer std.heap.page_allocator.free(decompress_buffer);
+            var transfer_buffer: [64]u8 = undefined;
+            var decompress: std.http.Decompress = undefined;
+            const body_reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+            var allocating: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+            defer allocating.deinit();
+            _ = body_reader.streamRemaining(&allocating.writer) catch {
+                const body_error = response.bodyErr() orelse error.ReadFailed;
+                return job.fail("{s}", .{@errorName(body_error)});
+            };
+            const response_body = std.heap.page_allocator.dupe(u8, allocating.written()) catch @panic("OOM");
+            job.cleanupOwned();
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .http_request = .{
+                .result = .{
+                    .status = @intFromEnum(response.head.status),
+                    .headers = header_pairs.toOwnedSlice(std.heap.page_allocator) catch @panic("OOM"),
+                    .body = response_body,
+                },
+                .err_message = null,
+            } } });
+        }
+    };
+    const job = Job{
+        .queue = &vm.async_queue,
+        .target_id = target_id,
+        .method_text = std.heap.page_allocator.dupe(u8, method_text) catch @panic("OOM"),
+        .url = std.heap.page_allocator.dupe(u8, url) catch @panic("OOM"),
+        .body = std.heap.page_allocator.dupe(u8, body) catch @panic("OOM"),
+        .headers = owned_headers,
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{job}) catch @panic("не удалось запустить фоновый поток сеть.http_запрос");
+    thread.detach();
+}
+
+// `connection` is gc_pinned by the CALLER (connectionReadSubmit) for the
+// whole flight — the worker only ever touches the copied `stream` VALUE
+// (a plain fd wrapper, safe to use from another thread while the fd stays
+// open), never `connection`'s GC header or any other field; `connection`
+// itself is carried only as an opaque identifier for delivery.
+fn submitConnectionRead(vm: *Vm, connection: *value.Connection, stream: std.Io.net.Stream, drained_pending: []u8, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        connection: *value.Connection,
+        stream: std.Io.net.Stream,
+        collected: std.ArrayList(u8),
+
+        fn run(job: @This()) void {
+            var collected = job.collected;
+            var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            var temp: [4096]u8 = undefined;
+            while (true) {
+                var reader = job.stream.reader(io.io(), &.{});
+                const n = reader.interface.readSliceShort(&temp) catch |err| {
+                    collected.deinit(std.heap.page_allocator);
+                    const message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM");
+                    job.queue.push(.{ .target_id = job.target_id, .payload = .{ .connection_read = .{
+                        .connection = job.connection,
+                        .content = null,
+                        .err_message = message,
+                    } } });
+                    return;
+                };
+                collected.appendSlice(std.heap.page_allocator, temp[0..n]) catch @panic("OOM");
+                if (n < temp.len) break;
+            }
+            const content = collected.toOwnedSlice(std.heap.page_allocator) catch @panic("OOM");
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .connection_read = .{
+                .connection = job.connection,
+                .content = content,
+                .err_message = null,
+            } } });
+        }
+    };
+    var owned_pending: std.ArrayList(u8) = .empty;
+    owned_pending.appendSlice(std.heap.page_allocator, drained_pending) catch @panic("OOM");
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{
+        .queue = &vm.async_queue,
+        .target_id = target_id,
+        .connection = connection,
+        .stream = stream,
+        .collected = owned_pending,
+    }}) catch @panic("не удалось запустить фоновый поток Соединение.получить");
+    thread.detach();
+}
+
+// Same gc_pin/opaque-identifier discipline as submitConnectionRead above.
+fn submitConnectionWrite(vm: *Vm, connection: *value.Connection, stream: std.Io.net.Stream, content: []const u8, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const owned_content = std.heap.page_allocator.dupe(u8, content) catch @panic("OOM: содержимое для async Соединение.отправить");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        connection: *value.Connection,
+        stream: std.Io.net.Stream,
+        content: []u8,
+
+        fn run(job: @This()) void {
+            var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            var writer = job.stream.writer(io.io(), &.{});
+            const payload: AsyncPayload = blk: {
+                writer.interface.writeAll(job.content) catch |err| break :blk .{ .connection_write = .{
+                    .connection = job.connection,
+                    .bytes_written = 0,
+                    .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
+                } };
+                writer.interface.flush() catch |err| break :blk .{ .connection_write = .{
+                    .connection = job.connection,
+                    .bytes_written = 0,
+                    .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
+                } };
+                break :blk .{ .connection_write = .{ .connection = job.connection, .bytes_written = job.content.len, .err_message = null } };
+            };
+            std.heap.page_allocator.free(job.content);
+            job.queue.push(.{ .target_id = job.target_id, .payload = payload });
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{
+        .queue = &vm.async_queue,
+        .target_id = target_id,
+        .connection = connection,
+        .stream = stream,
+        .content = owned_content,
+    }}) catch @panic("не удалось запустить фоновый поток Соединение.отправить");
+    thread.detach();
+}
+
+// `drained_pending` — whatever `.pending` already held before this call,
+// handed over as the worker's starting accumulation buffer (same drain-
+// then-transfer discipline as submitConnectionRead).
+fn submitConnectionReadLine(vm: *Vm, connection: *value.Connection, stream: std.Io.net.Stream, drained_pending: []const u8, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    var owned_pending: std.ArrayList(u8) = .empty;
+    owned_pending.appendSlice(std.heap.page_allocator, drained_pending) catch @panic("OOM");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        connection: *value.Connection,
+        stream: std.Io.net.Stream,
+        pending: std.ArrayList(u8),
+
+        fn run(job: @This()) void {
+            var pending = job.pending;
+            var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            var temp: [4096]u8 = undefined;
+            while (true) {
+                if (std.mem.indexOfScalar(u8, pending.items, '\n')) |newline_index| {
+                    const raw_line = pending.items[0..newline_index];
+                    const line = if (std.mem.endsWith(u8, raw_line, "\r")) raw_line[0 .. raw_line.len - 1] else raw_line;
+                    const owned_line = std.heap.page_allocator.dupe(u8, line) catch @panic("OOM");
+                    const remaining_len = pending.items.len - (newline_index + 1);
+                    std.mem.copyForwards(u8, pending.items[0..remaining_len], pending.items[newline_index + 1 ..]);
+                    pending.shrinkRetainingCapacity(remaining_len);
+                    const new_pending = pending.toOwnedSlice(std.heap.page_allocator) catch @panic("OOM");
+                    job.queue.push(.{ .target_id = job.target_id, .payload = .{ .connection_read_line = .{
+                        .connection = job.connection,
+                        .line = owned_line,
+                        .new_pending = new_pending,
+                        .err_message = null,
+                    } } });
+                    return;
+                }
+                var reader = job.stream.reader(io.io(), &.{});
+                const n = reader.interface.readSliceShort(&temp) catch |err| {
+                    const new_pending = pending.toOwnedSlice(std.heap.page_allocator) catch @panic("OOM");
+                    job.queue.push(.{ .target_id = job.target_id, .payload = .{ .connection_read_line = .{
+                        .connection = job.connection,
+                        .line = null,
+                        .new_pending = new_pending,
+                        .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
+                    } } });
+                    return;
+                };
+                if (n == 0) {
+                    const leftover = pending.toOwnedSlice(std.heap.page_allocator) catch @panic("OOM");
+                    job.queue.push(.{ .target_id = job.target_id, .payload = .{ .connection_read_line = .{
+                        .connection = job.connection,
+                        .line = leftover,
+                        .new_pending = &.{},
+                        .err_message = null,
+                    } } });
+                    return;
+                }
+                pending.appendSlice(std.heap.page_allocator, temp[0..n]) catch @panic("OOM");
+            }
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{
+        .queue = &vm.async_queue,
+        .target_id = target_id,
+        .connection = connection,
+        .stream = stream,
+        .pending = owned_pending,
+    }}) catch @panic("не удалось запустить фоновый поток Соединение.получить_строку");
+    thread.detach();
+}
+
+// `Файл.прочитать()`/`Файл.прочитать_строку()` share this — `want_line`
+// picks which slicing rule applies to the same reopen-by-path whole-file
+// read (see `value.zig`'s `FileHandle` doc comment for why there's no
+// persistent OS handle to seek through instead).
+fn submitFileHandleRead(vm: *Vm, handle: *value.FileHandle, path: []const u8, offset: usize, want_line: bool, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const owned_path = std.heap.page_allocator.dupe(u8, path) catch @panic("OOM: путь для async Файл.прочитать");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        handle: *value.FileHandle,
+        path: []u8,
+        offset: usize,
+        want_line: bool,
+
+        fn fail(job: @This(), comptime format: []const u8, args: anytype) void {
+            const message = std.fmt.allocPrint(std.heap.page_allocator, format, args) catch @panic("OOM");
+            std.heap.page_allocator.free(job.path);
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .file_handle_read = .{
+                .handle = job.handle,
+                .content = null,
+                .new_offset = job.offset,
+                .err_message = message,
+            } } });
+        }
+
+        fn run(job: @This()) void {
+            var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            const full_content = std.Io.Dir.cwd().readFileAlloc(io.io(), job.path, std.heap.page_allocator, .unlimited) catch |err| {
+                return job.fail("{s}", .{@errorName(err)});
+            };
+            defer std.heap.page_allocator.free(full_content);
+            std.heap.page_allocator.free(job.path);
+            const remainder = if (job.offset < full_content.len) full_content[job.offset..] else "";
+            var result_slice: []const u8 = undefined;
+            var new_offset: usize = undefined;
+            if (job.want_line) {
+                const newline_index = std.mem.indexOfScalar(u8, remainder, '\n');
+                const raw_line = if (newline_index) |index| remainder[0..index] else remainder;
+                new_offset = job.offset + raw_line.len + @as(usize, if (newline_index != null) 1 else 0);
+                result_slice = if (std.mem.endsWith(u8, raw_line, "\r")) raw_line[0 .. raw_line.len - 1] else raw_line;
+            } else {
+                result_slice = remainder;
+                new_offset = full_content.len;
+            }
+            const owned_result = std.heap.page_allocator.dupe(u8, result_slice) catch @panic("OOM");
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .file_handle_read = .{
+                .handle = job.handle,
+                .content = owned_result,
+                .new_offset = new_offset,
+                .err_message = null,
+            } } });
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{
+        .queue = &vm.async_queue,
+        .target_id = target_id,
+        .handle = handle,
+        .path = owned_path,
+        .offset = offset,
+        .want_line = want_line,
+    }}) catch @panic("не удалось запустить фоновый поток Файл.прочитать");
+    thread.detach();
+}
+
+fn submitFileHandleWrite(vm: *Vm, handle: *value.FileHandle, path: []const u8, content: []const u8, offset: usize, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const owned_path = std.heap.page_allocator.dupe(u8, path) catch @panic("OOM: путь для async Файл.записать");
+    const owned_content = std.heap.page_allocator.dupe(u8, content) catch @panic("OOM: содержимое для async Файл.записать");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        handle: *value.FileHandle,
+        path: []u8,
+        content: []u8,
+        offset: usize,
+
+        fn fail(job: @This(), comptime format: []const u8, args: anytype) void {
+            const message = std.fmt.allocPrint(std.heap.page_allocator, format, args) catch @panic("OOM");
+            std.heap.page_allocator.free(job.path);
+            std.heap.page_allocator.free(job.content);
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .file_handle_write = .{
+                .handle = job.handle,
+                .bytes_written = 0,
+                .new_offset = job.offset,
+                .err_message = message,
+            } } });
+        }
+
+        fn run(job: @This()) void {
+            var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            const existing = std.Io.Dir.cwd().readFileAlloc(io.io(), job.path, std.heap.page_allocator, .unlimited) catch |err| {
+                return job.fail("{s}", .{@errorName(err)});
+            };
+            defer std.heap.page_allocator.free(existing);
+            const prefix_len = @min(job.offset, existing.len);
+            const tail_start = job.offset + job.content.len;
+            const new_len = @max(existing.len, tail_start);
+            const buffer = std.heap.page_allocator.alloc(u8, new_len) catch @panic("OOM");
+            defer std.heap.page_allocator.free(buffer);
+            @memcpy(buffer[0..prefix_len], existing[0..prefix_len]);
+            if (job.offset > prefix_len) @memset(buffer[prefix_len..job.offset], 0);
+            @memcpy(buffer[job.offset..tail_start], job.content);
+            if (existing.len > tail_start) @memcpy(buffer[tail_start..existing.len], existing[tail_start..existing.len]);
+            std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = job.path, .data = buffer }) catch |err| {
+                return job.fail("{s}", .{@errorName(err)});
+            };
+            const bytes_written = job.content.len;
+            const new_offset = job.offset + job.content.len;
+            std.heap.page_allocator.free(job.path);
+            std.heap.page_allocator.free(job.content);
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .file_handle_write = .{
+                .handle = job.handle,
+                .bytes_written = bytes_written,
+                .new_offset = new_offset,
+                .err_message = null,
+            } } });
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{
+        .queue = &vm.async_queue,
+        .target_id = target_id,
+        .handle = handle,
+        .path = owned_path,
+        .content = owned_content,
+        .offset = offset,
+    }}) catch @panic("не удалось запустить фоновый поток Файл.записать");
+    thread.detach();
+}
+
+fn submitSqlOpen(vm: *Vm, path: []const u8, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const owned_path = std.heap.page_allocator.dupeZ(u8, path) catch @panic("OOM: путь для async бд.открыть");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        path: [:0]u8,
+
+        fn run(job: @This()) void {
+            var db: ?*sqlite3.sqlite3 = null;
+            const rc = sqlite3.sqlite3_open_v2(job.path, &db, sqlite3.SQLITE_OPEN_READWRITE | sqlite3.SQLITE_OPEN_CREATE, null);
+            std.heap.page_allocator.free(job.path);
+            if (rc != sqlite3.SQLITE_OK) {
+                // See the old synchronous sqlOpen — sqlite3_open_v2 can
+                // allocate a barely-usable `db` even on failure, purely so
+                // sqlite3_errmsg has something to report; must still close it.
+                const message = std.mem.span(sqlite3.sqlite3_errmsg(db) orelse "не удалось открыть базу данных");
+                const owned_message = std.heap.page_allocator.dupe(u8, message) catch @panic("OOM");
+                _ = sqlite3.sqlite3_close_v2(db);
+                job.queue.push(.{ .target_id = job.target_id, .payload = .{ .sql_open = .{ .db = null, .err_message = owned_message } } });
+                return;
+            }
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .sql_open = .{ .db = db, .err_message = null } } });
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{ .queue = &vm.async_queue, .target_id = target_id, .path = owned_path }}) catch @panic("не удалось запустить фоновый поток бд.открыть");
+    thread.detach();
+}
+
+const SqlPrepareWorkerOutcome = union(enum) {
+    ok: ?*sqlite3.sqlite3_stmt,
+    fail: []u8,
+};
+
+// Worker-side equivalent of `Vm.sqlPrepare` — no `Vm` access, everything on
+// `page_allocator`. `params` is already validated (all-Строка) and cloned
+// to plain `[]const u8` by the caller (submitSqlExec/submitSqlQuery, on the
+// main thread) before the worker ever starts.
+fn sqlPrepareWorker(db: ?*sqlite3.sqlite3, sql_z: [:0]const u8, params: []const []const u8) SqlPrepareWorkerOutcome {
+    var stmt: ?*sqlite3.sqlite3_stmt = null;
+    const prepare_rc = sqlite3.sqlite3_prepare_v2(db, sql_z.ptr, -1, &stmt, null);
+    if (prepare_rc != sqlite3.SQLITE_OK) {
+        const message = std.mem.span(sqlite3.sqlite3_errmsg(db) orelse "ошибка SQL");
+        return .{ .fail = std.heap.page_allocator.dupe(u8, message) catch @panic("OOM") };
+    }
+    for (params, 0..) |param, index| {
+        const text_z = std.heap.page_allocator.dupeZ(u8, param) catch @panic("OOM");
+        defer std.heap.page_allocator.free(text_z);
+        const bind_rc = sqlite3.sqlite3_bind_text(stmt, @intCast(index + 1), text_z, -1, sqlite3.SQLITE_TRANSIENT);
+        if (bind_rc != sqlite3.SQLITE_OK) {
+            const message = std.mem.span(sqlite3.sqlite3_errmsg(db) orelse "ошибка привязки параметра");
+            const owned_message = std.heap.page_allocator.dupe(u8, message) catch @panic("OOM");
+            _ = sqlite3.sqlite3_finalize(stmt);
+            return .{ .fail = owned_message };
+        }
+    }
+    return .{ .ok = stmt };
+}
+
+fn submitSqlExec(vm: *Vm, connection: *value.SqlConnection, sql: []const u8, params: []const []const u8, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const owned_sql = std.heap.page_allocator.dupeZ(u8, sql) catch @panic("OOM");
+    const owned_params = std.heap.page_allocator.alloc([]u8, params.len) catch @panic("OOM");
+    for (params, owned_params) |param, *slot| slot.* = std.heap.page_allocator.dupe(u8, param) catch @panic("OOM");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        connection: *value.SqlConnection,
+        sql: [:0]u8,
+        params: [][]u8,
+
+        fn cleanupOwned(job: @This()) void {
+            std.heap.page_allocator.free(job.sql);
+            for (job.params) |param| std.heap.page_allocator.free(param);
+            std.heap.page_allocator.free(job.params);
+        }
+
+        fn run(job: @This()) void {
+            const outcome = sqlPrepareWorker(job.connection.db, job.sql, job.params);
+            job.cleanupOwned();
+            switch (outcome) {
+                .fail => |message| job.queue.push(.{ .target_id = job.target_id, .payload = .{ .sql_exec = .{
+                    .connection = job.connection,
+                    .rows_affected = 0,
+                    .err_message = message,
+                } } }),
+                .ok => |stmt| {
+                    defer _ = sqlite3.sqlite3_finalize(stmt);
+                    const step_rc = sqlite3.sqlite3_step(stmt);
+                    if (step_rc != sqlite3.SQLITE_DONE and step_rc != sqlite3.SQLITE_ROW) {
+                        const message = std.mem.span(sqlite3.sqlite3_errmsg(job.connection.db) orelse "ошибка выполнения SQL");
+                        const owned_message = std.heap.page_allocator.dupe(u8, message) catch @panic("OOM");
+                        job.queue.push(.{ .target_id = job.target_id, .payload = .{ .sql_exec = .{
+                            .connection = job.connection,
+                            .rows_affected = 0,
+                            .err_message = owned_message,
+                        } } });
+                        return;
+                    }
+                    job.queue.push(.{ .target_id = job.target_id, .payload = .{ .sql_exec = .{
+                        .connection = job.connection,
+                        .rows_affected = sqlite3.sqlite3_changes(job.connection.db),
+                        .err_message = null,
+                    } } });
+                },
+            }
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{
+        .queue = &vm.async_queue,
+        .target_id = target_id,
+        .connection = connection,
+        .sql = owned_sql,
+        .params = owned_params,
+    }}) catch @panic("не удалось запустить фоновый поток Соединение_БД.выполнить");
+    thread.detach();
+}
+
+fn submitSqlQuery(vm: *Vm, connection: *value.SqlConnection, sql: []const u8, params: []const []const u8, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const owned_sql = std.heap.page_allocator.dupeZ(u8, sql) catch @panic("OOM");
+    const owned_params = std.heap.page_allocator.alloc([]u8, params.len) catch @panic("OOM");
+    for (params, owned_params) |param, *slot| slot.* = std.heap.page_allocator.dupe(u8, param) catch @panic("OOM");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        connection: *value.SqlConnection,
+        sql: [:0]u8,
+        params: [][]u8,
+
+        fn cleanupOwned(job: @This()) void {
+            std.heap.page_allocator.free(job.sql);
+            for (job.params) |param| std.heap.page_allocator.free(param);
+            std.heap.page_allocator.free(job.params);
+        }
+
+        fn fail(job: @This(), message: []u8) void {
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .sql_query = .{
+                .connection = job.connection,
+                .column_names = &.{},
+                .rows = &.{},
+                .err_message = message,
+            } } });
+        }
+
+        fn run(job: @This()) void {
+            const outcome = sqlPrepareWorker(job.connection.db, job.sql, job.params);
+            job.cleanupOwned();
+            switch (outcome) {
+                .fail => |message| job.fail(message),
+                .ok => |stmt| {
+                    defer _ = sqlite3.sqlite3_finalize(stmt);
+                    const column_count = sqlite3.sqlite3_column_count(stmt);
+                    var column_names = std.heap.page_allocator.alloc([]u8, @intCast(column_count)) catch @panic("OOM");
+                    var column_index: c_int = 0;
+                    while (column_index < column_count) : (column_index += 1) {
+                        const name = std.mem.span(sqlite3.sqlite3_column_name(stmt, column_index) orelse "");
+                        column_names[@intCast(column_index)] = std.heap.page_allocator.dupe(u8, name) catch @panic("OOM");
+                    }
+                    var rows: std.ArrayList([]?[]u8) = .empty;
+                    while (true) {
+                        const step_rc = sqlite3.sqlite3_step(stmt);
+                        if (step_rc == sqlite3.SQLITE_DONE) break;
+                        if (step_rc != sqlite3.SQLITE_ROW) {
+                            const message = std.mem.span(sqlite3.sqlite3_errmsg(job.connection.db) orelse "ошибка выполнения SQL");
+                            for (rows.items) |row| {
+                                for (row) |cell| if (cell) |bytes| std.heap.page_allocator.free(bytes);
+                                std.heap.page_allocator.free(row);
+                            }
+                            rows.deinit(std.heap.page_allocator);
+                            for (column_names) |name| std.heap.page_allocator.free(name);
+                            std.heap.page_allocator.free(column_names);
+                            return job.fail(std.heap.page_allocator.dupe(u8, message) catch @panic("OOM"));
+                        }
+                        var row = std.heap.page_allocator.alloc(?[]u8, column_names.len) catch @panic("OOM");
+                        var is_blob_row = false;
+                        for (column_names, 0..) |_, index_usize| {
+                            const index: c_int = @intCast(index_usize);
+                            const column_type = sqlite3.sqlite3_column_type(stmt, index);
+                            if (column_type == sqlite3.SQLITE_NULL) {
+                                row[index_usize] = null;
+                            } else if (column_type == sqlite3.SQLITE_BLOB) {
+                                is_blob_row = true;
+                                row[index_usize] = null;
+                            } else {
+                                const text = std.mem.span(sqlite3.sqlite3_column_text(stmt, index) orelse "");
+                                row[index_usize] = std.heap.page_allocator.dupe(u8, text) catch @panic("OOM");
+                            }
+                        }
+                        if (is_blob_row) {
+                            for (row) |cell| if (cell) |bytes| std.heap.page_allocator.free(bytes);
+                            std.heap.page_allocator.free(row);
+                            for (rows.items) |existing_row| {
+                                for (existing_row) |cell| if (cell) |bytes| std.heap.page_allocator.free(bytes);
+                                std.heap.page_allocator.free(existing_row);
+                            }
+                            rows.deinit(std.heap.page_allocator);
+                            for (column_names) |name| std.heap.page_allocator.free(name);
+                            std.heap.page_allocator.free(column_names);
+                            return job.fail(std.heap.page_allocator.dupe(u8, "BLOB-колонки не поддержаны в этой версии") catch @panic("OOM"));
+                        }
+                        rows.append(std.heap.page_allocator, row) catch @panic("OOM");
+                    }
+                    job.queue.push(.{ .target_id = job.target_id, .payload = .{ .sql_query = .{
+                        .connection = job.connection,
+                        .column_names = column_names,
+                        .rows = rows.toOwnedSlice(std.heap.page_allocator) catch @panic("OOM"),
+                        .err_message = null,
+                    } } });
+                },
+            }
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{
+        .queue = &vm.async_queue,
+        .target_id = target_id,
+        .connection = connection,
+        .sql = owned_sql,
+        .params = owned_params,
+    }}) catch @panic("не удалось запустить фоновый поток Соединение_БД.запрос");
+    thread.detach();
+}
+
+// `listener.server` is copied by VALUE into the job — `Server.accept` only
+// reads its fields (socket handle + options) to issue the syscall, never
+// mutates them, so independent copies calling `.accept()` concurrently
+// (from however many `.принять_запрос()` calls are in flight at once) are
+// safe — the same shared listening socket, safe to accept() from multiple
+// threads simultaneously (ordinary POSIX behavior).
+fn submitHttpAccept(vm: *Vm, listener: *value.Listener, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        listener: *value.Listener,
+        server: std.Io.net.Server,
+
+        fn fail(job: @This(), message: []u8) void {
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .http_accept = .{
+                .listener = job.listener,
+                .stream = null,
+                .method = null,
+                .path = null,
+                .headers = &.{},
+                .err_message = message,
+            } } });
+        }
+
+        fn run(job: @This()) void {
+            var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            var server_copy = job.server;
+            const stream = server_copy.accept(io.io()) catch |err| {
+                return job.fail(std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"));
+            };
+            const head_buffer = std.heap.page_allocator.alloc(u8, 8192) catch @panic("OOM");
+            defer std.heap.page_allocator.free(head_buffer);
+            var reader = stream.reader(io.io(), head_buffer);
+            var write_buffer: [256]u8 = undefined;
+            var writer = stream.writer(io.io(), &write_buffer);
+            var http_server = std.http.Server.init(&reader.interface, &writer.interface);
+            const request = http_server.receiveHead() catch |err| {
+                stream.close(io.io());
+                return job.fail(std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"));
+            };
+            const method_text = std.heap.page_allocator.dupe(u8, @tagName(request.head.method)) catch @panic("OOM");
+            const path_text = std.heap.page_allocator.dupe(u8, request.head.target) catch @panic("OOM");
+            var header_pairs: std.ArrayList(HttpHeaderPair) = .empty;
+            var header_iterator = request.iterateHeaders();
+            while (header_iterator.next()) |header| {
+                header_pairs.append(std.heap.page_allocator, .{
+                    .name = std.heap.page_allocator.dupe(u8, header.name) catch @panic("OOM"),
+                    .value = std.heap.page_allocator.dupe(u8, header.value) catch @panic("OOM"),
+                }) catch @panic("OOM");
+            }
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .http_accept = .{
+                .listener = job.listener,
+                .stream = stream,
+                .method = method_text,
+                .path = path_text,
+                .headers = header_pairs.toOwnedSlice(std.heap.page_allocator) catch @panic("OOM"),
+                .err_message = null,
+            } } });
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{
+        .queue = &vm.async_queue,
+        .target_id = target_id,
+        .listener = listener,
+        .server = listener.server,
+    }}) catch @panic("не удалось запустить фоновый поток Слушатель.принять_запрос");
+    thread.detach();
+}
+
+// `std.c` only binds `getenv` — no `setenv`/`unsetenv` — so those two are
+// declared directly, same shape as libc's own prototypes. Only referenced
+// from `Vm.osEnvSet`/`osEnvUnset`'s non-freestanding `if`/`else` branch —
+// see the comment on `osEnvGet` for why that branch shape matters here.
+const posix_env = struct {
+    extern "c" fn setenv(name: [*:0]const u8, value_ptr: [*:0]const u8, overwrite: c_int) c_int;
+    extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 };
 
 pub const Vm = struct {
@@ -23,12 +1095,17 @@ pub const Vm = struct {
     stack: std.ArrayList(value.Value) = .empty,
     frames: std.ArrayList(Frame) = .empty,
     processes: std.ArrayList(*value.Process) = .empty,
-    active_processes: std.ArrayList(*value.Process) = .empty,
     current_process: ?*value.Process = null,
-    current_message: ?value.Value = null,
     next_process_id: u64 = 0,
     failure: ?*value.HeapString = null,
     target_profile: target_policy.TargetProfile = .native,
+    // Everything on the command line after the script path — `ос.
+    // аргументы()`, symmetric to Odin's `vm.program_args` (`core/vm.odin`,
+    // set from `main.odin`'s `run_file`). Empty for every entry point that
+    // isn't the native CLI (LSP, browser) — there is no meaningful argv
+    // there, same as Odin.
+    program_args: []const []const u8 = &.{},
+    async_queue: AsyncQueue = .{},
 
     pub fn init(allocator: std.mem.Allocator, program: *const bytecode.Program) Vm {
         return .{
@@ -50,7 +1127,6 @@ pub const Vm = struct {
         self.stack.deinit(self.allocator);
         self.clearProcesses();
         self.processes.deinit(self.allocator);
-        self.active_processes.deinit(self.allocator);
         self.heap.deinit();
         self.* = undefined;
     }
@@ -58,30 +1134,20 @@ pub const Vm = struct {
     pub fn run(self: *Vm, entry: bytecode.FunctionId, arguments: []const value.Value) !Execution {
         self.failure = null;
         self.current_process = null;
-        self.current_message = null;
         self.stack.clearRetainingCapacity();
         self.clearFrames();
         self.clearProcesses();
-        self.active_processes.clearRetainingCapacity();
         self.next_process_id = 0;
+        // Defensive reset for a reused Vm instance — next_process_id restarts
+        // from 0 above, so any leftover completion from a PRIOR run() could
+        // otherwise be delivered to an unrelated process that happens to
+        // reuse the same id.
+        self.async_queue.joinAll();
+        for (self.async_queue.items.items) |leftover| freeAsyncPayload(leftover.payload);
+        self.async_queue.items.clearRetainingCapacity();
         self.collect();
         const root = try self.createProcess(entry, &.{}, arguments);
-        try self.active_processes.append(self.allocator, root);
-        defer self.active_processes.clearRetainingCapacity();
-        self.current_process = root;
-        self.pushFrame(entry, &.{}, arguments) catch |err| switch (err) {
-            error.RuntimeFault => return .{ .runtime_error = if (self.failure) |failure| failure.bytes else "Runtime Error: неизвестная ошибка" },
-            else => return err,
-        };
-
-        while (self.frames.items.len != 0) {
-            const completed = self.step() catch |err| switch (err) {
-                error.RuntimeFault => return .{ .runtime_error = if (self.failure) |failure| failure.bytes else "Runtime Error: неизвестная ошибка" },
-                else => return err,
-            };
-            if (completed) |result| return .{ .success = result };
-        }
-        return .{ .success = .{ .void = {} } };
+        return self.runScheduler(root);
     }
 
     pub fn collect(self: *Vm) void {
@@ -93,20 +1159,28 @@ pub const Vm = struct {
             self.heap.markValues(process.arguments);
             self.heap.markValues(process.mailbox.items);
             self.heap.markValues(process.signals.items);
+            self.heap.markValues(process.async_results.items);
+            // Only the CURRENTLY swapped-in process's continuation lives in
+            // self.stack/self.frames (marked above) — every other process's
+            // own stack/frames fields hold its suspended state directly.
+            self.heap.markValues(process.stack.items);
+            for (process.frames.items) |frame| self.heap.markValues(frame.locals);
         }
-        if (self.current_message) |message| self.heap.markValue(message);
         if (self.failure) |failure| self.heap.markValue(.{ .heap_string = failure });
+        self.heap.markValues(self.heap.pinned.items);
         self.heap.sweep();
     }
 
-    fn step(self: *Vm) anyerror!?value.Value {
+    fn step(self: *Vm) anyerror!StepOutcome {
         const frame_index = self.frames.items.len - 1;
         const frame = &self.frames.items[frame_index];
         const compiled = self.program.functionConst(frame.function_id) orelse {
             try self.fault("Runtime Error: неизвестная функция", .{});
-            return null;
+            return .none;
         };
-        if (frame.ip >= compiled.instructions.items.len) return self.finishFrame(.{ .void = {} });
+        if (frame.ip >= compiled.instructions.items.len) {
+            return if (try self.finishFrame(.{ .void = {} })) |result| .{ .completed = result } else .none;
+        }
         const instruction = compiled.instructions.items[frame.ip];
         frame.ip += 1;
 
@@ -144,16 +1218,29 @@ pub const Vm = struct {
             .call_interface => |interface_call| try self.callInterface(interface_call),
             .spawn => |argument_count| try self.spawn(argument_count),
             .send => try self.send(),
-            .receive => try self.receive(),
+            .receive => {
+                if (try self.receive()) {
+                    frame.ip -= 1;
+                    return .suspended;
+                }
+            },
             .observe => try self.observe(),
-            .get_signal => try self.getSignal(),
+            .get_signal => {
+                if (try self.getSignal()) {
+                    frame.ip -= 1;
+                    return .suspended;
+                }
+            },
             .process_id => try self.processId(),
             .current_process => try self.currentProcess(),
             .kill_process => try self.killProcess(),
             .link_process => try self.linkProcess(),
             .build_closure => |closure| try self.buildClosure(closure),
-            .return_value => return self.finishFrame(try self.pop()),
-            .return_void => return self.finishFrame(.{ .void = {} }),
+            .return_value => {
+                const popped = try self.pop();
+                return if (try self.finishFrame(popped)) |result| .{ .completed = result } else .none;
+            },
+            .return_void => return if (try self.finishFrame(.{ .void = {} })) |result| .{ .completed = result } else .none,
             .build_tuple => |count| try self.buildAggregate(null, count),
             .build_struct => |structure| try self.buildStruct(compiled, structure),
             .build_array => |count| try self.buildArray(count),
@@ -174,8 +1261,60 @@ pub const Vm = struct {
             .get_property => |field| try self.getProperty(field),
             .set_property => |field| try self.setProperty(field),
             .file_exists => try self.fileExists(),
+            .file_delete => try self.fileDelete(),
+            .file_read => try self.fileRead(),
+            .file_write => try self.fileWrite(),
+            .dir_is_dir => try self.dirIsDir(),
+            .dir_create => try self.dirCreate(),
+            .dir_list => try self.dirList(),
+            .dir_delete => try self.dirDelete(),
+            .file_open => try self.fileOpen(),
+            .file_handle_read_submit => try self.fileHandleReadSubmit(),
+            .file_handle_read_line_submit => try self.fileHandleReadLineSubmit(),
+            .file_handle_write_submit => try self.fileHandleWriteSubmit(),
+            .file_handle_close => try self.fileHandleClose(),
+            .os_args => try self.osArgs(),
+            .os_version => try self.osVersion(),
+            .os_env_get => try self.osEnvGet(),
+            .os_env_set => try self.osEnvSet(),
+            .os_env_unset => try self.osEnvUnset(),
+            .os_exec => try self.osExec(),
+            .os_exit => try self.osExit(),
+            .gzip_decompress => try self.gzipDecompress(),
+            .syntax_structs => try self.syntaxStructs(),
+            .syntax_fields => try self.syntaxFields(),
+            .syntax_annotations => try self.syntaxAnnotations(),
+            .syntax_annotation_arg => try self.syntaxAnnotationArg(),
+            .syntax_field_annotations => try self.syntaxFieldAnnotations(),
+            .syntax_field_annotation_arg => try self.syntaxFieldAnnotationArg(),
+            .connection_read_submit => try self.connectionReadSubmit(),
+            .connection_read_line_submit => try self.connectionReadLineSubmit(),
+            .connection_write_submit => try self.connectionWriteSubmit(),
+            .connection_close => try self.connectionClose(),
+            .url_encode => try self.urlEncode(),
+            .http_request_submit => try self.httpRequestSubmit(),
+            .sql_open_submit => try self.sqlOpenSubmit(),
+            .sql_exec_submit => try self.sqlExecSubmit(),
+            .sql_query_submit => try self.sqlQuerySubmit(),
+            .sql_close => try self.sqlClose(),
+            .http_listen => try self.httpListen(),
+            .http_accept_submit => try self.httpAcceptSubmit(),
+            .http_request_method => try self.httpRequestMethod(),
+            .http_request_path => try self.httpRequestPath(),
+            .http_request_header => try self.httpRequestHeader(),
+            .http_request_respond => try self.httpRequestRespond(),
+            .call_foreign => |foreign_call| try self.callForeign(compiled, foreign_call.constant_index, foreign_call.argument_count),
+            .file_read_submit => try self.fileReadSubmit(),
+            .file_write_submit => try self.fileWriteSubmit(),
+            .net_connect_submit => try self.netConnectSubmit(),
+            .await_async => {
+                if (try self.awaitAsync()) {
+                    frame.ip -= 1;
+                    return .suspended;
+                }
+            },
         }
-        return null;
+        return .none;
     }
 
     fn pushFrame(self: *Vm, function_id: bytecode.FunctionId, captures: []const value.Value, arguments: []const value.Value) anyerror!void {
@@ -228,6 +1367,10 @@ pub const Vm = struct {
                 try self.fault("Runtime Error: vtable интерфейса нельзя использовать как значение", .{});
                 return;
             },
+            .foreign_function => {
+                try self.fault("Runtime Error: описание 'внешний'-функции нельзя использовать как значение", .{});
+                return;
+            },
         };
         try self.stack.append(self.allocator, runtime_value);
     }
@@ -255,6 +1398,1772 @@ pub const Vm = struct {
             };
             try self.stack.append(self.allocator, .{ .boolean = true });
         }
+    }
+
+    fn fileDelete(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::удалить", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::удалить", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.удалить() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::удалить' недоступно в этом runtime-таргете", .{});
+            return;
+        } else {
+            var io = std.Io.Threaded.init(self.allocator, .{});
+            defer io.deinit();
+            std.Io.Dir.cwd().deleteFile(io.io(), path) catch {
+                try self.stack.append(self.allocator, .{ .boolean = false });
+                return;
+            };
+            try self.stack.append(self.allocator, .{ .boolean = true });
+        }
+    }
+
+    fn fileRead(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::прочитать", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::прочитать", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.прочитать() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::прочитать' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io.io(), path, self.allocator, .unlimited) catch |err| {
+            try self.pushErrorResult(@errorName(err));
+            return;
+        };
+        const heap_string = try self.heap.createString(bytes);
+        try self.pushSuccessResult(.{ .heap_string = heap_string });
+    }
+
+    fn fileWrite(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::записать", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::записать", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const content = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.записать() ожидает содержимое типа Строка", .{});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.записать() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::записать' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = path, .data = content }) catch |err| {
+            try self.pushErrorResult(@errorName(err));
+            return;
+        };
+        try self.pushSuccessResult(.{ .number = @floatFromInt(content.len) });
+    }
+
+    fn fileReadSubmit(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::прочитать", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::прочитать", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.прочитать() ожидает путь типа Строка", .{});
+            return;
+        };
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: фс.прочитать() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::прочитать' недоступно в этом runtime-таргете", .{});
+        } else {
+            submitFileRead(self, path, process.id);
+        }
+    }
+
+    fn fileWriteSubmit(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::записать", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::записать", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const content = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.записать() ожидает содержимое типа Строка", .{});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.записать() ожидает путь типа Строка", .{});
+            return;
+        };
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: фс.записать() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::записать' недоступно в этом runtime-таргете", .{});
+        } else {
+            submitFileWrite(self, path, content, process.id);
+        }
+    }
+
+    // Единственная точка настоящей приостановки — process.async_results
+    // ОТДЕЛЬНАЯ от mailbox/signals очередь (value.zig), так что результат
+    // фонового I/O не может быть перепутан с обычным сообщением или
+    // сигналом наблюдателя, пришедшим, пока процесс ждал.
+    fn awaitAsync(self: *Vm) anyerror!bool {
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: await_async вне процесса", .{});
+            return false;
+        };
+        if (process.async_results.items.len == 0) return true;
+        const result = process.async_results.orderedRemove(0);
+        try self.stack.append(self.allocator, result);
+        return false;
+    }
+
+    fn fileOpen(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::открыть", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::открыть", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.открыть() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::открыть' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        // Open-or-create without wiping existing content, matching Odin's
+        // `os.open(path, {.Read, .Write, .Create}, ...)` (`фс::открыть`,
+        // `core/vm_io_native.odin`) — but see `value.zig`'s `FileHandle`
+        // doc comment for why this doesn't keep a descriptor open: `access`
+        // just probes existence (creating an empty file if missing), then
+        // every subsequent method reopens the file by path.
+        std.Io.Dir.cwd().access(io.io(), path, .{}) catch {
+            std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = path, .data = "" }) catch |err| {
+                try self.pushErrorResult(@errorName(err));
+                return;
+            };
+        };
+        const handle = try self.heap.createFile(path);
+        try self.pushSuccessResult(.{ .file = handle });
+    }
+
+    fn popFileHandle(self: *Vm, method_name: []const u8) anyerror!?*value.FileHandle {
+        const receiver = try self.pop();
+        return switch (receiver) {
+            .file => |handle| handle,
+            else => {
+                try self.fault("Runtime Error: {s} ожидает файловый дескриптор", .{method_name});
+                return null;
+            },
+        };
+    }
+
+    fn fileHandleReadSubmit(self: *Vm) anyerror!void {
+        const handle = try self.popFileHandle("Файл.прочитать()") orelse return;
+        if (!handle.is_open) {
+            const result = try self.buildErrorResultValue("фс", "файл уже закрыт");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        if (handle.in_flight) {
+            const result = try self.buildErrorResultValue("фс", "файл уже используется другой операцией");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: Файл.прочитать() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Файл.прочитать' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        handle.in_flight = true;
+        try self.heap.pin(.{ .file = handle });
+        submitFileHandleRead(self, handle, handle.path, handle.offset, false, process.id);
+    }
+
+    fn fileHandleReadLineSubmit(self: *Vm) anyerror!void {
+        const handle = try self.popFileHandle("Файл.прочитать_строку()") orelse return;
+        if (!handle.is_open) {
+            const result = try self.buildErrorResultValue("фс", "файл уже закрыт");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        if (handle.in_flight) {
+            const result = try self.buildErrorResultValue("фс", "файл уже используется другой операцией");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: Файл.прочитать_строку() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Файл.прочитать_строку' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        handle.in_flight = true;
+        try self.heap.pin(.{ .file = handle });
+        submitFileHandleRead(self, handle, handle.path, handle.offset, true, process.id);
+    }
+
+    fn fileHandleWriteSubmit(self: *Vm) anyerror!void {
+        const content = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: Файл.записать() ожидает содержимое типа Строка", .{});
+            return;
+        };
+        const handle = try self.popFileHandle("Файл.записать()") orelse return;
+        if (!handle.is_open) {
+            const result = try self.buildErrorResultValue("фс", "файл не открыт для записи");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        if (handle.in_flight) {
+            const result = try self.buildErrorResultValue("фс", "файл уже используется другой операцией");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: Файл.записать() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Файл.записать' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        handle.in_flight = true;
+        try self.heap.pin(.{ .file = handle });
+        submitFileHandleWrite(self, handle, handle.path, content, handle.offset, process.id);
+    }
+
+    fn fileHandleClose(self: *Vm) anyerror!void {
+        const handle = try self.popFileHandle("Файл.закрыть()") orelse return;
+        handle.is_open = false;
+        try self.stack.append(self.allocator, .{ .void = {} });
+    }
+
+    fn dirIsDir(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::это_директория", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::это_директория", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.это_директория() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::это_директория' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        const stat = std.Io.Dir.cwd().statFile(io.io(), path, .{}) catch {
+            try self.stack.append(self.allocator, .{ .boolean = false });
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .boolean = stat.kind == .directory });
+    }
+
+    fn dirCreate(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::создать_директорию", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::создать_директорию", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.создать_директорию() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::создать_директорию' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        std.Io.Dir.cwd().createDirPath(io.io(), path) catch |err| {
+            try self.pushErrorResult(@errorName(err));
+            return;
+        };
+        try self.pushSuccessResult(.{ .number = 0 });
+    }
+
+    fn dirList(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::список_директории", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::список_директории", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.список_директории() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::список_директории' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        var dir = std.Io.Dir.cwd().openDir(io.io(), path, .{ .iterate = true }) catch |err| {
+            try self.pushErrorResult(@errorName(err));
+            return;
+        };
+        defer dir.close(io.io());
+        var names: std.ArrayList(value.Value) = .empty;
+        errdefer names.deinit(self.allocator);
+        var iterator = dir.iterate();
+        while (try iterator.next(io.io())) |entry| {
+            const heap_string = try self.heap.createString(try self.allocator.dupe(u8, entry.name));
+            try names.append(self.allocator, .{ .heap_string = heap_string });
+        }
+        const array = try self.heap.createArray(try names.toOwnedSlice(self.allocator));
+        try self.pushSuccessResult(.{ .array = array });
+    }
+
+    fn dirDelete(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("фс::удалить_директорию", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "фс::удалить_директорию", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: фс.удалить_директорию() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'фс::удалить_директорию' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        // Odin's `удалить_директорию` tries a plain remove first (file or
+        // already-empty dir) then falls back to a recursive delete only if
+        // that fails (non-empty dir) — same two-step here, `deleteDir`
+        // before `deleteTree`.
+        std.Io.Dir.cwd().deleteDir(io.io(), path) catch {
+            std.Io.Dir.cwd().deleteTree(io.io(), path) catch |err| {
+                try self.pushErrorResult(@errorName(err));
+                return;
+            };
+            try self.pushSuccessResult(.{ .number = 0 });
+            return;
+        };
+        try self.pushSuccessResult(.{ .number = 0 });
+    }
+
+    fn osArgs(self: *Vm) anyerror!void {
+        const elements = try self.allocator.alloc(value.Value, self.program_args.len);
+        errdefer self.allocator.free(elements);
+        for (self.program_args, 0..) |argument, index| {
+            elements[index] = .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, argument)) };
+        }
+        const array = try self.heap.createArray(elements);
+        try self.stack.append(self.allocator, .{ .array = array });
+    }
+
+    fn osVersion(self: *Vm) anyerror!void {
+        // Kept in sync manually with Odin's `PANOS_VERSION` (`core/vm.odin`)
+        // — there is no single source of truth shared between the two
+        // implementations during the migration.
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, "0.2.16"));
+        try self.stack.append(self.allocator, .{ .heap_string = heap_string });
+    }
+
+    fn osEnvGet(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("ос::окружение", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "ос::окружение", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: ос.окружение() ожидает имя типа Строка", .{});
+            return;
+        };
+        // `if`/`else` (not the early-return-then-fallthrough shape used
+        // elsewhere in this file) — required here so the freestanding
+        // branch never gets semantically analyzed at all: `std.c.getenv`
+        // is a real libc extern with no freestanding stub, unlike the
+        // `std.Io.Dir`/`std.Io.Threaded` calls the `фс.*` builtins use.
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'ос::окружение' недоступно в этом runtime-таргете", .{});
+        } else {
+            const name_z = try self.allocator.dupeZ(u8, name);
+            defer self.allocator.free(name_z);
+            if (std.c.getenv(name_z)) |raw_value| {
+                const heap_string = try self.heap.createString(try self.allocator.dupe(u8, std.mem.span(raw_value)));
+                try self.pushOption(.{ .heap_string = heap_string });
+            } else {
+                try self.pushOption(null);
+            }
+        }
+    }
+
+    fn osEnvSet(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("ос::установить_окружение", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "ос::установить_окружение", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const env_value = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: ос.установить_окружение() ожидает значение типа Строка", .{});
+            return;
+        };
+        const name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: ос.установить_окружение() ожидает имя типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'ос::установить_окружение' недоступно в этом runtime-таргете", .{});
+        } else {
+            const name_z = try self.allocator.dupeZ(u8, name);
+            defer self.allocator.free(name_z);
+            const value_z = try self.allocator.dupeZ(u8, env_value);
+            defer self.allocator.free(value_z);
+            if (posix_env.setenv(name_z, value_z, 1) != 0) {
+                try self.pushErrorResultForModule("ос", "не удалось установить переменную окружения");
+            } else {
+                try self.pushSuccessResult(.{ .number = 0 });
+            }
+        }
+    }
+
+    fn osEnvUnset(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("ос::удалить_окружение", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "ос::удалить_окружение", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: ос.удалить_окружение() ожидает имя типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'ос::удалить_окружение' недоступно в этом runtime-таргете", .{});
+        } else {
+            const name_z = try self.allocator.dupeZ(u8, name);
+            defer self.allocator.free(name_z);
+            try self.stack.append(self.allocator, .{ .boolean = posix_env.unsetenv(name_z) == 0 });
+        }
+    }
+
+    fn osExec(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("ос::выполнить", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "ос::выполнить", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const working_dir = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: ос.выполнить() ожидает рабочую директорию типа Строка", .{});
+            return;
+        };
+        const args_value = try self.pop();
+        const args_array = switch (args_value) {
+            .array => |array| array,
+            else => {
+                try self.fault("Runtime Error: ос.выполнить() ожидает Массив(Строка) вторым аргументом", .{});
+                return;
+            },
+        };
+        const program = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: ос.выполнить() ожидает программу типа Строка первым аргументом", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'ос::выполнить' недоступно в этом runtime-таргете", .{});
+            return;
+        } else {
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(self.allocator);
+            try argv.append(self.allocator, program);
+            for (args_array.elements) |element| {
+                const element_string = element.stringBytes() orelse {
+                    try self.fault("Runtime Error: ос.выполнить() ожидает Массив(Строка) вторым аргументом", .{});
+                    return;
+                };
+                try argv.append(self.allocator, element_string);
+            }
+            var io = std.Io.Threaded.init(self.allocator, .{});
+            defer io.deinit();
+            const result = std.process.run(self.allocator, io.io(), .{
+                .argv = argv.items,
+                .cwd = .{ .path = working_dir },
+            }) catch |err| {
+                try self.pushErrorResultForModule("ос", @errorName(err));
+                return;
+            };
+            defer self.allocator.free(result.stdout);
+            defer self.allocator.free(result.stderr);
+            const exit_code: f64 = switch (result.term) {
+                .exited => |code| @floatFromInt(code),
+                .signal => |signal| 128 + @as(f64, @floatFromInt(@intFromEnum(signal))),
+                .stopped => |signal| 128 + @as(f64, @floatFromInt(@intFromEnum(signal))),
+                .unknown => |code| @floatFromInt(code),
+            };
+            const tuple_elements = try self.allocator.alloc(value.Value, 3);
+            tuple_elements[0] = .{ .number = exit_code };
+            tuple_elements[1] = .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, result.stdout)) };
+            tuple_elements[2] = .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, result.stderr)) };
+            const tuple = try self.heap.createAggregate(null, tuple_elements);
+            try self.pushSuccessResult(.{ .aggregate = tuple });
+        }
+    }
+
+    fn osExit(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("ос::завершить", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "ос::завершить", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const code = try self.number(try self.pop());
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'ос::завершить' недоступно в этом runtime-таргете", .{});
+        } else {
+            std.process.exit(@intFromFloat(code));
+        }
+    }
+
+    fn gzipDecompress(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("сжатие::разжать_gzip", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "сжатие::разжать_gzip", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const data = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: сжатие.разжать_gzip() ожидает Строку", .{});
+            return;
+        };
+        // Pure in-memory codec (no OS/threading dependency at all, unlike
+        // фс.*/ос.*) — no `std.Io.Threaded`/comptime-freestanding branch
+        // needed; `target_policy` above is the only gate, matching Odin's
+        // restriction (see `builtin_availability.odin`), not a real Zig
+        // compilation limitation.
+        var input: std.Io.Reader = .fixed(data);
+        var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &.{});
+        var allocating: std.Io.Writer.Allocating = .init(self.allocator);
+        defer allocating.deinit();
+        _ = decompress.reader.streamRemaining(&allocating.writer) catch {
+            const message = decompress.err orelse error.ReadFailed;
+            try self.pushErrorResultForModule("сжатие", @errorName(message));
+            return;
+        };
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, allocating.written()));
+        try self.pushSuccessResult(.{ .heap_string = heap_string });
+    }
+
+    // `Результат.Успех(payload)` — matches the tagged-aggregate shape every
+    // other prelude enum variant construction already uses (see
+    // `queueSignal`'s `Опция.Есть`/`Опция.Нет`).
+    fn pushSuccessResult(self: *Vm, payload: value.Value) anyerror!void {
+        const elements = try self.allocator.alloc(value.Value, 1);
+        elements[0] = payload;
+        const aggregate = try self.heap.createAggregate("Результат.Успех", elements);
+        try self.stack.append(self.allocator, .{ .aggregate = aggregate });
+    }
+
+    // `Результат.Неудача(Ошибка("фс", message))` — the plain `Ошибка` struct
+    // matches its `Ошибка(код, сообщение)` constructor shape
+    // (`compiler.zig`'s `compileErrorConstructor`), so `.код`/`.сообщение`
+    // field access on the value this pushes works exactly like a
+    // user-constructed `Ошибка`.
+    fn pushErrorResult(self: *Vm, message: []const u8) anyerror!void {
+        try self.pushErrorResultForModule("фс", message);
+    }
+
+    fn pushErrorResultForModule(self: *Vm, module: []const u8, message: []const u8) anyerror!void {
+        const error_fields = try self.allocator.alloc(value.Value, 2);
+        error_fields[0] = .{ .string = module };
+        error_fields[1] = .{ .heap_string = try self.heap.formatString("{s}", .{message}) };
+        const error_aggregate = try self.heap.createAggregate("Ошибка", error_fields);
+        const elements = try self.allocator.alloc(value.Value, 1);
+        elements[0] = .{ .aggregate = error_aggregate };
+        const aggregate = try self.heap.createAggregate("Результат.Неудача", elements);
+        try self.stack.append(self.allocator, .{ .aggregate = aggregate });
+    }
+
+    // `Опция.Есть(payload)`/`Опция.Нет()` — same tagged-aggregate shape as
+    // `pushSuccessResult`, for natives whose "not found" isn't an `Ошибка`
+    // (`ос.окружение`).
+    fn pushOption(self: *Vm, payload: ?value.Value) anyerror!void {
+        try self.stack.append(self.allocator, try self.makeOptionValue(payload));
+    }
+
+    // Same `Опция.Есть`/`Опция.Нет` construction as `pushOption`, but
+    // returns the value instead of pushing it — needed when an `Опция`
+    // itself becomes the payload of a `Результат.Успех(...)` (`синтаксис.
+    // аргумент_аннотации`/`аргумент_аннотации_поля`).
+    fn makeOptionValue(self: *Vm, payload: ?value.Value) anyerror!value.Value {
+        const elements = try self.allocator.alloc(value.Value, if (payload == null) 0 else 1);
+        if (payload) |some| elements[0] = some;
+        const aggregate = try self.heap.createAggregate(if (payload == null) "Опция.Нет" else "Опция.Есть", elements);
+        return .{ .aggregate = aggregate };
+    }
+
+    // `синтаксис.*` — compile-time AST introspection of ANOTHER .ps file
+    // (not the currently-running program), for codegen tooling written in
+    // panos itself (mirrors `core/vm_syntax_native.odin`). No persistent
+    // handle, unlike `Файл`/`Соединение` — every call re-reads and
+    // re-parses the path from scratch; acceptable for a build-time tool
+    // run once over a small file, not a hot path (same tradeoff Odin's
+    // version documents).
+    const SyntaxParseOutcome = union(enum) {
+        ok: syntax_parser.ParseResult,
+        fail: []u8,
+    };
+
+    fn parseSyntaxSource(self: *Vm, path: []const u8) anyerror!SyntaxParseOutcome {
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        const content = std.Io.Dir.cwd().readFileAlloc(io.io(), path, self.allocator, .unlimited) catch |err| {
+            return .{ .fail = try self.allocator.dupe(u8, @errorName(err)) };
+        };
+        defer self.allocator.free(content);
+        var lexed = try syntax_lexer.tokenize(self.allocator, content, 0);
+        defer lexed.deinit();
+        if (lexed.diagnostics.items.items.len != 0) {
+            return .{ .fail = try self.allocator.dupe(u8, lexed.diagnostics.items.items[0].message) };
+        }
+        var parsed = try syntax_parser.parse(self.allocator, lexed.tokens.items);
+        if (parsed.diagnostics.items.items.len != 0) {
+            const message = try self.allocator.dupe(u8, parsed.diagnostics.items.items[0].message);
+            parsed.deinit();
+            return .{ .fail = message };
+        }
+        return .{ .ok = parsed };
+    }
+
+    const StructLookupOutcome = union(enum) {
+        // `parsed` must be `.deinit()`-ed by the caller once done reading
+        // `decl.struct_decl.fields`/`.annotations` (both are slices into
+        // `parsed.ast`'s arena).
+        ok: struct { parsed: syntax_parser.ParseResult, decl: ast_types.Decl },
+        // An error `Результат.Неудача(...)` was already pushed onto the
+        // stack — caller just returns.
+        failed: void,
+    };
+
+    fn resolveSyntaxStruct(self: *Vm, path: []const u8, struct_name: []const u8) anyerror!StructLookupOutcome {
+        switch (try self.parseSyntaxSource(path)) {
+            .fail => |message| {
+                defer self.allocator.free(message);
+                try self.pushErrorResultForModule("синтаксис", message);
+                return .failed;
+            },
+            .ok => |parsed_result| {
+                var parsed = parsed_result;
+                for (parsed.ast.program.?.declarations) |decl_id| {
+                    const decl = parsed.ast.decl(decl_id).*;
+                    switch (decl) {
+                        .struct_decl => |s| if (std.mem.eql(u8, s.name, struct_name)) return .{ .ok = .{ .parsed = parsed, .decl = decl } },
+                        else => {},
+                    }
+                }
+                defer parsed.deinit();
+                const message = try std.fmt.allocPrint(self.allocator, "структура '{s}' не найдена в '{s}'", .{ struct_name, path });
+                defer self.allocator.free(message);
+                try self.pushErrorResultForModule("синтаксис", message);
+                return .failed;
+            },
+        }
+    }
+
+    fn findFieldDecl(fields: []const ast_types.FieldDecl, name: []const u8) ?ast_types.FieldDecl {
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.name, name)) return field;
+        }
+        return null;
+    }
+
+    fn findAnnotation(annotations: []const ast_types.Annotation, name: []const u8) ?ast_types.Annotation {
+        for (annotations) |annotation| {
+            if (std.mem.eql(u8, annotation.name, name)) return annotation;
+        }
+        return null;
+    }
+
+    // First positional string argument of an annotation (`&Json("ключ")`),
+    // if any — `annotation == null` (annotation absent) is also a valid
+    // input, just returns `null`, so callers don't need a separate nil
+    // check (mirrors Odin's `annotation_string_arg`).
+    fn annotationStringArg(annotation: ?ast_types.Annotation) ?[]const u8 {
+        const found = annotation orelse return null;
+        if (found.arguments.len == 0) return null;
+        const argument = found.arguments[0];
+        if (argument.name != null) return null;
+        return switch (argument.value) {
+            .string => |text| text,
+            else => null,
+        };
+    }
+
+    fn annotationNamesArray(self: *Vm, annotations: []const ast_types.Annotation) anyerror!*value.Array {
+        var elements: std.ArrayList(value.Value) = .empty;
+        errdefer elements.deinit(self.allocator);
+        for (annotations) |annotation| {
+            try elements.append(self.allocator, .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, annotation.name)) });
+        }
+        return self.heap.createArray(try elements.toOwnedSlice(self.allocator));
+    }
+
+    fn annotationArgOptionValue(self: *Vm, annotations: []const ast_types.Annotation, annotation_name: []const u8) anyerror!value.Value {
+        const text = annotationStringArg(findAnnotation(annotations, annotation_name)) orelse return self.makeOptionValue(null);
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, text));
+        return self.makeOptionValue(.{ .heap_string = heap_string });
+    }
+
+    // Textual rendering of a `Type_Node` as written in the source — NOT
+    // the checker's canonical `^Type`/`TypeId` (there is no type-checked
+    // graph for this file at all, it's a throwaway parse) — just the raw
+    // syntax, for human/codegen consumption. Mirrors Odin's
+    // `type_node_to_string` (`core/syntax_parser.odin`).
+    fn typeNodeText(allocator: std.mem.Allocator, tree: *const ast_types.Ast, id: ast_types.TypeId) ![]u8 {
+        return switch (tree.typeNode(id).*) {
+            .ident => |node| allocator.dupe(u8, node.name),
+            .generic => |node| std.fmt.allocPrint(allocator, "{s}(...)", .{node.name}),
+            .qualified => |node| std.fmt.allocPrint(allocator, "{s}.{s}", .{ node.module_name, node.name }),
+            .tuple => allocator.dupe(u8, "(кортеж)"),
+            .function => allocator.dupe(u8, "(тип функции)"),
+            .error_node => allocator.dupe(u8, "<ошибка типа>"),
+        };
+    }
+
+    fn syntaxStructs(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("синтаксис::структуры", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "синтаксис::структуры", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.структуры() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'синтаксис::структуры' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        switch (try self.parseSyntaxSource(path)) {
+            .fail => |message| {
+                defer self.allocator.free(message);
+                try self.pushErrorResultForModule("синтаксис", message);
+            },
+            .ok => |parsed_result| {
+                var parsed = parsed_result;
+                defer parsed.deinit();
+                var elements: std.ArrayList(value.Value) = .empty;
+                errdefer elements.deinit(self.allocator);
+                for (parsed.ast.program.?.declarations) |decl_id| {
+                    switch (parsed.ast.decl(decl_id).*) {
+                        .struct_decl => |s| try elements.append(self.allocator, .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, s.name)) }),
+                        else => {},
+                    }
+                }
+                const array = try self.heap.createArray(try elements.toOwnedSlice(self.allocator));
+                try self.pushSuccessResult(.{ .array = array });
+            },
+        }
+    }
+
+    fn syntaxFields(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("синтаксис::поля", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "синтаксис::поля", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const struct_name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.поля() ожидает имя структуры типа Строка", .{});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.поля() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'синтаксис::поля' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        switch (try self.resolveSyntaxStruct(path, struct_name)) {
+            .failed => return,
+            .ok => |lookup| {
+                var parsed = lookup.parsed;
+                defer parsed.deinit();
+                const fields = lookup.decl.struct_decl.fields;
+                var elements: std.ArrayList(value.Value) = .empty;
+                errdefer elements.deinit(self.allocator);
+                for (fields) |field| {
+                    const type_text = if (field.type_annotation) |type_id|
+                        try typeNodeText(self.allocator, &parsed.ast, type_id)
+                    else
+                        try self.allocator.dupe(u8, "<без типа>");
+                    const pair_elements = try self.allocator.alloc(value.Value, 2);
+                    pair_elements[0] = .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, field.name)) };
+                    pair_elements[1] = .{ .heap_string = try self.heap.createString(type_text) };
+                    const pair = try self.heap.createAggregate(null, pair_elements);
+                    try elements.append(self.allocator, .{ .aggregate = pair });
+                }
+                const array = try self.heap.createArray(try elements.toOwnedSlice(self.allocator));
+                try self.pushSuccessResult(.{ .array = array });
+            },
+        }
+    }
+
+    fn syntaxAnnotations(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("синтаксис::аннотации", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "синтаксис::аннотации", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const struct_name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аннотации() ожидает имя структуры типа Строка", .{});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аннотации() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'синтаксис::аннотации' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        switch (try self.resolveSyntaxStruct(path, struct_name)) {
+            .failed => return,
+            .ok => |lookup| {
+                var parsed = lookup.parsed;
+                defer parsed.deinit();
+                const array = try self.annotationNamesArray(lookup.decl.struct_decl.annotations);
+                try self.pushSuccessResult(.{ .array = array });
+            },
+        }
+    }
+
+    fn syntaxAnnotationArg(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("синтаксис::аргумент_аннотации", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "синтаксис::аргумент_аннотации", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const annotation_name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аргумент_аннотации() ожидает имя аннотации типа Строка", .{});
+            return;
+        };
+        const struct_name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аргумент_аннотации() ожидает имя структуры типа Строка", .{});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аргумент_аннотации() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'синтаксис::аргумент_аннотации' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        switch (try self.resolveSyntaxStruct(path, struct_name)) {
+            .failed => return,
+            .ok => |lookup| {
+                var parsed = lookup.parsed;
+                defer parsed.deinit();
+                const option_value = try self.annotationArgOptionValue(lookup.decl.struct_decl.annotations, annotation_name);
+                try self.pushSuccessResult(option_value);
+            },
+        }
+    }
+
+    fn syntaxFieldAnnotations(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("синтаксис::аннотации_поля", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "синтаксис::аннотации_поля", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const field_name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аннотации_поля() ожидает имя поля типа Строка", .{});
+            return;
+        };
+        const struct_name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аннотации_поля() ожидает имя структуры типа Строка", .{});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аннотации_поля() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'синтаксис::аннотации_поля' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        switch (try self.resolveSyntaxStruct(path, struct_name)) {
+            .failed => return,
+            .ok => |lookup| {
+                var parsed = lookup.parsed;
+                defer parsed.deinit();
+                const field = findFieldDecl(lookup.decl.struct_decl.fields, field_name) orelse {
+                    const message = try std.fmt.allocPrint(self.allocator, "поле '{s}' не найдено у структуры '{s}'", .{ field_name, struct_name });
+                    defer self.allocator.free(message);
+                    try self.pushErrorResultForModule("синтаксис", message);
+                    return;
+                };
+                const array = try self.annotationNamesArray(field.annotations);
+                try self.pushSuccessResult(.{ .array = array });
+            },
+        }
+    }
+
+    fn syntaxFieldAnnotationArg(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("синтаксис::аргумент_аннотации_поля", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "синтаксис::аргумент_аннотации_поля", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const annotation_name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аргумент_аннотации_поля() ожидает имя аннотации типа Строка", .{});
+            return;
+        };
+        const field_name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аргумент_аннотации_поля() ожидает имя поля типа Строка", .{});
+            return;
+        };
+        const struct_name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аргумент_аннотации_поля() ожидает имя структуры типа Строка", .{});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.аргумент_аннотации_поля() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'синтаксис::аргумент_аннотации_поля' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        switch (try self.resolveSyntaxStruct(path, struct_name)) {
+            .failed => return,
+            .ok => |lookup| {
+                var parsed = lookup.parsed;
+                defer parsed.deinit();
+                const field = findFieldDecl(lookup.decl.struct_decl.fields, field_name) orelse {
+                    const message = try std.fmt.allocPrint(self.allocator, "поле '{s}' не найдено у структуры '{s}'", .{ field_name, struct_name });
+                    defer self.allocator.free(message);
+                    try self.pushErrorResultForModule("синтаксис", message);
+                    return;
+                };
+                const option_value = try self.annotationArgOptionValue(field.annotations, annotation_name);
+                try self.pushSuccessResult(option_value);
+            },
+        }
+    }
+
+    fn urlEncode(self: *Vm) anyerror!void {
+        const text = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: сеть.кодировать_url() ожидает Строку", .{});
+            return;
+        };
+        // Percent-encoding by BYTE, not rune — RFC 3986 unreserved
+        // (A-Z a-z 0-9 - _ . ~) as-is, everything else (including every
+        // byte of a multi-byte UTF-8 rune individually) as `%XX`. Matches
+        // Odin's `сеть::кодировать_url` (`core/vm.odin`) exactly — no
+        // target restriction, pure byte manipulation.
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(self.allocator);
+        const hex_digits = "0123456789ABCDEF";
+        for (text) |byte| {
+            const is_unreserved = (byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z') or (byte >= '0' and byte <= '9') or byte == '-' or byte == '_' or byte == '.' or byte == '~';
+            if (is_unreserved) {
+                try encoded.append(self.allocator, byte);
+            } else {
+                try encoded.append(self.allocator, '%');
+                try encoded.append(self.allocator, hex_digits[byte >> 4]);
+                try encoded.append(self.allocator, hex_digits[byte & 0x0f]);
+            }
+        }
+        const heap_string = try self.heap.createString(try encoded.toOwnedSlice(self.allocator));
+        try self.stack.append(self.allocator, .{ .heap_string = heap_string });
+    }
+
+    fn httpRequestSubmit(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("сеть::http_запрос", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "сеть::http_запрос", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const headers_value = try self.pop();
+        const headers_map = switch (headers_value) {
+            .map => |map| map,
+            else => {
+                try self.fault("Runtime Error: сеть.http_запрос() ожидает Соответствие(Строка, Строка) четвёртым аргументом", .{});
+                return;
+            },
+        };
+        const body = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: сеть.http_запрос() ожидает тело типа Строка", .{});
+            return;
+        };
+        const url = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: сеть.http_запрос() ожидает url типа Строка", .{});
+            return;
+        };
+        const method_text = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: сеть.http_запрос() ожидает метод типа Строка", .{});
+            return;
+        };
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: сеть.http_запрос() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'сеть::http_запрос' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        // Everything the worker touches must be cloned onto page_allocator
+        // HERE, on the main thread, before spawning — the Value/Map bytes
+        // are self.allocator-owned and not safe for a background thread to
+        // read concurrently once this call returns. The array itself (not
+        // just each pair's strings) must ALSO be page_allocator-owned and
+        // NOT freed here — ownership transfers fully to the worker
+        // (submitHttpRequest/Job frees it), since the worker keeps reading
+        // it after this function returns.
+        const owned_headers = std.heap.page_allocator.alloc(HttpHeaderPair, headers_map.entries.items.len) catch @panic("OOM");
+        var header_count: usize = 0;
+        for (headers_map.entries.items) |map_entry| {
+            const name = map_entry.key.stringBytes() orelse continue;
+            const header_value = map_entry.value.stringBytes() orelse continue;
+            owned_headers[header_count] = .{
+                .name = std.heap.page_allocator.dupe(u8, name) catch @panic("OOM"),
+                .value = std.heap.page_allocator.dupe(u8, header_value) catch @panic("OOM"),
+            };
+            header_count += 1;
+        }
+        // Shrink to the actual valid count (not just a sub-slice) — the
+        // worker frees this slice by the SAME allocator with the SAME
+        // length it was given; a shorter sub-slice of a longer allocation
+        // is not a valid `free()` input for `page_allocator`. Shrinking via
+        // `realloc` is guaranteed to succeed (never needs new memory).
+        const shrunk_headers = std.heap.page_allocator.realloc(owned_headers, header_count) catch unreachable;
+        submitHttpRequest(
+            self,
+            method_text,
+            url,
+            body,
+            shrunk_headers,
+            process.id,
+        );
+    }
+
+    fn buildHttpAggregateResult(self: *Vm, data: HttpRequestResult) !value.Value {
+        var header_pairs: std.ArrayList(value.Value) = .empty;
+        errdefer header_pairs.deinit(self.allocator);
+        for (data.headers) |header| {
+            const pair_elements = try self.allocator.alloc(value.Value, 2);
+            pair_elements[0] = .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, header.name)) };
+            pair_elements[1] = .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, header.value)) };
+            const pair = try self.heap.createAggregate(null, pair_elements);
+            try header_pairs.append(self.allocator, .{ .aggregate = pair });
+        }
+        const headers_array = try self.heap.createArray(try header_pairs.toOwnedSlice(self.allocator));
+        const response_body = try self.heap.createString(try self.allocator.dupe(u8, data.body));
+        const tuple_elements = try self.allocator.alloc(value.Value, 3);
+        tuple_elements[0] = .{ .number = @floatFromInt(data.status) };
+        tuple_elements[1] = .{ .array = headers_array };
+        tuple_elements[2] = .{ .heap_string = response_body };
+        const tuple = try self.heap.createAggregate(null, tuple_elements);
+        return .{ .aggregate = tuple };
+    }
+
+    fn sqlOpenSubmit(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("бд::открыть", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "бд::открыть", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: бд.открыть() ожидает путь типа Строка", .{});
+            return;
+        };
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: бд.открыть() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'бд::открыть' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        submitSqlOpen(self, path, process.id);
+    }
+
+    fn popSqlConnection(self: *Vm, method_name: []const u8) anyerror!?*value.SqlConnection {
+        const receiver = try self.pop();
+        return switch (receiver) {
+            .sql_connection => |connection| connection,
+            else => {
+                try self.fault("Runtime Error: {s} ожидает соединение с БД", .{method_name});
+                return null;
+            },
+        };
+    }
+
+    const SqlPrepareOutcome = union(enum) {
+        ok: ?*sqlite3.sqlite3_stmt,
+        // Borrowed from `sqlite3_errmsg`'s own buffer — valid only until
+        // the next call on the same `db`/until it's closed. Callers must
+        // consume it (e.g. `pushErrorResultForModule`, which copies it
+        // immediately) before making any further sqlite3 call.
+        fail: []const u8,
+    };
+
+    // Shared prepare+positionally-bind-`?`-placeholders step for
+    // `Соединение_БД.выполнить`/`.запрос` — `параметры` bind ONLY this
+    // way, there is no string-concatenation SQL path anywhere in this
+    // VM, so callers can't build an injectable query even if they wanted
+    // to.
+    fn sqlPrepare(self: *Vm, connection: *value.SqlConnection, sql: []const u8, params: []const value.Value) anyerror!SqlPrepareOutcome {
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        var stmt: ?*sqlite3.sqlite3_stmt = null;
+        const prepare_rc = sqlite3.sqlite3_prepare_v2(connection.db, sql_z.ptr, -1, &stmt, null);
+        if (prepare_rc != sqlite3.SQLITE_OK) {
+            return .{ .fail = std.mem.span(sqlite3.sqlite3_errmsg(connection.db) orelse "ошибка SQL") };
+        }
+        for (params, 0..) |param, index| {
+            const text = param.stringBytes() orelse {
+                _ = sqlite3.sqlite3_finalize(stmt);
+                return .{ .fail = "параметр должен быть Строкой" };
+            };
+            const text_z = try self.allocator.dupeZ(u8, text);
+            defer self.allocator.free(text_z);
+            const bind_rc = sqlite3.sqlite3_bind_text(stmt, @intCast(index + 1), text_z, -1, sqlite3.SQLITE_TRANSIENT);
+            if (bind_rc != sqlite3.SQLITE_OK) {
+                const message = std.mem.span(sqlite3.sqlite3_errmsg(connection.db) orelse "ошибка привязки параметра");
+                _ = sqlite3.sqlite3_finalize(stmt);
+                return .{ .fail = message };
+            }
+        }
+        return .{ .ok = stmt };
+    }
+
+    // Validates that every element of `параметры` is a Строка and clones
+    // them onto page_allocator — shared by sqlExecSubmit/sqlQuerySubmit,
+    // both need this identical prep before handing off to a worker.
+    fn cloneSqlParams(self: *Vm, elements: []const value.Value) anyerror!?[][]u8 {
+        const owned = try self.allocator.alloc([]u8, elements.len);
+        errdefer self.allocator.free(owned);
+        var filled: usize = 0;
+        for (elements) |element| {
+            const text = element.stringBytes() orelse {
+                for (owned[0..filled]) |param| std.heap.page_allocator.free(param);
+                self.allocator.free(owned);
+                return null;
+            };
+            owned[filled] = std.heap.page_allocator.dupe(u8, text) catch @panic("OOM");
+            filled += 1;
+        }
+        return owned;
+    }
+
+    fn sqlExecSubmit(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("бд::выполнить", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "бд::выполнить", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const params_value = try self.pop();
+        const params_array = switch (params_value) {
+            .array => |array| array,
+            else => {
+                try self.fault("Runtime Error: Соединение_БД.выполнить() ожидает Массив(Строка) вторым аргументом", .{});
+                return;
+            },
+        };
+        const sql = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: Соединение_БД.выполнить() ожидает SQL типа Строка", .{});
+            return;
+        };
+        const connection = try self.popSqlConnection("Соединение_БД.выполнить()") orelse return;
+        if (!connection.is_open) {
+            const result = try self.buildErrorResultValue("бд", "соединение уже закрыто");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        if (connection.in_flight) {
+            const result = try self.buildErrorResultValue("бд", "соединение уже используется другой операцией");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: Соединение_БД.выполнить() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Соединение_БД.выполнить' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const owned_params = try self.cloneSqlParams(params_array.elements) orelse {
+            const result = try self.buildErrorResultValue("бд", "параметр должен быть Строкой");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        };
+        defer {
+            for (owned_params) |param| std.heap.page_allocator.free(param);
+            self.allocator.free(owned_params);
+        }
+        connection.in_flight = true;
+        try self.heap.pin(.{ .sql_connection = connection });
+        submitSqlExec(self, connection, sql, owned_params, process.id);
+    }
+
+    fn sqlQuerySubmit(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("бд::запрос", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "бд::запрос", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const params_value = try self.pop();
+        const params_array = switch (params_value) {
+            .array => |array| array,
+            else => {
+                try self.fault("Runtime Error: Соединение_БД.запрос() ожидает Массив(Строка) вторым аргументом", .{});
+                return;
+            },
+        };
+        const sql = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: Соединение_БД.запрос() ожидает SQL типа Строка", .{});
+            return;
+        };
+        const connection = try self.popSqlConnection("Соединение_БД.запрос()") orelse return;
+        if (!connection.is_open) {
+            const result = try self.buildErrorResultValue("бд", "соединение уже закрыто");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        if (connection.in_flight) {
+            const result = try self.buildErrorResultValue("бд", "соединение уже используется другой операцией");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: Соединение_БД.запрос() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Соединение_БД.запрос' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const owned_params = try self.cloneSqlParams(params_array.elements) orelse {
+            const result = try self.buildErrorResultValue("бд", "параметр должен быть Строкой");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        };
+        defer {
+            for (owned_params) |param| std.heap.page_allocator.free(param);
+            self.allocator.free(owned_params);
+        }
+        connection.in_flight = true;
+        try self.heap.pin(.{ .sql_connection = connection });
+        submitSqlQuery(self, connection, sql, owned_params, process.id);
+    }
+
+    fn sqlClose(self: *Vm) anyerror!void {
+        const connection = try self.popSqlConnection("Соединение_БД.закрыть()") orelse return;
+        if (!connection.is_open) {
+            try self.stack.append(self.allocator, .{ .void = {} });
+            return;
+        }
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Соединение_БД.закрыть' недоступно в этом runtime-таргете", .{});
+        } else {
+            _ = sqlite3.sqlite3_close_v2(connection.db);
+            connection.is_open = false;
+            try self.stack.append(self.allocator, .{ .void = {} });
+        }
+    }
+
+    fn callForeign(self: *Vm, compiled: *const bytecode.Function, constant_index: u16, argument_count: u16) anyerror!void {
+        if (constant_index >= compiled.constants.items.len) {
+            try self.fault("Runtime Error: константа вне границ пула", .{});
+            return;
+        }
+        const info = switch (compiled.constants.items[constant_index]) {
+            .foreign_function => |foreign| foreign,
+            else => {
+                try self.fault("Runtime Error: константа не описывает 'внешний'-функцию", .{});
+                return;
+            },
+        };
+        const arguments = try self.popValues(argument_count);
+        defer self.allocator.free(arguments);
+        if (info.fn_ptr == 0) {
+            try self.fault("Runtime Panic: 'внешний' функция не была разрешена при резолве", .{});
+            return;
+        }
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'внешний' недоступно в этом runtime-таргете", .{});
+        } else {
+            const result = try self.invokeForeign(info, arguments);
+            try self.stack.append(self.allocator, result);
+        }
+    }
+
+    // Marshals `arguments` through libffi and calls `info.fn_ptr`, one
+    // 8-byte storage cell per scalar argument (matches Odin's
+    // `arg_storage`/`avalue` in `core/vm_ffi_native.odin`, same rationale:
+    // libffi's contract is an array of POINTERS TO arguments, not the
+    // argument values themselves). `Указатель(T)`/struct-by-value
+    // marshaling isn't ported yet — rejected at the type-checker level
+    // (`type_checker.zig`'s `foreignMarshalType`), so `.pointer`/
+    // `.struct_value` are genuinely unreachable here.
+    fn invokeForeign(self: *Vm, info: bytecode.ForeignFunctionConstant, arguments: []const value.Value) anyerror!value.Value {
+        const nargs = info.param_kinds.len;
+        const atypes = try self.allocator.alloc(?*ffi.FfiType, nargs);
+        defer self.allocator.free(atypes);
+        for (info.param_kinds, atypes) |kind, *slot| slot.* = ffi.ffiTypeForMarshal(kind);
+        const rtype = ffi.ffiTypeForMarshal(info.return_kind);
+
+        var cif: ffi.FfiCif = undefined;
+        const prep_status = ffi.ffi_prep_cif(&cif, ffi.defaultAbi(), @intCast(nargs), rtype, if (nargs > 0) atypes.ptr else null);
+        if (prep_status != ffi.FFI_OK) {
+            try self.fault("Runtime Error: ffi_prep_cif не удался (status={d})", .{prep_status});
+            return .{ .void = {} };
+        }
+
+        const arg_storage = try self.allocator.alloc(u64, nargs);
+        defer self.allocator.free(arg_storage);
+        const avalue = try self.allocator.alloc(?*anyopaque, nargs);
+        defer self.allocator.free(avalue);
+        // `КСтрока` arguments need a real null-terminated buffer that
+        // outlives the `ffi_call` below — borrowed-for-the-duration-of-
+        // this-call convention (see `docs/src/language/ffi.md` in the
+        // Odin tree): if the C function retains the pointer past its own
+        // return, that's outside this feature's guarantees.
+        var cstring_storage: std.ArrayList([:0]u8) = .empty;
+        defer {
+            for (cstring_storage.items) |buffer| self.allocator.free(buffer);
+            cstring_storage.deinit(self.allocator);
+        }
+
+        for (info.param_kinds, 0..) |kind, index| {
+            switch (kind) {
+                .int8 => {
+                    const cell: *u8 = @ptrCast(&arg_storage[index]);
+                    cell.* = @intFromFloat(try self.number(arguments[index]));
+                },
+                .int32 => {
+                    const cell: *i32 = @ptrCast(&arg_storage[index]);
+                    cell.* = @intFromFloat(try self.number(arguments[index]));
+                },
+                .int64 => {
+                    const cell: *i64 = @ptrCast(&arg_storage[index]);
+                    cell.* = @intFromFloat(try self.number(arguments[index]));
+                },
+                .float32 => {
+                    const cell: *f32 = @ptrCast(&arg_storage[index]);
+                    cell.* = @floatCast(try self.number(arguments[index]));
+                },
+                .float64 => {
+                    const cell: *f64 = @ptrCast(&arg_storage[index]);
+                    cell.* = try self.number(arguments[index]);
+                },
+                .c_string => {
+                    const text = arguments[index].stringBytes() orelse {
+                        try self.fault("Runtime Error: 'внешний' ожидает Строку для параметра-КСтроки", .{});
+                        return .{ .void = {} };
+                    };
+                    const buffer = try self.allocator.dupeZ(u8, text);
+                    try cstring_storage.append(self.allocator, buffer);
+                    const cell: *[*:0]const u8 = @ptrCast(@alignCast(&arg_storage[index]));
+                    cell.* = buffer.ptr;
+                },
+                .void, .pointer, .struct_value => unreachable,
+            }
+            avalue[index] = &arg_storage[index];
+        }
+
+        var return_storage: u64 = 0;
+        ffi.ffi_call(&cif, @ptrFromInt(info.fn_ptr), &return_storage, if (nargs > 0) avalue.ptr else null);
+
+        return switch (info.return_kind) {
+            .void => .{ .void = {} },
+            .int8 => .{ .number = @floatFromInt(@as(*u8, @ptrCast(&return_storage)).*) },
+            .int32 => .{ .number = @floatFromInt(@as(*i32, @ptrCast(&return_storage)).*) },
+            .int64 => .{ .number = @floatFromInt(@as(*i64, @ptrCast(&return_storage)).*) },
+            .float32 => .{ .number = @as(*f32, @ptrCast(&return_storage)).* },
+            .float64 => .{ .number = @as(*f64, @ptrCast(&return_storage)).* },
+            .c_string => blk: {
+                // panos ALWAYS copies a returned C string into a new
+                // managed string — never borrows C-owned memory,
+                // regardless of who actually owns it on the C side. A
+                // real NULL return (e.g. `getenv` on a missing variable)
+                // becomes an empty `Строка` — the marshal kind is a
+                // non-optional `КСтрока`, there is no way to express
+                // "no value" in this first slice's type mapping, and
+                // `std.mem.span` on a null pointer would otherwise crash.
+                const raw: ?[*:0]const u8 = @as(*const ?[*:0]const u8, @ptrCast(@alignCast(&return_storage))).*;
+                const bytes = if (raw) |pointer| std.mem.span(pointer) else "";
+                const heap_string = try self.heap.createString(try self.allocator.dupe(u8, bytes));
+                break :blk .{ .heap_string = heap_string };
+            },
+            .pointer, .struct_value => unreachable,
+        };
+    }
+
+    fn netConnectSubmit(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("сеть::подключиться", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "сеть::подключиться", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const port_number = try self.number(try self.pop());
+        const host = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: сеть.подключиться() ожидает хост типа Строка", .{});
+            return;
+        };
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: сеть.подключиться() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'сеть::подключиться' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        if (port_number < 0 or port_number > 65535) {
+            // Не отправлено в воркер-пул — синхронная валидационная ошибка
+            // должна всё равно прийти через await_async (та же инструкция
+            // ВСЕГДА следует за submit'ом), поэтому кладём готовый
+            // Результат.Неудача сразу в async_results, а не на self.stack.
+            const result = try self.buildErrorResultValue("сеть", "недопустимый номер порта");
+            try process.async_results.append(self.allocator, result);
+            return;
+        }
+        const port: u16 = @intFromFloat(port_number);
+        submitNetConnect(self, host, port, process.id);
+    }
+
+    // Bind+listen is a fast, local, one-shot syscall — unlike `.accept()`
+    // (which can block indefinitely waiting for a client), this stays
+    // synchronous, same reasoning as `сеть.подключиться`'s DNS resolve NOT
+    // needing to be split from its own connect.
+    fn httpListen(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("сеть::http_сервер_слушать", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "сеть::http_сервер_слушать", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const port_number = try self.number(try self.pop());
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'сеть::http_сервер_слушать' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        if (port_number < 0 or port_number > 65535) {
+            try self.pushErrorResultForModule("сеть", "недопустимый номер порта");
+            return;
+        }
+        const port: u16 = @intFromFloat(port_number);
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        const address = std.Io.net.IpAddress.parse("0.0.0.0", port) catch |err| {
+            try self.pushErrorResultForModule("сеть", @errorName(err));
+            return;
+        };
+        const server = address.listen(io.io(), .{ .reuse_address = true }) catch |err| {
+            try self.pushErrorResultForModule("сеть", @errorName(err));
+            return;
+        };
+        const listener = try self.heap.createListener(server);
+        try self.pushSuccessResult(.{ .listener = listener });
+    }
+
+    fn popListener(self: *Vm, method_name: []const u8) anyerror!?*value.Listener {
+        const receiver = try self.pop();
+        return switch (receiver) {
+            .listener => |listener| listener,
+            else => {
+                try self.fault("Runtime Error: {s} ожидает слушатель", .{method_name});
+                return null;
+            },
+        };
+    }
+
+    fn popHttpRequestHandle(self: *Vm, method_name: []const u8) anyerror!?*value.HttpRequestHandle {
+        const receiver = try self.pop();
+        return switch (receiver) {
+            .http_request => |request| request,
+            else => {
+                try self.fault("Runtime Error: {s} ожидает Запрос", .{method_name});
+                return null;
+            },
+        };
+    }
+
+    fn httpAcceptSubmit(self: *Vm) anyerror!void {
+        const listener = try self.popListener("Слушатель.принять_запрос()") orelse return;
+        if (!listener.is_open) {
+            const result = try self.buildErrorResultValue("сеть", "слушатель уже закрыт");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: Слушатель.принять_запрос() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Слушатель.принять_запрос' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        // No in_flight gate, no gc_pin — unlike Connection/FileHandle/
+        // SqlConnection, MULTIPLE concurrent accepts on the same listener
+        // are exactly the point of a server (worker pool draining the
+        // accept "queue" concurrently across however many processes are
+        // calling .принять_запрос()). accept() itself is safe to call from
+        // multiple threads on the same listening socket.
+        try self.heap.pin(.{ .listener = listener });
+        submitHttpAccept(self, listener, process.id);
+    }
+
+    fn httpRequestMethod(self: *Vm) anyerror!void {
+        const request = try self.popHttpRequestHandle("Запрос.метод()") orelse return;
+        try self.stack.append(self.allocator, .{ .string = request.method });
+    }
+
+    fn httpRequestPath(self: *Vm) anyerror!void {
+        const request = try self.popHttpRequestHandle("Запрос.путь()") orelse return;
+        try self.stack.append(self.allocator, .{ .string = request.path });
+    }
+
+    fn httpRequestHeader(self: *Vm) anyerror!void {
+        const name = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: Запрос.заголовок() ожидает имя типа Строка", .{});
+            return;
+        };
+        const request = try self.popHttpRequestHandle("Запрос.заголовок()") orelse return;
+        for (request.headers) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) {
+                const heap_string = try self.heap.createString(try self.allocator.dupe(u8, entry.value));
+                try self.pushOption(.{ .heap_string = heap_string });
+                return;
+            }
+        }
+        try self.pushOption(null);
+    }
+
+    // Synchronous, like `.закрыть()` — formatting+writing a response is a
+    // fast local operation on an already-connected socket, no need to
+    // route it through the async worker pool. One request per connection
+    // (no keep-alive) — the stream is closed right after responding.
+    fn httpRequestRespond(self: *Vm) anyerror!void {
+        const body = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: Запрос.ответить() ожидает тело типа Строка", .{});
+            return;
+        };
+        const content_type = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: Запрос.ответить() ожидает тип содержимого типа Строка", .{});
+            return;
+        };
+        const status = try self.number(try self.pop());
+        const request = try self.popHttpRequestHandle("Запрос.ответить()") orelse return;
+        if (request.responded) {
+            try self.fault("Runtime Error: Запрос.ответить() уже было вызвано для этого запроса", .{});
+            return;
+        }
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Запрос.ответить' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const status_code: u32 = @intFromFloat(status);
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        const response_text = try std.fmt.allocPrint(
+            self.allocator,
+            "HTTP/1.1 {d} панос\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ status_code, content_type, body.len, body },
+        );
+        defer self.allocator.free(response_text);
+        request.responded = true;
+        // Best-effort — `Запрос.ответить()` returns plain `Пусто`, not a
+        // `Результат`: a write failure here almost always just means the
+        // client already disconnected, and there is nothing a request
+        // handler could meaningfully do differently in that case.
+        var writer = request.stream.writer(io.io(), &.{});
+        writer.interface.writeAll(response_text) catch {};
+        writer.interface.flush() catch {};
+        request.stream.close(io.io());
+        try self.stack.append(self.allocator, .{ .void = {} });
+    }
+
+    fn popConnection(self: *Vm, method_name: []const u8) anyerror!?*value.Connection {
+        const receiver = try self.pop();
+        return switch (receiver) {
+            .connection => |connection| connection,
+            else => {
+                try self.fault("Runtime Error: {s} ожидает соединение", .{method_name});
+                return null;
+            },
+        };
+    }
+
+    fn connectionReadSubmit(self: *Vm) anyerror!void {
+        const connection = try self.popConnection("Соединение.получить()") orelse return;
+        if (!connection.is_open) {
+            const result = try self.buildErrorResultValue("сеть", "соединение уже закрыто");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        if (connection.in_flight) {
+            const result = try self.buildErrorResultValue("сеть", "соединение уже используется другой операцией");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: Соединение.получить() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Соединение.получить' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        // Drain whatever a previous `.получить_строку()` already pulled off
+        // the wire but hadn't consumed yet — handed to the worker as its
+        // starting buffer, then it keeps reading raw chunks (zero-length
+        // internal buffer — see `value.zig`'s `Connection` doc comment)
+        // until the peer closes the connection.
+        const drained = try connection.pending.toOwnedSlice(self.allocator);
+        defer self.allocator.free(drained);
+        connection.in_flight = true;
+        try self.heap.pin(.{ .connection = connection });
+        submitConnectionRead(self, connection, connection.stream, drained, process.id);
+    }
+
+    fn appendAsyncResultForCurrentProcess(self: *Vm, result: value.Value) !void {
+        const process = self.current_process orelse return;
+        try process.async_results.append(self.allocator, result);
+    }
+
+    fn connectionReadLineSubmit(self: *Vm) anyerror!void {
+        const connection = try self.popConnection("Соединение.получить_строку()") orelse return;
+        if (!connection.is_open) {
+            const result = try self.buildErrorResultValue("сеть", "соединение уже закрыто");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        if (connection.in_flight) {
+            const result = try self.buildErrorResultValue("сеть", "соединение уже используется другой операцией");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: Соединение.получить_строку() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Соединение.получить_строку' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const drained = try connection.pending.toOwnedSlice(self.allocator);
+        defer self.allocator.free(drained);
+        connection.in_flight = true;
+        try self.heap.pin(.{ .connection = connection });
+        submitConnectionReadLine(self, connection, connection.stream, drained, process.id);
+    }
+
+    fn connectionWriteSubmit(self: *Vm) anyerror!void {
+        const content = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: Соединение.отправить() ожидает содержимое типа Строка", .{});
+            return;
+        };
+        const connection = try self.popConnection("Соединение.отправить()") orelse return;
+        if (!connection.is_open) {
+            const result = try self.buildErrorResultValue("сеть", "соединение уже закрыто");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        if (connection.in_flight) {
+            const result = try self.buildErrorResultValue("сеть", "соединение уже используется другой операцией");
+            try self.appendAsyncResultForCurrentProcess(result);
+            return;
+        }
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: Соединение.отправить() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Соединение.отправить' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        connection.in_flight = true;
+        try self.heap.pin(.{ .connection = connection });
+        submitConnectionWrite(self, connection, connection.stream, content, process.id);
+    }
+
+    fn connectionClose(self: *Vm) anyerror!void {
+        const connection = try self.popConnection("Соединение.закрыть()") orelse return;
+        if (!connection.is_open) {
+            try self.stack.append(self.allocator, .{ .void = {} });
+            return;
+        }
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'Соединение.закрыть' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        if (connection.in_flight) {
+            // Не закрываем fd, пока воркер читает через него — реальный
+            // close() применится в finishConnectionFlight, как только
+            // текущее чтение доставит результат (см. deliverAsyncResult).
+            // is_open переключается СРАЗУ (видимое поведение для panos-кода
+            // — "уже закрыто" на любой дальнейший вызов), только сам
+            // syscall откладывается.
+            connection.close_requested = true;
+            connection.is_open = false;
+            try self.stack.append(self.allocator, .{ .void = {} });
+            return;
+        }
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        connection.stream.close(io.io());
+        connection.is_open = false;
+        try self.stack.append(self.allocator, .{ .void = {} });
     }
 
     fn pop(self: *Vm) anyerror!value.Value {
@@ -472,14 +3381,27 @@ pub const Vm = struct {
             else => return err,
         };
         while (self.frames.items.len != 0) {
-            const completed = self.step() catch |err| switch (err) {
+            const outcome = self.step() catch |err| switch (err) {
                 error.RuntimeFault => {
                     nested_failure = self.failure;
                     return err;
                 },
                 else => return err,
             };
-            if (completed) |result| return result;
+            switch (outcome) {
+                .none => {},
+                .completed => |result| return result,
+                // A Сравниваемое implementation calling получить()/
+                // получить_сигнал()/an async builtin has no process context
+                // to suspend into here — this is a synchronous nested call,
+                // not a scheduled slice.
+                .suspended => {
+                    self.fault("Runtime Error: реализация Сравниваемое не может приостанавливаться (получить/асинхронный вызов)", .{}) catch |err| {
+                        nested_failure = self.failure;
+                        return err;
+                    };
+                },
+            }
         }
         return .{ .void = {} };
     }
@@ -620,27 +3542,19 @@ pub const Vm = struct {
         };
         if (target.status == .ready) {
             try target.mailbox.append(self.allocator, message);
-            if (!self.isProcessActive(target)) try self.runProcess(target);
         }
         try self.stack.append(self.allocator, .{ .void = {} });
     }
 
-    fn receive(self: *Vm) anyerror!void {
-        if (self.current_message) |message| {
-            self.current_message = null;
-            try self.stack.append(self.allocator, message);
-            return;
-        }
+    fn receive(self: *Vm) anyerror!bool {
         const process = self.current_process orelse {
             try self.fault("Runtime Error: получить() вызвано вне процесса", .{});
-            return;
+            return false;
         };
-        if (process.mailbox.items.len == 0) {
-            try self.fault("Runtime Error: получить() ожидает сообщение", .{});
-            return;
-        }
+        if (process.mailbox.items.len == 0) return true;
         const message = process.mailbox.orderedRemove(0);
         try self.stack.append(self.allocator, message);
+        return false;
     }
 
     fn observe(self: *Vm) anyerror!void {
@@ -664,17 +3578,15 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .void = {} });
     }
 
-    fn getSignal(self: *Vm) anyerror!void {
+    fn getSignal(self: *Vm) anyerror!bool {
         const process = self.current_process orelse {
             try self.fault("Runtime Error: получить_сигнал() вызвано вне процесса", .{});
-            return;
+            return false;
         };
-        if (process.signals.items.len == 0) {
-            try self.fault("Runtime Error: нет доступных сигналов процесса", .{});
-            return;
-        }
+        if (process.signals.items.len == 0) return true;
         const signal = process.signals.orderedRemove(0);
         try self.stack.append(self.allocator, signal);
+        return false;
     }
 
     fn processId(self: *Vm) anyerror!void {
@@ -768,63 +3680,303 @@ pub const Vm = struct {
         return process;
     }
 
-    fn isProcessActive(self: *const Vm, process: *const value.Process) bool {
-        for (self.active_processes.items) |active| {
-            if (active == process) return true;
-        }
-        return false;
-    }
+    const SliceOutcome = union(enum) {
+        completed: value.Value,
+        suspended,
+        failed,
+    };
 
-    fn runProcess(self: *Vm, process: *value.Process) anyerror!void {
-        if (process.status != .ready or process.mailbox.items.len == 0 or self.isProcessActive(process)) return;
-        const message = process.mailbox.orderedRemove(0);
-        const saved_stack = self.stack;
-        const saved_frames = self.frames;
-        const saved_failure = self.failure;
-        const saved_process = self.current_process;
-        const saved_message = self.current_message;
-        self.stack = .empty;
-        self.frames = .empty;
+    // Runs ONE process for one scheduling slice: swaps its persisted
+    // stack/frames into the shared vm.stack/vm.frames (cheap — an
+    // ArrayList header, not a data copy), steps until it either finishes,
+    // crashes, or suspends (получить/получить_сигнал/Await_Async on an
+    // empty queue), then swaps its (possibly still-mid-frame) state back.
+    // Mirrors Odin's run_scheduler swap discipline (core/vm.odin).
+    fn runProcessSlice(self: *Vm, process: *value.Process) anyerror!SliceOutcome {
+        self.stack = process.stack;
+        self.frames = process.frames;
         self.failure = null;
         self.current_process = process;
-        self.current_message = message;
-        try self.active_processes.append(self.allocator, process);
         defer {
-            _ = self.active_processes.pop();
-            self.clearFrames();
-            self.frames.deinit(self.allocator);
-            self.stack.deinit(self.allocator);
-            self.stack = saved_stack;
-            self.frames = saved_frames;
-            self.failure = saved_failure;
-            self.current_process = saved_process;
-            self.current_message = saved_message;
+            // Fully transfer ownership back (not just copy the header) —
+            // leaving self.stack/self.frames aliased to the same backing
+            // buffer as process.stack/process.frames would double-free at
+            // Vm.deinit() (both `self.frames.deinit()` and
+            // `process.deinit()` would free the same allocation).
+            process.stack = self.stack;
+            process.frames = self.frames;
+            self.stack = .empty;
+            self.frames = .empty;
         }
-
-        self.pushFrame(process.function_id, process.captures, process.arguments) catch |err| switch (err) {
-            error.RuntimeFault => {
-                try self.terminateFailedProcess(process);
-                return;
-            },
-            else => return err,
-        };
-        while (self.frames.items.len != 0) {
-            const completed = self.step() catch |err| switch (err) {
-                error.RuntimeFault => {
-                    try self.terminateFailedProcess(process);
-                    return;
-                },
+        if (self.frames.items.len == 0) {
+            self.pushFrame(process.function_id, process.captures, process.arguments) catch |err| switch (err) {
+                error.RuntimeFault => return .failed,
                 else => return err,
             };
-            if (process.status != .ready) return;
-            if (completed != null) {
-                process.status = .completed;
-                try self.notifyWatchers(process, null);
-                return;
+        }
+        while (self.frames.items.len != 0) {
+            const outcome = self.step() catch |err| switch (err) {
+                error.RuntimeFault => return .failed,
+                else => return err,
+            };
+            switch (outcome) {
+                .none => {},
+                .suspended => return .suspended,
+                .completed => |result| return .{ .completed = result },
             }
         }
-        process.status = .completed;
-        try self.notifyWatchers(process, null);
+        return .{ .completed = .{ .void = {} } };
+    }
+
+    // Round-robin driver (mirrors Odin's run_scheduler): a process is
+    // runnable if it has never run yet, or has a pending mailbox message /
+    // monitor signal / async result waiting for it. Returns as soon as the
+    // ROOT process (index 0, "старт()") finishes or crashes — orphaned
+    // processes are simply abandoned, same contract as before this
+    // refactor.
+    fn runScheduler(self: *Vm, root: *value.Process) anyerror!Execution {
+        while (true) {
+            self.drainAsyncCompletions();
+            var any_ran = false;
+            var i: usize = 0;
+            while (i < self.processes.items.len) : (i += 1) {
+                const process = self.processes.items[i];
+                if (process.status != .ready) continue;
+                if (process.has_run and process.mailbox.items.len == 0 and process.signals.items.len == 0 and process.async_results.items.len == 0) continue;
+
+                any_ran = true;
+                process.has_run = true;
+                const outcome = try self.runProcessSlice(process);
+                switch (outcome) {
+                    .suspended => {},
+                    .completed => |result| {
+                        process.status = .completed;
+                        if (process == root) {
+                            self.joinAsyncPool();
+                            return .{ .success = result };
+                        }
+                        try self.notifyWatchers(process, null);
+                    },
+                    .failed => {
+                        if (process == root) {
+                            self.joinAsyncPool();
+                            return .{ .runtime_error = if (self.failure) |failure| failure.bytes else "Runtime Error: неизвестная ошибка" };
+                        }
+                        try self.terminateFailedProcess(process);
+                    },
+                }
+            }
+            if (!any_ran) {
+                if (self.hasPendingAsyncIo()) {
+                    self.blockForOneAsyncCompletion();
+                    continue;
+                }
+                return .{ .runtime_error = "Runtime Error: все процессы заблокированы в ожидании сообщений (дедлок)" };
+            }
+        }
+    }
+
+    fn drainAsyncCompletions(self: *Vm) void {
+        var drained: std.ArrayList(AsyncCompletion) = .empty;
+        defer drained.deinit(std.heap.page_allocator);
+        self.async_queue.drain(&drained);
+        for (drained.items) |completion| {
+            self.deliverAsyncResult(completion) catch {
+                // Только настоящая нехватка памяти на ГЛАВНОМ потоке —
+                // нет осмысленного частичного состояния, в которое можно
+                // откатиться (та же логика, что уже применяется к OOM
+                // повсюду в этом файле через `try` без отдельного catch).
+                @panic("OOM: не удалось доставить результат async I/O процессу");
+            };
+        }
+    }
+
+    fn hasPendingAsyncIo(self: *Vm) bool {
+        return self.async_queue.hasPending();
+    }
+
+    fn blockForOneAsyncCompletion(self: *Vm) void {
+        self.async_queue.waitForOne();
+    }
+
+    fn joinAsyncPool(self: *Vm) void {
+        self.async_queue.joinAll();
+    }
+
+    fn deliverAsyncResult(self: *Vm, completion: AsyncCompletion) !void {
+        // Handle-lifecycle side effects (unpin, clear in_flight, apply a
+        // deferred close) must run REGARDLESS of whether the target
+        // process is still alive — a `.закрыть()` while a read is in
+        // flight only sets close_requested, precisely because the actual
+        // close is applied HERE, not conditionally on delivery succeeding.
+        switch (completion.payload) {
+            .connection_read => |data| self.finishConnectionFlight(data.connection),
+            .connection_write => |data| self.finishConnectionFlight(data.connection),
+            .file_handle_read => |data| self.finishFileHandleFlight(data.handle, data.new_offset),
+            .file_handle_write => |data| self.finishFileHandleFlight(data.handle, data.new_offset),
+            .connection_read_line => |data| self.finishConnectionReadLineFlight(data.connection, data.new_pending),
+            .sql_exec => |data| self.finishSqlConnectionFlight(data.connection),
+            .sql_query => |data| self.finishSqlConnectionFlight(data.connection),
+            .http_accept => |data| self.heap.unpin(.{ .listener = data.listener }),
+            else => {},
+        }
+        var target: ?*value.Process = null;
+        for (self.processes.items) |process| {
+            if (process.id == completion.target_id) {
+                target = process;
+                break;
+            }
+        }
+        const process = target orelse {
+            // Процесс завершился/был убит, пока I/O было в полёте — тихо
+            // отбрасываем, тот же приём, что у send() на мёртвый процесс.
+            freeAsyncPayload(completion.payload);
+            return;
+        };
+        const result_value = try self.buildAsyncResultValue(completion.payload);
+        try process.async_results.append(self.allocator, result_value);
+    }
+
+    fn finishConnectionFlight(self: *Vm, connection: *value.Connection) void {
+        connection.in_flight = false;
+        self.heap.unpin(.{ .connection = connection });
+        if (connection.close_requested) {
+            if (comptime builtin.target.os.tag == .freestanding) {
+                // Unreachable in practice — connection_read completions
+                // only ever originate from submitConnectionRead, itself
+                // gated to non-freestanding — but this function is called
+                // unconditionally from drainAsyncCompletions for every
+                // target, so it still needs a real `if`/`else` split.
+            } else {
+                var io = std.Io.Threaded.init(self.allocator, .{});
+                defer io.deinit();
+                connection.stream.close(io.io());
+            }
+            connection.is_open = false;
+        }
+    }
+
+    fn finishFileHandleFlight(self: *Vm, handle: *value.FileHandle, new_offset: usize) void {
+        handle.in_flight = false;
+        handle.offset = new_offset;
+        self.heap.unpin(.{ .file = handle });
+    }
+
+    fn finishConnectionReadLineFlight(self: *Vm, connection: *value.Connection, new_pending: []const u8) void {
+        self.finishConnectionFlight(connection);
+        connection.pending.clearRetainingCapacity();
+        connection.pending.appendSlice(self.allocator, new_pending) catch @panic("OOM: восстановление pending после Соединение.получить_строку");
+    }
+
+    fn finishSqlConnectionFlight(self: *Vm, connection: *value.SqlConnection) void {
+        connection.in_flight = false;
+        self.heap.unpin(.{ .sql_connection = connection });
+    }
+
+    fn buildAsyncResultValue(self: *Vm, payload: AsyncPayload) !value.Value {
+        defer freeAsyncPayload(payload);
+        switch (payload) {
+            .file_read => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("фс", message);
+                const heap_string = try self.heap.createString(try self.allocator.dupe(u8, data.content.?));
+                return self.buildSuccessResultValue(.{ .heap_string = heap_string });
+            },
+            .file_write => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("фс", message);
+                return self.buildSuccessResultValue(.{ .number = @floatFromInt(data.bytes_written) });
+            },
+            .net_connect => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("сеть", message);
+                const connection = try self.heap.createConnection(data.stream.?);
+                return self.buildSuccessResultValue(.{ .connection = connection });
+            },
+            .http_request => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("сеть", message);
+                const tuple_value = try self.buildHttpAggregateResult(data.result.?);
+                return self.buildSuccessResultValue(tuple_value);
+            },
+            .connection_read => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("сеть", message);
+                const heap_string = try self.heap.createString(try self.allocator.dupe(u8, data.content.?));
+                return self.buildSuccessResultValue(.{ .heap_string = heap_string });
+            },
+            .connection_write => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("сеть", message);
+                return self.buildSuccessResultValue(.{ .number = @floatFromInt(data.bytes_written) });
+            },
+            .file_handle_read => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("фс", message);
+                const heap_string = try self.heap.createString(try self.allocator.dupe(u8, data.content.?));
+                return self.buildSuccessResultValue(.{ .heap_string = heap_string });
+            },
+            .file_handle_write => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("фс", message);
+                return self.buildSuccessResultValue(.{ .number = @floatFromInt(data.bytes_written) });
+            },
+            .connection_read_line => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("сеть", message);
+                const heap_string = try self.heap.createString(try self.allocator.dupe(u8, data.line.?));
+                return self.buildSuccessResultValue(.{ .heap_string = heap_string });
+            },
+            .sql_open => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("бд", message);
+                const connection = try self.heap.createSqlConnection(data.db);
+                return self.buildSuccessResultValue(.{ .sql_connection = connection });
+            },
+            .sql_exec => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("бд", message);
+                return self.buildSuccessResultValue(.{ .number = @floatFromInt(data.rows_affected) });
+            },
+            .sql_query => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("бд", message);
+                var rows: std.ArrayList(value.Value) = .empty;
+                errdefer rows.deinit(self.allocator);
+                for (data.rows) |row| {
+                    const row_map = try self.heap.createMap();
+                    for (data.column_names, row) |name, cell| {
+                        const text = cell orelse continue;
+                        const key_string = try self.heap.createString(try self.allocator.dupe(u8, name));
+                        const value_string = try self.heap.createString(try self.allocator.dupe(u8, text));
+                        try row_map.entries.append(self.allocator, .{ .key = .{ .heap_string = key_string }, .value = .{ .heap_string = value_string } });
+                    }
+                    try rows.append(self.allocator, .{ .map = row_map });
+                }
+                const rows_array = try self.heap.createArray(try rows.toOwnedSlice(self.allocator));
+                return self.buildSuccessResultValue(.{ .array = rows_array });
+            },
+            .http_accept => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("сеть", message);
+                const method = try self.allocator.dupe(u8, data.method.?);
+                const path = try self.allocator.dupe(u8, data.path.?);
+                const headers = try self.allocator.alloc(value.HttpHeaderEntry, data.headers.len);
+                for (data.headers, headers) |source_header, *entry| {
+                    entry.* = .{
+                        .name = try self.allocator.dupe(u8, source_header.name),
+                        .value = try self.allocator.dupe(u8, source_header.value),
+                    };
+                }
+                const request = try self.heap.createHttpRequest(data.stream.?, method, path, headers);
+                return self.buildSuccessResultValue(.{ .http_request = request });
+            },
+        }
+    }
+
+    fn buildSuccessResultValue(self: *Vm, payload: value.Value) !value.Value {
+        const elements = try self.allocator.alloc(value.Value, 1);
+        elements[0] = payload;
+        const aggregate = try self.heap.createAggregate("Результат.Успех", elements);
+        return .{ .aggregate = aggregate };
+    }
+
+    fn buildErrorResultValue(self: *Vm, module: []const u8, message: []const u8) !value.Value {
+        const error_fields = try self.allocator.alloc(value.Value, 2);
+        error_fields[0] = .{ .string = module };
+        error_fields[1] = .{ .heap_string = try self.heap.formatString("{s}", .{message}) };
+        const error_aggregate = try self.heap.createAggregate("Ошибка", error_fields);
+        const elements = try self.allocator.alloc(value.Value, 1);
+        elements[0] = .{ .aggregate = error_aggregate };
+        const aggregate = try self.heap.createAggregate("Результат.Неудача", elements);
+        return .{ .aggregate = aggregate };
     }
 
     fn terminateFailedProcess(self: *Vm, process: *value.Process) !void {
@@ -3191,20 +6343,32 @@ test "VM cascades linked process failures" {
     const parser = @import("parser.zig");
     const resolver = @import("resolver.zig");
     const type_checker = @import("type_checker.zig");
+    // The round-robin scheduler does NOT run отправить()'s target
+    // synchronously (unlike the old recursive-execution model this test was
+    // originally written against) — сосед() must stay alive (loop forever
+    // instead of completing) so the link to жертва is still valid whenever
+    // жертва actually gets scheduled and crashes. Same rendezvous idiom as
+    // Odin's own equivalent test (core/e2e_actors_test.odin,
+    // test_link_cascades_crash_to_linked_process): сосед pings родитель
+    // back only AFTER связать() has run, so отправить(жертва, ...) below is
+    // guaranteed to happen after the link exists.
     const source =
         \\функ падающий() -> Пусто
         \\    получить()
         \\    паника("сбой")
         \\конец
-        \\функ связанный() -> Пусто
-        \\    пер child: Процесс(Число) = запусти падающий()
-        \\    связать(child)
-        \\    отправить(child, 1)
+        \\функ сосед(партнёр: Процесс(Число), родитель: Процесс(Число)) -> Пусто
+        \\    связать(партнёр)
+        \\    отправить(родитель, 1)
+        \\    получить()
+        \\    сосед(партнёр, родитель)
         \\конец
         \\функ проверка() -> Булево
-        \\    пер process: Процесс(Число) = запусти связанный()
+        \\    пер жертва: Процесс(Число) = запусти падающий()
+        \\    пер process: Процесс(Число) = запусти сосед(жертва, себя())
         \\    наблюдать(process)
-        \\    отправить(process, 1)
+        \\    получить()
+        \\    отправить(жертва, 1)
         \\    пер (id, причина) = получить_сигнал()
         \\    выбор причина
         \\        Нет -> ложь

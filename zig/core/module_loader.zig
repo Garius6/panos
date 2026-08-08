@@ -38,6 +38,41 @@ pub const Export = struct {
     span: source.Span,
 };
 
+// Methods declared via a same-file `реализация Тип ... конец` block (plain
+// or interface) on an exported owner type — separate from `Export` because a
+// method is never reachable by a qualified name (`модуль.метод`), only by
+// dispatch on a value of the owner's nominal type.
+pub const MethodExport = struct {
+    module: usize,
+    owner_declaration: ast.DeclId,
+    declaration: ast.DeclId,
+    name: []const u8,
+    span: source.Span,
+};
+
+// Variants of an exported enum type — construction/matching is entirely
+// name-string-based at compile time (`compiler.zig`'s `enumVariantName`
+// builds "Owner.Variant" from the owner symbol's own `.name`), so no
+// declaration/FunctionId re-hosting is needed, only the variant's bare name.
+pub const VariantExport = struct {
+    module: usize,
+    owner_declaration: ast.DeclId,
+    name: []const u8,
+    span: source.Span,
+};
+
+// A same-file `реализация Интерфейс для Тип ... конец` block on an exported
+// owner type — needed separately from `MethodExport` because interface-bound
+// generic dispatch (`T: Сравниваемое`) requires the owner's
+// `InterfaceImplementation` entry itself, not just its methods (which
+// `MethodExport` already covers as ordinary inherent methods).
+pub const ImplExport = struct {
+    module: usize,
+    owner_declaration: ast.DeclId,
+    interface_name: []const u8,
+    span: source.Span,
+};
+
 pub const Graph = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -47,6 +82,9 @@ pub const Graph = struct {
     order: std.ArrayList(usize) = .empty,
     imports: std.ArrayList(Import) = .empty,
     exports: std.ArrayList(Export) = .empty,
+    methods: std.ArrayList(MethodExport) = .empty,
+    variants: std.ArrayList(VariantExport) = .empty,
+    impls: std.ArrayList(ImplExport) = .empty,
     diagnostics: diagnostic.DiagnosticList = .{},
 
     pub fn init(allocator: std.mem.Allocator) Graph {
@@ -61,6 +99,9 @@ pub const Graph = struct {
     pub fn deinit(self: *Graph) void {
         for (self.modules.items) |*module| module.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
+        self.impls.deinit(self.allocator);
+        self.variants.deinit(self.allocator);
+        self.methods.deinit(self.allocator);
         self.exports.deinit(self.allocator);
         self.imports.deinit(self.allocator);
         self.order.deinit(self.allocator);
@@ -100,6 +141,47 @@ pub const Graph = struct {
         const canonical_path = try resolveImportPath(self.allocator, entry_path, "");
         defer self.allocator.free(canonical_path);
         _ = try self.loadRecursive(reader, canonical_path, null);
+    }
+
+    // Appends embedded prelude source as a module with NO explicit `импорт`
+    // — takes the next available file_id, appended AFTER every module
+    // already loaded via `load()`, so existing diagnostics' `file_id`
+    // expectations for real modules are never shifted. Prepended to
+    // `order` (not appended) so it compiles before every real module, which
+    // implicitly depends on it. Reuses `collectExports`/`collectMethods`
+    // exactly as a real file would, so its types/methods/interfaces flow
+    // through the same cross-module machinery — only the merge itself
+    // (unqualified, no `импорт` alias) is special-cased, in
+    // `module_linker.zig`.
+    pub fn appendPreludeModule(self: *Graph, source_text: []const u8) !usize {
+        const bytes = try self.allocator.dupe(u8, source_text);
+        var owns_bytes = true;
+        errdefer if (owns_bytes) self.allocator.free(bytes);
+
+        if (self.modules.items.len > std.math.maxInt(source.FileId)) return error.ModuleLimitReached;
+        const file_id: source.FileId = @intCast(self.modules.items.len);
+        const stored_path = try self.arena.allocator().dupe(u8, "@prelude");
+        const file = source.SourceFile.init(file_id, stored_path, bytes);
+
+        var lexed = try lexer.tokenize(self.allocator, bytes, file_id);
+        defer lexed.deinit();
+        try self.appendDiagnostics(&lexed.diagnostics);
+
+        var parsed = try parser.parse(self.allocator, lexed.tokens.items);
+        errdefer parsed.deinit();
+        try self.appendDiagnostics(&parsed.diagnostics);
+        const tree = parsed.ast;
+        parsed.ast = ast.Ast.init(self.allocator);
+        parsed.deinit();
+        owns_bytes = false;
+
+        const index = self.modules.items.len;
+        try self.modules.append(self.allocator, .{ .file = file, .tree = tree });
+        try self.module_indices.put(stored_path, index);
+        try self.collectExports(index);
+        try self.collectMethods(index);
+        try self.order.insert(self.allocator, 0, index);
+        return index;
     }
 
     fn loadRecursive(self: *Graph, reader: anytype, path: []const u8, importer_span: ?source.Span) !?usize {
@@ -147,6 +229,7 @@ pub const Graph = struct {
         }
         try self.module_indices.put(stored_path, index);
         try self.collectExports(index);
+        try self.collectMethods(index);
 
         const declarations = self.modules.items[index].tree.program.?.declarations;
         for (declarations) |declaration| {
@@ -201,12 +284,22 @@ pub const Graph = struct {
                     .kind = .type,
                     .span = value.span,
                 } else null,
-                .enum_decl => |value| if (value.is_exported) .{
-                    .module = module,
-                    .declaration = declaration,
-                    .name = value.name,
-                    .kind = .type,
-                    .span = value.span,
+                .enum_decl => |value| if (value.is_exported) blk: {
+                    for (value.variants) |variant| {
+                        try self.variants.append(self.allocator, .{
+                            .module = module,
+                            .owner_declaration = declaration,
+                            .name = variant.name,
+                            .span = variant.span,
+                        });
+                    }
+                    break :blk .{
+                        .module = module,
+                        .declaration = declaration,
+                        .name = value.name,
+                        .kind = .type,
+                        .span = value.span,
+                    };
                 } else null,
                 .type_alias => |value| if (value.is_exported) .{
                     .module = module,
@@ -219,6 +312,54 @@ pub const Graph = struct {
             };
             if (entry) |value| try self.exports.append(self.allocator, value);
         }
+    }
+
+    // Same-file impl blocks (plain OR interface) on an exported owner type:
+    // methods are reachable cross-module by dispatch on the owner's value,
+    // never by a qualified name, so they never enter `exports` — only
+    // `methods`. Interface-impl methods are ordinary inherent methods too
+    // (`defineMethodSignature`/`self.result.methods` in type_checker.zig
+    // doesn't distinguish), so they're collected here the same way. Also
+    // records `ImplExport` for interface-based impls — needed separately for
+    // interface-bound generic dispatch (`T: Сравниваемое`) across modules.
+    fn collectMethods(self: *Graph, module: usize) !void {
+        const tree = &self.modules.items[module].tree;
+        for (tree.program.?.declarations) |declaration| {
+            const implementation = switch (tree.decl(declaration).*) {
+                .impl => |value| value,
+                else => continue,
+            };
+            if (implementation.target_module != null) continue;
+            const owner_declaration = self.findExportedTypeDeclaration(module, implementation.target_type) orelse continue;
+            for (implementation.methods) |method_declaration| {
+                const function = tree.decl(method_declaration).function;
+                try self.methods.append(self.allocator, .{
+                    .module = module,
+                    .owner_declaration = owner_declaration,
+                    .declaration = method_declaration,
+                    .name = function.name,
+                    .span = function.span,
+                });
+            }
+            if (implementation.interface_name) |interface_name| {
+                if (implementation.interface_module == null) {
+                    try self.impls.append(self.allocator, .{
+                        .module = module,
+                        .owner_declaration = owner_declaration,
+                        .interface_name = interface_name,
+                        .span = implementation.span,
+                    });
+                }
+            }
+        }
+    }
+
+    fn findExportedTypeDeclaration(self: *const Graph, module: usize, name: []const u8) ?ast.DeclId {
+        for (self.exports.items) |exported| {
+            if (exported.module != module or exported.kind != .type) continue;
+            if (std.mem.eql(u8, exported.name, name)) return exported.declaration;
+        }
+        return null;
     }
 
     fn appendDiagnostics(self: *Graph, values: *const diagnostic.DiagnosticList) !void {
@@ -350,6 +491,35 @@ test "module loader orders local imports before their importers" {
     try std.testing.expectEqual(@as(usize, 0), graph.diagnostics.items.items.len);
 }
 
+test "module loader collects methods only for an exported same-file impl owner" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "экспорт функ старт() -> Число\n1\nконец" },
+        .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nтип Скрытая = структура\ny: Число\nконец\nреализация Точка\nфунк увеличить(это: Точка) -> Число\nэто.x + 1\nконец\nконец\nреализация Скрытая\nфунк читать(это: Скрытая) -> Число\nэто.y\nконец\nконец" },
+    } };
+    var graph = Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+    try graph.load(&reader, "проект/точки");
+
+    try std.testing.expectEqual(@as(usize, 1), graph.methods.items.len);
+    try std.testing.expectEqualStrings("увеличить", graph.methods.items[0].name);
+}
+
+test "module loader collects variants only for an exported enum type" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "экспорт функ старт() -> Число\n1\nконец" },
+        .{ .path = "проект/цвета.ps", .bytes = "экспорт тип Цвет = перечисление\nКрасный\nЗелёный\nконец\nтип Скрытый = перечисление\nОдин\nконец" },
+    } };
+    var graph = Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+    try graph.load(&reader, "проект/цвета");
+
+    try std.testing.expectEqual(@as(usize, 2), graph.variants.items.len);
+    try std.testing.expectEqualStrings("Красный", graph.variants.items[0].name);
+    try std.testing.expectEqualStrings("Зелёный", graph.variants.items[1].name);
+}
+
 test "module loader reports import cycles at the importing declaration" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "a.ps", .bytes = "импорт \"b\"" },
@@ -383,4 +553,23 @@ test "module loader normalizes relative import paths" {
     const path = try resolveImportPath(std.testing.allocator, "./детали/../математика", "проект/main.ps");
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("проект/математика.ps", path);
+}
+
+test "module loader appends a prelude module after real modules without shifting their file_ids" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "экспорт функ старт() -> Число\n1\nконец" },
+    } };
+    var graph = Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+    try std.testing.expectEqual(@as(usize, 1), graph.modules.items.len);
+
+    const prelude_index = try graph.appendPreludeModule("экспорт тип Штука = структура\nx: Число\nконец");
+    try std.testing.expectEqual(@as(usize, 1), prelude_index);
+    try std.testing.expectEqual(@as(usize, 2), graph.modules.items.len);
+    try std.testing.expectEqual(@as(source.FileId, 0), graph.modules.items[0].file.id);
+    try std.testing.expectEqual(@as(source.FileId, 1), graph.modules.items[1].file.id);
+    try std.testing.expectEqual(@as(usize, 2), graph.order.items.len);
+    try std.testing.expectEqual(prelude_index, graph.order.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), graph.order.items[1]);
 }

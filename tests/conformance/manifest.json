@@ -1,4 +1,91 @@
 {
   "version": 1,
-  "cases": []
+  "cases": [
+    {
+      "id": "semantic-undefined-name",
+      "tier": "semantic",
+      "profile": "native",
+      "input": "tests/conformance/semantic/undefined_name.ps",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "resolver",
+            "severity": "err",
+            "path": "tests/conformance/semantic/undefined_name.ps",
+            "start_byte": 36,
+            "end_byte": 56,
+            "message": "Resolve Error: неопределённое имя 'неизвестно'"
+          }
+        ]
+      }
+    },
+    {
+      "id": "semantic-wrong-return-type",
+      "tier": "semantic",
+      "profile": "native",
+      "input": "tests/conformance/semantic/wrong_return_type.ps",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "type_checker",
+            "severity": "err",
+            "path": "tests/conformance/semantic/wrong_return_type.ps",
+            "start_byte": 0,
+            "end_byte": 59,
+            "message": "Type Error: функция должна возвращать объявленный тип"
+          }
+        ],
+        "deviation": {
+          "id": "DEV-001",
+          "rationale": "Odin reports 'Type Error: функция должна возвращать <ожидаемый>, но последнее выражение имеет тип <фактический>' (names both types); Zig's checkFunction (zig/core/type_checker.zig) reports only the generic message above, with no type-name formatter available in that file yet (runner.zig's formatTypeName is not reachable from type_checker.zig's own diagnostic-reporting call site). Real, tracked quality gap (worse error message, not a wrong-vs-right correctness bug — both correctly reject the program) — NOT fixed in T053 (out of scope: 'record baselines', not 'improve diagnostics'). Follow-up: add a type-name formatter usable from type_checker.zig and include actual/expected types in this message, matching Odin's."
+        }
+      }
+    },
+    {
+      "id": "runtime-fib-recursive",
+      "tier": "runtime",
+      "profile": "native",
+      "input": "tests/conformance/benchmarks/fib_recursive.ps",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "832040",
+        "result": "832040"
+      }
+    },
+    {
+      "id": "runtime-loop-sum",
+      "tier": "runtime",
+      "profile": "native",
+      "input": "tests/conformance/benchmarks/loop_sum.ps",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "12499997500000",
+        "result": "12499997500000",
+        "deviation": {
+          "id": "DEV-002",
+          "rationale": "Odin's CLI renders this same numeric result (mathematically identical, 12499997500000) as '1.24999975e+13' — Odin's fmt.tprintf(\"%v\", f64) switches to scientific notation above ~15 significant digits (same underlying quirk documented for строки.из_числа elsewhere in this project). Zig's renderValue (zig/core/runner.zig) uses Zig's own '{d}' formatter, which does not have this quirk. Expected value above is Zig's (and the mathematically canonical) form — Odin is being retired (specs/010-zig-migration T058/T059), not worth replicating its formatting quirk in Zig."
+        }
+      }
+    },
+    {
+      "id": "runtime-string-concat",
+      "tier": "runtime",
+      "profile": "native",
+      "input": "tests/conformance/benchmarks/string_concat.ps",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "20000",
+        "result": "20000"
+      }
+    }
+  ]
 }

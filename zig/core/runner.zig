@@ -338,8 +338,13 @@ pub fn runSourceWithVerboseForTarget(
     var machine = vm.Vm.initForTarget(allocator, &compiled.program, target_profile);
     defer machine.deinit();
     switch (try machine.run(start, &.{})) {
-        .success => |runtime_value| result.execution = .{ .success = try renderValue(result.arena.allocator(), runtime_value) },
-        .runtime_error => |message| result.execution = .{ .runtime_error = try result.arena.allocator().dupe(u8, message) },
+        .success => |runtime_value| {
+            const rendered = try renderValue(result.arena.allocator(), runtime_value);
+            result.execution = .{ .success = try std.fmt.allocPrint(result.arena.allocator(), "{s}{s}", .{ machine.output.items, rendered }) };
+        },
+        .runtime_error => |message| {
+            result.execution = .{ .runtime_error = try std.fmt.allocPrint(result.arena.allocator(), "{s}{s}", .{ machine.output.items, message }) };
+        },
     }
     return result;
 }
@@ -359,15 +364,12 @@ fn reportUnsupportedImports(allocator: std.mem.Allocator, input: []const u8, ana
     return analysis.hasErrors();
 }
 
+// Thin re-export — the real implementation lives in `vm.zig`
+// (`renderRuntimeValue`) since `ввод_вывод.печать`/`.строка` need the
+// SAME value-to-text conversion at RUNTIME, not just here at the final
+// return-value line.
 pub fn renderValue(allocator: std.mem.Allocator, runtime_value: value.Value) ![]const u8 {
-    return switch (runtime_value) {
-        .void => allocator.dupe(u8, ""),
-        .number => |number| std.fmt.allocPrint(allocator, "{d}", .{number}),
-        .boolean => |boolean| std.fmt.allocPrint(allocator, "{}", .{boolean}),
-        .string => |string| allocator.dupe(u8, string),
-        .heap_string => |string| allocator.dupe(u8, string.bytes),
-        else => allocator.dupe(u8, "<составное значение>"),
-    };
+    return vm.renderRuntimeValue(allocator, runtime_value);
 }
 
 test "runner executes an exported start function" {

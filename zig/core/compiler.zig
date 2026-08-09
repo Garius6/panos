@@ -344,7 +344,11 @@ const FunctionCompiler = struct {
                 break :blk false;
             },
             .return_stmt => |return_statement| blk: {
-                try self.compileExpression(return_statement.value);
+                const return_value = return_statement.value orelse {
+                    try self.function.emit(self.compiler.result.allocator, .{ .return_void = {} });
+                    break :blk false;
+                };
+                try self.compileExpression(return_value);
                 if (self.function.returns_value) {
                     try self.function.emit(self.compiler.result.allocator, .{ .return_value = {} });
                 } else {
@@ -518,10 +522,14 @@ const FunctionCompiler = struct {
         const arguments = ordered_arguments orelse call.arguments;
         if (try self.compileErrorConstructor(call)) return;
         if (try self.compilePanicBuiltin(call)) return;
+        if (try self.compileNumericCastBuiltin(call)) return;
+        if (try self.compileToDisplayStringBuiltin(call)) return;
         if (try self.compileFilesystemBuiltin(call)) return;
         if (try self.compileOsBuiltin(call)) return;
         if (try self.compileTimeBuiltin(call)) return;
         if (try self.compileDomBuiltin(call)) return;
+        if (try self.compileIoBuiltin(call)) return;
+        if (try self.compileStringBuiltin(call)) return;
         if (try self.compileCompressBuiltin(call)) return;
         if (try self.compileSyntaxBuiltin(call)) return;
         if (try self.compileNetBuiltin(call)) return;
@@ -601,6 +609,30 @@ const FunctionCompiler = struct {
         return true;
     }
 
+    // `встроку(x)` — real gap found auditing panosiki: string
+    // interpolation (`"\(expr)"`) desugars to this exact call at PARSE
+    // time (`parser.zig`), and `резолвер.zig` has always registered
+    // "встроку" as a resolvable bare builtin name, but NOTHING ever gave
+    // it actual codegen — so EVERY interpolation containing a function
+    // call (`"\(слог.из_числа(x))"`, `"\(f())"`, ...) failed with
+    // "вызвано значение, не являющееся функцией". Reuses `vm.zig`'s
+    // `renderRuntimeValue` (built for `ввод_вывод.печать`/`.строка`) —
+    // the exact "value of any type → display string" conversion the
+    // docs already promise for `\( )` interpolation.
+    fn compileToDisplayStringBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path != null or !std.mem.eql(u8, entry.name, "встроку")) return false;
+        if (call.arguments.len != 1) {
+            try self.compiler.report(call.span, "Compiler Error: встроку(x) ожидает 1 аргумент", .{});
+            try self.emitVoid();
+            return true;
+        }
+        try self.compileExpression(call.arguments[0]);
+        try self.function.emit(self.compiler.result.allocator, .{ .to_display_string = {} });
+        return true;
+    }
+
     fn compilePanicBuiltin(self: *FunctionCompiler, call: anytype) !bool {
         const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
         const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
@@ -612,6 +644,33 @@ const FunctionCompiler = struct {
         }
         try self.compileExpression(call.arguments[0]);
         try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
+        return true;
+    }
+
+    // `Целое(x)`/`Число(x)` — real gap found auditing panosiki's `std/
+    // математика.ps`: registered as bare builtin NAMES (`resolver.zig`)
+    // for years, but never given actual codegen here, same failure mode
+    // as `встроку`/string interpolation ("вызвано значение, не являющееся
+    // функцией") — `docs/src/language/basic-types.md` §"Целое и Число"
+    // documents this as core, load-bearing syntax. Both directions share
+    // ONE f64 runtime representation (`Целое`/`Число` are the same
+    // `Value.number`, see `ARCHITECTURE.md`'s "Целое shares f64
+    // representation" note) — `Число(x)` is a pure no-op (nothing to
+    // truncate, compiles the argument and emits nothing extra); `Целое(x)`
+    // truncates toward zero via the SAME `int_cast` opcode the `/`
+    // int-division path already relies on conceptually (`vm.zig`'s
+    // `numericBinary(.int_divide)` already does `std.math.trunc`) — a
+    // no-op when the value already happens to be an integer, exactly
+    // matching the docs' "no-op при вызове на уже своём типе" contract.
+    fn compileNumericCastBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path != null) return false;
+        if (call.arguments.len != 1 or !(std.mem.eql(u8, entry.name, "Целое") or std.mem.eql(u8, entry.name, "Число"))) return false;
+        try self.compileExpression(call.arguments[0]);
+        if (std.mem.eql(u8, entry.name, "Целое")) {
+            try self.function.emit(self.compiler.result.allocator, .{ .int_cast = {} });
+        }
         return true;
     }
 
@@ -772,6 +831,66 @@ const FunctionCompiler = struct {
         try self.emitConstant(.{ .string = message });
         try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
         return true;
+    }
+
+    fn compileIoBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "ввод_вывод")) return false;
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "печать")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .io_print = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "строка")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .io_println = {} });
+            return true;
+        }
+        return false;
+    }
+
+    fn compileStringBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "строки")) return false;
+        const Op = struct { name: []const u8, argc: usize, instr: bytecode.Instruction };
+        const ops = [_]Op{
+            .{ .name = "байт", .argc = 2, .instr = .{ .str_byte = {} } },
+            .{ .name = "длина_байт", .argc = 1, .instr = .{ .str_len_bytes = {} } },
+            .{ .name = "срез_байт", .argc = 3, .instr = .{ .str_slice_bytes = {} } },
+            .{ .name = "из_байтов", .argc = 1, .instr = .{ .str_from_bytes = {} } },
+            .{ .name = "в_число", .argc = 1, .instr = .{ .str_to_number = {} } },
+            .{ .name = "из_числа", .argc = 1, .instr = .{ .str_number_to_str = {} } },
+            .{ .name = "из_целого", .argc = 1, .instr = .{ .str_int_to_str = {} } },
+            .{ .name = "верхний_регистр", .argc = 1, .instr = .{ .str_upper = {} } },
+            .{ .name = "заканчивается_на", .argc = 2, .instr = .{ .str_ends_with = {} } },
+            .{ .name = "начинается_с", .argc = 2, .instr = .{ .str_starts_with = {} } },
+            .{ .name = "содержит", .argc = 2, .instr = .{ .str_contains = {} } },
+            .{ .name = "найти", .argc = 2, .instr = .{ .str_find = {} } },
+            .{ .name = "заменить", .argc = 3, .instr = .{ .str_replace = {} } },
+            .{ .name = "обрезать", .argc = 1, .instr = .{ .str_trim = {} } },
+            .{ .name = "разбить", .argc = 2, .instr = .{ .str_split = {} } },
+            .{ .name = "соединить", .argc = 2, .instr = .{ .str_join = {} } },
+            .{ .name = "срез", .argc = 3, .instr = .{ .str_slice = {} } },
+            .{ .name = "цифра_или_буква", .argc = 1, .instr = .{ .str_is_digit_or_letter = {} } },
+        };
+        for (ops) |op| {
+            if (call.arguments.len == op.argc and std.mem.eql(u8, property.property, op.name)) {
+                for (call.arguments) |argument| try self.compileExpression(argument);
+                try self.function.emit(self.compiler.result.allocator, op.instr);
+                return true;
+            }
+        }
+        return false;
     }
 
     fn compileCompressBuiltin(self: *FunctionCompiler, call: anytype) !bool {

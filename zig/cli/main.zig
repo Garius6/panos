@@ -286,6 +286,27 @@ pub fn main(init: std.process.Init) !void {
 
     var graph = panos_core.module_loader.Graph.init(init.gpa);
     defer graph.deinit();
+    var global_search_roots: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (global_search_roots.items) |root| init.gpa.free(root);
+        global_search_roots.deinit(init.gpa);
+    }
+    // `$PANOS_STDLIB`, then `std/` next to this binary — tiers 3/4 of the
+    // documented module search (`docs/src/getting-started/installation.md`
+    // §"Поиск модулей"), tier 2 (`модули/` next to the importer) is
+    // per-importer and lives entirely in `module_loader.zig` itself.
+    if (init.environ_map.get("PANOS_STDLIB")) |stdlib_dir| {
+        try global_search_roots.append(init.gpa, try init.gpa.dupe(u8, stdlib_dir));
+    }
+    var exe_dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (std.process.executableDirPath(init.io, &exe_dir_buffer)) |len| {
+        try global_search_roots.append(init.gpa, try std.fmt.allocPrint(init.gpa, "{s}/std", .{exe_dir_buffer[0..len]}));
+    } else |_| {
+        // No real executable path (e.g. some sandboxed/embedded launch
+        // context) — tier 4 is simply unavailable then, not a fatal error;
+        // tiers 1-3 still work exactly as documented.
+    }
+    graph.global_search_roots = global_search_roots.items;
     try graph.load(&FileReader{ .io = init.io }, file_path);
     if (graph.diagnostics.items.items.len != 0) {
         try writeModuleDiagnostics(stderr, &graph);
@@ -328,7 +349,11 @@ pub fn main(init: std.process.Init) !void {
             const output = try panos_core.runner.renderValue(init.gpa, runtime_value);
             defer init.gpa.free(output);
             if (verbose) try stdout.print("EXECUTION\n--------------------------\n", .{});
-            try stdout.print("{s}\n", .{output});
+            // `machine.output` — accumulated `ввод_вывод.печать`/`.строка`
+            // calls made DURING execution — printed first, same order a
+            // real stdout write during the program's own run would have
+            // appeared in.
+            try stdout.print("{s}{s}\n", .{ machine.output.items, output });
             try stdout.flush();
             // `stderr` is buffered (`stderr_buffer` above) and otherwise
             // only ever flushed on the error-exit paths — a WARNING-only
@@ -344,6 +369,10 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
         },
         .runtime_error => |message| {
+            if (machine.output.items.len != 0) {
+                try stdout.print("{s}", .{machine.output.items});
+                try stdout.flush();
+            }
             try stderr.print("{s}\n", .{message});
             try stderr.flush();
             std.process.exit(1);

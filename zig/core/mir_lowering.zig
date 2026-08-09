@@ -221,7 +221,11 @@ fn lowerStmt(ctx: *LoweringContext, statement: ast.StmtId) anyerror!FlowResult {
             return .continues;
         },
         .return_stmt => |return_statement| {
-            const outcome = try lowerExpr(ctx, return_statement.value);
+            const return_value = return_statement.value orelse {
+                ctx.builder.terminate(.{ .return_value = .{ .value = null } });
+                return .terminates;
+            };
+            const outcome = try lowerExpr(ctx, return_value);
             if (outcome.flow == .terminates) return .terminates;
             ctx.builder.terminate(.{ .return_value = .{ .value = outcome.value } });
             return .terminates;
@@ -546,6 +550,7 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
                 const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
                 return emitCallValue(ctx, function_ref, args, result_type);
             }
+            if (try lowerNumericCastCall(ctx, symbol, call)) |outcome| return outcome;
         }
     }
 
@@ -558,6 +563,28 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
     if (callee_outcome.flow == .terminates) return terminated;
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     return emitCallValue(ctx, callee_outcome.value, args, result_type);
+}
+
+// `Целое(x)`/`Число(x)` — bare (non-module) builtin cast calls, same real
+// gap as `zig/core/compiler.zig`'s `compileNumericCastBuiltin` (see its
+// doc comment) — `mir_lowering.zig` needed the SAME fix independently
+// since it never routes through `compiler.zig` at all. `Число(x)` is a
+// pure no-op (identity — both share one f64 MIR/WASM representation),
+// `Целое(x)` truncates toward zero via `UnOp.int_trunc`.
+fn lowerNumericCastCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype) anyerror!?ExprOutcome {
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .builtin or entry.module_path != null) return null;
+    const is_integer = std.mem.eql(u8, entry.name, "Целое");
+    if (!is_integer and !std.mem.eql(u8, entry.name, "Число")) return null;
+    if (call.arguments.len != 1) unsupported("приведение типа с числом аргументов != 1");
+
+    const argument_outcome = try lowerExpr(ctx, call.arguments[0]);
+    if (argument_outcome.flow == .terminates) return terminated;
+    if (!is_integer) return continuesWith(argument_outcome.value);
+
+    const dst = try ctx.builder.newValue(ctx.checked.types.builtins.integer);
+    try ctx.builder.emit(.{ .unary = .{ .dst = dst, .op = .int_trunc, .src = argument_outcome.value } });
+    return continuesWith(dst);
 }
 
 // `время.сейчас_мс`/`.монотонно_мс` — the only builtin-module calls this

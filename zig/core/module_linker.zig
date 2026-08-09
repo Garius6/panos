@@ -36,7 +36,43 @@ pub const ImportScope = struct {
         }
         for (graph.imports.items) |import| {
             if (import.importer != importer) continue;
-            const target = import.target orelse continue;
+            const target = import.target orelse {
+                // Aliased native import (`импорт "ввод_вывод" как ио`) —
+                // `target == null` here doesn't mean "failed to load"
+                // (the module_loader.zig diagnostic already handles that
+                // case), it means "resolved ambiently, no file at all".
+                // Real gap found auditing panosiki's `std/слог.ps`: the
+                // BARE unaliased form (`импорт время`) already worked
+                // (resolver.zig's `installBuiltins` makes it globally
+                // ambient regardless of any `импорт`), but the alias
+                // itself was never bound to anything.
+                const native_name = import.native_module orelse continue;
+                // Bare, unaliased native import (`импорт время`) — the
+                // real name is ALREADY globally ambient
+                // (`resolver.zig`'s `installBuiltins`), predeclaring a
+                // SECOND `время` module symbol here would just collide
+                // with it (`Resolve Error: символ 'время' уже объявлен`).
+                // Only a GENUINE rename (`как ...`) needs anything built
+                // here at all.
+                if (std.mem.eql(u8, import.alias, native_name)) continue;
+                const export_names = resolver.nativeModuleExports(native_name) orelse continue;
+                var exports: std.ArrayList(resolver.ImportedExport) = .empty;
+                defer exports.deinit(allocator);
+                for (export_names) |export_name| {
+                    try exports.append(allocator, .{
+                        .name = export_name,
+                        .kind = .builtin,
+                        .span = import.span,
+                        .builtin_module_path = native_name,
+                    });
+                }
+                try modules.append(allocator, .{
+                    .alias = import.alias,
+                    .span = import.span,
+                    .exports = try result.arena.allocator().dupe(resolver.ImportedExport, exports.items),
+                });
+                continue;
+            };
             const exports = try buildExportsForTarget(allocator, &result.arena, graph, target);
             try modules.append(allocator, .{
                 .alias = import.alias,

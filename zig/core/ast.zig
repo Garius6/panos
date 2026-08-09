@@ -258,7 +258,13 @@ pub fn exprSpan(expression: Expr) source.Span {
 pub const Stmt = union(enum) {
     return_stmt: struct {
         span: source.Span,
-        value: ExprId,
+        // `null` — bare `возврат` (void return, no expression at all,
+        // e.g. an early exit inside a `Пусто`-returning function) — real
+        // gap found auditing panosiki's `std/слог.ps`: the parser used to
+        // REQUIRE an expression unconditionally, so `если x тогда возврат
+        // конец` (a completely ordinary early-return-with-no-value
+        // pattern) was a syntax error.
+        value: ?ExprId,
     },
     let: struct {
         span: source.Span,

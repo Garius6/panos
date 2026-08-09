@@ -405,9 +405,29 @@ const Checker = struct {
                 var fields: std.ArrayList(NominalField) = .empty;
                 defer fields.deinit(self.result.allocator);
                 for (source_fields) |field| {
+                    // A field type may reference a nominal type from a
+                    // module the CURRENT file never imports directly (an
+                    // imported struct's field pointing at a THIRD
+                    // module's type, e.g. `слог.Логгер` reached via
+                    // `Менеджер.логгер` when only `Менеджер`'s owning
+                    // module is imported here) — `imports.nominals` only
+                    // ever lists the local file's OWN direct imports, so
+                    // `copyImportedType` correctly can't resolve it.
+                    // Falls back to `poison` (assignable to/from
+                    // anything, see `assignable`'s own top check) rather
+                    // than letting `error.UnsupportedImportedType`
+                    // propagate uncaught — a real gap found auditing
+                    // panosiki (`тест.ps` importing `tempfiles.ps`'s
+                    // `Менеджер`, itself importing `слог.Логгер`): the
+                    // WHOLE compilation crashed with a raw Zig stack
+                    // trace instead of failing (or degrading) cleanly.
+                    const field_type = self.copyImportedType(imported.store, field.typ, imports.nominals, owner_remap) catch |err| switch (err) {
+                        error.UnsupportedImportedType => try self.result.types.poison(),
+                        else => return err,
+                    };
                     try fields.append(self.result.allocator, .{
                         .name = try self.result.arena.allocator().dupe(u8, field.name),
-                        .typ = try self.copyImportedType(imported.store, field.typ, imports.nominals, owner_remap),
+                        .typ = field_type,
                     });
                 }
                 const copied_fields = try self.result.arena.allocator().dupe(NominalField, fields.items);
@@ -424,7 +444,13 @@ const Checker = struct {
                     const variant_symbol = self.resolution.findEnumVariant(imported.local_symbol, source_variant.name) orelse continue;
                     var fields: std.ArrayList(types.TypeId) = .empty;
                     defer fields.deinit(self.result.allocator);
-                    for (source_variant.fields) |field| try fields.append(self.result.allocator, try self.copyImportedType(imported.store, field, imports.nominals, owner_remap));
+                    for (source_variant.fields) |field| {
+                        const field_type = self.copyImportedType(imported.store, field, imports.nominals, owner_remap) catch |err| switch (err) {
+                            error.UnsupportedImportedType => try self.result.types.poison(),
+                            else => return err,
+                        };
+                        try fields.append(self.result.allocator, field_type);
+                    }
                     try variants.append(self.result.allocator, .{
                         .symbol = variant_symbol,
                         .name = try self.result.arena.allocator().dupe(u8, source_variant.name),
@@ -1142,19 +1168,57 @@ const Checker = struct {
                 break :blk self.result.types.builtins.void;
             },
             .return_stmt => |return_statement| blk: {
-                const value_type = try self.inferExpected(return_statement.value, expected_return);
+                const return_value = return_statement.value orelse {
+                    // Bare `возврат` — a void return, only valid where the
+                    // function's declared return type actually IS `Пусто`
+                    // (matching an ordinary `Пусто`-returning function
+                    // that just falls off the end of its body).
+                    if (!self.isType(expected_return, self.result.types.builtins.void)) {
+                        try self.report(return_statement.span, "Type Error: 'возврат' без значения допустим только в функции, возвращающей Пусто", .{});
+                    }
+                    break :blk self.result.types.builtins.never;
+                };
+                const value_type = try self.inferExpected(return_value, expected_return);
                 if (!self.assignable(value_type, expected_return)) {
                     try self.report(return_statement.span, "Type Error: возвращаемое значение не совпадает с типом функции", .{});
                 } else {
-                    try self.registerInterfaceCast(return_statement.value, value_type, expected_return);
+                    try self.registerInterfaceCast(return_value, value_type, expected_return);
                 }
-                break :blk expected_return;
+                // `Никогда`, NOT `expected_return` — a `возврат` diverges
+                // the ENCLOSING FUNCTION, it doesn't produce a value at
+                // this point at all. Real gap found auditing panosiki's
+                // `std/математика.ps`: `если n == 0 тогда возврат 1 конец`
+                // (no `иначе`) used as a plain statement failed with
+                // "ветви 'если' возвращают разные типы" — `inferIfExpected`
+                // already has `isNever(then_type)`-based exemption logic
+                // for EXACTLY this shape, but it could never fire because
+                // this case returned `expected_return` (e.g. `Число`)
+                // instead of `Никогда`, so the then-branch's inferred type
+                // never matched the implicit empty else-branch's `Пусто`.
+                break :blk self.result.types.builtins.never;
             },
             .expr => |expression| if (expected_value) |expected| blk: {
                 const actual = try self.inferExpected(expression.value, expected);
                 if (self.assignable(actual, expected)) try self.registerInterfaceCast(expression.value, actual, expected);
                 break :blk actual;
-            } else self.infer(expression.value),
+            } else if (self.tree.expr(expression.value).* == .if_expr)
+                // `если` used as a BARE STATEMENT (not the block's trailing
+                // value) never needs its branches to agree on a type — its
+                // result is unconditionally discarded, mirroring
+                // `compiler.zig`'s OWN `compileStatement` comment on this
+                // exact shape ("Expr_Stmt — value is ALWAYS discarded...
+                // lower with want_value=false"). The type-checker never
+                // got the matching exemption: `если снимок.содержит(x)
+                // тогда x.добавить(y) конец` (no `иначе`, `.добавить`
+                // returns `Пусто`) was fine, but `если ... тогда
+                // фс.удалить_директорию(x) конец` (no `иначе`,
+                // `удалить_директорию` returns `Результат(...)`) failed
+                // "ветви 'если' возвращают разные типы" against the
+                // implicit empty `Пусто` else-branch — a real gap found
+                // auditing panosiki's `std/tempfiles.ps`.
+                try self.inferIfAsStatement(self.tree.expr(expression.value).if_expr)
+            else
+                self.infer(expression.value),
             .for_in => |loop| try self.inferForIn(statement, loop),
             .for_range => |range| try self.inferForRange(statement, range),
             .continue_stmt => |span| blk: {
@@ -1404,6 +1468,23 @@ const Checker = struct {
             return expected_type;
         }
         return joined orelse then_type;
+    }
+
+    // `если` as a bare statement — type-checks the condition and BOTH
+    // branch bodies independently (each with `expected_value = null`, so
+    // a NESTED trailing если/выбор inside either branch still gets its
+    // own correct treatment), but never requires them to agree with each
+    // other or produce any usable value — see the call site's comment in
+    // `inferStatement` for why (`compiler.zig`'s existing want_value=false
+    // codegen for this exact shape has no such requirement either).
+    fn inferIfAsStatement(self: *Checker, conditional: anytype) anyerror!types.TypeId {
+        const condition = try self.infer(conditional.condition);
+        if (!self.assignable(condition, self.result.types.builtins.boolean)) {
+            try self.report(conditional.span, "Type Error: условие 'если' должно иметь тип Булево", .{});
+        }
+        _ = try self.inferBlockExpected(conditional.then_branch, null);
+        _ = try self.inferBlockExpected(conditional.else_branch, null);
+        return self.result.types.builtins.void;
     }
 
     fn inferMatch(self: *Checker, match: anytype) anyerror!types.TypeId {
@@ -1814,7 +1895,7 @@ const Checker = struct {
     fn inferProperty(self: *Checker, expression: ast.ExprId, property: anytype) anyerror!types.TypeId {
         if (self.resolution.expr_symbols.get(expression)) |symbol| {
             if (self.resolution.symbols.get(symbol)) |entry| {
-                if (entry.kind == .enum_variant) return self.result.types.nominal(entry.owner_type, &.{});
+                if (entry.kind == .enum_variant) return self.nominalType(entry.owner_type, &.{});
                 if (entry.kind == .type) return self.nominalType(symbol, &.{});
                 if (self.result.unsupported_imports.contains(symbol)) {
                     try self.report(property.span, "Type Error: импортированный экспорт '{s}' использует пока неподдерживаемый тип", .{entry.name});
@@ -1884,8 +1965,19 @@ const Checker = struct {
         const previous_return = self.current_return;
         self.current_return = return_type;
         defer self.current_return = previous_return;
-        const body_type = try self.inferBlockExpected(lambda.body, return_type);
-        if (!self.assignable(body_type, return_type)) try self.report(lambda.span, "Type Error: тело лямбды не совпадает с типом возврата", .{});
+        // Mirrors `checkFunction`'s OWN void-return exemption exactly — a
+        // real gap found auditing panosiki's `std/слог.ps`: an ordinary
+        // `функ ... -> Пусто ... конец` whose last statement is a non-void
+        // expression (its value simply discarded) has ALWAYS been allowed
+        // (`checkFunction` skips the assignability check entirely when
+        // the declared return type is `Пусто`), but a LAMBDA with the
+        // exact same shape (`функ(x) -> Пусто ... конец`) unconditionally
+        // required an exact type match, rejecting the identical pattern.
+        const expected_body = if (self.isType(return_type, self.result.types.builtins.void)) null else return_type;
+        const body_type = try self.inferBlockExpected(lambda.body, expected_body);
+        if (!self.isType(return_type, self.result.types.builtins.void) and !self.assignable(body_type, return_type)) {
+            try self.report(lambda.span, "Type Error: тело лямбды не совпадает с типом возврата", .{});
+        }
         return self.result.types.function(parameter_types.items, return_type);
     }
 
@@ -2100,6 +2192,29 @@ const Checker = struct {
                     }
                 }
                 return self.result.types.builtins.error_value;
+            }
+            if (self.isBuiltin(symbol, "Целое") or self.isBuiltin(symbol, "Число")) {
+                const is_integer = self.isBuiltin(symbol, "Целое");
+                const target_type = if (is_integer) self.result.types.builtins.integer else self.result.types.builtins.number;
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: {s}(x) ожидает 1 аргумент", .{if (is_integer) "Целое" else "Число"});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return target_type;
+                }
+                const argument_type = try self.infer(call.arguments[0]);
+                if (!self.isType(argument_type, self.result.types.builtins.integer) and !self.isType(argument_type, self.result.types.builtins.number)) {
+                    try self.report(call.span, "Type Error: {s}(x) ожидает Число или Целое", .{if (is_integer) "Целое" else "Число"});
+                }
+                return target_type;
+            }
+            if (self.isBuiltin(symbol, "встроку")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: встроку(x) ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                _ = try self.infer(call.arguments[0]);
+                return self.result.types.builtins.string;
             }
             if (self.isPanicBuiltin(symbol)) {
                 if (call.arguments.len != 1) {
@@ -2363,6 +2478,227 @@ const Checker = struct {
                     }
                 }
                 return self.result.types.builtins.void;
+            }
+            if (self.isBuiltinModule(symbol, "ввод_вывод", "печать") or self.isBuiltinModule(symbol, "ввод_вывод", "строка")) {
+                const name = if (self.isBuiltinModule(symbol, "ввод_вывод", "печать")) "печать" else "строка";
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: ввод_вывод.{s}() ожидает 1 аргумент", .{name});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                // "любой тип" — no assignability check, unlike every other
+                // builtin here: `.печать`/`.строка` accept literally
+                // anything (renders via `vm.zig`'s `renderRuntimeValue`,
+                // a structural dump for compound values — Печатаемое-
+                // interface dispatch, mentioned in the docs as the
+                // preferred path when implemented, is NOT wired up yet,
+                // a separate follow-up).
+                _ = try self.infer(call.arguments[0]);
+                return self.result.types.builtins.void;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "байт")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: строки.байт() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.integer;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.байт() ожидает строку первым аргументом", .{});
+                }
+                if (!self.isNumeric(try self.infer(call.arguments[1]))) {
+                    try self.report(call.span, "Type Error: строки.байт() ожидает индекс-число вторым аргументом", .{});
+                }
+                return self.result.types.builtins.integer;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "длина_байт")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.длина_байт() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.integer;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.длина_байт() ожидает строку", .{});
+                }
+                return self.result.types.builtins.integer;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "срез_байт")) {
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: строки.срез_байт() ожидает 3 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.срез_байт() ожидает строку первым аргументом", .{});
+                }
+                for (call.arguments[1..3]) |argument| {
+                    if (!self.isNumeric(try self.infer(argument))) {
+                        try self.report(call.span, "Type Error: строки.срез_байт() ожидает границы-числа", .{});
+                    }
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "из_байтов")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.из_байтов() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                const array_type = try self.result.types.array(self.result.types.builtins.integer);
+                if (!self.assignable(try self.inferExpected(call.arguments[0], array_type), array_type)) {
+                    try self.report(call.span, "Type Error: строки.из_байтов() ожидает Массив(Целое)", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "в_число")) {
+                const result_type = self.resultOfString(self.result.types.builtins.number) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.в_число() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.в_число() ожидает строку", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "из_числа")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.из_числа() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.number), self.result.types.builtins.number)) {
+                    try self.report(call.span, "Type Error: строки.из_числа() ожидает Число", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "из_целого")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.из_целого() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.integer), self.result.types.builtins.integer)) {
+                    try self.report(call.span, "Type Error: строки.из_целого() ожидает Целое", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "верхний_регистр") or self.isBuiltinModule(symbol, "строки", "обрезать")) {
+                const name = if (self.isBuiltinModule(symbol, "строки", "верхний_регистр")) "верхний_регистр" else "обрезать";
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.{s}() ожидает 1 аргумент", .{name});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.{s}() ожидает строку", .{name});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "цифра_или_буква")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.цифра_или_буква() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.boolean;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.цифра_или_буква() ожидает строку", .{});
+                }
+                return self.result.types.builtins.boolean;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "заканчивается_на") or
+                self.isBuiltinModule(symbol, "строки", "начинается_с") or
+                self.isBuiltinModule(symbol, "строки", "содержит"))
+            {
+                const name = if (self.isBuiltinModule(symbol, "строки", "заканчивается_на"))
+                    "заканчивается_на"
+                else if (self.isBuiltinModule(symbol, "строки", "начинается_с"))
+                    "начинается_с"
+                else
+                    "содержит";
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: строки.{s}() ожидает 2 аргумента", .{name});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.boolean;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: строки.{s}() ожидает строки", .{name});
+                    }
+                }
+                return self.result.types.builtins.boolean;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "найти")) {
+                const result_type = self.optionOf(self.result.types.builtins.integer) orelse return self.result.types.poison();
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: строки.найти() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: строки.найти() ожидает строки", .{});
+                    }
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "заменить")) {
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: строки.заменить() ожидает 3 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: строки.заменить() ожидает строки", .{});
+                    }
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "срез")) {
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: строки.срез() ожидает 3 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.срез() ожидает строку первым аргументом", .{});
+                }
+                for (call.arguments[1..3]) |argument| {
+                    if (!self.isNumeric(try self.infer(argument))) {
+                        try self.report(call.span, "Type Error: строки.срез() ожидает границы-числа", .{});
+                    }
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "разбить")) {
+                const array_type = try self.result.types.array(self.result.types.builtins.string);
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: строки.разбить() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return array_type;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: строки.разбить() ожидает строки", .{});
+                    }
+                }
+                return array_type;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "соединить")) {
+                const array_type = try self.result.types.array(self.result.types.builtins.string);
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: строки.соединить() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], array_type), array_type)) {
+                    try self.report(call.span, "Type Error: строки.соединить() ожидает Массив(Строка) первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.соединить() ожидает разделитель типа Строка", .{});
+                }
+                return self.result.types.builtins.string;
             }
             if (self.isBuiltinModule(symbol, "сжатие", "разжать_gzip")) {
                 const result_type = self.resultOfString(self.result.types.builtins.string) orelse return self.result.types.poison();
@@ -2902,6 +3238,27 @@ const Checker = struct {
         if (actual == self.result.types.builtins.never) return true;
         if (actual_type.* == .process and self.isPoison(actual_type.process)) return true;
         if (self.result.types.eql(actual, expected)) return true;
+        // An EMPTY array/map literal (`массив()`/`соответствие()`) infers
+        // as `Массив(poison)`/`Соответствие(poison, poison)` (`inferBinary`'s
+        // `.array`/`.map` cases have no elements to infer a real type
+        // from) — `eql` above already rejects that against any concretely
+        // -typed array/map (poison isn't structurally equal to anything),
+        // so a completely ordinary `это.поле = массив()` (reset a typed
+        // field/variable to empty) failed "присваивание несовместимых
+        // типов", a real gap found auditing panosiki's `std/tempfiles.ps`.
+        // Recursing through `assignable` itself (not `eql`) lets the
+        // top-of-function poison short-circuit fire for the ELEMENT type.
+        switch (actual_type.*) {
+            .array => |actual_element| switch (expected_type.*) {
+                .array => |expected_element| return self.assignable(actual_element, expected_element),
+                else => {},
+            },
+            .map => |actual_map| switch (expected_type.*) {
+                .map => |expected_map| return self.assignable(actual_map.key, expected_map.key) and self.assignable(actual_map.value, expected_map.value),
+                else => {},
+            },
+            else => {},
+        }
         const actual_nominal = switch (actual_type.*) {
             .nominal => |value| value,
             else => return false,
@@ -3456,7 +3813,7 @@ const Checker = struct {
             const expected = try self.substituteGeneric(field, &substitutions);
             if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент конструктора варианта не совпадает с типом поля", .{});
         }
-        return self.result.types.nominal(entry.owner_type, arguments.items);
+        return self.nominalType(entry.owner_type, arguments.items);
     }
 
     fn inferEnumVariantCallExpected(self: *Checker, call: anytype, variant: EnumVariant, expected: types.TypeId) !types.TypeId {
@@ -3631,11 +3988,25 @@ pub fn checkWithImportContextForTarget(
     var owner_parameters_by_symbol = std.AutoHashMap(symbols.SymbolId, []const GenericParameter).init(allocator);
     defer owner_parameters_by_symbol.deinit();
     try checker.typeAliasPass();
-    try checker.nominalPass();
     try checker.preludePass();
     try checker.enumPass();
     try checker.interfacePass();
+    // `nominalPass` (struct field types, INCLUDING qualified ones like
+    // `слог.Логгер`) must run AFTER `importIdentityPass`, for the exact
+    // same reason `importIdentityPass`'s own doc comment already
+    // documents for `signaturePass`: `nominalType` reads
+    // `imported_nominal_identities`, and a qualified annotation resolved
+    // before that map is populated silently gets identity=0 instead of
+    // the real cross-module identity. Real gap found auditing panosiki's
+    // `std/слог.ps`: a struct field (`логгер: слог.Логгер`, resolved by
+    // the OLD earlier `nominalPass`) and a method parameter of the
+    // IDENTICAL declared type (resolved later, by `signaturePass`, AFTER
+    // `importIdentityPass` already ran) ended up with two DIFFERENT
+    // identities for "the same" type — assigning one to the other then
+    // failed "присваивание несовместимых типов" even though both sides
+    // were declared with the exact same annotation.
     try checker.importIdentityPass(imports, &owner_remaps, &owner_parameters_by_symbol);
+    try checker.nominalPass();
     try checker.signaturePass();
     try checker.importSignaturePass(imports, &owner_remaps, &owner_parameters_by_symbol);
     try checker.constantPass();

@@ -6,6 +6,53 @@ const source = @import("source.zig");
 const symbols = @import("symbols.zig");
 const target_policy = @import("target.zig");
 
+// Every ambient native builtin module name (`installBuiltins` below
+// registers each of these) — `module_loader.zig`'s import search uses the
+// SAME list to decide whether `импорт <имя>` with no `.ps` file anywhere
+// on the search path should silently resolve to the native module instead
+// of a `FileNotFound` error (documented behavior,
+// `docs/src/getting-started/installation.md` § "Поиск модулей" — real
+// gap found auditing panosiki: `импорт время`/`импорт фс`/etc. failed
+// outright before this, since NOTHING taught the loader these names
+// don't need a file at all).
+pub const native_builtin_modules = [_][]const u8{
+    "фс", "ос", "время", "ввод_вывод", "строки", "DOM", "сжатие", "синтаксис", "сеть", "бд",
+};
+
+// Export list per native module — the SAME data `installBuiltins` below
+// passes to `installBuiltinModule` inline (kept separate rather than
+// refactoring those call sites to read from this table, to avoid
+// touching already-tested code for a second consumer). Used by
+// `module_linker.zig` to bind an ALIASED native import (`импорт
+// "ввод_вывод" как ио`) — `module_loader.zig`'s `native_module` field on
+// `Import` says a name resolved natively, but the alias itself still
+// needs SOMETHING declared as its exports, exactly like a real file
+// import gets from `buildExportsForTarget`.
+pub fn nativeModuleExports(name: []const u8) ?[]const []const u8 {
+    const table = [_]struct { name: []const u8, exports: []const []const u8 }{
+        .{ .name = "фс", .exports = &.{ "есть", "удалить", "прочитать", "записать", "открыть", "это_директория", "создать_директорию", "список_директории", "удалить_директорию" } },
+        .{ .name = "ос", .exports = &.{ "аргументы", "версия_паноса", "окружение", "установить_окружение", "удалить_окружение", "выполнить", "завершить" } },
+        .{ .name = "время", .exports = &.{ "сейчас_мс", "монотонно_мс", "спать_мс" } },
+        .{ .name = "ввод_вывод", .exports = &.{ "печать", "строка" } },
+        .{ .name = "строки", .exports = &.{
+            "байт",             "длина_байт",   "срез_байт", "из_байтов",
+            "в_число",          "из_числа",     "из_целого", "верхний_регистр",
+            "заканчивается_на", "начинается_с", "содержит",  "найти",
+            "заменить",         "обрезать",     "разбить",   "соединить",
+            "срез",             "цифра_или_буква",
+        } },
+        .{ .name = "DOM", .exports = &.{ "текст", "установить_текст", "на_клик" } },
+        .{ .name = "сжатие", .exports = &.{"разжать_gzip"} },
+        .{ .name = "синтаксис", .exports = &.{ "структуры", "поля", "аннотации", "аргумент_аннотации", "аннотации_поля", "аргумент_аннотации_поля" } },
+        .{ .name = "сеть", .exports = &.{ "подключиться", "кодировать_url", "http_запрос", "http_сервер_слушать" } },
+        .{ .name = "бд", .exports = &.{"открыть"} },
+    };
+    for (table) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry.exports;
+    }
+    return null;
+}
+
 const EnumVariants = struct {
     owner: symbols.SymbolId,
     values: std.StringHashMap(symbols.SymbolId),
@@ -18,6 +65,15 @@ pub const ImportedExport = struct {
     origin: ?ImportedSymbolOrigin = null,
     methods: []const ImportedMethodExport = &.{},
     variants: []const ImportedVariantExport = &.{},
+    // Set ONLY for a native-builtin export reached through an ALIASED
+    // `импорт "ввод_вывод" как ио` — the member's `module_path` must stay
+    // the module's REAL name ("ввод_вывод"), never the local alias
+    // ("ио"), because every `compileXBuiltin`/`isBuiltinModule` dispatch
+    // in `compiler.zig`/`type_checker.zig` hardcodes the real name.
+    // `null` (the overwhelmingly common case — a real file import) keeps
+    // `predeclareImports`'s existing `module_path = import.alias`
+    // behavior exactly as before.
+    builtin_module_path: ?[]const u8 = null,
 };
 
 // A variant of an imported enum type — construction/matching is entirely
@@ -255,6 +311,33 @@ const Resolver = struct {
         try self.installBuiltinType("Файл");
         try self.installBuiltinModule("ос", &.{ "аргументы", "версия_паноса", "окружение", "установить_окружение", "удалить_окружение", "выполнить", "завершить" });
         try self.installBuiltinModule("время", &.{ "сейчас_мс", "монотонно_мс", "спать_мс" });
+        // `ввод_вывод` — real gap found auditing panosiki: this module
+        // never existed in Zig at all (`Resolve Error: неопределённое имя
+        // 'ввод_вывод'`), silently breaking EVERY consumer of `std/тест.ps`
+        // (which itself does `импорт ввод_вывод` on line 1) across every
+        // panosiki package. Scoped to `.печать`/`.строка` only for now —
+        // `.прочитать_строку`/`.поток` (`target.zig`'s `native_only` list
+        // already anticipates both by name) need the same async-stdin
+        // machinery `Файл`'s streaming reads use, a separate follow-up.
+        try self.installBuiltinModule("ввод_вывод", &.{ "печать", "строка" });
+        // `строки` — the other half of the panosiki audit's headline gap:
+        // completely absent (not native, no `std/строки.ps`), yet docs
+        // (`docs/src/language/basic-types.md` §"Байты") describe byte-level
+        // primitives (`срез_байт`/`из_байтов`/`байт`) that can ONLY be
+        // native (no way to build them out of other panos-level string
+        // ops) — this was always meant to be a native module like `фс`/
+        // `время`, not a `std/*.ps` library, and simply never got ported.
+        // Scoped to exactly the 18 functions panosiki/std actually call;
+        // docs also mention `в_байты`/`в_руны`/`из_рун`/`кодовая_точка`,
+        // none of which any real caller needs yet — left for a follow-up
+        // rather than built speculatively.
+        try self.installBuiltinModule("строки", &.{
+            "байт",             "длина_байт",       "срез_байт",   "из_байтов",
+            "в_число",          "из_числа",         "из_целого",   "верхний_регистр",
+            "заканчивается_на", "начинается_с",     "содержит",    "найти",
+            "заменить",         "обрезать",         "разбить",     "соединить",
+            "срез",             "цифра_или_буква",
+        });
         // `DOM` — AOT WASM only (`target.zig`'s `builtinAvailability`), a
         // minimal numeric-only slice: no object-table runtime, so
         // `.текст`/`.установить_текст` work on a NUMBER (parsed/formatted
@@ -346,7 +429,7 @@ const Resolver = struct {
                 const member = try self.result.symbols.add(.{
                     .name = exported.name,
                     .kind = exported.kind,
-                    .module_path = import.alias,
+                    .module_path = exported.builtin_module_path orelse import.alias,
                     .is_exported = true,
                     .span = exported.span,
                 });
@@ -711,7 +794,7 @@ const Resolver = struct {
                 }
                 if (bindings.items.len != 0) try self.result.stmt_bindings.put(statement, try self.result.arena.allocator().dupe(symbols.SymbolId, bindings.items));
             },
-            .return_stmt => |return_stmt| try self.resolveExpression(self.tree, return_stmt.value),
+            .return_stmt => |return_stmt| if (return_stmt.value) |return_value| try self.resolveExpression(self.tree, return_value),
             .expr => |expression| try self.resolveExpression(self.tree, expression.value),
             .for_in => |loop| {
                 try self.resolveExpression(self.tree, loop.iterable);

@@ -993,6 +993,19 @@ const Parser = struct {
 
     fn parseReturn(self: *Parser) !ast.StmtId {
         const start = self.next();
+        // Bare `возврат` (no expression) — a void return, valid wherever
+        // the enclosing function returns `Пусто`, checked later by
+        // `type_checker.zig`, not here. `.end`/`.else_expr` are the only
+        // tokens that can legally follow a statement with nothing else in
+        // its block (`если x тогда возврат конец`, `если x тогда возврат
+        // иначе ... конец`) — anything else starts parsing an expression
+        // exactly as before.
+        if (self.at(.end) or self.at(.else_expr)) {
+            return self.result.ast.addStmt(.{ .return_stmt = .{
+                .span = start.span,
+                .value = null,
+            } });
+        }
         const value = try self.parseExpression(0);
         return self.result.ast.addStmt(.{ .return_stmt = .{
             .span = spanFrom(start.span, self.astExprSpan(value)),

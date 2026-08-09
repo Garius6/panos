@@ -1088,6 +1088,77 @@ const posix_env = struct {
     extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 };
 
+// `ввод_вывод.печать`/`.строка`'s value-to-text conversion, also reused by
+// `runner.renderValue` for the CLI's final return-value line (same
+// contract, one implementation) — a structural dump (`Имя(поле1, поле2,
+// ...)`, positional, no field names — matches the display-string
+// convention already documented for compound values without a real
+// `Печатаемое` implementation). Dispatching to a value's OWN `.вСтроку()`
+// when it implements `Печатаемое` (the docs' PREFERRED path) is NOT done
+// here — that needs static-type-aware interface casting at each call
+// site (the same mechanism `Складываемое`-sugar uses for `+`), which
+// `ввод_вывод.печать(значение: любой тип)` can't get for free since its
+// parameter isn't a real generic; deliberately left for a follow-up
+// rather than silently only half-supporting it.
+pub fn renderRuntimeValue(allocator: std.mem.Allocator, runtime_value: value.Value) anyerror![]u8 {
+    return switch (runtime_value) {
+        .void => allocator.dupe(u8, ""),
+        .number => |number| std.fmt.allocPrint(allocator, "{d}", .{number}),
+        // Kept as Zig's default `true`/`false` (NOT `истина`/`ложь`) —
+        // matches the CLI's existing final-return-value rendering, which
+        // 19+ existing tests already assert on; changing it is a separate
+        // decision, not a side effect of adding `ввод_вывод`.
+        .boolean => |boolean| std.fmt.allocPrint(allocator, "{}", .{boolean}),
+        .string => |string| allocator.dupe(u8, string),
+        .heap_string => |string| allocator.dupe(u8, string.bytes),
+        .aggregate => |aggregate| blk: {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            try out.appendSlice(allocator, aggregate.name orelse "");
+            try out.append(allocator, '(');
+            for (aggregate.elements, 0..) |element, index| {
+                if (index != 0) try out.appendSlice(allocator, ", ");
+                const rendered = try renderRuntimeValue(allocator, element);
+                defer allocator.free(rendered);
+                try out.appendSlice(allocator, rendered);
+            }
+            try out.append(allocator, ')');
+            break :blk out.toOwnedSlice(allocator);
+        },
+        .array => |array| blk: {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            try out.append(allocator, '[');
+            for (array.elements, 0..) |element, index| {
+                if (index != 0) try out.appendSlice(allocator, ", ");
+                const rendered = try renderRuntimeValue(allocator, element);
+                defer allocator.free(rendered);
+                try out.appendSlice(allocator, rendered);
+            }
+            try out.append(allocator, ']');
+            break :blk out.toOwnedSlice(allocator);
+        },
+        .map => |map| blk: {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            try out.append(allocator, '{');
+            for (map.entries.items, 0..) |entry, index| {
+                if (index != 0) try out.appendSlice(allocator, ", ");
+                const key_rendered = try renderRuntimeValue(allocator, entry.key);
+                defer allocator.free(key_rendered);
+                const value_rendered = try renderRuntimeValue(allocator, entry.value);
+                defer allocator.free(value_rendered);
+                try out.appendSlice(allocator, key_rendered);
+                try out.appendSlice(allocator, ": ");
+                try out.appendSlice(allocator, value_rendered);
+            }
+            try out.append(allocator, '}');
+            break :blk out.toOwnedSlice(allocator);
+        },
+        else => allocator.dupe(u8, "<составное значение>"),
+    };
+}
+
 pub const Vm = struct {
     allocator: std.mem.Allocator,
     heap: gc.Heap,
@@ -1112,6 +1183,17 @@ pub const Vm = struct {
     // this baseline, matching the documented "миллисекунды с момента
     // старта VM" contract without needing a real "VM start" hook.
     monotonic_baseline_ns: ?i96 = null,
+    // `ввод_вывод.печать`/`.строка` accumulate here instead of writing
+    // directly to a real fd — there IS no real fd on the freestanding
+    // wasm32 browser interpreter (see `zig/browser/main.zig`'s batch
+    // "run to completion, then read the result buffer" model), so both
+    // targets share one mechanism: the CALLER (`zig/cli/main.zig`'s
+    // native run path, `runner.zig`'s `runSourceWithVerboseForTarget`,
+    // which `zig/browser/main.zig` goes through too) reads `output.items`
+    // once `run()` returns and emits/appends it before the final
+    // return-value line — ordering is still correct since nothing reads
+    // it mid-execution.
+    output: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, program: *const bytecode.Program) Vm {
         return .{
@@ -1133,6 +1215,7 @@ pub const Vm = struct {
         self.stack.deinit(self.allocator);
         self.clearProcesses();
         self.processes.deinit(self.allocator);
+        self.output.deinit(self.allocator);
         self.heap.deinit();
         self.* = undefined;
     }
@@ -1289,6 +1372,28 @@ pub const Vm = struct {
             .time_now => try self.timeNow(),
             .time_monotonic => try self.timeMonotonic(),
             .time_sleep => try self.timeSleep(),
+            .io_print => try self.ioPrint(false),
+            .io_println => try self.ioPrint(true),
+            .str_byte => try self.strByte(),
+            .str_len_bytes => try self.strLenBytes(),
+            .str_slice_bytes => try self.strSliceBytes(),
+            .str_from_bytes => try self.strFromBytes(),
+            .str_to_number => try self.strToNumber(),
+            .str_number_to_str => try self.strNumberToStr(),
+            .str_int_to_str => try self.strIntToStr(),
+            .str_upper => try self.strUpper(),
+            .str_ends_with => try self.strEndsWith(),
+            .str_starts_with => try self.strStartsWith(),
+            .str_contains => try self.strContains(),
+            .str_find => try self.strFind(),
+            .str_replace => try self.strReplace(),
+            .str_trim => try self.strTrim(),
+            .str_split => try self.strSplit(),
+            .str_join => try self.strJoin(),
+            .str_slice => try self.strSlice(),
+            .str_is_digit_or_letter => try self.strIsDigitOrLetter(),
+            .int_cast => try self.intCast(),
+            .to_display_string => try self.toDisplayString(),
             .gzip_decompress => try self.gzipDecompress(),
             .syntax_structs => try self.syntaxStructs(),
             .syntax_fields => try self.syntaxFields(),
@@ -2022,6 +2127,398 @@ pub const Vm = struct {
         defer io.deinit();
         std.Io.sleep(io.io(), .fromMilliseconds(clamped), .awake) catch {};
         try self.stack.append(self.allocator, .{ .number = millis });
+    }
+
+    fn ioPrint(self: *Vm, newline: bool) anyerror!void {
+        const popped = try self.pop();
+        const rendered = try renderRuntimeValue(self.allocator, popped);
+        defer self.allocator.free(rendered);
+        try self.output.appendSlice(self.allocator, rendered);
+        if (newline) try self.output.append(self.allocator, '\n');
+        try self.stack.append(self.allocator, .{ .void = {} });
+    }
+
+    // Byte offset of the Nth rune (codepoint) in `string` — `string.len`
+    // itself is a valid result (the position just past the last rune),
+    // used as the upper bound by `strSlice`/`strFind`'s rune-index-to-
+    // byte-offset conversion. Same UTF-8 walk `stringAt` (indexing, `s[i]`)
+    // already does, factored out since `строки.срез`/`.найти` need it too.
+    fn runeByteOffset(self: *Vm, string: []const u8, rune_index: usize) anyerror!usize {
+        var offset: usize = 0;
+        var current: usize = 0;
+        while (current < rune_index) {
+            if (offset >= string.len) {
+                try self.fault("Runtime Error: индекс строки вне границ", .{});
+                return 0;
+            }
+            const width = std.unicode.utf8ByteSequenceLength(string[offset]) catch {
+                try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+                return 0;
+            };
+            offset += width;
+            current += 1;
+        }
+        return offset;
+    }
+
+    fn strByte(self: *Vm) anyerror!void {
+        const index_value = try self.pop();
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.байт() ожидает строку", .{});
+            return;
+        };
+        const index = try self.arrayIndex(index_value);
+        if (index >= string.len) {
+            try self.fault("Runtime Error: строки.байт(): индекс вне границ", .{});
+            return;
+        }
+        try self.stack.append(self.allocator, .{ .number = @floatFromInt(string[index]) });
+    }
+
+    fn strLenBytes(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.длина_байт() ожидает строку", .{});
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .number = @floatFromInt(string.len) });
+    }
+
+    fn strSliceBytes(self: *Vm) anyerror!void {
+        const end_value = try self.pop();
+        const start_value = try self.pop();
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.срез_байт() ожидает строку", .{});
+            return;
+        };
+        const start = try self.arrayIndex(start_value);
+        const end = try self.arrayIndex(end_value);
+        if (start > end or end > string.len) {
+            try self.fault("Runtime Error: строки.срез_байт(): границы вне диапазона", .{});
+            return;
+        }
+        const result = try self.heap.createString(try self.allocator.dupe(u8, string[start..end]));
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    fn strFromBytes(self: *Vm) anyerror!void {
+        const array_value = try self.pop();
+        const array = switch (array_value) {
+            .array => |a| a,
+            else => {
+                try self.fault("Runtime Error: строки.из_байтов() ожидает Массив(Целое)", .{});
+                return;
+            },
+        };
+        const bytes = try self.allocator.alloc(u8, array.elements.len);
+        errdefer self.allocator.free(bytes);
+        for (array.elements, 0..) |element, i| {
+            const n = try self.number(element);
+            if (n < 0 or n > 255 or n != std.math.trunc(n)) {
+                try self.fault("Runtime Error: строки.из_байтов(): элемент вне диапазона 0..255", .{});
+                return;
+            }
+            bytes[i] = @intFromFloat(n);
+        }
+        const result = try self.heap.createString(bytes);
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    fn strToNumber(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.в_число() ожидает строку", .{});
+            return;
+        };
+        const parsed = std.fmt.parseFloat(f64, string) catch {
+            try self.pushErrorResultForModule("строки", "не удалось разобрать число");
+            return;
+        };
+        try self.pushSuccessResult(.{ .number = parsed });
+    }
+
+    fn strNumberToStr(self: *Vm) anyerror!void {
+        const number_value = try self.number(try self.pop());
+        const result = try self.heap.formatString("{d}", .{number_value});
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    fn strIntToStr(self: *Vm) anyerror!void {
+        const number_value = try self.number(try self.pop());
+        const result = try self.heap.formatString("{d}", .{@as(i64, @intFromFloat(number_value))});
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    // ASCII + Cyrillic (а-я/ё → А-Я/Ё) — the two alphabets any real panos
+    // caller (Russian-keyword language, 1С-adjacent tooling) actually
+    // uses; full Unicode case-folding is out of scope for this slice.
+    fn strUpper(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.верхний_регистр() ожидает строку", .{});
+            return;
+        };
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var view = std.unicode.Utf8View.init(string) catch {
+            try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+            return;
+        };
+        var iterator = view.iterator();
+        while (iterator.nextCodepoint()) |codepoint| {
+            const upper: u21 = switch (codepoint) {
+                'a'...'z' => codepoint - ('a' - 'A'),
+                0x0430...0x044F => codepoint - (0x0430 - 0x0410), // а-я → А-Я
+                0x0451 => 0x0401, // ё → Ё
+                else => codepoint,
+            };
+            var buffer: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(upper, &buffer) catch unreachable;
+            try out.appendSlice(self.allocator, buffer[0..len]);
+        }
+        const result = try self.heap.createString(try out.toOwnedSlice(self.allocator));
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    fn strEndsWith(self: *Vm) anyerror!void {
+        const suffix_value = try self.pop();
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.заканчивается_на() ожидает строки", .{});
+            return;
+        };
+        const suffix = suffix_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.заканчивается_на() ожидает строки", .{});
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .boolean = std.mem.endsWith(u8, string, suffix) });
+    }
+
+    fn strStartsWith(self: *Vm) anyerror!void {
+        const prefix_value = try self.pop();
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.начинается_с() ожидает строки", .{});
+            return;
+        };
+        const prefix = prefix_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.начинается_с() ожидает строки", .{});
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .boolean = std.mem.startsWith(u8, string, prefix) });
+    }
+
+    fn strContains(self: *Vm) anyerror!void {
+        const needle_value = try self.pop();
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.содержит() ожидает строки", .{});
+            return;
+        };
+        const needle = needle_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.содержит() ожидает строки", .{});
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .boolean = std.mem.indexOf(u8, string, needle) != null });
+    }
+
+    // Returns the RUNE index (not byte offset) of the first match, per
+    // `docs/src/language/basic-types.md`'s explicit contract ("строки.
+    // найти возвращает рановый индекс") — converts the byte offset
+    // `std.mem.indexOf` finds by counting codepoints up to it.
+    fn strFind(self: *Vm) anyerror!void {
+        const needle_value = try self.pop();
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.найти() ожидает строки", .{});
+            return;
+        };
+        const needle = needle_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.найти() ожидает строки", .{});
+            return;
+        };
+        const byte_offset = std.mem.indexOf(u8, string, needle) orelse {
+            try self.pushOption(null);
+            return;
+        };
+        const rune_index = std.unicode.utf8CountCodepoints(string[0..byte_offset]) catch {
+            try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+            return;
+        };
+        try self.pushOption(.{ .number = @floatFromInt(rune_index) });
+    }
+
+    fn strReplace(self: *Vm) anyerror!void {
+        const replacement_value = try self.pop();
+        const target_value = try self.pop();
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.заменить() ожидает строки", .{});
+            return;
+        };
+        const target = target_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.заменить() ожидает строки", .{});
+            return;
+        };
+        const replacement = replacement_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.заменить() ожидает строки", .{});
+            return;
+        };
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        if (target.len == 0) {
+            try out.appendSlice(self.allocator, string);
+        } else {
+            var remaining = string;
+            while (std.mem.indexOf(u8, remaining, target)) |index| {
+                try out.appendSlice(self.allocator, remaining[0..index]);
+                try out.appendSlice(self.allocator, replacement);
+                remaining = remaining[index + target.len ..];
+            }
+            try out.appendSlice(self.allocator, remaining);
+        }
+        const result = try self.heap.createString(try out.toOwnedSlice(self.allocator));
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    fn strTrim(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.обрезать() ожидает строку", .{});
+            return;
+        };
+        const trimmed = std.mem.trim(u8, string, " \t\r\n");
+        const result = try self.heap.createString(try self.allocator.dupe(u8, trimmed));
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    fn strSplit(self: *Vm) anyerror!void {
+        const separator_value = try self.pop();
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.разбить() ожидает строки", .{});
+            return;
+        };
+        const separator = separator_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.разбить() ожидает строки", .{});
+            return;
+        };
+        var parts: std.ArrayList(value.Value) = .empty;
+        errdefer parts.deinit(self.allocator);
+        if (separator.len == 0) {
+            const copy = try self.heap.createString(try self.allocator.dupe(u8, string));
+            try parts.append(self.allocator, .{ .heap_string = copy });
+        } else {
+            var iterator = std.mem.splitSequence(u8, string, separator);
+            while (iterator.next()) |part| {
+                const copy = try self.heap.createString(try self.allocator.dupe(u8, part));
+                try parts.append(self.allocator, .{ .heap_string = copy });
+            }
+        }
+        const array = try self.heap.createArray(try parts.toOwnedSlice(self.allocator));
+        try self.stack.append(self.allocator, .{ .array = array });
+    }
+
+    fn strJoin(self: *Vm) anyerror!void {
+        const separator_value = try self.pop();
+        const array_value = try self.pop();
+        const array = switch (array_value) {
+            .array => |a| a,
+            else => {
+                try self.fault("Runtime Error: строки.соединить() ожидает Массив(Строка)", .{});
+                return;
+            },
+        };
+        const separator = separator_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.соединить() ожидает разделитель типа Строка", .{});
+            return;
+        };
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        for (array.elements, 0..) |element, i| {
+            if (i != 0) try out.appendSlice(self.allocator, separator);
+            const part = element.stringBytes() orelse {
+                try self.fault("Runtime Error: строки.соединить(): элемент массива не является строкой", .{});
+                return;
+            };
+            try out.appendSlice(self.allocator, part);
+        }
+        const result = try self.heap.createString(try out.toOwnedSlice(self.allocator));
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    // Rune-based (NOT byte-based) — `строки.срез_байт` is the byte-offset
+    // equivalent, see `docs/src/language/basic-types.md` §"Байты" for why
+    // both exist separately.
+    fn strSlice(self: *Vm) anyerror!void {
+        const end_value = try self.pop();
+        const start_value = try self.pop();
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.срез() ожидает строку", .{});
+            return;
+        };
+        const start_rune = try self.arrayIndex(start_value);
+        const end_rune = try self.arrayIndex(end_value);
+        if (start_rune > end_rune) {
+            try self.fault("Runtime Error: строки.срез(): границы вне диапазона", .{});
+            return;
+        }
+        const start_byte = try self.runeByteOffset(string, start_rune);
+        const end_byte = try self.runeByteOffset(string, end_rune);
+        if (end_byte > string.len) {
+            try self.fault("Runtime Error: строки.срез(): границы вне диапазона", .{});
+            return;
+        }
+        const result = try self.heap.createString(try self.allocator.dupe(u8, string[start_byte..end_byte]));
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    // ASCII + Cyrillic letters (matches `strUpper`'s scope) — single-rune
+    // input expected (typical caller passes a one-character index slice
+    // like `s[i]`), only the FIRST rune is inspected if given more.
+    fn strIsDigitOrLetter(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.цифра_или_буква() ожидает строку", .{});
+            return;
+        };
+        if (string.len == 0) {
+            try self.stack.append(self.allocator, .{ .boolean = false });
+            return;
+        }
+        var view = std.unicode.Utf8View.init(string) catch {
+            try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+            return;
+        };
+        var iterator = view.iterator();
+        const codepoint = iterator.nextCodepoint() orelse {
+            try self.stack.append(self.allocator, .{ .boolean = false });
+            return;
+        };
+        const is_match = switch (codepoint) {
+            '0'...'9', 'a'...'z', 'A'...'Z' => true,
+            0x0410...0x044F, 0x0401, 0x0451 => true, // А-Я, а-я, Ё, ё
+            else => false,
+        };
+        try self.stack.append(self.allocator, .{ .boolean = is_match });
+    }
+
+    // `Целое(x)` — truncates toward zero, a no-op if `x` is already an
+    // integer value (same `Value.number` f64 representation either way,
+    // see `bytecode.zig`'s `.int_cast` doc comment).
+    fn intCast(self: *Vm) anyerror!void {
+        const n = try self.number(try self.pop());
+        try self.stack.append(self.allocator, .{ .number = std.math.trunc(n) });
+    }
+
+    fn toDisplayString(self: *Vm) anyerror!void {
+        const popped = try self.pop();
+        const rendered = try renderRuntimeValue(self.allocator, popped);
+        const result = try self.heap.createString(rendered);
+        try self.stack.append(self.allocator, .{ .heap_string = result });
     }
 
     fn gzipDecompress(self: *Vm) anyerror!void {

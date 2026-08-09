@@ -3,6 +3,7 @@ const ast = @import("ast.zig");
 const diagnostic = @import("diagnostic.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
+const resolver = @import("resolver.zig");
 const source = @import("source.zig");
 
 pub const Module = struct {
@@ -22,6 +23,17 @@ pub const Import = struct {
     target: ?usize,
     alias: []const u8,
     span: source.Span,
+    // Set when `target == null` because this import resolved to a native
+    // builtin module (see `resolveAndLoadImport`) instead of failing —
+    // holds the module's REAL name (e.g. "ввод_вывод"), which may differ
+    // from `alias` (`импорт "ввод_вывод" как ио"`). `module_linker.zig`
+    // uses this to bind the alias to the native module's exports, same as
+    // it already does for a real file target — without it, an ALIASED
+    // native import resolved with no diagnostic (correct) but then the
+    // alias itself was never bound to anything (`Resolve Error:
+    // неопределённое имя 'ио'`), a real gap found auditing panosiki's
+    // `std/слог.ps` (`импорт "ввод_вывод" как ио`).
+    native_module: ?[]const u8 = null,
 };
 
 pub const ExportKind = enum {
@@ -86,6 +98,18 @@ pub const Graph = struct {
     variants: std.ArrayList(VariantExport) = .empty,
     impls: std.ArrayList(ImplExport) = .empty,
     diagnostics: diagnostic.DiagnosticList = .{},
+    // `PANOS_STDLIB` env dir + the `std/` next to the running `panos`
+    // binary, in that priority order, checked AFTER same-directory and
+    // `модули/` — set by the caller (`zig/cli/main.zig`) before `.load()`,
+    // empty by default so every existing test/synthetic-reader caller
+    // (which has no such directories to offer) keeps its exact current
+    // behavior. See `docs/src/getting-started/installation.md` §"Поиск
+    // модулей" for the full documented 4-tier contract this implements —
+    // real gap found auditing panosiki: NONE of tiers 2-4 (nor the
+    // native-module fallback below) existed before this, only tier 1
+    // (same directory) did, silently breaking every multi-file program
+    // that imports a real stdlib module by bare name.
+    global_search_roots: []const []const u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator) Graph {
         return .{
@@ -184,7 +208,7 @@ pub const Graph = struct {
         return index;
     }
 
-    fn loadRecursive(self: *Graph, reader: anytype, path: []const u8, importer_span: ?source.Span) !?usize {
+    fn loadRecursive(self: *Graph, reader: anytype, path: []const u8, importer_span: ?source.Span) anyerror!?usize {
         if (self.loading.contains(path)) {
             try self.report(importer_span orelse .{ .file_id = 0, .start = 0, .end = 0 }, "Module Loader Error: обнаружен циклический импорт '{s}'", .{path});
             return null;
@@ -198,6 +222,40 @@ pub const Graph = struct {
             try self.report(importer_span orelse .{ .file_id = 0, .start = 0, .end = 0 }, "Module Loader Error: не удалось загрузить модуль '{s}': {s}", .{ path, @errorName(err) });
             return null;
         };
+        return try self.registerModule(reader, path, bytes);
+    }
+
+    // Same as `loadRecursive`, but a read failure PROPAGATES instead of
+    // being reported — used only by `resolveAndLoadImport`'s fallback
+    // chain, which needs to try the next search-root candidate silently
+    // and only report once EVERY candidate has failed (or fall back to a
+    // native builtin module, which needs no diagnostic at all). A cyclic
+    // import is still reported directly here — trying a different search
+    // root can never resolve a real cycle, so there is no "next candidate"
+    // that would help.
+    fn tryLoadSilently(self: *Graph, reader: anytype, path: []const u8, importer_span: ?source.Span) anyerror!?usize {
+        if (self.loading.contains(path)) {
+            try self.report(importer_span orelse .{ .file_id = 0, .start = 0, .end = 0 }, "Module Loader Error: обнаружен циклический импорт '{s}'", .{path});
+            return null;
+        }
+        if (self.module_indices.get(path)) |existing| return existing;
+
+        try self.loading.put(path, {});
+        defer _ = self.loading.remove(path);
+
+        const bytes = try reader.read(self.allocator, path);
+        return try self.registerModule(reader, path, bytes);
+    }
+
+    // Lex/parse/register a module whose SOURCE BYTES are already read —
+    // shared by `loadRecursive` (entry file, reports on its own read
+    // failure) and `tryLoadSilently` (import fallback candidates, read
+    // failure already propagated by the caller). Recurses into `path`'s
+    // OWN imports via `resolveAndLoadImport`, not directly into
+    // `loadRecursive`/`tryLoadSilently` — every nested import gets the
+    // full search-path fallback too, not just the entry file's direct
+    // imports.
+    fn registerModule(self: *Graph, reader: anytype, path: []const u8, bytes: []u8) anyerror!usize {
         var owns_bytes = true;
         errdefer if (owns_bytes) self.allocator.free(bytes);
 
@@ -237,19 +295,75 @@ pub const Graph = struct {
                 .import => |value| value,
                 else => continue,
             };
-            const import_path = try resolveImportPath(self.allocator, import.path, stored_path);
-            defer self.allocator.free(import_path);
-            const target = try self.loadRecursive(reader, import_path, import.span);
+            const resolved = try self.resolveAndLoadImport(reader, import.path, stored_path, import.span);
             try self.imports.append(self.allocator, .{
                 .importer = index,
                 .declaration = declaration,
-                .target = target,
+                .target = resolved.target,
                 .alias = import.alias orelse moduleBaseName(import.path),
                 .span = import.span,
+                .native_module = resolved.native_module,
             });
         }
         try self.order.append(self.allocator, index);
         return index;
+    }
+
+    // The documented 4-tier search (`docs/src/getting-started/
+    // installation.md` §"Поиск модулей"): same directory as the importer,
+    // then `модули/` next to the importer, then each of
+    // `global_search_roots` in order (`$PANOS_STDLIB`, `std/` next to the
+    // `panos` binary — populated by `zig/cli/main.zig`, empty for every
+    // other caller, which keeps their exact previous single-tier
+    // behavior). If NONE of those have the file AND the bare import name
+    // matches a registered native builtin module (`resolver.
+    // native_builtin_modules` — the SAME list `installBuiltins` uses, so
+    // the two can never drift apart), this resolves to `null` with NO
+    // diagnostic — the module is already ambiently available without a
+    // file at all, exactly like calling it without ever writing `импорт`
+    // in the first place. A genuinely missing module (not native, not
+    // found anywhere) reports the SAME "FileNotFound" message the single-
+    // tier version always did, against the same-directory candidate (so
+    // existing diagnostic-text assertions keep matching).
+    const ImportResolution = struct { target: ?usize, native_module: ?[]const u8 = null };
+
+    fn resolveAndLoadImport(self: *Graph, reader: anytype, raw_import_path: []const u8, importer_path: []const u8, importer_span: ?source.Span) anyerror!ImportResolution {
+        var candidates: std.ArrayList([]u8) = .empty;
+        defer {
+            for (candidates.items) |candidate| self.allocator.free(candidate);
+            candidates.deinit(self.allocator);
+        }
+
+        try candidates.append(self.allocator, try resolveImportPath(self.allocator, raw_import_path, importer_path));
+
+        const importer_dir = moduleDirectory(importer_path);
+        const modules_relative = if (importer_dir.len != 0)
+            try std.fmt.allocPrint(self.allocator, "{s}/модули/{s}", .{ importer_dir, raw_import_path })
+        else
+            try std.fmt.allocPrint(self.allocator, "модули/{s}", .{raw_import_path});
+        defer self.allocator.free(modules_relative);
+        try candidates.append(self.allocator, try resolveImportPath(self.allocator, modules_relative, ""));
+
+        for (self.global_search_roots) |root| {
+            const combined = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, raw_import_path });
+            defer self.allocator.free(combined);
+            try candidates.append(self.allocator, try resolveImportPath(self.allocator, combined, ""));
+        }
+
+        for (candidates.items) |candidate| {
+            if (self.tryLoadSilently(reader, candidate, importer_span)) |result| {
+                return .{ .target = result };
+            } else |err| {
+                if (err != error.FileNotFound) return err;
+            }
+        }
+
+        if (isBareModuleName(raw_import_path) and isNativeBuiltinModule(raw_import_path)) {
+            return .{ .target = null, .native_module = try self.arena.allocator().dupe(u8, raw_import_path) };
+        }
+
+        try self.report(importer_span orelse .{ .file_id = 0, .start = 0, .end = 0 }, "Module Loader Error: не удалось загрузить модуль '{s}': FileNotFound", .{candidates.items[0]});
+        return .{ .target = null };
     }
 
     fn collectExports(self: *Graph, module: usize) !void {
@@ -399,6 +513,17 @@ pub fn resolveImportPath(allocator: std.mem.Allocator, import_path: []const u8, 
     };
     defer if (combined.ptr != suffixed.ptr) allocator.free(combined);
     return normalizePath(allocator, combined);
+}
+
+fn isBareModuleName(path: []const u8) bool {
+    return std.mem.indexOfScalar(u8, path, '/') == null;
+}
+
+fn isNativeBuiltinModule(name: []const u8) bool {
+    for (resolver.native_builtin_modules) |native| {
+        if (std.mem.eql(u8, name, native)) return true;
+    }
+    return false;
 }
 
 fn isAbsolute(path: []const u8) bool {

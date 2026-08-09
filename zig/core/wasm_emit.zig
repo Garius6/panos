@@ -329,6 +329,7 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             switch (unary.op) {
                 .negate_number => try code.append(allocator, 0x9A), // f64.neg
                 .negate_bool => try code.append(allocator, 0x45), // i32.eqz
+                .int_trunc => try code.append(allocator, 0x9C), // f64.trunc
                 .bit_not => unsupported("побитовое НЕ (вне Phase 1a)"),
             }
             return unary.dst;

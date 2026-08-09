@@ -59,6 +59,7 @@ pub const UnOp = enum {
     negate_number,
     negate_bool,
     bit_not,
+    int_trunc,
 };
 
 pub const ConstValue = union(enum) {

@@ -7319,6 +7319,202 @@ test "VM reorders named spawn arguments" {
     }
 }
 
+// Regression for a real bug found auditing panosiki's `cli` package:
+// named-argument struct constructors were type-checked in the CALLER's
+// argument order (correct, via `reorderNamedArguments`), but codegen
+// zipped the raw, UNREORDERED `call.arguments` against the struct's
+// declared field order — silently storing each value in the wrong
+// field slot at runtime. `Точка(y = 1, x = 2)` (fields declared `x`
+// then `y`) must build `x=2, y=1`, not `x=1, y=2`.
+test "VM reorders named struct constructor arguments" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Точка = структура
+        \\    x: Число
+        \\    y: Число
+        \\конец
+        \\функ старт() -> Число
+        \\    пер п = Точка(y = 1, x = 2)
+        \\    п.x * 10 + п.y
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 21), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Regression for a real bug found auditing panosiki's `gitsync`: a
+// `выбор`/`если` whose arms are one bare interface-typed value and one
+// concrete implementor (both individually assignable to a KNOWN
+// `expected` type, e.g. a function's declared return type) must be
+// accepted — `assignable` is directional for interfaces, so the old
+// mutual pairwise check between arms rejected this even though each
+// arm independently satisfies `expected`.
+test "VM allows if/match branches that satisfy expected type asymmetrically via an interface" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Точка = структура
+        \\    x: Число
+        \\конец
+        \\реализация Печатаемое для Точка
+        \\    функ вСтроку(это: Точка) -> Строка
+        \\        "точка"
+        \\    конец
+        \\конец
+        \\функ выбрать(есть_значение: Опция(Точка)) -> Печатаемое
+        \\    выбор есть_значение
+        \\        Опция.Есть(п) -> п
+        \\        Опция.Нет -> Точка(0)
+        \\    конец
+        \\конец
+        \\функ старт() -> Строка
+        \\    выбрать(Опция.Есть(Точка(1))).вСтроку()
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| try std.testing.expectEqualStrings("точка", runtime_value.stringBytes() orelse return error.TestUnexpectedResult),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Regression for a real bug found auditing panosiki's `configor`: a
+// generic function whose parameter is bound by a USER-DEFINED interface
+// (`[T: ИзTOML]`) calling a method on that bare parameter inside its own
+// body (`это.метод()`) — panos generics aren't monomorphized, so this
+// only works if the caller's concrete argument gets cast to the bound
+// interface at the call site, and the method call inside the generic
+// body dispatches through that same interface's vtable.
+test "VM dispatches an interface method through a generic bound parameter" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Точка = структура
+        \\    x: Число
+        \\конец
+        \\реализация Печатаемое для Точка
+        \\    функ вСтроку(это: Точка) -> Строка
+        \\        "точка"
+        \\    конец
+        \\конец
+        \\функ показать[T: Печатаемое](значение: T) -> Строка
+        \\    значение.вСтроку()
+        \\конец
+        \\функ старт() -> Строка
+        \\    показать(Точка(1))
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| try std.testing.expectEqualStrings("точка", runtime_value.stringBytes() orelse return error.TestUnexpectedResult),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Regression for a real bug found auditing panosiki's `cli-selector`
+// (`новый_селектор[T](заголовок: Строка) -> Селектор(T)` whose body is
+// `Селектор(заголовок, массив())`): a generic struct's own type
+// parameter couldn't be inferred from an EMPTY array-literal
+// constructor argument (`массив()` infers as `Массив(poison)`, and the
+// old `inferGenericSubstitution` gave up silently instead of
+// substituting `poison`) — the function's declared return type
+// (`Коробка(T)`, the FUNCTION's own `T`) then failed to unify against
+// the constructed `Коробка(poison)` at all, since plain nominal-type
+// assignability required an exact argument match before the sibling
+// `assignable` fix (see the elementwise-recursion case) started
+// tolerating `poison` there too. This checks the DECLARATION alone —
+// deliberately not a call site: calling a generic function whose type
+// parameter appears ONLY in the return type (never in any parameter)
+// can't be resolved from argument types either way, an entirely
+// separate, orthogonal limitation real panosiki callers route around by
+// never annotating the call (`пер с1 = выборка.новый_селектор(...)`,
+// no `: Тип`) rather than something this fix touches.
+test "type checker infers a generic struct's type parameter through an empty array literal argument" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Коробка[T] = структура
+        \\    метка: Строка
+        \\    элементы: Массив(T)
+        \\конец
+        \\функ новая_коробка[T](метка: Строка) -> Коробка(T)
+        \\    Коробка(метка, массив())
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
 test "VM partially destructures a named structure field" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");

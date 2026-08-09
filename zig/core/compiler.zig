@@ -570,22 +570,40 @@ const FunctionCompiler = struct {
             return;
         }
         if (try self.enumConstructor(call.callee)) |enumeration| {
-            for (call.arguments) |argument| try self.compileExpression(argument);
-            if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
+            // `arguments` (possibly name-reordered, see `ordered_arguments`
+            // above), NOT raw `call.arguments` — an enum-variant
+            // constructor called with named args in a different order
+            // than the variant's declared field order type-checked
+            // correctly against the REORDERED list but was CODEGEN'd in
+            // raw call-site order, silently building a struct whose
+            // fields held the wrong values at runtime.
+            for (arguments) |argument| try self.compileExpression(argument);
+            if (arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
             const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(enumeration) });
             try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
                 .name_constant = name_constant,
-                .field_count = @intCast(call.arguments.len),
+                .field_count = @intCast(arguments.len),
             } });
             return;
         }
         if (try self.structConstructor(call.callee)) |structure| {
-            for (call.arguments) |argument| try self.compileExpression(argument);
-            if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
+            // Same fix as the enum-variant case just above — real bug
+            // found auditing panosiki's `cli` package (`Конфигурация(флаги
+            // = ..., наименование = ..., ...)`, named args not in field
+            // declaration order): type-checking already reorders via
+            // `reorderNamedArguments`/`call_arguments`, but codegen here
+            // still zipped raw `call.arguments` positionally against the
+            // struct's DECLARED field order, silently storing each value
+            // in the wrong field slot at runtime (e.g. a `Соответствие`
+            // ending up in a `Строка`-typed slot) — a real bug, not
+            // detected by type-checking, which discards on runtime
+          // access.
+            for (arguments) |argument| try self.compileExpression(argument);
+            if (arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
             const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(structure) });
             try self.function.emit(self.compiler.result.allocator, .{ .build_struct = .{
                 .name_constant = name_constant,
-                .field_count = @intCast(call.arguments.len),
+                .field_count = @intCast(arguments.len),
             } });
             return;
         }
@@ -851,6 +869,10 @@ const FunctionCompiler = struct {
             try self.function.emit(self.compiler.result.allocator, .{ .io_println = {} });
             return true;
         }
+        if (call.arguments.len == 0 and std.mem.eql(u8, property.property, "прочитать_строку")) {
+            try self.function.emit(self.compiler.result.allocator, .{ .io_read_line = {} });
+            return true;
+        }
         return false;
     }
 
@@ -875,13 +897,15 @@ const FunctionCompiler = struct {
             .{ .name = "заканчивается_на", .argc = 2, .instr = .{ .str_ends_with = {} } },
             .{ .name = "начинается_с", .argc = 2, .instr = .{ .str_starts_with = {} } },
             .{ .name = "содержит", .argc = 2, .instr = .{ .str_contains = {} } },
-            .{ .name = "найти", .argc = 2, .instr = .{ .str_find = {} } },
+            .{ .name = "найти", .argc = 3, .instr = .{ .str_find = {} } },
             .{ .name = "заменить", .argc = 3, .instr = .{ .str_replace = {} } },
             .{ .name = "обрезать", .argc = 1, .instr = .{ .str_trim = {} } },
             .{ .name = "разбить", .argc = 2, .instr = .{ .str_split = {} } },
             .{ .name = "соединить", .argc = 2, .instr = .{ .str_join = {} } },
             .{ .name = "срез", .argc = 3, .instr = .{ .str_slice = {} } },
             .{ .name = "цифра_или_буква", .argc = 1, .instr = .{ .str_is_digit_or_letter = {} } },
+            .{ .name = "это_буква", .argc = 1, .instr = .{ .str_is_letter = {} } },
+            .{ .name = "это_цифра", .argc = 1, .instr = .{ .str_is_digit = {} } },
         };
         for (ops) |op| {
             if (call.arguments.len == op.argc and std.mem.eql(u8, property.property, op.name)) {
@@ -1137,6 +1161,8 @@ const FunctionCompiler = struct {
                 .{ .array_append = {} }
             else if (std.mem.eql(u8, property.property, "содержит") and call.arguments.len == 1)
                 .{ .array_contains = {} }
+            else if (std.mem.eql(u8, property.property, "срез") and call.arguments.len == 2)
+                .{ .array_slice = {} }
             else
                 return false,
             .map => if (std.mem.eql(u8, property.property, "длина") and call.arguments.len == 0)

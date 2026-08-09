@@ -33,13 +33,13 @@ pub fn nativeModuleExports(name: []const u8) ?[]const []const u8 {
         .{ .name = "фс", .exports = &.{ "есть", "удалить", "прочитать", "записать", "открыть", "это_директория", "создать_директорию", "список_директории", "удалить_директорию" } },
         .{ .name = "ос", .exports = &.{ "аргументы", "версия_паноса", "окружение", "установить_окружение", "удалить_окружение", "выполнить", "завершить" } },
         .{ .name = "время", .exports = &.{ "сейчас_мс", "монотонно_мс", "спать_мс" } },
-        .{ .name = "ввод_вывод", .exports = &.{ "печать", "строка" } },
+        .{ .name = "ввод_вывод", .exports = &.{ "печать", "строка", "прочитать_строку" } },
         .{ .name = "строки", .exports = &.{
             "байт",             "длина_байт",   "срез_байт", "из_байтов",
             "в_число",          "из_числа",     "из_целого", "верхний_регистр",
             "заканчивается_на", "начинается_с", "содержит",  "найти",
             "заменить",         "обрезать",     "разбить",   "соединить",
-            "срез",             "цифра_или_буква",
+            "срез",             "цифра_или_буква", "это_буква", "это_цифра",
         } },
         .{ .name = "DOM", .exports = &.{ "текст", "установить_текст", "на_клик" } },
         .{ .name = "сжатие", .exports = &.{"разжать_gzip"} },
@@ -319,7 +319,14 @@ const Resolver = struct {
         // `.прочитать_строку`/`.поток` (`target.zig`'s `native_only` list
         // already anticipates both by name) need the same async-stdin
         // machinery `Файл`'s streaming reads use, a separate follow-up.
-        try self.installBuiltinModule("ввод_вывод", &.{ "печать", "строка" });
+        // `прочитать_строку` — real gap found auditing panosiki's
+        // `cli-selector` package (an interactive menu that reads real
+        // stdin lines to drive its prompts): blocking, native-only (see
+        // `target.zig`'s `native_only` list, which already anticipated
+        // this exact name) — returns `Опция(Строка)`, `Нет()` on EOF
+        // rather than an empty string, so callers can distinguish "user
+        // pressed Enter on an empty line" from "stdin closed".
+        try self.installBuiltinModule("ввод_вывод", &.{ "печать", "строка", "прочитать_строку" });
         // `строки` — the other half of the panosiki audit's headline gap:
         // completely absent (not native, no `std/строки.ps`), yet docs
         // (`docs/src/language/basic-types.md` §"Байты") describe byte-level
@@ -336,7 +343,7 @@ const Resolver = struct {
             "в_число",          "из_числа",         "из_целого",   "верхний_регистр",
             "заканчивается_на", "начинается_с",     "содержит",    "найти",
             "заменить",         "обрезать",         "разбить",     "соединить",
-            "срез",             "цифра_или_буква",
+            "срез",             "цифра_или_буква",  "это_буква",   "это_цифра",
         });
         // `DOM` — AOT WASM only (`target.zig`'s `builtinAvailability`), a
         // minimal numeric-only slice: no object-table runtime, so
@@ -370,6 +377,28 @@ const Resolver = struct {
         try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });
         try self.installPreludeInterface("Сравниваемое");
         try self.installPreludeInterface("Итерируемое");
+        // `Печатаемое` — real gap found auditing panosiki's `cli` package
+        // (`реализация Печатаемое для X`): DECLARED in the embedded
+        // prelude source (`prelude.zig`) alongside `Сравниваемое`/
+        // `Итерируемое`, but the real CLI run path never actually loads
+        // that embedded module at all (`zig/cli/main.zig`'s `main()`
+        // never calls `graph.appendPreludeModule` — only the LSP/test-
+        // harness entry points do) — so `Печатаемое` was NEVER resolvable
+        // as a symbol for a normal `panos file.ps` run, unlike
+        // `Сравниваемое`/`Итерируемое`, which work ONLY because of this
+        // same hardcoded `installPreludeInterface` call plus a matching
+        // hardcoded `interface_definitions` entry in `type_checker.zig`'s
+        // `preludePass`. `Печатаемое`'s `вСтроку() -> Строка` has no
+        // self-referencing parameter/return type at all (unlike
+        // `Сравниваемое`'s `сравнить(другое: Сравниваемое) -> Число`),
+        // so it needs none of that interface's `Никогда`-placeholder
+        // workaround — a plain, ordinary interface method signature.
+        // `Складываемое`/`Вычитаемое`/`Умножаемое`/`Делимое`/`Копируемое`/
+        // `Равнозначное` (also declared in the same dead prelude source)
+        // are NOT added here — their methods return the implementing
+        // type itself ("Self"), which this hardcoded-prelude mechanism
+        // has no substitution mechanism for; a separate, larger fix.
+        try self.installPreludeInterface("Печатаемое");
     }
 
     fn installBuiltinModule(self: *Resolver, name: []const u8, exports: []const []const u8) !void {
@@ -764,10 +793,18 @@ const Resolver = struct {
             .is_pattern_binder = is_pattern_binder,
             .span = span,
         });
-        self.scopes.declare(&self.result.symbols, symbol) catch |err| switch (err) {
-            error.DuplicateSymbol => try self.report(span, "Resolve Error: символ '{s}' уже объявлен", .{name}),
-            else => return err,
-        };
+        // `_` is the universal discard binder (params, `пер`, pattern
+        // binders alike) — it's meant to be written arbitrarily many
+        // times in the same scope (e.g. two discarded lambda parameters,
+        // `функ(_: А, _: Б)`) without ever being looked up again, so it's
+        // deliberately exempt from the duplicate-declaration check that
+        // every other name is subject to.
+        if (!std.mem.eql(u8, name, "_")) {
+            self.scopes.declare(&self.result.symbols, symbol) catch |err| switch (err) {
+                error.DuplicateSymbol => try self.report(span, "Resolve Error: символ '{s}' уже объявлен", .{name}),
+                else => return err,
+            };
+        }
         if (track_unused and !std.mem.eql(u8, name, "_")) try self.unused_check_symbols.put(symbol, {});
         return symbol;
     }
@@ -923,7 +960,30 @@ const Resolver = struct {
             },
             .constructor => |constructor| {
                 if (constructor.module_name) |owner_name| {
-                    const owner_symbol = try self.scopes.lookupTrackingCaptures(&self.result.symbols, owner_name) orelse symbols.invalid_symbol;
+                    // `parser.zig`'s 3-level qualified pattern
+                    // (`алиас.Тип.Вариант(...)`) concatenates the first
+                    // two segments into ONE `module_name` string
+                    // ("алиас.Тип") rather than keeping them separate —
+                    // a plain scope lookup of that compound string can
+                    // never succeed (scopes only ever hold bare
+                    // identifiers). Real gap found auditing panosiki's
+                    // `скобки` package: matching an ALIASED cross-module
+                    // enum in `выбор` (`алиас.Тип.Вариант(...)`, as
+                    // opposed to the un-aliased same-module `Тип.
+                    // Вариант(...)` case, which already worked via a
+                    // direct single-name lookup) always failed
+                    // "неопределённый тип перечисления". Fixed by
+                    // splitting on the LAST '.' and resolving in two
+                    // steps — module alias, then that module's own
+                    // member — exactly like an ordinary `алиас.Тип`
+                    // qualified type annotation already does elsewhere.
+                    const owner_symbol = self.scopes.lookupTrackingCaptures(&self.result.symbols, owner_name) catch null orelse blk: {
+                        const separator = std.mem.lastIndexOfScalar(u8, owner_name, '.') orelse break :blk null;
+                        const module_alias = owner_name[0..separator];
+                        const type_name = owner_name[separator + 1 ..];
+                        const module_symbol = try self.scopes.lookupTrackingCaptures(&self.result.symbols, module_alias) orelse break :blk null;
+                        break :blk self.moduleMember(module_symbol, type_name);
+                    } orelse symbols.invalid_symbol;
                     const owner = self.result.symbols.get(owner_symbol);
                     if (owner) |entry| {
                         if (entry.kind == .type) {

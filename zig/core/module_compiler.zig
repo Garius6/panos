@@ -102,10 +102,35 @@ const ImportContext = struct {
         next_nominal_identity: *u32,
         graph: *const module_loader.Graph,
     ) !void {
+        // `Результат`/`Опция` are prelude types — EVERY module gets its
+        // OWN freshly-minted symbol for them (the embedded prelude source
+        // is merged unqualified into each file's own resolution, see
+        // `resolver.zig`'s `predeclareUnqualifiedImport`), so an exported
+        // function/field type referencing "the source module's Результат"
+        // was structurally unrelated to "this module's Результат" as far
+        // as `copyImportedType`'s `.nominal` case was concerned — it's
+        // not a REAL cross-module import (`resolution.imported_symbols`
+        // never contains it), so nothing ever bridged the two. Real gap
+        // found auditing panosiki: ANY imported function returning
+        // `Результат(T, Ошибка)` (i.e. basically every function that can
+        // fail) silently became `poison` on the calling side once
+        // `copyImportedType` failed to find it — `.значение()`/`.ошибка()`
+        // then failed "у типа нет поля" instead of working normally.
+        // Fixed by bridging, ONCE per distinct target module this file
+        // actually imports from: that module's own `Результат`/`Опция`
+        // symbol → THIS module's own `Результат`/`Опция` symbol, with
+        // `identity = 0` so `TypeStore.eql`'s nominal comparison falls
+        // back to comparing symbols directly — exactly the same shape a
+        // purely LOCAL (never-imported) usage of `Результат` already
+        // produces in this same file.
+        var bridged_modules: std.AutoHashMap(usize, void) = .init(self.allocator);
+        defer bridged_modules.deinit();
+
         var imported_symbols = resolution.imported_symbols.iterator();
         while (imported_symbols.next()) |entry| {
             const imported_symbol = entry.key_ptr.*;
             const origin = entry.value_ptr.*;
+            try bridged_modules.put(origin.module, {});
             const exported = resolution.symbols.get(imported_symbol) orelse continue;
             const target = &modules[origin.module];
             const target_resolution = if (target.resolution) |*value| value else return error.ImportNotCompiled;
@@ -187,6 +212,7 @@ const ImportContext = struct {
             }
         }
         for (resolution.imported_methods.items) |binding| {
+            try bridged_modules.put(binding.origin.module, {});
             const target = &modules[binding.origin.module];
             const target_resolution = if (target.resolution) |*value| value else return error.ImportNotCompiled;
             const target_checked = if (target.checked) |*value| value else return error.ImportNotChecked;
@@ -206,8 +232,35 @@ const ImportContext = struct {
                 .function_id = function_id,
             });
         }
+
+        const prelude_type_names = [_][]const u8{ "Результат", "Опция" };
+        var touched = bridged_modules.keyIterator();
+        while (touched.next()) |module_index_ptr| {
+            const target = &modules[module_index_ptr.*];
+            const target_resolution = if (target.resolution) |*value| value else return error.ImportNotCompiled;
+            const target_checked = if (target.checked) |*value| value else return error.ImportNotChecked;
+            for (prelude_type_names) |name| {
+                const source_symbol = findLocalTypeSymbol(target_resolution, name) orelse continue;
+                const local_symbol = findLocalTypeSymbol(resolution, name) orelse continue;
+                try self.nominals.append(self.allocator, .{
+                    .store = &target_checked.types,
+                    .source_symbol = source_symbol,
+                    .local_symbol = local_symbol,
+                    .identity = 0,
+                });
+            }
+        }
     }
 };
+
+fn findLocalTypeSymbol(resolution: *const resolver.Resolution, name: []const u8) ?symbols.SymbolId {
+    for (resolution.symbols.symbols.items[1..], 1..) |entry, index| {
+        if (entry.kind == .type and entry.module_path == null and std.mem.eql(u8, entry.name, name)) {
+            return @enumFromInt(index);
+        }
+    }
+    return null;
+}
 
 fn nominalIdentity(
     identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),

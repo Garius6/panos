@@ -1176,6 +1176,30 @@ const Parser = struct {
                 end = (try self.expect(.end, "Синтаксическая ошибка: блок ветки 'выбор' не закрыт 'конец'")).span;
             } else {
                 _ = try self.expect(.arrow, "Синтаксическая ошибка: после шаблона 'выбор' ожидается '->'");
+                // `Шаблон -> возврат значение` (or bare `возврат`) — real
+                // gap found auditing panosiki's `скобки`: `возврат` starts
+                // a STATEMENT (`parseReturn`), not a valid expression, so
+                // `parseExpression` below always failed immediately for
+                // this otherwise completely ordinary early-return arm
+                // body; only `Шаблон -> значение` (no `возврат`) ever
+                // worked. `возврат` needs its own statement parse here,
+                // same special-case `если`-as-single-arm-statement bodies
+                // don't need (an ordinary expression already covers those).
+                if (self.at(.return_expr)) {
+                    const statement = try self.parseReturn();
+                    body = try self.result.ast.copySlice(ast.StmtId, &.{statement});
+                    end = self.result.ast.stmt(statement).return_stmt.span;
+                    self.consumeSemicolons();
+                    if (!self.at(.end) and !self.at(.eof) and !self.peek().nl_before) {
+                        try self.report(self.peek().span, "Синтаксическая ошибка: несколько выражений в одной строке ветки 'выбор' — используйте 'тогда ... конец' для нескольких операторов");
+                    }
+                    try arms.append(self.result.allocator, .{
+                        .span = spanFrom(arm_start, end),
+                        .pattern = pattern,
+                        .body = body,
+                    });
+                    continue;
+                }
                 const value = try self.parseExpression(0);
                 const statement = try self.result.ast.addStmt(.{ .expr = .{
                     .span = self.astExprSpan(value),

@@ -1337,6 +1337,7 @@ pub const Vm = struct {
             .string_length => try self.stringLength(),
             .array_get_or => try self.arrayGetOr(),
             .array_contains => try self.arrayContains(),
+            .array_slice => try self.arraySlice(),
             .build_map => |count| try self.buildMap(count),
             .map_length => try self.mapLength(),
             .map_get_or => try self.mapGetOr(),
@@ -1374,6 +1375,7 @@ pub const Vm = struct {
             .time_sleep => try self.timeSleep(),
             .io_print => try self.ioPrint(false),
             .io_println => try self.ioPrint(true),
+            .io_read_line => try self.ioReadLine(),
             .str_byte => try self.strByte(),
             .str_len_bytes => try self.strLenBytes(),
             .str_slice_bytes => try self.strSliceBytes(),
@@ -1392,6 +1394,8 @@ pub const Vm = struct {
             .str_join => try self.strJoin(),
             .str_slice => try self.strSlice(),
             .str_is_digit_or_letter => try self.strIsDigitOrLetter(),
+            .str_is_letter => try self.strIsLetter(),
+            .str_is_digit => try self.strIsDigit(),
             .int_cast => try self.intCast(),
             .to_display_string => try self.toDisplayString(),
             .gzip_decompress => try self.gzipDecompress(),
@@ -2034,9 +2038,46 @@ pub const Vm = struct {
             }
             var io = std.Io.Threaded.init(self.allocator, .{});
             defer io.deinit();
+            // `std.Io.Threaded.init(allocator, .{})` (no `.environ`
+            // supplied) sets `environ_initialized = options.environ.
+            // block.isEmpty()` to TRUE (Zig 0.16's `Io/Threaded.zig`) —
+            // so the lazy `scanEnviron()` call inside `processSpawn*`
+            // sees "already initialized" and skips scanning the REAL OS
+            // environment entirely, spawning every child with a
+            // completely EMPTY environment. Real bug found auditing
+            // panosiki's `gitsync` (`ос.установить_окружение(...)`
+            // followed by `ос.выполнить(...)` — the fake-1cv8 test
+            // harness reads `$GITSYNC_TEST_MAX_VERSION` to know when to
+            // stop, so the version-probing loop in `sync.ps` never saw
+            // the variable and looped until the DEFAULT fallback of
+            // 999999, spawning a subprocess per iteration — indistinguishable
+            // from an infinite hang). Worked around entirely within this
+            // function (no VM-wide `Io` plumbing exists to fix at the
+            // source) by hand-building an `Environ.Map` from the live
+            // libc `environ` global (mutated in place by `ос.
+            // установить_окружение`'s `setenv`, see `osEnvSet`) and
+            // passing it explicitly via `RunOptions.environ_map` —
+            // bypassing `Io.Threaded`'s broken auto-scan path entirely.
+            const raw_environ: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+            var environ_len: usize = 0;
+            while (raw_environ[environ_len] != null) : (environ_len += 1) {}
+            var environ_map = try std.process.Environ.createMap(.{ .block = .{ .slice = raw_environ[0..environ_len :null] } }, self.allocator);
+            defer environ_map.deinit();
+            // An empty `working_dir` means "run in the current directory"
+            // (documented contract, matches every real panosiki caller —
+            // `configurator.ps`/`storage_manager.ps` both pass `""` when
+            // they have no specific directory to chdir into) — real bug
+            // found auditing `v8runner`: `.{ .path = "" }` was passed to
+            // `Child.Cwd` UNCONDITIONALLY, and Zig 0.16's `chdir("")`
+            // fails `error.FileNotFound` (POSIX `chdir` rejects an empty
+            // path outright) — so EVERY `ос.выполнить(..., "")` call
+            // failed before the child process even spawned, regardless
+            // of whether the program path itself was valid.
+            const cwd: std.process.Child.Cwd = if (working_dir.len == 0) .inherit else .{ .path = working_dir };
             const result = std.process.run(self.allocator, io.io(), .{
                 .argv = argv.items,
-                .cwd = .{ .path = working_dir },
+                .cwd = cwd,
+                .environ_map = &environ_map,
             }) catch |err| {
                 try self.pushErrorResultForModule("ос", @errorName(err));
                 return;
@@ -2127,6 +2168,50 @@ pub const Vm = struct {
         defer io.deinit();
         std.Io.sleep(io.io(), .fromMilliseconds(clamped), .awake) catch {};
         try self.stack.append(self.allocator, .{ .number = millis });
+    }
+
+    // Blocking, line-buffered real-stdin read — real gap found auditing
+    // panosiki's `cli-selector` package (an interactive menu that reads
+    // stdin lines to drive prompts): `native_only` per `target.zig`
+    // (already anticipated this exact name before it was implemented) —
+    // a browser tab has no real stdin to block on, same rationale as
+    // `время.спать_мс`'s freestanding panic. Returns `Результат.Неудача`
+    // only on IMMEDIATE EOF (zero bytes ever read) — a final
+    // unterminated line before EOF still comes back as `Успех(...)`,
+    // matching normal `readline`/`fgets` behavior elsewhere.
+    fn ioReadLine(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("ввод_вывод::прочитать_строку", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "ввод_вывод::прочитать_строку", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'ввод_вывод::прочитать_строку' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.allocator);
+        var got_any = false;
+        var buf: [1]u8 = undefined;
+        while (true) {
+            const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch |err| {
+                try self.fault("Runtime Error: не удалось прочитать stdin: {s}", .{@errorName(err)});
+                return;
+            };
+            if (n == 0) break;
+            got_any = true;
+            if (buf[0] == '\n') break;
+            try line.append(self.allocator, buf[0]);
+        }
+        if (!got_any) {
+            try self.pushErrorResultForModule("ввод_вывод", "EOF");
+            return;
+        }
+        var slice = line.items;
+        if (slice.len > 0 and slice[slice.len - 1] == '\r') slice = slice[0 .. slice.len - 1];
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, slice));
+        try self.pushSuccessResult(.{ .heap_string = heap_string });
     }
 
     fn ioPrint(self: *Vm, newline: bool) anyerror!void {
@@ -2329,6 +2414,7 @@ pub const Vm = struct {
     // найти возвращает рановый индекс") — converts the byte offset
     // `std.mem.indexOf` finds by counting codepoints up to it.
     fn strFind(self: *Vm) anyerror!void {
+        const start_value = try self.pop();
         const needle_value = try self.pop();
         const string_value = try self.pop();
         const string = string_value.stringBytes() orelse {
@@ -2339,15 +2425,21 @@ pub const Vm = struct {
             try self.fault("Runtime Error: строки.найти() ожидает строки", .{});
             return;
         };
-        const byte_offset = std.mem.indexOf(u8, string, needle) orelse {
-            try self.pushOption(null);
+        const start_rune = try self.arrayIndex(start_value);
+        const start_byte = try self.runeByteOffset(string, start_rune);
+        if (start_byte > string.len) {
+            try self.stack.append(self.allocator, .{ .number = -1 });
+            return;
+        }
+        const relative_offset = std.mem.indexOf(u8, string[start_byte..], needle) orelse {
+            try self.stack.append(self.allocator, .{ .number = -1 });
             return;
         };
-        const rune_index = std.unicode.utf8CountCodepoints(string[0..byte_offset]) catch {
+        const rune_index = std.unicode.utf8CountCodepoints(string[0 .. start_byte + relative_offset]) catch {
             try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
             return;
         };
-        try self.pushOption(.{ .number = @floatFromInt(rune_index) });
+        try self.stack.append(self.allocator, .{ .number = @floatFromInt(rune_index) });
     }
 
     fn strReplace(self: *Vm) anyerror!void {
@@ -2504,6 +2596,55 @@ pub const Vm = struct {
             else => false,
         };
         try self.stack.append(self.allocator, .{ .boolean = is_match });
+    }
+
+    fn strIsLetter(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.это_буква() ожидает строку", .{});
+            return;
+        };
+        if (string.len == 0) {
+            try self.stack.append(self.allocator, .{ .boolean = false });
+            return;
+        }
+        var view = std.unicode.Utf8View.init(string) catch {
+            try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+            return;
+        };
+        var iterator = view.iterator();
+        const codepoint = iterator.nextCodepoint() orelse {
+            try self.stack.append(self.allocator, .{ .boolean = false });
+            return;
+        };
+        const is_match = switch (codepoint) {
+            'a'...'z', 'A'...'Z' => true,
+            0x0410...0x044F, 0x0401, 0x0451 => true, // А-Я, а-я, Ё, ё
+            else => false,
+        };
+        try self.stack.append(self.allocator, .{ .boolean = is_match });
+    }
+
+    fn strIsDigit(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.это_цифра() ожидает строку", .{});
+            return;
+        };
+        if (string.len == 0) {
+            try self.stack.append(self.allocator, .{ .boolean = false });
+            return;
+        }
+        var view = std.unicode.Utf8View.init(string) catch {
+            try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+            return;
+        };
+        var iterator = view.iterator();
+        const codepoint = iterator.nextCodepoint() orelse {
+            try self.stack.append(self.allocator, .{ .boolean = false });
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .boolean = codepoint >= '0' and codepoint <= '9' });
     }
 
     // `Целое(x)` — truncates toward zero, a no-op if `x` is already an
@@ -4704,6 +4845,28 @@ pub const Vm = struct {
             return;
         }
         try self.stack.append(self.allocator, .{ .boolean = false });
+    }
+
+    fn arraySlice(self: *Vm) anyerror!void {
+        const end_value = try self.pop();
+        const start_value = try self.pop();
+        const runtime_value = try self.pop();
+        const array = switch (runtime_value) {
+            .array => |array| array,
+            else => {
+                try self.fault("Runtime Error: .срез() доступен только для массива", .{});
+                return;
+            },
+        };
+        const start = try self.arrayIndex(start_value);
+        const end = try self.arrayIndex(end_value);
+        if (start > end or end > array.elements.len) {
+            try self.fault("Runtime Error: .срез(): границы вне диапазона", .{});
+            return;
+        }
+        const copy = try self.allocator.dupe(value.Value, array.elements[start..end]);
+        const result = try self.heap.createArray(copy);
+        try self.stack.append(self.allocator, .{ .array = result });
     }
 
     fn buildMap(self: *Vm, count: u16) !void {

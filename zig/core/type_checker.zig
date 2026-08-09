@@ -532,6 +532,29 @@ const Checker = struct {
     // struct field and `T` in one of its imported methods land on the SAME
     // local type — without it (null), `.generic_parameter` stays unsupported,
     // preserving prior behavior for non-generic imports.
+    // A NESTED type reference that can't be copied (see `copyImportedType`'s
+    // `.nominal` case) degrades to `poison` HERE instead of failing the
+    // WHOLE containing type — `poison` is universally assignable
+    // (`assignable`'s own top check), so one field/parameter/return
+    // reaching a type from a module the current file doesn't import
+    // directly (`Менеджер.логгер: слог.Логгер` when only `Менеджер`'s
+    // module is imported) no longer takes down the entire struct/method
+    // signature with it. Real gap found auditing panosiki: a method whose
+    // signature touched ANY such transitively-unsupported type used to
+    // vanish ENTIRELY from `self.result.methods` (the top-level `catch
+    // ... continue` in `importSignaturePass`), producing "у типа нет поля
+    // '...'" for methods that have NOTHING to do with the actually-broken
+    // type. The TOP-level call (`imports.symbols`' own `try
+    // self.copyImportedType(...)`) still propagates the error uncaught —
+    // that one path wants the "импортированный экспорт '...' использует
+    // пока неподдерживаемый тип" diagnostic, not a silent poison.
+    fn copyImportedTypeOrPoison(self: *Checker, external_store: *const types.TypeStore, external_type: types.TypeId, nominals: []const ImportedNominal, generic_remap: ?*const std.AutoHashMap(types.TypeId, types.TypeId)) anyerror!types.TypeId {
+        return self.copyImportedType(external_store, external_type, nominals, generic_remap) catch |err| switch (err) {
+            error.UnsupportedImportedType => self.result.types.poison(),
+            else => err,
+        };
+    }
+
     fn copyImportedType(self: *Checker, external_store: *const types.TypeStore, external_type: types.TypeId, nominals: []const ImportedNominal, generic_remap: ?*const std.AutoHashMap(types.TypeId, types.TypeId)) !types.TypeId {
         const entry = external_store.get(external_type) orelse return error.UnsupportedImportedType;
         return switch (entry.*) {
@@ -547,32 +570,32 @@ const Checker = struct {
             .tuple => |elements| blk: {
                 var copied: std.ArrayList(types.TypeId) = .empty;
                 defer copied.deinit(self.result.allocator);
-                for (elements) |element| try copied.append(self.result.allocator, try self.copyImportedType(external_store, element, nominals, generic_remap));
+                for (elements) |element| try copied.append(self.result.allocator, try self.copyImportedTypeOrPoison(external_store, element, nominals, generic_remap));
                 break :blk self.result.types.tuple(copied.items);
             },
             .function => |function| blk: {
                 var copied: std.ArrayList(types.TypeId) = .empty;
                 defer copied.deinit(self.result.allocator);
-                for (function.parameters) |parameter| try copied.append(self.result.allocator, try self.copyImportedType(external_store, parameter, nominals, generic_remap));
-                break :blk self.result.types.function(copied.items, try self.copyImportedType(external_store, function.return_type, nominals, generic_remap));
+                for (function.parameters) |parameter| try copied.append(self.result.allocator, try self.copyImportedTypeOrPoison(external_store, parameter, nominals, generic_remap));
+                break :blk self.result.types.function(copied.items, try self.copyImportedTypeOrPoison(external_store, function.return_type, nominals, generic_remap));
             },
             .nominal => |nominal| blk: {
                 for (nominals) |imported| {
                     if (imported.store != external_store or imported.source_symbol != nominal.symbol) continue;
                     var arguments: std.ArrayList(types.TypeId) = .empty;
                     defer arguments.deinit(self.result.allocator);
-                    for (nominal.arguments) |argument| try arguments.append(self.result.allocator, try self.copyImportedType(external_store, argument, nominals, generic_remap));
+                    for (nominal.arguments) |argument| try arguments.append(self.result.allocator, try self.copyImportedTypeOrPoison(external_store, argument, nominals, generic_remap));
                     break :blk self.result.types.nominalWithIdentity(imported.local_symbol, imported.identity, arguments.items);
                 }
                 return error.UnsupportedImportedType;
             },
-            .array => |element| self.result.types.array(try self.copyImportedType(external_store, element, nominals, generic_remap)),
+            .array => |element| self.result.types.array(try self.copyImportedTypeOrPoison(external_store, element, nominals, generic_remap)),
             .map => |map| self.result.types.map(
-                try self.copyImportedType(external_store, map.key, nominals, generic_remap),
-                try self.copyImportedType(external_store, map.value, nominals, generic_remap),
+                try self.copyImportedTypeOrPoison(external_store, map.key, nominals, generic_remap),
+                try self.copyImportedTypeOrPoison(external_store, map.value, nominals, generic_remap),
             ),
-            .process => |message| self.result.types.process(try self.copyImportedType(external_store, message, nominals, generic_remap)),
-            .pointer => |pointee| self.result.types.pointer(try self.copyImportedType(external_store, pointee, nominals, generic_remap)),
+            .process => |message| self.result.types.process(try self.copyImportedTypeOrPoison(external_store, message, nominals, generic_remap)),
+            .pointer => |pointee| self.result.types.pointer(try self.copyImportedTypeOrPoison(external_store, pointee, nominals, generic_remap)),
             .generic_parameter => blk: {
                 const remap = generic_remap orelse return error.UnsupportedImportedType;
                 break :blk remap.get(external_type) orelse return error.UnsupportedImportedType;
@@ -693,6 +716,7 @@ const Checker = struct {
         const result_symbol = self.findTypeSymbol("Результат") orelse return;
         const comparable_symbol = self.findTypeSymbol("Сравниваемое") orelse return;
         const iterable_symbol = self.findTypeSymbol("Итерируемое") orelse return;
+        const printable_symbol = self.findTypeSymbol("Печатаемое");
         const option_parameters = try self.defineGenericEnumParameters(&.{"T"});
         const result_parameters = try self.defineGenericEnumParameters(&.{ "T", "E" });
         const option_variants = try self.result.arena.allocator().alloc(EnumVariant, 2);
@@ -746,6 +770,18 @@ const Checker = struct {
             .parameters = iterable_parameters,
             .methods = iterable_methods,
         });
+        if (printable_symbol) |symbol| {
+            const printable_methods = try self.result.arena.allocator().alloc(InterfaceMethod, 1);
+            printable_methods[0] = .{
+                .name = "вСтроку",
+                .parameters = &.{},
+                .return_type = self.result.types.builtins.string,
+            };
+            try self.result.interface_definitions.put(symbol, .{
+                .parameters = &.{},
+                .methods = printable_methods,
+            });
+        }
     }
 
     // Panos-side type for a `внешний` parameter/return marshal kind —
@@ -1456,7 +1492,27 @@ const Checker = struct {
         const then_type = try self.inferBlockExpected(conditional.then_branch, expected);
         const else_type = try self.inferBlockExpected(conditional.else_branch, expected);
         const joined = if (self.isNever(then_type)) else_type else if (self.isNever(else_type)) then_type else null;
-        if (joined == null and (!self.assignable(then_type, else_type) or !self.assignable(else_type, then_type))) {
+        // `both_satisfy_expected` — when `expected` is known AND both
+        // branches are ALREADY individually valid against it (checked
+        // again, explicitly, right below), the pairwise mutual check is
+        // skipped: `assignable` isn't symmetric for interfaces, so two
+        // branches that each satisfy an interface-typed `expected` (one
+        // via a bare interface-typed value, the other via a concrete
+        // implementor — e.g. `слог.Логгер` vs a bare `СтандартныйЛоггер`)
+        // can still fail the OLD mutual check against each other even
+        // though the join is perfectly sound. Scoped narrowly to that
+        // case (not "skip whenever expected != null") so a GENUINELY
+        // mismatched pair (e.g. one branch's actual type failing
+        // `expected` outright) still falls through to the pairwise
+        // check below and keeps reporting the same
+        // "ветви 'если' возвращают разные типы" message existing tests
+        // rely on, rather than the different "не совпадают с ожидаемым
+        // типом" message from the check further down.
+        const both_satisfy_expected = if (expected) |expected_type|
+            (self.isNever(then_type) or self.assignable(then_type, expected_type)) and (self.isNever(else_type) or self.assignable(else_type, expected_type))
+        else
+            false;
+        if (joined == null and !both_satisfy_expected and (!self.assignable(then_type, else_type) or !self.assignable(else_type, then_type))) {
             try self.report(conditional.span, "Type Error: ветви 'если' возвращают разные типы", .{});
             return self.result.types.poison();
         }
@@ -1533,14 +1589,36 @@ const Checker = struct {
                 }
             }
             const arm_type = try self.inferBlockExpected(arm.body, expected);
-            if (result_type) |previous| {
-                if (self.isNever(previous)) {
+            // When `expected` is known (the match sits in a context with
+            // a declared type — a function's return position, an
+            // annotated `пер`, ...), each arm is ALREADY validated
+            // against it individually just below — that alone is enough
+            // to prove the join is sound, so the separate pairwise
+            // mutual-assignability check between arms is skipped
+            // entirely in that case. Real gap found auditing panosiki's
+            // `gitsync` (`выбор контекст.логгер \n Опция.Есть(л) -> л \n
+            // Опция.Нет -> слог.логгер().с_уровнем(...) \n конец`,
+            // function declared `-> слог.Логгер`): one arm's value is
+            // already interface-typed (`л`, unwrapped from
+            // `Опция(слог.Логгер)`), the other a CONCRETE
+            // `СтандартныйЛоггер` — each is individually assignable to
+            // the declared `слог.Логгер` (one directly, one via
+            // interface implementation), but `assignable` is NOT
+            // symmetric for interface types (a concrete struct is
+            // assignable TO an interface it implements, never the
+            // reverse) — the old pairwise check compared the two arms
+            // directly against EACH OTHER (mutually, both directions)
+            // and always failed for exactly this legitimate pattern.
+            if (expected == null) {
+                if (result_type) |previous| {
+                    if (self.isNever(previous)) {
+                        result_type = arm_type;
+                    } else if (!self.isNever(arm_type) and (!self.assignable(previous, arm_type) or !self.assignable(arm_type, previous))) {
+                        try self.report(arm.span, "Type Error: ветви выбора возвращают разные типы", .{});
+                    }
+                } else {
                     result_type = arm_type;
-                } else if (!self.isNever(arm_type) and (!self.assignable(previous, arm_type) or !self.assignable(arm_type, previous))) {
-                    try self.report(arm.span, "Type Error: ветви выбора возвращают разные типы", .{});
                 }
-            } else {
-                result_type = arm_type;
             }
             if (expected) |expected_type| {
                 if (!self.assignable(arm_type, expected_type)) try self.report(arm.span, "Type Error: ветвь выбора не совпадает с ожидаемым типом", .{});
@@ -2496,6 +2574,21 @@ const Checker = struct {
                 _ = try self.infer(call.arguments[0]);
                 return self.result.types.builtins.void;
             }
+            if (self.isBuiltinModule(symbol, "ввод_вывод", "прочитать_строку")) {
+                if (call.arguments.len != 0) {
+                    try self.report(call.span, "Type Error: ввод_вывод.прочитать_строку() не принимает аргументов", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                }
+                // `Результат(Строка, Ошибка)`, NOT `Опция(Строка)` — real
+                // usage found auditing panosiki's `cli-selector`
+                // (`строка_ввода.ошибка()`/`.значение()`): EOF is
+                // reported as a real `Неудача(Ошибка(...))`, matching
+                // every OTHER native I/O builtin that can fail
+                // (`фс.прочитать`, `сеть.http_запрос`, ...), not the
+                // `Опция` shape this was first (wrongly) modeled after.
+                const result_symbol = self.findTypeSymbol("Результат") orelse return self.result.types.poison();
+                return self.nominalType(result_symbol, &.{ self.result.types.builtins.string, self.result.types.builtins.error_value });
+            }
             if (self.isBuiltinModule(symbol, "строки", "байт")) {
                 if (call.arguments.len != 2) {
                     try self.report(call.span, "Type Error: строки.байт() ожидает 2 аргумента", .{});
@@ -2606,6 +2699,18 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.boolean;
             }
+            if (self.isBuiltinModule(symbol, "строки", "это_буква") or self.isBuiltinModule(symbol, "строки", "это_цифра")) {
+                const name = if (self.isBuiltinModule(symbol, "строки", "это_буква")) "это_буква" else "это_цифра";
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.{s}() ожидает 1 аргумент", .{name});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.boolean;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.{s}() ожидает строку", .{name});
+                }
+                return self.result.types.builtins.boolean;
+            }
             if (self.isBuiltinModule(symbol, "строки", "заканчивается_на") or
                 self.isBuiltinModule(symbol, "строки", "начинается_с") or
                 self.isBuiltinModule(symbol, "строки", "содержит"))
@@ -2629,18 +2734,27 @@ const Checker = struct {
                 return self.result.types.builtins.boolean;
             }
             if (self.isBuiltinModule(symbol, "строки", "найти")) {
-                const result_type = self.optionOf(self.result.types.builtins.integer) orelse return self.result.types.poison();
-                if (call.arguments.len != 2) {
-                    try self.report(call.span, "Type Error: строки.найти() ожидает 2 аргумента", .{});
+                // (s, подстрока, начало: Целое) -> Целое (-1, если не
+                // найдено) — matches every REAL caller found auditing
+                // panosiki (`gitrunner/git.ps`, `std/флаги.ps`, both
+                // `строки.найти(s, "=", 0)` compared against `-1`
+                // directly), not the `Опция(Целое)`/2-argument shape
+                // invented here originally with no real caller to check
+                // against.
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: строки.найти() ожидает 3 аргумента", .{});
                     for (call.arguments) |argument| _ = try self.infer(argument);
-                    return result_type;
+                    return self.result.types.builtins.integer;
                 }
-                for (call.arguments) |argument| {
+                for (call.arguments[0..2]) |argument| {
                     if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
-                        try self.report(call.span, "Type Error: строки.найти() ожидает строки", .{});
+                        try self.report(call.span, "Type Error: строки.найти() ожидает строки первым и вторым аргументом", .{});
                     }
                 }
-                return result_type;
+                if (!self.isNumeric(try self.infer(call.arguments[2]))) {
+                    try self.report(call.span, "Type Error: строки.найти() ожидает начальный индекс-число третьим аргументом", .{});
+                }
+                return self.result.types.builtins.integer;
             }
             if (self.isBuiltinModule(symbol, "строки", "заменить")) {
                 if (call.arguments.len != 3) {
@@ -2905,6 +3019,7 @@ const Checker = struct {
                 if (try self.inferProcessMethod(call, property, object_type)) |method_type| return method_type;
                 if (try self.inferPreludeEnumMethod(call, property, object_type)) |method_type| return method_type;
                 if (try self.inferInterfaceCall(expression, call, property, object_type)) |method_type| return method_type;
+                if (try self.inferGenericBoundInterfaceCall(expression, call, property, object_type)) |method_type| return method_type;
                 if (try self.inferMethodCall(expression, call, property, object_type)) |method_type| return method_type;
                 const object = self.result.types.get(object_type) orelse return self.result.types.poison();
                 switch (object.*) {
@@ -2945,6 +3060,15 @@ const Checker = struct {
                                 try self.report(call.span, "Type Error: элемент массива имеет неверный тип", .{});
                             }
                             return self.result.types.builtins.boolean;
+                        }
+                        if (std.mem.eql(u8, property.property, "срез")) {
+                            try self.checkMethodArity(call, "срез", 2);
+                            for (call.arguments) |argument| {
+                                if (!self.isNumeric(try self.infer(argument))) {
+                                    try self.report(call.span, "Type Error: .срез() ожидает границы-числа", .{});
+                                }
+                            }
+                            return object_type;
                         }
                     },
                     .map => |map| {
@@ -3032,6 +3156,34 @@ const Checker = struct {
                         const actual = try self.inferExpected(argument, expected);
                         if (!self.assignable(actual, expected)) {
                             try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
+                        } else if (try self.interfaceBoundOf(parameter, generic_parameters)) |bound| {
+                            // Generic function whose parameter is bound by
+                            // a user-defined interface (`функ ф[T: ИзTOML]
+                            // (это: T, ...)`), called with a concrete
+                            // struct argument. Panos generic functions are
+                            // NOT monomorphized (compiled once, generically
+                            // — no per-call-site specialization exists at
+                            // all), so `это.метод()` inside the generic
+                            // body has no concrete type to dispatch
+                            // against; the ONLY mechanism this VM has for
+                            // dispatching a method call without knowing
+                            // the concrete type at compile time is the
+                            // existing interface vtable (`Cast_Interface`/
+                            // `Invoke_Interface`). Casting the ARGUMENT to
+                            // the bound interface type here (instead of to
+                            // `expected`, which — since substitution
+                            // resolves T to the argument's OWN concrete
+                            // type — is always a same-type no-op cast) is
+                            // what makes that dispatch possible: the value
+                            // actually entering the generic function's `T`
+                            // parameter slot is the interface-wrapped
+                            // runtime representation, so `inferMethodCall`'s
+                            // sibling handling for `.generic_parameter`
+                            // receiver types (see `interfaceBoundOf`/
+                            // `inferInterfaceCall`) can compile `это.метод()`
+                            // as an ordinary `call_interface` against that
+                            // same vtable — no monomorphization needed.
+                            try self.registerInterfaceCast(argument, actual, try self.nominalType(bound, &.{}));
                         } else {
                             try self.registerInterfaceCast(argument, actual, expected);
                         }
@@ -3050,35 +3202,84 @@ const Checker = struct {
             },
             .nominal => |nominal| {
                 if (self.result.generic_nominal_fields.get(nominal.symbol)) |generic_nominal| {
-                    if (call.arguments.len != generic_nominal.fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора структуры", .{});
-                    const shared = @min(call.arguments.len, generic_nominal.fields.len);
+                    // Named-argument constructor calls (`Тип(поле = x,
+                    // ...)`) were NEVER reordered here — every field got
+                    // checked in DECLARATION order regardless of what
+                    // order the CALLER actually wrote them in. Real gap
+                    // found auditing panosiki's `cli` package
+                    // (`Конфигурация(флаги = ..., действие = Опция.
+                    // Нет(), ...)`, field order in the call not matching
+                    // declaration order): `Опция.Нет()` got checked
+                    // against an unrelated field's type, so its own
+                    // generic `T` could never be inferred ("не удалось
+                    // вывести type-параметр 'T'"). Same
+                    // `reorderNamedArguments`/`call_arguments` cache a
+                    // regular named-argument FUNCTION call already used
+                    // above — `compiler.zig`'s `compileCall` already
+                    // reads that SAME cache for codegen, so fixing the
+                    // order here is enough for both type-checking AND
+                    // codegen.
+                    const arguments = if (call.argument_names) |_| blk: {
+                        const names = try self.result.arena.allocator().alloc([]const u8, generic_nominal.fields.len);
+                        for (generic_nominal.fields, names) |field, *name| name.* = field.name;
+                        break :blk try self.reorderNamedArguments(expression, call, names);
+                    } else call.arguments;
+                    if (arguments.len != generic_nominal.fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора структуры", .{});
+                    const shared = @min(arguments.len, generic_nominal.fields.len);
                     var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
                     defer substitutions.deinit();
-                    for (call.arguments[0..shared], generic_nominal.fields[0..shared]) |argument, field| {
+                    for (arguments[0..shared], generic_nominal.fields[0..shared]) |argument, field| {
                         try self.inferGenericSubstitution(field.typ, try self.infer(argument), &substitutions, call.span);
                     }
-                    var arguments: std.ArrayList(types.TypeId) = .empty;
-                    defer arguments.deinit(self.result.allocator);
+                    var type_arguments: std.ArrayList(types.TypeId) = .empty;
+                    defer type_arguments.deinit(self.result.allocator);
                     for (generic_nominal.parameters) |parameter| {
                         if (substitutions.get(parameter.typ)) |argument| {
-                            try arguments.append(self.result.allocator, argument);
+                            try type_arguments.append(self.result.allocator, argument);
                         } else {
                             try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
-                            try arguments.append(self.result.allocator, try self.result.types.poison());
+                            try type_arguments.append(self.result.allocator, try self.result.types.poison());
                         }
                     }
-                    const constructor_type = try self.nominalType(nominal.symbol, arguments.items);
-                    for (call.arguments[0..shared], generic_nominal.fields[0..shared]) |argument, field| {
+                    const constructor_type = try self.nominalType(nominal.symbol, type_arguments.items);
+                    for (arguments[0..shared], generic_nominal.fields[0..shared]) |argument, field| {
                         const expected = try self.substituteGeneric(field.typ, &substitutions);
-                        if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент конструктора не совпадает с типом поля", .{});
+                        const actual = try self.inferExpected(argument, expected);
+                        if (!self.assignable(actual, expected)) {
+                            try self.report(call.span, "Type Error: аргумент конструктора не совпадает с типом поля", .{});
+                        } else {
+                            try self.registerInterfaceCast(argument, actual, expected);
+                        }
                     }
                     return constructor_type;
                 }
                 if (self.result.nominal_fields.get(nominal.symbol)) |fields| {
-                    if (call.arguments.len != fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора структуры", .{});
-                    const shared = @min(call.arguments.len, fields.len);
-                    for (call.arguments[0..shared], fields[0..shared]) |argument, field| {
-                        if (!self.assignable(try self.inferExpected(argument, field.typ), field.typ)) try self.report(call.span, "Type Error: аргумент конструктора не совпадает с типом поля", .{});
+                    const arguments = if (call.argument_names) |_| blk: {
+                        const names = try self.result.arena.allocator().alloc([]const u8, fields.len);
+                        for (fields, names) |field, *name| name.* = field.name;
+                        break :blk try self.reorderNamedArguments(expression, call, names);
+                    } else call.arguments;
+                    if (arguments.len != fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора структуры", .{});
+                    const shared = @min(arguments.len, fields.len);
+                    for (arguments[0..shared], fields[0..shared]) |argument, field| {
+                        // `registerInterfaceCast` — real gap found
+                        // auditing panosiki: every OTHER argument-check
+                        // site (return, method call, enum variant) already
+                        // calls this on success; a plain struct
+                        // constructor never did, so `Держатель(слог.
+                        // логгер())` (a field typed `слог.Логгер`, an
+                        // interface, given a concrete `СтандартныйЛоггер`)
+                        // stored the raw concrete value uncast — calling
+                        // `.инфо(...)` on that field later crashed at
+                        // runtime ("попытка вызвать интерфейсный метод у
+                        // не-интерфейса") since the compiler had no cast
+                        // recorded to compile a real `Cast_Interface`.
+                        const actual = try self.inferExpected(argument, field.typ);
+                        if (!self.assignable(actual, field.typ)) {
+                            try self.report(call.span, "Type Error: аргумент конструктора не совпадает с типом поля", .{});
+                        } else {
+                            try self.registerInterfaceCast(argument, actual, field.typ);
+                        }
                     }
                     return callee_type;
                 }
@@ -3224,6 +3425,45 @@ const Checker = struct {
         };
     }
 
+    // Returns the FIRST interface bound of `parameter`, if `parameter`
+    // (as written in the declaration, before generic substitution) is a
+    // `.generic_parameter` type with at least one interface bound.
+    // "first" — real usage in practice (`std/кодирование/toml.ps`'s
+    // `[T: ИзTOML]`/`[T: ВTOML]`) never declares more than one bound per
+    // parameter; a value can only be `Cast_Interface`'d to ONE interface
+    // type at a time anyway (see `registerInterfaceCast`'s single
+    // `interface_casts` entry per expression), so multiple bounds would
+    // need a genuinely different mechanism this doesn't attempt.
+    fn interfaceBoundOf(self: *const Checker, parameter: types.TypeId, generic_parameters: []const GenericParameter) !?symbols.SymbolId {
+        const entry = self.result.types.get(parameter) orelse return null;
+        if (entry.* != .generic_parameter) return null;
+        for (generic_parameters) |candidate| {
+            if (candidate.typ != parameter) continue;
+            for (candidate.bounds) |bound| {
+                // `Сравниваемое` is deliberately EXCLUDED here — it has
+                // its own, older, non-vtable dispatch mechanism for
+                // generic-bound comparisons (`compiler.zig`'s
+                // `registerComparableMethods`/`addComparableMethod`,
+                // driven by the VM looking up a method by the runtime
+                // value's OWN struct name, not by an interface vtable).
+                // That mechanism requires the value to arrive at the
+                // generic function PLAIN (uncast) — an ordinary Число or
+                // an ordinary struct aggregate — so casting it to the
+                // interface type here (turning it into an
+                // interface-wrapped runtime value) would break `a > b`
+                // dispatch for every existing `[T: Сравниваемое]` caller.
+                // Every OTHER user-defined interface bound has no such
+                // pre-existing mechanism, so casting is the only way
+                // `это.метод()` inside the generic body can dispatch at
+                // all (see `inferGenericBoundInterfaceCall`).
+                if (self.isComparableInterface(bound)) continue;
+                return bound;
+            }
+            return null;
+        }
+        return null;
+    }
+
     fn nominalType(self: *Checker, symbol: symbols.SymbolId, arguments: []const types.TypeId) !types.TypeId {
         if (self.result.imported_nominal_identities.get(symbol)) |identity| {
             return self.result.types.nominalWithIdentity(symbol, identity, arguments);
@@ -3270,6 +3510,28 @@ const Checker = struct {
         if (self.result.interface_definitions.get(expected_nominal.symbol)) |interface| {
             if (interface.parameters.len != expected_nominal.arguments.len) return false;
             return self.interfaceImplementation(expected_nominal.symbol, expected_nominal.arguments, actual_nominal.symbol) != null;
+        }
+        // Same generic struct/enum, argument-wise assignable (not `eql`)
+        // type arguments — e.g. `Селектор(poison)` vs the declared
+        // `Селектор(T)`. Mirrors the array/map elementwise-assignable
+        // recursion just above; real gap found auditing panosiki's
+        // `cli-selector` (`функ новый_селектор[T](...) -> Селектор(T)`
+        // whose body constructs `Селектор(заголовок, массив())` — the
+        // struct's own `T` can't be inferred from an EMPTY array
+        // argument, so `fillUnknownWithPoison` substitutes `poison`
+        // there; without this case, `eql`'s exact-match requirement
+        // rejected `Селектор(poison)` against the declared `Селектор(T)`
+        // return type even though `poison` is assignable to/from
+        // anything, including `T`).
+        const same_declaration = if (actual_nominal.identity != 0 or expected_nominal.identity != 0)
+            actual_nominal.identity != 0 and actual_nominal.identity == expected_nominal.identity
+        else
+            actual_nominal.symbol == expected_nominal.symbol;
+        if (same_declaration and actual_nominal.arguments.len == expected_nominal.arguments.len) {
+            for (actual_nominal.arguments, expected_nominal.arguments) |actual_argument, expected_argument| {
+                if (!self.assignable(actual_argument, expected_argument)) return false;
+            }
+            return true;
         }
         return false;
     }
@@ -3416,6 +3678,61 @@ const Checker = struct {
             .method_index = @intCast(index),
         });
         return @as(?types.TypeId, try self.substituteGeneric(method.return_type, &substitutions));
+    }
+
+    // `это.метод()` where `это`'s static type is a bare GENERIC
+    // PARAMETER bound by a user-defined interface (inside the body of a
+    // generic function like `функ разобрать_в[T: ИзTOML](это: T, ...)`
+    // in `std/кодирование/toml.ps`) — real gap found auditing panosiki's
+    // `configor` package. Panos generics are never monomorphized, so
+    // there is no concrete type available here to resolve `.метод`
+    // against; this compiles the call exactly like `inferInterfaceCall`
+    // (an ordinary `call_interface`/vtable dispatch) against whichever
+    // bound interface declares the method — safe ONLY because callers
+    // are required (see `interfaceBoundOf`, used at every generic
+    // function-call site) to have already cast their concrete argument
+    // to that SAME interface type before it reaches this parameter, so
+    // the runtime value here already carries a real vtable to dispatch
+    // through.
+    fn inferGenericBoundInterfaceCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
+        const object = self.result.types.get(object_type) orelse return null;
+        if (object.* != .generic_parameter) return null;
+        var bounds: []const symbols.SymbolId = &.{};
+        for (self.current_generic_parameters) |parameter| {
+            if (parameter.typ != object_type) continue;
+            bounds = parameter.bounds;
+            break;
+        }
+        for (bounds) |bound| {
+            if (self.isComparableInterface(bound)) continue;
+            const definition = self.result.interface_definitions.get(bound) orelse continue;
+            var method_index: ?usize = null;
+            for (definition.methods, 0..) |method, index| {
+                if (std.mem.eql(u8, method.name, property.property)) {
+                    method_index = index;
+                    break;
+                }
+            }
+            const index = method_index orelse continue;
+            const method = definition.methods[index];
+            if (call.arguments.len != method.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов метода", .{});
+            const shared = @min(call.arguments.len, method.parameters.len);
+            for (call.arguments[0..shared], method.parameters[0..shared]) |argument, parameter| {
+                const actual = try self.inferExpected(argument, parameter);
+                if (!self.assignable(actual, parameter)) {
+                    try self.report(call.span, "Type Error: аргумент метода не совпадает с типом параметра", .{});
+                } else {
+                    try self.registerInterfaceCast(argument, actual, parameter);
+                }
+            }
+            if (index > std.math.maxInt(u16)) return error.MethodLimitReached;
+            try self.result.interface_calls.put(expression, .{
+                .interface = bound,
+                .method_index = @intCast(index),
+            });
+            return @as(?types.TypeId, method.return_type);
+        }
+        return null;
     }
 
     fn inferProcessMethod(self: *Checker, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
@@ -3843,8 +4160,41 @@ const Checker = struct {
         return expected;
     }
 
+    // Structurally walks `type_id`, filling `poison` into `substitutions`
+    // for every bare generic-parameter reached that isn't already
+    // constrained — used when `inferGenericSubstitution` hits a shape it
+    // can't unify against (most commonly an EMPTY array/map literal,
+    // `массив()`/`соответствие()`, whose element type is already
+    // `poison` per its own inference rule — see `assignable`'s array/map
+    // cases). Real gap found auditing panosiki's `cli-selector`
+    // (`Селектор(заголовок, массив())` inside `новый_селектор[T]`,
+    // constructing `Селектор[T]{пункты: Массив(Пункт(T))}` from an empty
+    // array): without this, `T` was NEVER added to `substitutions` at
+    // all (the old code just silently `return`ed on the shape mismatch),
+    // so the very next pass reported "не удалось вывести type-параметр"
+    // even though the missing type is provably safe to leave as
+    // `poison` (assignable to/from anything, same reasoning `assignable`
+    // already applies to empty-literal elements directly).
+    fn fillUnknownWithPoison(self: *Checker, type_id: types.TypeId, substitutions: *std.AutoHashMap(types.TypeId, types.TypeId)) !void {
+        const entry = self.result.types.get(type_id) orelse return;
+        switch (entry.*) {
+            .generic_parameter => {
+                if (!substitutions.contains(type_id)) try substitutions.put(type_id, try self.result.types.poison());
+            },
+            .tuple => |elements| for (elements) |element| try self.fillUnknownWithPoison(element, substitutions),
+            .array => |element| try self.fillUnknownWithPoison(element, substitutions),
+            .map => |map| {
+                try self.fillUnknownWithPoison(map.key, substitutions);
+                try self.fillUnknownWithPoison(map.value, substitutions);
+            },
+            .nominal => |nominal| for (nominal.arguments) |argument| try self.fillUnknownWithPoison(argument, substitutions),
+            else => {},
+        }
+    }
+
     fn inferGenericSubstitution(self: *Checker, parameter: types.TypeId, argument: types.TypeId, substitutions: *std.AutoHashMap(types.TypeId, types.TypeId), span: source.Span) !void {
         const parameter_type = self.result.types.get(parameter) orelse return;
+        if (self.isPoison(argument)) return self.fillUnknownWithPoison(parameter, substitutions);
         switch (parameter_type.*) {
             .generic_parameter => {
                 if (substitutions.get(parameter)) |existing| {

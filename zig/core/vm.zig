@@ -1806,7 +1806,7 @@ pub const Vm = struct {
         // Kept in sync manually with Odin's `PANOS_VERSION` (`core/vm.odin`)
         // — there is no single source of truth shared between the two
         // implementations during the migration.
-        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, "0.3.0"));
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, "0.3.1"));
         try self.stack.append(self.allocator, .{ .heap_string = heap_string });
     }
 

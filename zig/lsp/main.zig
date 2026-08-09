@@ -1620,7 +1620,7 @@ pub fn main(init: std.process.Init) !void {
         // with a normal, successful exit) instead of an uncaught error.
         const message = readMessage(init.gpa, stdin) catch |err| {
             var stderr_buffer: [256]u8 = undefined;
-            var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
+            var stderr_file_writer: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &stderr_buffer);
             stderr_file_writer.interface.print("panos-lsp: транспортная ошибка, останавливаюсь: {t}\n", .{err}) catch {};
             stderr_file_writer.interface.flush() catch {};
             break;

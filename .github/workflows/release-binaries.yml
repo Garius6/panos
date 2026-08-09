@@ -45,7 +45,7 @@ jobs:
       # release build is never the FIRST time this exact platform/optimize
       # combination has been compiled.
       - name: Установить Zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: "0.16.0"
 

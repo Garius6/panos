@@ -39,8 +39,16 @@ const EmitContext = struct {
     // callee up here and emits a direct `call`.
     value_to_function: std.AutoHashMap(mir.ValueId, mir.FunctionId),
     use_count: std.AutoHashMap(mir.ValueId, u32),
+    // `call_builtin`'s "модуль::имя" (`time_now`/`time_monotonic`
+    // строки) → WASM import function index — empty for any module that
+    // never calls a builtin (the common case; see `collectBuiltinNames`).
+    builtin_index: *const std.StringHashMap(u32),
+    // Every string CONSTANT literal in the module → its byte offset into
+    // the module's own static data section (see `collectStringConstants`)
+    // — empty for any module with no string literals at all.
+    string_offsets: *const std.StringHashMap(u32),
 
-    fn init(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, function: *const mir.Function, func_index: *const std.AutoHashMap(mir.FunctionId, u32)) !EmitContext {
+    fn init(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, function: *const mir.Function, func_index: *const std.AutoHashMap(mir.FunctionId, u32), builtin_index: *const std.StringHashMap(u32), string_offsets: *const std.StringHashMap(u32)) !EmitContext {
         var cfg = try mir_cfg.computeCfgInfo(allocator, function);
         errdefer cfg.deinit();
         var rpo_index = try wasm_stackify.buildRpoIndex(allocator, &cfg);
@@ -59,6 +67,8 @@ const EmitContext = struct {
             .visited = .init(allocator),
             .value_to_function = .init(allocator),
             .use_count = use_count,
+            .builtin_index = builtin_index,
+            .string_offsets = string_offsets,
         };
     }
 
@@ -106,6 +116,7 @@ fn computeUseCount(allocator: std.mem.Allocator, function: *const mir.Function) 
                     try countUse(&counts, call.callee);
                     for (call.args) |arg| try countUse(&counts, arg);
                 },
+                .call_builtin => |call| for (call.args) |arg| try countUse(&counts, arg),
                 .const_value, .load_local, .function_ref => {},
                 else => unsupported("вид MIR-инструкции при подсчёте использований"),
             }
@@ -269,7 +280,11 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
                     try code.append(allocator, 0x41); // i32.const
                     try wasm_module.writeSleb128(code, allocator, if (b) 1 else 0);
                 },
-                .string => unsupported("строковая константа (нет object-table рантайма)"),
+                .string => |s| {
+                    const offset = ctx.string_offsets.get(s) orelse unsupported("строковая константа без выделенного смещения (баг сборки data-секции)");
+                    try code.append(allocator, 0x41); // i32.const
+                    try wasm_module.writeSleb128(code, allocator, @intCast(offset));
+                },
             }
             return c.dst;
         },
@@ -330,6 +345,13 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try wasm_module.writeUleb128(code, allocator, function_index);
             return call.dst;
         },
+        .call_builtin => |call| {
+            for (call.args) |_| {} // время.сейчас_мс/монотонно_мс take no args — nothing to replay yet.
+            const import_index = ctx.builtin_index.get(call.name) orelse unsupported("call_builtin без соответствующего host-импорта");
+            try code.append(allocator, 0x10); // call
+            try wasm_module.writeUleb128(code, allocator, import_index);
+            return call.dst;
+        },
         else => unsupported("вид MIR-инструкции"),
     }
 }
@@ -339,8 +361,10 @@ pub fn emitFunctionWasm(
     checked: *const type_checker.CheckResult,
     function: *const mir.Function,
     func_index: *const std.AutoHashMap(mir.FunctionId, u32),
+    builtin_index: *const std.StringHashMap(u32),
+    string_offsets: *const std.StringHashMap(u32),
 ) ![]u8 {
-    var ctx = try EmitContext.init(allocator, checked, function, func_index);
+    var ctx = try EmitContext.init(allocator, checked, function, func_index, builtin_index, string_offsets);
     defer ctx.deinit();
 
     _ = try processFrom(&ctx, function.entry, mir.invalid_block);
@@ -358,13 +382,116 @@ pub fn emitFunctionWasm(
     return try out.toOwnedSlice(allocator);
 }
 
-// Assembles a complete, standalone `.wasm` binary — Type/Function/Export/
-// Code sections, one function type per MIR function (no deduplication —
-// wasteful but valid, matching the Odin original's own choice not to
-// bother sharing signatures), every function exported under its MIR name.
-// No imports at all in this Phase-1a slice (no builtins/`внешний`/actors
-// lowered yet), so the WASM function index space is simply the MIR
-// module's function order, 1:1.
+// `call_builtin`'s "модуль::имя" name → the host runtime export it needs
+// (`zig/wasm_runtime/runtime_wasi.zig`/`runtime_js.zig`'s `pw_now_ms`/
+// `pw_monotonic_ms` — built for exactly this, previously never called by
+// anything). `время.спать_мс` never reaches this function at all —
+// `mir_lowering.zig`'s `lowerTimeBuiltinCall` panics before producing a
+// `call_builtin` for it (native-only builtin, not an AOT WASM host call).
+fn hostImportNameForBuiltin(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "время::сейчас_мс")) return "pw_now_ms";
+    if (std.mem.eql(u8, name, "время::монотонно_мс")) return "pw_monotonic_ms";
+    // `DOM::*` — a Строка ARGUMENT (CSS selector / handler name) is an i32
+    // byte-offset handle into the module's own data section (see
+    // `wasmValType`/`collectStringConstants`) — the host reads a
+    // null-terminated UTF-8 run starting at that offset out of the
+    // module's exported `memory`, exactly like a C string. No object-table
+    // runtime needed for this narrow case: these are always COMPILE-TIME
+    // constant strings (literal selectors/handler names), never
+    // dynamically computed panos values.
+    if (std.mem.eql(u8, name, "DOM::текст")) return "dom_get_text_num";
+    if (std.mem.eql(u8, name, "DOM::установить_текст")) return "dom_set_text_num";
+    if (std.mem.eql(u8, name, "DOM::на_клик")) return "dom_on_click_num";
+    unsupported("call_builtin с именем без известного host-импорта");
+}
+
+const BuiltinSignature = struct { params: []const u8, result: ?u8 };
+
+fn builtinSignature(name: []const u8) BuiltinSignature {
+    if (std.mem.eql(u8, name, "время::сейчас_мс") or std.mem.eql(u8, name, "время::монотонно_мс"))
+        return .{ .params = &.{}, .result = wasm_module.wasm_f64 };
+    if (std.mem.eql(u8, name, "DOM::текст"))
+        return .{ .params = &.{wasm_module.wasm_i32}, .result = wasm_module.wasm_f64 };
+    if (std.mem.eql(u8, name, "DOM::установить_текст"))
+        return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_f64 }, .result = null };
+    if (std.mem.eql(u8, name, "DOM::на_клик"))
+        return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
+    unsupported("call_builtin с именем без известной сигнатуры импорта");
+}
+
+// Every DISTINCT string literal any function in `module` uses, concatenated
+// null-terminated (matching `hostImportNameForBuiltin`'s "read a C string
+// out of memory" contract) into one blob — the returned map gives each
+// string's byte OFFSET into that blob. Empty for any module with no string
+// literals at all (the common case — no memory/data section needed then).
+fn collectStringConstants(allocator: std.mem.Allocator, module: *const mir.Module) !struct {
+    data: []u8,
+    offsets: std.StringHashMap(u32),
+} {
+    var offsets: std.StringHashMap(u32) = .init(allocator);
+    errdefer offsets.deinit();
+    var data: std.ArrayList(u8) = .empty;
+    errdefer data.deinit(allocator);
+    for (module.functions.items) |function| {
+        for (function.blocks.items) |block| {
+            for (block.instructions.items) |instruction| {
+                switch (instruction) {
+                    .const_value => |c| switch (c.value) {
+                        .string => |s| {
+                            if (!offsets.contains(s)) {
+                                try offsets.put(s, @intCast(data.items.len));
+                                try data.appendSlice(allocator, s);
+                                try data.append(allocator, 0); // null terminator
+                            }
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    return .{ .data = try data.toOwnedSlice(allocator), .offsets = offsets };
+}
+
+// Every DISTINCT builtin name any function in `module` calls, in first-seen
+// order — the common case (no builtin calls anywhere) returns an empty
+// list, so a program that never touches `время.*` gets a WASM module with
+// NO import section at all, same as before this feature existed (no host
+// needs to supply anything to run it).
+fn collectBuiltinNames(allocator: std.mem.Allocator, module: *const mir.Module) !std.ArrayList([]const u8) {
+    var seen: std.StringHashMap(void) = .init(allocator);
+    defer seen.deinit();
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(allocator);
+    for (module.functions.items) |function| {
+        for (function.blocks.items) |block| {
+            for (block.instructions.items) |instruction| {
+                switch (instruction) {
+                    .call_builtin => |call| {
+                        if (!seen.contains(call.name)) {
+                            try seen.put(call.name, {});
+                            try names.append(allocator, call.name);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    return names;
+}
+
+// Assembles a complete, standalone `.wasm` binary — Type/Import/Function/
+// Export/Code sections, one function type per MIR function (no
+// deduplication — wasteful but valid, matching the Odin original's own
+// choice not to bother sharing signatures), every function exported under
+// its MIR name. WASM's function index space is imports-first: every
+// `call_builtin` name used anywhere in `module` becomes ONE import (module
+// "env", field = `hostImportNameForBuiltin`'s host export name) at the
+// FRONT of the index space, so every module-defined function's real index
+// is `builtin_count + declaration_order` — `func_index`/`function_section`/
+// `export_section` all apply that same offset consistently.
 // `mir_validate.zig`'s own construction-time invariants already guarantee
 // `mir_lowering.zig`'s OWN output is well-formed — but running this here
 // unconditionally is what turns a FUTURE lowering bug into a clean error
@@ -387,13 +514,39 @@ fn validateOrFail(allocator: std.mem.Allocator, checked: *const type_checker.Che
 
 pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, module: *const mir.Module) ![]u8 {
     try validateOrFail(allocator, checked, module);
+
+    var builtin_names = try collectBuiltinNames(allocator, module);
+    defer builtin_names.deinit(allocator);
+    const builtin_count: u32 = @intCast(builtin_names.items.len);
+
+    var builtin_index: std.StringHashMap(u32) = .init(allocator);
+    defer builtin_index.deinit();
+    for (builtin_names.items, 0..) |name, i| try builtin_index.put(name, @intCast(i));
+
+    var strings = try collectStringConstants(allocator, module);
+    defer allocator.free(strings.data);
+    defer strings.offsets.deinit();
+    const needs_memory = strings.data.len != 0;
+
     var func_index: std.AutoHashMap(mir.FunctionId, u32) = .init(allocator);
     defer func_index.deinit();
-    for (module.functions.items, 0..) |function, i| try func_index.put(function.id, @intCast(i));
+    for (module.functions.items, 0..) |function, i| try func_index.put(function.id, builtin_count + @as(u32, @intCast(i)));
 
+    // Import types come FIRST in the type section — import type index `i`
+    // is simply `i` for `i < builtin_count`, per each builtin's own
+    // `builtinSignature` (NOT uniformly `() -> f64` any more — `DOM.*`
+    // needs real params/void results too).
     var type_section: std.ArrayList(u8) = .empty;
     defer type_section.deinit(allocator);
-    try wasm_module.writeUleb128(&type_section, allocator, module.functions.items.len);
+    try wasm_module.writeUleb128(&type_section, allocator, builtin_count + module.functions.items.len);
+    for (builtin_names.items) |name| {
+        const signature = builtinSignature(name);
+        try type_section.append(allocator, 0x60); // functype
+        try wasm_module.writeUleb128(&type_section, allocator, signature.params.len);
+        for (signature.params) |param_type| try type_section.append(allocator, param_type);
+        try wasm_module.writeUleb128(&type_section, allocator, if (signature.result != null) 1 else 0);
+        if (signature.result) |result_type| try type_section.append(allocator, result_type);
+    }
     for (module.functions.items) |function| {
         try type_section.append(allocator, 0x60); // functype
         try wasm_module.writeUleb128(&type_section, allocator, function.parameters.len);
@@ -406,26 +559,70 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         if (!is_void) try type_section.append(allocator, wasm_module.wasmValType(checked, function.result_type));
     }
 
+    var import_section: std.ArrayList(u8) = .empty;
+    defer import_section.deinit(allocator);
+    if (builtin_count != 0) {
+        try wasm_module.writeUleb128(&import_section, allocator, builtin_count);
+        for (builtin_names.items, 0..) |name, i| {
+            const host_name = hostImportNameForBuiltin(name);
+            try wasm_module.writeUleb128(&import_section, allocator, "env".len);
+            try import_section.appendSlice(allocator, "env");
+            try wasm_module.writeUleb128(&import_section, allocator, host_name.len);
+            try import_section.appendSlice(allocator, host_name);
+            try import_section.append(allocator, 0x00); // func import kind
+            try wasm_module.writeUleb128(&import_section, allocator, i); // typeidx
+        }
+    }
+
     var function_section: std.ArrayList(u8) = .empty;
     defer function_section.deinit(allocator);
     try wasm_module.writeUleb128(&function_section, allocator, module.functions.items.len);
-    for (0..module.functions.items.len) |i| try wasm_module.writeUleb128(&function_section, allocator, i);
+    for (0..module.functions.items.len) |i| try wasm_module.writeUleb128(&function_section, allocator, builtin_count + i);
+
+    // One page (64 KiB) is always enough for this backend's ONLY use of
+    // linear memory — a flat blob of literal strings, no dynamic
+    // allocation of any kind (`DOM.*` args are the only strings that ever
+    // exist here, and they're all compile-time constants).
+    var memory_section: std.ArrayList(u8) = .empty;
+    defer memory_section.deinit(allocator);
+    var data_section: std.ArrayList(u8) = .empty;
+    defer data_section.deinit(allocator);
+    if (needs_memory) {
+        const pages: u32 = @intCast((strings.data.len + 65535) / 65536);
+        try wasm_module.writeUleb128(&memory_section, allocator, 1); // 1 memory
+        try memory_section.append(allocator, 0x00); // limits: min only, no max
+        try wasm_module.writeUleb128(&memory_section, allocator, @max(pages, 1));
+
+        try wasm_module.writeUleb128(&data_section, allocator, 1); // 1 active segment
+        try data_section.append(allocator, 0x00); // flags: active, memory 0
+        try data_section.append(allocator, 0x41); // i32.const
+        try wasm_module.writeSleb128(&data_section, allocator, 0); // offset 0
+        try data_section.append(allocator, 0x0B); // end
+        try wasm_module.writeUleb128(&data_section, allocator, strings.data.len);
+        try data_section.appendSlice(allocator, strings.data);
+    }
 
     var export_section: std.ArrayList(u8) = .empty;
     defer export_section.deinit(allocator);
-    try wasm_module.writeUleb128(&export_section, allocator, module.functions.items.len);
+    try wasm_module.writeUleb128(&export_section, allocator, module.functions.items.len + @as(usize, if (needs_memory) 1 else 0));
     for (module.functions.items, 0..) |function, i| {
         try wasm_module.writeUleb128(&export_section, allocator, function.name.len);
         try export_section.appendSlice(allocator, function.name);
         try export_section.append(allocator, 0x00); // func export kind
-        try wasm_module.writeUleb128(&export_section, allocator, i);
+        try wasm_module.writeUleb128(&export_section, allocator, builtin_count + i);
+    }
+    if (needs_memory) {
+        try wasm_module.writeUleb128(&export_section, allocator, "memory".len);
+        try export_section.appendSlice(allocator, "memory");
+        try export_section.append(allocator, 0x02); // memory export kind
+        try wasm_module.writeUleb128(&export_section, allocator, 0); // memidx 0
     }
 
     var code_section: std.ArrayList(u8) = .empty;
     defer code_section.deinit(allocator);
     try wasm_module.writeUleb128(&code_section, allocator, module.functions.items.len);
     for (module.functions.items) |function| {
-        const body = try emitFunctionWasm(allocator, checked, &function, &func_index);
+        const body = try emitFunctionWasm(allocator, checked, &function, &func_index, &builtin_index, &strings.offsets);
         defer allocator.free(body);
         try wasm_module.writeUleb128(&code_section, allocator, body.len);
         try code_section.appendSlice(allocator, body);
@@ -435,9 +632,12 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, &wasm_module.magic_and_version);
     try wasm_module.writeSection(&out, allocator, 1, type_section.items);
+    if (builtin_count != 0) try wasm_module.writeSection(&out, allocator, 2, import_section.items);
     try wasm_module.writeSection(&out, allocator, 3, function_section.items);
+    if (needs_memory) try wasm_module.writeSection(&out, allocator, 5, memory_section.items);
     try wasm_module.writeSection(&out, allocator, 7, export_section.items);
     try wasm_module.writeSection(&out, allocator, 10, code_section.items);
+    if (needs_memory) try wasm_module.writeSection(&out, allocator, 11, data_section.items);
     return try out.toOwnedSlice(allocator);
 }
 

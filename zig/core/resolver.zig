@@ -254,6 +254,14 @@ const Resolver = struct {
         // здесь, как и модуль `фс` выше, а не через встроенную прелюдию.
         try self.installBuiltinType("Файл");
         try self.installBuiltinModule("ос", &.{ "аргументы", "версия_паноса", "окружение", "установить_окружение", "удалить_окружение", "выполнить", "завершить" });
+        try self.installBuiltinModule("время", &.{ "сейчас_мс", "монотонно_мс", "спать_мс" });
+        // `DOM` — AOT WASM only (`target.zig`'s `builtinAvailability`), a
+        // minimal numeric-only slice: no object-table runtime, so
+        // `.текст`/`.установить_текст` work on a NUMBER (parsed/formatted
+        // as text by the host, see `docs/src/assets/dom-loader.js`), not a
+        // real `Строка` — element content that isn't a valid number reads
+        // as `0`, matching `DOM.текст`'s own doc comment.
+        try self.installBuiltinModule("DOM", &.{ "текст", "установить_текст", "на_клик" });
         try self.installBuiltinModule("сжатие", &.{"разжать_gzip"});
         try self.installBuiltinModule("синтаксис", &.{ "структуры", "поля", "аннотации", "аргумент_аннотации", "аннотации_поля", "аргумент_аннотации_поля" });
         try self.installBuiltinModule("сеть", &.{ "подключиться", "кодировать_url", "http_запрос", "http_сервер_слушать" });

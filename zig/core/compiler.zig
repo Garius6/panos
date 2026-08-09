@@ -520,6 +520,8 @@ const FunctionCompiler = struct {
         if (try self.compilePanicBuiltin(call)) return;
         if (try self.compileFilesystemBuiltin(call)) return;
         if (try self.compileOsBuiltin(call)) return;
+        if (try self.compileTimeBuiltin(call)) return;
+        if (try self.compileDomBuiltin(call)) return;
         if (try self.compileCompressBuiltin(call)) return;
         if (try self.compileSyntaxBuiltin(call)) return;
         if (try self.compileNetBuiltin(call)) return;
@@ -720,6 +722,56 @@ const FunctionCompiler = struct {
             return true;
         }
         return false;
+    }
+
+    fn compileTimeBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "время")) return false;
+        if (call.arguments.len == 0 and std.mem.eql(u8, property.property, "сейчас_мс")) {
+            try self.function.emit(self.compiler.result.allocator, .{ .time_now = {} });
+            return true;
+        }
+        if (call.arguments.len == 0 and std.mem.eql(u8, property.property, "монотонно_мс")) {
+            try self.function.emit(self.compiler.result.allocator, .{ .time_monotonic = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "спать_мс")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .time_sleep = {} });
+            return true;
+        }
+        return false;
+    }
+
+    // `DOM.*` is `aot_wasm_only` (`target.zig`'s `builtinAvailability`) —
+    // the bytecode VM (native CLI, browser interpreter) has no DOM opcode
+    // at all, only `mir_lowering.zig`/`wasm_emit.zig`'s AOT path knows how
+    // to lower it. A COMPILE-time diagnostic here would be wrong: `panos
+    // build --target=wasm` ALSO runs this same bytecode compiler as an
+    // incidental part of full analysis (`module_compiler.compileGraphForTarget`,
+    // used by every entry point, not just `panos run`) even though it
+    // never actually EXECUTES the resulting bytecode for that command — a
+    // hard compile error here would wrongly block a legitimate AOT wasm
+    // build. Instead this compiles to a genuine RUNTIME panic (same
+    // `.panic` opcode `паника(...)` uses), matching every OTHER
+    // cross-target-restricted builtin's OWN pattern
+    // (`target_policy.ensureRuntimeBuiltinAvailable` faulting inside
+    // `vm.zig`, not `compiler.zig`) — the panic only actually fires if
+    // someone runs a DOM-using program THROUGH the bytecode VM, which
+    // legitimately can never work, on any target.
+    fn compileDomBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "DOM")) return false;
+        const message = try self.compiler.program().copyString("DOM доступен только через panos build --target=wasm, не в этом runtime-таргете");
+        try self.emitConstant(.{ .string = message });
+        try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
+        return true;
     }
 
     fn compileCompressBuiltin(self: *FunctionCompiler, call: anytype) !bool {

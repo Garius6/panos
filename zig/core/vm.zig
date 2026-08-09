@@ -1106,6 +1106,12 @@ pub const Vm = struct {
     // there, same as Odin.
     program_args: []const []const u8 = &.{},
     async_queue: AsyncQueue = .{},
+    // Set on the FIRST `время.монотонно_мс()` call (native only — the
+    // freestanding wasm32 side has no clock of its own at all, see
+    // `timeMonotonic`) — every subsequent call reports elapsed time since
+    // this baseline, matching the documented "миллисекунды с момента
+    // старта VM" contract without needing a real "VM start" hook.
+    monotonic_baseline_ns: ?i96 = null,
 
     pub fn init(allocator: std.mem.Allocator, program: *const bytecode.Program) Vm {
         return .{
@@ -1280,6 +1286,9 @@ pub const Vm = struct {
             .os_env_unset => try self.osEnvUnset(),
             .os_exec => try self.osExec(),
             .os_exit => try self.osExit(),
+            .time_now => try self.timeNow(),
+            .time_monotonic => try self.timeMonotonic(),
+            .time_sleep => try self.timeSleep(),
             .gzip_decompress => try self.gzipDecompress(),
             .syntax_structs => try self.syntaxStructs(),
             .syntax_fields => try self.syntaxFields(),
@@ -1957,6 +1966,62 @@ pub const Vm = struct {
         } else {
             std.process.exit(@intFromFloat(code));
         }
+    }
+
+    // Host-provided clock for the freestanding wasm32 browser interpreter —
+    // wasm32-freestanding has no syscalls of its own (no `std.time`), so
+    // `время.сейчас_мс`/`.монотонно_мс` need the embedding JS to supply
+    // real time the same way `docs/src/assets/interactive.js`'s `env`
+    // import object already does for this exact purpose. Declared only
+    // here (not exported from `zig/browser/main.zig`) — an unreferenced
+    // `extern` on a non-wasm32 build is simply dead, never actually
+    // imported by the linker.
+    extern "env" fn panos_host_time_now_ms() f64;
+    extern "env" fn panos_host_tick_now_ms() f64;
+
+    fn timeNow(self: *Vm) anyerror!void {
+        const millis: f64 = if (comptime builtin.target.cpu.arch == .wasm32 and builtin.target.os.tag == .freestanding)
+            panos_host_time_now_ms()
+        else blk: {
+            var io: std.Io.Threaded = .init(self.allocator, .{});
+            defer io.deinit();
+            const now_ns = std.Io.Timestamp.now(io.io(), .real).nanoseconds;
+            break :blk @as(f64, @floatFromInt(now_ns)) / std.time.ns_per_ms;
+        };
+        try self.stack.append(self.allocator, .{ .number = millis });
+    }
+
+    fn timeMonotonic(self: *Vm) anyerror!void {
+        const millis: f64 = if (comptime builtin.target.cpu.arch == .wasm32 and builtin.target.os.tag == .freestanding)
+            panos_host_tick_now_ms()
+        else blk: {
+            var io: std.Io.Threaded = .init(self.allocator, .{});
+            defer io.deinit();
+            const now_ns = std.Io.Timestamp.now(io.io(), .awake).nanoseconds;
+            if (self.monotonic_baseline_ns == null) self.monotonic_baseline_ns = now_ns;
+            const delta_ns = now_ns - self.monotonic_baseline_ns.?;
+            break :blk @as(f64, @floatFromInt(delta_ns)) / std.time.ns_per_ms;
+        };
+        try self.stack.append(self.allocator, .{ .number = millis });
+    }
+
+    fn timeSleep(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("время::спать_мс", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "время::спать_мс", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const millis = try self.number(try self.pop());
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'время::спать_мс' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const clamped: i64 = if (millis > 0) @intFromFloat(millis) else 0;
+        var io: std.Io.Threaded = .init(self.allocator, .{});
+        defer io.deinit();
+        std.Io.sleep(io.io(), .fromMilliseconds(clamped), .awake) catch {};
+        try self.stack.append(self.allocator, .{ .number = millis });
     }
 
     fn gzipDecompress(self: *Vm) anyerror!void {

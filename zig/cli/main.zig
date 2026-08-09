@@ -158,7 +158,18 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
     };
     defer init.gpa.free(bytes);
 
-    var analysis = try panos_core.runner.analyzeSource(init.gpa, input, bytes);
+    // `.aot_js_wasm`, NOT `analyzeSource`'s `.native` default — `panos
+    // build --target=wasm` produces AOT WASM, so type-checking under the
+    // NATIVE target profile silently applied the wrong `target_policy`
+    // gate (rejecting `DOM.*`, which IS meant to work here, while letting
+    // native-only builtins like `время.спать_мс` wrongly pass). Between
+    // the two AOT profiles, `.aot_js_wasm` is the least restrictive
+    // (allows `DOM.*` for the browser case) — this command has no
+    // separate `--target=wasm-wasi` flag to pick the stricter one, so a
+    // WASI-only program using a `DOM.*` call fails at `wasmtime run` time
+    // (unresolved import) instead of at build time, an acceptable trade
+    // matching this command's current single-profile scope.
+    var analysis = try panos_core.runner.analyzeSourceForTarget(init.gpa, input, bytes, .aot_js_wasm);
     defer analysis.deinit();
     if (analysis.diagnostics.items.items.len != 0) {
         try writeAnalysisDiagnostics(stderr, &analysis);
@@ -210,11 +221,26 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
 }
 
 pub fn main(init: std.process.Init) !void {
+    // `.initStreaming`, NOT the default `.init` (`.positional` mode) —
+    // `.positional` writes via `pwrite` at a `Writer`-local `pos` that
+    // starts at 0 and is invisible to any OTHER `Writer` on the same
+    // underlying file. Under `panos run x.ps > log.txt 2>&1` (or any
+    // shell redirect that dups stdout/stderr to the SAME seekable file),
+    // stdout's and stderr's independently-tracked positions both start at
+    // 0 — whichever one flushes second overwrites the other's bytes at
+    // that shared offset instead of appending after them, silently
+    // dropping real program output whenever a warning diagnostic was also
+    // printed. Found by running a program with an unused-variable warning
+    // through `2>&1`: the warning survived, the actual return value never
+    // appeared. Streaming mode uses a plain sequential `write()`, the
+    // only correct choice for stdout/stderr (never actually random-access
+    // files we own exclusively, unlike `--target=wasm`'s output file
+    // below, which legitimately wants `.positional`).
     var stdout_buffer: [256]u8 = undefined;
-    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+    var stdout_file_writer: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
     var stderr_buffer: [256]u8 = undefined;
-    var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
+    var stderr_file_writer: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &stderr_buffer);
     const stderr = &stderr_file_writer.interface;
 
     var arguments = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);

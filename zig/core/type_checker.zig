@@ -2305,6 +2305,65 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.never;
             }
+            if (self.isBuiltinModule(symbol, "время", "сейчас_мс")) {
+                if (call.arguments.len != 0) try self.report(call.span, "Type Error: время.сейчас_мс() не принимает аргументы", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.result.types.builtins.number;
+            }
+            if (self.isBuiltinModule(symbol, "время", "монотонно_мс")) {
+                if (call.arguments.len != 0) try self.report(call.span, "Type Error: время.монотонно_мс() не принимает аргументы", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.result.types.builtins.number;
+            }
+            if (self.isBuiltinModule(symbol, "время", "спать_мс")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: время.спать_мс() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.number;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.number), self.result.types.builtins.number)) {
+                    try self.report(call.span, "Type Error: время.спать_мс() ожидает миллисекунды типа Число", .{});
+                }
+                return self.result.types.builtins.number;
+            }
+            if (self.isBuiltinModule(symbol, "DOM", "текст")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: DOM.текст() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.number;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: DOM.текст() ожидает CSS-селектор типа Строка", .{});
+                }
+                return self.result.types.builtins.number;
+            }
+            if (self.isBuiltinModule(symbol, "DOM", "установить_текст")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: DOM.установить_текст() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: DOM.установить_текст() ожидает CSS-селектор типа Строка первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.number), self.result.types.builtins.number)) {
+                    try self.report(call.span, "Type Error: DOM.установить_текст() ожидает значение типа Число вторым аргументом", .{});
+                }
+                return self.result.types.builtins.void;
+            }
+            if (self.isBuiltinModule(symbol, "DOM", "на_клик")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: DOM.на_клик() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: DOM.на_клик() ожидает селектор и имя обработчика типа Строка", .{});
+                    }
+                }
+                return self.result.types.builtins.void;
+            }
             if (self.isBuiltinModule(symbol, "сжатие", "разжать_gzip")) {
                 const result_type = self.resultOfString(self.result.types.builtins.string) orelse return self.result.types.poison();
                 if (call.arguments.len != 1) {

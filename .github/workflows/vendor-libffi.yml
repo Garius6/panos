@@ -126,7 +126,7 @@ jobs:
             external/libffi/include/
 
       - name: Установить Zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: "0.16.0"
 
@@ -240,7 +240,7 @@ jobs:
           Copy-Item out/external/libffi/include/windows-amd64-*.h external/libffi/include/ -Force
 
       - name: Установить Zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: "0.16.0"
 

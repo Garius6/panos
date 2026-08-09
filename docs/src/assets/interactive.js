@@ -38,7 +38,18 @@
 		if (initPromise) return initPromise;
 		initPromise = (async () => {
 			const imports = {
-				env: {},
+				// `panos_host_*` — `время.сейчас_мс`/`.монотонно_мс` host
+				// clock for the wasm32-freestanding browser interpreter
+				// (`zig/core/vm.zig`'s `timeNow`/`timeMonotonic`, see the
+				// `extern "env"` declarations there): freestanding wasm has
+				// no syscalls of its own, so the embedding page supplies
+				// real time the same way it already supplies output
+				// (`odin_env.write` below, kept for the old Odin-built
+				// panos.wasm — see `usesOdinRuntime`).
+				env: {
+					panos_host_time_now_ms: () => Date.now(),
+					panos_host_tick_now_ms: () => performance.now(),
+				},
 				odin_env: {
 					write: (fd, ptr, len) => {
 						if (activeOutput) {

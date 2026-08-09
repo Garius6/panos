@@ -30,7 +30,7 @@ jobs:
       # тащит свой линкер (нет отдельного system-пакета вроде lld/wasm-ld,
       # который нужен был Odin) — шаг "Установить wasm-ld" больше не нужен.
       - name: Установить Zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: "0.16.0"
 

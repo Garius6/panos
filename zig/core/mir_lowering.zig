@@ -549,10 +549,86 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
         }
     }
 
+    if (ctx.tree.expr(call.callee).* == .property) {
+        if (try lowerTimeBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
+        if (try lowerDomBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
+    }
+
     const callee_outcome = try lowerExpr(ctx, call.callee);
     if (callee_outcome.flow == .terminates) return terminated;
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     return emitCallValue(ctx, callee_outcome.value, args, result_type);
+}
+
+// `время.сейчас_мс`/`.монотонно_мс` — the only builtin-module calls this
+// Phase-1a-plus slice lowers, matching exactly what `zig/wasm_runtime/
+// runtime_wasi.zig`'s own doc comment already anticipated ("Phase-1a never
+// lowers a string at all... no clock reads reachable from any lowered
+// program yet EITHER" — this is that "either" becoming true). Emitted as
+// `call_builtin` with the SAME "модуль::имя" name convention `target.zig`
+// already uses for runtime availability checks, not a new naming scheme.
+// `время.спать_мс` deliberately has no case here — it's native-only
+// (`target.zig`'s `builtinAvailability`), and stays an `unsupported()`
+// panic in AOT WASM, same failure mode every other native-only feature
+// already gets in this file.
+fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const property = ctx.tree.expr(call.callee).property;
+    const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "время")) return null;
+
+    if (std.mem.eql(u8, property.property, "спать_мс")) unsupported("время.спать_мс (native-only builtin, недоступен в AOT WASM)");
+
+    const name = if (std.mem.eql(u8, property.property, "сейчас_мс"))
+        "время::сейчас_мс"
+    else if (std.mem.eql(u8, property.property, "монотонно_мс"))
+        "время::монотонно_мс"
+    else
+        unsupported("модуль.свойство вызов (только время.сейчас_мс/монотонно_мс поддержаны в AOT WASM)");
+
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = name, .args = &.{} } });
+    return continuesWith(dst);
+}
+
+// `DOM.текст`/`.установить_текст`/`.на_клик` — the minimal, numeric-only
+// slice `wasm_emit.zig`'s `hostImportNameForBuiltin`/`builtinSignature`
+// know how to emit (see those two, `zig/core/wasm_emit.zig`): no
+// object-table runtime, no closures — `DOM.текст` returns a `Число`
+// (0 if the element is missing or its content doesn't parse as a
+// number, matching the host loader's own contract), and `.на_клик`'s
+// handler is looked up BY NAME on the host side, called with zero
+// arguments (no captured "context" — that would need a real closures
+// ABI, out of scope for this slice, same `AGENTS.md` Phase-1a-plus
+// framing `время.*` above already uses). Arguments (CSS selectors/
+// handler names) are ordinary `Строка` literals — `lowerCallArgs`
+// lowers them the same generic way as any other call, relying on
+// `lowerExpr`'s existing `.string` case (`const_value{.string=...}`,
+// resolved to a data-section byte offset only in `wasm_emit.zig`).
+fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "DOM")) return null;
+
+    const property = ctx.tree.expr(call.callee).property;
+    const name = if (std.mem.eql(u8, property.property, "текст"))
+        "DOM::текст"
+    else if (std.mem.eql(u8, property.property, "установить_текст"))
+        "DOM::установить_текст"
+    else if (std.mem.eql(u8, property.property, "на_клик"))
+        "DOM::на_клик"
+    else
+        unsupported("DOM.свойство вызов (только текст/установить_текст/на_клик поддержаны)");
+
+    const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+    const is_void = ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);
+    if (is_void) {
+        try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = name, .args = args } });
+        return continuesWith(mir.invalid_value);
+    }
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = name, .args = args } });
+    return continuesWith(dst);
 }
 
 fn lowerCallArgs(ctx: *LoweringContext, expressions: []const ast.ExprId) anyerror!?[]const mir.ValueId {

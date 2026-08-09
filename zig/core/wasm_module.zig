@@ -13,6 +13,11 @@ pub const wasm_i32: u8 = 0x7F;
 
 pub fn wasmValType(checked: *const type_checker.CheckResult, type_id: types.TypeId) u8 {
     if (checked.types.eql(type_id, checked.types.builtins.boolean)) return wasm_i32;
+    // Строка has no object-table runtime in this backend (see
+    // `wasm_emit.zig`'s string-constant handling) — a Строка VALUE at the
+    // WASM level is really just a byte OFFSET into the module's own static
+    // data section, i.e. an i32 handle, not the string's own bytes.
+    if (checked.types.eql(type_id, checked.types.builtins.string)) return wasm_i32;
     return wasm_f64;
 }
 

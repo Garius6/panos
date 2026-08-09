@@ -11,7 +11,10 @@ panos [-v|--verbose] [file.ps] [program arguments...]
 panos build --target=wasm <file.ps> [-o output.wasm]
 ```
 
-- With no `file.ps`, `panos` starts the existing REPL mode.
+- With no `file.ps`, `panos` prints "Panos REPL пока не реализован" and
+  exits 0. No REPL exists yet on either implementation (Odin's own `repl()`,
+  `main.odin`, is an empty stub) — this is not a compatibility target,
+  just the current honest behavior.
 - `-v` and `--verbose` are interpreter flags only when they occur before the
   source file; subsequent arguments are exposed unchanged to
   `ос.аргументы()`.

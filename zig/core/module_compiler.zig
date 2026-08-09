@@ -852,3 +852,4 @@ test "module compiler constructs and reads exported structure fields" {
         .runtime_error => return error.TestUnexpectedResult,
     }
 }
+

@@ -97,7 +97,7 @@ pub const SymbolStore = struct {
     }
 };
 
-const Scope = struct {
+pub const Scope = struct {
     parent: ?ScopeId,
     symbols: std.StringHashMap(SymbolId),
 
@@ -252,7 +252,13 @@ pub const ScopeStack = struct {
         return &self.scopes.items[@intFromEnum(id)];
     }
 
-    fn scopeByIdConst(self: *const ScopeStack, id: ScopeId) *const Scope {
+    // Public so callers (e.g. `resolver.zig`'s unused-variable warning
+    // check) can enumerate a scope's own symbols right before it's
+    // popped — the only safe moment: blocks are strictly nested, no
+    // hoisting, so by `pop`-time every possible reference into this
+    // scope has already been visited by the resolver's single forward
+    // pass.
+    pub fn scopeByIdConst(self: *const ScopeStack, id: ScopeId) *const Scope {
         return &self.scopes.items[@intFromEnum(id)];
     }
 };

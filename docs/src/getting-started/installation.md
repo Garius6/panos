@@ -26,27 +26,24 @@ mv panos-macos-arm64 /usr/local/bin/panos
 
 ## Сборка из исходников
 
-Нужен установленный [Odin](https://odin-lang.org/docs/install/) — тот же
-тулчейн, что использует CI (`dev-2026-06`, см.
-`.github/workflows/*.yml`; более новые dev-сборки Odin, скорее всего, тоже
-подойдут, но не гарантировано — API `core:` иногда меняется между
-dev-релизами).
+Нужен установленный [Zig](https://ziglang.org/download/) `0.16.0` — тот же
+тулчейн, что использует CI (см. `.github/workflows/*.yml`).
 
 ```sh
 git clone https://github.com/Garius6/panos.git
 cd panos
 
 # CLI-интерпретатор
-odin build . -out:panos
+zig build
 # или, если установлен just (https://github.com/casey/just):
 just build
 
 # LSP-сервер
-odin build ./lsp -out:panos-lsp
+zig build lsp
 just build-lsp
 
 # WASM-сборка для браузера (демо в demo/)
-odin build wasm -target:js_wasm32 -o:size -out:demo/panos.wasm
+zig build browser
 just build-wasm
 ```
 

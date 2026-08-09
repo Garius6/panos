@@ -2,6 +2,7 @@ const std = @import("std");
 const panos_core = @import("panos_core");
 
 const core_lsp = panos_core.lsp;
+const lsp_graph = panos_core.lsp_graph;
 const max_message_size = 16 * 1024 * 1024;
 
 pub const ProtocolError = error{
@@ -325,6 +326,15 @@ pub const Server = struct {
         try writeDocumentSymbolsResponse(output, request_id, file, symbols.items);
     }
 
+    // Cross-document (specs/010-zig-migration T047): backed by
+    // `lsp_graph.analyze` (a REAL `module_loader.Graph`, not the single-
+    // file `runner.analyzeSource`) — a symbol resolving to a real
+    // `импорт` jumps to the DECLARING module's own file/span via
+    // `resolved.imported_symbols`, not just within the current document.
+    // Falls back to `analyzeSource` only when the URI isn't a `file://`
+    // one (`lsp_graph.analyze` needs a real filesystem path to resolve
+    // relative `импорт`s against) — matches the exact previous behavior
+    // for that edge case.
     fn definition(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
         const context = self.documentPosition(params) orelse {
             try writeResponse(output, request_id, "null");
@@ -335,16 +345,16 @@ pub const Server = struct {
             try writeResponse(output, request_id, "null");
             return;
         };
-        var analysis = panos_core.runner.analyzeSource(self.allocator, context.uri, context.text) catch {
+
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        var analysis = lsp_graph.analyze(self.allocator, io.io(), &self.documents, context.uri) catch {
             try writeResponse(output, request_id, "null");
             return;
         };
         defer analysis.deinit();
-        const tree = analysis.tree() orelse {
-            try writeResponse(output, request_id, "null");
-            return;
-        };
-        const resolved = analysis.resolution() orelse {
+        const tree = analysis.entryTree();
+        const resolved = analysis.entryResolution() orelse {
             try writeResponse(output, request_id, "null");
             return;
         };
@@ -356,6 +366,21 @@ pub const Server = struct {
             try writeResponse(output, request_id, "null");
             return;
         };
+
+        if (resolved.imported_symbols.get(symbol)) |origin| {
+            const target_tree = analysis.moduleTree(origin.module);
+            const target_span = declNameOrFullSpan(target_tree, origin.declaration);
+            const target_file = analysis.moduleSourceFile(origin.module);
+            if (!target_span.isValidFor(target_file)) {
+                try writeResponse(output, request_id, "null");
+                return;
+            }
+            const target_uri = try lsp_graph.pathToUri(self.allocator, analysis.modulePath(origin.module));
+            defer self.allocator.free(target_uri);
+            try writeDefinitionResponse(output, request_id, target_uri, rangeForSpan(target_file, target_span));
+            return;
+        }
+
         const entry = resolved.symbols.get(symbol) orelse {
             try writeResponse(output, request_id, "null");
             return;
@@ -368,6 +393,14 @@ pub const Server = struct {
         try writeDefinitionResponse(output, request_id, context.uri, rangeForSpan(file, target_span));
     }
 
+    // Cross-document (specs/010-zig-migration T047): the contract's own
+    // documented limit still applies — "current graph plus currently open
+    // documents; closed reverse dependents on disk are not required".
+    // Identifies the target declaration by (declaring file path, decl
+    // span) rather than a raw `SymbolId`/`DeclId` — those are only
+    // meaningful WITHIN one `lsp_graph.analyze` call, and each currently
+    // open document gets its OWN independent graph built here, each with
+    // its own numbering.
     fn references(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
         const context = self.documentPosition(params) orelse {
             try writeResponse(output, request_id, "null");
@@ -378,16 +411,16 @@ pub const Server = struct {
             try writeResponse(output, request_id, "null");
             return;
         };
-        var analysis = panos_core.runner.analyzeSource(self.allocator, context.uri, context.text) catch {
+
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        var analysis = lsp_graph.analyze(self.allocator, io.io(), &self.documents, context.uri) catch {
             try writeResponse(output, request_id, "null");
             return;
         };
         defer analysis.deinit();
-        const tree = analysis.tree() orelse {
-            try writeResponse(output, request_id, "null");
-            return;
-        };
-        const resolved = analysis.resolution() orelse {
+        const tree = analysis.entryTree();
+        const resolved = analysis.entryResolution() orelse {
             try writeResponse(output, request_id, "null");
             return;
         };
@@ -399,7 +432,67 @@ pub const Server = struct {
             try writeResponse(output, request_id, "null");
             return;
         };
-        try writeReferencesResponse(output, request_id, context.uri, file, tree, resolved, symbol, referenceIncludesDeclaration(params));
+
+        // Target identity: where the symbol is DECLARED, regardless of
+        // whether the cursor was on the declaration or on an imported use
+        // of it — both a same-file declaration and any OTHER open
+        // document's own `импорт` of it are matched against this same
+        // (path, span) pair below.
+        const entry_path = lsp_graph.uriToPath(context.uri).?; // already validated: `analyze` above only succeeds for file:// URIs
+        var target_path: []const u8 = entry_path;
+        var target_span: panos_core.source.Span = undefined;
+        if (resolved.imported_symbols.get(symbol)) |origin| {
+            target_path = analysis.modulePath(origin.module);
+            target_span = declNameOrFullSpan(analysis.moduleTree(origin.module), origin.declaration);
+        } else {
+            const local_entry = resolved.symbols.get(symbol) orelse {
+                try writeResponse(output, request_id, "null");
+                return;
+            };
+            target_span = definitionSpan(tree, resolved, symbol, local_entry.span);
+        }
+
+        try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
+        try appendJsonValue(output, request_id);
+        try output.appendSlice(",\"result\":[");
+        var first = true;
+
+        if (referenceIncludesDeclaration(params)) {
+            const target_file = if (std.mem.eql(u8, target_path, entry_path)) file else blk: {
+                if (resolved.imported_symbols.get(symbol)) |origin| break :blk analysis.moduleSourceFile(origin.module);
+                break :blk file;
+            };
+            if (target_span.isValidFor(target_file)) {
+                const target_uri = try lsp_graph.pathToUri(self.allocator, target_path);
+                defer self.allocator.free(target_uri);
+                try appendLocation(output, target_uri, rangeForSpan(target_file, target_span));
+                first = false;
+            }
+        }
+
+        try appendSymbolReferenceLocations(output, &first, context.uri, file, tree, resolved, symbol);
+
+        var document_iterator = self.documents.documents.iterator();
+        while (document_iterator.next()) |document_entry| {
+            const other_uri = document_entry.key_ptr.*;
+            if (std.mem.eql(u8, other_uri, context.uri)) continue;
+            var other_analysis = lsp_graph.analyze(self.allocator, io.io(), &self.documents, other_uri) catch continue;
+            defer other_analysis.deinit();
+            const other_resolved = other_analysis.entryResolution() orelse continue;
+            const other_tree = other_analysis.entryTree();
+            const other_file = other_analysis.moduleSourceFile(0);
+
+            var import_iterator = other_resolved.imported_symbols.iterator();
+            while (import_iterator.next()) |import_entry| {
+                const origin = import_entry.value_ptr.*;
+                if (!std.mem.eql(u8, other_analysis.modulePath(origin.module), target_path)) continue;
+                const origin_span = declNameOrFullSpan(other_analysis.moduleTree(origin.module), origin.declaration);
+                if (origin_span.start != target_span.start or origin_span.end != target_span.end) continue;
+                try appendSymbolReferenceLocations(output, &first, other_uri, other_file, other_tree, other_resolved, import_entry.key_ptr.*);
+            }
+        }
+
+        try output.appendSlice("]}");
     }
 
     fn documentHighlight(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
@@ -969,29 +1062,20 @@ fn writeDefinitionResponse(output: *ResponseBuffer, id: std.json.Value, uri: []c
     try output.append('}');
 }
 
-fn writeReferencesResponse(output: *ResponseBuffer, id: std.json.Value, uri: []const u8, file: panos_core.source.SourceFile, tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId, include_declaration: bool) !void {
-    try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
-    try appendJsonValue(output, id);
-    try output.appendSlice(",\"result\":[");
-    var first = true;
-    if (include_declaration) {
-        if (resolved.symbols.get(symbol)) |entry| {
-            const span = definitionSpan(tree, resolved, symbol, entry.span);
-            if (span.isValidFor(file)) {
-                try appendLocation(output, uri, rangeForSpan(file, span));
-                first = false;
-            }
-        }
-    }
+// Appends every `.ident`-use of `symbol` WITHIN one document's own
+// `resolved`/`tree` as a JSON location (comma-separated, tracking `first`
+// across possibly-multiple documents) — shared by `references`' own
+// document and every other currently open document that imports the same
+// target.
+fn appendSymbolReferenceLocations(output: *ResponseBuffer, first: *bool, uri: []const u8, file: panos_core.source.SourceFile, tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId) !void {
     var iterator = resolved.expr_symbols.iterator();
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != symbol) continue;
-        if (!first) try output.append(',');
-        first = false;
+        if (!first.*) try output.append(',');
+        first.* = false;
         const span = panos_core.ast.exprSpan(tree.expr(entry.key_ptr.*).*);
         try appendLocation(output, uri, rangeForSpan(file, span));
     }
-    try output.appendSlice("]}");
 }
 
 fn writeHighlightsResponse(output: *ResponseBuffer, id: std.json.Value, file: panos_core.source.SourceFile, tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId) !void {
@@ -1159,6 +1243,19 @@ fn appendMatchingSymbols(
         }
         try appendMatchingSymbols(output, first, file, uri, symbol.children, query, symbol.name);
     }
+}
+
+// Like `definitionSpan` below, but for a DIRECTLY known `DeclId` (no
+// `decl_symbols` reverse-lookup needed) — used for cross-document jumps
+// (`resolver.ImportedSymbolOrigin.declaration` already names the exact
+// declaration in the OTHER module's tree).
+fn declNameOrFullSpan(tree: *const panos_core.ast.Ast, id: panos_core.ast.DeclId) panos_core.source.Span {
+    return switch (tree.decl(id).*) {
+        .function => |value| value.name_span,
+        .constant => |value| value.name_span,
+        .error_node => |span| span,
+        inline else => |value| value.span,
+    };
 }
 
 fn definitionSpan(tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId, fallback: panos_core.source.Span) panos_core.source.Span {
@@ -1639,6 +1736,36 @@ test "LSP server publishes diagnostics for opened and changed documents" {
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"data\":[]}") == null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), ",5,0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), ",3,0") != null);
+}
+
+test "LSP definition and references cross a real импорт between two open documents" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var output = ResponseBuffer.init(std.testing.allocator);
+    defer output.deinit();
+
+    // main.ps: line 2 (0-indexed) is `мат.сложить(мат.ОТВЕТ, 2)` —
+    // "мат." is 4 characters, "сложить" starts at character 4.
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/main.ps\",\"text\":\"импорт \\\"./математика\\\" как мат\\nэкспорт функ старт() -> Число\\nмат.сложить(мат.ОТВЕТ, 2)\\nконец\"}}}", &output));
+    // математика.ps: line 1 is `экспорт функ сложить(a: Число, b: Число) -> Число` —
+    // "экспорт функ " is 13 characters, "сложить" starts at character 13.
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/математика.ps\",\"text\":\"экспорт конст ОТВЕТ = 40\\nэкспорт функ сложить(a: Число, b: Число) -> Число\\na + b\\nконец\"}}}", &output));
+
+    // definition on the `сложить` CALL in main.ps must jump to
+    // математика.ps, not stay within main.ps.
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/main.ps\"},\"position\":{\"line\":2,\"character\":5}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"uri\":\"file:///проект/математика.ps\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"line\":1") != null);
+
+    // references from the `сложить` CALL SITE in main.ps (a declaration
+    // NAME by itself isn't an expression at all in this AST — only USES
+    // land in `expr_symbols`, see `definitionSpan`'s doc comment — so the
+    // call site is the only clickable spot that resolves to the symbol
+    // here) must find BOTH the declaration in математика.ps (via
+    // `includeDeclaration`) AND this same use in main.ps.
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"textDocument/references\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/main.ps\"},\"position\":{\"line\":2,\"character\":5},\"context\":{\"includeDeclaration\":true}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"uri\":\"file:///проект/математика.ps\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"uri\":\"file:///проект/main.ps\"") != null);
 }
 
 test "LSP transport reads Content-Length frames" {

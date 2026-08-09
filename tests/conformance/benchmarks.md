@@ -27,6 +27,11 @@ T052 (`specs/010-zig-migration/tasks.md`). Три `.ps`-фикстуры под
 
 ## Методология
 
+> Зафиксировано ДО удаления Odin (`specs/010-zig-migration` T059). Шаг
+> `odin build` ниже больше НЕ воспроизводим — Odin-исходники удалены из
+> дерева. Оставлено как метод разового замера базовой линии, не как
+> повторяемая процедура.
+
 ```sh
 odin build . -o:speed -out:panos-odin-bench
 zig build -Doptimize=ReleaseFast

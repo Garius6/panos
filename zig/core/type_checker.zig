@@ -262,6 +262,23 @@ const Checker = struct {
         });
     }
 
+    // Ported from `core/type_cheker.odin`'s `report_warning` — same
+    // shape as `report` above, `.severity = .warning` instead of `.err`.
+    // `diagnostics_have_error`-equivalent gating (`SourceRun.hasErrors`)
+    // already treats `.warning` as non-blocking; this is what actually
+    // PRODUCES that severity — before `check_unreachable_code`/unused-
+    // variable warnings below, NOTHING in `zig/core/*.zig` ever
+    // constructed a `.warning` diagnostic at all.
+    fn reportWarning(self: *Checker, span: source.Span, comptime format: []const u8, args: anytype) !void {
+        const message = try std.fmt.allocPrint(self.result.arena.allocator(), format, args);
+        _ = try self.result.diagnostics.appendUnique(self.result.allocator, .{
+            .phase = .type_checker,
+            .severity = .warning,
+            .span = span,
+            .message = message,
+        });
+    }
+
     fn signaturePass(self: *Checker) !void {
         for (self.tree.program.?.declarations) |declaration| {
             switch (self.tree.decl(declaration).*) {
@@ -994,6 +1011,112 @@ const Checker = struct {
         if (!self.isType(function_type.return_type, self.result.types.builtins.void) and !self.assignable(actual, function_type.return_type)) {
             const span = self.tree.decl(declaration).function.span;
             try self.report(span, "Type Error: функция должна возвращать объявленный тип", .{});
+        }
+        try self.checkUnreachableCode(body);
+    }
+
+    // Ported from `core/type_cheker.odin`'s `stmt_always_diverges`/
+    // `block_always_diverges`/`expr_always_diverges`/
+    // `stmt_diverges_for_reachability`/`check_unreachable_code`/
+    // `check_unreachable_code_expr` — warns (`.severity = .warning`, does
+    // NOT block execution) about code that follows a guaranteed-diverging
+    // statement in the SAME block. `если` without `иначе` never counts as
+    // diverging (the false-condition path falls straight through) — only
+    // `stmtAlwaysDiverges`'s `.if_expr` case matters here, reached via
+    // `exprAlwaysDiverges`.
+    fn stmtAlwaysDiverges(self: *const Checker, statement: ast.StmtId) bool {
+        return switch (self.tree.stmt(statement).*) {
+            .return_stmt => true,
+            .expr => |value| self.exprAlwaysDiverges(value.value),
+            else => false,
+        };
+    }
+
+    fn blockAlwaysDiverges(self: *const Checker, body: []const ast.StmtId) bool {
+        for (body) |statement| {
+            if (self.stmtAlwaysDiverges(statement)) return true;
+        }
+        return false;
+    }
+
+    fn exprAlwaysDiverges(self: *const Checker, expression: ast.ExprId) bool {
+        switch (self.tree.expr(expression).*) {
+            .if_expr => |conditional| {
+                // No `иначе` — the false-condition path falls straight
+                // through, never diverges.
+                if (conditional.else_branch.len == 0) return false;
+                return self.blockAlwaysDiverges(conditional.then_branch) and self.blockAlwaysDiverges(conditional.else_branch);
+            },
+            .match_expr => |match| {
+                if (match.arms.len == 0) return false;
+                for (match.arms) |arm| {
+                    if (!self.blockAlwaysDiverges(arm.body)) return false;
+                }
+                return true;
+            },
+            else => {},
+        }
+        // Everything else (panic/infinite recursion etc.) is already
+        // typed `Никогда` by ordinary Never-propagation — `expression_types`
+        // is already fully populated by the time this runs (after the
+        // whole body's been inferred once).
+        const expression_type = self.result.expression_types.get(expression) orelse return false;
+        return self.isType(expression_type, self.result.types.builtins.never);
+    }
+
+    // Superset of `stmtAlwaysDiverges` — `прервать`/`продолжить` also
+    // make the REST OF THIS BLOCK unreachable (they don't make the
+    // enclosing function/block itself always-diverge, which is why this
+    // is a SEPARATE function from `stmtAlwaysDiverges`, not a shared one).
+    fn stmtDivergesForReachability(self: *const Checker, statement: ast.StmtId) bool {
+        return switch (self.tree.stmt(statement).*) {
+            .return_stmt, .break_stmt, .continue_stmt => true,
+            .expr => |value| self.exprAlwaysDiverges(value.value),
+            else => false,
+        };
+    }
+
+    fn stmtSpan(self: *const Checker, statement: ast.StmtId) source.Span {
+        return switch (self.tree.stmt(statement).*) {
+            .return_stmt => |value| value.span,
+            .let => |value| value.span,
+            .expr => |value| value.span,
+            .continue_stmt => |span| span,
+            .break_stmt => |span| span,
+            .for_in => |value| value.span,
+            .for_range => |value| value.span,
+            .error_node => |span| span,
+        };
+    }
+
+    fn checkUnreachableCode(self: *Checker, body: []const ast.StmtId) anyerror!void {
+        for (body, 0..) |statement, index| {
+            switch (self.tree.stmt(statement).*) {
+                .expr => |value| try self.checkUnreachableCodeExpr(value.value),
+                .for_in => |value| try self.checkUnreachableCode(value.body),
+                .for_range => |value| try self.checkUnreachableCode(value.body),
+                else => {},
+            }
+            if (self.stmtDivergesForReachability(statement) and index + 1 < body.len) {
+                const first = self.stmtSpan(body[index + 1]);
+                const last = self.stmtSpan(body[body.len - 1]);
+                try self.reportWarning(.{ .file_id = first.file_id, .start = first.start, .end = last.end }, "недостижимый код", .{});
+                return;
+            }
+        }
+    }
+
+    fn checkUnreachableCodeExpr(self: *Checker, expression: ast.ExprId) anyerror!void {
+        switch (self.tree.expr(expression).*) {
+            .if_expr => |conditional| {
+                try self.checkUnreachableCode(conditional.then_branch);
+                try self.checkUnreachableCode(conditional.else_branch);
+            },
+            .match_expr => |match| {
+                for (match.arms) |arm| try self.checkUnreachableCode(arm.body);
+            },
+            .while_expr => |loop| try self.checkUnreachableCode(loop.body),
+            else => {},
         }
     }
 
@@ -3642,9 +3765,16 @@ test "type checker rejects loop control outside a loop" {
     var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
     defer checked.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), checked.diagnostics.items.items.len);
+    // 3, not 2: `продолжить` (unconditionally diverges-for-reachability)
+    // is immediately followed by `прервать` in the same block — a real
+    // "недостижимый код" warning, ported from Odin's `check_unreachable_
+    // code` (`core/type_cheker.odin`) alongside these two pre-existing
+    // errors. Confirmed Odin produces the exact same warning text for the
+    // equivalent program before adding this assertion.
+    try std.testing.expectEqual(@as(usize, 3), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("Type Error: 'продолжить' можно использовать только внутри цикла", checked.diagnostics.items.items[0].message);
     try std.testing.expectEqualStrings("Type Error: 'прервать' можно использовать только внутри цикла", checked.diagnostics.items.items[1].message);
+    try std.testing.expectEqualStrings("недостижимый код", checked.diagnostics.items.items[2].message);
 }
 
 test "type checker narrows integer literals in an expected context" {
@@ -3806,3 +3936,59 @@ test "type checker enforces Comparable generic bounds" {
     try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("Type Error: тип аргумента не реализует ограничение 'Сравниваемое'", checked.diagnostics.items.items[0].message);
 }
+
+test "type checker warns on code after an unconditional возврат" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Число\nвозврат 1\n2\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
+    try std.testing.expectEqual(diagnostic.Severity.warning, checked.diagnostics.items.items[0].severity);
+    try std.testing.expectEqualStrings("недостижимый код", checked.diagnostics.items.items[0].message);
+}
+
+test "type checker warns on code after an if/else where both branches return" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f(x: Булево) -> Число\nесли x тогда\nвозврат 1\nиначе\nвозврат 2\nконец\n3\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("недостижимый код", checked.diagnostics.items.items[0].message);
+}
+
+test "type checker does not warn when an if has no else (false path falls through)" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    // `если x тогда паника("boom") конец` — `Никогда`-typed then-branch,
+    // no `иначе`, so the whole `если` never claims to always diverge (the
+    // false-condition path falls straight through) — the trailing `2`
+    // must NOT be flagged unreachable. `паника` avoids an unrelated,
+    // pre-existing if-expression-value-type inference limitation this
+    // exact shape hits with `возврат` in a lone then-branch (separate
+    // from what this test is checking).
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f(x: Булево) -> Число\nесли x тогда\nпаника(\"boom\")\nконец\n2\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+

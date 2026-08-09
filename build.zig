@@ -278,6 +278,16 @@ pub fn build(b: *std.Build) void {
     });
     module_compiler_unit_tests.root_module.linkLibrary(sqlite_lib);
     module_compiler_unit_tests.root_module.addObjectFile(libffi_archive);
+    const lsp_graph_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/core/lsp_graph.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    lsp_graph_unit_tests.root_module.linkLibrary(sqlite_lib);
+    lsp_graph_unit_tests.root_module.addObjectFile(libffi_archive);
     const runner_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/core/runner.zig"),
@@ -408,6 +418,7 @@ pub fn build(b: *std.Build) void {
     const run_module_loader_unit_tests = b.addRunArtifact(module_loader_unit_tests);
     const run_module_linker_unit_tests = b.addRunArtifact(module_linker_unit_tests);
     const run_module_compiler_unit_tests = b.addRunArtifact(module_compiler_unit_tests);
+    const run_lsp_graph_unit_tests = b.addRunArtifact(lsp_graph_unit_tests);
     const run_runner_unit_tests = b.addRunArtifact(runner_unit_tests);
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const run_lsp_tests = b.addRunArtifact(lsp_tests);
@@ -457,6 +468,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_module_loader_unit_tests.step);
     test_step.dependOn(&run_module_linker_unit_tests.step);
     test_step.dependOn(&run_module_compiler_unit_tests.step);
+    test_step.dependOn(&run_lsp_graph_unit_tests.step);
     test_step.dependOn(&run_runner_unit_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_lsp_tests.step);

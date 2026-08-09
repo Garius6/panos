@@ -4,8 +4,7 @@ Auto-generated from feature plans. Last updated: 2026-07-27.
 
 ## Active Technologies
 - mdBook (docs/) — internal architecture documentation, no new dependency (002-interpreter-architecture-docs)
-- Odin (toolchain pinned via `Justfile`), stdlib packages `core:fmt`, `core:strings`, `core:strconv`.
-- `core:thread` (worker pool) + `core:sync/chan` — actor-model non-blocking I/O (see Recent Changes), stdlib only, no new dependency.
+- Zig `0.16.0` (toolchain pinned via `build.zig.zon`/`Justfile`) — the ONLY toolchain since `specs/010-zig-migration` T059 removed Odin entirely. Everything below this line describing `core/*.odin`/`main.odin`/`lsp/*.odin`/`wasm/*.odin` is HISTORICAL (the Odin implementation these entries describe no longer exists) — see `zig/core/`, `zig/cli/`, `zig/lsp/`, `zig/browser/` for the current, real implementation of the same features.
 - pan package manager (003-pan-package-manager): panos itself (self-hosted, `../panosiki/pan/`) using `std/кодирование/toml.ps` for manifest/lock; three new native-only core builtins (`ос.выполнить` process spawn, `ос.завершить` exit-with-code, `фс` directory-ops) as prerequisite, see `specs/003-pan-package-manager/`.
 - gitsync dependency scaffolding (004-gitsync-dependency-packages): 7 new independent git repos under `../panosiki/` (each `pan init`-ed) for gitsync's oscript-library dependencies that need porting; one new panos stdlib module `std/слог.ps` (logging, replaces `logos`); no `core/` changes. See `specs/004-gitsync-dependency-packages/`.
 - panos metaprogramming (not a speckit feature — see Recent Changes): `&`-annotations (parser-only AST metadata, no runtime effect — `core/parser.odin`) + `синтаксис.*` compile-time-only AST-introspection native builtin (`core/vm_syntax_native.odin`/`_wasm.odin`), no new dependency. Generic codegen driver self-hosted in `../panosiki/codegen/` (separate repo, not bundled in `std/`), invoked via `pan task`.
@@ -21,11 +20,22 @@ Auto-generated from feature plans. Last updated: 2026-07-27.
 
 ## Project Structure
 
+Odin was fully removed as of `specs/010-zig-migration` T059 — Zig
+(`build.zig` at repo root) is the only toolchain. `core/`, `lsp/`, `wasm/`,
+`wasm_runtime/`, `main.odin` (all Odin source) no longer exist; every
+mention of them below in "Recent Changes" is HISTORICAL (describes the
+now-deleted Odin implementation at the time each entry was written), not
+current architecture.
+
 ```text
-core/       # lexer, parser, resolver, type checker, compiler, VM
+zig/core/   # lexer, parser, resolver, type checker, compiler, VM, LSP core
+zig/cli/    # native CLI entrypoint
+zig/lsp/    # language server entrypoint
+zig/browser/# wasm browser-interpreter entrypoint
+zig/wasm_runtime/ # AOT runtime modules (WASI/JS)
+zig/conformance/  # conformance manifest/outcome/matrix machinery
 std/        # panos stdlib (.ps sources)
-lsp/        # language server
-wasm/       # wasm build entrypoint
+tests/      # conformance corpus, integration fixtures, LSP/WASM tests
 fixtures/   # test fixtures
 specs/      # speckit feature specs
 ```
@@ -35,11 +45,11 @@ authoritative for language/pipeline specifics per the constitution below.
 
 ## Commands
 
-- `just build` — native build
-- `just build-lsp` — LSP build
-- `just build-wasm` — wasm build (output: `demo/panos.wasm`)
-- `just test` — run `odin test ./core`
-- `just debug-file <path>` — run a `.ps` file with vet/debug flags
+- `just build` — native build (`zig build -Doptimize=ReleaseFast`)
+- `just build-lsp` — LSP build (`zig build lsp`)
+- `just build-wasm` — wasm build (`zig build browser`, output: `demo/panos.wasm`)
+- `just test` — run `zig build test`
+- `zig build conformance` — faster subset of `test` for frontend/module changes
 
 ## Code Style
 

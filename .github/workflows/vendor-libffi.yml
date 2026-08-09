@@ -125,15 +125,14 @@ jobs:
           cp out/external/libffi/include/${{ matrix.platform }}-*.h \
             external/libffi/include/
 
-      - name: Установить Odin
-        uses: laytan/setup-odin@v2
+      - name: Установить Zig
+        uses: mlugg/setup-zig@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          version: "0.16.0"
 
       - name: Проверить линковку с panos
         shell: bash
-        run: odin build . -o:speed -out:panos-smoke
+        run: zig build
 
       - name: Сохранить платформенный архив
         uses: actions/upload-artifact@v4
@@ -240,15 +239,14 @@ jobs:
           Copy-Item out/external/libffi/lib/windows-amd64/libffi.lib external/libffi/lib/windows-amd64/libffi.lib -Force
           Copy-Item out/external/libffi/include/windows-amd64-*.h external/libffi/include/ -Force
 
-      - name: Установить Odin
-        uses: laytan/setup-odin@v2
+      - name: Установить Zig
+        uses: mlugg/setup-zig@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          version: "0.16.0"
 
       - name: Проверить линковку с panos
         shell: pwsh
-        run: odin build . -o:speed -out:panos-smoke.exe
+        run: zig build
 
       - name: Сохранить платформенный архив
         uses: actions/upload-artifact@v4

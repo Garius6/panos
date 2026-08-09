@@ -86,6 +86,86 @@
         "stdout": "20000",
         "result": "20000"
       }
+    },
+    {
+      "id": "native-file-roundtrip",
+      "tier": "native",
+      "profile": "native",
+      "input": "tests/integration/native/file_roundtrip.ps",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "панос-интеграция",
+        "result": "панос-интеграция",
+        "deviation": {
+          "id": "DEV-003",
+          "rationale": "This case is Zig-only, not cross-checked against Odin: Zig's resolver.zig makes native builtin modules (фс/ос/сеть/бд/...) ambient/always-in-scope with no импорт required or even accepted through the real module-graph path, while Odin requires an explicit `импорт <модуль>` for the same modules (confirmed: core/resolver.odin has no unconditional builtin-module installer; every native-builtin e2e test in core/e2e_*.odin imports explicitly). This means no single fixture source can run on both toolchains' real CLIs as-is — see T053's progress-report.md entry for the full investigation. Not fixed here: this is a real, foundational, pre-existing simplification from earlier in the migration, not a regression, and Odin is being retired (T058/T059) rather than made to match."
+        }
+      }
+    },
+    {
+      "id": "native-ffi-libc",
+      "tier": "native",
+      "profile": "native",
+      "input": "tests/integration/native/ffi_libc.ps",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "52",
+        "result": "52"
+      }
+    },
+    {
+      "id": "native-http-client-error",
+      "tier": "native",
+      "profile": "native",
+      "input": "tests/integration/native/http_client_error.ps",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "ошибка:ConnectionRefused",
+        "result": "ошибка:ConnectionRefused"
+      }
+    },
+    {
+      "id": "native-sqlite-roundtrip",
+      "tier": "native",
+      "profile": "native",
+      "input": "tests/integration/native/sqlite_roundtrip.ps",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "панос",
+        "result": "панос"
+      }
+    },
+    {
+      "id": "aot-fib-recursive",
+      "tier": "aot",
+      "profile": "aot_wasi",
+      "input": "tests/conformance/benchmarks/fib_recursive.ps",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "832040\n",
+        "result": "832040",
+        "deviation": {
+          "id": "DEV-004",
+          "rationale": "This tier exercises the SEPARATE MIR->WASM AOT pipeline (panos build --target=wasm, T043/T048), not the bytecode VM the `runtime` tier above uses — same source, same result, but a genuinely different execution path (no Odin equivalent exists to compare against: Odin never built a MIR-based AOT backend for this migration, see docs/src/architecture/toolchain-and-testing.md's MIR/WASM section). `stdout` here is the raw `wasmtime run --invoke старт` process output (includes wasmtime's own trailing newline), not the bytecode VM CLI's rendered value — the two tiers are not byte-for-byte comparable outcomes, only value-equal."
+        }
+      }
+    },
+    {
+      "id": "aot-loop-sum",
+      "tier": "aot",
+      "profile": "aot_wasi",
+      "input": "tests/conformance/benchmarks/loop_sum.ps",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "12499997500000\n",
+        "result": "12499997500000"
+      }
     }
   ]
 }

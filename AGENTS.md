@@ -3,44 +3,53 @@
 ## О проекте
 
 Panos — экспериментальный интерпретатор самописного языка программирования,
-реализованный на Odin. Язык русскоязычный по ключевым словам и синтаксически
-ориентирован на смесь Go и Rust.
+реализованный на Zig `0.16.0` (`specs/010-zig-migration` T059 полностью
+удалил более раннюю Odin-реализацию — Zig теперь единственный тулчейн).
+Язык русскоязычный по ключевым словам и синтаксически ориентирован на
+смесь Go и Rust.
 
 Текущий pipeline:
 
-1. `lexer.odin` — токенизация исходного текста.
-2. `parser.odin` — построение AST.
-3. `resolver.odin` — связывание имен с символами.
-4. `type_cheker.odin` — проверка и вывод типов.
-5. `compiler.odin` — компиляция AST в байткод.
-6. `vm.odin` — выполнение байткода.
-7. `main.odin` — запуск файла и диагностический вывод всех стадий.
+1. `zig/core/lexer.zig` — токенизация исходного текста.
+2. `zig/core/parser.zig` — построение AST.
+3. `zig/core/resolver.zig` — связывание имен с символами.
+4. `zig/core/type_checker.zig` — проверка и вывод типов.
+5. `zig/core/compiler.zig` — компиляция AST в байткод.
+6. `zig/core/vm.zig` — выполнение байткода.
+7. `zig/cli/main.zig` — запуск файла и диагностический вывод всех стадий.
 
-`test.ps` — основной демонстрационный файл языка. `e2e_test.odin` содержит
-сквозные тесты pipeline через `run_code`.
+Отдельный, полностью независимый пайплайн: `zig/core/mir_lowering.zig` +
+`zig/core/wasm_emit.zig` — AOT-компиляция в самостоятельный `.wasm`
+(`panos build --target=wasm`, см. `docs/src/architecture/toolchain-and-
+testing.md` § "MIR→WASM AOT-пайплайн"), минуя байткод-VM целиком.
+
+`zig/core/runner.zig`'s `test "runner ..."` (паттерн `runSource(...)`/
+`checkSourceForTarget(...)`) — основной e2e-тестовый харнесс pipeline.
+`tests/conformance/manifest.json` + `zig/conformance/matrix_test.zig` —
+структурированный conformance-корпус с зафиксированными ожидаемыми
+outcome'ами.
 
 ## Команды
 
-Запуск тестового файла:
-
 ```sh
-odin run . -debug -vet -strict-style -vet-tabs -warnings-as-errors -- test.ps
+zig build test          # весь набор Zig-юнит-тестов
+zig build conformance   # быстрое подмножество для фронтенд/модульных правок
+zig build lsp            # LSP-сервер (zig-out/bin/panos-lsp)
+zig build browser         # WASM-сборка браузерного интерпретатора
+zig build run -- file.ps  # запустить файл через нативный CLI
 ```
 
-То же через Justfile:
+Через Justfile: `just build`/`just build-lsp`/`just build-wasm`/`just test`
+(см. `Justfile` в корне — тонкие обёртки над `zig build ...`, копирующие
+артефакт на путь, который ожидают внешние потребители: `./panos`,
+`./panos-lsp`, `demo/panos.wasm`).
 
-```sh
-just debug-file test.ps
-```
-
-Автотесты:
-
-```sh
-odin test . -debug -vet -strict-style -vet-tabs -warnings-as-errors
-```
-
-Тесты могут печатать предупреждения memory tracker о текущих утечках
-аллокатора. Если команда завершилась с кодом `0`, тест считается успешным.
+Перед коммитом Zig-изменений — ВСЕ четыре: `zig build test`, `zig build
+conformance`, `zig build lsp`, `zig build browser` (не только `test` —
+`browser` единственная проверка компиляции под wasm, легко сломать
+случайно, см. известную ловушку про `if`/`else`-устранение мёртвой ветки
+для `wasm32-freestanding` в `docs/src/architecture/toolchain-and-testing.
+md`).
 
 ## Язык Panos
 
@@ -89,10 +98,10 @@ odin test . -debug -vet -strict-style -vet-tabs -warnings-as-errors
 - обычные ошибки: `Результат(Число, Ошибка)`
 
 `Опция`/`Результат` — не примитивы языка, а generic-перечисления из
-стандартной «прелюдии» (core/prelude.odin), неявно доступной каждому
-модулю без `импорт`. Их конструкторы — как у любого ADT (Стадия 18):
-ТОЛЬКО квалифицированные `Опция.Есть(...)`/`Результат.Успех(...)` и т.п.,
-голые `Есть(...)`/`Успех(...)` не резолвятся.
+стандартной «прелюдии» (`zig/core/prelude.zig`), неявно доступной каждому
+модулю без `импорт`. Их конструкторы — как у любого ADT: ТОЛЬКО
+квалифицированные `Опция.Есть(...)`/`Результат.Успех(...)` и т.п., голые
+`Есть(...)`/`Успех(...)` не резолвятся.
 
 Строки поддерживают escape-последовательности `\n`, `\t`, `\r`, `\"` и `\\`.
 
@@ -195,24 +204,21 @@ odin test . -debug -vet -strict-style -vet-tabs -warnings-as-errors
 
 - Сохранять русскоязычные сообщения ошибок и диагностический вывод.
 - Предпочитать минимальные вертикальные срезы: lexer → parser → resolver →
-  type checker → compiler → VM → e2e-тест.
-- При добавлении синтаксиса сначала покрывать его сквозным тестом в
-  `e2e_test.odin`, если это практически возможно.
-- Не коммитить `panos.dSYM/` и другие локальные артефакты сборки.
+  type checker → compiler → VM → тест.
+- При добавлении синтаксиса сначала покрывать его тестом в
+  `zig/core/runner.zig` (паттерн `test "runner ..."`,
+  `runSource(...)`/`checkSourceForTarget(...)`), если это практически
+  возможно.
+- Не коммитить артефакты сборки (`zig-out/`, `.zig-cache/`, `panos`,
+  `panos-lsp` и т.п.).
 - Не менять unrelated untracked файлы без явного запроса.
 
-## Контекст миграции на Zig
+## История миграции на Zig
 
-- Zig `0.16.0` — целевой toolchain; Odin остаётся эталонной реализацией до
-  завершения cutover.
-- План совместимого переноса: `specs/010-zig-migration/plan.md`, статус —
-  `specs/010-zig-migration/tasks.md` и `progress-report.md` (актуальнее
-  tasks.md — обновляется после каждого среза).
-- `zig build test`/`conformance`/`lsp`/`browser`/`run -- <file.ps>` — см.
-  `docs/src/architecture/toolchain-and-testing.md` § "Zig-тулчейн" за
-  полным разбором команд и известных ловушек (особенно про
-  `if`/`else`-устранение мёртвой ветки для `wasm32-freestanding`).
-- Перед коммитом Zig-изменений: `zig build test`, `zig build conformance`,
-  `zig build lsp`, `zig build browser` — ВСЕ четыре, не только `test`
-  (browser — единственная проверка компиляции под wasm, легко сломать
-  случайно).
+Полный перенос интерпретатора с Odin на Zig `0.16.0` завершён
+(`specs/010-zig-migration/` — план, задачи, полная история среза за
+срезом в `progress-report.md`). Odin-реализация полностью удалена
+(T059) — `specs/010-zig-migration/tasks.md`/`progress-report.md` остаются
+единственным источником ПОЧЕМУ конкретные архитектурные решения были
+приняты именно так во время переноса, полезно при разборе кода, даже
+когда сам Odin-код уже недостижим.

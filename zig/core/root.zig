@@ -7,6 +7,7 @@ pub const diagnostic = @import("diagnostic.zig");
 pub const gc = @import("gc.zig");
 pub const lexer = @import("lexer.zig");
 pub const lsp = @import("lsp.zig");
+pub const lsp_graph = @import("lsp_graph.zig");
 pub const mir = @import("mir.zig");
 pub const mir_builder = @import("mir_builder.zig");
 pub const mir_cfg = @import("mir_cfg.zig");

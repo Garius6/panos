@@ -151,19 +151,46 @@ const Resolver = struct {
     tree: *const ast.Ast = undefined,
     module_members: std.ArrayList(ModuleMembers) = .empty,
     target_profile: target_policy.TargetProfile = .native,
+    // Ported from `core/resolver.odin`'s `used_symbols`/
+    // `unused_check_symbols` (`Symbol_Id -> bool` maps there, sets here) —
+    // see `popScopeAndWarnUnused` for the actual warning.
+    used_symbols: std.AutoHashMap(symbols.SymbolId, void),
+    unused_check_symbols: std.AutoHashMap(symbols.SymbolId, void),
 
     fn init(result: *Resolution) !Resolver {
         return .{
             .result = result,
             .scopes = try symbols.ScopeStack.init(result.allocator),
+            .used_symbols = .init(result.allocator),
+            .unused_check_symbols = .init(result.allocator),
         };
     }
 
     fn deinit(self: *Resolver) void {
         for (self.module_members.items) |*members| members.values.deinit();
         self.module_members.deinit(self.result.allocator);
+        self.used_symbols.deinit();
+        self.unused_check_symbols.deinit();
         self.scopes.deinit();
         self.* = undefined;
+    }
+
+    // Ported from `core/resolver.odin`'s `pop_scope` — checks the
+    // ABOUT-TO-CLOSE scope's own symbols for unused `пер`-declared
+    // variables before actually popping (`scopeByIdConst(self.scopes.
+    // current)` reads the CURRENT scope, still valid at this point —
+    // `self.scopes.pop()` only moves the cursor to the parent, it never
+    // frees/invalidates the popped scope's storage).
+    fn popScopeAndWarnUnused(self: *Resolver) !void {
+        const scope = self.scopes.scopeByIdConst(self.scopes.current);
+        var iterator = scope.symbols.valueIterator();
+        while (iterator.next()) |symbol_id| {
+            if (!self.unused_check_symbols.contains(symbol_id.*)) continue;
+            if (self.used_symbols.contains(symbol_id.*)) continue;
+            const symbol = self.result.symbols.get(symbol_id.*) orelse continue;
+            try self.reportWarning(symbol.span, "неиспользованная переменная '{s}'", .{symbol.name});
+        }
+        _ = try self.scopes.pop();
     }
 
     fn report(self: *Resolver, span: source.Span, comptime format: []const u8, args: anytype) !void {
@@ -171,6 +198,18 @@ const Resolver = struct {
         _ = try self.result.diagnostics.appendUnique(self.result.allocator, .{
             .phase = .resolver,
             .severity = .err,
+            .span = span,
+            .message = message,
+        });
+    }
+
+    // Ported from `core/resolver.odin`'s `report_resolve_warning` — same
+    // shape as `report` above, `.severity = .warning` instead of `.err`.
+    fn reportWarning(self: *Resolver, span: source.Span, comptime format: []const u8, args: anytype) !void {
+        const message = try std.fmt.allocPrint(self.result.arena.allocator(), format, args);
+        _ = try self.result.diagnostics.appendUnique(self.result.allocator, .{
+            .phase = .resolver,
+            .severity = .warning,
             .span = span,
             .message = message,
         });
@@ -597,7 +636,7 @@ const Resolver = struct {
 
     fn resolveFunction(self: *Resolver, declaration: ast.DeclId, parameters: []const ast.ParamDecl, body: []const ast.StmtId) !void {
         _ = try self.scopes.push();
-        defer _ = self.scopes.pop() catch unreachable;
+        defer self.popScopeAndWarnUnused() catch unreachable;
         const parameter_symbols = try self.declareParameters(parameters);
         try self.result.function_parameters.put(declaration, parameter_symbols);
         try self.resolveStatements(body);
@@ -607,12 +646,23 @@ const Resolver = struct {
         var parameter_symbols: std.ArrayList(symbols.SymbolId) = .empty;
         defer parameter_symbols.deinit(self.result.allocator);
         for (parameters) |parameter| {
-            try parameter_symbols.append(self.result.allocator, try self.declareLocal(parameter.name, parameter.span, true, false));
+            // `track_unused = false` — Odin deliberately excludes function
+            // parameters from the unused-variable warning (see
+            // `resolver.odin`'s own doc comment: often intentionally
+            // unused when implementing an interface/callback signature
+            // that requires an exact match).
+            try parameter_symbols.append(self.result.allocator, try self.declareLocal(parameter.name, parameter.span, true, false, false));
         }
         return self.result.arena.allocator().dupe(symbols.SymbolId, parameter_symbols.items);
     }
 
-    fn declareLocal(self: *Resolver, name: []const u8, span: source.Span, is_const: bool, is_pattern_binder: bool) !symbols.SymbolId {
+    // `track_unused` — Odin's `unused_check_symbols` only ever covers
+    // `пер`-declared variables (plain or destructured) and for-loop
+    // variables, NEVER function parameters or match/pattern binders (see
+    // `resolver.odin`'s own doc comment on `unused_check_symbols`) — `"_"`
+    // is excluded by every CALLER already (the same opt-out `_` already
+    // gets from pattern matching), not checked again here.
+    fn declareLocal(self: *Resolver, name: []const u8, span: source.Span, is_const: bool, is_pattern_binder: bool, track_unused: bool) !symbols.SymbolId {
         if (isReservedBuiltin(name)) {
             try self.report(span, "Resolve Error: '{s}' — зарезервированное имя, нельзя использовать", .{name});
         }
@@ -627,6 +677,7 @@ const Resolver = struct {
             error.DuplicateSymbol => try self.report(span, "Resolve Error: символ '{s}' уже объявлен", .{name}),
             else => return err,
         };
+        if (track_unused and !std.mem.eql(u8, name, "_")) try self.unused_check_symbols.put(symbol, {});
         return symbol;
     }
 
@@ -642,12 +693,12 @@ const Resolver = struct {
                 var bindings: std.ArrayList(symbols.SymbolId) = .empty;
                 defer bindings.deinit(self.result.allocator);
                 if (let.name) |name| {
-                    const symbol = try self.declareLocal(name, let.span, let.is_const, false);
+                    const symbol = try self.declareLocal(name, let.span, let.is_const, false, true);
                     try self.result.stmt_symbols.put(statement, symbol);
                     try bindings.append(self.result.allocator, symbol);
                 } else {
                     for (let.destructure_names) |name| {
-                        try bindings.append(self.result.allocator, try self.declareLocal(name, let.span, let.is_const, false));
+                        try bindings.append(self.result.allocator, try self.declareLocal(name, let.span, let.is_const, false, true));
                     }
                 }
                 if (bindings.items.len != 0) try self.result.stmt_bindings.put(statement, try self.result.arena.allocator().dupe(symbols.SymbolId, bindings.items));
@@ -657,10 +708,10 @@ const Resolver = struct {
             .for_in => |loop| {
                 try self.resolveExpression(self.tree, loop.iterable);
                 _ = try self.scopes.push();
-                defer _ = self.scopes.pop() catch unreachable;
+                defer self.popScopeAndWarnUnused() catch unreachable;
                 var bindings: std.ArrayList(symbols.SymbolId) = .empty;
                 defer bindings.deinit(self.result.allocator);
-                for (loop.names) |name| try bindings.append(self.result.allocator, try self.declareLocal(name, loop.span, false, false));
+                for (loop.names) |name| try bindings.append(self.result.allocator, try self.declareLocal(name, loop.span, false, false, true));
                 try self.result.stmt_bindings.put(statement, try self.result.arena.allocator().dupe(symbols.SymbolId, bindings.items));
                 try self.resolveStatements(loop.body);
             },
@@ -668,8 +719,8 @@ const Resolver = struct {
                 try self.resolveExpression(self.tree, range.start);
                 try self.resolveExpression(self.tree, range.end);
                 _ = try self.scopes.push();
-                defer _ = self.scopes.pop() catch unreachable;
-                const symbol = try self.declareLocal(range.name, range.span, false, false);
+                defer self.popScopeAndWarnUnused() catch unreachable;
+                const symbol = try self.declareLocal(range.name, range.span, false, false, true);
                 try self.result.stmt_bindings.put(statement, try self.result.arena.allocator().dupe(symbols.SymbolId, &.{symbol}));
                 try self.resolveStatements(range.body);
             },
@@ -686,6 +737,13 @@ const Resolver = struct {
                     break :blk symbols.invalid_symbol;
                 };
                 try self.result.expr_symbols.put(expression, symbol);
+                // Ported from `core/resolver.odin`'s `used_symbols` — ANY
+                // reference through a bare `.ident` (read OR assignment
+                // target — `x = 5`'s left side resolves through this same
+                // case, no separate handling needed) marks the symbol
+                // used, for the unused-variable warning in `popScope`
+                // below.
+                if (symbol != symbols.invalid_symbol) try self.used_symbols.put(symbol, {});
             },
             .unary => |unary| try self.resolveExpression(tree, unary.operand),
             .binary => |binary| {
@@ -739,7 +797,7 @@ const Resolver = struct {
                 try self.resolveExpression(tree, match.subject);
                 for (match.arms) |arm| {
                     _ = try self.scopes.push();
-                    defer _ = self.scopes.pop() catch unreachable;
+                    defer self.popScopeAndWarnUnused() catch unreachable;
                     try self.resolvePattern(tree, arm.pattern);
                     try self.resolveStatements(arm.body);
                 }
@@ -750,7 +808,7 @@ const Resolver = struct {
 
     fn resolveScopedStatements(self: *Resolver, statements: []const ast.StmtId) anyerror!void {
         _ = try self.scopes.push();
-        defer _ = self.scopes.pop() catch unreachable;
+        defer self.popScopeAndWarnUnused() catch unreachable;
         try self.resolveStatements(statements);
     }
 
@@ -769,7 +827,7 @@ const Resolver = struct {
         switch (tree.pattern(pattern).*) {
             .literal => |literal| try self.resolveExpression(tree, literal.value),
             .ident => |ident| {
-                const symbol = try self.declareLocal(ident.name, ident.span, false, true);
+                const symbol = try self.declareLocal(ident.name, ident.span, false, true, false);
                 try self.result.pattern_symbols.put(pattern, symbol);
             },
             .constructor => |constructor| {
@@ -963,7 +1021,23 @@ test "resolver records all statement binders for destructuring and loops" {
     var resolved = try resolve(std.testing.allocator, &parsed.ast);
     defer resolved.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    // 2, not 0: `ключ`/`значение` (destructured, line 2) are never
+    // referenced anywhere in this body — both now warn "неиспользованная
+    // переменная" (the unused-variable check ported from `core/resolver.
+    // odin`'s `pop_scope`). `элемент`/`индекс` ARE referenced inside their
+    // own loop bodies, so neither warns. Order between the two warnings
+    // is NOT asserted — `popScopeAndWarnUnused` iterates a `StringHashMap`
+    // (`symbols.Scope.symbols`), whose iteration order is unspecified,
+    // same as Odin's own equivalent map iteration.
+    try std.testing.expectEqual(@as(usize, 2), resolved.diagnostics.items.items.len);
+    try std.testing.expectEqual(diagnostic.Severity.warning, resolved.diagnostics.items.items[0].severity);
+    try std.testing.expectEqual(diagnostic.Severity.warning, resolved.diagnostics.items.items[1].severity);
+    const has_klyuch = std.mem.eql(u8, resolved.diagnostics.items.items[0].message, "неиспользованная переменная 'ключ'") or
+        std.mem.eql(u8, resolved.diagnostics.items.items[1].message, "неиспользованная переменная 'ключ'");
+    const has_znachenie = std.mem.eql(u8, resolved.diagnostics.items.items[0].message, "неиспользованная переменная 'значение'") or
+        std.mem.eql(u8, resolved.diagnostics.items.items[1].message, "неиспользованная переменная 'значение'");
+    try std.testing.expect(has_klyuch);
+    try std.testing.expect(has_znachenie);
     const function = parsed.ast.decl(parsed.ast.program.?.declarations[0]).function;
     const destructure = resolved.stmt_bindings.get(function.body[0]).?;
     const for_in = resolved.stmt_bindings.get(function.body[1]).?;
@@ -974,4 +1048,74 @@ test "resolver records all statement binders for destructuring and loops" {
     try std.testing.expectEqualStrings("элемент", resolved.symbols.get(for_in[0]).?.name);
     try std.testing.expectEqual(@as(usize, 1), for_range.len);
     try std.testing.expectEqualStrings("индекс", resolved.symbols.get(for_range[0]).?.name);
+}
+
+test "resolver warns on an unused пер-variable" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Число\nпер x: Число = 1\n2\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), resolved.diagnostics.items.items.len);
+    try std.testing.expectEqual(diagnostic.Severity.warning, resolved.diagnostics.items.items[0].severity);
+    try std.testing.expectEqualStrings("неиспользованная переменная 'x'", resolved.diagnostics.items.items[0].message);
+}
+
+test "resolver does not warn on a used пер-variable" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Число\nпер x: Число = 1\nx\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+}
+
+test "resolver does not warn on пер-variable used only as an assignment target" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    // `x = 2` resolves `x` through the same `.ident` case as a read (see
+    // `resolveExpression`'s doc comment) — matches Odin's own documented
+    // choice not to distinguish read vs. write-only uses.
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Число\nпер x: Число = 1\nx = 2\nx\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+}
+
+test "resolver does not warn on an unused function parameter" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f(x: Число) -> Число\n1\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+}
+
+test "resolver does not warn on an underscore-named пер-variable" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Число\nпер _: Число = 1\n2\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
 }

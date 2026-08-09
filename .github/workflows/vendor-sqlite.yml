@@ -24,10 +24,10 @@ concurrency:
 env:
   SQLITE_VERSION: ${{ inputs.sqlite_version }}
   SQLITE_YEAR: ${{ inputs.sqlite_year }}
-  # Флаги сборки — общие для всех платформ (см. core/sqlite3_bindings.
-  # odin и обоснование в plan/CLAUDE.md): SQLITE_THREADSAFE=1 —
+  # Флаги сборки — общие для всех платформ (см. zig/core/sqlite3_bindings.
+  # zig и обоснование в plan/CLAUDE.md): SQLITE_THREADSAFE=1 —
   # belt-and-suspenders поверх собственной сериализации panos через
-  # in_flight (vm_sql_native.odin); SQLITE_OMIT_LOAD_EXTENSION — не
+  # in_flight (vm.zig); SQLITE_OMIT_LOAD_EXTENSION — не
   # грузим .so/.dll расширения в рантайме (self-contained policy);
   # SQLITE_OMIT_DEPRECATED/SQLITE_DQS=0 — чистое ужесточение, меньше
   # бинарь, никакого устаревшего API panos никогда не вызовет.
@@ -113,15 +113,14 @@ jobs:
           cp _deps/external/sqlite3/sqlite3.c external/sqlite3/sqlite3.c
           cp _deps/external/sqlite3/include/sqlite3.h external/sqlite3/include/sqlite3.h
 
-      - name: Установить Odin
-        uses: laytan/setup-odin@v2
+      - name: Установить Zig
+        uses: mlugg/setup-zig@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          version: "0.16.0"
 
       - name: Проверить линковку с panos
         shell: bash
-        run: odin build . -o:speed -out:panos-smoke
+        run: zig build
 
       - name: Сохранить платформенный архив
         uses: actions/upload-artifact@v4
@@ -175,15 +174,14 @@ jobs:
           Copy-Item _deps/external/sqlite3/sqlite3.c external/sqlite3/sqlite3.c -Force
           Copy-Item _deps/external/sqlite3/include/sqlite3.h external/sqlite3/include/sqlite3.h -Force
 
-      - name: Установить Odin
-        uses: laytan/setup-odin@v2
+      - name: Установить Zig
+        uses: mlugg/setup-zig@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-06
+          version: "0.16.0"
 
       - name: Проверить линковку с panos
         shell: pwsh
-        run: odin build . -o:speed -out:panos-smoke.exe
+        run: zig build
 
       - name: Сохранить платформенный архив
         uses: actions/upload-artifact@v4

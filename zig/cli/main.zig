@@ -221,8 +221,14 @@ pub fn main(init: std.process.Init) !void {
     defer arguments.deinit();
     _ = arguments.next();
     var verbose = false;
+    // `contracts/cli.md` says "with no file.ps, panos starts the existing
+    // REPL mode" — but Odin's own `repl()` (`main.odin:205-207`) is an
+    // empty stub, no output, exit 0. No REPL exists on either toolchain —
+    // Odin is being deleted, not a compatibility target, so this stays a
+    // clear, informative message rather than silently matching Odin's
+    // no-op.
     var file_path = arguments.next() orelse {
-        try stdout.print("Panos REPL ещё не поддержан Zig-версией\n", .{});
+        try stdout.print("Panos REPL пока не реализован\n", .{});
         try stdout.flush();
         return;
     };
@@ -298,6 +304,18 @@ pub fn main(init: std.process.Init) !void {
             if (verbose) try stdout.print("EXECUTION\n--------------------------\n", .{});
             try stdout.print("{s}\n", .{output});
             try stdout.flush();
+            // `stderr` is buffered (`stderr_buffer` above) and otherwise
+            // only ever flushed on the error-exit paths — a WARNING-only
+            // diagnostic (e.g. "неиспользованная переменная") written by
+            // `writeGraphDiagnostics` above never reaches the real
+            // terminal on the success path without this: the process
+            // just returns normally, and Zig's buffered `Io.Writer` has
+            // no destructor-style auto-flush on exit. Found by actually
+            // running the built binary, not by reading the code — a unit
+            // test calling `compileGraph` directly (bypassing `main`
+            // entirely) saw the diagnostic just fine, which is why this
+            // stayed hidden.
+            try stderr.flush();
         },
         .runtime_error => |message| {
             try stderr.print("{s}\n", .{message});

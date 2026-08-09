@@ -1912,10 +1912,7 @@ pub const Vm = struct {
     }
 
     fn osVersion(self: *Vm) anyerror!void {
-        // Kept in sync manually with Odin's `PANOS_VERSION` (`core/vm.odin`)
-        // — there is no single source of truth shared between the two
-        // implementations during the migration.
-        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, "0.3.1"));
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, "0.3.2"));
         try self.stack.append(self.allocator, .{ .heap_string = heap_string });
     }
 

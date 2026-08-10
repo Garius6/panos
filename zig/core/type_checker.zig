@@ -195,6 +195,12 @@ pub const CheckResult = struct {
     unsupported_imports: std.AutoHashMap(symbols.SymbolId, void),
     imported_nominal_identities: std.AutoHashMap(symbols.SymbolId, u32),
     nominal_fields: std.AutoHashMap(symbols.SymbolId, []const NominalField),
+    // Field marshal kinds (declaration order) for `ff_структура` types
+    // ONLY — needed at `внешний` struct-by-value call sites to build a
+    // libffi struct `ffi_type` (its `elements` array) and to pack/unpack
+    // raw bytes at each field's C ABI offset. Ordinary (non-`ff_структура`)
+    // nominals never get an entry here.
+    ffi_struct_layouts: std.AutoHashMap(symbols.SymbolId, []const ast.ForeignMarshalKind),
     type_aliases: std.AutoHashMap(symbols.SymbolId, types.TypeId),
     alias_type_nodes: std.AutoHashMap(symbols.SymbolId, ast.TypeId),
     generic_function_parameters: std.AutoHashMap(symbols.SymbolId, []const GenericParameter),
@@ -221,6 +227,7 @@ pub const CheckResult = struct {
             .unsupported_imports = .init(allocator),
             .imported_nominal_identities = .init(allocator),
             .nominal_fields = .init(allocator),
+            .ffi_struct_layouts = .init(allocator),
             .type_aliases = .init(allocator),
             .alias_type_nodes = .init(allocator),
             .generic_function_parameters = .init(allocator),
@@ -254,6 +261,7 @@ pub const CheckResult = struct {
         self.alias_type_nodes.deinit();
         self.type_aliases.deinit();
         self.nominal_fields.deinit();
+        self.ffi_struct_layouts.deinit();
         self.imported_nominal_identities.deinit();
         self.unsupported_imports.deinit();
         self.symbol_types.deinit();
@@ -713,8 +721,35 @@ const Checker = struct {
                 .struct_decl => |value| value,
                 else => continue,
             };
-            if (structure.is_ffi) continue;
             const symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
+            if (structure.is_ffi) {
+                // `ff_структура` fields carry a marshal kind, not a real
+                // type annotation (parser.zig's `parseFfiStructDeclaration`
+                // restricts them to Целое(8|32|64)/Число(32|64) — always
+                // scalar, never nested) — panos-side field TYPE is derived
+                // from that marshal kind the same way an ordinary
+                // `внешний функ` parameter's type is (`foreignMarshalType`),
+                // so `Вектор2(x, y)`/`.x` construction and field access get
+                // the SAME real arity/type checking an ordinary struct's
+                // fields already have — this was silently unchecked before
+                // (is_ffi structs got skipped here entirely, no
+                // `nominal_fields` entry at all).
+                var ffi_fields: std.ArrayList(NominalField) = .empty;
+                defer ffi_fields.deinit(self.result.allocator);
+                var layout: std.ArrayList(ast.ForeignMarshalKind) = .empty;
+                defer layout.deinit(self.result.allocator);
+                for (structure.fields) |field| {
+                    const kind = field.marshal orelse .int32;
+                    try ffi_fields.append(self.result.allocator, .{
+                        .name = field.name,
+                        .typ = try self.foreignMarshalType(kind, null, null, field.span),
+                    });
+                    try layout.append(self.result.allocator, kind);
+                }
+                try self.result.nominal_fields.put(symbol, try self.result.arena.allocator().dupe(NominalField, ffi_fields.items));
+                try self.result.ffi_struct_layouts.put(symbol, try self.result.arena.allocator().dupe(ast.ForeignMarshalKind, layout.items));
+                continue;
+            }
             var fields: std.ArrayList(NominalField) = .empty;
             defer fields.deinit(self.result.allocator);
             const generic_parameters = try self.defineGenericNominalParameters(symbol, structure.type_parameters);
@@ -951,27 +986,46 @@ const Checker = struct {
     // `.struct_value` (struct-by-value marshaling) isn't ported yet —
     // mirrors Odin's own history, where it was a later addition on top
     // of the scalar-only first slice, not a from-day-one requirement.
-    fn foreignMarshalType(self: *Checker, marshal: ast.ForeignMarshalKind, pointee: ?ast.TypeId, span: source.Span) anyerror!types.TypeId {
+    fn foreignMarshalType(self: *Checker, marshal: ast.ForeignMarshalKind, pointee: ?ast.TypeId, struct_type_name: ?[]const u8, span: source.Span) anyerror!types.TypeId {
         return switch (marshal) {
             .void => self.result.types.builtins.void,
             .int8, .int32, .int64 => self.result.types.builtins.integer,
             .float32, .float64 => self.result.types.builtins.number,
             .c_string => self.result.types.builtins.string,
-            // Both real, well-defined marshal kinds — rejected here only
-            // because this VM has no `Указатель`/struct-by-value RUNTIME
-            // value representation yet to marshal them into (the type
-            // system already models `Указатель(T)`, e.g. `types.zig`'s
+            // A real, well-defined marshal kind — rejected here only
+            // because this VM has no `Указатель` RUNTIME value
+            // representation yet to marshal it into (the type system
+            // already models `Указатель(T)`, e.g. `types.zig`'s
             // `.pointer` — nothing constructs a live value of it yet).
             // Matches Odin's own history: `внешний` shipped scalar-only
-            // first, pointers/structs were later, separate additions.
+            // first, pointers were a later, separate addition.
             .pointer => blk: {
                 _ = pointee;
                 try self.report(span, "Type Error: 'внешний' с Указатель(T) ещё не поддержан Zig-версией", .{});
                 break :blk try self.result.types.poison();
             },
+            // The panos-side type of a struct-by-value parameter/return is
+            // the `ff_структура` itself — an ordinary nominal type, same
+            // as any other struct parameter (`nominalPass`'s `is_ffi`
+            // branch already registered real fields/a `ffi_struct_layouts`
+            // entry for it, keyed by the SAME symbol found here). The
+            // parser already restricted `ff_структура` fields to flat
+            // scalars (no nesting) — `invokeForeign` (vm.zig) relies on
+            // that invariant when packing/unpacking raw bytes.
             .struct_value => blk: {
-                try self.report(span, "Type Error: 'внешний' с передачей структуры по значению ещё не поддержан Zig-версией", .{});
-                break :blk try self.result.types.poison();
+                const name = struct_type_name orelse {
+                    try self.report(span, "Type Error: 'внешний' ожидает имя ff_структура", .{});
+                    break :blk try self.result.types.poison();
+                };
+                const symbol = self.findTypeSymbol(name) orelse {
+                    try self.report(span, "Type Error: неизвестная структура '{s}'", .{name});
+                    break :blk try self.result.types.poison();
+                };
+                if (!self.result.ffi_struct_layouts.contains(symbol)) {
+                    try self.report(span, "Type Error: '{s}' не является ff_структура", .{name});
+                    break :blk try self.result.types.poison();
+                }
+                break :blk try self.result.types.nominal(symbol, &.{});
             },
         };
     }
@@ -981,9 +1035,9 @@ const Checker = struct {
         var parameter_types: std.ArrayList(types.TypeId) = .empty;
         defer parameter_types.deinit(self.result.allocator);
         for (foreign.parameters) |parameter| {
-            try parameter_types.append(self.result.allocator, try self.foreignMarshalType(parameter.marshal, parameter.pointee, parameter.span));
+            try parameter_types.append(self.result.allocator, try self.foreignMarshalType(parameter.marshal, parameter.pointee, parameter.struct_type_name, parameter.span));
         }
-        const return_type = try self.foreignMarshalType(foreign.return_marshal, foreign.return_pointee, foreign.span);
+        const return_type = try self.foreignMarshalType(foreign.return_marshal, foreign.return_pointee, foreign.return_struct_type_name, foreign.span);
         const signature = try self.result.types.function(parameter_types.items, return_type);
         try self.result.symbol_types.put(symbol, signature);
     }

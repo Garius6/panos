@@ -6,6 +6,7 @@ const resolver = @import("resolver.zig");
 const source = @import("source.zig");
 const symbols = @import("symbols.zig");
 const type_checker = @import("type_checker.zig");
+const types = @import("types.zig");
 
 pub const CompileResult = struct {
     allocator: std.mem.Allocator,
@@ -1051,6 +1052,28 @@ const FunctionCompiler = struct {
         for (call.arguments) |argument| try self.compileExpression(argument);
         const param_kinds = try self.compiler.program().arena.allocator().alloc(ast.ForeignMarshalKind, foreign.parameters.len);
         for (foreign.parameters, param_kinds) |parameter, *kind| kind.* = parameter.marshal;
+        // Struct-by-value field layouts — resolved from the ALREADY
+        // TYPE-CHECKED function signature (`checked.symbol_types`), not by
+        // re-resolving `parameter.struct_type_name` here: the type checker
+        // already turned each `.struct_value` parameter into a real
+        // nominal `Вектор2`/`Цвет`-style TypeId (`type_checker.zig`'s
+        // `foreignMarshalType`), so its underlying symbol is just sitting
+        // in the signature, one lookup away.
+        const signature = self.compiler.checked.symbol_types.get(symbol);
+        const function_type = if (signature) |value| self.compiler.checked.types.get(value) else null;
+        const param_struct_layouts = try self.compiler.program().arena.allocator().alloc([]const ast.ForeignMarshalKind, foreign.parameters.len);
+        for (param_kinds, param_struct_layouts, 0..) |kind, *layout, index| {
+            const parameter_type = if (function_type) |entry| switch (entry.*) {
+                .function => |f| if (index < f.parameters.len) f.parameters[index] else null,
+                else => null,
+            } else null;
+            layout.* = if (kind != .struct_value) &.{} else self.ffiStructLayoutFor(parameter_type);
+        }
+        const return_type = if (function_type) |entry| switch (entry.*) {
+            .function => |f| f.return_type,
+            else => null,
+        } else null;
+        const return_struct_layout: []const ast.ForeignMarshalKind = if (foreign.return_marshal != .struct_value) &.{} else self.ffiStructLayoutFor(return_type);
         // `0` (never a valid function pointer) if the resolver already
         // failed to load the library/symbol — that's already a reported
         // diagnostic by this point, this call is unreachable in a
@@ -1059,7 +1082,9 @@ const FunctionCompiler = struct {
         const constant_index = try self.function.addConstant(self.compiler.result.allocator, .{ .foreign_function = .{
             .fn_ptr = fn_ptr,
             .param_kinds = param_kinds,
+            .param_struct_layouts = param_struct_layouts,
             .return_kind = foreign.return_marshal,
+            .return_struct_layout = return_struct_layout,
         } });
         if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
         try self.function.emit(self.compiler.result.allocator, .{ .call_foreign = .{
@@ -1067,6 +1092,21 @@ const FunctionCompiler = struct {
             .argument_count = @intCast(call.arguments.len),
         } });
         return true;
+    }
+
+    // `type_id` (a `.struct_value` parameter/return's already-resolved
+    // panos type) -> its `ff_структура`'s field marshal kinds, or `&.{}`
+    // if it isn't one (shouldn't happen for a program that type-checked
+    // cleanly, but this is compile-time metadata plumbing, not a place to
+    // introduce a NEW crash on a malformed/poisoned type).
+    fn ffiStructLayoutFor(self: *FunctionCompiler, type_id: ?types.TypeId) []const ast.ForeignMarshalKind {
+        const id = type_id orelse return &.{};
+        const entry = self.compiler.checked.types.get(id) orelse return &.{};
+        const nominal_symbol = switch (entry.*) {
+            .nominal => |n| n.symbol,
+            else => return &.{},
+        };
+        return self.compiler.checked.ffi_struct_layouts.get(nominal_symbol) orelse &.{};
     }
 
     // Reverse `decl_symbols` lookup (same linear-scan pattern already

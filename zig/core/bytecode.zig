@@ -15,7 +15,16 @@ pub const invalid_function: FunctionId = @enumFromInt(std.math.maxInt(u32));
 pub const ForeignFunctionConstant = struct {
     fn_ptr: usize,
     param_kinds: []const ast.ForeignMarshalKind,
+    // Parallel to `param_kinds` — empty slice for every non-`.struct_value`
+    // parameter, the `ff_структура`'s field marshal kinds (declaration
+    // order) for a `.struct_value` one. Needed at the VM's FFI call site to
+    // build a libffi struct `ffi_type` (its `elements` array) and pack the
+    // panos-side struct `Value`'s fields into raw C ABI bytes.
+    param_struct_layouts: []const []const ast.ForeignMarshalKind,
     return_kind: ast.ForeignMarshalKind,
+    // Same shape as one `param_struct_layouts` entry — empty unless
+    // `return_kind == .struct_value`.
+    return_struct_layout: []const ast.ForeignMarshalKind,
 };
 
 pub const Constant = union(enum) {

@@ -6,6 +6,8 @@
 // native-target `Compile` steps).
 
 const builtin = @import("builtin");
+const std = @import("std");
+const ast = @import("ast.zig");
 
 // Layout matches `ffi_type` on the supported 64-bit platforms:
 // size_t -> usize, unsigned short -> u16, struct _ffi_type** -> ?[*]?*FfiType.
@@ -64,10 +66,10 @@ pub fn defaultAbi() i32 {
     return @intCast(ffi_get_default_abi());
 }
 
-// `ast.ForeignMarshalKind` -> `*FfiType`. `.struct_value` is unsupported
-// in this Zig port (see `vm.zig`'s foreign-call handling) — callers must
-// reject it before reaching here, same as Odin's `fmt.panicf` guard for
-// the same case.
+// `ast.ForeignMarshalKind` -> `*FfiType`. `.struct_value` needs its OWN
+// per-struct `FfiType` (built by `buildStructFfiType` below, from the
+// `ff_структура`'s field layout) — callers must build that separately and
+// never reach `.struct_value` here, same as before this was ported.
 pub fn ffiTypeForMarshal(marshal: anytype) *FfiType {
     return switch (marshal) {
         .void => &ffi_type_void,
@@ -79,4 +81,21 @@ pub fn ffiTypeForMarshal(marshal: anytype) *FfiType {
         .c_string, .pointer => &ffi_type_pointer,
         .struct_value => unreachable,
     };
+}
+
+// Builds a libffi struct `ffi_type` describing a `ff_структура`'s field
+// layout (`fields`, declaration order — every field is a flat scalar,
+// `parser.zig`'s `parseFfiStructDeclaration` enforces that at parse time,
+// so `ffiTypeForMarshal` never hits its own `.struct_value` case while
+// filling `elements` here). `size`/`alignment` are deliberately left `0`
+// — libffi computes and fills them in during `ffi_prep_cif` once this
+// type is referenced from an argument/return type array; reading either
+// field before that call returns garbage, not real values.
+pub fn buildStructFfiType(allocator: std.mem.Allocator, fields: []const ast.ForeignMarshalKind) !*FfiType {
+    const elements = try allocator.alloc(?*FfiType, fields.len + 1);
+    for (fields, elements[0..fields.len]) |field, *slot| slot.* = ffiTypeForMarshal(field);
+    elements[fields.len] = null;
+    const struct_type = try allocator.create(FfiType);
+    struct_type.* = .{ .size = 0, .alignment = 0, .type = FFI_TYPE_STRUCT, .elements = elements.ptr };
+    return struct_type;
 }

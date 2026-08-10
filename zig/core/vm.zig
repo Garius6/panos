@@ -3501,20 +3501,117 @@ pub const Vm = struct {
         }
     }
 
-    // Marshals `arguments` through libffi and calls `info.fn_ptr`, one
-    // 8-byte storage cell per scalar argument (matches Odin's
-    // `arg_storage`/`avalue` in `core/vm_ffi_native.odin`, same rationale:
-    // libffi's contract is an array of POINTERS TO arguments, not the
-    // argument values themselves). `Указатель(T)`/struct-by-value
-    // marshaling isn't ported yet — rejected at the type-checker level
-    // (`type_checker.zig`'s `foreignMarshalType`), so `.pointer`/
-    // `.struct_value` are genuinely unreachable here.
+    // Packs a numeric panos `Value` into `dest` per `kind` — shared by
+    // both a plain scalar argument/field and one FIELD of a struct-by-value
+    // argument (`ff_структура` fields are always one of these five kinds,
+    // never `.c_string`/`.pointer`/`.struct_value` — `parser.zig`'s
+    // `parseFfiStructDeclaration` enforces that at parse time).
+    fn packScalar(self: *Vm, dest: [*]u8, kind: ast_types.ForeignMarshalKind, source: value.Value) anyerror!void {
+        const numeric = try self.number(source);
+        switch (kind) {
+            .int8 => @as(*u8, @ptrCast(@alignCast(dest))).* = @intFromFloat(numeric),
+            .int32 => @as(*i32, @ptrCast(@alignCast(dest))).* = @intFromFloat(numeric),
+            .int64 => @as(*i64, @ptrCast(@alignCast(dest))).* = @intFromFloat(numeric),
+            .float32 => @as(*f32, @ptrCast(@alignCast(dest))).* = @floatCast(numeric),
+            .float64 => @as(*f64, @ptrCast(@alignCast(dest))).* = numeric,
+            .void, .c_string, .pointer, .struct_value => unreachable,
+        }
+    }
+
+    // Inverse of `packScalar` — reads one field back out of raw C ABI
+    // bytes into a panos `Value`.
+    fn unpackScalar(kind: ast_types.ForeignMarshalKind, source: [*]const u8) value.Value {
+        return switch (kind) {
+            .int8 => .{ .number = @floatFromInt(@as(*const u8, @ptrCast(@alignCast(source))).*) },
+            .int32 => .{ .number = @floatFromInt(@as(*const i32, @ptrCast(@alignCast(source))).*) },
+            .int64 => .{ .number = @floatFromInt(@as(*const i64, @ptrCast(@alignCast(source))).*) },
+            .float32 => .{ .number = @as(*const f32, @ptrCast(@alignCast(source))).* },
+            .float64 => .{ .number = @as(*const f64, @ptrCast(@alignCast(source))).* },
+            .void, .c_string, .pointer, .struct_value => unreachable,
+        };
+    }
+
+    // Packs a panos struct-by-value argument (`.aggregate`, one element per
+    // field, declaration order — matches `layout`) into `dest`, which must
+    // be at least `struct_type.size` bytes (populated by `ffi_prep_cif` —
+    // callers must call this only AFTER that, never before). Field byte
+    // offsets come from libffi itself (`ffi_get_struct_offsets`) — C ABI
+    // struct layout (padding for alignment) is NOT something to
+    // reimplement by hand here.
+    fn packStruct(self: *Vm, dest: [*]u8, struct_type: *ffi.FfiType, layout: []const ast_types.ForeignMarshalKind, source: value.Value) anyerror!void {
+        const aggregate = switch (source) {
+            .aggregate => |a| a,
+            else => {
+                try self.fault("Runtime Error: 'внешний' ожидает значение ff_структура для этого параметра", .{});
+                return;
+            },
+        };
+        if (aggregate.elements.len != layout.len) {
+            try self.fault("Runtime Error: количество полей ff_структура не совпадает при 'внешний'-вызове", .{});
+            return;
+        }
+        const offsets = try self.allocator.alloc(usize, layout.len);
+        defer self.allocator.free(offsets);
+        _ = ffi.ffi_get_struct_offsets(ffi.defaultAbi(), struct_type, offsets.ptr);
+        for (layout, aggregate.elements, offsets) |kind, field_value, offset| {
+            try self.packScalar(dest + offset, kind, field_value);
+        }
+    }
+
+    // Inverse of `packStruct` — builds a panos `.aggregate` (untagged —
+    // field access is purely positional, `vm.zig`'s `getProperty`/
+    // `setProperty` never consult `.name`, see `buildStruct`) from raw C
+    // ABI bytes.
+    fn unpackStruct(self: *Vm, source: [*]const u8, struct_type: *ffi.FfiType, layout: []const ast_types.ForeignMarshalKind) anyerror!value.Value {
+        const offsets = try self.allocator.alloc(usize, layout.len);
+        defer self.allocator.free(offsets);
+        _ = ffi.ffi_get_struct_offsets(ffi.defaultAbi(), struct_type, offsets.ptr);
+        const elements = try self.allocator.alloc(value.Value, layout.len);
+        for (layout, offsets, elements) |kind, offset, *slot| slot.* = unpackScalar(kind, source + offset);
+        const aggregate = try self.heap.createAggregate(null, elements);
+        return .{ .aggregate = aggregate };
+    }
+
+    // Marshals `arguments` through libffi and calls `info.fn_ptr`. Each
+    // argument gets its own 8-byte-aligned storage region, sized in whole
+    // 8-byte cells — 1 cell for every scalar (matches Odin's
+    // `arg_storage`/`avalue` in `core/vm_ffi_native.odin`), `ceil(size /
+    // 8)` cells for a struct-by-value argument (`size` only known AFTER
+    // `ffi_prep_cif` fills it in — struct cell counts are computed in a
+    // SECOND pass, after that call, not up front). One flat `[]u64`
+    // buffer for ALL cells (not one allocation per argument) — avoids
+    // ever reallocating out from under an `avalue[i]` pointer already
+    // handed to libffi.
     fn invokeForeign(self: *Vm, info: bytecode.ForeignFunctionConstant, arguments: []const value.Value) anyerror!value.Value {
         const nargs = info.param_kinds.len;
         const atypes = try self.allocator.alloc(?*ffi.FfiType, nargs);
         defer self.allocator.free(atypes);
-        for (info.param_kinds, atypes) |kind, *slot| slot.* = ffi.ffiTypeForMarshal(kind);
-        const rtype = ffi.ffiTypeForMarshal(info.return_kind);
+        // Struct `ffi_type`s are built per call (their `elements` array is
+        // sized to that struct's own field count) — freed alongside
+        // `atypes` once the call is done; `ffi_call` never keeps a
+        // reference past its own return.
+        var struct_type_allocs: std.ArrayList(struct { ptr: *ffi.FfiType, field_count: usize }) = .empty;
+        defer {
+            for (struct_type_allocs.items) |entry| {
+                self.allocator.free(entry.ptr.elements.?[0 .. entry.field_count + 1]);
+                self.allocator.destroy(entry.ptr);
+            }
+            struct_type_allocs.deinit(self.allocator);
+        }
+        for (info.param_kinds, info.param_struct_layouts, atypes) |kind, layout, *slot| {
+            if (kind == .struct_value) {
+                const struct_type = try ffi.buildStructFfiType(self.allocator, layout);
+                try struct_type_allocs.append(self.allocator, .{ .ptr = struct_type, .field_count = layout.len });
+                slot.* = struct_type;
+            } else {
+                slot.* = ffi.ffiTypeForMarshal(kind);
+            }
+        }
+        const rtype = if (info.return_kind == .struct_value) blk: {
+            const struct_type = try ffi.buildStructFfiType(self.allocator, info.return_struct_layout);
+            try struct_type_allocs.append(self.allocator, .{ .ptr = struct_type, .field_count = info.return_struct_layout.len });
+            break :blk struct_type;
+        } else ffi.ffiTypeForMarshal(info.return_kind);
 
         var cif: ffi.FfiCif = undefined;
         const prep_status = ffi.ffi_prep_cif(&cif, ffi.defaultAbi(), @intCast(nargs), rtype, if (nargs > 0) atypes.ptr else null);
@@ -3523,7 +3620,19 @@ pub const Vm = struct {
             return .{ .void = {} };
         }
 
-        const arg_storage = try self.allocator.alloc(u64, nargs);
+        // Now that `ffi_prep_cif` has run, every struct `FfiType.size` in
+        // `atypes`/`rtype` is real — compute per-argument cell counts.
+        const cell_offsets = try self.allocator.alloc(usize, nargs);
+        defer self.allocator.free(cell_offsets);
+        var total_cells: usize = 0;
+        for (info.param_kinds, atypes, cell_offsets) |kind, atype, *offset| {
+            offset.* = total_cells;
+            const bytes: usize = if (kind == .struct_value) atype.?.size else 8;
+            total_cells += (bytes + 7) / 8;
+        }
+        const return_cells: usize = if (info.return_kind == .struct_value) (rtype.size + 7) / 8 else 1;
+
+        const arg_storage = try self.allocator.alloc(u64, @max(1, total_cells));
         defer self.allocator.free(arg_storage);
         const avalue = try self.allocator.alloc(?*anyopaque, nargs);
         defer self.allocator.free(avalue);
@@ -3538,28 +3647,10 @@ pub const Vm = struct {
             cstring_storage.deinit(self.allocator);
         }
 
-        for (info.param_kinds, 0..) |kind, index| {
+        for (info.param_kinds, info.param_struct_layouts, atypes, cell_offsets, 0..) |kind, layout, atype, cell_offset, index| {
+            const dest: [*]u8 = @ptrCast(&arg_storage[cell_offset]);
             switch (kind) {
-                .int8 => {
-                    const cell: *u8 = @ptrCast(&arg_storage[index]);
-                    cell.* = @intFromFloat(try self.number(arguments[index]));
-                },
-                .int32 => {
-                    const cell: *i32 = @ptrCast(&arg_storage[index]);
-                    cell.* = @intFromFloat(try self.number(arguments[index]));
-                },
-                .int64 => {
-                    const cell: *i64 = @ptrCast(&arg_storage[index]);
-                    cell.* = @intFromFloat(try self.number(arguments[index]));
-                },
-                .float32 => {
-                    const cell: *f32 = @ptrCast(&arg_storage[index]);
-                    cell.* = @floatCast(try self.number(arguments[index]));
-                },
-                .float64 => {
-                    const cell: *f64 = @ptrCast(&arg_storage[index]);
-                    cell.* = try self.number(arguments[index]);
-                },
+                .int8, .int32, .int64, .float32, .float64 => try self.packScalar(dest, kind, arguments[index]),
                 .c_string => {
                     const text = arguments[index].stringBytes() orelse {
                         try self.fault("Runtime Error: 'внешний' ожидает Строку для параметра-КСтроки", .{});
@@ -3567,24 +3658,23 @@ pub const Vm = struct {
                     };
                     const buffer = try self.allocator.dupeZ(u8, text);
                     try cstring_storage.append(self.allocator, buffer);
-                    const cell: *[*:0]const u8 = @ptrCast(@alignCast(&arg_storage[index]));
+                    const cell: *[*:0]const u8 = @ptrCast(@alignCast(dest));
                     cell.* = buffer.ptr;
                 },
-                .void, .pointer, .struct_value => unreachable,
+                .struct_value => try self.packStruct(dest, atype.?, layout, arguments[index]),
+                .void, .pointer => unreachable,
             }
-            avalue[index] = &arg_storage[index];
+            avalue[index] = dest;
         }
 
-        var return_storage: u64 = 0;
-        ffi.ffi_call(&cif, @ptrFromInt(info.fn_ptr), &return_storage, if (nargs > 0) avalue.ptr else null);
+        const return_storage = try self.allocator.alloc(u64, @max(1, return_cells));
+        defer self.allocator.free(return_storage);
+        ffi.ffi_call(&cif, @ptrFromInt(info.fn_ptr), return_storage.ptr, if (nargs > 0) avalue.ptr else null);
+        const return_bytes: [*]const u8 = @ptrCast(return_storage.ptr);
 
         return switch (info.return_kind) {
             .void => .{ .void = {} },
-            .int8 => .{ .number = @floatFromInt(@as(*u8, @ptrCast(&return_storage)).*) },
-            .int32 => .{ .number = @floatFromInt(@as(*i32, @ptrCast(&return_storage)).*) },
-            .int64 => .{ .number = @floatFromInt(@as(*i64, @ptrCast(&return_storage)).*) },
-            .float32 => .{ .number = @as(*f32, @ptrCast(&return_storage)).* },
-            .float64 => .{ .number = @as(*f64, @ptrCast(&return_storage)).* },
+            .int8, .int32, .int64, .float32, .float64 => unpackScalar(info.return_kind, return_bytes),
             .c_string => blk: {
                 // panos ALWAYS copies a returned C string into a new
                 // managed string — never borrows C-owned memory,
@@ -3594,12 +3684,13 @@ pub const Vm = struct {
                 // non-optional `КСтрока`, there is no way to express
                 // "no value" in this first slice's type mapping, and
                 // `std.mem.span` on a null pointer would otherwise crash.
-                const raw: ?[*:0]const u8 = @as(*const ?[*:0]const u8, @ptrCast(@alignCast(&return_storage))).*;
+                const raw: ?[*:0]const u8 = @as(*const ?[*:0]const u8, @ptrCast(@alignCast(return_bytes))).*;
                 const bytes = if (raw) |pointer| std.mem.span(pointer) else "";
                 const heap_string = try self.heap.createString(try self.allocator.dupe(u8, bytes));
                 break :blk .{ .heap_string = heap_string };
             },
-            .pointer, .struct_value => unreachable,
+            .struct_value => try self.unpackStruct(return_bytes, rtype, info.return_struct_layout),
+            .pointer => unreachable,
         };
     }
 

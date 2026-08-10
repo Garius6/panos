@@ -24,12 +24,24 @@ jobs:
         include:
           - os: ubuntu-24.04
             suffix: linux-amd64
+            target_flag: ""
 
           - os: macos-14
             suffix: macos-arm64
+            target_flag: ""
 
+          # Zig's "native" target detection on Windows defaults to the
+          # `-gnu` ABI (self-hosted mingw, no external toolchain needed in
+          # theory) — but this Zig version's mingw import-lib synthesis for
+          # `внешний`/FFI's `-lc` (`libLIBCMT.a`/`libOLDNAMES.a`) doesn't
+          # work here (confirmed: identical missing-file error on a local
+          # macOS→x86_64-windows-gnu CROSS-compile too, so it's not
+          # `windows-2022`-specific). `ilammy/msvc-dev-cmd` above already
+          # sets up a real MSVC toolchain — forcing the ACTUAL `-msvc` ABI
+          # sidesteps the broken mingw path entirely.
           - os: windows-2022
             suffix: windows-amd64
+            target_flag: "-Dtarget=x86_64-windows-msvc"
 
     runs-on: ${{ matrix.os }}
 
@@ -101,10 +113,10 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $extractedDir.FullName
 
       - name: zig build test
-        run: zig build test --summary all
+        run: zig build test ${{ matrix.target_flag }} --summary all
 
       - name: zig build conformance
-        run: zig build conformance --summary all
+        run: zig build conformance ${{ matrix.target_flag }} --summary all
 
       # `integration`/`aot`/`bench` used to be bundled into the single
       # `test` step (before it was split into fast-unit-only, see
@@ -114,19 +126,19 @@ jobs:
       # `tests/conformance/benchmarks.md`'s own documented methodology —
       # Debug-mode `фиб(30)` alone takes minutes.
       - name: zig build integration
-        run: zig build integration --summary all
+        run: zig build integration ${{ matrix.target_flag }} --summary all
 
       - name: zig build aot
-        run: zig build aot --summary all
+        run: zig build aot ${{ matrix.target_flag }} --summary all
 
       - name: zig build -Doptimize=ReleaseFast bench
-        run: zig build -Doptimize=ReleaseFast bench --summary all
+        run: zig build -Doptimize=ReleaseFast bench ${{ matrix.target_flag }} --summary all
 
       - name: zig build lsp
-        run: zig build lsp
+        run: zig build lsp ${{ matrix.target_flag }}
 
       - name: zig build browser
-        run: zig build browser
+        run: zig build browser ${{ matrix.target_flag }}
 
       - name: zig build aot-runtime-wasi
         run: zig build aot-runtime-wasi

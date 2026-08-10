@@ -234,7 +234,18 @@ const ImportContext = struct {
             });
         }
 
-        const prelude_type_names = [_][]const u8{ "Результат", "Опция" };
+        // Every module has separately resolved prelude symbols. Re-host all
+        // prelude types that can occur in an exported signature or generic
+        // bound; otherwise an imported `[T: Сравниваемое]`, for example,
+        // silently loses its bound because its source SymbolId cannot be
+        // compared with the importer's local SymbolId.
+        const prelude_type_names = [_][]const u8{
+            "Результат",
+            "Опция",
+            "Сравниваемое",
+            "Итерируемое",
+            "Печатаемое",
+        };
         var touched = bridged_modules.keyIterator();
         while (touched.next()) |module_index_ptr| {
             const target = &modules[module_index_ptr.*];
@@ -822,6 +833,45 @@ test "module compiler dispatches an imported struct's interface implementation v
     }
 }
 
+test "module compiler preserves a prelude bound on an imported generic function" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./библиотека\" как библиотека\nэкспорт функ старт() -> Число\nпер a: библиотека.Точка = библиотека.Точка(40)\nпер b: библиотека.Точка = библиотека.Точка(2)\nбиблиотека.макс(a, b).x\nконец" },
+        .{ .path = "проект/библиотека.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nреализация Сравниваемое для Точка\nфунк сравнить(это: Точка, другое: Точка) -> Число\nэто.x - другое.x\nконец\nконец\nэкспорт функ макс[T: Сравниваемое](a: T, b: T) -> T\nесли a > b тогда a иначе b конец\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 40), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "module compiler rejects a value outside an imported generic function bound" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./библиотека\" как библиотека\nэкспорт функ старт() -> Строка\nбиблиотека.макс(\"a\", \"b\")\nконец" },
+        .{ .path = "проект/библиотека.ps", .bytes = "экспорт функ макс[T: Сравниваемое](a: T, b: T) -> T\nесли a > b тогда a иначе b конец\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expect(compiled.hasErrors());
+    try std.testing.expectEqualStrings("Type Error: тип аргумента не реализует ограничение 'Сравниваемое'", compiled.diagnostics.items.items[0].message);
+}
+
 test "module compiler dispatches through a direct interface-typed cast on an imported struct" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер a: точки.Точка = точки.Точка(40)\nпер b: точки.Точка = точки.Точка(2)\nпер x: Сравниваемое = a\nx.сравнить(b)\nконец" },
@@ -906,4 +956,3 @@ test "module compiler constructs and reads exported structure fields" {
         .runtime_error => return error.TestUnexpectedResult,
     }
 }
-

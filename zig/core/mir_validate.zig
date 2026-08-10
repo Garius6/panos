@@ -246,7 +246,7 @@ pub fn validateFunction(allocator: std.mem.Allocator, module: *const mir.Module,
                 }
             },
             .return_value => |r| {
-                const returns_value = function.result_type != void_type;
+                const returns_value = !function.result_type.eql(void_type);
                 const has_value = r.value != null;
                 if (returns_value and !has_value) {
                     try issues.append(allocator, .{
@@ -381,7 +381,7 @@ test "validateFunction reports a Jump to a nonexistent block" {
     const allocator = std.testing.allocator;
     var module = mir.Module.init(allocator);
     defer module.deinit(allocator);
-    const void_type: types.TypeId = @enumFromInt(0);
+    const void_type: types.TypeId = types.TypeId.raw(0);
     const function_id = try mir_builder.newFunction(&module, allocator, "тест", @enumFromInt(0), void_type, .{ .file_id = 0, .start = 0, .end = 0 });
     var builder = try mir_builder.Builder.beginFunction(&module, allocator, function_id);
     builder.terminate(.{ .jump = .{ .target = @enumFromInt(99) } });
@@ -401,8 +401,8 @@ test "validateFunction reports a value used more than once (single-use invariant
     const allocator = std.testing.allocator;
     var module = mir.Module.init(allocator);
     defer module.deinit(allocator);
-    const void_type: types.TypeId = @enumFromInt(0);
-    const number_type: types.TypeId = @enumFromInt(1);
+    const void_type: types.TypeId = types.TypeId.raw(0);
+    const number_type: types.TypeId = types.TypeId.raw(1);
     const function_id = try mir_builder.newFunction(&module, allocator, "тест", @enumFromInt(0), number_type, .{ .file_id = 0, .start = 0, .end = 0 });
     var builder = try mir_builder.Builder.beginFunction(&module, allocator, function_id);
     const v = try builder.newValue(number_type);
@@ -428,7 +428,7 @@ test "validateFunction warns (not errors) on an unreachable block" {
     const allocator = std.testing.allocator;
     var module = mir.Module.init(allocator);
     defer module.deinit(allocator);
-    const void_type: types.TypeId = @enumFromInt(0);
+    const void_type: types.TypeId = types.TypeId.raw(0);
     const function_id = try mir_builder.newFunction(&module, allocator, "тест", @enumFromInt(0), void_type, .{ .file_id = 0, .start = 0, .end = 0 });
     var builder = try mir_builder.Builder.beginFunction(&module, allocator, function_id);
     builder.terminate(.{ .return_value = .{ .value = null } });

@@ -138,10 +138,10 @@ const types = @import("types.zig");
 
 fn buildDiamondFunction(allocator: std.mem.Allocator, module: *mir.Module) !mir.FunctionId {
     const span: source.Span = .{ .file_id = 0, .start = 0, .end = 0 };
-    const number_type: types.TypeId = @enumFromInt(1);
+    const number_type: types.TypeId = types.TypeId.raw(1);
     const function_id = try mir_builder.newFunction(module, allocator, "тест", @enumFromInt(0), number_type, span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, function_id);
-    const cond = try builder.newValue(@enumFromInt(0));
+    const cond = try builder.newValue(types.TypeId.raw(0));
     try builder.emit(.{ .const_value = .{ .dst = cond, .value = .{ .boolean = true } } });
     const then_block = try builder.newBlock();
     const else_block = try builder.newBlock();
@@ -176,7 +176,7 @@ test "findMerge identifies the join block of a diamond если/иначе" {
 
 fn buildLoopFunction(allocator: std.mem.Allocator, module: *mir.Module) !mir.FunctionId {
     const span: source.Span = .{ .file_id = 0, .start = 0, .end = 0 };
-    const void_type: types.TypeId = @enumFromInt(0);
+    const void_type: types.TypeId = types.TypeId.raw(0);
     const function_id = try mir_builder.newFunction(module, allocator, "цикл", @enumFromInt(0), void_type, span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, function_id);
     const header = try builder.newBlock();
@@ -184,7 +184,7 @@ fn buildLoopFunction(allocator: std.mem.Allocator, module: *mir.Module) !mir.Fun
     const exit = try builder.newBlock();
     builder.terminate(.{ .jump = .{ .target = header } });
     builder.setCurrentBlock(header);
-    const cond = try builder.newValue(@enumFromInt(0));
+    const cond = try builder.newValue(types.TypeId.raw(0));
     try builder.emit(.{ .const_value = .{ .dst = cond, .value = .{ .boolean = true } } });
     builder.terminate(.{ .branch = .{ .cond = cond, .then_block = body, .else_block = exit } });
     builder.setCurrentBlock(body);

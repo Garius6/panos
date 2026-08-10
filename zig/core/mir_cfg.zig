@@ -1,5 +1,6 @@
 const std = @import("std");
 const mir = @import("mir.zig");
+const types = @import("types.zig");
 
 // Ported from `core/mir_cfg.odin`. Computed ON THE FLY from block
 // terminators, never stored as a synchronized graph on `mir.Function`
@@ -116,7 +117,7 @@ fn testFunction(allocator: std.mem.Allocator) !mir.Function {
         .id = @enumFromInt(0),
         .name = "тест",
         .symbol = @enumFromInt(0),
-        .result_type = @enumFromInt(0),
+        .result_type = types.TypeId.raw(0),
         .span = .{ .file_id = 0, .start = 0, .end = 0 },
     };
 }

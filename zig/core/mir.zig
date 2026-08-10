@@ -237,14 +237,14 @@ test "mir Function.block/valueType index correctly by id" {
         .id = @enumFromInt(0),
         .name = "тест",
         .symbol = @enumFromInt(0),
-        .result_type = @enumFromInt(0),
+        .result_type = types.TypeId.raw(0),
         .span = .{ .file_id = 0, .start = 0, .end = 0 },
     };
     defer function.deinit(allocator);
     try function.blocks.append(allocator, .{ .id = @enumFromInt(0), .span = .{ .file_id = 0, .start = 0, .end = 0 } });
-    try function.value_types.append(allocator, @enumFromInt(7));
+    try function.value_types.append(allocator, types.TypeId.raw(7));
     try std.testing.expectEqual(@as(BlockId, @enumFromInt(0)), function.block(@enumFromInt(0)).id);
-    try std.testing.expectEqual(@as(types.TypeId, @enumFromInt(7)), function.valueType(@enumFromInt(0)));
+    try std.testing.expectEqual(types.TypeId.raw(7), function.valueType(@enumFromInt(0)));
 }
 
 test "mir Module tracks generic instantiations by name" {

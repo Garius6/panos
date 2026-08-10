@@ -120,7 +120,7 @@ test "mir_builder accumulates instructions into the current block until terminat
     var module = mir.Module.init(allocator);
     defer module.deinit(allocator);
     const span: source.Span = .{ .file_id = 0, .start = 0, .end = 0 };
-    const number_type: types.TypeId = @enumFromInt(1);
+    const number_type: types.TypeId = types.TypeId.raw(1);
     const function_id = try newFunction(&module, allocator, "тест", @enumFromInt(0), number_type, span);
     var builder = try Builder.beginFunction(&module, allocator, function_id);
 
@@ -140,7 +140,7 @@ test "mir_builder panics when emitting past a terminated block" {
     var module = mir.Module.init(allocator);
     defer module.deinit(allocator);
     const span: source.Span = .{ .file_id = 0, .start = 0, .end = 0 };
-    const void_type: types.TypeId = @enumFromInt(0);
+    const void_type: types.TypeId = types.TypeId.raw(0);
     const function_id = try newFunction(&module, allocator, "тест", @enumFromInt(0), void_type, span);
     var builder = try Builder.beginFunction(&module, allocator, function_id);
     builder.terminate(.{ .return_value = .{ .value = null } });

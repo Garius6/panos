@@ -44,6 +44,18 @@ jobs:
         with:
           version: "0.16.0"
 
+      # `zig build` on `x86_64-windows` links against the REAL MSVC CRT
+      # import libs (`libLIBCMT.a`/`libOLDNAMES.a`, needed here because
+      # `внешний`/FFI and sqlite3/libffi are all `-lc`) — Visual Studio
+      # Build Tools ARE preinstalled on `windows-2022` runners, but their
+      # `LIB`/`INCLUDE`/`PATH` env vars are only set inside a "Developer
+      # Command Prompt", which this job isn't running in by default.
+      # `ilammy/msvc-dev-cmd` runs the equivalent of `vcvarsall.bat` and
+      # exports those vars into `$GITHUB_ENV` for every step after it.
+      - name: Настроить MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       # Реальные `.wasm`-модули (`panos build --target=wasm`, T048) и
       # runtime-тесты (T044) исполняются через настоящий `wasmtime run
       # --invoke`, не просто структурно проверяются — но каждый такой тест

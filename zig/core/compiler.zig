@@ -913,6 +913,7 @@ const FunctionCompiler = struct {
             .{ .name = "из_числа", .argc = 1, .instr = .{ .str_number_to_str = {} } },
             .{ .name = "из_целого", .argc = 1, .instr = .{ .str_int_to_str = {} } },
             .{ .name = "верхний_регистр", .argc = 1, .instr = .{ .str_upper = {} } },
+            .{ .name = "нижний_регистр", .argc = 1, .instr = .{ .str_lower = {} } },
             .{ .name = "заканчивается_на", .argc = 2, .instr = .{ .str_ends_with = {} } },
             .{ .name = "начинается_с", .argc = 2, .instr = .{ .str_starts_with = {} } },
             .{ .name = "содержит", .argc = 2, .instr = .{ .str_contains = {} } },

@@ -94,7 +94,13 @@ pub const ImportedSymbolType = struct {
 };
 
 pub const ImportedNominal = struct {
+    // Store in which `source_symbol` appears in an imported signature.
     store: *const types.TypeStore,
+    // Store that owns fields, variants and generic parameters of the
+    // nominal's declaration. These differ for a transitive import: module B
+    // refers to C.Type through B's local TypeStore, while C owns Type's
+    // definition.
+    definition_store: *const types.TypeStore,
     source_symbol: symbols.SymbolId,
     local_symbol: symbols.SymbolId,
     identity: u32,
@@ -378,7 +384,7 @@ const Checker = struct {
                     var parameters: std.ArrayList(types.TypeId) = .empty;
                     defer parameters.deinit(self.result.allocator);
                     for (source_method.parameters) |parameter| {
-                        const copied = self.copyImportedType(imported.store, parameter, imports.nominals, owner_remap) catch |err| switch (err) {
+                        const copied = self.copyImportedType(imported.definition_store, parameter, imports.nominals, owner_remap) catch |err| switch (err) {
                             error.UnsupportedImportedType => {
                                 unsupported = true;
                                 break;
@@ -388,7 +394,7 @@ const Checker = struct {
                         try parameters.append(self.result.allocator, copied);
                     }
                     if (unsupported) break;
-                    const return_type = self.copyImportedType(imported.store, source_method.return_type, imports.nominals, owner_remap) catch |err| switch (err) {
+                    const return_type = self.copyImportedType(imported.definition_store, source_method.return_type, imports.nominals, owner_remap) catch |err| switch (err) {
                         error.UnsupportedImportedType => {
                             unsupported = true;
                             break;
@@ -440,7 +446,7 @@ const Checker = struct {
                     // `Менеджер`, itself importing `слог.Логгер`): the
                     // WHOLE compilation crashed with a raw Zig stack
                     // trace instead of failing (or degrading) cleanly.
-                    const field_type = self.copyImportedType(imported.store, field.typ, imports.nominals, owner_remap) catch |err| switch (err) {
+                    const field_type = self.copyImportedType(imported.definition_store, field.typ, imports.nominals, owner_remap) catch |err| switch (err) {
                         error.UnsupportedImportedType => try self.result.types.poison(),
                         else => return err,
                     };
@@ -464,7 +470,7 @@ const Checker = struct {
                     var fields: std.ArrayList(types.TypeId) = .empty;
                     defer fields.deinit(self.result.allocator);
                     for (source_variant.fields) |field| {
-                        const field_type = self.copyImportedType(imported.store, field, imports.nominals, owner_remap) catch |err| switch (err) {
+                        const field_type = self.copyImportedType(imported.definition_store, field, imports.nominals, owner_remap) catch |err| switch (err) {
                             error.UnsupportedImportedType => try self.result.types.poison(),
                             else => return err,
                         };
@@ -3004,8 +3010,13 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.string;
             }
-            if (self.isBuiltinModule(symbol, "строки", "верхний_регистр") or self.isBuiltinModule(symbol, "строки", "обрезать")) {
-                const name = if (self.isBuiltinModule(symbol, "строки", "верхний_регистр")) "верхний_регистр" else "обрезать";
+            if (self.isBuiltinModule(symbol, "строки", "верхний_регистр") or self.isBuiltinModule(symbol, "строки", "нижний_регистр") or self.isBuiltinModule(symbol, "строки", "обрезать")) {
+                const name = if (self.isBuiltinModule(symbol, "строки", "верхний_регистр"))
+                    "верхний_регистр"
+                else if (self.isBuiltinModule(symbol, "строки", "нижний_регистр"))
+                    "нижний_регистр"
+                else
+                    "обрезать";
                 if (call.arguments.len != 1) {
                     try self.report(call.span, "Type Error: строки.{s}() ожидает 1 аргумент", .{name});
                     for (call.arguments) |argument| _ = try self.infer(argument);
@@ -3933,6 +3944,16 @@ const Checker = struct {
             },
             .map => |actual_map| switch (expected_type.*) {
                 .map => |expected_map| return self.assignable(actual_map.key, expected_map.key) and self.assignable(actual_map.value, expected_map.value),
+                else => {},
+            },
+            .function => |actual_function| switch (expected_type.*) {
+                .function => |expected_function| {
+                    if (actual_function.parameters.len != expected_function.parameters.len) return false;
+                    for (actual_function.parameters, expected_function.parameters) |actual_parameter, expected_parameter| {
+                        if (!self.assignable(actual_parameter, expected_parameter)) return false;
+                    }
+                    return self.assignable(actual_function.return_type, expected_function.return_type);
+                },
                 else => {},
             },
             else => {},

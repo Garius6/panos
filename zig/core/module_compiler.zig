@@ -1,4 +1,5 @@
 const std = @import("std");
+const ast = @import("ast.zig");
 const bytecode = @import("bytecode.zig");
 const compiler = @import("compiler.zig");
 const diagnostic = @import("diagnostic.zig");
@@ -8,6 +9,7 @@ const resolver = @import("resolver.zig");
 const symbols = @import("symbols.zig");
 const target_policy = @import("target.zig");
 const type_checker = @import("type_checker.zig");
+const types = @import("types.zig");
 const vm = @import("vm.zig");
 
 pub const ModuleCompilation = struct {
@@ -96,7 +98,7 @@ const ImportContext = struct {
 
     fn collect(
         self: *ImportContext,
-        resolution: *const resolver.Resolution,
+        resolution: *resolver.Resolution,
         modules: []const ModuleCompilation,
         nominal_identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
         next_nominal_identity: *u32,
@@ -157,6 +159,7 @@ const ImportContext = struct {
                     const interface_methods = if (interface_definition) |value| value.methods else null;
                     try self.nominals.append(self.allocator, .{
                         .store = &target_checked.types,
+                        .definition_store = &target_checked.types,
                         .source_symbol = target_symbol,
                         .local_symbol = imported_symbol,
                         .identity = identity,
@@ -256,14 +259,185 @@ const ImportContext = struct {
                 const local_symbol = findLocalTypeSymbol(resolution, name) orelse continue;
                 try self.nominals.append(self.allocator, .{
                     .store = &target_checked.types,
+                    .definition_store = &target_checked.types,
                     .source_symbol = source_symbol,
                     .local_symbol = local_symbol,
                     .identity = 0,
                 });
             }
         }
+
+        // A public signature may contain a nominal from a dependency of the
+        // directly imported module.  It has no name in this module's source,
+        // but it still needs a LOCAL representative: fields and methods are
+        // keyed by SymbolId in the checker, whereas TypeId must never escape
+        // its owning TypeStore.  Re-host the complete reachable nominal
+        // closure before importSignaturePass copies any signature.
+        var nominal_index: usize = 0;
+        while (nominal_index < self.nominals.items.len) : (nominal_index += 1) {
+            const imported = self.nominals.items[nominal_index];
+            if (imported.fields) |fields| {
+                for (fields) |field| {
+                    try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.definition_store, field.typ);
+                }
+            }
+            if (imported.enum_variants) |variants| {
+                for (variants) |variant| {
+                    for (variant.fields) |field| {
+                        try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.definition_store, field);
+                    }
+                }
+            }
+            if (imported.interface_methods) |methods| {
+                for (methods) |method| {
+                    for (method.parameters) |parameter| {
+                        try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.definition_store, parameter);
+                    }
+                    try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.definition_store, method.return_type);
+                }
+            }
+        }
+        for (self.imported_types.items) |imported| {
+            try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.store, imported.type_id);
+        }
+        for (self.methods.items) |method| {
+            try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, method.store, method.type_id);
+        }
+    }
+
+    fn collectTransitiveNominals(
+        self: *ImportContext,
+        resolution: *resolver.Resolution,
+        modules: []const ModuleCompilation,
+        nominal_identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
+        next_nominal_identity: *u32,
+        external_store: *const types.TypeStore,
+        external_type: types.TypeId,
+    ) !void {
+        const entry = external_store.get(external_type) orelse return error.InvalidImportedType;
+        switch (entry.*) {
+            .tuple => |elements| for (elements) |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, element),
+            .function => |function| {
+                for (function.parameters) |parameter| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, parameter);
+                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, function.return_type);
+            },
+            .nominal => |nominal| {
+                for (nominal.arguments) |argument| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, argument);
+                for (self.nominals.items) |known| {
+                    if (known.store == external_store and known.source_symbol == nominal.symbol) return;
+                }
+                const reference_module = moduleForTypeStore(modules, external_store) orelse return error.UnsupportedImportedType;
+                const target = &modules[reference_module];
+                const target_resolution = if (target.resolution) |*value| value else return error.ImportNotCompiled;
+                const origin: resolver.ImportedSymbolOrigin = target_resolution.imported_symbols.get(nominal.symbol) orelse blk: {
+                    const declaration = declarationForSymbol(target_resolution, nominal.symbol);
+                    if (declaration) |value| break :blk .{ .module = reference_module, .declaration = value };
+                    // Resolver-installed builtin types have no AST
+                    // declaration and exist independently in every module.
+                    // Re-host them by name, just like prelude types; their
+                    // operations are recognised by the local checker.
+                    const source_symbol = target_resolution.symbols.get(nominal.symbol) orelse return error.UnsupportedImportedType;
+                    const local_symbol = findLocalTypeSymbol(resolution, source_symbol.name) orelse return error.UnsupportedImportedType;
+                    try self.nominals.append(self.allocator, .{
+                        .store = external_store,
+                        .definition_store = external_store,
+                        .source_symbol = nominal.symbol,
+                        .local_symbol = local_symbol,
+                        .identity = 0,
+                    });
+                    return;
+                };
+                const definition = &modules[origin.module];
+                const definition_resolution = if (definition.resolution) |*value| value else return error.ImportNotCompiled;
+                const definition_checked = if (definition.checked) |*value| value else return error.ImportNotChecked;
+                const definition_compiled = if (definition.compiled) |*value| value else return error.ImportNotCompiled;
+                const definition_symbol = definition_resolution.decl_symbols.get(origin.declaration) orelse return error.UnsupportedImportedType;
+                const source_symbol = definition_resolution.symbols.get(definition_symbol) orelse return error.UnsupportedImportedType;
+                const local_symbol = try resolution.symbols.add(.{
+                    .name = source_symbol.name,
+                    .kind = .type,
+                    .module_path = "@transitive",
+                    .is_exported = true,
+                    .span = source_symbol.span,
+                });
+                const identity = try nominalIdentity(nominal_identities, next_nominal_identity, origin);
+                const enum_definition = definition_checked.enum_definitions.get(definition_symbol);
+                const generic_struct = definition_checked.generic_nominal_fields.get(definition_symbol);
+                const interface_definition = definition_checked.interface_definitions.get(definition_symbol);
+                const generic_parameters: ?[]const type_checker.GenericParameter = if (generic_struct) |value|
+                    value.parameters
+                else if (enum_definition) |value|
+                    (if (value.parameters.len != 0) value.parameters else null)
+                else if (interface_definition) |value|
+                    (if (value.parameters.len != 0) value.parameters else null)
+                else
+                    null;
+                try self.nominals.append(self.allocator, .{
+                    .store = external_store,
+                    .definition_store = &definition_checked.types,
+                    .source_symbol = nominal.symbol,
+                    .local_symbol = local_symbol,
+                    .identity = identity,
+                    .fields = if (generic_struct) |value| value.fields else definition_checked.nominal_fields.get(definition_symbol),
+                    .enum_variants = if (enum_definition) |value| value.variants else null,
+                    .generic_parameters = generic_parameters,
+                    .interface_methods = if (interface_definition) |value| value.methods else null,
+                });
+                // The source resolver never created a binding for this
+                // method in the importing module, so create one alongside
+                // the synthetic owner.  The compiler then links it to the
+                // already compiled source function exactly as for a direct
+                // import.
+                for (definition_checked.methods.items) |method| {
+                    if (method.owner != definition_symbol) continue;
+                    const source_method = definition_resolution.symbols.get(method.symbol) orelse continue;
+                    const function_id = definition_compiled.function_ids.get(method.symbol) orelse continue;
+                    const local_method = try resolution.symbols.add(.{
+                        .name = source_method.name,
+                        .kind = .function,
+                        .module_path = "@transitive",
+                        .is_exported = true,
+                        .span = source_method.span,
+                    });
+                    const signature = definition_checked.symbol_types.get(method.symbol) orelse continue;
+                    try self.methods.append(self.allocator, .{
+                        .owner = local_symbol,
+                        .name = source_method.name,
+                        .symbol = local_method,
+                        .store = &definition_checked.types,
+                        .type_id = signature,
+                    });
+                    try self.functions.append(self.allocator, .{ .symbol = local_method, .function_id = function_id });
+                }
+            },
+            .array => |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, element),
+            .map => |map| {
+                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, map.key);
+                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, map.value);
+            },
+            .process => |message| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, message),
+            .pointer => |pointee| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, pointee),
+            else => {},
+        }
     }
 };
+
+fn moduleForTypeStore(modules: []const ModuleCompilation, store: *const types.TypeStore) ?usize {
+    for (modules, 0..) |*module, index| {
+        if (module.checked) |*checked| {
+            if (&checked.types == store) return index;
+        }
+    }
+    return null;
+}
+
+fn declarationForSymbol(resolution: *const resolver.Resolution, symbol: symbols.SymbolId) ?ast.DeclId {
+    var declarations = resolution.decl_symbols.iterator();
+    while (declarations.next()) |entry| {
+        if (entry.value_ptr.* == symbol) return entry.key_ptr.*;
+    }
+    return null;
+}
 
 fn findLocalTypeSymbol(resolution: *const resolver.Resolution, name: []const u8) ?symbols.SymbolId {
     for (resolution.symbols.symbols.items[1..], 1..) |entry, index| {
@@ -937,6 +1111,56 @@ test "module compiler constructs and reads exported structure fields" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.Точка(1)\nточка.x = 40\nточка.x + 2\nконец" },
         .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "module compiler preserves a transitive nominal field type" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./api\" как api\nэкспорт функ старт() -> Число\napi.создать().элемент.значение\nконец" },
+        .{ .path = "проект/api.ps", .bytes = "импорт \"./модель\" как модель\nэкспорт тип Ответ = структура\nэлемент: модель.Элемент\nконец\nэкспорт функ создать() -> Ответ\nОтвет(модель.Элемент(42))\nконец" },
+        .{ .path = "проект/модель.ps", .bytes = "экспорт тип Элемент = структура\nзначение: Число\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "module compiler accepts an imported nominal in an imported generic callback" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./коллекции\" как кол\nимпорт \"./модель\" как модель\nфунк в_число(x: модель.Элемент) -> Число\nx.значение\nконец\nэкспорт функ старт() -> Число\nпер значения = кол.отобразить(массив(модель.Элемент(42)), в_число)\nзначения.получить(0, 0)\nконец" },
+        .{ .path = "проект/коллекции.ps", .bytes = "экспорт функ отобразить[T, U](значения: Массив(T), преобразовать: функ(T) -> U) -> Массив(U)\nпер результат: Массив(U) = массив()\nдля значение в значения цикл\nрезультат.добавить(преобразовать(значение))\nконец\nрезультат\nконец" },
+        .{ .path = "проект/модель.ps", .bytes = "экспорт тип Элемент = структура\nзначение: Число\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
     defer graph.deinit();

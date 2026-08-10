@@ -1400,6 +1400,7 @@ pub const Vm = struct {
             .str_number_to_str => try self.strNumberToStr(),
             .str_int_to_str => try self.strIntToStr(),
             .str_upper => try self.strUpper(),
+            .str_lower => try self.strLower(),
             .str_ends_with => try self.strEndsWith(),
             .str_starts_with => try self.strStartsWith(),
             .str_contains => try self.strContains(),
@@ -2374,6 +2375,34 @@ pub const Vm = struct {
             };
             var buffer: [4]u8 = undefined;
             const len = std.unicode.utf8Encode(upper, &buffer) catch unreachable;
+            try out.appendSlice(self.allocator, buffer[0..len]);
+        }
+        const result = try self.heap.createString(try out.toOwnedSlice(self.allocator));
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    fn strLower(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.нижний_регистр() ожидает строку", .{});
+            return;
+        };
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var view = std.unicode.Utf8View.init(string) catch {
+            try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+            return;
+        };
+        var iterator = view.iterator();
+        while (iterator.nextCodepoint()) |codepoint| {
+            const lower: u21 = switch (codepoint) {
+                'A'...'Z' => codepoint + ('a' - 'A'),
+                0x0410...0x042F => codepoint + (0x0430 - 0x0410), // А-Я → а-я
+                0x0401 => 0x0451, // Ё → ё
+                else => codepoint,
+            };
+            var buffer: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(lower, &buffer) catch unreachable;
             try out.appendSlice(self.allocator, buffer[0..len]);
         }
         const result = try self.heap.createString(try out.toOwnedSlice(self.allocator));

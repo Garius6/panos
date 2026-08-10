@@ -25,19 +25,31 @@ testing.md` § "MIR→WASM AOT-пайплайн"), минуя байткод-VM 
 
 `zig/core/runner.zig`'s `test "runner ..."` (паттерн `runSource(...)`/
 `checkSourceForTarget(...)`) — основной e2e-тестовый харнесс pipeline.
-`tests/conformance/manifest.json` + `zig/conformance/matrix_test.zig` —
+`tests/conformance/manifest.json` + `zig/conformance/matrix_runner.zig`
+(4 per-tier callers: `matrix_{semantic,runtime,native,aot}_test.zig`) —
 структурированный conformance-корпус с зафиксированными ожидаемыми
 outcome'ами.
 
 ## Команды
 
 ```sh
-zig build test          # весь набор Zig-юнит-тестов
-zig build conformance   # быстрое подмножество для фронтенд/модульных правок
-zig build lsp            # LSP-сервер (zig-out/bin/panos-lsp)
+zig build test          # быстрые unit-тесты (per-file, никаких тяжёлых сценариев)
+zig build conformance   # языковой conformance (manifest + semantic/native тиры + lexer/parser/modules)
+zig build integration   # SQLite/FFI/HTTP через реальные ресурсы
+zig build aot            # MIR → WASM → wasmtime
+zig build bench           # runtime-тир manifest'а (fib/loop/string-concat) — предпочтительно -Doptimize=ReleaseFast
+zig build fuzz            # crash-oracle fuzz-тесты lexer/parser/runner (--fuzz для continuous)
+zig build lsp             # LSP-сервер (zig-out/bin/panos-lsp)
 zig build browser         # WASM-сборка браузерного интерпретатора
 zig build run -- file.ps  # запустить файл через нативный CLI
 ```
+
+`test`/`conformance`/`integration`/`aot`/`bench`/`fuzz` — намеренно
+раздельные шаги (не один большой `test`): каждый — свой профиль
+стоимости (unit — мс, conformance — секунды, integration/aot — реальные
+внешние ресурсы/wasmtime, bench — минуты в Debug на fib(30) и т.п.,
+секунды в ReleaseFast). `zig build test` больше НЕ тянет за собой ни
+conformance matrix, ни integration, ни AOT — только per-file unit-тесты.
 
 Через Justfile: `just build`/`just build-lsp`/`just build-wasm`/`just test`
 (см. `Justfile` в корне — тонкие обёртки над `zig build ...`, копирующие

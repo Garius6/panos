@@ -48,8 +48,10 @@ authoritative for language/pipeline specifics per the constitution below.
 - `just build` — native build (`zig build -Doptimize=ReleaseFast`)
 - `just build-lsp` — LSP build (`zig build lsp`)
 - `just build-wasm` — wasm build (`zig build browser`, output: `demo/panos.wasm`)
-- `just test` — run `zig build test`
-- `zig build conformance` — faster subset of `test` for frontend/module changes
+- `just test` — run `zig build test` (fast per-file unit tests only — no
+  conformance matrix, no native integration, no AOT/wasmtime, no
+  benchmarks; those are separate `zig build` steps now, see AGENTS.md
+  §"Команды" — `conformance`/`integration`/`aot`/`bench`/`fuzz`)
 
 ## Code Style
 

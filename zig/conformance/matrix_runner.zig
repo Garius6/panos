@@ -8,14 +8,26 @@ const outcome = @import("outcome.zig");
 // The manifest's `expected` values were determined by actually running BOTH
 // toolchains (Odin reference + this Zig port) side by side and comparing —
 // see each case's `deviation` field (or absence of one) for what that
-// comparison found. This test is the automated, ongoing HALF of that gate:
-// it catches a future Zig regression against the already-approved values.
-// It does NOT re-run Odin itself — `zig/conformance/reference.zig` (the
-// old odin-shell-out helper) was retired in T058, since it only ever
-// existed to support the manual, one-time comparison used to populate
-// this manifest, not an ongoing per-CI-run check.
+// comparison found. This is the automated, ongoing HALF of that gate: it
+// catches a future Zig regression against the already-approved values. It
+// does NOT re-run Odin itself — `zig/conformance/reference.zig` (the old
+// odin-shell-out helper) was retired in T058, since it only ever existed to
+// support the manual, one-time comparison used to populate this manifest,
+// not an ongoing per-CI-run check.
+//
+// Split into per-TIER entry points (`runTier`/`runAot` below, each called
+// from its OWN tiny `test` file/build artifact — see `build.zig`) instead of
+// one `test` block looping over the whole manifest sequentially: Zig's build
+// graph only parallelizes across separate `addTest`/`Run` steps, never
+// across `test` declarations inside one binary, and the "runtime" tier in
+// particular embeds the `tests/conformance/benchmarks/*.ps` fixtures
+// (`фиб(30)` recursion, a 5-million-iteration loop, 20k string
+// concatenations) — genuinely slow in a Debug-mode bytecode VM, and were
+// dragging down `zig build test`'s everyday dev loop by being bundled into
+// it at all (see `build.zig`'s `test_step`, which no longer depends on any
+// tier of this).
 
-fn computeOutcome(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !outcome.Outcome {
+pub fn computeOutcome(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !outcome.Outcome {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(source);
 
@@ -68,8 +80,12 @@ fn freeOutcome(allocator: std.mem.Allocator, value: outcome.Outcome) void {
     if (value.diagnostics.len != 0) allocator.free(value.diagnostics);
 }
 
-test "every manifest case's recorded expected outcome matches Zig's actual outcome" {
-    const allocator = std.testing.allocator;
+// Runs every manifest case whose `tier` matches `tier_name` (one of
+// "semantic"/"runtime"/"native" — `aot` has its own, completely different
+// execution path, see `runAot` below) through `runner.runSource` (the
+// ordinary bytecode-VM pipeline) and asserts the outcome matches the
+// manifest's recorded expectation exactly.
+pub fn runTier(allocator: std.mem.Allocator, tier_name: []const u8) !void {
     var io = std.Io.Threaded.init(allocator, .{});
     defer io.deinit();
 
@@ -80,22 +96,7 @@ test "every manifest case's recorded expected outcome matches Zig's actual outco
     defer parsed.deinit();
 
     for (parsed.value.cases) |case| {
-        // `semantic`/`runtime`/`native` are all single-file, no real
-        // `импорт` — `runner.runSource` handles all three identically
-        // (`native` fixtures just happen to exercise native-only builtins
-        // instead of pure language features). `aot` has its own dedicated
-        // test below (a completely different execution path — compile to
-        // WASM, run via wasmtime, not the bytecode VM). `lexer`/`parser`
-        // already have equivalent coverage via their own harnesses (see
-        // `tests/conformance/README.md`); `browser`/`lsp` still have no
-        // manifest cases (browser needs a WASM-memory-capable host beyond
-        // the `wasmtime` CLI, which would add a new dependency — see
-        // T056; `lsp` transcripts are already covered directly in
-        // `zig/lsp/main.zig`'s own tests, a JSON-RPC shape the
-        // `Case`/`Outcome` schema doesn't model).
-        if (!std.mem.eql(u8, case.tier, "semantic") and
-            !std.mem.eql(u8, case.tier, "runtime") and
-            !std.mem.eql(u8, case.tier, "native")) continue;
+        if (!std.mem.eql(u8, case.tier, tier_name)) continue;
 
         const actual = try computeOutcome(allocator, io.io(), case.input);
         defer freeOutcome(allocator, actual);
@@ -158,8 +159,7 @@ fn computeAotOutcome(allocator: std.mem.Allocator, io: std.Io, path: []const u8)
     };
 }
 
-test "every aot-tier manifest case's recorded expected outcome matches a real panos build --target=wasm + wasmtime run" {
-    const allocator = std.testing.allocator;
+pub fn runAot(allocator: std.mem.Allocator) !void {
     var io = std.Io.Threaded.init(allocator, .{});
     defer io.deinit();
 

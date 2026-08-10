@@ -333,17 +333,64 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "panos_core", .module = core_module }},
         }),
     });
-    const matrix_tests = b.addTest(.{
+    // Split by manifest `tier` into 4 SEPARATE build artifacts (was one
+    // `matrix_test.zig` looping over the whole manifest sequentially in a
+    // single `test` block) — Zig's build graph only parallelizes across
+    // separate `addTest`/`Run` steps, never across `test` declarations
+    // inside one binary, so this is what actually lets `semantic`/
+    // `runtime`/`native` run concurrently. See `zig/conformance/
+    // matrix_runner.zig`'s module doc comment for the full rationale
+    // (also: why `runtime`, which embeds the slow benchmark fixtures, is
+    // no longer anywhere near `zig build test`).
+    // All four link libc/sqlite/libffi, even though only the `native` tier
+    // actually EXERCISES those code paths at runtime — they all import the
+    // same `panos_core` module, which pulls in `vm.zig`'s FFI/SQLite
+    // bindings unconditionally at compile time (same reason
+    // `runner_unit_tests`/`vm_unit_tests` below need the same linking).
+    const matrix_semantic_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("zig/conformance/matrix_test.zig"),
+            .root_source_file = b.path("zig/conformance/matrix_semantic_test.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{.{ .name = "panos_core", .module = core_module }},
         }),
     });
-    matrix_tests.root_module.linkLibrary(sqlite_lib);
-    matrix_tests.root_module.addObjectFile(libffi_archive);
+    matrix_semantic_tests.root_module.linkLibrary(sqlite_lib);
+    matrix_semantic_tests.root_module.addObjectFile(libffi_archive);
+    const matrix_runtime_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/conformance/matrix_runtime_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    matrix_runtime_tests.root_module.linkLibrary(sqlite_lib);
+    matrix_runtime_tests.root_module.addObjectFile(libffi_archive);
+    const matrix_native_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/conformance/matrix_native_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    matrix_native_tests.root_module.linkLibrary(sqlite_lib);
+    matrix_native_tests.root_module.addObjectFile(libffi_archive);
+    const matrix_aot_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/conformance/matrix_aot_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    matrix_aot_tests.root_module.linkLibrary(sqlite_lib);
+    matrix_aot_tests.root_module.addObjectFile(libffi_archive);
     const lexer_conformance_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/conformance/lexer_test.zig"),
@@ -425,7 +472,10 @@ pub fn build(b: *std.Build) void {
     const run_browser_tests = b.addRunArtifact(browser_tests);
     const run_manifest_tests = b.addRunArtifact(manifest_tests);
     const run_outcome_tests = b.addRunArtifact(outcome_tests);
-    const run_matrix_tests = b.addRunArtifact(matrix_tests);
+    const run_matrix_semantic_tests = b.addRunArtifact(matrix_semantic_tests);
+    const run_matrix_runtime_tests = b.addRunArtifact(matrix_runtime_tests);
+    const run_matrix_native_tests = b.addRunArtifact(matrix_native_tests);
+    const run_matrix_aot_tests = b.addRunArtifact(matrix_aot_tests);
     const run_lexer_conformance_tests = b.addRunArtifact(lexer_conformance_tests);
     const run_parser_conformance_tests = b.addRunArtifact(parser_conformance_tests);
     const run_modules_conformance_tests = b.addRunArtifact(modules_conformance_tests);
@@ -444,7 +494,20 @@ pub fn build(b: *std.Build) void {
     // compile them itself.
     run_aot_runtime_tests.step.dependOn(&install_runtime_wasi.step);
     run_aot_runtime_tests.step.dependOn(&install_runtime_js.step);
-    const test_step = b.step("test", "Run Zig unit tests");
+
+    // `zig build test` — the everyday dev-loop step: pure per-file unit
+    // tests only. Real gap found auditing this project's own test suite
+    // (codex review, 2026-08-09): this step used to also depend on the
+    // WHOLE conformance matrix (including the slow `runtime`-tier
+    // benchmark fixtures — `фиб(30)` under a Debug bytecode VM didn't
+    // finish in 20s), native SQLite/FFI/HTTP integration, AND the
+    // WASM/wasmtime AOT suite — all bundled into ONE sequential step,
+    // defeating Zig's own build-graph parallelism and making the
+    // "just run the tests" loop minutes slower than it needed to be for
+    // no benefit during normal development. Each of those now has its
+    // own step below (`conformance`/`integration`/`aot`/`bench`) — run
+    // them explicitly, or let CI run all of them.
+    const test_step = b.step("test", "Run fast per-file unit tests only");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_frontend_unit_tests.step);
     test_step.dependOn(&run_target_unit_tests.step);
@@ -473,24 +536,59 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_lsp_tests.step);
     test_step.dependOn(&run_browser_tests.step);
-    test_step.dependOn(&run_manifest_tests.step);
-    test_step.dependOn(&run_outcome_tests.step);
-    test_step.dependOn(&run_matrix_tests.step);
-    test_step.dependOn(&run_lexer_conformance_tests.step);
-    test_step.dependOn(&run_parser_conformance_tests.step);
-    test_step.dependOn(&run_modules_conformance_tests.step);
-    test_step.dependOn(&run_demo_parser_tests.step);
-    test_step.dependOn(&run_native_integration_tests.step);
-    test_step.dependOn(&run_aot_runtime_tests.step);
 
-    const conformance_step = b.step("conformance", "Validate the local conformance manifest");
+    // `zig build conformance` — the language conformance surface: manifest
+    // harness + semantic/native tiers of the matrix (fast — small fixed
+    // fixtures, no benchmarks) + lexer/parser/modules conformance fixtures.
+    // Deliberately EXCLUDES the `runtime` tier (benchmark fixtures — see
+    // `bench` below) and the `aot`/native-integration tiers (see `aot`/
+    // `integration` below) — each has a different cost profile and doesn't
+    // belong in the same "did I break the language" everyday check.
+    const conformance_step = b.step("conformance", "Validate language conformance (manifest + lexer/parser/modules fixtures)");
     conformance_step.dependOn(&run_manifest_tests.step);
-    conformance_step.dependOn(&run_matrix_tests.step);
+    conformance_step.dependOn(&run_outcome_tests.step);
+    conformance_step.dependOn(&run_matrix_semantic_tests.step);
+    conformance_step.dependOn(&run_matrix_native_tests.step);
     conformance_step.dependOn(&run_lexer_conformance_tests.step);
     conformance_step.dependOn(&run_parser_conformance_tests.step);
     conformance_step.dependOn(&run_modules_conformance_tests.step);
     conformance_step.dependOn(&run_demo_parser_tests.step);
-    conformance_step.dependOn(&run_native_integration_tests.step);
+
+    // `zig build integration` — native-only resources (SQLite/FFI/HTTP),
+    // exercising real files/sockets/dynamic libraries, not mocks.
+    const integration_step = b.step("integration", "Run native integration tests (SQLite, FFI, HTTP)");
+    integration_step.dependOn(&run_native_integration_tests.step);
+
+    // `zig build aot` — MIR → WASM → `wasmtime` pipeline. Each case here
+    // does a FULL separate compile (lex/parse/resolve/typecheck/lower/
+    // emit) plus a real `wasmtime` subprocess spawn — heavier than the
+    // bytecode-VM tiers above by a wide margin, and needs `wasmtime` on
+    // PATH; kept out of `test`/`conformance` for exactly that reason.
+    const aot_step = b.step("aot", "Run the WASM/wasmtime AOT test suite");
+    aot_step.dependOn(&run_matrix_aot_tests.step);
+    aot_step.dependOn(&run_aot_runtime_tests.step);
+
+    // `zig build bench` — the `runtime`-tier manifest cases, which embed
+    // `tests/conformance/benchmarks/*.ps` (`фиб(30)` recursion, a
+    // 5-million-iteration loop, 20k string concatenations — see
+    // `tests/conformance/benchmarks.md`). Still asserts exact correctness
+    // (not just timing), but is slow enough in Debug that it doesn't
+    // belong in the everyday loop — run with `-Doptimize=ReleaseFast` for
+    // a real performance read, matching `benchmarks.md`'s own documented
+    // methodology.
+    const bench_step = b.step("bench", "Run the benchmark-fixture correctness/perf suite (prefer -Doptimize=ReleaseFast)");
+    bench_step.dependOn(&run_matrix_runtime_tests.step);
+
+    // `zig build fuzz` — the crash-oracle fuzz tests (`lexer`/`parser`/
+    // `runner`, see each file's own "never panics" tests) already run
+    // their single-pass seed corpus as part of `zig build test` (cheap,
+    // no slowdown) — this step exists so CONTINUOUS fuzzing targets just
+    // these binaries: `zig build fuzz --fuzz` (libFuzzer-style coverage-
+    // guided mutation, runs until interrupted), instead of pulling in the
+    // rest of the unit-test suite too.
+    const fuzz_step = b.step("fuzz", "Run (or, with --fuzz, continuously fuzz) the crash-oracle fuzz tests");
+    fuzz_step.dependOn(&run_frontend_unit_tests.step);
+    fuzz_step.dependOn(&run_runner_unit_tests.step);
 }
 
 fn libffiArchivePath(b: *std.Build, resolved_target: std.Build.ResolvedTarget) std.Build.LazyPath {

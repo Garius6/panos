@@ -77,6 +77,22 @@ jobs:
       - name: zig build conformance
         run: zig build conformance --summary all
 
+      # `integration`/`aot`/`bench` used to be bundled into the single
+      # `test` step (before it was split into fast-unit-only, see
+      # AGENTS.md §"Команды") — each needs its OWN explicit CI step now so
+      # CI doesn't silently lose the coverage the old combined step gave
+      # for free. `-Doptimize=ReleaseFast` on `bench` matches
+      # `tests/conformance/benchmarks.md`'s own documented methodology —
+      # Debug-mode `фиб(30)` alone takes minutes.
+      - name: zig build integration
+        run: zig build integration --summary all
+
+      - name: zig build aot
+        run: zig build aot --summary all
+
+      - name: zig build -Doptimize=ReleaseFast bench
+        run: zig build -Doptimize=ReleaseFast bench --summary all
+
       - name: zig build lsp
         run: zig build lsp
 

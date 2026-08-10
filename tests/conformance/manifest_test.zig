@@ -7,8 +7,10 @@ test "populated manifest validates through the public parser" {
 
     try std.testing.expectEqual(manifest.manifest_version, parsed.value.version);
     // T053 populated this with real, verified cases — see
-    // `zig/conformance/matrix_test.zig` for the test that actually RUNS
-    // them against Zig and checks the recorded outcome.
+    // `zig/conformance/matrix_runner.zig` (and its four per-tier
+    // `matrix_{semantic,runtime,native,aot}_test.zig` callers) for the
+    // tests that actually RUN them against Zig and check the recorded
+    // outcome.
     try std.testing.expectEqual(@as(usize, 11), parsed.value.cases.len);
     try std.testing.expectEqualStrings("semantic-undefined-name", parsed.value.cases[0].id);
 }

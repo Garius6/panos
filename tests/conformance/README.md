@@ -3,12 +3,19 @@
 `manifest.json` records user-observable Panos behavior once, per the
 contract in `specs/010-zig-migration/contracts/conformance.md` (stable
 `id`, tier, target profile, input, normalized outcome). `semantic`/
-`runtime`/`native`/`aot` tier cases are populated (T053) and gated
-automatically on every `zig build test`/`conformance` via
-`zig/conformance/matrix_test.zig`, which runs each case's `.ps` input
-through the Zig pipeline (bytecode VM for `semantic`/`runtime`/`native`,
-the separate MIR→WASM AOT pipeline + real `wasmtime` for `aot`) and
-asserts the recorded `expected` outcome still holds.
+`runtime`/`native`/`aot` tier cases are populated (T053) and gated by
+`zig/conformance/matrix_runner.zig`'s shared `runTier`/`runAot` — each
+tier is its OWN build artifact (`matrix_semantic_test.zig`/
+`matrix_runtime_test.zig`/`matrix_native_test.zig`/`matrix_aot_test.zig`,
+so Zig's build graph can run them in parallel instead of one sequential
+loop), running each case's `.ps` input through the Zig pipeline (bytecode
+VM for `semantic`/`runtime`/`native`, the separate MIR→WASM AOT pipeline +
+real `wasmtime` for `aot`) and asserting the recorded `expected` outcome
+still holds. `zig build test` (fast unit tests) no longer depends on ANY
+of these — `semantic`/`native` run under `zig build conformance`,
+`runtime` (embeds the slow `tests/conformance/benchmarks/*.ps` fixtures)
+under `zig build bench` (prefer `-Doptimize=ReleaseFast`), `aot` under
+`zig build aot`.
 
 `lexer`/`parser` tiers have equivalent coverage through their own dedicated
 harnesses (`lexer_test.zig`/`parser_test.zig`, `tests/conformance/lexer/`

@@ -30,12 +30,20 @@ test:
 # Обновляет версию (zig/core/vm.zig's osVersion), собирает+тестирует,
 # коммитит "chore: версия X.Y.Z", тегирует vX.Y.Z, пушит main и тег.
 # Версию передавать БЕЗ "v": just bump-and-push 0.2.9
-# zig build test падает ненулевым кодом на провале — just останавливает
-# рецепт на первой упавшей строке, коммит/тег/push не происходят.
+# Прогоняет ВСЕ тестовые шаги (test/conformance/integration/aot/bench), не
+# только быстрый `test` — `test` больше не тянет за собой остальные (см.
+# AGENTS.md §"Команды"), а релизный гейт должен оставаться таким же полным,
+# как раньше, когда `zig build test` включал всё разом. Любой шаг падает
+# ненулевым кодом на провале — just останавливает рецепт на первой упавшей
+# строке, коммит/тег/push не происходят.
 bump-and-push version:
 	sed -i '' 's/createString(try self.allocator.dupe(u8, "[^"]*"))/createString(try self.allocator.dupe(u8, "{{version}}"))/' zig/core/vm.zig
 	zig build
 	zig build test
+	zig build conformance
+	zig build integration
+	zig build aot
+	zig build bench
 	git add zig/core/vm.zig
 	git commit -m "chore: версия {{version}}"
 	git tag v{{version}}

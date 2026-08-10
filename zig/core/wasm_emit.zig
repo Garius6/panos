@@ -49,6 +49,29 @@ const EmitContext = struct {
     // the module's own static data section (see `collectStringConstants`)
     // — empty for any module with no string literals at all.
     string_offsets: *const std.StringHashMap(u32),
+    // Lazily reserved the first time a function needs `%`/bitwise ops
+    // (see `.binary`'s `.modulo`/`.bit_*`/`.shift_*` cases) — WASM's f64
+    // has no modulo/bitwise instructions at all, only i32/i64 do, and
+    // Phase-1a numbers are uniformly f64 (see `.binary`'s own comment on
+    // that convention). Converting BOTH operands to i32 needs a scratch
+    // local: they're already both live on the WASM value stack by the
+    // time this instruction runs (stack machine — no way to reach the
+    // BOTTOM one, `lhs`, without first popping the top one, `rhs`,
+    // somewhere). One local suffices for a whole function — each use is
+    // fully consumed (stored then immediately reloaded) before the next,
+    // never overlapping. Declared in the function's local section by
+    // `emitFunctionWasm` only if `scratch_i32_local != null` after the
+    // body's been fully emitted (its index is fixed the moment it's
+    // first reserved: `function.locals.items.len`, i.e. right past every
+    // real MIR local).
+    scratch_i32_local: ?u32 = null,
+
+    fn reserveScratchLocal(self: *EmitContext) u32 {
+        if (self.scratch_i32_local) |index| return index;
+        const index: u32 = @intCast(self.function.locals.items.len);
+        self.scratch_i32_local = index;
+        return index;
+    }
 
     fn init(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, function: *const mir.Function, func_index: *const std.AutoHashMap(mir.FunctionId, u32), builtin_index: *const std.StringHashMap(u32), string_offsets: *const std.StringHashMap(u32)) !EmitContext {
         var cfg = try mir_cfg.computeCfgInfo(allocator, function);
@@ -345,13 +368,45 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             }
             const is_int = wasmType(ctx, binary.dst) == wasm_module.wasm_i32;
             _ = is_int; // Phase-1a binary ops are all f64 — Целое shares f64 representation (same convention as the bytecode VM).
+            switch (binary.op) {
+                .modulo, .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => {
+                    // Stack on entry: [lhs_f64, rhs_f64] (both already
+                    // pushed by earlier instructions — see
+                    // `scratch_i32_local`'s doc comment for why a scratch
+                    // local is unavoidable here). Shuffle rhs through the
+                    // scratch local so both operands can be converted to
+                    // i32 in the right order, do the i32 op, convert the
+                    // i32 result back to f64 (matching every other
+                    // Phase-1a numeric op's f64 representation).
+                    const scratch = ctx.reserveScratchLocal();
+                    try code.append(allocator, 0x21); // local.set scratch  (pops rhs_f64)
+                    try wasm_module.writeUleb128(code, allocator, scratch);
+                    try code.append(allocator, 0xAA); // i32.trunc_f64_s   (lhs_f64 -> lhs_i32)
+                    try code.append(allocator, 0x20); // local.get scratch (push rhs_f64 back)
+                    try wasm_module.writeUleb128(code, allocator, scratch);
+                    try code.append(allocator, 0xAA); // i32.trunc_f64_s   (rhs_f64 -> rhs_i32)
+                    const int_opcode: u8 = switch (binary.op) {
+                        .modulo => 0x6F, // i32.rem_s
+                        .bit_and => 0x71, // i32.and
+                        .bit_or => 0x72, // i32.or
+                        .bit_xor => 0x73, // i32.xor
+                        .shift_left => 0x74, // i32.shl
+                        .shift_right => 0x75, // i32.shr_s
+                        else => unreachable,
+                    };
+                    try code.append(allocator, int_opcode);
+                    try code.append(allocator, 0xB7); // f64.convert_i32_s
+                    return binary.dst;
+                },
+                else => {},
+            }
             const opcode: u8 = switch (binary.op) {
                 .add => 0xA0, // f64.add
                 .subtract => 0xA1, // f64.sub
                 .multiply => 0xA2, // f64.mul
                 .divide => 0xA3, // f64.div
                 .int_divide => 0xA3, // f64.div, truncated below
-                .modulo, .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => return unsupported("побитовый/остаточный оператор (нужна i32/i64-конверсия, вне Phase 1a)"),
+                .modulo, .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => unreachable, // handled above
             };
             try code.append(allocator, opcode);
             if (binary.op == .int_divide) try code.append(allocator, 0x9C); // f64.trunc — toward zero, matches Целое/Целое semantics
@@ -497,12 +552,17 @@ pub fn emitFunctionWasm(
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    const n_body_locals = function.locals.items.len - function.parameters.len;
+    const has_scratch = ctx.scratch_i32_local != null;
+    const n_body_locals = function.locals.items.len - function.parameters.len + @as(usize, if (has_scratch) 1 else 0);
     try wasm_module.writeUleb128(&out, allocator, n_body_locals);
     for (function.parameters.len..function.locals.items.len) |i| {
         try wasm_module.writeUleb128(&out, allocator, 1);
         const store = function.type_store orelse &checked.types;
         try out.append(allocator, wasm_module.wasmValTypeForStore(store, function.locals.items[i].type_id));
+    }
+    if (has_scratch) {
+        try wasm_module.writeUleb128(&out, allocator, 1);
+        try out.append(allocator, wasm_module.wasm_f64);
     }
     try out.appendSlice(allocator, ctx.code.items);
     try out.append(allocator, 0x0B); // end функции

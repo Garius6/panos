@@ -808,6 +808,21 @@ const Resolver = struct {
     }
 
     fn foreignLibraryFilename(allocator: std.mem.Allocator, logical_name: []const u8) ![]const u8 {
+        // `libc` on glibc Linux is a real, separate exception to the
+        // generic "name + suffix" rule below — found breaking CI (Linux
+        // runner, `внешний "libc"` test suite), never caught locally
+        // (macOS's `libc.dylib` genuinely exists as a loadable file).
+        // Unversioned `libc.so` is normally ONLY part of the `-dev`
+        // package (a linker SCRIPT for `-lc` at compile time, not a
+        // real shared object `dlopen` can load) — the actual runtime
+        // library glibc programs are already linked against is the
+        // versioned SONAME, near-universally `libc.so.6`. Narrow,
+        // deliberately not general (doesn't attempt musl's differently-
+        // named libc, e.g. Alpine) — this project's CI/dev targets are
+        // glibc Linux + macOS only.
+        if (builtin.target.os.tag != .macos and builtin.target.os.tag != .windows and std.mem.eql(u8, logical_name, "libc")) {
+            return allocator.dupe(u8, "libc.so.6");
+        }
         const suffix = switch (builtin.target.os.tag) {
             .macos, .ios, .tvos, .watchos => ".dylib",
             .windows => ".dll",

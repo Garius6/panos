@@ -1188,8 +1188,26 @@ const posix_env = struct {
 // what `osExec`'s environ-hack needs on Windows too (see there).
 const windows_env = struct {
     extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) c_int;
+    extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buffer: ?[*]u16, size: u32) callconv(.winapi) u32;
     extern "kernel32" fn GetEnvironmentStringsW() callconv(.winapi) ?[*:0]const u16;
     extern "kernel32" fn FreeEnvironmentStringsW(penv: [*:0]const u16) callconv(.winapi) c_int;
+
+    // `std.c.getenv` reads ucrt's OWN cached copy of the environment
+    // block (populated at process startup, only kept in sync by
+    // `_putenv`/`_wputenv`) — `SetEnvironmentVariableW` mutates the raw
+    // Win32 process environment block directly and does NOT update that
+    // ucrt cache, so a `ос.установить_окружение(...)` followed by
+    // `ос.окружение(...)` would silently see the OLD value through
+    // `std.c.getenv`. `GetEnvironmentVariableW` reads the live Win32
+    // block instead, matching what `SetEnvironmentVariableW` just wrote.
+    fn getenv(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+        const name_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, name);
+        defer allocator.free(name_w);
+        var buffer: [4096]u16 = undefined;
+        const len = GetEnvironmentVariableW(name_w, &buffer, buffer.len);
+        if (len == 0 or len >= buffer.len) return null;
+        return try std.unicode.wtf16LeToWtf8Alloc(allocator, buffer[0..len]);
+    }
 
     fn setenv(allocator: std.mem.Allocator, name: []const u8, env_value: []const u8) !c_int {
         const name_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, name);

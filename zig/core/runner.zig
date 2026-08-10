@@ -153,6 +153,7 @@ fn formatTypeName(
         .pointer => |pointee| formatWrappedType(allocator, store, symbol_store, "Указатель", pointee),
         .generic_parameter => |identifier| std.fmt.allocPrint(allocator, "T{d}", .{identifier}),
         .poison => allocator.dupe(u8, "<ошибка типа>"),
+        .unconstrained => allocator.dupe(u8, "<неограниченный тип>"),
     };
 }
 

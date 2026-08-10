@@ -710,7 +710,7 @@ const Checker = struct {
                 const remap = generic_remap orelse return error.UnsupportedImportedType;
                 break :blk remap.get(external_type) orelse return error.UnsupportedImportedType;
             },
-            .poison => error.UnsupportedImportedType,
+            .poison, .unconstrained => error.UnsupportedImportedType,
         };
     }
 
@@ -1529,7 +1529,7 @@ const Checker = struct {
                 break :blk try self.result.types.tuple(element_types.items);
             },
             .array => |array| blk: {
-                if (array.elements.len == 0) break :blk try self.result.types.array(try self.result.types.poison());
+                if (array.elements.len == 0) break :blk try self.result.types.array(try self.result.types.unconstrained());
                 const element_type = try self.infer(array.elements[0]);
                 for (array.elements[1..]) |element| {
                     if (!self.assignable(try self.infer(element), element_type)) try self.report(array.span, "Type Error: элементы массива имеют разные типы", .{});
@@ -1537,7 +1537,7 @@ const Checker = struct {
                 break :blk try self.result.types.array(element_type);
             },
             .map => |map| blk: {
-                if (map.entries.len == 0) break :blk try self.result.types.map(try self.result.types.poison(), try self.result.types.poison());
+                if (map.entries.len == 0) break :blk try self.result.types.map(try self.result.types.unconstrained(), try self.result.types.unconstrained());
                 const key = try self.infer(map.entries[0].key);
                 const value = try self.infer(map.entries[0].value);
                 for (map.entries[1..]) |entry| {
@@ -2031,7 +2031,7 @@ const Checker = struct {
             },
             .constructor => |constructor| {
                 const subject_entry = self.result.types.get(subject_type) orelse return null;
-                if (subject_entry.* == .poison) {
+                if (subject_entry.* == .poison or subject_entry.* == .unconstrained) {
                     if (self.resolution.pattern_symbols.get(pattern_id)) |variant| {
                         try self.result.pattern_variants.put(pattern_id, variant);
                         return variant;
@@ -2552,9 +2552,24 @@ const Checker = struct {
         return false;
     }
 
+    // Broadened to also match `.unconstrained` — every EXISTING caller
+    // of `isPoison` uses it to mean "no real type info here, skip
+    // further constraint checking" (error-recovery AND the deliberate-
+    // permissive-generic case both qualify equally for that). Keeping
+    // that behavior identical for both variants is intentional — this
+    // pass only makes the two DISTINGUISHABLE in the type representation
+    // itself (`types.zig`'s `Type.unconstrained`), it does not change
+    // when either one is treated as "unconstrained" for checking
+    // purposes. Use `isUnconstrained` below when the distinction itself
+    // (not just "skip checking") actually matters.
     fn isPoison(self: *const Checker, type_id: types.TypeId) bool {
         const entry = self.result.types.get(type_id) orelse return false;
-        return entry.* == .poison;
+        return entry.* == .poison or entry.* == .unconstrained;
+    }
+
+    fn isUnconstrained(self: *const Checker, type_id: types.TypeId) bool {
+        const entry = self.result.types.get(type_id) orelse return false;
+        return entry.* == .unconstrained;
     }
 
     fn isNever(self: *const Checker, type_id: types.TypeId) bool {
@@ -3715,8 +3730,10 @@ const Checker = struct {
                         if (substitutions.contains(parameter.typ)) continue;
                         if (expected_return != null) {
                             try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
+                            try substitutions.put(parameter.typ, try self.result.types.poison());
+                        } else {
+                            try substitutions.put(parameter.typ, try self.result.types.unconstrained());
                         }
-                        try substitutions.put(parameter.typ, try self.result.types.poison());
                     }
                     for (generic_parameters) |parameter| {
                         // The fill-loop right above guarantees every
@@ -4080,6 +4097,7 @@ const Checker = struct {
         const actual_type = self.result.types.get(actual) orelse return false;
         const expected_type = self.result.types.get(expected) orelse return false;
         if (actual_type.* == .poison or expected_type.* == .poison) return true;
+        if (actual_type.* == .unconstrained or expected_type.* == .unconstrained) return true;
         if (actual.eql(self.result.types.builtins.never)) return true;
         if (actual_type.* == .process and self.isPoison(actual_type.process)) return true;
         if (self.result.types.eql(actual, expected)) return true;
@@ -4846,26 +4864,36 @@ const Checker = struct {
     // even though the missing type is provably safe to leave as
     // `poison` (assignable to/from anything, same reasoning `assignable`
     // already applies to empty-literal elements directly).
-    fn fillUnknownWithPoison(self: *Checker, type_id: types.TypeId, substitutions: *std.AutoHashMap(types.TypeId, types.TypeId)) !void {
+    // `placeholder` is whichever of `poison()`/`unconstrained()` the
+    // ORIGINAL argument that triggered this fill already was (see the
+    // call site in `inferGenericSubstitution`) — a single TypeId
+    // instance, reused for every nested generic-parameter position
+    // found by this walk (both variants carry a `void` payload, so one
+    // instance is structurally interchangeable with a fresh one
+    // everywhere `.eql`/`assignable` look at it). This propagates the
+    // SAME kind (real error vs deliberately-unconstrained) all the way
+    // through, instead of collapsing every fill back to a hardcoded
+    // `.poison`.
+    fn fillUnknownWithPoison(self: *Checker, type_id: types.TypeId, substitutions: *std.AutoHashMap(types.TypeId, types.TypeId), placeholder: types.TypeId) !void {
         const entry = self.result.types.get(type_id) orelse return;
         switch (entry.*) {
             .generic_parameter => {
-                if (!substitutions.contains(type_id)) try substitutions.put(type_id, try self.result.types.poison());
+                if (!substitutions.contains(type_id)) try substitutions.put(type_id, placeholder);
             },
-            .tuple => |elements| for (elements) |element| try self.fillUnknownWithPoison(element, substitutions),
-            .array => |element| try self.fillUnknownWithPoison(element, substitutions),
+            .tuple => |elements| for (elements) |element| try self.fillUnknownWithPoison(element, substitutions, placeholder),
+            .array => |element| try self.fillUnknownWithPoison(element, substitutions, placeholder),
             .map => |map| {
-                try self.fillUnknownWithPoison(map.key, substitutions);
-                try self.fillUnknownWithPoison(map.value, substitutions);
+                try self.fillUnknownWithPoison(map.key, substitutions, placeholder);
+                try self.fillUnknownWithPoison(map.value, substitutions, placeholder);
             },
-            .nominal => |nominal| for (nominal.arguments) |argument| try self.fillUnknownWithPoison(argument, substitutions),
+            .nominal => |nominal| for (nominal.arguments) |argument| try self.fillUnknownWithPoison(argument, substitutions, placeholder),
             else => {},
         }
     }
 
     fn inferGenericSubstitution(self: *Checker, parameter: types.TypeId, argument: types.TypeId, substitutions: *std.AutoHashMap(types.TypeId, types.TypeId), span: source.Span) !void {
         const parameter_type = self.result.types.get(parameter) orelse return;
-        if (self.isPoison(argument)) return self.fillUnknownWithPoison(parameter, substitutions);
+        if (self.isPoison(argument)) return self.fillUnknownWithPoison(parameter, substitutions, argument);
         switch (parameter_type.*) {
             .generic_parameter => {
                 if (substitutions.get(parameter)) |existing| {

@@ -1952,7 +1952,7 @@ const FunctionCompiler = struct {
     fn patternFieldIndex(self: *FunctionCompiler, pattern: ast.PatternId, constructor: anytype, argument_index: usize) !?u16 {
         const pattern_type = self.compiler.checked.pattern_types.get(pattern) orelse return null;
         const entry = self.compiler.checked.types.get(pattern_type) orelse return null;
-        if (entry.* == .poison) {
+        if (entry.* == .poison or entry.* == .unconstrained) {
             // `получить()`/`Сообщение(T)`-style untyped payloads: there's
             // no real nominal type here to look up field order from, but
             // the type checker's own poison fallback (`inferMatchPattern`)

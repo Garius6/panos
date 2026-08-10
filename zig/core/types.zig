@@ -73,6 +73,20 @@ pub const Type = union(enum) {
     pointer: TypeId,
     generic_parameter: u32,
     poison: void,
+    // Structurally identical to `poison` everywhere it's checked
+    // (`TypeStore.eql`, `Checker.assignable`'s short-circuit) — the
+    // distinction is purely for future diagnostics/tooling to tell
+    // apart WHY a value ended up universally-assignable: `poison` means
+    // "a real type error was already reported here, don't cascade more
+    // diagnostics from this value". `unconstrained` means "no error at
+    // all — a generic type parameter genuinely couldn't be inferred
+    // from any available context (no cross-statement inference, no
+    // explicit generic-argument call syntax), and staying permissive
+    // here is a deliberate, documented backward-compat fallback real
+    // code depends on (see `inferCallExpected`'s `expected_return`
+    // handling)". No behavioral difference introduced by this variant
+    // existing — see [[project_panos_sound_core_typesystem_direction]].
+    unconstrained: void,
 };
 
 pub const TypeStore = struct {
@@ -181,6 +195,10 @@ pub const TypeStore = struct {
         return self.add(.{ .poison = {} });
     }
 
+    pub fn unconstrained(self: *TypeStore) !TypeId {
+        return self.add(.{ .unconstrained = {} });
+    }
+
     pub fn eql(self: *const TypeStore, left: TypeId, right: TypeId) bool {
         if (!self.owns(left) or !self.owns(right)) return false;
         if (left.eql(right)) return true;
@@ -228,6 +246,10 @@ pub const TypeStore = struct {
             },
             .poison => switch (right_type.*) {
                 .poison => true,
+                else => false,
+            },
+            .unconstrained => switch (right_type.*) {
+                .unconstrained => true,
                 else => false,
             },
         };

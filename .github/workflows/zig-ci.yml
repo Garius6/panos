@@ -66,12 +66,27 @@ jobs:
           # нужно явно продлить `$GITHUB_PATH` на весь остаток job'а.
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
 
+      # `install.ps1` (used above until this fix) stopped existing —
+      # wasmtime.dev now serves only an `.msi` installer for Windows,
+      # not a script (confirmed: `irm https://wasmtime.dev/install.ps1`
+      # returns a GitHub Pages 404, breaking every Windows CI run).
+      # Skip the `.msi` (needs `msiexec`, a real system-level install,
+      # registry lookups to find where it landed) — the release also
+      # ships a plain `.zip` with just `wasmtime.exe` inside, matching
+      # the same "download, extract, extend PATH" shape the Linux/macOS
+      # step above already uses. Resolves "latest" via the GitHub API
+      # at run time instead of pinning a version here, so this doesn't
+      # go stale the same way `install.ps1` did.
       - name: Установить wasmtime (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          irm https://wasmtime.dev/install.ps1 | iex
-          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.wasmtime\bin"
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/bytecodealliance/wasmtime/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -like "wasmtime-*-x86_64-windows.zip" } | Select-Object -First 1
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\wasmtime.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\wasmtime.zip" -DestinationPath "$env:RUNNER_TEMP\wasmtime" -Force
+          $extractedDir = Get-ChildItem -Path "$env:RUNNER_TEMP\wasmtime" -Directory | Select-Object -First 1
+          Add-Content -Path $env:GITHUB_PATH -Value $extractedDir.FullName
 
       - name: zig build test
         run: zig build test --summary all

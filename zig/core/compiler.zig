@@ -1437,6 +1437,11 @@ const FunctionCompiler = struct {
                 try self.function.emit(self.compiler.result.allocator, .{ .http_request_path = {} });
                 return true;
             }
+            if (std.mem.eql(u8, property.property, "тело") and call.arguments.len == 0) {
+                try self.compileExpression(property.object);
+                try self.function.emit(self.compiler.result.allocator, .{ .http_request_body = {} });
+                return true;
+            }
             if (std.mem.eql(u8, property.property, "заголовок") and call.arguments.len == 1) {
                 try self.compileExpression(property.object);
                 try self.compileExpression(call.arguments[0]);

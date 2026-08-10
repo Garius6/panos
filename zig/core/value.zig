@@ -122,6 +122,7 @@ pub const HttpRequestHandle = struct {
     stream: std.Io.net.Stream,
     method: []u8,
     path: []u8,
+    body: []u8,
     headers: []HttpHeaderEntry,
     responded: bool = false,
 };

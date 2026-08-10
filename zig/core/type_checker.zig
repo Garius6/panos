@@ -4403,6 +4403,10 @@ const Checker = struct {
                 try self.checkMethodArity(call, property.property, 0);
                 return @as(?types.TypeId, self.result.types.builtins.string);
             }
+            if (std.mem.eql(u8, property.property, "тело")) {
+                try self.checkMethodArity(call, "тело", 0);
+                return @as(?types.TypeId, self.result.types.builtins.string);
+            }
             if (std.mem.eql(u8, property.property, "заголовок")) {
                 try self.checkMethodArity(call, "заголовок", 1);
                 if (call.arguments.len != 0 and !self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {

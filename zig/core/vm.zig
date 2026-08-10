@@ -79,7 +79,7 @@ const AsyncPayload = union(enum) {
     // `Heap.pin`/`unpin` already support multiple concurrent pins of the
     // same value, unlike Connection/FileHandle/SqlConnection's single
     // `in_flight` flag.
-    http_accept: struct { listener: *value.Listener, stream: ?std.Io.net.Stream, method: ?[]u8, path: ?[]u8, headers: []HttpHeaderPair, err_message: ?[]u8 },
+    http_accept: struct { listener: *value.Listener, stream: ?std.Io.net.Stream, method: ?[]u8, path: ?[]u8, body: ?[]u8, headers: []HttpHeaderPair, err_message: ?[]u8 },
 };
 
 const AsyncCompletion = struct {
@@ -148,6 +148,7 @@ fn freeAsyncPayload(payload: AsyncPayload) void {
         .http_accept => |data| {
             if (data.method) |bytes| std.heap.page_allocator.free(bytes);
             if (data.path) |bytes| std.heap.page_allocator.free(bytes);
+            if (data.body) |bytes| std.heap.page_allocator.free(bytes);
             for (data.headers) |header| {
                 std.heap.page_allocator.free(header.name);
                 std.heap.page_allocator.free(header.value);
@@ -1028,6 +1029,7 @@ fn submitHttpAccept(vm: *Vm, listener: *value.Listener, target_id: u64) void {
                 .stream = null,
                 .method = null,
                 .path = null,
+                .body = null,
                 .headers = &.{},
                 .err_message = message,
             } } });
@@ -1046,7 +1048,7 @@ fn submitHttpAccept(vm: *Vm, listener: *value.Listener, target_id: u64) void {
             var write_buffer: [256]u8 = undefined;
             var writer = stream.writer(io.io(), &write_buffer);
             var http_server = std.http.Server.init(&reader.interface, &writer.interface);
-            const request = http_server.receiveHead() catch |err| {
+            var request = http_server.receiveHead() catch |err| {
                 stream.close(io.io());
                 return job.fail(std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"));
             };
@@ -1060,11 +1062,18 @@ fn submitHttpAccept(vm: *Vm, listener: *value.Listener, target_id: u64) void {
                     .value = std.heap.page_allocator.dupe(u8, header.value) catch @panic("OOM"),
                 }) catch @panic("OOM");
             }
+            var body_buffer: [8192]u8 = undefined;
+            const body_reader = request.readerExpectNone(&body_buffer);
+            const body = body_reader.allocRemaining(std.heap.page_allocator, .limited(1024 * 1024)) catch |err| {
+                stream.close(io.io());
+                return job.fail(std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"));
+            };
             job.queue.push(.{ .target_id = job.target_id, .payload = .{ .http_accept = .{
                 .listener = job.listener,
                 .stream = stream,
                 .method = method_text,
                 .path = path_text,
+                .body = body,
                 .headers = header_pairs.toOwnedSlice(std.heap.page_allocator) catch @panic("OOM"),
                 .err_message = null,
             } } });
@@ -1436,6 +1445,7 @@ pub const Vm = struct {
             .http_accept_submit => try self.httpAcceptSubmit(),
             .http_request_method => try self.httpRequestMethod(),
             .http_request_path => try self.httpRequestPath(),
+            .http_request_body => try self.httpRequestBody(),
             .http_request_header => try self.httpRequestHeader(),
             .http_request_respond => try self.httpRequestRespond(),
             .call_foreign => |foreign_call| try self.callForeign(compiled, foreign_call.constant_index, foreign_call.argument_count),
@@ -3718,6 +3728,11 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .string = request.path });
     }
 
+    fn httpRequestBody(self: *Vm) anyerror!void {
+        const request = try self.popHttpRequestHandle("Запрос.тело()") orelse return;
+        try self.stack.append(self.allocator, .{ .string = request.body });
+    }
+
     fn httpRequestHeader(self: *Vm) anyerror!void {
         const name = (try self.pop()).stringBytes() orelse {
             try self.fault("Runtime Error: Запрос.заголовок() ожидает имя типа Строка", .{});
@@ -5084,6 +5099,7 @@ pub const Vm = struct {
                 if (data.err_message) |message| return self.buildErrorResultValue("сеть", message);
                 const method = try self.allocator.dupe(u8, data.method.?);
                 const path = try self.allocator.dupe(u8, data.path.?);
+                const body = try self.allocator.dupe(u8, data.body.?);
                 const headers = try self.allocator.alloc(value.HttpHeaderEntry, data.headers.len);
                 for (data.headers, headers) |source_header, *entry| {
                     entry.* = .{
@@ -5091,7 +5107,7 @@ pub const Vm = struct {
                         .value = try self.allocator.dupe(u8, source_header.value),
                     };
                 }
-                const request = try self.heap.createHttpRequest(data.stream.?, method, path, headers);
+                const request = try self.heap.createHttpRequest(data.stream.?, method, path, body, headers);
                 return self.buildSuccessResultValue(.{ .http_request = request });
             },
         }

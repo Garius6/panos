@@ -180,6 +180,7 @@ pub const Opcode = enum {
     http_accept_submit,
     http_request_method,
     http_request_path,
+    http_request_body,
     http_request_header,
     http_request_respond,
 };
@@ -345,6 +346,7 @@ pub const Instruction = union(Opcode) {
     http_accept_submit: void,
     http_request_method: void,
     http_request_path: void,
+    http_request_body: void,
     http_request_header: void,
     http_request_respond: void,
 };

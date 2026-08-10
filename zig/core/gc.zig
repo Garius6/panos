@@ -125,10 +125,10 @@ pub const Heap = struct {
 
     // `method`/`path` are duped by the caller (delivery time, `vm.zig`) so
     // they outlive whatever worker-owned buffer they were parsed from.
-    pub fn createHttpRequest(self: *Heap, stream: std.Io.net.Stream, method: []u8, path: []u8, headers: []value.HttpHeaderEntry) !*value.HttpRequestHandle {
+    pub fn createHttpRequest(self: *Heap, stream: std.Io.net.Stream, method: []u8, path: []u8, body: []u8, headers: []value.HttpHeaderEntry) !*value.HttpRequestHandle {
         const request = try self.allocator.create(value.HttpRequestHandle);
         errdefer self.allocator.destroy(request);
-        request.* = .{ .stream = stream, .method = method, .path = path, .headers = headers };
+        request.* = .{ .stream = stream, .method = method, .path = path, .body = body, .headers = headers };
         try self.objects.append(self.allocator, .{ .http_request = request });
         return request;
     }
@@ -312,6 +312,7 @@ pub const Heap = struct {
                 }
                 self.allocator.free(request.method);
                 self.allocator.free(request.path);
+                self.allocator.free(request.body);
                 for (request.headers) |entry| {
                     self.allocator.free(entry.name);
                     self.allocator.free(entry.value);

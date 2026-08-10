@@ -1331,6 +1331,10 @@ pub const Vm = struct {
     program_args: []const []const u8 = &.{},
     async_queue: AsyncQueue = .{},
     foreign_call_cache: std.AutoHashMap(*const bytecode.ForeignFunctionConstant, *PreparedForeignCall),
+    // The profile is deliberately opt-in: a frame loop pays neither for
+    // timestamps nor hash-map writes unless the CLI enables --profile-ffi.
+    foreign_profile_enabled: bool = false,
+    foreign_profile: std.AutoHashMap(*const bytecode.ForeignFunctionConstant, ForeignCallMetric),
     // Set on the FIRST `время.монотонно_мс()` call (native only — the
     // freestanding wasm32 side has no clock of its own at all, see
     // `timeMonotonic`) — every subsequent call reports elapsed time since
@@ -1355,6 +1359,7 @@ pub const Vm = struct {
             .heap = gc.Heap.init(allocator),
             .program = program,
             .foreign_call_cache = .init(allocator),
+            .foreign_profile = .init(allocator),
         };
     }
 
@@ -1377,8 +1382,33 @@ pub const Vm = struct {
             self.allocator.destroy(prepared.*);
         }
         self.foreign_call_cache.deinit();
+        self.foreign_profile.deinit();
         self.heap.deinit();
         self.* = undefined;
+    }
+
+    pub fn writeForeignProfile(self: *const Vm, writer: *std.Io.Writer) !void {
+        if (!self.foreign_profile_enabled) return;
+        try writer.print("FFI PROFILE (per external declaration)\n", .{});
+        if (self.foreign_profile.count() == 0) {
+            try writer.print("  внешние вызовы не выполнялись\n", .{});
+            return;
+        }
+
+        var entries = self.foreign_profile.iterator();
+        while (entries.next()) |entry| {
+            const info = entry.key_ptr.*;
+            const metric = entry.value_ptr.*;
+            const total_us = metric.total_ns / 1_000;
+            const native_us = metric.native_call_ns / 1_000;
+            const overhead_us = if (total_us >= native_us) total_us - native_us else 0;
+            const average_ns = if (metric.calls > 0) metric.total_ns / metric.calls else 0;
+            const cache_hits = if (metric.calls >= metric.cache_misses) metric.calls - metric.cache_misses else 0;
+            try writer.print(
+                "  {s}: calls={d}, total={d} us, ffi_call={d} us, pack/cache={d} us, avg={d} ns, cache hit/miss={d}/{d}\n",
+                .{ info.name, metric.calls, total_us, native_us, overhead_us, average_ns, cache_hits, metric.cache_misses },
+            );
+        }
     }
 
     pub fn run(self: *Vm, entry: bytecode.FunctionId, arguments: []const value.Value) !Execution {
@@ -3743,6 +3773,12 @@ pub const Vm = struct {
                 return;
             },
         };
+        const profile_started_at: ?u64 = if (comptime builtin.target.os.tag == .freestanding)
+            null
+        else if (self.foreign_profile_enabled)
+            foreignProfileNowNanoseconds()
+        else
+            null;
         const arguments = try self.popValues(argument_count);
         defer self.allocator.free(arguments);
         if (info.fn_ptr == 0) {
@@ -3753,6 +3789,10 @@ pub const Vm = struct {
             try self.fault("Runtime Panic: 'внешний' недоступно в этом runtime-таргете", .{});
         } else {
             const result = try self.invokeForeign(info, arguments);
+            if (profile_started_at) |started_at| {
+                const finished_at = foreignProfileNowNanoseconds();
+                try self.recordForeignTotalTime(info, if (finished_at >= started_at) finished_at - started_at else 0);
+            }
             try self.stack.append(self.allocator, result);
         }
     }
@@ -3833,6 +3873,10 @@ pub const Vm = struct {
     fn cachedForeignCall(self: *Vm, info: *const bytecode.ForeignFunctionConstant) anyerror!?*PreparedForeignCall {
         if (self.foreign_call_cache.get(info)) |prepared| return prepared;
 
+        if (self.foreign_profile_enabled) {
+            const metric = try self.foreignCallMetric(info);
+            metric.cache_misses += 1;
+        }
         const prepared = self.prepareForeignCall(info) catch |err| {
             if (err == error.ForeignPreparationFailed) return null;
             return err;
@@ -3843,6 +3887,23 @@ pub const Vm = struct {
         }
         try self.foreign_call_cache.put(info, prepared);
         return prepared;
+    }
+
+    fn foreignCallMetric(self: *Vm, info: *const bytecode.ForeignFunctionConstant) !*ForeignCallMetric {
+        const entry = try self.foreign_profile.getOrPut(info);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        return entry.value_ptr;
+    }
+
+    fn recordForeignTotalTime(self: *Vm, info: *const bytecode.ForeignFunctionConstant, elapsed_ns: u64) !void {
+        const metric = try self.foreignCallMetric(info);
+        metric.calls += 1;
+        metric.total_ns += elapsed_ns;
+    }
+
+    fn recordForeignNativeTime(self: *Vm, info: *const bytecode.ForeignFunctionConstant, elapsed_ns: u64) !void {
+        const metric = try self.foreignCallMetric(info);
+        metric.native_call_ns += elapsed_ns;
     }
 
     fn prepareForeignCall(self: *Vm, info: *const bytecode.ForeignFunctionConstant) anyerror!*PreparedForeignCall {
@@ -3964,7 +4025,12 @@ pub const Vm = struct {
             argument_values[index] = dest;
         }
 
+        const native_started_at: ?u64 = if (self.foreign_profile_enabled) foreignProfileNowNanoseconds() else null;
         ffi.ffi_call(&prepared.cif, @ptrFromInt(info.fn_ptr), return_storage.ptr, if (nargs > 0) argument_values.ptr else null);
+        if (native_started_at) |started_at| {
+            const finished_at = foreignProfileNowNanoseconds();
+            try self.recordForeignNativeTime(info, if (finished_at >= started_at) finished_at - started_at else 0);
+        }
         const return_bytes: [*]const u8 = @ptrCast(return_storage.ptr);
 
         return switch (info.return_kind) {
@@ -6054,6 +6120,44 @@ test "VM stores concatenated strings in the managed heap" {
         },
         .runtime_error => return error.TestUnexpectedResult,
     }
+}
+
+test "VM profiles repeated внешний calls and their prepared ABI cache" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const input = "внешний \"libc\" функ abs(значение: Целое(32)) -> Целое(32)\nфунк старт() -> Целое\nпер сумма: Целое = 0\nпер i: Целое = 0\nпока i < 100 цикл\n    сумма = сумма + abs(i - 50)\n    i = i + 1\nконец\nсумма\nконец";
+    var lexed = try lexer.tokenize(std.testing.allocator, input, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    vm.foreign_profile_enabled = true;
+    const outcome = try vm.run(@enumFromInt(0), &.{});
+    switch (outcome) {
+        .success => |runtime_value| try std.testing.expectEqual(@as(f64, 2500), runtime_value.number),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), vm.foreign_profile.count());
+    var profile = vm.foreign_profile.iterator();
+    const entry = profile.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("abs", entry.key_ptr.*.name);
+    try std.testing.expectEqual(@as(u64, 100), entry.value_ptr.calls);
+    try std.testing.expectEqual(@as(u64, 1), entry.value_ptr.cache_misses);
+    try std.testing.expect(entry.value_ptr.total_ns >= entry.value_ptr.native_call_ns);
 }
 
 test "VM executes generic functions" {

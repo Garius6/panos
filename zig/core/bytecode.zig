@@ -14,6 +14,10 @@ pub const invalid_function: FunctionId = @enumFromInt(std.math.maxInt(u32));
 // runtime panic, unreachable if the program actually type-checked clean.
 pub const ForeignFunctionConstant = struct {
     fn_ptr: usize,
+    // Имя C-символа сохраняется рядом с адресом только для диагностик и
+    // опционального профиля FFI в VM. Это arena-owned строка Program, как
+    // остальные строковые константы байткода.
+    name: []const u8,
     param_kinds: []const ast.ForeignMarshalKind,
     // Parallel to `param_kinds` — empty slice for every non-`.struct_value`
     // parameter, the `ff_структура`'s field marshal kinds (declaration

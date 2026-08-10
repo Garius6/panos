@@ -1092,6 +1092,7 @@ const FunctionCompiler = struct {
         const fn_ptr = self.compiler.resolution.foreign_functions.get(symbol) orelse 0;
         const constant_index = try self.function.addConstant(self.compiler.result.allocator, .{ .foreign_function = .{
             .fn_ptr = fn_ptr,
+            .name = try self.compiler.program().copyString(foreign.name),
             .param_kinds = param_kinds,
             .param_struct_layouts = param_struct_layouts,
             .return_kind = foreign.return_marshal,

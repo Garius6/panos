@@ -252,6 +252,7 @@ pub fn main(init: std.process.Init) !void {
     defer arguments.deinit();
     _ = arguments.next();
     var verbose = false;
+    var profile_ffi = false;
     // `contracts/cli.md` says "with no file.ps, panos starts the existing
     // REPL mode" — but Odin's own `repl()` (`main.odin:205-207`) is an
     // empty stub, no output, exit 0. No REPL exists on either toolchain —
@@ -263,10 +264,14 @@ pub fn main(init: std.process.Init) !void {
         try stdout.flush();
         return;
     };
-    if (std.mem.eql(u8, file_path, "-v") or std.mem.eql(u8, file_path, "--verbose")) {
-        verbose = true;
+    while (std.mem.eql(u8, file_path, "-v") or std.mem.eql(u8, file_path, "--verbose") or std.mem.eql(u8, file_path, "--profile-ffi")) {
+        if (std.mem.eql(u8, file_path, "--profile-ffi")) {
+            profile_ffi = true;
+        } else {
+            verbose = true;
+        }
         file_path = arguments.next() orelse {
-            try stderr.print("panos [-v|--verbose] [file.ps] [program arguments...]\n", .{});
+            try stderr.print("panos [-v|--verbose] [--profile-ffi] <файл.pns> [аргументы программы...]\n", .{});
             try stderr.flush();
             std.process.exit(1);
         };
@@ -348,8 +353,14 @@ pub fn main(init: std.process.Init) !void {
 
     var machine = panos_core.vm.Vm.init(init.gpa, &compiled.program);
     machine.program_args = program_args.items;
+    machine.foreign_profile_enabled = profile_ffi;
     defer machine.deinit();
-    switch (try machine.run(start, &.{})) {
+    const execution = try machine.run(start, &.{});
+    if (profile_ffi) {
+        try machine.writeForeignProfile(stderr);
+        try stderr.flush();
+    }
+    switch (execution) {
         .success => |runtime_value| {
             const output = try panos_core.runner.renderValue(init.gpa, runtime_value);
             defer init.gpa.free(output);

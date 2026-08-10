@@ -65,10 +65,16 @@ pub const Opcode = enum {
     receive,
     observe,
     get_signal,
+    await_task,
+    select_wait,
     process_id,
     current_process,
     kill_process,
     link_process,
+    set_mailbox_capacity,
+    send_or,
+    request_cancel,
+    is_cancelled,
     build_closure,
     return_value,
     return_void,
@@ -217,10 +223,16 @@ pub const Instruction = union(Opcode) {
     receive: void,
     observe: void,
     get_signal: void,
+    await_task: void,
+    select_wait: void,
     process_id: void,
     current_process: void,
     kill_process: void,
     link_process: void,
+    set_mailbox_capacity: void,
+    send_or: void,
+    request_cancel: void,
+    is_cancelled: void,
     build_closure: struct {
         function_id: FunctionId,
         capture_count: u16,
@@ -367,11 +379,23 @@ pub const ComparableMethod = struct {
     function_id: FunctionId,
 };
 
+// Same name-keyed dispatch table shape as `ComparableMethod` — `отправить`
+// needs to know, at RUNTIME (the message's exact struct name is only known
+// once it's an actual `Aggregate` on the heap, same as `Сравниваемое`'s
+// existing dispatch), whether the type being sent declared a custom
+// `реализация Копируемое`. Restoring copy-on-send (ROADMAP.md Стадия 24) —
+// see `vm.zig`'s `send`/`deepCopyForSend`.
+pub const CopyableMethod = struct {
+    type_name: []const u8,
+    function_id: FunctionId,
+};
+
 pub const Program = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     functions: std.ArrayList(Function) = .empty,
     comparable_methods: std.ArrayList(ComparableMethod) = .empty,
+    copyable_methods: std.ArrayList(CopyableMethod) = .empty,
     entry: FunctionId = invalid_function,
 
     pub fn init(allocator: std.mem.Allocator) Program {
@@ -384,6 +408,7 @@ pub const Program = struct {
     pub fn deinit(self: *Program) void {
         for (self.functions.items) |*compiled_function| compiled_function.deinit(self.allocator);
         self.comparable_methods.deinit(self.allocator);
+        self.copyable_methods.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.arena.deinit();
         self.* = undefined;
@@ -429,6 +454,25 @@ pub const Program = struct {
         const separator = std.mem.indexOfScalar(u8, type_name, '.') orelse return null;
         const owner = type_name[0..separator];
         for (self.comparable_methods.items) |method| {
+            if (std.mem.eql(u8, method.type_name, owner)) return method.function_id;
+        }
+        return null;
+    }
+
+    pub fn addCopyableMethod(self: *Program, type_name: []const u8, function_id: FunctionId) !void {
+        try self.copyable_methods.append(self.allocator, .{
+            .type_name = try self.copyString(type_name),
+            .function_id = function_id,
+        });
+    }
+
+    pub fn copyableMethod(self: *const Program, type_name: []const u8) ?FunctionId {
+        for (self.copyable_methods.items) |method| {
+            if (std.mem.eql(u8, method.type_name, type_name)) return method.function_id;
+        }
+        const separator = std.mem.indexOfScalar(u8, type_name, '.') orelse return null;
+        const owner = type_name[0..separator];
+        for (self.copyable_methods.items) |method| {
             if (std.mem.eql(u8, method.type_name, owner)) return method.function_id;
         }
         return null;

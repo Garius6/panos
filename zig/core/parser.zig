@@ -1152,6 +1152,17 @@ const Parser = struct {
         return self.result.ast.copySlice(ast.ParamDecl, parameters.items);
     }
 
+    fn parseSelectWait(self: *Parser) anyerror!ast.ExprId {
+        const keyword = self.next();
+        _ = try self.expect(.l_paren, "Синтаксическая ошибка: после 'ожидание' ожидается '('");
+        const source_expr = try self.parseExpression(0);
+        const end = try self.expect(.r_paren, "Синтаксическая ошибка: 'ожидание(...)' не закрыто ')'");
+        return self.result.ast.addExpr(.{ .select_wait = .{
+            .span = spanFrom(keyword.span, end.span),
+            .source = source_expr,
+        } });
+    }
+
     fn parseSpawnExpression(self: *Parser, start: token.Token) anyerror!ast.ExprId {
         const call = try self.parseExpression(12);
         return self.result.ast.addExpr(.{ .spawn = .{
@@ -1161,7 +1172,7 @@ const Parser = struct {
     }
 
     fn parseMatchExpression(self: *Parser, start: token.Token) anyerror!ast.ExprId {
-        const subject = try self.parseExpression(0);
+        const subject = if (self.at(.wait_select)) try self.parseSelectWait() else try self.parseExpression(0);
         var arms: std.ArrayList(ast.MatchArm) = .empty;
         defer arms.deinit(self.result.allocator);
 

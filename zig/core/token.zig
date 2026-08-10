@@ -53,6 +53,7 @@ pub const TokenKind = enum {
     comma,
     question,
     spawn,
+    wait_select,
     percent,
     in,
     foreign,
@@ -110,6 +111,11 @@ pub fn lookupKeyword(identifier: []const u8) TokenKind {
         .{ .spelling = "выбор", .kind = .match },
         .{ .spelling = "как", .kind = .as },
         .{ .spelling = "запусти", .kind = .spawn },
+        // `выбор ожидание(...)` — select-style multi-source blocking wait,
+        // only meaningful directly after `выбор` (see `parser.zig`'s
+        // `parseMatchExpression`); a bare `ожидание` anywhere else is a
+        // parse error the same way a stray `тогда`/`конец` would be.
+        .{ .spelling = "ожидание", .kind = .wait_select },
         .{ .spelling = "в", .kind = .in },
         .{ .spelling = "внешний", .kind = .foreign },
         .{ .spelling = "ff_структура", .kind = .ff_struct },
@@ -154,6 +160,11 @@ test "Russian keywords retain their Odin token kinds" {
         .{ .spelling = "выбор", .kind = .match },
         .{ .spelling = "как", .kind = .as },
         .{ .spelling = "запусти", .kind = .spawn },
+        // `выбор ожидание(...)` — select-style multi-source blocking wait,
+        // only meaningful directly after `выбор` (see `parser.zig`'s
+        // `parseMatchExpression`); a bare `ожидание` anywhere else is a
+        // parse error the same way a stray `тогда`/`конец` would be.
+        .{ .spelling = "ожидание", .kind = .wait_select },
         .{ .spelling = "в", .kind = .in },
         .{ .spelling = "внешний", .kind = .foreign },
         .{ .spelling = "ff_структура", .kind = .ff_struct },

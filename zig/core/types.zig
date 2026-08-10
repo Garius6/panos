@@ -1,9 +1,30 @@
 const std = @import("std");
 const symbols = @import("symbols.zig");
 
-pub const TypeId = enum(u32) { _ };
+/// A type-store-scoped handle.
+///
+/// The index is intentionally not sufficient to identify a type: every
+/// module owns a separate TypeStore, so index 1 means a different type in
+/// every store.  The owner token makes accidental cross-store use fail at
+/// the TypeStore boundary instead of silently reading a local type at the
+/// same index.
+pub const TypeId = struct {
+    owner: u32,
+    index: u32,
 
-pub const invalid_type: TypeId = @enumFromInt(0);
+    /// Synthetic IDs are only for MIR/unit-test fixtures that do not have a
+    /// TypeStore. They must never be passed to TypeStore.get or a composite
+    /// type constructor.
+    pub fn raw(index: u32) TypeId {
+        return .{ .owner = 0, .index = index };
+    }
+
+    pub fn eql(self: TypeId, other: TypeId) bool {
+        return self.owner == other.owner and self.index == other.index;
+    }
+};
+
+pub const invalid_type: TypeId = TypeId.raw(0);
 
 pub const Primitive = enum {
     number,
@@ -42,6 +63,12 @@ pub const Type = union(enum) {
         key: TypeId,
         value: TypeId,
     },
+    // `Процесс(T)` — T is the spawned function's return type (delivered by
+    // `ждать`), not the message type accepted via `получить()` inside the
+    // process's own body — `Процесс(T)` has no way to type-check the latter
+    // today (would need analyzing `получить()` call sites in the callee),
+    // so `запусти`/`ждать` treat T as "the eventual result", matching what
+    // was previously a separate `Задача(R)` type before it was folded in.
     process: TypeId,
     pointer: TypeId,
     generic_parameter: u32,
@@ -51,6 +78,7 @@ pub const Type = union(enum) {
 pub const TypeStore = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
+    identity: u32,
     types: std.ArrayList(Type) = .empty,
     builtins: Builtins,
 
@@ -58,6 +86,7 @@ pub const TypeStore = struct {
         var store = TypeStore{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
+            .identity = nextStoreIdentity(),
             .builtins = undefined,
         };
         errdefer store.deinit();
@@ -80,17 +109,30 @@ pub const TypeStore = struct {
         self.* = undefined;
     }
 
+    pub fn owns(self: *const TypeStore, id: TypeId) bool {
+        return id.owner != 0 and id.owner == self.identity;
+    }
+
     pub fn get(self: *const TypeStore, id: TypeId) ?*const Type {
-        const index = @intFromEnum(id);
+        if (!self.owns(id)) return null;
+        const index = id.index;
         if (index == 0 or index >= self.types.items.len) return null;
         return &self.types.items[index];
     }
 
+    pub fn require(self: *const TypeStore, id: TypeId) !*const Type {
+        if (!self.owns(id)) return error.ForeignTypeId;
+        return self.get(id) orelse error.InvalidTypeId;
+    }
+
     pub fn tuple(self: *TypeStore, elements: []const TypeId) !TypeId {
+        try self.ensureOwnedSlice(elements);
         return self.add(.{ .tuple = try self.arena.allocator().dupe(TypeId, elements) });
     }
 
     pub fn function(self: *TypeStore, parameters: []const TypeId, return_type: TypeId) !TypeId {
+        try self.ensureOwnedSlice(parameters);
+        try self.ensureOwned(return_type);
         return self.add(.{ .function = .{
             .parameters = try self.arena.allocator().dupe(TypeId, parameters),
             .return_type = return_type,
@@ -102,6 +144,7 @@ pub const TypeStore = struct {
     }
 
     pub fn nominalWithIdentity(self: *TypeStore, symbol: symbols.SymbolId, identity: u32, arguments: []const TypeId) !TypeId {
+        try self.ensureOwnedSlice(arguments);
         return self.add(.{ .nominal = .{
             .symbol = symbol,
             .identity = identity,
@@ -110,18 +153,23 @@ pub const TypeStore = struct {
     }
 
     pub fn array(self: *TypeStore, element: TypeId) !TypeId {
+        try self.ensureOwned(element);
         return self.add(.{ .array = element });
     }
 
     pub fn map(self: *TypeStore, key: TypeId, value: TypeId) !TypeId {
+        try self.ensureOwned(key);
+        try self.ensureOwned(value);
         return self.add(.{ .map = .{ .key = key, .value = value } });
     }
 
     pub fn process(self: *TypeStore, message: TypeId) !TypeId {
+        try self.ensureOwned(message);
         return self.add(.{ .process = message });
     }
 
     pub fn pointer(self: *TypeStore, pointee: TypeId) !TypeId {
+        try self.ensureOwned(pointee);
         return self.add(.{ .pointer = pointee });
     }
 
@@ -134,7 +182,8 @@ pub const TypeStore = struct {
     }
 
     pub fn eql(self: *const TypeStore, left: TypeId, right: TypeId) bool {
-        if (left == right) return true;
+        if (!self.owns(left) or !self.owns(right)) return false;
+        if (left.eql(right)) return true;
         const left_type = self.get(left) orelse return false;
         const right_type = self.get(right) orelse return false;
         return switch (left_type.*) {
@@ -185,9 +234,17 @@ pub const TypeStore = struct {
     }
 
     fn add(self: *TypeStore, value: Type) !TypeId {
-        const id: TypeId = @enumFromInt(self.types.items.len);
+        const id: TypeId = .{ .owner = self.identity, .index = @intCast(self.types.items.len) };
         try self.types.append(self.allocator, value);
         return id;
+    }
+
+    fn ensureOwned(self: *const TypeStore, id: TypeId) !void {
+        if (!self.owns(id)) return error.ForeignTypeId;
+    }
+
+    fn ensureOwnedSlice(self: *const TypeStore, ids: []const TypeId) !void {
+        for (ids) |id| try self.ensureOwned(id);
     }
 
     fn eqlSlices(self: *const TypeStore, left: []const TypeId, right: []const TypeId) bool {
@@ -199,11 +256,17 @@ pub const TypeStore = struct {
     }
 };
 
+var next_identity: std.atomic.Value(u32) = .init(1);
+
+fn nextStoreIdentity() u32 {
+    return next_identity.fetchAdd(1, .monotonic);
+}
+
 test "type store keeps canonical primitive IDs" {
     var store = try TypeStore.init(std.testing.allocator);
     defer store.deinit();
 
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(store.builtins.number));
+    try std.testing.expectEqual(@as(u32, 1), store.builtins.number.index);
     try std.testing.expect(store.eql(store.builtins.number, store.builtins.number));
     try std.testing.expect(!store.eql(store.builtins.number, store.builtins.string));
     switch (store.get(store.builtins.integer).?.*) {
@@ -232,6 +295,20 @@ test "composite types own their parameter slices" {
         .function => |signature| try std.testing.expectEqual(tuple, signature.parameters[0]),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "type ids cannot cross type stores" {
+    var left = try TypeStore.init(std.testing.allocator);
+    defer left.deinit();
+    var right = try TypeStore.init(std.testing.allocator);
+    defer right.deinit();
+
+    try std.testing.expect(!left.owns(right.builtins.number));
+    try std.testing.expect(left.get(right.builtins.number) == null);
+    try std.testing.expect(!left.eql(right.builtins.number, right.builtins.number));
+    try std.testing.expectError(error.ForeignTypeId, left.require(right.builtins.number));
+    try std.testing.expectError(error.ForeignTypeId, left.array(right.builtins.number));
+    try std.testing.expectError(error.ForeignTypeId, left.function(&.{right.builtins.string}, left.builtins.number));
 }
 
 test "nominal types compare declaration identity and generic arguments" {

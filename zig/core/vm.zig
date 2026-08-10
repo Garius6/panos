@@ -1320,10 +1320,26 @@ pub const Vm = struct {
                     return .suspended;
                 }
             },
+            .await_task => {
+                if (try self.awaitTask()) {
+                    frame.ip -= 1;
+                    return .suspended;
+                }
+            },
+            .select_wait => {
+                if (try self.selectWait()) {
+                    frame.ip -= 1;
+                    return .suspended;
+                }
+            },
             .process_id => try self.processId(),
             .current_process => try self.currentProcess(),
             .kill_process => try self.killProcess(),
             .link_process => try self.linkProcess(),
+            .set_mailbox_capacity => try self.setMailboxCapacity(),
+            .send_or => try self.sendOr(),
+            .request_cancel => try self.requestCancel(),
+            .is_cancelled => try self.isCancelled(),
             .build_closure => |closure| try self.buildClosure(closure),
             .return_value => {
                 const popped = try self.pop();
@@ -4106,6 +4122,153 @@ pub const Vm = struct {
         return .{ .void = {} };
     }
 
+    // Same nested-call shape as `invokeComparable`, one argument instead
+    // of two (`клонировать(это)`) — synchronously runs a `реализация
+    // Копируемое` override to completion and returns its result. Used by
+    // `deepCopyForSend` below.
+    fn invokeCopyable(self: *Vm, function_id: bytecode.FunctionId, receiver: value.Value) anyerror!value.Value {
+        const saved_stack = self.stack;
+        const saved_frames = self.frames;
+        const saved_failure = self.failure;
+        var nested_failure: ?*value.HeapString = null;
+        self.stack = .empty;
+        self.frames = .empty;
+        self.failure = null;
+        defer {
+            self.clearFrames();
+            self.frames.deinit(self.allocator);
+            self.stack.deinit(self.allocator);
+            self.stack = saved_stack;
+            self.frames = saved_frames;
+            self.failure = nested_failure orelse saved_failure;
+        }
+
+        self.pushFrame(function_id, &.{}, &.{receiver}) catch |err| switch (err) {
+            error.RuntimeFault => {
+                nested_failure = self.failure;
+                return err;
+            },
+            else => return err,
+        };
+        while (self.frames.items.len != 0) {
+            const outcome = self.step() catch |err| switch (err) {
+                error.RuntimeFault => {
+                    nested_failure = self.failure;
+                    return err;
+                },
+                else => return err,
+            };
+            switch (outcome) {
+                .none => {},
+                .completed => |result| return result,
+                // Same rationale as `invokeComparable` — a Копируемое
+                // override calling получить()/получить_сигнал()/an async
+                // builtin has no process context to suspend into here.
+                .suspended => {
+                    self.fault("Runtime Error: реализация Копируемое не может приостанавливаться (получить/асинхронный вызов)", .{}) catch |err| {
+                        nested_failure = self.failure;
+                        return err;
+                    };
+                },
+            }
+        }
+        return .{ .void = {} };
+    }
+
+    // Restores copy-on-send isolation (ROADMAP.md Стадия 24, silently
+    // dropped in the Zig migration — see `send`'s own comment). Two
+    // dispatch paths, mirroring `Сравниваемое`'s existing name-keyed
+    // lookup:
+    //   - the message's runtime struct name has a registered `реализация
+    //     Копируемое` override (`registerCopyableMethods`,
+    //     `compiler.zig`) — call it directly and trust its result AS-IS
+    //     (no further reflective walk — a custom override exists
+    //     precisely to control what gets copied, e.g. deliberately
+    //     sharing a cache field; re-walking afterward would defeat that).
+    //   - otherwise, reflectively walk the value's structure and build an
+    //     independent copy — cycle-safe via `seen` (old heap pointer →
+    //     already-built copy), same shape as the GC mark-walker's own
+    //     cycle protection, just building a copy instead of setting a
+    //     mark bit.
+    // Primitives (Число/Булево/Пусто/Никогда) and heap strings are NOT
+    // copied — panos strings are immutable, so sharing them is always
+    // safe (ROADMAP.md Стадия 24, decision 2). Native resource handles
+    // (Процесс/Файл/Соединение/Соединение_БД/Слушатель/Запрос) are also
+    // NOT copied — they identify a live resource, not data; copying one
+    // would be meaningless (a "cloned" file handle doesn't point at a
+    // second copy of the file) and sending a `Процесс(T)` handle must
+    // keep pointing at the SAME target process.
+    fn deepCopyForSend(self: *Vm, source: value.Value) anyerror!value.Value {
+        var seen = std.AutoHashMap(usize, value.Value).init(self.allocator);
+        defer seen.deinit();
+        return self.deepCopyForSendInner(source, &seen);
+    }
+
+    fn deepCopyForSendInner(self: *Vm, source: value.Value, seen: *std.AutoHashMap(usize, value.Value)) anyerror!value.Value {
+        return switch (source) {
+            .aggregate => |aggregate| blk: {
+                const key = @intFromPtr(aggregate);
+                if (seen.get(key)) |existing| break :blk existing;
+                if (aggregate.name) |type_name| {
+                    if (self.program.copyableMethod(type_name)) |method| {
+                        const copied = try self.invokeCopyable(method, source);
+                        try seen.put(key, copied);
+                        break :blk copied;
+                    }
+                }
+                const elements = try self.allocator.alloc(value.Value, aggregate.elements.len);
+                const new_aggregate = try self.heap.createAggregate(aggregate.name, elements);
+                const copied: value.Value = .{ .aggregate = new_aggregate };
+                try seen.put(key, copied);
+                for (aggregate.elements, elements) |element, *dest| dest.* = try self.deepCopyForSendInner(element, seen);
+                break :blk copied;
+            },
+            .array => |array| blk: {
+                const key = @intFromPtr(array);
+                if (seen.get(key)) |existing| break :blk existing;
+                const elements = try self.allocator.alloc(value.Value, array.elements.len);
+                const new_array = try self.heap.createArray(elements);
+                const copied: value.Value = .{ .array = new_array };
+                try seen.put(key, copied);
+                for (array.elements, elements) |element, *dest| dest.* = try self.deepCopyForSendInner(element, seen);
+                break :blk copied;
+            },
+            .map => |map| blk: {
+                const key = @intFromPtr(map);
+                if (seen.get(key)) |existing| break :blk existing;
+                const new_map = try self.heap.createMap();
+                const copied: value.Value = .{ .map = new_map };
+                try seen.put(key, copied);
+                for (map.entries.items) |entry| {
+                    try new_map.entries.append(self.allocator, .{
+                        .key = try self.deepCopyForSendInner(entry.key, seen),
+                        .value = try self.deepCopyForSendInner(entry.value, seen),
+                    });
+                }
+                break :blk copied;
+            },
+            .closure => |closure| blk: {
+                const key = @intFromPtr(closure);
+                if (seen.get(key)) |existing| break :blk existing;
+                const captures = try self.allocator.alloc(value.Value, closure.captures.len);
+                const new_closure = try self.heap.createClosure(closure.function_id, captures);
+                const copied: value.Value = .{ .closure = new_closure };
+                try seen.put(key, copied);
+                for (closure.captures, captures) |capture, *dest| dest.* = try self.deepCopyForSendInner(capture, seen);
+                break :blk copied;
+            },
+            .interface => |interface| blk: {
+                const key = @intFromPtr(interface);
+                if (seen.get(key)) |existing| break :blk existing;
+                const receiver_copy = try self.deepCopyForSendInner(interface.receiver, seen);
+                const copied: value.Value = .{ .interface = try self.heap.createInterface(receiver_copy, interface.methods) };
+                try seen.put(key, copied);
+                break :blk copied;
+            },
+            else => source,
+        };
+    }
+
     fn equal(self: *Vm, negate: bool) anyerror!void {
         const right = try self.pop();
         const left = try self.pop();
@@ -4241,7 +4404,11 @@ pub const Vm = struct {
             },
         };
         if (target.status == .ready) {
-            try target.mailbox.append(self.allocator, message);
+            // Deep-copy for actor isolation — see `deepCopyForSend`'s own
+            // comment. Only done when the target is actually alive (a
+            // dead target is a silent no-op either way, no point paying
+            // the copy cost).
+            try target.mailbox.append(self.allocator, try self.deepCopyForSend(message));
         }
         try self.stack.append(self.allocator, .{ .void = {} });
     }
@@ -4287,6 +4454,134 @@ pub const Vm = struct {
         const signal = process.signals.orderedRemove(0);
         try self.stack.append(self.allocator, signal);
         return false;
+    }
+
+    // `ждать(процесс)` — unlike получить/получить_сигнал/await_async
+    // (parameterless, block on the CURRENT process's own queue),
+    // `ждать` takes an argument (the target `Процесс(T)` handle) already
+    // sitting on the stack from `compileExpression(call.arguments[0])`.
+    // A suspend here only rewinds `frame.ip` back to THIS instruction —
+    // the argument-computing instructions before it do NOT re-run — so
+    // the target must be PEEKED (not popped) while still pending, and
+    // only actually consumed once ready to push a real result.
+    fn awaitTask(self: *Vm) anyerror!bool {
+        const waiter = self.current_process orelse {
+            _ = try self.pop();
+            try self.fault("Runtime Error: ждать() вызвано вне процесса", .{});
+            return false;
+        };
+        if (self.stack.items.len == 0) {
+            try self.fault("Runtime Error: ждать() ожидает Процесс(T) первым аргументом", .{});
+            return false;
+        }
+        const target = switch (self.stack.items[self.stack.items.len - 1]) {
+            .process => |process| process,
+            else => {
+                _ = try self.pop();
+                try self.fault("Runtime Error: ждать() ожидает Процесс(T) первым аргументом", .{});
+                return false;
+            },
+        };
+        const outcome = target.result orelse {
+            // A single process only ever executes one instruction at a
+            // time (cooperative, single-threaded) — it can't already be
+            // registered as a waiter for a DIFFERENT still-pending `ждать`
+            // when this one starts, so a plain append here can't produce
+            // a stale/duplicate registration in practice.
+            try target.task_waiters.append(self.allocator, waiter);
+            return true;
+        };
+        _ = try self.pop();
+        switch (outcome) {
+            .completed => |result| try self.pushSuccessResult(result),
+            .failed => |message| try self.pushErrorResultForModule("процесс", message.bytes),
+        }
+        return false;
+    }
+
+    // `выбор ожидание(источник) ... конец` — like `awaitTask`, the source
+    // array is peeked (not popped) while nothing is ready, since a
+    // suspend only rewinds `frame.ip` back to THIS instruction and the
+    // instructions that computed the array won't re-run. Priority order
+    // when multiple sources are ready simultaneously: mailbox, then
+    // signals, then a listed process's completion — matching
+    // получить/получить_сигнал/ждать's own relative ordering elsewhere in
+    // this file (получить/получить_сигнал are always checked before any
+    // task-completion path exists at all).
+    fn selectWait(self: *Vm) anyerror!bool {
+        const waiter = self.current_process orelse {
+            _ = try self.pop();
+            try self.fault("Runtime Error: 'ожидание' вызвано вне процесса", .{});
+            return false;
+        };
+        if (self.stack.items.len == 0) {
+            try self.fault("Runtime Error: 'ожидание' ожидает Массив(Процесс(R))", .{});
+            return false;
+        }
+        const source = switch (self.stack.items[self.stack.items.len - 1]) {
+            .array => |array| array,
+            else => {
+                _ = try self.pop();
+                try self.fault("Runtime Error: 'ожидание' ожидает Массив(Процесс(R))", .{});
+                return false;
+            },
+        };
+        if (waiter.mailbox.items.len != 0) {
+            _ = try self.pop();
+            const message = waiter.mailbox.orderedRemove(0);
+            try self.pushSelectSource("ИсточникОжидания.Сообщение", &.{message});
+            return false;
+        }
+        if (waiter.signals.items.len != 0) {
+            _ = try self.pop();
+            const signal = waiter.signals.orderedRemove(0);
+            try self.pushSelectSource("ИсточникОжидания.Сигнал", &.{signal});
+            return false;
+        }
+        for (source.elements) |element| {
+            const target = switch (element) {
+                .process => |process| process,
+                else => continue,
+            };
+            const outcome = target.result orelse continue;
+            _ = try self.pop();
+            const result_value = switch (outcome) {
+                .completed => |payload| try self.buildSuccessResultValue(payload),
+                .failed => |message| try self.buildErrorResultValue("процесс", message.bytes),
+            };
+            try self.pushSelectSource("ИсточникОжидания.Готово", &.{ .{ .process = target }, result_value });
+            return false;
+        }
+        // Nothing ready yet — register as a waiter on every still-pending
+        // listed process, guarding against duplicate registration across
+        // retries of this same suspended opcode (unlike `awaitTask`,
+        // `selectWait` CAN legitimately retry multiple times before
+        // anything becomes ready, e.g. woken by an unrelated mailbox
+        // message that turns out not to be present anymore by the time
+        // this instruction re-runs).
+        for (source.elements) |element| {
+            const target = switch (element) {
+                .process => |process| process,
+                else => continue,
+            };
+            if (target.result != null) continue;
+            var already_registered = false;
+            for (target.task_waiters.items) |existing| {
+                if (existing == waiter) {
+                    already_registered = true;
+                    break;
+                }
+            }
+            if (!already_registered) try target.task_waiters.append(self.allocator, waiter);
+        }
+        return true;
+    }
+
+    fn pushSelectSource(self: *Vm, name: []const u8, fields: []const value.Value) anyerror!void {
+        const elements = try self.allocator.alloc(value.Value, fields.len);
+        @memcpy(elements, fields);
+        const aggregate = try self.heap.createAggregate(name, elements);
+        try self.stack.append(self.allocator, .{ .aggregate = aggregate });
     }
 
     fn processId(self: *Vm) anyerror!void {
@@ -4362,6 +4657,81 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .void = {} });
     }
 
+    // `ограничить_почту(N)` — sets a capacity on the CALLING process's OWN
+    // mailbox (no target argument, mirrors `себя()`'s "current process"
+    // shape). Only `отправить_или` below ever consults this — plain
+    // `отправить` stays capacity-blind, matching every process's behavior
+    // before this feature existed.
+    fn setMailboxCapacity(self: *Vm) anyerror!void {
+        const raw = try self.pop();
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: ограничить_почту() вызвано вне процесса", .{});
+            return;
+        };
+        const capacity = try self.number(raw);
+        if (capacity < 0) {
+            try self.fault("Runtime Error: ограничить_почту() ожидает неотрицательное число", .{});
+            return;
+        }
+        process.mailbox_capacity = @intFromFloat(capacity);
+        try self.stack.append(self.allocator, .{ .void = {} });
+    }
+
+    // `отправить_или(процесс, сообщение) -> Результат(Пусто, Ошибка)` —
+    // opt-in, backpressure-aware sibling of `отправить`. Rejects (without
+    // appending) only when the TARGET has an explicit `mailbox_capacity`
+    // AND is already at/over it; an unbounded target (the default) never
+    // rejects, same as plain `отправить`.
+    fn sendOr(self: *Vm) anyerror!void {
+        const message = try self.pop();
+        const target = switch (try self.pop()) {
+            .process => |process| process,
+            else => {
+                try self.fault("Runtime Error: отправить_или() ожидает Процесс(T) первым аргументом", .{});
+                return;
+            },
+        };
+        if (target.status != .ready) {
+            try self.pushSuccessResult(.{ .void = {} });
+            return;
+        }
+        if (target.mailbox_capacity) |capacity| {
+            if (target.mailbox.items.len >= capacity) {
+                try self.pushErrorResultForModule("почта", "почтовый ящик переполнен");
+                return;
+            }
+        }
+        try target.mailbox.append(self.allocator, try self.deepCopyForSend(message));
+        try self.pushSuccessResult(.{ .void = {} });
+    }
+
+    // `отмена(процесс)` — sets a flag on the TARGET; purely advisory,
+    // nothing forces the target to notice. Sibling to `убить()`
+    // (structurally: pops a `Процесс(T)`, no self-cancel/main-process
+    // restriction needed since this can never actually stop anything on
+    // its own).
+    fn requestCancel(self: *Vm) anyerror!void {
+        const target = switch (try self.pop()) {
+            .process => |process| process,
+            else => {
+                try self.fault("Runtime Error: отмена() ожидает Процесс(T) первым аргументом", .{});
+                return;
+            },
+        };
+        target.cancel_requested = true;
+        try self.stack.append(self.allocator, .{ .void = {} });
+    }
+
+    // `отменено()` — polls the CURRENT process's own flag. A process that
+    // never calls this never observes cancellation at all.
+    fn isCancelled(self: *Vm) anyerror!void {
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: отменено() вызвано вне процесса", .{});
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .boolean = process.cancel_requested });
+    }
+
     fn createProcess(self: *Vm, function_id: bytecode.FunctionId, captures: []const value.Value, arguments: []const value.Value) !*value.Process {
         const owned_captures = try self.allocator.dupe(value.Value, captures);
         errdefer self.allocator.free(owned_captures);
@@ -4383,15 +4753,40 @@ pub const Vm = struct {
     const SliceOutcome = union(enum) {
         completed: value.Value,
         suspended,
+        // A CPU-bound process (busy loop with no blocking call inside)
+        // burned through its instruction budget without reaching
+        // completion, failure, or a blocking op — distinct from
+        // `.suspended`, which means "blocked on an empty mailbox/signal/
+        // async queue, re-check the SAME instruction next slice." Budget
+        // exhaustion has no such rollback: the loop below only checks the
+        // budget BETWEEN completed `step()` calls, never mid-dispatch, so
+        // `frame.ip` is already sitting exactly where execution should
+        // resume — no new persisted state is needed beyond what
+        // suspend/resume already maintains.
+        budget_exhausted,
         failed,
     };
+
+    // A process runs at most this many bytecode instructions per
+    // scheduling slice before voluntarily yielding back to the scheduler,
+    // even if it never calls получить()/получить_сигнал()/an async
+    // builtin. Without this, a CPU-bound `пока истина цикл ... конец` with
+    // no blocking call inside hangs the ENTIRE VM forever — round-robin in
+    // name only, since `runProcessSlice` used to run a process strictly
+    // until it blocked or finished. Value is a rough empirical balance:
+    // large enough that ordinary short-lived process bodies never hit it
+    // (avoiding needless round-trip overhead for the common case), small
+    // enough that a busy-looping process can't starve message-blocked
+    // siblings for more than a bounded number of scheduler rounds.
+    const process_instruction_budget: u32 = 100_000;
 
     // Runs ONE process for one scheduling slice: swaps its persisted
     // stack/frames into the shared vm.stack/vm.frames (cheap — an
     // ArrayList header, not a data copy), steps until it either finishes,
-    // crashes, or suspends (получить/получить_сигнал/Await_Async on an
-    // empty queue), then swaps its (possibly still-mid-frame) state back.
-    // Mirrors Odin's run_scheduler swap discipline (core/vm.odin).
+    // crashes, suspends (получить/получить_сигнал/Await_Async on an empty
+    // queue), or exhausts its instruction budget, then swaps its (possibly
+    // still-mid-frame) state back. Mirrors Odin's run_scheduler swap
+    // discipline (core/vm.odin), extended with the instruction budget.
     fn runProcessSlice(self: *Vm, process: *value.Process) anyerror!SliceOutcome {
         self.stack = process.stack;
         self.frames = process.frames;
@@ -4414,11 +4809,14 @@ pub const Vm = struct {
                 else => return err,
             };
         }
+        var instructions_run: u32 = 0;
         while (self.frames.items.len != 0) {
+            if (instructions_run >= process_instruction_budget) return .budget_exhausted;
             const outcome = self.step() catch |err| switch (err) {
                 error.RuntimeFault => return .failed,
                 else => return err,
             };
+            instructions_run += 1;
             switch (outcome) {
                 .none => {},
                 .suspended => return .suspended,
@@ -4442,15 +4840,24 @@ pub const Vm = struct {
             while (i < self.processes.items.len) : (i += 1) {
                 const process = self.processes.items[i];
                 if (process.status != .ready) continue;
-                if (process.has_run and process.mailbox.items.len == 0 and process.signals.items.len == 0 and process.async_results.items.len == 0) continue;
+                // A budget-exhausted OR task-wakeup-pending process is NOT
+                // blocked on anything — it must always be eligible for its
+                // next slice, or (respectively) a CPU-bound busy loop, or a
+                // process whose `ждать`-ed task just finished, would be
+                // wrongly treated as "no work to do" the moment its
+                // mailbox/signals/async_results happen to all be empty.
+                if (process.has_run and !process.budget_exhausted and !process.task_wakeup_pending and process.mailbox.items.len == 0 and process.signals.items.len == 0 and process.async_results.items.len == 0) continue;
 
                 any_ran = true;
                 process.has_run = true;
+                process.task_wakeup_pending = false;
                 const outcome = try self.runProcessSlice(process);
+                process.budget_exhausted = outcome == .budget_exhausted;
                 switch (outcome) {
-                    .suspended => {},
+                    .suspended, .budget_exhausted => {},
                     .completed => |result| {
                         process.status = .completed;
+                        completeTask(process, .{ .completed = result });
                         if (process == root) {
                             self.joinAsyncPool();
                             return .{ .success = result };
@@ -4691,6 +5098,11 @@ pub const Vm = struct {
         if (process.status != .ready) return;
         process.status = .failed;
         process.mailbox.clearRetainingCapacity();
+        const failure_message = switch (reason) {
+            .heap_string => |string| string,
+            else => try self.heap.formatString("{s}", .{reason.stringBytes() orelse "неизвестная ошибка"}),
+        };
+        completeTask(process, .{ .failed = failure_message });
         try self.notifyWatchers(process, reason);
         const reason_text = reason.stringBytes() orelse "неизвестная ошибка";
         const linked_reason = try self.heap.formatString("связанный процесс #{d} упал: {s}", .{ process.id, reason_text });
@@ -4701,6 +5113,18 @@ pub const Vm = struct {
     fn notifyWatchers(self: *Vm, process: *value.Process, reason: ?value.Value) !void {
         for (process.watchers.items) |watcher| try self.queueSignal(watcher, process.id, reason);
         process.watchers.clearRetainingCapacity();
+    }
+
+    // Delivers a process's terminal outcome and wakes anything blocked
+    // in `ждать(это)` — called exactly once per process, from whichever
+    // path actually ends it (normal completion in `runScheduler`, or
+    // `terminateProcess` for a crash/forceful `убить()`). Harmless no-op
+    // work for a `запусти`-spawned process that nothing ever
+    // calls `ждать` on (empty `task_waiters`, `result` simply unused).
+    fn completeTask(process: *value.Process, outcome: value.TaskResult) void {
+        process.result = outcome;
+        for (process.task_waiters.items) |waiter| waiter.task_wakeup_pending = true;
+        process.task_waiters.clearRetainingCapacity();
     }
 
     fn queueSignal(self: *Vm, watcher: *value.Process, process_id: u64, reason: ?value.Value) !void {
@@ -7678,5 +8102,261 @@ test "VM guards a native builtin when bytecode bypasses static checking" {
     switch (try machine.run(function_id, &.{})) {
         .success => return error.TestUnexpectedResult,
         .runtime_error => |message| try std.testing.expectEqualStrings("Runtime Panic: 'фс::есть' недоступно в этом runtime-таргете", message),
+    }
+}
+
+// Direct reproduction of the scheduler-fairness bug (Phase A of the
+// concurrency remediation plan): a CPU-bound process that never calls
+// получить()/получить_сигнал()/an async builtin must NOT be able to starve
+// a sibling process forever. `бесконечный` below is a genuinely
+// non-terminating loop — before the instruction-budget fix, spawning it
+// FIRST made `runProcessSlice` (and therefore this whole test) hang
+// forever the moment the scheduler gave it a turn (`while (true) { step() }`
+// with no exit condition it could ever reach). With the fix, the busy
+// process yields back to the scheduler every `process_instruction_budget`
+// instructions, so the sibling `ответчик` still gets scheduled, sends its
+// reply, and `проверка` (root) receives it — even though `бесконечный`
+// itself never completes and is simply abandoned when root returns.
+test "VM scheduler does not let a CPU-bound process starve a sibling forever" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\функ бесконечный() -> Пусто
+        \\    пока истина цикл
+        \\    конец
+        \\конец
+        \\функ ответчик(родитель: Процесс(Число)) -> Пусто
+        \\    отправить(родитель, 42)
+        \\конец
+        \\функ проверка() -> Число
+        \\    запусти бесконечный()
+        \\    запусти ответчик(себя())
+        \\    получить()
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Phase B (concurrency remediation plan): `отправить` restores the
+// Odin-era copy-on-send isolation guarantee (ROADMAP.md Стадия 24). The
+// sender mutates its own array AFTER spawning a child and sending it a
+// struct wrapping that array — the child must see the array as it was AT
+// SEND TIME, not reflect the sender's later mutation, proving the message
+// was NOT shared by reference.
+test "VM deep-copies a message on send, isolating it from the sender's later mutations" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Ящик = структура
+        \\    значения: Массив(Число)
+        \\конец
+        \\функ приёмник(родитель: Процесс(Число), ящик: Ящик) -> Пусто
+        \\    отправить(родитель, ящик.значения.получить(0, -1))
+        \\конец
+        \\экспорт функ старт() -> Число
+        \\    пер ящик = Ящик(массив())
+        \\    ящик.значения.добавить(1)
+        \\    запусти приёмник(себя(), ящик)
+        \\    ящик.значения.добавить(2)
+        \\    получить()
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(1), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 1), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// A `реализация Копируемое` override is invoked directly at send time
+// instead of the default reflective walk — proving the custom clone (which
+// deliberately replaces the label field) actually ran, not the structural
+// default (which would have preserved the original label unchanged).
+test "VM dispatches a custom Копируемое override on send instead of reflective copy" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Ящик = структура
+        \\    метка: Строка
+        \\    значения: Массив(Число)
+        \\конец
+        \\реализация Копируемое для Ящик
+        \\    функ клонировать(это: Ящик) -> Ящик
+        \\        Ящик("клон", это.значения)
+        \\    конец
+        \\конец
+        \\функ читатель(родитель: Процесс(Строка)) -> Пусто
+        \\    пер коробка: Ящик = получить()
+        \\    отправить(родитель, коробка.метка)
+        \\конец
+        \\экспорт функ старт() -> Строка
+        \\    пер приёмный_процесс: Процесс(Ящик) = запусти читатель(себя())
+        \\    пер ящик = Ящик("оригинал", массив())
+        \\    отправить(приёмный_процесс, ящик)
+        \\    получить()
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(2), &.{});
+    switch (outcome) {
+        .success => |runtime_value| try std.testing.expectEqualStrings("клон", runtime_value.stringBytes() orelse return error.TestUnexpectedResult),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Phase C (concurrency remediation plan, simplified per user feedback to
+// avoid a redundant Erlang-less keyword/type): `запусти <вызов>` spawns a
+// `Процесс(T)` where T is now correctly inferred from the spawned
+// function's own return type. `ждать` blocks on that same `Процесс(T)`
+// handle until it completes and returns `Результат.Успех(T)`.
+test "VM spawns a process and ждать returns its successful result" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\функ вычислить(x: Число) -> Число
+        \\    x * 2
+        \\конец
+        \\экспорт функ старт() -> Число
+        \\    пер p: Процесс(Число) = запусти вычислить(21)
+        \\    выбор ждать(p)
+        \\        Результат.Успех(значение) -> значение
+        \\        Результат.Неудача(_) -> -1
+        \\    конец
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(1), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// A spawned process that CRASHES (panics) must not take down the whole VM
+// — `ждать` on it returns `Результат.Неудача(Ошибка(...))`, exactly like
+// any other fallible native operation, not a propagated runtime fault.
+test "VM converts a crashed process into a failed Результат, not a VM-wide crash" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\функ падает() -> Число
+        \\    паника("сбой")
+        \\конец
+        \\экспорт функ старт() -> Булево
+        \\    пер p: Процесс(Число) = запусти падает()
+        \\    выбор ждать(p)
+        \\        Результат.Успех(_) -> ложь
+        \\        Результат.Неудача(_) -> истина
+        \\    конец
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(1), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .boolean => |flag| try std.testing.expect(flag),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
     }
 }

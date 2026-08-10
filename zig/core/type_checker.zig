@@ -500,6 +500,7 @@ const Checker = struct {
                 var remap = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
                 var local_parameters: std.ArrayList(GenericParameter) = .empty;
                 defer local_parameters.deinit(self.result.allocator);
+                var unsupported_contract = false;
                 for (target_parameters) |target_parameter| {
                     const local_typ = try self.result.types.genericParameter(self.next_generic_parameter);
                     self.next_generic_parameter += 1;
@@ -507,17 +508,34 @@ const Checker = struct {
                     var local_bounds: std.ArrayList(symbols.SymbolId) = .empty;
                     defer local_bounds.deinit(self.result.allocator);
                     for (target_parameter.bounds) |target_bound| {
+                        var remapped = false;
                         for (imports.nominals) |nominal| {
                             if (nominal.store != imported.store or nominal.source_symbol != target_bound) continue;
                             try local_bounds.append(self.result.allocator, nominal.local_symbol);
+                            remapped = true;
+                            break;
+                        }
+                        // A bound is part of the exported function's
+                        // contract. Dropping it turns `[T: Интерфейс]`
+                        // into `[T]` and lets an uncast value reach the
+                        // source module's interface dispatch at runtime.
+                        // Import only a complete contract.
+                        if (!remapped) {
+                            unsupported_contract = true;
                             break;
                         }
                     }
+                    if (unsupported_contract) break;
                     try local_parameters.append(self.result.allocator, .{
                         .name = target_parameter.name,
                         .typ = local_typ,
                         .bounds = try self.result.arena.allocator().dupe(symbols.SymbolId, local_bounds.items),
                     });
+                }
+                if (unsupported_contract) {
+                    remap.deinit();
+                    try self.result.unsupported_imports.put(imported.symbol, {});
+                    continue;
                 }
                 // Invariant this whole bridging step depends on: one
                 // fresh local TypeId per target parameter, no collisions,
@@ -624,7 +642,7 @@ const Checker = struct {
     }
 
     fn copyImportedType(self: *Checker, external_store: *const types.TypeStore, external_type: types.TypeId, nominals: []const ImportedNominal, generic_remap: ?*const std.AutoHashMap(types.TypeId, types.TypeId)) !types.TypeId {
-        const entry = external_store.get(external_type) orelse return error.UnsupportedImportedType;
+        const entry = try external_store.require(external_type);
         return switch (entry.*) {
             .primitive => |primitive| switch (primitive) {
                 .number => self.result.types.builtins.number,
@@ -817,6 +835,46 @@ const Checker = struct {
             .parameters = result_parameters,
             .variants = result_variants,
         });
+        select_source: {
+            const select_symbol = self.findTypeSymbol("ИсточникОжидания") orelse break :select_source;
+            const select_parameters = try self.defineGenericEnumParameters(&.{ "T", "R" });
+            const message_type = select_parameters[0].typ;
+            const result_type = select_parameters[1].typ;
+            const select_variants = try self.result.arena.allocator().alloc(EnumVariant, 3);
+            select_variants[0] = .{
+                .symbol = self.resolution.findEnumVariant(select_symbol, "Сообщение") orelse break :select_source,
+                .name = "Сообщение",
+                .fields = try self.result.arena.allocator().dupe(types.TypeId, &.{message_type}),
+            };
+            // `Сигнал` carries the SAME `(Число, Опция(Строка))` shape as
+            // `получить_сигнал()`'s own return value (see that builtin's
+            // handling above — the reason is a plain `Строка`, not an
+            // `Ошибка`), as a single tuple field — so a `Сигнал(с)` arm
+            // binds `с` the same way a direct `получить_сигнал()` call
+            // already would.
+            select_variants[1] = .{
+                .symbol = self.resolution.findEnumVariant(select_symbol, "Сигнал") orelse break :select_source,
+                .name = "Сигнал",
+                .fields = try self.result.arena.allocator().dupe(types.TypeId, &.{
+                    try self.result.types.tuple(&.{
+                        self.result.types.builtins.number,
+                        try self.result.types.nominal(option_symbol, &.{self.result.types.builtins.string}),
+                    }),
+                }),
+            };
+            select_variants[2] = .{
+                .symbol = self.resolution.findEnumVariant(select_symbol, "Готово") orelse break :select_source,
+                .name = "Готово",
+                .fields = try self.result.arena.allocator().dupe(types.TypeId, &.{
+                    try self.result.types.process(result_type),
+                    try self.result.types.nominal(result_symbol, &.{ result_type, self.result.types.builtins.error_value }),
+                }),
+            };
+            try self.result.enum_definitions.put(select_symbol, .{
+                .parameters = select_parameters,
+                .variants = select_variants,
+            });
+        }
         const comparable_methods = try self.result.arena.allocator().alloc(InterfaceMethod, 1);
         comparable_methods[0] = .{
             .name = "сравнить",
@@ -848,6 +906,31 @@ const Checker = struct {
             try self.result.interface_definitions.put(symbol, .{
                 .parameters = &.{},
                 .methods = printable_methods,
+            });
+        }
+        // `Копируемое` — restoring copy-on-send (see `resolver.zig`'s
+        // `installPreludeInterface("Копируемое")` comment for the full
+        // rationale). `клонировать() -> Копируемое` returns the
+        // implementing type itself ("Self") — a fresh, throwaway generic
+        // parameter here (never tied to any real declared type parameter
+        // list) lets `defineInterfaceImplementation`'s existing generic-
+        // substitution machinery unify it against whatever concrete
+        // return type each individual `реализация Копируемое для X`
+        // actually declares, exactly like an ordinary generic method
+        // parameter — no special-casing needed beyond minting the
+        // placeholder.
+        if (self.findTypeSymbol("Копируемое")) |symbol| {
+            const self_placeholder = try self.result.types.genericParameter(self.next_generic_parameter);
+            self.next_generic_parameter += 1;
+            const clone_methods = try self.result.arena.allocator().alloc(InterfaceMethod, 1);
+            clone_methods[0] = .{
+                .name = "клонировать",
+                .parameters = &.{},
+                .return_type = self_placeholder,
+            };
+            try self.result.interface_definitions.put(symbol, .{
+                .parameters = &.{},
+                .methods = clone_methods,
             });
         }
     }
@@ -1387,6 +1470,7 @@ const Checker = struct {
             .spawn => |spawn| try self.inferSpawn(spawn),
             .try_expr => |try_expression| try self.inferTry(try_expression),
             .match_expr => |match| try self.inferMatch(match),
+            .select_wait => |select| try self.inferSelectWait(select),
             else => try self.result.types.poison(),
         };
         return self.recordExpressionType(expression, inferred);
@@ -1449,6 +1533,38 @@ const Checker = struct {
         return self.result.types.poison();
     }
 
+    // `выбор ожидание(источник) ... конец` — `источник` must be
+    // `Массив(Процесс(R))`; R comes straight from that array's element
+    // type (ordinary array-literal unification already rejects
+    // heterogeneous `Процесс(T)` elements, same as any other array — not
+    // a new limitation introduced here). The message payload of a
+    // `Сообщение` arm stays poison/untyped, matching `получить()`'s own
+    // return type — the mailbox has no static element type today either.
+    fn inferSelectWait(self: *Checker, select: anytype) !types.TypeId {
+        const source_type = try self.infer(select.source);
+        const source_entry = self.result.types.get(source_type) orelse return self.result.types.poison();
+        const result_r = switch (source_entry.*) {
+            .array => |element_type| blk: {
+                const element_entry = self.result.types.get(element_type) orelse break :blk try self.result.types.poison();
+                break :blk switch (element_entry.*) {
+                    .process => |r| r,
+                    .poison => try self.result.types.poison(),
+                    else => blk2: {
+                        try self.report(select.span, "Type Error: 'ожидание' ожидает Массив(Процесс(R))", .{});
+                        break :blk2 try self.result.types.poison();
+                    },
+                };
+            },
+            .poison => return self.result.types.poison(),
+            else => blk: {
+                try self.report(select.span, "Type Error: 'ожидание' ожидает Массив(Процесс(R))", .{});
+                break :blk try self.result.types.poison();
+            },
+        };
+        const symbol = self.findTypeSymbol("ИсточникОжидания") orelse return self.result.types.poison();
+        return self.result.types.nominal(symbol, &.{ try self.result.types.poison(), result_r });
+    }
+
     fn inferSpawn(self: *Checker, spawn: anytype) !types.TypeId {
         const call = switch (self.tree.expr(spawn.call).*) {
             .call => |value| value,
@@ -1457,24 +1573,39 @@ const Checker = struct {
                 return self.result.types.process(try self.result.types.poison());
             },
         };
-        _ = try self.inferCall(spawn.call, call);
-        return self.result.types.process(try self.result.types.poison());
+        const call_return_type = try self.inferCall(spawn.call, call);
+        // An ordinary long-lived actor is written as a `-> Пусто` function
+        // driven by `получить()` in a loop — `Процесс(T)`'s T on THAT kind
+        // of spawn conventionally annotates the MESSAGE type the actor
+        // accepts, not its (void) return value, and that message type is
+        // not something this checker can infer (would need analyzing
+        // `получить()` call sites inside the callee — a separate, larger
+        // inference feature) — so it stays poison, unchecked, exactly as
+        // before, to avoid breaking every existing actor-style spawn.
+        // A function that actually RETURNS a value is being used
+        // task-style instead (one-shot computation, result read back via
+        // `ждать`) — for that case T becomes the real return type, so
+        // `ждать` can deliver it.
+        if (self.isType(call_return_type, self.result.types.builtins.void)) {
+            return self.result.types.process(try self.result.types.poison());
+        }
+        return self.result.types.process(call_return_type);
     }
 
     fn inferExpected(self: *Checker, expression: ast.ExprId, expected: types.TypeId) anyerror!types.TypeId {
         return switch (self.tree.expr(expression).*) {
             .lambda => |lambda| self.recordExpressionType(expression, try self.inferLambda(expression, lambda, expected)),
-            .number => |number| if (expected == self.result.types.builtins.integer) blk: {
+            .number => |number| if (expected.eql(self.result.types.builtins.integer)) blk: {
                 if (number.value != std.math.trunc(number.value)) {
                     try self.report(number.span, "Type Error: дробный литерал несовместим с Целое", .{});
                 }
                 break :blk self.recordExpressionType(expression, expected);
             } else self.infer(expression),
-            .unary => |unary| if (expected == self.result.types.builtins.integer and unary.operator == .minus) blk: {
+            .unary => |unary| if (expected.eql(self.result.types.builtins.integer) and unary.operator == .minus) blk: {
                 _ = try self.inferExpected(unary.operand, expected);
                 break :blk self.recordExpressionType(expression, expected);
             } else self.infer(expression),
-            .binary => |binary| if (expected == self.result.types.builtins.integer and (binary.operator == .plus or binary.operator == .minus or binary.operator == .star)) blk: {
+            .binary => |binary| if (expected.eql(self.result.types.builtins.integer) and (binary.operator == .plus or binary.operator == .minus or binary.operator == .star)) blk: {
                 const left = try self.inferExpected(binary.left, expected);
                 const right = try self.inferExpected(binary.right, expected);
                 if (!self.assignable(left, expected) or !self.assignable(right, expected)) {
@@ -1488,10 +1619,28 @@ const Checker = struct {
                 if (expected_type.* != .tuple or expected_type.tuple.len != tuple.elements.len) break :blk self.infer(expression);
                 for (tuple.elements, expected_type.tuple) |element, element_type| {
                     const actual = try self.inferExpected(element, element_type);
-                    if (!self.assignable(actual, element_type)) try self.report(tuple.span, "Type Error: элемент тупла не совпадает с ожидаемым типом", .{});
+                    if (self.assignable(actual, element_type)) {
+                        try self.registerInterfaceCast(element, actual, element_type);
+                    } else {
+                        try self.report(tuple.span, "Type Error: элемент тупла не совпадает с ожидаемым типом", .{});
+                    }
                 }
                 break :blk self.recordExpressionType(expression, expected);
             },
+            // `Массив(Интерфейс) = массив(КонкретныйТип(...), ...)` — real
+            // gap found designing `супервизор.ps`'s Phase E rewrite:
+            // unlike a `пер`/return/argument site (all of which call
+            // `registerInterfaceCast` on an assignable mismatch), a
+            // collection LITERAL's element only ever ran `assignable()`
+            // here — true (poison-tolerant `.process`-style structural
+            // check aside), but never recorded the cast the COMPILER
+            // needs to actually BOX the concrete struct value as an
+            // interface at runtime. Every element ended up stored
+            // unboxed, and any later interface-dispatched call through it
+            // (`массив[i].метод()`, even via an intermediate local)
+            // panicked "попытка вызвать интерфейсный метод у
+            // не-интерфейса" — 100% reproducible, not an edge case, for
+            // ANY interface-typed collection literal.
             .array => |array| blk: {
                 const expected_type = self.result.types.get(expected) orelse break :blk self.infer(expression);
                 const element_type = switch (expected_type.*) {
@@ -1500,7 +1649,11 @@ const Checker = struct {
                 };
                 for (array.elements) |element| {
                     const actual = try self.inferExpected(element, element_type);
-                    if (!self.assignable(actual, element_type)) try self.report(array.span, "Type Error: элемент массива не совпадает с ожидаемым типом", .{});
+                    if (self.assignable(actual, element_type)) {
+                        try self.registerInterfaceCast(element, actual, element_type);
+                    } else {
+                        try self.report(array.span, "Type Error: элемент массива не совпадает с ожидаемым типом", .{});
+                    }
                 }
                 break :blk self.recordExpressionType(expression, expected);
             },
@@ -1513,8 +1666,16 @@ const Checker = struct {
                 for (map.entries) |entry| {
                     const key = try self.inferExpected(entry.key, expected_map.key);
                     const value = try self.inferExpected(entry.value, expected_map.value);
-                    if (!self.assignable(key, expected_map.key)) try self.report(entry.span, "Type Error: ключ соответствия не совпадает с ожидаемым типом", .{});
-                    if (!self.assignable(value, expected_map.value)) try self.report(entry.span, "Type Error: значение соответствия не совпадает с ожидаемым типом", .{});
+                    if (self.assignable(key, expected_map.key)) {
+                        try self.registerInterfaceCast(entry.key, key, expected_map.key);
+                    } else {
+                        try self.report(entry.span, "Type Error: ключ соответствия не совпадает с ожидаемым типом", .{});
+                    }
+                    if (self.assignable(value, expected_map.value)) {
+                        try self.registerInterfaceCast(entry.value, value, expected_map.value);
+                    } else {
+                        try self.report(entry.span, "Type Error: значение соответствия не совпадает с ожидаемым типом", .{});
+                    }
                 }
                 break :blk self.recordExpressionType(expression, expected);
             },
@@ -1526,10 +1687,11 @@ const Checker = struct {
             .if_expr => |conditional| self.recordExpressionType(expression, try self.inferIfExpected(conditional, expected)),
             .match_expr => |match| self.recordExpressionType(expression, try self.inferMatchExpected(match, expected)),
             .spawn => |spawn| blk: {
-                _ = try self.inferSpawn(spawn);
-                const expected_entry = self.result.types.get(expected) orelse break :blk self.infer(expression);
-                if (expected_entry.* != .process) break :blk self.infer(expression);
-                break :blk self.recordExpressionType(expression, expected);
+                const actual = try self.inferSpawn(spawn);
+                if (!self.assignable(actual, expected)) {
+                    try self.report(spawn.span, "Type Error: тип 'запусти' не совпадает с ожидаемым Процесс(T)", .{});
+                }
+                break :blk self.recordExpressionType(expression, actual);
             },
             else => self.infer(expression),
         };
@@ -2268,7 +2430,7 @@ const Checker = struct {
 
     fn isComparableGeneric(self: *const Checker, type_id: types.TypeId) bool {
         for (self.current_generic_parameters) |parameter| {
-            if (parameter.typ != type_id) continue;
+            if (!parameter.typ.eql(type_id)) continue;
             for (parameter.bounds) |bound| {
                 if (self.isComparableInterface(bound)) return true;
             }
@@ -2277,7 +2439,7 @@ const Checker = struct {
     }
 
     fn isPoison(self: *const Checker, type_id: types.TypeId) bool {
-        const entry = self.result.types.get(type_id) orelse return true;
+        const entry = self.result.types.get(type_id) orelse return false;
         return entry.* == .poison;
     }
 
@@ -3102,12 +3264,59 @@ const Checker = struct {
                 for (call.arguments) |argument| _ = try self.infer(argument);
                 return self.result.types.builtins.void;
             }
+            if (self.isBuiltin(symbol, "ждать")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: ждать() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.poison();
+                }
+                const argument_type = try self.infer(call.arguments[0]);
+                const argument_entry = self.result.types.get(argument_type) orelse return self.result.types.poison();
+                const result_type = switch (argument_entry.*) {
+                    .process => |value_type| value_type,
+                    .poison => return self.result.types.poison(),
+                    else => blk: {
+                        try self.report(call.span, "Type Error: ждать() ожидает Процесс(T) первым аргументом", .{});
+                        break :blk try self.result.types.poison();
+                    },
+                };
+                return self.resultOfString(result_type) orelse self.result.types.poison();
+            }
             if (self.isBuiltin(symbol, "получить_сигнал")) {
                 if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить_сигнал() не принимает аргументы", .{});
                 for (call.arguments) |argument| _ = try self.infer(argument);
                 const option = self.findTypeSymbol("Опция") orelse return self.result.types.poison();
                 const reason = try self.result.types.nominal(option, &.{self.result.types.builtins.string});
                 return self.result.types.tuple(&.{ self.result.types.builtins.number, reason });
+            }
+            if (self.isBuiltin(symbol, "ограничить_почту")) {
+                if (call.arguments.len != 1) try self.report(call.span, "Type Error: ограничить_почту() ожидает 1 аргумент", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.result.types.builtins.void;
+            }
+            if (self.isBuiltin(symbol, "отправить_или")) {
+                if (call.arguments.len != 2) try self.report(call.span, "Type Error: отправить_или() ожидает 2 аргумент(а)", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.resultOfString(self.result.types.builtins.void) orelse self.result.types.poison();
+            }
+            if (self.isBuiltin(symbol, "отмена")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: отмена() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                const argument_type = try self.infer(call.arguments[0]);
+                const argument_entry = self.result.types.get(argument_type) orelse return self.result.types.builtins.void;
+                switch (argument_entry.*) {
+                    .process, .poison => {},
+                    else => try self.report(call.span, "Type Error: отмена() ожидает Процесс(T) первым аргументом", .{}),
+                }
+                return self.result.types.builtins.void;
+            }
+            if (self.isBuiltin(symbol, "отменено")) {
+                if (call.arguments.len != 0) try self.report(call.span, "Type Error: отменено() не принимает аргументы", .{});
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                return self.result.types.builtins.boolean;
             }
             if (self.isLengthBuiltin(symbol)) {
                 if (call.arguments.len != 1) {
@@ -3601,7 +3810,7 @@ const Checker = struct {
         const entry = self.result.types.get(parameter) orelse return null;
         if (entry.* != .generic_parameter) return null;
         for (generic_parameters) |candidate| {
-            if (candidate.typ != parameter) continue;
+            if (!candidate.typ.eql(parameter)) continue;
             for (candidate.bounds) |bound| {
                 // `Сравниваемое` is deliberately EXCLUDED here — it has
                 // its own, older, non-vtable dispatch mechanism for
@@ -3635,10 +3844,10 @@ const Checker = struct {
     }
 
     fn assignable(self: *const Checker, actual: types.TypeId, expected: types.TypeId) bool {
-        const actual_type = self.result.types.get(actual) orelse return true;
-        const expected_type = self.result.types.get(expected) orelse return true;
+        const actual_type = self.result.types.get(actual) orelse return false;
+        const expected_type = self.result.types.get(expected) orelse return false;
         if (actual_type.* == .poison or expected_type.* == .poison) return true;
-        if (actual == self.result.types.builtins.never) return true;
+        if (actual.eql(self.result.types.builtins.never)) return true;
         if (actual_type.* == .process and self.isPoison(actual_type.process)) return true;
         if (self.result.types.eql(actual, expected)) return true;
         // An EMPTY array/map literal (`массив()`/`соответствие()`) infers
@@ -3763,7 +3972,7 @@ const Checker = struct {
         const actual_entry = self.result.types.get(actual) orelse return false;
         if (actual_entry.* == .generic_parameter) {
             for (self.current_generic_parameters) |parameter| {
-                if (parameter.typ != actual) continue;
+                if (!parameter.typ.eql(actual)) continue;
                 for (parameter.bounds) |bound| if (bound == interface) return true;
             }
             return false;
@@ -3862,7 +4071,7 @@ const Checker = struct {
         if (object.* != .generic_parameter) return null;
         var bounds: []const symbols.SymbolId = &.{};
         for (self.current_generic_parameters) |parameter| {
-            if (parameter.typ != object_type) continue;
+            if (!parameter.typ.eql(object_type)) continue;
             bounds = parameter.bounds;
             break;
         }
@@ -4291,7 +4500,12 @@ const Checker = struct {
         }
         for (call.arguments[0..shared], variant.fields[0..shared]) |argument, field| {
             const expected = try self.substituteGeneric(field, &substitutions);
-            if (!self.assignable(try self.inferExpected(argument, expected), expected)) try self.report(call.span, "Type Error: аргумент конструктора варианта не совпадает с типом поля", .{});
+            const actual = try self.inferExpected(argument, expected);
+            if (self.assignable(actual, expected)) {
+                try self.registerInterfaceCast(argument, actual, expected);
+            } else {
+                try self.report(call.span, "Type Error: аргумент конструктора варианта не совпадает с типом поля", .{});
+            }
         }
         return self.nominalType(entry.owner_type, arguments.items);
     }
@@ -4318,7 +4532,12 @@ const Checker = struct {
         const shared = @min(call.arguments.len, variant.fields.len);
         for (call.arguments[0..shared], variant.fields[0..shared]) |argument, field| {
             const expected_field = try self.substituteGeneric(field, &substitutions);
-            if (!self.assignable(try self.inferExpected(argument, expected_field), expected_field)) try self.report(call.span, "Type Error: аргумент конструктора варианта не совпадает с типом поля", .{});
+            const actual = try self.inferExpected(argument, expected_field);
+            if (self.assignable(actual, expected_field)) {
+                try self.registerInterfaceCast(argument, actual, expected_field);
+            } else {
+                try self.report(call.span, "Type Error: аргумент конструктора варианта не совпадает с типом поля", .{});
+            }
         }
         return expected;
     }
@@ -4958,4 +5177,3 @@ test "type checker does not warn when an if has no else (false path falls throug
 
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
-

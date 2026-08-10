@@ -290,9 +290,33 @@ const Resolver = struct {
             "получить_сигнал",
             "убить",
             "связать",
+            // `ждать` — blocks until a process spawned via `запусти
+            // <вызов>` completes or fails, returning `Результат(R,
+            // Ошибка)` where R is the spawned function's return type.
+            // Sibling to `получить`, not a replacement.
+            "ждать",
             "встроку",
             "Целое",
             "Число",
+            // Bounded mailbox (Phase F, item 6): `ограничить_почту(N)`
+            // sets a capacity on the CURRENT process's own mailbox
+            // (called from within an actor's body, mirrors `себя()`'s
+            // "acts on current process" shape) — unbounded (no cap) stays
+            // the default. `отправить_или` is a SEPARATE, opt-in send
+            // that respects that cap and rejects with `Ошибка` instead of
+            // appending when full; plain `отправить` is deliberately left
+            // UNCHANGED (always succeeds) — bounded behavior only applies
+            // when BOTH sides opt in.
+            "ограничить_почту",
+            "отправить_или",
+            // Cooperative cancellation (Phase F, item 7): `отмена(proc)`
+            // sets a flag on the TARGET process, `отменено()` polls the
+            // CURRENT process's own flag — purely advisory, the target
+            // must observe it itself via `отменено()`; forceful
+            // `убить()`/`остановить()` (супервизор.ps) are unchanged and
+            // unrelated.
+            "отмена",
+            "отменено",
         };
         for (builtin_names) |name| {
             const symbol = try self.result.symbols.add(.{
@@ -375,6 +399,15 @@ const Resolver = struct {
         if (skip_prelude_hardcode) return;
         try self.installPreludeEnum("Опция", &.{ "Нет", "Есть" });
         try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });
+        // `выбор ожидание(...)` (select-style multi-source wait) matches
+        // against this synthetic enum's variants the exact same way any
+        // ordinary `выбор` matches `Опция`/`Результат` — same hardcoded
+        // bare-name registration those two need for the identical reason
+        // (panos never merges an imported module's names into scope, so
+        // the prelude's own real declaration in `prelude.zig` alone isn't
+        // enough to make `Сообщение`/`Сигнал`/`Готово` resolvable
+        // unqualified).
+        try self.installPreludeEnum("ИсточникОжидания", &.{ "Сообщение", "Сигнал", "Готово" });
         try self.installPreludeInterface("Сравниваемое");
         try self.installPreludeInterface("Итерируемое");
         // `Печатаемое` — real gap found auditing panosiki's `cli` package
@@ -393,12 +426,28 @@ const Resolver = struct {
         // `Сравниваемое`'s `сравнить(другое: Сравниваемое) -> Число`),
         // so it needs none of that interface's `Никогда`-placeholder
         // workaround — a plain, ordinary interface method signature.
-        // `Складываемое`/`Вычитаемое`/`Умножаемое`/`Делимое`/`Копируемое`/
-        // `Равнозначное` (also declared in the same dead prelude source)
-        // are NOT added here — their methods return the implementing
-        // type itself ("Self"), which this hardcoded-prelude mechanism
-        // has no substitution mechanism for; a separate, larger fix.
         try self.installPreludeInterface("Печатаемое");
+        // `Копируемое` — needed to restore reflective deep-copy-on-send
+        // (ROADMAP.md Стадия 24, "copy-on-send": reflective by default,
+        // `реализация Копируемое` as an opt-in override — silently
+        // dropped in the Zig migration, `отправить` currently does a bare
+        // shallow copy sharing heap payloads by pointer between
+        // processes). Earlier assumed (see the comment this replaces)
+        // that a Self-typed return (`клонировать() -> Копируемое`) needed
+        // "a substitution mechanism this hardcoded prelude has none of" —
+        // verified false by reading `defineInterfaceImplementation`
+        // directly: it already unifies an interface method's return type
+        // against the impl's ACTUAL return type via the same
+        // `inferGenericSubstitution`/`substituteGeneric` machinery used
+        // for ordinary generic parameters, as long as the interface's
+        // declared return type is some bare `.generic_parameter` — which
+        // is exactly what `type_checker.zig`'s `preludePass` mints for
+        // this entry (a throwaway placeholder, not tied to any real
+        // declared type parameter). `Складываемое`/`Вычитаемое`/
+        // `Умножаемое`/`Делимое`/`Равнозначное` are still not added here —
+        // no known real caller depends on any of them, unlike
+        // `Копируемое` — but the SAME technique would work for them too.
+        try self.installPreludeInterface("Копируемое");
     }
 
     fn installBuiltinModule(self: *Resolver, name: []const u8, exports: []const []const u8) !void {
@@ -883,6 +932,7 @@ const Resolver = struct {
                 for (call.arguments) |argument| try self.resolveExpression(tree, argument);
             },
             .spawn => |spawn| try self.resolveExpression(tree, spawn.call),
+            .select_wait => |select| try self.resolveExpression(tree, select.source),
             .property => |property| {
                 try self.resolveExpression(tree, property.object);
                 if (self.result.expr_symbols.get(property.object)) |object_symbol| {
@@ -1045,10 +1095,15 @@ fn isReservedBuiltin(name: []const u8) bool {
         "получить_сигнал",
         "убить",
         "связать",
+        "ждать",
         "встроку",
         "Целое",
         "Число",
         "Итерируемое",
+        "ограничить_почту",
+        "отправить_или",
+        "отмена",
+        "отменено",
     };
     for (names) |reserved| {
         if (std.mem.eql(u8, name, reserved)) return true;

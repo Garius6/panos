@@ -185,6 +185,21 @@ const Compiler = struct {
         }
     }
 
+    // Same pattern as `registerComparableMethods` — `отправить` needs to
+    // look up a custom `клонировать()` override by the message's runtime
+    // struct name (see `vm.zig`'s `send`), restoring copy-on-send
+    // (ROADMAP.md Стадия 24).
+    fn registerCopyableMethods(self: *Compiler) !void {
+        for (self.checked.interface_implementations.items) |implementation| {
+            const interface = self.resolution.symbols.get(implementation.interface) orelse continue;
+            if (!std.mem.eql(u8, interface.name, "Копируемое")) continue;
+            const target = self.resolution.symbols.get(implementation.target) orelse continue;
+            const method_symbol = implementation.methods[0];
+            const method = self.result.function_ids.get(method_symbol) orelse continue;
+            try self.program().addCopyableMethod(target.name, method);
+        }
+    }
+
     fn compileLambdas(self: *Compiler) !void {
         for (self.tree.expressions.items, 0..) |expression, index| {
             const lambda = switch (expression) {
@@ -430,6 +445,10 @@ const FunctionCompiler = struct {
             .spawn => |spawn| try self.compileSpawn(spawn),
             .try_expr => |try_expression| try self.compileTry(try_expression),
             .match_expr => |match| try self.compileMatch(match),
+            .select_wait => |select| {
+                try self.compileExpression(select.source);
+                try self.function.emit(self.compiler.result.allocator, .{ .select_wait = {} });
+            },
             else => try self.unsupportedExpression(expressionSpan(self.compiler.tree, expression)),
         }
         try self.emitInterfaceCast(expression);
@@ -1092,6 +1111,30 @@ const FunctionCompiler = struct {
         }
         if (std.mem.eql(u8, name, "получить_сигнал") and call.arguments.len == 0) {
             try self.function.emit(self.compiler.result.allocator, .{ .get_signal = {} });
+            return true;
+        }
+        if (std.mem.eql(u8, name, "ждать") and call.arguments.len == 1) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .await_task = {} });
+            return true;
+        }
+        if (std.mem.eql(u8, name, "ограничить_почту") and call.arguments.len == 1) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .set_mailbox_capacity = {} });
+            return true;
+        }
+        if (std.mem.eql(u8, name, "отправить_или") and call.arguments.len == 2) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .send_or = {} });
+            return true;
+        }
+        if (std.mem.eql(u8, name, "отмена") and call.arguments.len == 1) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .request_cancel = {} });
+            return true;
+        }
+        if (std.mem.eql(u8, name, "отменено") and call.arguments.len == 0) {
+            try self.function.emit(self.compiler.result.allocator, .{ .is_cancelled = {} });
             return true;
         }
         return false;
@@ -1838,6 +1881,26 @@ const FunctionCompiler = struct {
     fn patternFieldIndex(self: *FunctionCompiler, pattern: ast.PatternId, constructor: anytype, argument_index: usize) !?u16 {
         const pattern_type = self.compiler.checked.pattern_types.get(pattern) orelse return null;
         const entry = self.compiler.checked.types.get(pattern_type) orelse return null;
+        if (entry.* == .poison) {
+            // `получить()`/`Сообщение(T)`-style untyped payloads: there's
+            // no real nominal type here to look up field order from, but
+            // the type checker's own poison fallback (`inferMatchPattern`)
+            // still resolved a real variant symbol via `pattern_variants`
+            // — enum-variant fields are purely positional (see the real
+            // `.nominal` enum branch below, which never consults field
+            // NAMES either), so the same positional index is correct here
+            // too. Constructor patterns with payload args matched against
+            // `получить()` (e.g. `выбор получить() \n Тип.Вариант(x) ->
+            // ...`) failed to compile at all before this — every existing
+            // fixture happened to only exercise EITHER a payload-less
+            // qualified variant against `получить()` OR a real nominal
+            // subject, never both at once.
+            if (self.compiler.checked.pattern_variants.contains(pattern)) {
+                if (argument_index > std.math.maxInt(u16)) return error.FieldLimitReached;
+                return @intCast(argument_index);
+            }
+            return null;
+        }
         const nominal = switch (entry.*) {
             .nominal => |value| value,
             else => return null,
@@ -2118,6 +2181,7 @@ pub fn compileWithOptions(
     try compiler.predeclareFunctions();
     try compiler.predeclareLambdas();
     try compiler.registerComparableMethods();
+    try compiler.registerCopyableMethods();
     try compiler.compileFunctions();
     try compiler.compileLambdas();
     return result;

@@ -193,6 +193,48 @@ pub const Process = struct {
     // mailbox/signals so a background I/O result can never be mistaken for
     // an ordinary message or a monitor signal that arrived while waiting.
     async_results: std.ArrayList(Value) = .empty,
+    // Set when the LAST scheduling slice ended because this process burned
+    // through its instruction budget without blocking or completing (a
+    // CPU-bound busy loop with no получить()/получить_сигнал()/async call
+    // inside) — see `Vm.runProcessSlice`. The scheduler's runnability check
+    // must treat this the same as "has a pending message": a
+    // budget-exhausted process is NOT actually blocked on anything and
+    // must always be eligible for its next slice, regardless of whether
+    // mailbox/signals/async_results are empty (unlike a genuinely
+    // MESSAGE-blocked process, for which "nothing pending" really does
+    // mean "no work to do yet").
+    budget_exhausted: bool = false,
+    // `ждать(процесс)` support — `result` is populated exactly
+    // once, whenever this process transitions out of `.ready` (completed
+    // OR failed), regardless of whether anything is actually waiting on
+    // it — cheap to always record (one optional field), and means `ждать`
+    // never races the completion: if it's already there when `ждать`
+    // checks, no suspend/wakeup dance is needed at all.
+    result: ?TaskResult = null,
+    // Processes currently blocked in `ждать(это)` — separate from
+    // `.watchers` (which feeds `получить_сигнал()`, a user-observable
+    // channel) so an internal task-completion wakeup can never be
+    // mistaken for a real monitor signal by code that happens to also
+    // call `получить_сигнал()`.
+    task_waiters: std.ArrayList(*Process) = .empty,
+    // Mirrors `budget_exhausted`'s role in the scheduler's runnability
+    // gate: set on a WAITING process (not on the completed task) when
+    // something it's `ждать`-ing on just finished — this process is not
+    // actually blocked on its own mailbox/signals/async_results, so it
+    // must stay eligible for its next slice regardless of those being
+    // empty.
+    task_wakeup_pending: bool = false,
+    // Bounded mailbox (Phase F, item 6) — `null` (default) means
+    // unbounded, matching every process's behavior before this feature.
+    // Set only via `ограничить_почту(N)`, called by the process on
+    // itself; only `отправить_или` (not plain `отправить`) consults it.
+    mailbox_capacity: ?u32 = null,
+    // Cooperative cancellation (Phase F, item 7) — purely advisory, set
+    // by `отмена(proc)` on the TARGET, read by `отменено()` on the
+    // CURRENT process. No VM code besides these two builtins ever
+    // touches this; a process that never calls `отменено()` behaves as
+    // if cancellation doesn't exist.
+    cancel_requested: bool = false,
 
     pub fn deinit(self: *Process, allocator: std.mem.Allocator) void {
         self.links.deinit(allocator);
@@ -200,6 +242,7 @@ pub const Process = struct {
         self.signals.deinit(allocator);
         self.mailbox.deinit(allocator);
         self.async_results.deinit(allocator);
+        self.task_waiters.deinit(allocator);
         for (self.frames.items) |frame| allocator.free(frame.locals);
         self.frames.deinit(allocator);
         self.stack.deinit(allocator);
@@ -207,6 +250,13 @@ pub const Process = struct {
         allocator.free(self.arguments);
         self.* = undefined;
     }
+};
+
+// The outcome of a `запусти`-spawned process, delivered by `ждать` as
+// `Результат.Успех(значение)`/`Результат.Неудача(Ошибка(...))`.
+pub const TaskResult = union(enum) {
+    completed: Value,
+    failed: *HeapString,
 };
 
 pub const Value = union(enum) {

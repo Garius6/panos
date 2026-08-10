@@ -180,6 +180,16 @@ pub const Expr = union(enum) {
         span: source.Span,
         call: ExprId,
     },
+    // `выбор ожидание(источник) ... конец` — the "subject" slot of an
+    // ordinary `match_expr`, produced only by that special-cased parse
+    // path. `source` (`Массив(Процесс(R))`) is the extra set of processes
+    // to watch for completion alongside the process's own mailbox/signal
+    // queues. Evaluating this expression IS the suspend point — see
+    // `Vm.selectWait`.
+    select_wait: struct {
+        span: source.Span,
+        source: ExprId,
+    },
     property: struct {
         span: source.Span,
         object: ExprId,
@@ -241,6 +251,7 @@ pub fn exprSpan(expression: Expr) source.Span {
         .binary => |value| value.span,
         .call => |value| value.span,
         .spawn => |value| value.span,
+        .select_wait => |value| value.span,
         .property => |value| value.span,
         .if_expr => |value| value.span,
         .while_expr => |value| value.span,

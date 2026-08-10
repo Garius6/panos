@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("ast.zig");
 const bytecode = @import("bytecode.zig");
 const compiler = @import("compiler.zig");
@@ -793,6 +794,12 @@ test "runner round-trips an environment variable through установить_о
 }
 
 test "runner captures exit code and stdout through ос.выполнить" {
+    // `/bin/echo` doesn't exist on Windows at all (no POSIX filesystem
+    // layout, and there's no single universal standalone echo.exe path —
+    // `echo` there is a `cmd.exe` builtin, not a real executable file) —
+    // this was never a real cross-platform test, just never compile-
+    // tested on Windows until `внешний`/FFI itself started working there.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var result = try runSource(std.testing.allocator, "пример.ps",
         \\экспорт функ старт() -> Строка
         \\выбор ос.выполнить("/bin/echo", массив("привет"), ".")

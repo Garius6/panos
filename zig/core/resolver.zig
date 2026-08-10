@@ -897,6 +897,14 @@ const Resolver = struct {
     } else struct {};
 
     fn foreignLibraryFilename(allocator: std.mem.Allocator, logical_name: []const u8) ![]const u8 {
+        // Windows has no file called "libc.dll" — the C runtime there is
+        // `msvcrt.dll` (present on every Windows version since NT4, the
+        // same universal-CRT-analog role `dlopen(NULL)` fills on POSIX
+        // above). Only "libc" gets this special case; any other library
+        // name still goes through the generic `<name>.dll` suffix rule.
+        if (comptime builtin.target.os.tag == .windows) {
+            if (std.mem.eql(u8, logical_name, "libc")) return allocator.dupe(u8, "msvcrt.dll");
+        }
         const suffix = switch (builtin.target.os.tag) {
             .macos, .ios, .tvos, .watchos => ".dylib",
             .windows => ".dll",

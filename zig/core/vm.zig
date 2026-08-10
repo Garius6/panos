@@ -47,6 +47,42 @@ const OwnedForeignStructType = struct {
     field_count: usize,
 };
 
+const ForeignCallMetric = struct {
+    calls: u64 = 0,
+    total_ns: u64 = 0,
+    native_call_ns: u64 = 0,
+    cache_misses: u64 = 0,
+};
+
+// Zig 0.16 routes clocks through std.Io, but keeping an Io.Threaded object
+// in every VM would install process-wide signal handlers just for an
+// optional profiler. Use direct monotonic platform clocks instead.
+fn foreignProfileNowNanoseconds() u64 {
+    if (comptime builtin.target.os.tag == .freestanding) {
+        return 0;
+    } else if (comptime builtin.target.os.tag == .windows) {
+        const windows = std.os.windows;
+        var frequency_raw: windows.LARGE_INTEGER = undefined;
+        if (!windows.ntdll.RtlQueryPerformanceFrequency(&frequency_raw).toBool()) return 0;
+        const frequency: u64 = @intCast(frequency_raw);
+        if (frequency == 0) return 0;
+        var counter_raw: windows.LARGE_INTEGER = undefined;
+        if (!windows.ntdll.RtlQueryPerformanceCounter(&counter_raw).toBool()) return 0;
+        const counter: u64 = @intCast(counter_raw);
+        return @intCast((@as(u128, counter) * std.time.ns_per_s) / frequency);
+    } else {
+        const clock_id: std.posix.clockid_t = switch (builtin.target.os.tag) {
+            .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => std.posix.CLOCK.UPTIME_RAW,
+            else => std.posix.CLOCK.MONOTONIC,
+        };
+        var timestamp: std.posix.timespec = undefined;
+        if (std.posix.errno(std.posix.system.clock_gettime(clock_id, &timestamp)) != .SUCCESS) return 0;
+        const seconds: u64 = @intCast(timestamp.sec);
+        const nanoseconds: u64 = @intCast(timestamp.nsec);
+        return seconds * std.time.ns_per_s + nanoseconds;
+    }
+}
+
 const PreparedForeignCall = struct {
     cif: ffi.FfiCif = undefined,
     arg_types: ?[]?*ffi.FfiType = null,
@@ -2060,6 +2096,14 @@ pub const Vm = struct {
         // `std.Io.Dir`/`std.Io.Threaded` calls the `фс.*` builtins use.
         if (comptime builtin.target.os.tag == .freestanding) {
             try self.fault("Runtime Panic: 'ос::окружение' недоступно в этом runtime-таргете", .{});
+        } else if (comptime builtin.target.os.tag == .windows) {
+            if (try windows_env.getenv(self.allocator, name)) |raw_value| {
+                defer self.allocator.free(raw_value);
+                const heap_string = try self.heap.createString(try self.allocator.dupe(u8, raw_value));
+                try self.pushOption(.{ .heap_string = heap_string });
+            } else {
+                try self.pushOption(null);
+            }
         } else {
             const name_z = try self.allocator.dupeZ(u8, name);
             defer self.allocator.free(name_z);

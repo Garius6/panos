@@ -232,6 +232,17 @@ const Resolver = struct {
     tree: *const ast.Ast = undefined,
     module_members: std.ArrayList(ModuleMembers) = .empty,
     target_profile: target_policy.TargetProfile = .native,
+    // The `.pns`/`.ps` file this module was loaded from (e.g.
+    // "проект/main.ps") — empty for every inline/test caller of `resolve`
+    // (no real file on disk to be relative to). Only consumed by
+    // `resolveForeignFunction` to make an explicit relative `внешний`
+    // library path (`"./libs/foo.so"`) resolve against THIS file's own
+    // directory, not the process's current working directory — matching
+    // `импорт`'s existing relative-path convention
+    // (`module_loader.resolveImportPath`), so a library shipped alongside
+    // a `.pns` file keeps working regardless of where `panos` is invoked
+    // from.
+    source_path: []const u8 = "",
     // Ported from `core/resolver.odin`'s `used_symbols`/
     // `unused_check_symbols` (`Symbol_Id -> bool` maps there, sets here) —
     // see `popScopeAndWarnUnused` for the actual warning.
@@ -856,7 +867,7 @@ const Resolver = struct {
             // "kernel32"` declarations below are the direct Win32 API,
             // same shape `std.DynLib` used internally in Zig versions
             // where it DID support Windows.
-            const filename = try foreignLibraryFilename(self.result.arena.allocator(), foreign.library);
+            const filename = try self.foreignLibraryFilename(self.result.arena.allocator(), foreign.library);
             const filename_w = std.unicode.utf8ToUtf16LeAllocZ(self.result.arena.allocator(), filename) catch {
                 try self.report(foreign.span, "Resolve Error: имя библиотеки '{s}' не в UTF-8", .{filename});
                 return;
@@ -872,7 +883,7 @@ const Resolver = struct {
             };
             try self.result.foreign_functions.put(symbol, @intFromPtr(fn_ptr));
         } else {
-            const filename = try foreignLibraryFilename(self.result.arena.allocator(), foreign.library);
+            const filename = try self.foreignLibraryFilename(self.result.arena.allocator(), foreign.library);
             const filename_z = try self.result.arena.allocator().dupeZ(u8, filename);
             var library = std.DynLib.openZ(filename_z) catch {
                 try self.report(foreign.span, "Resolve Error: библиотека '{s}' не найдена ({s})", .{ foreign.library, filename });
@@ -896,20 +907,52 @@ const Resolver = struct {
         extern "kernel32" fn GetProcAddress(hModule: *anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
     } else struct {};
 
-    fn foreignLibraryFilename(allocator: std.mem.Allocator, logical_name: []const u8) ![]const u8 {
-        // Windows has no file called "libc.dll" — the C runtime there is
-        // `msvcrt.dll` (present on every Windows version since NT4, the
-        // same universal-CRT-analog role `dlopen(NULL)` fills on POSIX
-        // above). Only "libc" gets this special case; any other library
-        // name still goes through the generic `<name>.dll` suffix rule.
-        if (comptime builtin.target.os.tag == .windows) {
-            if (std.mem.eql(u8, logical_name, "libc")) return allocator.dupe(u8, "msvcrt.dll");
-        }
+    fn foreignLibraryFilename(self: *Resolver, allocator: std.mem.Allocator, logical_name: []const u8) ![]const u8 {
         const suffix = switch (builtin.target.os.tag) {
             .macos, .ios, .tvos, .watchos => ".dylib",
             .windows => ".dll",
             else => ".so",
         };
+        // A path-like library reference (contains '/') is an explicit
+        // file path, not a bare logical name resolved via the OS
+        // loader's own search path (LD_LIBRARY_PATH/DYLD_.../PATH) — a
+        // bare logical name (`"libc"`, `"raylib"`) never contains '/'.
+        // Resolved the same way `импорт` resolves a relative module path
+        // (`module_loader.resolveImportPath`): against the DIRECTORY of
+        // THIS `.pns`/`.ps` file (`self.source_path`), not the process's
+        // current working directory — a library shipped next to a
+        // script keeps working regardless of where `panos` is invoked
+        // from. An already-absolute path, or an inline/test caller with
+        // no real `self.source_path` (empty — nothing to be relative
+        // to), is used exactly as given, which then resolves against the
+        // process's own CWD via the OS loader — the same fallback
+        // `импорт` itself uses (`importer_path.len == 0`).
+        if (std.mem.indexOfScalar(u8, logical_name, '/') != null) {
+            const suffixed = if (std.mem.endsWith(u8, logical_name, suffix))
+                logical_name
+            else
+                try std.fmt.allocPrint(allocator, "{s}{s}", .{ logical_name, suffix });
+            defer if (suffixed.ptr != logical_name.ptr) allocator.free(suffixed);
+
+            if (suffixed[0] == '/' or self.source_path.len == 0) return allocator.dupe(u8, suffixed);
+            const directory = std.fs.path.dirname(self.source_path) orelse "";
+            if (directory.len == 0) return allocator.dupe(u8, suffixed);
+            // Strips a leading "./" (but not "../", which is meaningful)
+            // before joining — purely cosmetic, "dir/./libs/x.so" would
+            // still resolve fine, this just keeps reported paths and
+            // `Resolve Error` messages readable.
+            const relative = if (std.mem.startsWith(u8, suffixed, "./")) suffixed[2..] else suffixed;
+            return std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, relative });
+        }
+        // Windows has no file called "libc.dll" — the C runtime there is
+        // `msvcrt.dll` (present on every Windows version since NT4, the
+        // same universal-CRT-analog role `dlopen(NULL)` fills on POSIX
+        // above). Only "libc" gets this special case; any other bare
+        // library name still goes through the generic `<name>.dll`
+        // suffix rule.
+        if (comptime builtin.target.os.tag == .windows) {
+            if (std.mem.eql(u8, logical_name, "libc")) return allocator.dupe(u8, "msvcrt.dll");
+        }
         if (std.mem.endsWith(u8, logical_name, suffix)) return allocator.dupe(u8, logical_name);
         return std.fmt.allocPrint(allocator, "{s}{s}", .{ logical_name, suffix });
     }
@@ -1200,16 +1243,17 @@ pub fn resolveWithImports(allocator: std.mem.Allocator, tree: *const ast.Ast, im
 }
 
 pub fn resolveModule(allocator: std.mem.Allocator, tree: *const ast.Ast, imports: []const ImportedModule, skip_prelude_hardcode: bool) !Resolution {
-    return resolveModuleForTarget(allocator, tree, imports, skip_prelude_hardcode, .native);
+    return resolveModuleForTarget(allocator, tree, imports, skip_prelude_hardcode, .native, "");
 }
 
-pub fn resolveModuleForTarget(allocator: std.mem.Allocator, tree: *const ast.Ast, imports: []const ImportedModule, skip_prelude_hardcode: bool, target_profile: target_policy.TargetProfile) !Resolution {
+pub fn resolveModuleForTarget(allocator: std.mem.Allocator, tree: *const ast.Ast, imports: []const ImportedModule, skip_prelude_hardcode: bool, target_profile: target_policy.TargetProfile, source_path: []const u8) !Resolution {
     var result = try Resolution.init(allocator);
     errdefer result.deinit();
     var resolver = try Resolver.init(&result);
     defer resolver.deinit();
     resolver.tree = tree;
     resolver.target_profile = target_profile;
+    resolver.source_path = source_path;
 
     try resolver.installBuiltins(skip_prelude_hardcode);
     try resolver.predeclareImports(imports);

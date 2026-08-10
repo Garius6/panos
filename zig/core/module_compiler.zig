@@ -512,7 +512,7 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
         // instead, and every OTHER module receives them via the implicit
         // unqualified import above, so the hand-installed duplicates would
         // collide with either path, not just the prelude module's own.
-        result.modules[module_index].resolution = try resolver.resolveModuleForTarget(allocator, &module.tree, scope.modules, prelude_module != null, target_profile);
+        result.modules[module_index].resolution = try resolver.resolveModuleForTarget(allocator, &module.tree, scope.modules, prelude_module != null, target_profile, module.file.path);
         const resolution = &result.modules[module_index].resolution.?;
         try result.appendDiagnostics(&resolution.diagnostics);
         if (result.hasErrors()) return result;

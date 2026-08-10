@@ -1273,6 +1273,19 @@ test "runner reports a Resolve Error for a missing внешний library or sym
     try std.testing.expect(std.mem.indexOf(u8, missing_symbol.diagnostics.items.items[0].message, "не экспортирует") != null);
 }
 
+test "runner resolves a relative внешний library path against the script's own directory, not cwd" {
+    // No real shared library needs to exist on disk for this — a
+    // missing-library error still reports the path the resolver
+    // actually TRIED, which is enough to confirm it joined against
+    // "проект" (the script's directory) rather than leaving
+    // "./libs/zzz_missing" untouched (which would mean cwd-relative
+    // resolution, not script-relative).
+    var result = try runSource(std.testing.allocator, "проект/main.ps", "внешний \"./libs/zzz_missing_lib\" функ f() -> Целое(32)\nэкспорт функ старт() -> Целое\n0\nконец");
+    defer result.deinit();
+    try std.testing.expect(result.hasErrors());
+    try std.testing.expect(std.mem.indexOf(u8, result.diagnostics.items.items[0].message, "проект/libs/zzz_missing_lib") != null);
+}
+
 test "browser target rejects внешний before compilation" {
     var result = try checkSourceForTarget(std.testing.allocator, "плейграунд.ps", "внешний \"libc\" функ getpid() -> Целое(32)\nэкспорт функ старт() -> Целое\ngetpid()\nконец", .browser_interpreter);
     defer result.deinit();

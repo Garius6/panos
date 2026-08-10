@@ -838,6 +838,39 @@ const Resolver = struct {
                 return;
             };
             try self.result.foreign_functions.put(symbol, @intFromPtr(fn_ptr));
+        } else if (comptime builtin.target.os.tag == .windows) {
+            // Real, previously-latent gap found via CI (not this
+            // session's own commits — masked until now by an UNRELATED
+            // broken `wasmtime` install step that failed before the
+            // build ever got this far): `std.DynLib` in this Zig
+            // version has NO Windows implementation at all
+            // (`dynamic_library.zig`'s inner-type switch only lists
+            // linux/macos/bsd-family, everything else — including
+            // Windows — hits `@compileError("unsupported platform")`).
+            // `внешний` has never actually worked on Windows through
+            // this codebase; it just never got compile-tested there
+            // until the wasmtime-install fix let CI reach this file.
+            //
+            // `std` also doesn't expose `LoadLibraryW`/`GetProcAddress`
+            // bindings anywhere in this version — hand-rolled `extern
+            // "kernel32"` declarations below are the direct Win32 API,
+            // same shape `std.DynLib` used internally in Zig versions
+            // where it DID support Windows.
+            const filename = try foreignLibraryFilename(self.result.arena.allocator(), foreign.library);
+            const filename_w = std.unicode.utf8ToUtf16LeAllocZ(self.result.arena.allocator(), filename) catch {
+                try self.report(foreign.span, "Resolve Error: имя библиотеки '{s}' не в UTF-8", .{filename});
+                return;
+            };
+            const handle = WindowsDynLib.LoadLibraryW(filename_w.ptr) orelse {
+                try self.report(foreign.span, "Resolve Error: библиотека '{s}' не найдена ({s})", .{ foreign.library, filename });
+                return;
+            };
+            const name_z = try self.result.arena.allocator().dupeZ(u8, foreign.name);
+            const fn_ptr = WindowsDynLib.GetProcAddress(handle, name_z) orelse {
+                try self.report(foreign.span, "Resolve Error: библиотека '{s}' не экспортирует символ '{s}'", .{ foreign.library, foreign.name });
+                return;
+            };
+            try self.result.foreign_functions.put(symbol, @intFromPtr(fn_ptr));
         } else {
             const filename = try foreignLibraryFilename(self.result.arena.allocator(), foreign.library);
             const filename_z = try self.result.arena.allocator().dupeZ(u8, filename);
@@ -853,6 +886,15 @@ const Resolver = struct {
             try self.result.foreign_functions.put(symbol, @intFromPtr(fn_ptr));
         }
     }
+
+    // Minimal direct Win32 bindings — `std.DynLib` doesn't cover Windows
+    // in this Zig version (see `resolveForeignFunction`'s Windows
+    // branch). `callconv(.winapi)` matches every other raw Win32 extern
+    // already used where this project talks to Windows directly.
+    const WindowsDynLib = if (builtin.target.os.tag == .windows) struct {
+        extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn GetProcAddress(hModule: *anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    } else struct {};
 
     fn foreignLibraryFilename(allocator: std.mem.Allocator, logical_name: []const u8) ![]const u8 {
         const suffix = switch (builtin.target.os.tag) {

@@ -124,6 +124,7 @@ pub fn lowerModule(
         module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
         try symbol_to_function.put(symbol, function_id);
     }
+    try reserveMethods(&module, allocator, tree, resolution, checked, program, &symbol_to_function);
 
     for (program.declarations) |decl_id| {
         const function = switch (tree.decl(decl_id).*) {
@@ -135,8 +136,85 @@ pub fn lowerModule(
         const function_id = symbol_to_function.get(symbol) orelse continue;
         try lowerFunctionBody(allocator, tree, resolution, checked, &module, function_id, decl_id, function.body, &symbol_to_function);
     }
+    try lowerMethods(&module, allocator, tree, resolution, checked, program, &symbol_to_function);
 
     return module;
+}
+
+// `реализация Тип ... конец` methods — compiled by the NATIVE bytecode
+// backend (`compiler.zig`) as nothing more than an extra pass over
+// `implementation.methods` calling the same `predeclareFunction`/
+// `compileFunction` used for top-level `.function` decls (`это` is
+// just `parameters[0]`, no special binding) — `mir_lowering.zig` had
+// ZERO handling for `.impl` at all before this (confirmed: reservation
+// switched only `.function`, `.impl` fell into `else => continue`),
+// which made ANY struct method (e.g. `std/математика.pns`'s
+// `Генератор.следующее()`) an AOT-unsupported compile error (a process
+// panic before an earlier fix this session). Mirrors the native path
+// exactly: `lowerFunctionBody` is already fully generic over
+// `decl_id`/`body`, a method needs nothing method-specific there.
+//
+// The one real difference from a plain function: the name a method's
+// `FunctionId` is reserved under is MANGLED (`"{Тип}::{метод}"`, same
+// convention the native VM already uses for its own method registry —
+// see the "interface vtables" fix) rather than the bare method name,
+// because `wasm_emit.zig`'s export section writes EVERY function's
+// name unconditionally with no dedup — two different structs both
+// defining a same-named method (e.g. `.длина()`-shaped collisions)
+// would otherwise produce duplicate WASM export entries.
+fn mangledMethodName(module: *mir.Module, target_type: []const u8, method_name: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(module.arena.allocator(), "{s}::{s}", .{ target_type, method_name });
+}
+
+fn reserveMethods(
+    module: *mir.Module,
+    allocator: std.mem.Allocator,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    checked: *const type_checker.CheckResult,
+    program: anytype,
+    symbol_to_function: *std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
+) !void {
+    for (program.declarations) |decl_id| {
+        const implementation = switch (tree.decl(decl_id).*) {
+            .impl => |value| value,
+            else => continue,
+        };
+        for (implementation.methods) |method_decl_id| {
+            const function = tree.decl(method_decl_id).function;
+            if (function.type_parameters.len > 0) continue; // generics — Phase 2
+            const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
+            const result_type = functionReturnType(checked, symbol);
+            const name = try mangledMethodName(module, implementation.target_type, function.name);
+            const function_id = try mir_builder.newFunction(module, allocator, name, symbol, result_type, function.span);
+            module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
+            try symbol_to_function.put(symbol, function_id);
+        }
+    }
+}
+
+fn lowerMethods(
+    module: *mir.Module,
+    allocator: std.mem.Allocator,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    checked: *const type_checker.CheckResult,
+    program: anytype,
+    symbol_to_function: *const std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
+) !void {
+    for (program.declarations) |decl_id| {
+        const implementation = switch (tree.decl(decl_id).*) {
+            .impl => |value| value,
+            else => continue,
+        };
+        for (implementation.methods) |method_decl_id| {
+            const function = tree.decl(method_decl_id).function;
+            if (function.type_parameters.len > 0) continue;
+            const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
+            const function_id = symbol_to_function.get(symbol) orelse continue;
+            try lowerFunctionBody(allocator, tree, resolution, checked, module, function_id, method_decl_id, function.body, symbol_to_function);
+        }
+    }
 }
 
 // Link the already resolved/type-checked module graph into one AOT MIR
@@ -180,6 +258,7 @@ pub fn lowerGraph(
             module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
             try function_maps.items[module_index].put(symbol, function_id);
         }
+        try reserveMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index]);
     }
 
     // Imported symbols are freshly minted in the importing Resolution. Map
@@ -211,6 +290,7 @@ pub fn lowerGraph(
             const function_id = function_maps.items[module_index].get(symbol) orelse continue;
             try lowerFunctionBody(allocator, tree, resolution, checked, &module, function_id, decl_id, function.body, &function_maps.items[module_index]);
         }
+        try lowerMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index]);
     }
 
     return module;
@@ -982,6 +1062,32 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
     }
 
     if (ctx.tree.expr(call.callee).* == .property) {
+        // `значение.метод(...)` where `значение`'s static type is a
+        // concrete struct (not an interface — that's a SEPARATE map,
+        // `checked.interface_calls`, needing real indirect dispatch this
+        // backend doesn't have yet, deliberately left unsupported) —
+        // the type checker already resolved this to the method's own
+        // `Symbol_Id` in `method_calls` (`type_checker.zig:4437`), the
+        // exact same map the native bytecode compiler reads
+        // (`compiler.zig`'s `Method_Struct` case) instead of re-deriving
+        // struct-field lookup here. `это` is just `parameters[0]` on the
+        // method's own side (see `reserveMethods`/`lowerMethods`) — the
+        // receiver (`property.object`) is lowered as an ordinary
+        // argument and placed FIRST, matching that.
+        if (ctx.checked.method_calls.get(expression)) |method_symbol| {
+            if (ctx.symbol_to_function.get(method_symbol)) |function_id| {
+                const function_ref = try emitFunctionRef(ctx, function_id);
+                const property = ctx.tree.expr(call.callee).property;
+                const receiver = try lowerExpr(ctx, property.object);
+                if (receiver.flow == .terminates) return terminated;
+                const rest = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+                const arena = ctx.builder.module.arena.allocator();
+                var args: std.ArrayList(mir.ValueId) = .empty;
+                try args.append(arena, receiver.value);
+                try args.appendSlice(arena, rest);
+                return emitCallValue(ctx, function_ref, try args.toOwnedSlice(arena), result_type);
+            }
+        }
         // A function imported from a local file is represented in the AST
         // as `модуль.функция`, not as a bare identifier. Resolution has
         // already associated that property expression with the importer-side

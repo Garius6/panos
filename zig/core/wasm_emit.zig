@@ -88,8 +88,20 @@ const EmitContext = struct {
     }
 };
 
-fn unsupported(comptime what: []const u8) noreturn {
-    @panic("wasm backend: не поддержано — " ++ what);
+// Same treatment as `mir_lowering.zig`'s `unsupported()` (see that
+// file's doc comment) — was `@panic`, crashed the whole `panos build
+// --target=wasm` process with a Zig stack trace on any Phase-1a
+// codegen gap (found running the actual motivating case for the
+// struct-methods feature: `std/математика.pns`'s `Генератор.
+// следующее()` PRNG uses `%`/bitwise ops, which this backend's
+// arithmetic emission doesn't cover yet — a genuinely separate,
+// pre-existing gap from method dispatch itself). `cli/main.zig`
+// already wraps `emitModule(...)` in a `catch |err| { print; exit(1);
+// }` (needed for its OTHER failure modes already) — no caller-side
+// change needed here, just stop crashing.
+fn unsupported(comptime what: []const u8) error{WasmEmitUnsupported} {
+    std.debug.print("panos build: AOT (wasm) кодогенерация не поддерживает — " ++ what ++ "\n", .{});
+    return error.WasmEmitUnsupported;
 }
 
 fn countUse(counts: *std.AutoHashMap(mir.ValueId, u32), value: mir.ValueId) !void {
@@ -140,7 +152,7 @@ fn computeUseCount(allocator: std.mem.Allocator, function: *const mir.Function) 
                 .match_tag => |match| try countUse(&counts, match.subject),
                 .get_variant_field => |field| try countUse(&counts, field.subject),
                 .const_value, .load_local, .function_ref => {},
-                else => unsupported("вид MIR-инструкции при подсчёте использований"),
+                else => return unsupported("вид MIR-инструкции при подсчёте использований"),
             }
         }
         switch (block.terminator) {
@@ -152,14 +164,14 @@ fn computeUseCount(allocator: std.mem.Allocator, function: *const mir.Function) 
     return counts;
 }
 
-fn findBrDepth(ctx: *EmitContext, target: mir.BlockId) usize {
+fn findBrDepth(ctx: *EmitContext, target: mir.BlockId) !usize {
     var i = ctx.scope_stack.items.len;
     while (i > 0) {
         i -= 1;
         const scope = ctx.scope_stack.items[i];
         if (scope.kind == .loop and scope.header == target) return (ctx.scope_stack.items.len - 1) - i;
     }
-    unsupported("br-цель не найдена среди открытых scope (нарушен структурный инвариант)");
+    return unsupported("br-цель не найдена среди открытых scope (нарушен структурный инвариант)");
 }
 
 const ProcessOutcome = struct { fallthrough: mir.BlockId, ok: bool };
@@ -180,7 +192,7 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) !Pro
             const block = ctx.function.blockConst(b);
             const branch = switch (block.terminator) {
                 .branch => |value| value,
-                else => unsupported("loop header без branch-terminator'а"),
+                else => return unsupported("loop header без branch-terminator'а"),
             };
             const identified = try wasm_stackify.identifyLoopBodyAndExit(ctx.allocator, ctx.function, b, branch.then_block, branch.else_block);
 
@@ -217,7 +229,7 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) !Pro
         switch (block.terminator) {
             .jump => |jump| {
                 if (ctx.visited.contains(jump.target) and wasm_stackify.isLoopHeader(&ctx.cfg, &ctx.rpo_index, jump.target)) {
-                    const depth = findBrDepth(ctx, jump.target);
+                    const depth = try findBrDepth(ctx, jump.target);
                     try ctx.code.append(ctx.allocator, 0x0C); // br
                     try wasm_module.writeUleb128(&ctx.code, ctx.allocator, depth);
                     return .{ .fallthrough = mir.invalid_block, .ok = false };
@@ -260,7 +272,7 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) !Pro
                 try ctx.code.append(ctx.allocator, 0x00); // unreachable
                 return .{ .fallthrough = mir.invalid_block, .ok = false };
             },
-            .none => unsupported("блок без terminator'а"),
+            .none => return unsupported("блок без terminator'а"),
         }
     }
 }
@@ -303,10 +315,10 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
                     try wasm_module.writeSleb128(code, allocator, if (b) 1 else 0);
                 },
                 .string => |s| {
-                    const offset = ctx.string_offsets.get(s) orelse unsupported("строковая константа без выделенного смещения (баг сборки data-секции)");
+                    const offset = ctx.string_offsets.get(s) orelse return unsupported("строковая константа без выделенного смещения (баг сборки data-секции)");
                     try code.append(allocator, 0x41); // i32.const
                     try wasm_module.writeSleb128(code, allocator, @intCast(offset));
-                    const import_index = ctx.builtin_index.get("@runtime::строка_литерал") orelse unsupported("строковая константа без runtime-импорта");
+                    const import_index = ctx.builtin_index.get("@runtime::строка_литерал") orelse return unsupported("строковая константа без runtime-импорта");
                     try code.append(allocator, 0x10); // call
                     try wasm_module.writeUleb128(code, allocator, import_index);
                 },
@@ -325,8 +337,8 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
         },
         .binary => |binary| {
             if (ctx.type_store.eql(ctx.function.valueType(binary.dst), ctx.type_store.builtins.string)) {
-                if (binary.op != .add) unsupported("строки поддерживают только оператор +");
-                const import_index = ctx.builtin_index.get("@runtime::строка_сложить") orelse unsupported("конкатенация строк без runtime-импорта");
+                if (binary.op != .add) return unsupported("строки поддерживают только оператор +");
+                const import_index = ctx.builtin_index.get("@runtime::строка_сложить") orelse return unsupported("конкатенация строк без runtime-импорта");
                 try code.append(allocator, 0x10); // call
                 try wasm_module.writeUleb128(code, allocator, import_index);
                 return binary.dst;
@@ -339,7 +351,7 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
                 .multiply => 0xA2, // f64.mul
                 .divide => 0xA3, // f64.div
                 .int_divide => 0xA3, // f64.div, truncated below
-                .modulo, .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => unsupported("побитовый/остаточный оператор (нужна i32/i64-конверсия, вне Phase 1a)"),
+                .modulo, .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => return unsupported("побитовый/остаточный оператор (нужна i32/i64-конверсия, вне Phase 1a)"),
             };
             try code.append(allocator, opcode);
             if (binary.op == .int_divide) try code.append(allocator, 0x9C); // f64.trunc — toward zero, matches Целое/Целое semantics
@@ -373,7 +385,7 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
                 .negate_number => try code.append(allocator, 0x9A), // f64.neg
                 .negate_bool => try code.append(allocator, 0x45), // i32.eqz
                 .int_trunc => try code.append(allocator, 0x9C), // f64.trunc
-                .bit_not => unsupported("побитовое НЕ (вне Phase 1a)"),
+                .bit_not => return unsupported("побитовое НЕ (вне Phase 1a)"),
             }
             return unary.dst;
         },
@@ -383,21 +395,21 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
         },
         .call_value => |call| {
             for (call.args) |_| {} // args are already on the stack — replayed earlier, in order, by their own instructions.
-            const function_id = ctx.value_to_function.get(call.callee) orelse unsupported("вызов через динамическое значение (нет call_indirect/таблицы функций в Phase 1a)");
-            const function_index = ctx.func_index.get(function_id) orelse unsupported("функция не найдена в индексе модуля");
+            const function_id = ctx.value_to_function.get(call.callee) orelse return unsupported("вызов через динамическое значение (нет call_indirect/таблицы функций в Phase 1a)");
+            const function_index = ctx.func_index.get(function_id) orelse return unsupported("функция не найдена в индексе модуля");
             try code.append(allocator, 0x10); // call
             try wasm_module.writeUleb128(code, allocator, function_index);
             return call.dst;
         },
         .call_builtin => |call| {
             for (call.args) |_| {} // время.сейчас_мс/монотонно_мс take no args — nothing to replay yet.
-            const import_index = ctx.builtin_index.get(call.name) orelse unsupported("call_builtin без соответствующего host-импорта");
+            const import_index = ctx.builtin_index.get(call.name) orelse return unsupported("call_builtin без соответствующего host-импорта");
             try code.append(allocator, 0x10); // call
             try wasm_module.writeUleb128(code, allocator, import_index);
             return call.dst;
         },
         .new_aggregate => |aggregate| {
-            const import_index = ctx.builtin_index.get(structNewBuiltinName(ctx.function, aggregate.elements)) orelse unsupported("конструктор структуры без runtime-импорта");
+            const import_index = ctx.builtin_index.get(try structNewBuiltinName(ctx.function, aggregate.elements)) orelse return unsupported("конструктор структуры без runtime-импорта");
             try code.append(allocator, 0x10); // call
             try wasm_module.writeUleb128(code, allocator, import_index);
             return aggregate.dst;
@@ -406,7 +418,7 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try code.append(allocator, 0x41); // i32.const field index
             try wasm_module.writeSleb128(code, allocator, @intCast(property.field_index));
             const getter_name = if (wasmType(ctx, property.dst) == wasm_module.wasm_i32) "@runtime::struct_get_i32" else "@runtime::struct_get_f64";
-            const import_index = ctx.builtin_index.get(getter_name) orelse unsupported("чтение поля структуры без runtime-импорта");
+            const import_index = ctx.builtin_index.get(getter_name) orelse return unsupported("чтение поля структуры без runtime-импорта");
             try code.append(allocator, 0x10); // call
             try wasm_module.writeUleb128(code, allocator, import_index);
             return property.dst;
@@ -415,28 +427,28 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try code.append(allocator, 0x41); // i32.const field index
             try wasm_module.writeSleb128(code, allocator, @intCast(property.field_index));
             const setter_name = if (wasmType(ctx, property.value) == wasm_module.wasm_i32) "@runtime::struct_set_i32" else "@runtime::struct_set_f64";
-            const import_index = ctx.builtin_index.get(setter_name) orelse unsupported("запись поля структуры без runtime-импорта");
+            const import_index = ctx.builtin_index.get(setter_name) orelse return unsupported("запись поля структуры без runtime-импорта");
             try code.append(allocator, 0x10); // call(handle, value, field)
             try wasm_module.writeUleb128(code, allocator, import_index);
             return null;
         },
         .new_array => |array| {
-            if (array.elements.len != 0) unsupported("new_array с inline-элементами");
-            const import_index = ctx.builtin_index.get("@runtime::array_new") orelse unsupported("массив без runtime-импорта");
+            if (array.elements.len != 0) return unsupported("new_array с inline-элементами");
+            const import_index = ctx.builtin_index.get("@runtime::array_new") orelse return unsupported("массив без runtime-импорта");
             try code.append(allocator, 0x10); // call
             try wasm_module.writeUleb128(code, allocator, import_index);
             return array.dst;
         },
         .get_index => |index| {
             const getter_name = if (wasmType(ctx, index.dst) == wasm_module.wasm_i32) "@runtime::array_get_i32" else "@runtime::array_get_f64";
-            const import_index = ctx.builtin_index.get(getter_name) orelse unsupported("индексирование массива без runtime-импорта");
+            const import_index = ctx.builtin_index.get(getter_name) orelse return unsupported("индексирование массива без runtime-импорта");
             try code.append(allocator, 0x10); // call(handle, index)
             try wasm_module.writeUleb128(code, allocator, import_index);
             return index.dst;
         },
         .set_index => |index| {
             const setter_name = if (wasmType(ctx, index.value) == wasm_module.wasm_i32) "@runtime::array_set_i32" else "@runtime::array_set_f64";
-            const import_index = ctx.builtin_index.get(setter_name) orelse unsupported("запись массива без runtime-импорта");
+            const import_index = ctx.builtin_index.get(setter_name) orelse return unsupported("запись массива без runtime-импорта");
             try code.append(allocator, 0x10); // call(handle, index, value)
             try wasm_module.writeUleb128(code, allocator, import_index);
             return null;
@@ -444,7 +456,7 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
         .build_variant => |variant| {
             try code.append(allocator, 0x41); // i32.const tag follows fields
             try wasm_module.writeSleb128(code, allocator, @intCast(variant.tag));
-            const import_index = ctx.builtin_index.get(variantNewBuiltinName(ctx.function, variant.fields)) orelse unsupported("вариант без runtime-импорта");
+            const import_index = ctx.builtin_index.get(try variantNewBuiltinName(ctx.function, variant.fields)) orelse return unsupported("вариант без runtime-импорта");
             try code.append(allocator, 0x10);
             try wasm_module.writeUleb128(code, allocator, import_index);
             return variant.dst;
@@ -452,7 +464,7 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
         .match_tag => |match| {
             try code.append(allocator, 0x41);
             try wasm_module.writeSleb128(code, allocator, @intCast(match.tag));
-            const import_index = ctx.builtin_index.get("@runtime::variant_match") orelse unsupported("проверка variant без runtime-импорта");
+            const import_index = ctx.builtin_index.get("@runtime::variant_match") orelse return unsupported("проверка variant без runtime-импорта");
             try code.append(allocator, 0x10);
             try wasm_module.writeUleb128(code, allocator, import_index);
             return match.dst;
@@ -461,12 +473,12 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try code.append(allocator, 0x41);
             try wasm_module.writeSleb128(code, allocator, @intCast(field.field_index));
             const name = if (wasmType(ctx, field.dst) == wasm_module.wasm_i32) "@runtime::variant_get_i32" else "@runtime::variant_get_f64";
-            const import_index = ctx.builtin_index.get(name) orelse unsupported("чтение поля variant без runtime-импорта");
+            const import_index = ctx.builtin_index.get(name) orelse return unsupported("чтение поля variant без runtime-импорта");
             try code.append(allocator, 0x10);
             try wasm_module.writeUleb128(code, allocator, import_index);
             return field.dst;
         },
-        else => unsupported("вид MIR-инструкции"),
+        else => return unsupported("вид MIR-инструкции"),
     }
 }
 
@@ -503,7 +515,7 @@ pub fn emitFunctionWasm(
 // anything). `время.спать_мс` never reaches this function at all —
 // `mir_lowering.zig`'s `lowerTimeBuiltinCall` panics before producing a
 // `call_builtin` for it (native-only builtin, not an AOT WASM host call).
-fn hostImportNameForBuiltin(name: []const u8) []const u8 {
+fn hostImportNameForBuiltin(name: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "время::сейчас_мс")) return "pw_now_ms";
     if (std.mem.eql(u8, name, "время::монотонно_мс")) return "pw_monotonic_ms";
     if (std.mem.eql(u8, name, "сеть::http_запрос_sync")) return "pw_http_request_sync";
@@ -534,12 +546,12 @@ fn hostImportNameForBuiltin(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "@runtime::struct_")) return name["@runtime::".len..];
     if (std.mem.startsWith(u8, name, "@runtime::variant_")) return name["@runtime::".len..];
     if (std.mem.startsWith(u8, name, "@runtime::array_")) return name["@runtime::".len..];
-    unsupported("call_builtin с именем без известного host-импорта");
+    return unsupported("call_builtin с именем без известного host-импорта");
 }
 
 const BuiltinSignature = struct { params: []const u8, result: ?u8 };
 
-fn builtinSignature(name: []const u8) BuiltinSignature {
+fn builtinSignature(name: []const u8) !BuiltinSignature {
     if (std.mem.eql(u8, name, "время::сейчас_мс") or std.mem.eql(u8, name, "время::монотонно_мс"))
         return .{ .params = &.{}, .result = wasm_module.wasm_f64 };
     if (std.mem.eql(u8, name, "сеть::http_запрос_sync"))
@@ -588,7 +600,7 @@ fn builtinSignature(name: []const u8) BuiltinSignature {
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
     if (std.mem.eql(u8, name, "@runtime::struct_set_f64"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_f64, wasm_module.wasm_i32 }, .result = null };
-    if (std.mem.startsWith(u8, name, "@runtime::struct_new_")) return structNewSignature(name["@runtime::struct_new_".len..]);
+    if (std.mem.startsWith(u8, name, "@runtime::struct_new_")) return try structNewSignature(name["@runtime::struct_new_".len..]);
     if (std.mem.eql(u8, name, "@runtime::variant_new_f")) return .{ .params = &.{ wasm_module.wasm_f64, wasm_module.wasm_i32 }, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "@runtime::variant_new_i")) return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "@runtime::variant_new_ff")) return .{ .params = &.{ wasm_module.wasm_f64, wasm_module.wasm_f64, wasm_module.wasm_i32 }, .result = wasm_module.wasm_i32 };
@@ -622,7 +634,7 @@ fn builtinSignature(name: []const u8) BuiltinSignature {
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "@runtime::variant_get_f64"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = wasm_module.wasm_f64 };
-    unsupported("call_builtin с именем без известной сигнатуры импорта");
+    return unsupported("call_builtin с именем без известной сигнатуры импорта");
 }
 
 // Every DISTINCT string literal any function in `module` uses, concatenated
@@ -687,7 +699,7 @@ fn collectBuiltinNames(allocator: std.mem.Allocator, module: *const mir.Module) 
                         }
                     },
                     .new_aggregate => |aggregate| {
-                        try appendBuiltinName(allocator, &seen, &names, structNewBuiltinName(&function, aggregate.elements));
+                        try appendBuiltinName(allocator, &seen, &names, try structNewBuiltinName(&function, aggregate.elements));
                     },
                     .get_property => {
                         const getter_name = if (wasm_module.wasmValTypeForStore(function.type_store orelse continue, function.valueType(instruction.get_property.dst)) == wasm_module.wasm_i32) "@runtime::struct_get_i32" else "@runtime::struct_get_f64";
@@ -706,7 +718,7 @@ fn collectBuiltinNames(allocator: std.mem.Allocator, module: *const mir.Module) 
                         const setter_name = if (wasm_module.wasmValTypeForStore(function.type_store orelse continue, function.valueType(index.value)) == wasm_module.wasm_i32) "@runtime::array_set_i32" else "@runtime::array_set_f64";
                         try appendBuiltinName(allocator, &seen, &names, setter_name);
                     },
-                    .build_variant => |variant| try appendBuiltinName(allocator, &seen, &names, variantNewBuiltinName(&function, variant.fields)),
+                    .build_variant => |variant| try appendBuiltinName(allocator, &seen, &names, try variantNewBuiltinName(&function, variant.fields)),
                     .match_tag => try appendBuiltinName(allocator, &seen, &names, "@runtime::variant_match"),
                     .get_variant_field => |field| {
                         const name = if (wasm_module.wasmValTypeForStore(function.type_store orelse continue, function.valueType(field.dst)) == wasm_module.wasm_i32) "@runtime::variant_get_i32" else "@runtime::variant_get_f64";
@@ -720,9 +732,9 @@ fn collectBuiltinNames(allocator: std.mem.Allocator, module: *const mir.Module) 
     return names;
 }
 
-fn structNewBuiltinName(function: *const mir.Function, elements: []const mir.ValueId) []const u8 {
-    if (elements.len > 3) unsupported("структура с более чем 3 полями");
-    const store = function.type_store orelse unsupported("структура без TypeStore");
+fn structNewBuiltinName(function: *const mir.Function, elements: []const mir.ValueId) ![]const u8 {
+    if (elements.len > 3) return unsupported("структура с более чем 3 полями");
+    const store = function.type_store orelse return unsupported("структура без TypeStore");
     var mask: u3 = 0;
     for (elements, 0..) |element, index| {
         if (wasm_module.wasmValTypeForStore(store, function.valueType(element)) == wasm_module.wasm_i32) {
@@ -753,21 +765,21 @@ fn structNewBuiltinName(function: *const mir.Function, elements: []const mir.Val
     };
 }
 
-fn structNewSignature(pattern: []const u8) BuiltinSignature {
+fn structNewSignature(pattern: []const u8) !BuiltinSignature {
     const params: []const u8 = switch (pattern.len) {
         0 => &.{},
         1 => if (pattern[0] == 'i') &.{wasm_module.wasm_i32} else &.{wasm_module.wasm_f64},
         2 => if (std.mem.eql(u8, pattern, "ii")) &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 } else if (std.mem.eql(u8, pattern, "if")) &.{ wasm_module.wasm_i32, wasm_module.wasm_f64 } else if (std.mem.eql(u8, pattern, "fi")) &.{ wasm_module.wasm_f64, wasm_module.wasm_i32 } else &.{ wasm_module.wasm_f64, wasm_module.wasm_f64 },
         3 => if (std.mem.eql(u8, pattern, "iii")) &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 } else if (std.mem.eql(u8, pattern, "iif")) &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_f64 } else if (std.mem.eql(u8, pattern, "ifi")) &.{ wasm_module.wasm_i32, wasm_module.wasm_f64, wasm_module.wasm_i32 } else if (std.mem.eql(u8, pattern, "iff")) &.{ wasm_module.wasm_i32, wasm_module.wasm_f64, wasm_module.wasm_f64 } else if (std.mem.eql(u8, pattern, "fii")) &.{ wasm_module.wasm_f64, wasm_module.wasm_i32, wasm_module.wasm_i32 } else if (std.mem.eql(u8, pattern, "fif")) &.{ wasm_module.wasm_f64, wasm_module.wasm_i32, wasm_module.wasm_f64 } else if (std.mem.eql(u8, pattern, "ffi")) &.{ wasm_module.wasm_f64, wasm_module.wasm_f64, wasm_module.wasm_i32 } else &.{ wasm_module.wasm_f64, wasm_module.wasm_f64, wasm_module.wasm_f64 },
-        else => unsupported("сигнатура структуры с более чем 3 полями"),
+        else => return unsupported("сигнатура структуры с более чем 3 полями"),
     };
     return .{ .params = params, .result = wasm_module.wasm_i32 };
 }
 
-fn variantNewBuiltinName(function: *const mir.Function, fields: []const mir.ValueId) []const u8 {
-    const struct_name = structNewBuiltinName(function, fields);
+fn variantNewBuiltinName(function: *const mir.Function, fields: []const mir.ValueId) ![]const u8 {
+    const struct_name = try structNewBuiltinName(function, fields);
     const pattern = struct_name["@runtime::struct_new_".len..];
-    if (pattern.len > 2) unsupported("variant с более чем 2 полями");
+    if (pattern.len > 2) return unsupported("variant с более чем 2 полями");
     if (pattern.len == 0) return "@runtime::variant_new_";
     if (std.mem.eql(u8, pattern, "i")) return "@runtime::variant_new_i";
     if (std.mem.eql(u8, pattern, "f")) return "@runtime::variant_new_f";
@@ -777,13 +789,13 @@ fn variantNewBuiltinName(function: *const mir.Function, fields: []const mir.Valu
     return "@runtime::variant_new_ff";
 }
 
-fn variantNewSignature(pattern: []const u8) BuiltinSignature {
-    const base = structNewSignature(pattern);
+fn variantNewSignature(pattern: []const u8) !BuiltinSignature {
+    const base = try structNewSignature(pattern);
     const params = switch (pattern.len) {
         0 => &.{wasm_module.wasm_i32},
         1 => if (pattern[0] == 'i') &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 } else &.{ wasm_module.wasm_f64, wasm_module.wasm_i32 },
         2 => if (std.mem.eql(u8, pattern, "ii")) &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 } else if (std.mem.eql(u8, pattern, "if")) &.{ wasm_module.wasm_i32, wasm_module.wasm_f64, wasm_module.wasm_i32 } else if (std.mem.eql(u8, pattern, "fi")) &.{ wasm_module.wasm_f64, wasm_module.wasm_i32, wasm_module.wasm_i32 } else &.{ wasm_module.wasm_f64, wasm_module.wasm_f64, wasm_module.wasm_i32 },
-        else => unsupported("variant с более чем 2 полями"),
+        else => return unsupported("variant с более чем 2 полями"),
     };
     return .{ .params = params, .result = base.result };
 }
@@ -858,7 +870,7 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     defer type_section.deinit(allocator);
     try wasm_module.writeUleb128(&type_section, allocator, builtin_count + module.functions.items.len);
     for (builtin_names.items) |name| {
-        const signature = builtinSignature(name);
+        const signature = try builtinSignature(name);
         try type_section.append(allocator, 0x60); // functype
         try wasm_module.writeUleb128(&type_section, allocator, signature.params.len);
         for (signature.params) |param_type| try type_section.append(allocator, param_type);
@@ -883,7 +895,7 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     if (builtin_count != 0) {
         try wasm_module.writeUleb128(&import_section, allocator, builtin_count);
         for (builtin_names.items, 0..) |name, i| {
-            const host_name = hostImportNameForBuiltin(name);
+            const host_name = try hostImportNameForBuiltin(name);
             try wasm_module.writeUleb128(&import_section, allocator, "env".len);
             try import_section.appendSlice(allocator, "env");
             try wasm_module.writeUleb128(&import_section, allocator, host_name.len);

@@ -824,7 +824,6 @@ fn validateOrFail(allocator: std.mem.Allocator, checked: *const type_checker.Che
         defer mir_validate.freeIssues(allocator, issues);
         for (issues) |issue| {
             if (issue.is_error) {
-                std.debug.print("mir_validate: {s}\n", .{issue.message});
                 return error.InvalidMir;
             }
         }

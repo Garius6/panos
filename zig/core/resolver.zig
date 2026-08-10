@@ -791,7 +791,22 @@ const Resolver = struct {
             try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
         } else if (self.target_profile != .native) {
             try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
-        } else if ((comptime builtin.target.os.tag != .windows) and std.mem.eql(u8, foreign.library, "libc")) {
+        } else if ((comptime builtin.target.os.tag != .windows and builtin.link_libc) and std.mem.eql(u8, foreign.library, "libc")) {
+            // Real bug found via CI (not local — this machine always
+            // links libc for every build): `std.c.dlopen` referenced
+            // UNCONDITIONALLY (no `builtin.link_libc` guard) forces
+            // EVERY test binary that merely compiles `resolver.zig`
+            // (virtually all of them, via `predeclare`/
+            // `resolveModuleForTarget` — reachable regardless of
+            // whether that specific test ever declares `внешний`) to
+            // link libc at compile time, even ones that otherwise never
+            // needed it — Zig's own `std.DynLib` (the path this branch
+            // replaces) avoids exactly this by internally picking a
+            // libc-free pure-Zig ELF parser (`ElfDynLib`) instead of the
+            // libc-`dlopen`-based one (`DlDynLib`) whenever `!builtin.
+            // link_libc` — a fallback this direct `std.c.dlopen` call
+            // doesn't get for free, so it needs the same guard here.
+            //
             // `внешний "libc"` doesn't need to find and load a SEPARATE
             // shared object file at all — libc is ALREADY linked into
             // this very process (every native panos binary links libc).

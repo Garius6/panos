@@ -1724,3 +1724,36 @@ test "parser explains multi-statement match arms without тогда" {
         parsed.diagnostics.items.items[0].message,
     );
 }
+
+// Crash-oracle fuzz test — `parse` must never panic on ANY token stream a
+// lexer can produce, however garbled the underlying bytes (a malformed
+// token stream degrading to syntax-error diagnostics + recovery is the
+// whole point of the parser's error-recovery machinery; a panic would mean
+// recovery missed a case). Feeds the SAME arbitrary bytes through the
+// lexer first — panosiki bugs found this session were mostly "syntax that
+// looks almost right", not pure garbage, so exercising the real lexer
+// (not synthetic tokens) is closer to the actual failure class.
+test "parser never panics on arbitrary token streams" {
+    try std.testing.fuzz(std.testing.allocator, testParseNeverPanics, .{
+        .corpus = &.{
+            "",
+            "функ",
+            "функ старт(",
+            "тип Т = структура\nx:\nконец",
+            "выбор x\nа -> 1\nконец",
+            "если а тогда б иначе",
+            "1 + + 2",
+            "пер (a, b, = массив()",
+        },
+    });
+}
+
+fn testParseNeverPanics(allocator: std.mem.Allocator, smith: *std.testing.Smith) anyerror!void {
+    const lexer = @import("lexer.zig");
+    var buffer: [4096]u8 = undefined;
+    const len = smith.slice(&buffer);
+    var lexed = try lexer.tokenize(allocator, buffer[0..len], 0);
+    defer lexed.deinit();
+    var parsed = try parse(allocator, lexed.tokens.items);
+    defer parsed.deinit();
+}

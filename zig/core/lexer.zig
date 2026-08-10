@@ -696,3 +696,31 @@ test "lexer reports invalid UTF-8 and continues" {
     try std.testing.expectEqualStrings("Лексическая ошибка: некорректный UTF-8", result.diagnostics.items.items[0].message);
     try std.testing.expectEqualDeep(source.Span{ .file_id = 3, .start = 0, .end = 1 }, result.diagnostics.items.items[0].span);
 }
+
+// Crash-oracle fuzz test — `tokenize` must never panic/UB on ANY byte
+// sequence, valid UTF-8 or not (the whole point of `Лексическая ошибка:
+// некорректный UTF-8`/`неожиданный символ` recovery above is that malformed
+// input degrades to a diagnostic, never a crash). `zig build test --fuzz`
+// runs this continuously against libFuzzer-style coverage-guided mutation;
+// a plain `zig build test` still runs it once against the seed corpus
+// below, so a regression here fails CI even without fuzzing turned on.
+test "lexer never panics on arbitrary bytes" {
+    try std.testing.fuzz(std.testing.allocator, testTokenizeNeverPanics, .{
+        .corpus = &.{
+            "",
+            "\x00",
+            "\xff\xfe\xfd",
+            "функ старт() -> Число\n\\(",
+            "\"незакрытая строка",
+            "// комментарий\r\n\t \n",
+            "пер x = 1_000_000.5e10",
+        },
+    });
+}
+
+fn testTokenizeNeverPanics(allocator: std.mem.Allocator, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [4096]u8 = undefined;
+    const len = smith.slice(&buffer);
+    var result = try tokenize(allocator, buffer[0..len], 0);
+    defer result.deinit();
+}

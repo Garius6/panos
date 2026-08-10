@@ -189,6 +189,7 @@ const ImportContext = struct {
                         .symbol = imported_symbol,
                         .store = &target_checked.types,
                         .type_id = signature,
+                        .generic_parameters = target_checked.generic_function_parameters.get(target_symbol),
                     });
                     try self.functions.append(self.allocator, .{
                         .symbol = imported_symbol,

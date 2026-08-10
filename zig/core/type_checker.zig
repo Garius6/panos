@@ -72,6 +72,25 @@ pub const ImportedSymbolType = struct {
     symbol: symbols.SymbolId,
     store: *const types.TypeStore,
     type_id: types.TypeId,
+    // Non-null when the imported symbol is a GENERIC FREE FUNCTION (`функ
+    // ф[T: Интерфейс](...)`) — the source module's own, UNREMAPPED
+    // generic-parameter TypeIds/bounds (bound interface symbols are
+    // still the SOURCE module's local symbols here; the importer remaps
+    // them via `imports.nominals` when consuming this). Real gap found
+    // auditing panosiki's `pan` (`томл.сериализовать_из(манифест)` —
+    // `std/кодирование/toml.ps`'s `сериализовать_из[T: ВTOML](это: T)`
+    // called cross-module): without this, `copyImportedType`'s
+    // `.generic_parameter` case had no remap to consult and silently
+    // degraded `T` to `poison` for ANY cross-module generic function
+    // call — `poison` is universally assignable, so the call
+    // type-checked with zero diagnostics, but the callee's compiled
+    // body still expected `это` to arrive already `Cast_Interface`'d
+    // (see `interfaceBoundOf`/`inferGenericBoundInterfaceCall`, which
+    // never fired here since `generic_function_parameters` was never
+    // populated for the imported symbol either) — a silent, guaranteed
+    // "Runtime Error: попытка вызвать интерфейсный метод у не-интерфейса"
+    // crash on the very first real cross-module use of this pattern.
+    generic_parameters: ?[]const GenericParameter = null,
 };
 
 pub const ImportedNominal = struct {
@@ -465,7 +484,56 @@ const Checker = struct {
             }
         }
         for (imports.symbols) |imported| {
-            const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals, null) catch |err| switch (err) {
+            // Imported GENERIC FREE FUNCTION — mint fresh LOCAL
+            // generic-parameter TypeIds (one per target parameter),
+            // remap the signature through them (instead of `null`,
+            // which silently poisons every `T` reference — see
+            // `ImportedSymbolType.generic_parameters`'s own doc comment
+            // for the crash this caused), and register the remapped
+            // parameters/bounds into `generic_function_parameters` so
+            // the call site's existing same-file machinery
+            // (`interfaceBoundOf`/generic-call substitution) works
+            // identically for a cross-module call.
+            var local_generic_remap: ?std.AutoHashMap(types.TypeId, types.TypeId) = null;
+            defer if (local_generic_remap) |*map| map.deinit();
+            if (imported.generic_parameters) |target_parameters| {
+                var remap = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+                var local_parameters: std.ArrayList(GenericParameter) = .empty;
+                defer local_parameters.deinit(self.result.allocator);
+                for (target_parameters) |target_parameter| {
+                    const local_typ = try self.result.types.genericParameter(self.next_generic_parameter);
+                    self.next_generic_parameter += 1;
+                    try remap.put(target_parameter.typ, local_typ);
+                    var local_bounds: std.ArrayList(symbols.SymbolId) = .empty;
+                    defer local_bounds.deinit(self.result.allocator);
+                    for (target_parameter.bounds) |target_bound| {
+                        for (imports.nominals) |nominal| {
+                            if (nominal.store != imported.store or nominal.source_symbol != target_bound) continue;
+                            try local_bounds.append(self.result.allocator, nominal.local_symbol);
+                            break;
+                        }
+                    }
+                    try local_parameters.append(self.result.allocator, .{
+                        .name = target_parameter.name,
+                        .typ = local_typ,
+                        .bounds = try self.result.arena.allocator().dupe(symbols.SymbolId, local_bounds.items),
+                    });
+                }
+                // Invariant this whole bridging step depends on: one
+                // fresh local TypeId per target parameter, no collisions,
+                // nothing dropped. A violation here would silently
+                // produce a WRONG cross-module generic signature (the
+                // exact bug class `interfaceBoundOf`/bound-dispatch broke
+                // on before this session) — assert loudly in Debug
+                // instead of compiling a subtly incorrect signature that
+                // only surfaces as a confusing runtime crash three layers
+                // away, in a DIFFERENT file, later.
+                std.debug.assert(remap.count() == target_parameters.len);
+                std.debug.assert(local_parameters.items.len == target_parameters.len);
+                try self.result.generic_function_parameters.put(imported.symbol, try self.result.arena.allocator().dupe(GenericParameter, local_parameters.items));
+                local_generic_remap = remap;
+            }
+            const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals, if (local_generic_remap) |*map| map else null) catch |err| switch (err) {
                 error.UnsupportedImportedType => {
                     try self.result.unsupported_imports.put(imported.symbol, {});
                     continue;
@@ -1453,7 +1521,7 @@ const Checker = struct {
             .call => |call| blk: {
                 const variant = if (self.resolution.expr_symbols.get(call.callee)) |symbol| self.enumVariant(symbol) else null;
                 if (variant) |value| break :blk self.recordExpressionType(expression, try self.inferEnumVariantCallExpected(call, value, expected));
-                break :blk self.infer(expression);
+                break :blk self.recordExpressionType(expression, try self.inferCallExpected(expression, call, expected));
             },
             .if_expr => |conditional| self.recordExpressionType(expression, try self.inferIfExpected(conditional, expected)),
             .match_expr => |match| self.recordExpressionType(expression, try self.inferMatchExpected(match, expected)),
@@ -1489,8 +1557,35 @@ const Checker = struct {
         if (!self.assignable(condition, self.result.types.builtins.boolean)) {
             try self.report(conditional.span, "Type Error: условие 'если' должно иметь тип Булево", .{});
         }
-        const then_type = try self.inferBlockExpected(conditional.then_branch, expected);
-        const else_type = try self.inferBlockExpected(conditional.else_branch, expected);
+        const diagnostics_before_then = self.result.diagnostics.items.items.len;
+        var then_type = try self.inferBlockExpected(conditional.then_branch, expected);
+        const then_failed = self.result.diagnostics.items.items.len > diagnostics_before_then;
+        const diagnostics_before_else = self.result.diagnostics.items.items.len;
+        var else_type = try self.inferBlockExpected(conditional.else_branch, expected);
+        const else_failed = self.result.diagnostics.items.items.len > diagnostics_before_else;
+        // Real gap found auditing panosiki's `gitsync`
+        // (`пер remote_опция = если remote == "" тогда Опция.Нет()
+        // иначе Опция.Есть(remote) конец`, no `: Тип` annotation): with
+        // no `expected` propagated at all, `Опция.Нет()` has ZERO
+        // arguments to infer its own `T` from (`inferEnumVariantCall`
+        // reports "не удалось вывести type-параметр 'T'" and falls back
+        // to `poison`) — a fully ordinary, common panos idiom that
+        // NEVER worked without an explicit annotation. When exactly ONE
+        // branch fails this way while the other infers cleanly, retry
+        // the FAILED branch using the SUCCESSFUL branch's inferred type
+        // as `expected` — this routes back through the SAME
+        // `inferEnumVariantCallExpected` mechanism that already makes
+        // `Опция.Нет()` work fine in every OTHER expected-type context
+        // (a struct field, a return position, ...). The failed attempt's
+        // diagnostics are rolled back (`shrinkRetainingCapacity`) before
+        // retrying so a since-fixed error doesn't linger.
+        if (expected == null and then_failed and !else_failed and !self.isNever(else_type)) {
+            self.result.diagnostics.items.shrinkRetainingCapacity(diagnostics_before_then);
+            then_type = try self.inferBlockExpected(conditional.then_branch, else_type);
+        } else if (expected == null and else_failed and !then_failed and !self.isNever(then_type)) {
+            self.result.diagnostics.items.shrinkRetainingCapacity(diagnostics_before_else);
+            else_type = try self.inferBlockExpected(conditional.else_branch, then_type);
+        }
         const joined = if (self.isNever(then_type)) else_type else if (self.isNever(else_type)) then_type else null;
         // `both_satisfy_expected` — when `expected` is known AND both
         // branches are ALREADY individually valid against it (checked
@@ -2252,6 +2347,25 @@ const Checker = struct {
     }
 
     fn inferCall(self: *Checker, expression: ast.ExprId, call: anytype) anyerror!types.TypeId {
+        return self.inferCallExpected(expression, call, null);
+    }
+
+    // `expected_return` — non-null only when this call is the value of an
+    // expression with a KNOWN expected type (currently: the right-hand
+    // side of an annotated `пер`, via `inferExpected`'s `.call` case).
+    // Used to seed generic substitutions from the function's RETURN type
+    // before falling back to argument-only inference — the bidirectional
+    // half `funcё[T](x: Строка) -> Тип(T)` needs when `T` never appears in
+    // any parameter. Real gap found auditing panosiki: `Тип(T)` could
+    // ONLY ever be inferred from arguments, so a type parameter used
+    // solely in the return position silently degraded to `poison` even
+    // when the caller had explicitly written the expected type
+    // (`пер к: Коробка(Число) = новая_коробка("x")`) right there — this
+    // is exactly the caller-provided context that should have resolved
+    // it. Deliberately does NOT attempt full Hindley-Milner unification
+    // (no cross-statement/deferred inference) — only this one caller-
+    // adjacent context.
+    fn inferCallExpected(self: *Checker, expression: ast.ExprId, call: anytype, expected_return: ?types.TypeId) anyerror!types.TypeId {
         if (try self.rejectUnavailableBuiltin(call.callee, call.span)) {
             for (call.arguments) |argument| _ = try self.infer(argument);
             return self.result.types.poison();
@@ -3136,14 +3250,63 @@ const Checker = struct {
                 if (generic_parameters.len != 0) {
                     var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
                     defer substitutions.deinit();
+                    // Seed from the caller's KNOWN expected type FIRST
+                    // (bidirectional half) — see `inferCallExpected`'s doc
+                    // comment. Structural unification against
+                    // `function.return_type`, same mechanism argument
+                    // inference already uses, just walked in the other
+                    // direction (parameter shape = return type, argument
+                    // shape = the caller's expected type).
+                    if (expected_return) |expected_type| {
+                        try self.inferGenericSubstitution(function.return_type, expected_type, &substitutions, call.span);
+                    }
                     for (arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
                         try self.inferGenericSubstitution(parameter, try self.infer(argument), &substitutions, call.span);
                     }
+                    // A type parameter that appears ONLY in the RETURN
+                    // type (never in any parameter) can't be inferred
+                    // from the call's arguments alone — the seeding step
+                    // above handles the case where the CALLER provided an
+                    // expected type; if that's ALSO absent, there is
+                    // truly no context anywhere to resolve it from (panos
+                    // has no cross-statement/deferred inference and no
+                    // explicit generic type-argument call syntax).
+                    // Silently substituting `poison` in that fully-
+                    // unconstrained case (not reporting an error) is NOT
+                    // a new leniency — real gap found the hard way:
+                    // before cross-module generic function signatures
+                    // started tracking `T` for real (see
+                    // `ImportedSymbolType.generic_parameters`), EVERY
+                    // such call already got exactly this behavior by
+                    // accident (`copyImportedType` degraded any
+                    // unremapped `.generic_parameter` to `poison` on
+                    // import, unconditionally). Panosiki code —
+                    // `выборка.новый_селектор(...)` (`cli-selector`),
+                    // i.e. `функ ф[T](x: Строка) -> Тип(T)` called with NO
+                    // annotation anywhere, T only ever pinned down later
+                    // through USAGE — depends on this exact fallback.
+                    // But when `expected_return` WAS available and
+                    // substitution STILL failed (the seeding step above
+                    // ran and didn't resolve every parameter), that's a
+                    // genuine inference failure, not an absence-of-
+                    // context case — report it instead of poisoning
+                    // silently, matching the "no unconstrained T out of
+                    // thin air when context exists" soundness goal.
                     for (generic_parameters) |parameter| {
-                        if (!substitutions.contains(parameter.typ)) try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
+                        if (substitutions.contains(parameter.typ)) continue;
+                        if (expected_return != null) {
+                            try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
+                        }
+                        try substitutions.put(parameter.typ, try self.result.types.poison());
                     }
                     for (generic_parameters) |parameter| {
-                        const actual = substitutions.get(parameter.typ) orelse continue;
+                        // The fill-loop right above guarantees every
+                        // `generic_parameters` entry has a substitution
+                        // by now (found from context, or explicitly
+                        // poison-filled) — `orelse` here would mean that
+                        // guarantee broke silently; make it loud instead.
+                        const actual = substitutions.get(parameter.typ) orelse unreachable;
+                        if (self.isPoison(actual)) continue;
                         for (parameter.bounds) |bound| {
                             if (!self.satisfiesInterfaceBound(actual, bound)) {
                                 const interface = self.resolution.symbols.get(bound) orelse continue;
@@ -4198,7 +4361,31 @@ const Checker = struct {
         switch (parameter_type.*) {
             .generic_parameter => {
                 if (substitutions.get(parameter)) |existing| {
-                    if (!self.assignable(argument, existing) or !self.assignable(existing, argument)) try self.report(span, "Type Error: type-параметр выведен неоднозначно", .{});
+                    // Число/Целое share ONE f64 runtime representation
+                    // (see `Целое(x)`/`Число(x)` casts — `Число` is a
+                    // pure no-op precisely because of this) — unifying a
+                    // generic parameter across TWO occurrences where one
+                    // argument is an untyped numeric literal (`0`,
+                    // inferred as plain `Число` with no expected-type
+                    // context to narrow it) and the other is a real
+                    // `Целое` (e.g. `.длина()`) is completely safe, not
+                    // a genuine ambiguity. Real regression found while
+                    // fixing cross-module generic-bound dispatch: every
+                    // cross-module generic call USED to skip this check
+                    // entirely (silently permissive, via the "T always
+                    // degrades to poison" gap this session's OTHER fix
+                    // just closed) — `std/тест.ps`'s `т.равны[T](a, b:
+                    // T, ...)`, called all over panosiki as `т.равны(...,
+                    // массив.длина(), 0, ...)`, only started hitting
+                    // this path once cross-module generics actually
+                    // started tracking `T` for real.
+                    if (self.isNumeric(argument) and self.isNumeric(existing)) {
+                        if (self.isType(existing, self.result.types.builtins.integer) or self.isType(argument, self.result.types.builtins.integer)) {
+                            try substitutions.put(parameter, self.result.types.builtins.integer);
+                        }
+                    } else if (!self.assignable(argument, existing) or !self.assignable(existing, argument)) {
+                        try self.report(span, "Type Error: type-параметр выведен неоднозначно", .{});
+                    }
                 } else {
                     try substitutions.put(parameter, argument);
                 }

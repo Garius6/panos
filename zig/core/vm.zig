@@ -7512,6 +7512,95 @@ test "type checker infers a generic struct's type parameter through an empty arr
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
+// Regression for the bidirectional-inference fix this session added
+// (`inferCallExpected`): `новая_коробка[T](метка: Строка) -> Коробка(T)`
+// has `T` ONLY in the return type — with an explicit `: Коробка(Число)`
+// annotation on the call site, `T` must now resolve to `Число` for real
+// (seeded from the expected type), not silently fall back to `poison`.
+test "VM resolves a generic call's return-only type parameter from an annotated let" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Коробка[T] = структура
+        \\    метка: Строка
+        \\    элементы: Массив(T)
+        \\конец
+        \\функ новая_коробка[T](метка: Строка) -> Коробка(T)
+        \\    Коробка(метка, массив())
+        \\конец
+        \\функ старт() -> Число
+        \\    пер к: Коробка(Число) = новая_коробка("х")
+        \\    к.элементы.добавить(42)
+        \\    к.элементы.получить(0, 0)
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(1), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Regression: an ANNOTATED call whose generic type parameter STILL can't
+// be resolved (expected type given, but structurally incompatible with
+// the function's own return type) must now be a hard Type Error — not a
+// silently-poisoned success. This is the "no unconstrained T out of thin
+// air when context exists" half of the bidirectional-inference fix.
+test "type checker reports an error when an annotated generic call's type parameter is genuinely unresolvable" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Коробка[T] = структура
+        \\    элементы: Массив(T)
+        \\конец
+        \\функ пустая_коробка[T]() -> Коробка(T)
+        \\    Коробка(массив())
+        \\конец
+        \\функ старт() -> Пусто
+        \\    пер к: Строка = пустая_коробка()
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    // `Строка` (the annotation) is structurally incompatible with
+    // `Коробка(T)` (the function's real return shape) — `T` can never be
+    // seeded from it, and there's no argument to fall back to either.
+    var found = false;
+    for (checked.diagnostics.items.items) |diagnostic_value| {
+        if (std.mem.indexOf(u8, diagnostic_value.message, "не удалось вывести type-параметр") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "VM partially destructures a named structure field" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");

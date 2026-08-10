@@ -1408,5 +1408,47 @@ test "runner reads a custom request header through Запрос.заголово
     try std.testing.expect(std.mem.indexOf(u8, body, "заголовок-ok") != null);
 }
 
+// Crash-oracle fuzz test over the ENTIRE pipeline (lex → parse → resolve →
+// typecheck → compile → run) — the class of bug this session actually
+// found in panosiki was never a lexer/parser crash, it was VM/typechecker
+// invariants breaking on legitimate-looking but unusual programs (empty
+// collection literals feeding generic inference, named-argument
+// constructors, cross-pass argument-order desync, ...). Random bytes
+// essentially never get past parsing, so the corpus below seeds a handful
+// of REAL near-miss shapes (empty generic literals, reordered named args,
+// nested match/if with mixed interface types) that the mutator can then
+// perturb — closer to what actually broke than pure byte noise. Diagnostics
+// and runtime errors are both an expected, PASSING outcome here; only an
+// actual panic/crash fails this test.
+test "full pipeline never panics on arbitrary or near-valid programs" {
+    try std.testing.fuzz(std.testing.allocator, testPipelineNeverPanics, .{
+        .corpus = &.{
+            "",
+            "экспорт функ старт() -> Число\n0\nконец",
+            "тип Т[T] = структура\nx: Массив(T)\nконец\nфунк ф[T](a: T) -> Т(T)\nТ(массив())\nконец",
+            "тип Т = структура\nx: Число\ny: Число\nконец\nэкспорт функ старт() -> Число\nТ(y = 1, x = 2).x\nконец",
+            "экспорт функ старт() -> Число\nвыбор 1\n1 -> 2\n_ -> 3\nконец\nконец",
+            "экспорт функ старт() -> Пусто\nпер x: Соответствие(Строка, Число) = соответствие()\nx[\"a\"] = 1\nконец",
+            "функ ф() -> Никогда\nпаника(\"x\")\nконец",
+            // Return-only generic type parameter, seeded from an
+            // annotated `пер` (bidirectional inference, added this
+            // session) — both the resolvable and genuinely-unresolvable
+            // shapes.
+            "тип К[T] = структура\nэ: Массив(T)\nконец\nфунк ф[T]() -> К(T)\nК(массив())\nконец\nэкспорт функ старт() -> Пусто\nпер к: К(Число) = ф()\nконец",
+            "тип К[T] = структура\nэ: Массив(T)\nконец\nфунк ф[T]() -> К(T)\nК(массив())\nконец\nэкспорт функ старт() -> Пусто\nпер к: Строка = ф()\nконец",
+            // Cross-module-shaped generic interface bound (single-file
+            // approximation) — the class of bug that broke `pan init`.
+            "тип Т = структура\nx: Число\nконец\nреализация Печатаемое для Т\nфунк вСтроку(это: Т) -> Строка\n\"т\"\nконец\nконец\nфунк ф[T: Печатаемое](x: T) -> Строка\nx.вСтроку()\nконец\nэкспорт функ старт() -> Строка\nф(Т(1))\nконец",
+        },
+    });
+}
+
+fn testPipelineNeverPanics(allocator: std.mem.Allocator, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [4096]u8 = undefined;
+    const len = smith.slice(&buffer);
+    var result = try runSource(allocator, "фазз.ps", buffer[0..len]);
+    defer result.deinit();
+}
+
 
 

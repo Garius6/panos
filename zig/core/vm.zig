@@ -1438,6 +1438,7 @@ pub const Vm = struct {
             .connection_write_submit => try self.connectionWriteSubmit(),
             .connection_close => try self.connectionClose(),
             .url_encode => try self.urlEncode(),
+            .url_decode => try self.urlDecode(),
             .http_request_submit => try self.httpRequestSubmit(),
             .sql_open_submit => try self.sqlOpenSubmit(),
             .sql_exec_submit => try self.sqlExecSubmit(),
@@ -2310,6 +2311,29 @@ pub const Vm = struct {
             try self.fault("Runtime Error: строки.срез_байт(): границы вне диапазона", .{});
             return;
         }
+        // `строки.найти` returns a RUNE index, `срез_байт` takes BYTE
+        // indices — mixing the two (a real, confirmed-by-running trap:
+        // `строки.срез_байт(текст, строки.найти(текст, "хлеб", 0), ...)`
+        // silently produced mangled output on Cyrillic input, since a
+        // rune offset landing mid-character is a perfectly valid byte
+        // offset арифметически, just not a valid UTF-8 boundary) is not
+        // fixable by guessing which index kind the caller meant — but a
+        // continuation byte (`10xxxxxx`) at either boundary means the
+        // slice cuts a multi-byte rune in half, which is NEVER correct
+        // regardless of which index kind was intended. Converts silent
+        // corruption into a loud, debuggable error at the exact call
+        // site that got it wrong, instead of mangled output surfacing
+        // however many operations later someone finally looks at the
+        // string.
+        const is_continuation_byte = struct {
+            fn check(bytes: []const u8, offset: usize) bool {
+                return offset < bytes.len and bytes[offset] & 0xC0 == 0x80;
+            }
+        }.check;
+        if (is_continuation_byte(string, start) or is_continuation_byte(string, end)) {
+            try self.fault("Runtime Error: строки.срез_байт(): граница внутри UTF-8-руны — вероятно, перепутаны rune- и byte-индексы", .{});
+            return;
+        }
         const result = try self.heap.createString(try self.allocator.dupe(u8, string[start..end]));
         try self.stack.append(self.allocator, .{ .heap_string = result });
     }
@@ -3174,6 +3198,50 @@ pub const Vm = struct {
             }
         }
         const heap_string = try self.heap.createString(try encoded.toOwnedSlice(self.allocator));
+        try self.stack.append(self.allocator, .{ .heap_string = heap_string });
+    }
+
+    // Real gap found this session running `std/сеть/http.pns`'s router
+    // against a real curl request: HTTP clients percent-encode non-ASCII
+    // path segments on the wire (confirmed via `curl -sv` sending
+    // `/api/%d0%b7...` for a route registered as `/api/задачи`), and the
+    // router compared the RAW (still-encoded) request path against route
+    // templates — a Cyrillic route could never match a real request. No
+    // decode counterpart to `urlEncode` existed anywhere (native, std/,
+    // nothing) before this. Byte-level, symmetric with `urlEncode` above
+    // — a malformed `%`-escape (not a hex pair, or `%` truncated at the
+    // end of the string) is a `Runtime Error`, not a silent drop, so a
+    // malformed path fails loudly instead of matching the wrong route.
+    fn urlDecode(self: *Vm) anyerror!void {
+        const text = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: сеть.декодировать_url() ожидает Строку", .{});
+            return;
+        };
+        var decoded: std.ArrayList(u8) = .empty;
+        defer decoded.deinit(self.allocator);
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] == '%') {
+                if (i + 2 >= text.len) {
+                    try self.fault("Runtime Error: сеть.декодировать_url(): '%' в конце строки без hex-пары", .{});
+                    return;
+                }
+                const high = std.fmt.charToDigit(text[i + 1], 16) catch {
+                    try self.fault("Runtime Error: сеть.декодировать_url(): некорректный '%'-escape", .{});
+                    return;
+                };
+                const low = std.fmt.charToDigit(text[i + 2], 16) catch {
+                    try self.fault("Runtime Error: сеть.декодировать_url(): некорректный '%'-escape", .{});
+                    return;
+                };
+                try decoded.append(self.allocator, @intCast(high << 4 | low));
+                i += 3;
+            } else {
+                try decoded.append(self.allocator, text[i]);
+                i += 1;
+            }
+        }
+        const heap_string = try self.heap.createString(try decoded.toOwnedSlice(self.allocator));
         try self.stack.append(self.allocator, .{ .heap_string = heap_string });
     }
 

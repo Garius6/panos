@@ -3332,6 +3332,17 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.string;
             }
+            if (self.isBuiltinModule(symbol, "сеть", "декодировать_url")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: сеть.декодировать_url() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: сеть.декодировать_url() ожидает Строку", .{});
+                }
+                return self.result.types.builtins.string;
+            }
             if (self.isBuiltinModule(symbol, "сеть", "http_запрос")) {
                 // (статус, заголовки, тело) — плоский tuple, тот же
                 // паттерн, что и у `ос.выполнить`: сырые данные, не
@@ -3577,6 +3588,20 @@ const Checker = struct {
                                 }
                             }
                             return object_type;
+                        }
+                    },
+                    .primitive => |primitive| {
+                        // `Строка` had no `.длина()` at all — only the free
+                        // function `длина(x)` worked on strings (Массив/
+                        // Соответствие have BOTH), a confusing asymmetry
+                        // (`Type Error: у типа нет поля 'длина'` reads like
+                        // a typo, not "use the free function instead").
+                        // Same `.string_length`/`строки::длина` runtime
+                        // path the free function already uses — no VM
+                        // change, purely a dispatch gap.
+                        if (primitive == .string and std.mem.eql(u8, property.property, "длина")) {
+                            try self.checkMethodArity(call, "длина", 0);
+                            return self.result.types.builtins.integer;
                         }
                     },
                     .map => |map| {
@@ -5135,6 +5160,27 @@ test "type checker infers collection elements through indexing" {
     try std.testing.expectEqual(checked.types.builtins.number, checked.expression_types.get(index).?);
 }
 
+// Real gap found this session: `Строка` had `.есть()`/`.получить()`/etc
+// counterparts nowhere, but specifically `.длина()` was missing while
+// Массив/Соответствие both have it AND the free function `длина(x)`
+// already worked fine on strings — a confusing asymmetry, not a
+// deliberate omission. Fixed by adding a `.primitive == .string` arm
+// alongside the existing `.array`/`.map` arms in the same dispatch.
+test "type checker allows .длина() as a method on Строка, matching Массив/Соответствие" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Целое\nпер s = \"привет\"\ns.длина()\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
 test "type checker infers lambda parameters from a function annotation" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -5451,6 +5497,32 @@ test "type checker unifies branches of a nested if-expression used as an else-br
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
     var lexed = try lexer.tokenize(std.testing.allocator, "тип Т = структура\nx: Число\nконец\nфунк f(a: Т) -> Число\nпер b = если истина тогда\nТ(2)\nиначе\nесли ложь тогда\nТ(3)\nиначе\na\nконец\nконец\nb.x\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+// Pre-emptive coverage, not a fix — an older memory of a bug report
+// claimed `массив()` (empty array literal) inside a `выбор` arm doesn't
+// inherit its element type from the enclosing function's declared `->
+// Массив(T)` return type. Re-tested directly this session: NOT
+// reproducible, on this commit or on the one right before `5515580`'s
+// nested-if-expression fix — `inferMatchExpected` already threads
+// `expected` correctly into each arm via `inferBlockExpected(arm.body,
+// expected, false)`. Zero prior test coverage of this exact shape
+// existed, though, and it's the same "trailing value type propagation"
+// category `5515580` fixed a real bug in — this locks the behavior in
+// so a future regression here doesn't go unnoticed the same way.
+test "type checker infers массив() element type inside a выбор arm from the function's declared return type" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип E = перечисление\nА\nБ\nконец\nфунк f(e: E) -> Массив(Число)\nвыбор e\nE.А -> массив()\nE.Б -> массив(1)\nконец\nконец\nфунк старт() -> Массив(Число)\nf(E.А)\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

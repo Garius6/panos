@@ -197,8 +197,15 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
     };
 
     // `mir_lowering.zig` deliberately rejects language features outside
-    // the current AOT runtime (ADTs, closures, actors, async I/O, ...).
-    var module = try panos_core.mir_lowering.lowerGraph(init.gpa, &graph, &compiled);
+    // the current AOT runtime (ADTs, closures, actors, async I/O, ...) —
+    // it already printed the SPECIFIC reason to stderr before returning
+    // `error.AotUnsupported`; this catch only needs to turn that into a
+    // clean exit instead of an unhandled-error trace.
+    var module = panos_core.mir_lowering.lowerGraph(init.gpa, &graph, &compiled) catch |err| {
+        if (err != error.AotUnsupported) return err;
+        try stderr.flush();
+        std.process.exit(1);
+    };
     defer module.deinit(init.gpa);
     try panos_core.mir_cps.prepare(&module);
 

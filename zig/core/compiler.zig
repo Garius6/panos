@@ -1006,6 +1006,11 @@ const FunctionCompiler = struct {
             try self.function.emit(self.compiler.result.allocator, .{ .url_encode = {} });
             return true;
         }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "декодировать_url")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .url_decode = {} });
+            return true;
+        }
         if (call.arguments.len == 4 and std.mem.eql(u8, property.property, "http_запрос")) {
             for (call.arguments) |argument| try self.compileExpression(argument);
             try self.function.emit(self.compiler.result.allocator, .{ .http_request_submit = {} });
@@ -1251,6 +1256,10 @@ const FunctionCompiler = struct {
         const object_type = self.compiler.checked.expression_types.get(property.object) orelse return false;
         const type_entry = self.compiler.checked.types.get(object_type) orelse return false;
         const instruction: bytecode.Instruction = switch (type_entry.*) {
+            .primitive => |primitive| if (primitive == .string and std.mem.eql(u8, property.property, "длина") and call.arguments.len == 0)
+                .{ .string_length = {} }
+            else
+                return false,
             .array => if (std.mem.eql(u8, property.property, "длина") and call.arguments.len == 0)
                 .{ .array_length = {} }
             else if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 2)

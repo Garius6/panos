@@ -1273,7 +1273,22 @@ const Parser = struct {
             },
             .ident => {},
             else => {
-                try self.report(value.span, "Синтаксическая ошибка: такой шаблон в выборе не поддержан");
+                // Real trap found running actual code, not just reading
+                // it: forgetting `тогда ... конец` after a multi-statement
+                // match arm (`Шаблон -> первое_выражение\nвторой_statement`
+                // — legal only as `Шаблон тогда ... конец`) makes the
+                // PARSER, not just the user, misread the orphaned second
+                // statement as the start of a NEW arm's pattern — which
+                // lands here once its tokens don't parse as one. The
+                // cascade of confusing follow-on errors after this one
+                // (from whatever partial pattern/expression got parsed
+                // from the orphaned statement) isn't safely fixable via
+                // lookahead without real backtracking (this parser has
+                // none — see 005-language-fixes' precedent for the same
+                // constraint), so only THIS first, always-correct
+                // diagnostic gets a hint — the point where the parser is
+                // already, unambiguously, reporting an error regardless.
+                try self.report(value.span, "Синтаксическая ошибка: такой шаблон в выборе не поддержан (если это продолжение предыдущей ветки с несколькими операторами — используйте 'тогда ... конец')");
                 return self.result.ast.addPattern(.{ .error_node = value.span });
             },
         }

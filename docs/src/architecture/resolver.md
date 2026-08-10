@@ -98,5 +98,5 @@ byte-span объявления), см. [LSP-сервер](./lsp.md).
 |---|---|
 | Новая diagnostic-проверка при резолве (например запрет использования зарезервированного имени) | `report_resolve` (`resolver.odin:489`) — репортит `Diagnostic` в `ctx.diagnostics`, не паникует (accumulate-not-panic, тот же паттерн, что в парсере/тайпчекере) |
 | Новый вид объявления, которое резолвер должен видеть на верхнем уровне модуля | `resolve_program`/место обхода `prog.decls` — нужно добавить ветку `#partial switch` |
-| Изменить, как резолвится путь импорта | `resolve_import_path` (`resolver.odin:309`) — конкатенация `importer_dir`+`import_spec`, добавление `.ps`-суффикса, нормализация пути |
+| Изменить, как резолвится путь импорта | `resolve_import_path` (`resolver.odin:309`) — конкатенация `importer_dir`+`import_spec`, добавление `.pns`-суффикса, нормализация пути |
 | Изменить, что попадает в `node_symbols` (для LSP-фич вроде semantic tokens/rename) | места вызова `ctx.node_symbols[expr] = sym_id` внутри резолва `Ident_Expr`/`Property_Expr` |

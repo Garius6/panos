@@ -5,7 +5,7 @@
       "id": "semantic-undefined-name",
       "tier": "semantic",
       "profile": "native",
-      "input": "tests/conformance/semantic/undefined_name.ps",
+      "input": "tests/conformance/semantic/undefined_name.pns",
       "expected": {
         "status": "diagnostic",
         "exit_code": 1,
@@ -14,7 +14,7 @@
           {
             "phase": "resolver",
             "severity": "err",
-            "path": "tests/conformance/semantic/undefined_name.ps",
+            "path": "tests/conformance/semantic/undefined_name.pns",
             "start_byte": 36,
             "end_byte": 56,
             "message": "Resolve Error: неопределённое имя 'неизвестно'"
@@ -26,7 +26,7 @@
       "id": "semantic-wrong-return-type",
       "tier": "semantic",
       "profile": "native",
-      "input": "tests/conformance/semantic/wrong_return_type.ps",
+      "input": "tests/conformance/semantic/wrong_return_type.pns",
       "expected": {
         "status": "diagnostic",
         "exit_code": 1,
@@ -35,7 +35,7 @@
           {
             "phase": "type_checker",
             "severity": "err",
-            "path": "tests/conformance/semantic/wrong_return_type.ps",
+            "path": "tests/conformance/semantic/wrong_return_type.pns",
             "start_byte": 0,
             "end_byte": 59,
             "message": "Type Error: функция должна возвращать объявленный тип"
@@ -51,7 +51,7 @@
       "id": "runtime-fib-recursive",
       "tier": "runtime",
       "profile": "native",
-      "input": "tests/conformance/benchmarks/fib_recursive.ps",
+      "input": "tests/conformance/benchmarks/fib_recursive.pns",
       "expected": {
         "status": "success",
         "exit_code": 0,
@@ -63,7 +63,7 @@
       "id": "runtime-loop-sum",
       "tier": "runtime",
       "profile": "native",
-      "input": "tests/conformance/benchmarks/loop_sum.ps",
+      "input": "tests/conformance/benchmarks/loop_sum.pns",
       "expected": {
         "status": "success",
         "exit_code": 0,
@@ -79,7 +79,7 @@
       "id": "runtime-string-concat",
       "tier": "runtime",
       "profile": "native",
-      "input": "tests/conformance/benchmarks/string_concat.ps",
+      "input": "tests/conformance/benchmarks/string_concat.pns",
       "expected": {
         "status": "success",
         "exit_code": 0,
@@ -91,7 +91,7 @@
       "id": "native-file-roundtrip",
       "tier": "native",
       "profile": "native",
-      "input": "tests/integration/native/file_roundtrip.ps",
+      "input": "tests/integration/native/file_roundtrip.pns",
       "expected": {
         "status": "success",
         "exit_code": 0,
@@ -107,7 +107,7 @@
       "id": "native-ffi-libc",
       "tier": "native",
       "profile": "native",
-      "input": "tests/integration/native/ffi_libc.ps",
+      "input": "tests/integration/native/ffi_libc.pns",
       "expected": {
         "status": "success",
         "exit_code": 0,
@@ -119,7 +119,7 @@
       "id": "native-http-client-error",
       "tier": "native",
       "profile": "native",
-      "input": "tests/integration/native/http_client_error.ps",
+      "input": "tests/integration/native/http_client_error.pns",
       "expected": {
         "status": "success",
         "exit_code": 0,
@@ -131,7 +131,7 @@
       "id": "native-sqlite-roundtrip",
       "tier": "native",
       "profile": "native",
-      "input": "tests/integration/native/sqlite_roundtrip.ps",
+      "input": "tests/integration/native/sqlite_roundtrip.pns",
       "expected": {
         "status": "success",
         "exit_code": 0,
@@ -143,7 +143,7 @@
       "id": "aot-fib-recursive",
       "tier": "aot",
       "profile": "aot_wasi",
-      "input": "tests/conformance/benchmarks/fib_recursive.ps",
+      "input": "tests/conformance/benchmarks/fib_recursive.pns",
       "expected": {
         "status": "success",
         "exit_code": 0,
@@ -159,7 +159,7 @@
       "id": "aot-loop-sum",
       "tier": "aot",
       "profile": "aot_wasi",
-      "input": "tests/conformance/benchmarks/loop_sum.ps",
+      "input": "tests/conformance/benchmarks/loop_sum.pns",
       "expected": {
         "status": "success",
         "exit_code": 0,

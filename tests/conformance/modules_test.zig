@@ -64,23 +64,23 @@ fn runStartExpectingNumber(allocator: std.mem.Allocator, entry_path: []const u8,
 }
 
 test "modules/basic_import: cross-file exported function and constant, loaded from real files" {
-    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/basic_import/main.ps", 42);
+    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/basic_import/main.pns", 42);
 }
 
 test "modules/three_file_chain: transitive import (main -> mid -> leaf), loaded from real files" {
-    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/three_file_chain/main.ps", 31);
+    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/three_file_chain/main.pns", 31);
 }
 
 test "modules/generic_struct: imported generic struct instantiation + method dispatch, loaded from real files" {
-    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/generic_struct/main.ps", 42);
+    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/generic_struct/main.pns", 42);
 }
 
 test "modules/adt_match: imported generic enum construction + exhaustive match, loaded from real files" {
-    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/adt_match/main.ps", 42);
+    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/adt_match/main.pns", 42);
 }
 
 test "modules/interface_dispatch: cross-module interface impl dispatched as an ordinary call, loaded from real files" {
-    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/interface_dispatch/main.ps", 38);
+    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/interface_dispatch/main.pns", 38);
 }
 
 // No `импорт` at all in this fixture — `Опция` must resolve via the
@@ -99,7 +99,7 @@ test "modules/interface_dispatch: cross-module interface impl dispatched as an o
 // they always go through `analyzeSourceForTarget`'s explicit
 // `appendPreludeModule` call instead.
 test "modules/prelude_merge: Опция resolves without any импорт, loaded from a real file" {
-    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/prelude_merge/main.ps", 42);
+    try runStartExpectingNumber(std.testing.allocator, "tests/conformance/modules/prelude_merge/main.pns", 42);
 }
 
 test "modules/missing_export: importing an unexported (or nonexistent) name reports the documented diagnostic" {
@@ -109,7 +109,7 @@ test "modules/missing_export: importing an unexported (or nonexistent) name repo
     var graph = panos.module_loader.Graph.init(std.testing.allocator);
     defer graph.deinit();
     const reader = FileReader{ .io = io.io() };
-    try graph.load(&reader, "tests/conformance/modules/missing_export/main.ps");
+    try graph.load(&reader, "tests/conformance/modules/missing_export/main.pns");
 
     var compiled = try panos.module_compiler.compileGraph(std.testing.allocator, &graph);
     defer compiled.deinit();
@@ -128,11 +128,11 @@ test "modules/cycle: a mutually-importing pair reports a cycle diagnostic, loade
     var graph = panos.module_loader.Graph.init(std.testing.allocator);
     defer graph.deinit();
     const reader = FileReader{ .io = io.io() };
-    try graph.load(&reader, "tests/conformance/modules/cycle/a.ps");
+    try graph.load(&reader, "tests/conformance/modules/cycle/a.pns");
 
     try std.testing.expectEqual(@as(usize, 1), graph.diagnostics.items.items.len);
     try std.testing.expectEqualStrings(
-        "Module Loader Error: обнаружен циклический импорт 'tests/conformance/modules/cycle/a.ps'",
+        "Module Loader Error: обнаружен циклический импорт 'tests/conformance/modules/cycle/a.pns'",
         graph.diagnostics.items.items[0].message,
     );
 }
@@ -144,7 +144,7 @@ test "modules/adt_non_exhaustive: a match missing a variant reports an exhaustiv
     var graph = panos.module_loader.Graph.init(std.testing.allocator);
     defer graph.deinit();
     const reader = FileReader{ .io = io.io() };
-    try graph.load(&reader, "tests/conformance/modules/adt_non_exhaustive/main.ps");
+    try graph.load(&reader, "tests/conformance/modules/adt_non_exhaustive/main.pns");
     try std.testing.expectEqual(@as(usize, 0), graph.diagnostics.items.items.len);
 
     var compiled = try panos.module_compiler.compileGraph(std.testing.allocator, &graph);

@@ -285,7 +285,7 @@ pub fn analyzeSourceForTarget(
 
     var graph = module_loader.Graph.init(allocator);
     errdefer graph.deinit();
-    const canonical_path = try module_loader.resolveImportPath(allocator, path, "");
+    const canonical_path = try module_loader.resolveImportPath(allocator, path, "", ".pns");
     defer allocator.free(canonical_path);
     const reader = SingleFileReader{ .path = canonical_path, .bytes = input };
     try graph.load(&reader, path);

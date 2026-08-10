@@ -25,7 +25,7 @@ wasm (`#+build js`):
 | `vm_http_native.odin` | `vm_http_wasm.odin` | HTTP(S)-клиент |
 | `vm_io_native.odin` | `vm_io_wasm.odin` | Файловый ввод-вывод |
 | `vm_process_native.odin` | `vm_process_wasm.odin` | `ос.выполнить`/`ос.завершить` (спавн процесса, exit-with-code) — wasm-заглушка паникует, браузер не может управлять процессами |
-| `vm_syntax_native.odin` | `vm_syntax_wasm.odin` | `синтаксис.*` (compile-time АСТ-интроспекция ДРУГОГО `.ps` файла для codegen-инструментов) — wasm-заглушка паникует, нет файловой системы для чтения чужого файла |
+| `vm_syntax_native.odin` | `vm_syntax_wasm.odin` | `синтаксис.*` (compile-time АСТ-интроспекция ДРУГОГО `.pns` файла для codegen-инструментов) — wasm-заглушка паникует, нет файловой системы для чтения чужого файла |
 
 Точка входа wasm-сборки — `wasm/main.odin`, экспортирует `panos_run "c"`
 (и `panos_check`/`panos_hover`/`panos_complete` для интерактивного демо —

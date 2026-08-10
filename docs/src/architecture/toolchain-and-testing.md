@@ -31,7 +31,7 @@ debug-путь — `zig build -Doptimize=Debug`) — Odin остаётся со�
 
 - `just test` → `odin test ./core` — весь Odin-набор тестов (Zig-набор —
   `zig build test`, см. "Zig-тулчейн" ниже).
-- `just debug-file <path>` → запуск одного `.ps`-файла с vet/debug-флагами
+- `just debug-file <path>` → запуск одного `.pns`-файла с vet/debug-флагами
   (`odin run . -debug -vet -strict-style -vet-tabs -warnings-as-errors`).
 
 ## Зачем
@@ -71,18 +71,18 @@ wasm-сборка выполняется в браузере без файлов
   поэтому живёт в `pipeline.odin`, а не в помеченном `#+build !js_wasm32`
   `e2e_test.odin` (`core:testing` не собирается под `js`).
 - **Полный `Module_Graph`-пайплайн** (`core/module_loader.odin`,
-  `load_module_graph_with_overrides`) — читает `std/*.ps` и другие модули с
+  `load_module_graph_with_overrides`) — читает `std/*.pns` и другие модули с
   диска, резолвит граф импортов целиком. Используется LSP-сервером
   (`revalidate_document` в `lsp/lsp_server.odin`) и полноценным CLI-запуском
   файла, НЕ используется в изолированных unit-тестах core-пакета.
 - **Известное следствие для тестов**: изолированный тестовый путь
   (`resolve_program`/`typecheck_program` напрямую на распарсенной
-  `Program`, без `Module_Graph`) НЕ грузит файловые `std/*.ps`-модули с
+  `Program`, без `Module_Graph`) НЕ грузит файловые `std/*.pns`-модули с
   диска — `импорт математика` в таком тесте не резолвится (модуль не
   найден), а `импорт строки` резолвится (это core builtin-модуль,
   регистрируется без файлового I/O, см. [модульная система](./module-system.md)).
   Тесты, которым нужен реальный импорт stdlib-модуля, должны использовать
-  builtin-модуль вроде `строки`, а не файловый `std/*.ps`-модуль (см.
+  builtin-модуль вроде `строки`, а не файловый `std/*.pns`-модуль (см.
   `core/semantic_tokens_test.odin` — конкретный пример этого затруднения и
   исправления).
 
@@ -158,15 +158,15 @@ Odin-версия, см. ниже). Odin-рецепты НЕ удалены — 
   `zig/browser/main.zig` под НАТИВНЫЙ таргет для юнит-тестов самой логики,
   не под wasm — так исторически проще тестировать browser-специфичный код
   без wasm-рантайма).
-- `zig build run -- <file.ps> [-v|--verbose] [program args...]` —
+- `zig build run -- <file.pns> [-v|--verbose] [program args...]` —
   запускает файл через нативный Zig CLI (`zig/cli/main.zig`); `-v`
   печатает промежуточную статистику пайплайна (AST/типы/байткод), всё
   после пути к файлу становится `ос.аргументы()` внутри самой программы.
-- `zig build run -- build --target=wasm <file.ps> [-o выход.wasm]` (или
+- `zig build run -- build --target=wasm <file.pns> [-o выход.wasm]` (или
   собранный `zig-out/bin/panos build --target=wasm ...` напрямую) — AOT
   MIR→WASM сборка одного файла (T048, см. новый раздел ниже) — НЕ то же
   самое, что `zig build browser` (которая собирает сам ИНТЕРПРЕТАТОР под
-  wasm, а не компилирует пользовательскую `.ps`-программу в отдельный
+  wasm, а не компилирует пользовательскую `.pns`-программу в отдельный
   `.wasm`-модуль).
 - `zig build aot-runtime-js` / `zig build aot-runtime-wasi` — сборка
   рантайм-модулей для AOT-пути (`zig/wasm_runtime/`) — РЕАЛЬНЫЕ, не

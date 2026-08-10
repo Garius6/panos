@@ -2,7 +2,7 @@ const std = @import("std");
 const panos = @import("panos_core");
 
 test "parser conformance fixture produces one typed function" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/basic.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/basic.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -21,7 +21,7 @@ test "parser conformance fixture produces one typed function" {
 }
 
 test "parser conformance fixture preserves module declarations and type syntax" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/declarations.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/declarations.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -52,7 +52,7 @@ test "parser conformance fixture preserves module declarations and type syntax" 
 }
 
 test "parser conformance fixture preserves structs interfaces and generic ADTs" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/types.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/types.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -92,7 +92,7 @@ test "parser conformance fixture preserves structs interfaces and generic ADTs" 
 }
 
 test "parser conformance fixture preserves nested control-flow blocks" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/control_flow.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/control_flow.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -126,7 +126,7 @@ test "parser conformance fixture preserves nested control-flow blocks" {
 }
 
 test "parser conformance fixture preserves for-in bindings" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/for_in.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/for_in.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -149,7 +149,7 @@ test "parser conformance fixture preserves for-in bindings" {
 }
 
 test "parser conformance fixture preserves inclusive numeric ranges" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/for_range.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/for_range.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -170,7 +170,7 @@ test "parser conformance fixture preserves inclusive numeric ranges" {
 }
 
 test "parser conformance fixture accepts binary operators after a line break" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/wrapped_binary.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/wrapped_binary.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -194,7 +194,7 @@ test "parser conformance fixture accepts binary operators after a line break" {
 }
 
 test "parser conformance fixture preserves bitwise negation and tuple index chains" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/bitwise_tuple_index.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/bitwise_tuple_index.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -230,7 +230,7 @@ test "parser conformance fixture preserves bitwise negation and tuple index chai
 }
 
 test "parser conformance fixture recovers at the next top-level declaration" {
-    const input = @embedFile("parser/recovery.ps");
+    const input = @embedFile("parser/recovery.pns");
     var lexed = try panos.lexer.tokenize(std.testing.allocator, input, 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
@@ -259,7 +259,7 @@ test "parser conformance fixture recovers at the next top-level declaration" {
 }
 
 test "parser conformance fixture preserves lambdas and spawn expressions" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/lambda_spawn.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/lambda_spawn.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -292,7 +292,7 @@ test "parser conformance fixture preserves lambdas and spawn expressions" {
 }
 
 test "parser conformance fixture preserves match patterns and both arm forms" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/match.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/match.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -327,7 +327,7 @@ test "parser conformance fixture preserves match patterns and both arm forms" {
 }
 
 test "parser conformance fixture preserves foreign ABI declarations" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/foreign.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/foreign.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -355,7 +355,7 @@ test "parser conformance fixture preserves foreign ABI declarations" {
 }
 
 test "parser conformance fixture preserves FFI structs and values by ABI" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/ffi_struct.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/ffi_struct.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -380,7 +380,7 @@ test "parser conformance fixture preserves FFI structs and values by ABI" {
 }
 
 test "parser conformance fixture preserves declaration and field annotations" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/annotations.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/annotations.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -413,7 +413,7 @@ test "parser conformance fixture preserves declaration and field annotations" {
 }
 
 test "parser conformance fixture lowers collection constructor literals" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/collections.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/collections.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -443,7 +443,7 @@ test "parser conformance fixture lowers collection constructor literals" {
 }
 
 test "parser conformance fixture preserves tuple and struct destructuring" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/destructure.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/destructure.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -482,7 +482,7 @@ test "parser conformance fixture preserves tuple and struct destructuring" {
 }
 
 test "parser conformance fixture desugars interpolated strings" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/interpolation.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/interpolation.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -503,7 +503,7 @@ test "parser conformance fixture desugars interpolated strings" {
 }
 
 test "parser conformance fixture preserves three-part match qualifications" {
-    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/qualified_match.ps"), 0);
+    var lexed = try panos.lexer.tokenize(std.testing.allocator, @embedFile("parser/qualified_match.pns"), 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

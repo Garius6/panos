@@ -31,7 +31,7 @@ pub export fn panos_run(source_len: i32) void {
         setResult("Ошибка спайка: исходник длиннее буфера демо\n");
         return;
     };
-    var run = panos_core.runner.runSourceForTarget(allocator, "плейграунд.ps", input, .browser_interpreter) catch {
+    var run = panos_core.runner.runSourceForTarget(allocator, "плейграунд.pns", input, .browser_interpreter) catch {
         setResult("Ошибка выполнения Zig-версии\n");
         return;
     };
@@ -56,7 +56,7 @@ pub export fn panos_check(source_len: i32) void {
         setResult("[]");
         return;
     };
-    var run = panos_core.runner.checkSourceForTarget(allocator, "плейграунд.ps", input, .browser_interpreter) catch {
+    var run = panos_core.runner.checkSourceForTarget(allocator, "плейграунд.pns", input, .browser_interpreter) catch {
         setResult("[]");
         return;
     };
@@ -74,7 +74,7 @@ pub export fn panos_hover(source_len: i32, utf16_offset: i32) void {
         setResult("null");
         return;
     };
-    var analysis = panos_core.runner.analyzeSourceForTarget(allocator, "плейграунд.ps", input, .browser_interpreter) catch {
+    var analysis = panos_core.runner.analyzeSourceForTarget(allocator, "плейграунд.pns", input, .browser_interpreter) catch {
         setResult("null");
         return;
     };
@@ -133,7 +133,7 @@ pub export fn panos_complete(source_len: i32, utf16_offset: i32) void {
         @memcpy(bytes[byte_offset + placeholder.len ..], input[byte_offset..]);
         break :blk bytes;
     };
-    var analysis = panos_core.runner.analyzeSourceForTarget(allocator, "плейграунд.ps", analysis_input, .browser_interpreter) catch {
+    var analysis = panos_core.runner.analyzeSourceForTarget(allocator, "плейграунд.pns", analysis_input, .browser_interpreter) catch {
         setResult("[]");
         return;
     };

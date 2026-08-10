@@ -161,10 +161,31 @@ pub const Graph = struct {
         return null;
     }
 
+    // Bare (extension-less) entry paths get the same `.pns`-then-`.ps`
+    // try-both treatment as bare `импорт` names (`appendCandidateBothSuffixes`)
+    // — otherwise an unmigrated `.ps`-only project passed as `panos run
+    // проект/main` (no explicit extension) would resolve straight to a
+    // nonexistent `main.pns` and fail. An entry path with an explicit
+    // extension resolves once, as given.
     pub fn load(self: *Graph, reader: anytype, entry_path: []const u8) !void {
-        const canonical_path = try resolveImportPath(self.allocator, entry_path, "");
-        defer self.allocator.free(canonical_path);
-        _ = try self.loadRecursive(reader, canonical_path, null);
+        if (hasKnownSourceExtension(entry_path)) {
+            const canonical_path = try resolveImportPath(self.allocator, entry_path, "", ".pns");
+            defer self.allocator.free(canonical_path);
+            _ = try self.loadRecursive(reader, canonical_path, null);
+            return;
+        }
+
+        const pns_path = try resolveImportPath(self.allocator, entry_path, "", ".pns");
+        defer self.allocator.free(pns_path);
+        if (self.tryLoadSilently(reader, pns_path, null)) |_| {
+            return;
+        } else |err| {
+            if (err != error.FileNotFound) return err;
+        }
+
+        const ps_path = try resolveImportPath(self.allocator, entry_path, "", ".ps");
+        defer self.allocator.free(ps_path);
+        _ = try self.loadRecursive(reader, ps_path, null);
     }
 
     // Appends embedded prelude source as a module with NO explicit `импорт`
@@ -327,6 +348,20 @@ pub const Graph = struct {
     // existing diagnostic-text assertions keep matching).
     const ImportResolution = struct { target: ?usize, native_module: ?[]const u8 = null };
 
+    // Bare (extension-less) import names get tried as `.pns` first, then
+    // `.ps` — the FileNotFound-tolerant candidate loop in
+    // `resolveAndLoadImport` already treats "not found" as "try the next
+    // candidate", so this reuses that machinery rather than adding a
+    // second resolution pass. An import path that already names an
+    // extension explicitly resolves once, as given (no `.ps` file ever
+    // gets probed for an explicit `.pns` import or vice versa).
+    fn appendCandidateBothSuffixes(self: *Graph, candidates: *std.ArrayList([]u8), raw_path: []const u8, importer_path: []const u8) !void {
+        try candidates.append(self.allocator, try resolveImportPath(self.allocator, raw_path, importer_path, ".pns"));
+        if (!hasKnownSourceExtension(raw_path)) {
+            try candidates.append(self.allocator, try resolveImportPath(self.allocator, raw_path, importer_path, ".ps"));
+        }
+    }
+
     fn resolveAndLoadImport(self: *Graph, reader: anytype, raw_import_path: []const u8, importer_path: []const u8, importer_span: ?source.Span) anyerror!ImportResolution {
         var candidates: std.ArrayList([]u8) = .empty;
         defer {
@@ -334,7 +369,7 @@ pub const Graph = struct {
             candidates.deinit(self.allocator);
         }
 
-        try candidates.append(self.allocator, try resolveImportPath(self.allocator, raw_import_path, importer_path));
+        try self.appendCandidateBothSuffixes(&candidates, raw_import_path, importer_path);
 
         const importer_dir = moduleDirectory(importer_path);
         const modules_relative = if (importer_dir.len != 0)
@@ -342,12 +377,12 @@ pub const Graph = struct {
         else
             try std.fmt.allocPrint(self.allocator, "модули/{s}", .{raw_import_path});
         defer self.allocator.free(modules_relative);
-        try candidates.append(self.allocator, try resolveImportPath(self.allocator, modules_relative, ""));
+        try self.appendCandidateBothSuffixes(&candidates, modules_relative, "");
 
         for (self.global_search_roots) |root| {
             const combined = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, raw_import_path });
             defer self.allocator.free(combined);
-            try candidates.append(self.allocator, try resolveImportPath(self.allocator, combined, ""));
+            try self.appendCandidateBothSuffixes(&candidates, combined, "");
         }
 
         for (candidates.items) |candidate| {
@@ -499,11 +534,21 @@ pub const Graph = struct {
     }
 };
 
-pub fn resolveImportPath(allocator: std.mem.Allocator, import_path: []const u8, importer_path: []const u8) ![]u8 {
-    const suffixed = if (std.mem.endsWith(u8, import_path, ".ps"))
+// `.pns` is the primary source extension; `.ps` is accepted permanently
+// for backward compatibility (pre-migration files, unmigrated panosiki
+// packages) — GitHub Linguist misclassifies `.ps` as PostScript, `.pns`
+// doesn't collide with any registered language. An import path that
+// already names either extension explicitly is never re-suffixed;
+// `preferred_suffix` only applies to bare names (`импорт "модуль"`).
+fn hasKnownSourceExtension(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".ps") or std.mem.endsWith(u8, path, ".pns");
+}
+
+pub fn resolveImportPath(allocator: std.mem.Allocator, import_path: []const u8, importer_path: []const u8, preferred_suffix: []const u8) ![]u8 {
+    const suffixed = if (hasKnownSourceExtension(import_path))
         import_path
     else
-        try std.fmt.allocPrint(allocator, "{s}.ps", .{import_path});
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ import_path, preferred_suffix });
     defer if (suffixed.ptr != import_path.ptr) allocator.free(suffixed);
 
     const combined = if (isAbsolute(suffixed) or importer_path.len == 0) suffixed else blk: {
@@ -537,7 +582,9 @@ fn moduleDirectory(path: []const u8) []const u8 {
 
 fn moduleBaseName(path: []const u8) []const u8 {
     const file_name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |separator| path[separator + 1 ..] else path;
-    return if (std.mem.endsWith(u8, file_name, ".ps")) file_name[0 .. file_name.len - 3] else file_name;
+    if (std.mem.endsWith(u8, file_name, ".pns")) return file_name[0 .. file_name.len - 4];
+    if (std.mem.endsWith(u8, file_name, ".ps")) return file_name[0 .. file_name.len - 3];
+    return file_name;
 }
 
 fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -670,14 +717,20 @@ test "module loader reports missing local modules" {
     try graph.load(&reader, "проект/main.ps");
 
     try std.testing.expectEqual(@as(usize, 1), graph.diagnostics.items.items.len);
-    try std.testing.expectEqualStrings("Module Loader Error: не удалось загрузить модуль 'проект/нет.ps': FileNotFound", graph.diagnostics.items.items[0].message);
+    try std.testing.expectEqualStrings("Module Loader Error: не удалось загрузить модуль 'проект/нет.pns': FileNotFound", graph.diagnostics.items.items[0].message);
     try std.testing.expectEqual(@as(source.FileId, 0), graph.diagnostics.items.items[0].span.file_id);
 }
 
 test "module loader normalizes relative import paths" {
-    const path = try resolveImportPath(std.testing.allocator, "./детали/../математика", "проект/main.ps");
+    const path = try resolveImportPath(std.testing.allocator, "./детали/../математика", "проект/main.ps", ".ps");
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("проект/математика.ps", path);
+}
+
+test "module loader normalizes relative import paths with .pns suffix" {
+    const path = try resolveImportPath(std.testing.allocator, "./детали/../математика", "проект/main.pns", ".pns");
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("проект/математика.pns", path);
 }
 
 test "module loader appends a prelude module after real modules without shifting their file_ids" {

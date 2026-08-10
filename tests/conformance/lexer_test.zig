@@ -2,7 +2,7 @@ const std = @import("std");
 const panos = @import("panos_core");
 
 test "lexer conformance fixture preserves doc comments" {
-    var result = try panos.lexer.tokenize(std.testing.allocator, @embedFile("lexer/basic.ps"), 0);
+    var result = try panos.lexer.tokenize(std.testing.allocator, @embedFile("lexer/basic.pns"), 0);
     defer result.deinit();
 
     try std.testing.expectEqual(panos.token.TokenKind.function, result.tokens.items[0].kind);
@@ -11,7 +11,7 @@ test "lexer conformance fixture preserves doc comments" {
 }
 
 test "lexer conformance fixture preserves interpolation fragments" {
-    var result = try panos.lexer.tokenize(std.testing.allocator, @embedFile("lexer/interpolation.ps"), 0);
+    var result = try panos.lexer.tokenize(std.testing.allocator, @embedFile("lexer/interpolation.pns"), 0);
     defer result.deinit();
 
     const expected = [_]panos.token.TokenKind{

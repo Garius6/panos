@@ -13,8 +13,8 @@ fn deleteTempFile(path: []const u8) void {
 // controlled-failure network case, no outbound internet access needed).
 
 test "integration: file_roundtrip.ps writes then reads a real file" {
-    const source = @embedFile("native/file_roundtrip.ps");
-    var result = try panos_core.runner.runSource(std.testing.allocator, "file_roundtrip.ps", source);
+    const source = @embedFile("native/file_roundtrip.pns");
+    var result = try panos_core.runner.runSource(std.testing.allocator, "file_roundtrip.pns", source);
     defer result.deinit();
     defer deleteTempFile("zzz_integration_native_file.tmp");
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
@@ -25,8 +25,8 @@ test "integration: file_roundtrip.ps writes then reads a real file" {
 }
 
 test "integration: sqlite_roundtrip.ps creates, inserts, and queries a real SQLite file" {
-    const source = @embedFile("native/sqlite_roundtrip.ps");
-    var result = try panos_core.runner.runSource(std.testing.allocator, "sqlite_roundtrip.ps", source);
+    const source = @embedFile("native/sqlite_roundtrip.pns");
+    var result = try panos_core.runner.runSource(std.testing.allocator, "sqlite_roundtrip.pns", source);
     defer result.deinit();
     defer deleteTempFile("zzz_integration_native_sqlite.tmp");
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
@@ -37,8 +37,8 @@ test "integration: sqlite_roundtrip.ps creates, inserts, and queries a real SQLi
 }
 
 test "integration: ffi_libc.ps calls real libc functions through внешний" {
-    const source = @embedFile("native/ffi_libc.ps");
-    var result = try panos_core.runner.runSource(std.testing.allocator, "ffi_libc.ps", source);
+    const source = @embedFile("native/ffi_libc.pns");
+    var result = try panos_core.runner.runSource(std.testing.allocator, "ffi_libc.pns", source);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
     switch (result.execution orelse return error.TestUnexpectedResult) {
@@ -50,8 +50,8 @@ test "integration: ffi_libc.ps calls real libc functions through внешний"
 }
 
 test "integration: http_client_error.ps reports a controlled connection-refused failure" {
-    const source = @embedFile("native/http_client_error.ps");
-    var result = try panos_core.runner.runSource(std.testing.allocator, "http_client_error.ps", source);
+    const source = @embedFile("native/http_client_error.pns");
+    var result = try panos_core.runner.runSource(std.testing.allocator, "http_client_error.pns", source);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
     switch (result.execution orelse return error.TestUnexpectedResult) {

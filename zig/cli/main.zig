@@ -145,7 +145,12 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
     var output_owned: ?[]u8 = null;
     defer if (output_owned) |owned| init.gpa.free(owned);
     if (output.len == 0) {
-        const base = if (std.mem.endsWith(u8, input, ".ps")) input[0 .. input.len - 3] else input;
+        const base = if (std.mem.endsWith(u8, input, ".pns"))
+            input[0 .. input.len - 4]
+        else if (std.mem.endsWith(u8, input, ".ps"))
+            input[0 .. input.len - 3]
+        else
+            input;
         output_owned = try std.fmt.allocPrint(init.gpa, "{s}.wasm", .{base});
         output = output_owned.?;
     }

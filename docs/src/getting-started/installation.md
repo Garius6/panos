@@ -60,8 +60,8 @@ just build-wasm
 ```sh
 echo 'функ старт() -> Число
     10 + 20
-конец' > hello.ps
-./panos hello.ps
+конец' > hello.pns
+./panos hello.pns
 ```
 
 Должно напечатать `30`.

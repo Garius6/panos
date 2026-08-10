@@ -1290,7 +1290,7 @@ const Checker = struct {
             try self.result.symbol_types.put(parameter_symbol, parameter_type);
         }
         const expected_body = if (self.isType(function_type.return_type, self.result.types.builtins.void)) null else function_type.return_type;
-        const actual = try self.inferBlockExpected(body, expected_body);
+        const actual = try self.inferBlockExpected(body, expected_body, false);
         if (!self.isType(function_type.return_type, self.result.types.builtins.void) and !self.assignable(actual, function_type.return_type)) {
             const span = self.tree.decl(declaration).function.span;
             try self.report(span, "Type Error: функция должна возвращать объявленный тип", .{});
@@ -1403,7 +1403,7 @@ const Checker = struct {
         }
     }
 
-    fn inferStatement(self: *Checker, statement: ast.StmtId, expected_return: types.TypeId, expected_value: ?types.TypeId) anyerror!types.TypeId {
+    fn inferStatement(self: *Checker, statement: ast.StmtId, expected_return: types.TypeId, expected_value: ?types.TypeId, tail_value_needed: bool) anyerror!types.TypeId {
         return switch (self.tree.stmt(statement).*) {
             .let => |let| blk: {
                 const expected = if (let.type_annotation) |annotation| try self.resolveType(annotation) else null;
@@ -1458,7 +1458,7 @@ const Checker = struct {
                 const actual = try self.inferExpected(expression.value, expected);
                 if (self.assignable(actual, expected)) try self.registerInterfaceCast(expression.value, actual, expected);
                 break :blk actual;
-            } else if (self.tree.expr(expression.value).* == .if_expr)
+            } else if (!tail_value_needed and self.tree.expr(expression.value).* == .if_expr)
                 // `если` used as a BARE STATEMENT (not the block's trailing
                 // value) never needs its branches to agree on a type — its
                 // result is unconditionally discarded, mirroring
@@ -1473,6 +1473,20 @@ const Checker = struct {
                 // "ветви 'если' возвращают разные типы" against the
                 // implicit empty `Пусто` else-branch — a real gap found
                 // auditing panosiki's `std/tempfiles.ps`.
+                //
+                // `tail_value_needed` is NOT the same thing as
+                // `expected_value != null`: a block's TRAILING statement
+                // whose value is actually consumed (function/lambda body,
+                // an if-expression branch, a match arm) but with no
+                // concrete expected type propagated to THIS point
+                // (expected_value == null) must still go through full
+                // branch unification — otherwise a nested if-expression as
+                // the tail of an else-branch (found running `pan`'s own
+                // `семвер` module) silently took the discard path, always
+                // inferred as `Пусто` regardless of its real branches, and
+                // the OUTER if-expression failed "ветви 'если' возвращают
+                // разные типы" against two branches whose types were
+                // actually identical.
                 try self.inferIfAsStatement(self.tree.expr(expression.value).if_expr)
             else
                 self.infer(expression.value),
@@ -1767,15 +1781,37 @@ const Checker = struct {
         };
     }
 
+    // `inferBlock` is used ONLY for loop bodies (см. `inferForIn`/
+    // `inferForRange`/`выбор` над `получить`) — a loop's body value is
+    // NEVER consumed by anything, so its trailing statement is discarded
+    // exactly like `инferIfAsStatement`'s two sub-blocks, not "value
+    // needed, type unknown" (`discard_tail = true`, see `inferBlockExpected`).
     fn inferBlock(self: *Checker, statements: []const ast.StmtId) anyerror!types.TypeId {
-        return self.inferBlockExpected(statements, null);
+        return self.inferBlockExpected(statements, null, true);
     }
 
-    fn inferBlockExpected(self: *Checker, statements: []const ast.StmtId, expected_last: ?types.TypeId) anyerror!types.TypeId {
+    // `discard_tail` distinguishes two DIFFERENT reasons the trailing
+    // statement's `expected_last` can be `null`: (1) the block's value is
+    // never consumed at all (loop bodies, `inferIfAsStatement`'s two
+    // branches — `discard_tail = true`, trailing `если` may still take
+    // the cheap discard path in `inferStatement`), vs (2) the block's
+    // value genuinely matters (function/lambda body, an if-expression
+    // branch, a match arm) but no concrete type was propagated INTO this
+    // point (`discard_tail = false` — the trailing statement must still
+    // be fully inferred/unified, see `tail_value_needed` in
+    // `inferStatement`). Conflating these two into a single `null` was a
+    // real bug found running `pan`'s own `семвер` module: a nested
+    // if-expression as the tail of an else-branch silently discarded
+    // instead of unifying, and the OUTER if-expression then failed
+    // "ветви 'если' возвращают разные типы" on two branches whose actual
+    // types were identical.
+    fn inferBlockExpected(self: *Checker, statements: []const ast.StmtId, expected_last: ?types.TypeId, discard_tail: bool) anyerror!types.TypeId {
         var result_type = self.result.types.builtins.void;
         for (statements, 0..) |statement, index| {
-            const expected_value = if (index + 1 == statements.len) expected_last else null;
-            result_type = try self.inferStatement(statement, self.current_return orelse self.result.types.builtins.void, expected_value);
+            const is_last = index + 1 == statements.len;
+            const expected_value = if (is_last) expected_last else null;
+            const tail_value_needed = is_last and !discard_tail;
+            result_type = try self.inferStatement(statement, self.current_return orelse self.result.types.builtins.void, expected_value, tail_value_needed);
         }
         return result_type;
     }
@@ -1790,10 +1826,10 @@ const Checker = struct {
             try self.report(conditional.span, "Type Error: условие 'если' должно иметь тип Булево", .{});
         }
         const diagnostics_before_then = self.result.diagnostics.items.items.len;
-        var then_type = try self.inferBlockExpected(conditional.then_branch, expected);
+        var then_type = try self.inferBlockExpected(conditional.then_branch, expected, false);
         const then_failed = self.result.diagnostics.items.items.len > diagnostics_before_then;
         const diagnostics_before_else = self.result.diagnostics.items.items.len;
-        var else_type = try self.inferBlockExpected(conditional.else_branch, expected);
+        var else_type = try self.inferBlockExpected(conditional.else_branch, expected, false);
         const else_failed = self.result.diagnostics.items.items.len > diagnostics_before_else;
         // Real gap found auditing panosiki's `gitsync`
         // (`пер remote_опция = если remote == "" тогда Опция.Нет()
@@ -1813,10 +1849,10 @@ const Checker = struct {
         // retrying so a since-fixed error doesn't linger.
         if (expected == null and then_failed and !else_failed and !self.isNever(else_type)) {
             self.result.diagnostics.items.shrinkRetainingCapacity(diagnostics_before_then);
-            then_type = try self.inferBlockExpected(conditional.then_branch, else_type);
+            then_type = try self.inferBlockExpected(conditional.then_branch, else_type, false);
         } else if (expected == null and else_failed and !then_failed and !self.isNever(then_type)) {
             self.result.diagnostics.items.shrinkRetainingCapacity(diagnostics_before_else);
-            else_type = try self.inferBlockExpected(conditional.else_branch, then_type);
+            else_type = try self.inferBlockExpected(conditional.else_branch, then_type, false);
         }
         const joined = if (self.isNever(then_type)) else_type else if (self.isNever(else_type)) then_type else null;
         // `both_satisfy_expected` — when `expected` is known AND both
@@ -1865,8 +1901,8 @@ const Checker = struct {
         if (!self.assignable(condition, self.result.types.builtins.boolean)) {
             try self.report(conditional.span, "Type Error: условие 'если' должно иметь тип Булево", .{});
         }
-        _ = try self.inferBlockExpected(conditional.then_branch, null);
-        _ = try self.inferBlockExpected(conditional.else_branch, null);
+        _ = try self.inferBlockExpected(conditional.then_branch, null, true);
+        _ = try self.inferBlockExpected(conditional.else_branch, null, true);
         return self.result.types.builtins.void;
     }
 
@@ -1915,7 +1951,7 @@ const Checker = struct {
                     if (value) true_covered = true else false_covered = true;
                 }
             }
-            const arm_type = try self.inferBlockExpected(arm.body, expected);
+            const arm_type = try self.inferBlockExpected(arm.body, expected, false);
             // When `expected` is known (the match sits in a context with
             // a declared type — a function's return position, an
             // annotated `пер`, ...), each arm is ALREADY validated
@@ -2379,7 +2415,7 @@ const Checker = struct {
         // exact same shape (`функ(x) -> Пусто ... конец`) unconditionally
         // required an exact type match, rejecting the identical pattern.
         const expected_body = if (self.isType(return_type, self.result.types.builtins.void)) null else return_type;
-        const body_type = try self.inferBlockExpected(lambda.body, expected_body);
+        const body_type = try self.inferBlockExpected(lambda.body, expected_body, false);
         if (!self.isType(return_type, self.result.types.builtins.void) and !self.assignable(body_type, return_type)) {
             try self.report(lambda.span, "Type Error: тело лямбды не совпадает с типом возврата", .{});
         }
@@ -5398,6 +5434,32 @@ test "type checker warns on code after an if/else where both branches return" {
 
     try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("недостижимый код", checked.diagnostics.items.items[0].message);
+}
+
+// Real bug found running `pan`'s own `семвер.pns` module (this session):
+// a nested if-expression used as the TAIL of an else-branch, with no
+// type annotation anywhere propagating an `expected` type down to it,
+// wrongly reported "ветви 'если' возвращают разные типы" — even though
+// both branches produced the exact same nominal struct type. Root cause:
+// `inferBlockExpected`'s trailing statement dispatch used
+// `expected_value == null` as a proxy for "discard this if-expression's
+// value" (the correct, cheap path for loop bodies / bare-`если`-as-
+// statement sub-blocks), but that's also exactly what a normal
+// annotation-less block tail looks like — the nested `если`'s branches
+// never got unified at all, silently inferred as `Пусто`.
+test "type checker unifies branches of a nested if-expression used as an else-branch's tail, with no type annotation anywhere" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Т = структура\nx: Число\nконец\nфунк f(a: Т) -> Число\nпер b = если истина тогда\nТ(2)\nиначе\nесли ложь тогда\nТ(3)\nиначе\na\nконец\nконец\nb.x\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
 test "type checker does not warn when an if has no else (false path falls through)" {

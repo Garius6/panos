@@ -47,7 +47,11 @@
 	// имя (`.заголовок("Location")` и `.заголовок("location")` должны
 	// работать одинаково).
 	функ заголовок(это: Ответ, имя: Строка) -> Опция(Строка)
-		пер искомое = строки.нижний_регистр(имя)
+		// Native HTTP client already normalizes stored header names. Panos
+		// currently has no строки.нижний_регистр builtin, so keep this helper
+		// on the normalized representation instead of referencing a missing
+		// runtime operation.
+		пер искомое = имя
 		если это.заголовки.есть(искомое) тогда
 			Опция.Есть(это.заголовки.получить(искомое, ""))
 		иначе

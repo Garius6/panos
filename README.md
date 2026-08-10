@@ -1,71 +1,96 @@
-# panos README
+# panos
 
-This is the README for your extension "panos". After writing up a brief description, we recommend including the following sections.
+Экспериментальный скриптовый язык программирования с русскими ключевыми
+словами и синтаксисом, близким к Go и Rust. Статическая типизация,
+структуры и интерфейсы, перечисления (ADT) с pattern matching, дженерики,
+замыкания, простой mark-and-sweep сборщик мусора, cooperative-scheduled
+акторная модель (процессы, mailbox, наблюдение/линки, select).
 
-## Features
+```panos
+тип Фигура = перечисление
+    Точка
+    Круг(Число)
+    Прямоугольник(Число, Число)
+конец
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+функ площадь(ф: Фигура) -> Число
+    возврат выбор ф
+        Точка -> 0
+        Круг(р) -> р * р * 314 / 100
+        Прямоугольник(ш, в) -> ш * в
+    конец
+конец
 
-For example if there is an image subfolder under your extension project workspace:
+функ старт() -> Число
+    площадь(Фигура.Прямоугольник(3, 4))
+конец
+```
 
-\!\[feature X\]\(images/feature-x.png\)
+Компилятор целиком: лексер → парсер → resolver → type checker → компилятор
+в байткод → VM, плюс LSP-сервер (`panos-lsp`) с диагностикой, hover,
+автокомплитом и rename/references на весь граф импортов, и WASM-сборка для
+браузера.
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+Полная документация: <https://garius6.github.io/panos/> ·
+живая песочница: <https://garius6.github.io/panos/playground/>.
 
-## Requirements
+## Установка
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+Готовые бинарники (`panos` CLI + `panos-lsp`) под Linux/macOS/Windows — на
+странице [релизов](https://github.com/Garius6/panos/releases/latest).
 
-## Extension Settings
+Сборка из исходников (нужен [Zig](https://ziglang.org/download/) `0.16.0`):
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+```sh
+git clone https://github.com/Garius6/panos.git
+cd panos
+zig build              # CLI-интерпретатор → zig-out/bin/panos
+zig build lsp           # LSP-сервер
+zig build browser       # WASM-сборка для браузера
+```
 
-For example:
+Или через `just` (обёртки над теми же командами, см. `Justfile`):
+`just build` / `just build-lsp` / `just build-wasm` / `just build-all`.
 
-This extension contributes the following settings:
+## Быстрый старт
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+```sh
+echo 'функ старт() -> Число
+    10 + 20
+конец' > hello.ps
+./panos hello.ps
+```
 
-## Known Issues
+Подробнее — [Установка](https://garius6.github.io/panos/getting-started/installation.html)
+и [Быстрый старт](https://garius6.github.io/panos/getting-started/quickstart.html)
+в документации.
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+## Тесты
 
-## Release Notes
+```sh
+zig build test          # быстрые unit-тесты (per-file)
+zig build conformance    # conformance-матрица
+```
 
-Users appreciate release notes as you update your extension.
+Полный список тестовых шагов (`integration`/`aot`/`bench`/`fuzz`) — в
+`AGENTS.md`.
 
-### 1.0.0
+## Структура репозитория
 
-Initial release of ...
+```text
+zig/core/   # лексер, парсер, resolver, type checker, компилятор, VM, LSP core
+zig/cli/    # нативная точка входа CLI
+zig/lsp/    # точка входа LSP-сервера
+zig/browser/# точка входа WASM-интерпретатора для браузера
+std/        # стандартная библиотека panos (.ps)
+tests/      # conformance-корпус, интеграционные фикстуры, LSP/WASM тесты
+fixtures/   # тестовые фикстуры
+docs/       # исходники документации (mdBook)
+specs/      # speckit-спецификации фич
+```
 
-### 1.0.1
+## Статус
 
-Fixed issue #.
-
-### 1.1.0
-
-Added features X, Y, and Z.
-
----
-
-## Following extension guidelines
-
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
-
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+Активно развивается, поведение языка может меняться. Смотрите
+[ROADMAP.md](./ROADMAP.md) за списком нереализованных пока направлений и
+`AGENTS.md`/`CLAUDE.md` за деталями пайплайна и конвенций для контрибьюторов.

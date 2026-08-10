@@ -7,6 +7,7 @@ const source = @import("source.zig");
 const symbols = @import("symbols.zig");
 const type_checker = @import("type_checker.zig");
 const types = @import("types.zig");
+const wasm_module = @import("wasm_module.zig");
 
 // AST (post resolve+typecheck) → MIR. Ported from `core/mir_lowering.odin`
 // (~2000 lines there) — works at the SAME pipeline point `compiler.zig`
@@ -110,6 +111,7 @@ pub fn lowerModule(
         const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
         const result_type = functionReturnType(checked, symbol);
         const function_id = try mir_builder.newFunction(&module, allocator, function.name, symbol, result_type, function.span);
+        module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
         try symbol_to_function.put(symbol, function_id);
     }
 
@@ -122,6 +124,83 @@ pub fn lowerModule(
         const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
         const function_id = symbol_to_function.get(symbol) orelse continue;
         try lowerFunctionBody(allocator, tree, resolution, checked, &module, function_id, decl_id, function.body, &symbol_to_function);
+    }
+
+    return module;
+}
+
+// Link the already resolved/type-checked module graph into one AOT MIR
+// module. The bytecode compiler has its own linker; this deliberately keeps
+// an AOT-specific, small equivalent so WASM does not inherit bytecode VM
+// assumptions. The initial slice supports plain non-generic functions and
+// direct local-file imports — exactly the Phase-1 MIR surface.
+pub fn lowerGraph(
+    allocator: std.mem.Allocator,
+    graph: anytype,
+    compiled: anytype,
+) !mir.Module {
+    var module = mir.Module.init(allocator);
+    errdefer module.deinit(allocator);
+
+    var function_maps: std.ArrayList(std.AutoHashMap(symbols.SymbolId, mir.FunctionId)) = .empty;
+    defer {
+        for (function_maps.items) |*map| map.deinit();
+        function_maps.deinit(allocator);
+    }
+    try function_maps.ensureTotalCapacity(allocator, graph.modules.items.len);
+    for (0..graph.modules.items.len) |_| try function_maps.append(allocator, .init(allocator));
+
+    // Reserve every local function before lowering any body. This gives
+    // forward references, recursion and cross-module direct calls stable
+    // global FunctionIds in the resulting WASM module.
+    for (graph.order.items) |module_index| {
+        const resolution = if (compiled.modules[module_index].resolution) |*value| value else continue;
+        const checked = if (compiled.modules[module_index].checked) |*value| value else continue;
+        const tree = &graph.modules.items[module_index].tree;
+        const program = tree.program orelse continue;
+        for (program.declarations) |decl_id| {
+            const function = switch (tree.decl(decl_id).*) {
+                .function => |value| value,
+                else => continue,
+            };
+            if (function.type_parameters.len != 0) continue;
+            const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
+            const result_type = functionReturnType(checked, symbol);
+            const function_id = try mir_builder.newFunction(&module, allocator, function.name, symbol, result_type, function.span);
+            module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
+            try function_maps.items[module_index].put(symbol, function_id);
+        }
+    }
+
+    // Imported symbols are freshly minted in the importing Resolution. Map
+    // each one back to the reserved FunctionId of its exporting declaration.
+    for (graph.order.items) |module_index| {
+        const resolution = if (compiled.modules[module_index].resolution) |*value| value else continue;
+        var imports = resolution.imported_symbols.iterator();
+        while (imports.next()) |entry| {
+            const origin = entry.value_ptr.*;
+            const target_resolution = if (compiled.modules[origin.module].resolution) |*value| value else continue;
+            const target_symbol = target_resolution.decl_symbols.get(origin.declaration) orelse continue;
+            const target_function = function_maps.items[origin.module].get(target_symbol) orelse continue;
+            try function_maps.items[module_index].put(entry.key_ptr.*, target_function);
+        }
+    }
+
+    for (graph.order.items) |module_index| {
+        const resolution = if (compiled.modules[module_index].resolution) |*value| value else continue;
+        const checked = if (compiled.modules[module_index].checked) |*value| value else continue;
+        const tree = &graph.modules.items[module_index].tree;
+        const program = tree.program orelse continue;
+        for (program.declarations) |decl_id| {
+            const function = switch (tree.decl(decl_id).*) {
+                .function => |value| value,
+                else => continue,
+            };
+            if (function.type_parameters.len != 0) continue;
+            const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
+            const function_id = function_maps.items[module_index].get(symbol) orelse continue;
+            try lowerFunctionBody(allocator, tree, resolution, checked, &module, function_id, decl_id, function.body, &function_maps.items[module_index]);
+        }
     }
 
     return module;
@@ -249,6 +328,7 @@ fn lowerStmt(ctx: *LoweringContext, statement: ast.StmtId) anyerror!FlowResult {
             const outcome = try lowerExpr(ctx, expr_statement.value);
             return outcome.flow;
         },
+        .for_range => |range| return lowerForRange(ctx, statement, range),
         .continue_stmt => {
             if (ctx.loops.items.len == 0) unsupported("продолжить вне цикла");
             const target = ctx.loops.items[ctx.loops.items.len - 1].continue_target;
@@ -265,6 +345,48 @@ fn lowerStmt(ctx: *LoweringContext, statement: ast.StmtId) anyerror!FlowResult {
     }
 }
 
+fn lowerForRange(ctx: *LoweringContext, statement: ast.StmtId, range: anytype) anyerror!FlowResult {
+    const start = try lowerExpr(ctx, range.start);
+    if (start.flow == .terminates) return .terminates;
+    const end = try lowerExpr(ctx, range.end);
+    if (end.flow == .terminates) return .terminates;
+    const bindings = ctx.resolution.stmt_bindings.get(statement) orelse unsupported("для без символа переменной");
+    if (bindings.len != 1) unsupported("для с несколькими переменными");
+    const index_type = ctx.checked.expression_types.get(range.start) orelse ctx.checked.types.builtins.number;
+    const index_local = try ctx.builder.newLocal(bindings[0], range.name, index_type);
+    try ctx.symbol_to_local.put(bindings[0], index_local);
+    const end_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$for_end", index_type);
+    try ctx.builder.emit(.{ .store_local = .{ .local = end_local, .src = end.value } });
+    try ctx.builder.emit(.{ .store_local = .{ .local = index_local, .src = start.value } });
+    const header = try ctx.builder.newBlock();
+    const body = try ctx.builder.newBlock();
+    const step = try ctx.builder.newBlock();
+    const exit = try ctx.builder.newBlock();
+    ctx.builder.terminate(.{ .jump = .{ .target = header } });
+    ctx.builder.setCurrentBlock(header);
+    const index_value = try ctx.builder.newValue(index_type);
+    const end_value = try ctx.builder.newValue(index_type);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = index_value, .local = index_local } });
+    try ctx.builder.emit(.{ .load_local = .{ .dst = end_value, .local = end_local } });
+    const cond = try emitCompare(ctx, .less_equal, index_value, end_value);
+    ctx.builder.terminate(.{ .branch = .{ .cond = cond, .then_block = body, .else_block = exit } });
+    ctx.builder.setCurrentBlock(body);
+    try ctx.loops.append(ctx.allocator, .{ .continue_target = step, .break_target = exit });
+    const body_outcome = try lowerBlock(ctx, range.body, false);
+    _ = ctx.loops.pop();
+    if (body_outcome.flow == .continues) ctx.builder.terminate(.{ .jump = .{ .target = step } });
+    ctx.builder.setCurrentBlock(step);
+    const current = try ctx.builder.newValue(index_type);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = current, .local = index_local } });
+    const one = try emitConstNumber(ctx, 1);
+    const next = try ctx.builder.newValue(index_type);
+    try ctx.builder.emit(.{ .binary = .{ .dst = next, .op = .add, .lhs = current, .rhs = one } });
+    try ctx.builder.emit(.{ .store_local = .{ .local = index_local, .src = next } });
+    ctx.builder.terminate(.{ .jump = .{ .target = header } });
+    ctx.builder.setCurrentBlock(exit);
+    return .continues;
+}
+
 fn lowerExpr(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOutcome {
     return switch (ctx.tree.expr(expression).*) {
         .number => |number| continuesWith(try emitConstNumber(ctx, number.value)),
@@ -278,6 +400,9 @@ fn lowerExpr(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOutcome
             try ctx.builder.emit(.{ .const_value = .{ .dst = dst, .value = .{ .string = string.value } } });
             break :blk continuesWith(dst);
         },
+        .array => |array| lowerArrayLiteral(ctx, expression, array),
+        .spawn => |spawn| lowerSpawn(ctx, expression, spawn),
+        .index => |index| lowerIndex(ctx, expression, index),
         .ident => blk: {
             const symbol = ctx.resolution.expr_symbols.get(expression) orelse unsupported("неразрешённый идентификатор");
             break :blk continuesWith(try lowerSymbolValueRef(ctx, symbol, expressionSpan(ctx.tree, expression)));
@@ -285,7 +410,9 @@ fn lowerExpr(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOutcome
         .unary => |unary| lowerUnary(ctx, expression, unary),
         .binary => |binary| lowerBinary(ctx, expression, binary),
         .call => |call| lowerCall(ctx, expression, call),
+        .property => |property| lowerProperty(ctx, expression, property),
         .if_expr => |conditional| lowerIfExpr(ctx, expression, conditional, true),
+        .match_expr => |match| lowerMatchExpr(ctx, expression, match),
         .while_expr => |loop| blk: {
             const flow = try lowerWhile(ctx, loop);
             if (flow == .terminates) break :blk terminated;
@@ -293,6 +420,179 @@ fn lowerExpr(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOutcome
         },
         else => unsupported("вид выражения"),
     };
+}
+
+// Keep actor creation explicit in MIR. CPS lowering consumes this before the
+// WASM emitter; representing it as an ordinary call would lose the child
+// frame and make a later `получить()` impossible to resume correctly.
+fn lowerSpawn(ctx: *LoweringContext, expression: ast.ExprId, spawn: anytype) anyerror!ExprOutcome {
+    const call = switch (ctx.tree.expr(spawn.call).*) {
+        .call => |value| value,
+        else => unsupported("запусти не-вызов"),
+    };
+    const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse unsupported("запусти неразрешённую функцию");
+    const function_id = ctx.symbol_to_function.get(symbol) orelse unsupported("запусти не-статическую функцию");
+    const callee = try emitFunctionRef(ctx, function_id);
+    const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+    const result_type = ctx.checked.expression_types.get(expression) orelse unsupported("запусти без типа");
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .spawn = .{ .dst = dst, .callee = callee, .args = args } });
+    return continuesWith(dst);
+}
+
+fn lowerMatchExpr(ctx: *LoweringContext, expression: ast.ExprId, match: anytype) anyerror!ExprOutcome {
+    const subject = try lowerExpr(ctx, match.subject);
+    if (subject.flow == .terminates) return terminated;
+    const subject_type = ctx.checked.expression_types.get(match.subject) orelse unsupported("выбор без типа subject");
+    const subject_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$match", subject_type);
+    try ctx.builder.emit(.{ .store_local = .{ .local = subject_local, .src = subject.value } });
+    const result_type = ctx.checked.expression_types.get(expression) orelse ctx.checked.types.builtins.void;
+    const has_result = !ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);
+    const result_local: ?mir.LocalId = if (has_result) try ctx.builder.newLocal(symbols.invalid_symbol, "$match_result", result_type) else null;
+    const merge = try ctx.builder.newBlock();
+
+    for (match.arms, 0..) |arm, arm_index| {
+        const next = if (arm_index + 1 < match.arms.len) try ctx.builder.newBlock() else mir.invalid_block;
+        const variant = ctx.checked.pattern_variants.get(arm.pattern);
+        if (variant) |variant_symbol| {
+            const definition = ctx.checked.enum_definitions.get((ctx.resolution.symbols.get(variant_symbol) orelse unreachable).owner_type) orelse unsupported("вариант без enum definition");
+            var tag: u32 = 0;
+            for (definition.variants, 0..) |candidate, index| if (candidate.symbol == variant_symbol) {
+                tag = @intCast(index);
+                break;
+            };
+            const condition = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
+            const loaded_subject = try ctx.builder.newValue(subject_type);
+            try ctx.builder.emit(.{ .load_local = .{ .dst = loaded_subject, .local = subject_local } });
+            try ctx.builder.emit(.{ .match_tag = .{ .dst = condition, .subject = loaded_subject, .tag = tag } });
+            const body = try ctx.builder.newBlock();
+            if (next == mir.invalid_block) {
+                const impossible = try ctx.builder.newBlock();
+                ctx.builder.terminate(.{ .branch = .{ .cond = condition, .then_block = body, .else_block = impossible } });
+                ctx.builder.setCurrentBlock(impossible);
+                ctx.builder.terminate(.{ .unreachable_term = .{ .reason = "неисчерпывающий выбор" } });
+            } else ctx.builder.terminate(.{ .branch = .{ .cond = condition, .then_block = body, .else_block = next } });
+            ctx.builder.setCurrentBlock(body);
+            try bindVariantPattern(ctx, arm.pattern, subject_local, subject_type);
+        } else {
+            try bindCatchAllPattern(ctx, arm.pattern, subject_local, subject_type);
+        }
+        const outcome = try lowerBlock(ctx, arm.body, has_result);
+        if (outcome.flow == .continues) {
+            if (result_local) |local| try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = outcome.value } });
+            ctx.builder.terminate(.{ .jump = .{ .target = merge } });
+        }
+        if (next != mir.invalid_block) ctx.builder.setCurrentBlock(next);
+    }
+    ctx.builder.setCurrentBlock(merge);
+    if (!has_result) return continuesWith(mir.invalid_value);
+    const result = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = result, .local = result_local.? } });
+    return continuesWith(result);
+}
+
+fn bindCatchAllPattern(ctx: *LoweringContext, pattern: ast.PatternId, subject_local: mir.LocalId, subject_type: types.TypeId) !void {
+    const binding = ctx.resolution.pattern_symbols.get(pattern) orelse return;
+    const local = try ctx.builder.newLocal(binding, "$pattern", subject_type);
+    try ctx.symbol_to_local.put(binding, local);
+    const value = try ctx.builder.newValue(subject_type);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = value, .local = subject_local } });
+    try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = value } });
+}
+
+fn bindVariantPattern(ctx: *LoweringContext, pattern: ast.PatternId, subject_local: mir.LocalId, subject_type: types.TypeId) !void {
+    const constructor = switch (ctx.tree.pattern(pattern).*) {
+        .constructor => |value| value,
+        else => return,
+    };
+    for (constructor.arguments, 0..) |argument, index| {
+        const binding = ctx.resolution.pattern_symbols.get(argument) orelse continue;
+        const field_type = ctx.checked.pattern_types.get(argument) orelse blk: {
+            // `получить()` deliberately has poison as its static subject
+            // type. The checker still resolved the constructor variant, so
+            // recover its positional field type from that enum definition.
+            const variant_symbol = ctx.checked.pattern_variants.get(pattern) orelse unsupported("payload pattern без типа");
+            const entry = ctx.resolution.symbols.get(variant_symbol) orelse unsupported("payload variant без symbol");
+            const definition = ctx.checked.enum_definitions.get(entry.owner_type) orelse unsupported("payload variant без enum definition");
+            for (definition.variants) |variant| {
+                if (variant.symbol != variant_symbol) continue;
+                if (index >= variant.fields.len) unsupported("payload pattern вне variant fields");
+                break :blk variant.fields[index];
+            }
+            unsupported("payload variant не найден");
+        };
+        const local = try ctx.builder.newLocal(binding, "$payload", field_type);
+        try ctx.symbol_to_local.put(binding, local);
+        const loaded_subject = try ctx.builder.newValue(subject_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = loaded_subject, .local = subject_local } });
+        const field = try ctx.builder.newValue(field_type);
+        try ctx.builder.emit(.{ .get_variant_field = .{ .dst = field, .subject = loaded_subject, .field_index = @intCast(index) } });
+        try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = field } });
+    }
+}
+
+fn valuesInArena(ctx: *LoweringContext, values: []const mir.ValueId) ![]const mir.ValueId {
+    const out = try ctx.builder.module.arena.allocator().alloc(mir.ValueId, values.len);
+    @memcpy(out, values);
+    return out;
+}
+
+fn lowerArrayLiteral(ctx: *LoweringContext, expression: ast.ExprId, array: anytype) anyerror!ExprOutcome {
+    const array_type = ctx.checked.expression_types.get(expression) orelse unsupported("массив без типа");
+    const entry = ctx.checked.types.get(array_type) orelse unsupported("массив с неизвестным типом");
+    const element_type = switch (entry.*) {
+        .array => |value| value,
+        else => unsupported("литерал не-массива"),
+    };
+    const array_value = try ctx.builder.newValue(array_type);
+    try ctx.builder.emit(.{ .new_array = .{ .dst = array_value, .elements = &.{} } });
+    const local = try ctx.builder.newLocal(symbols.invalid_symbol, "$array", array_type);
+    try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = array_value } });
+    const append_name = if (wasm_module.wasmValTypeForStore(&ctx.checked.types, element_type) == wasm_module.wasm_i32) "@runtime::array_append_i32" else "@runtime::array_append_f64";
+    for (array.elements) |element| {
+        const receiver = try ctx.builder.newValue(array_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = receiver, .local = local } });
+        const value = try lowerExpr(ctx, element);
+        if (value.flow == .terminates) return terminated;
+        try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = append_name, .args = try valuesInArena(ctx, &.{ receiver, value.value }) } });
+    }
+    const result = try ctx.builder.newValue(array_type);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = result, .local = local } });
+    return continuesWith(result);
+}
+
+fn lowerIndex(ctx: *LoweringContext, expression: ast.ExprId, index: anytype) anyerror!ExprOutcome {
+    const object = try lowerExpr(ctx, index.object);
+    if (object.flow == .terminates) return terminated;
+    const subscript = try lowerExpr(ctx, index.index);
+    if (subscript.flow == .terminates) return terminated;
+    const result_type = ctx.checked.expression_types.get(expression) orelse unsupported("индексирование без типа результата");
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .get_index = .{ .dst = dst, .object = object.value, .index = subscript.value } });
+    return continuesWith(dst);
+}
+
+fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytype) anyerror!ExprOutcome {
+    // Module members and enum variants are resolved symbols and are handled
+    // by their callers. A remaining property expression is a struct field.
+    if (ctx.resolution.expr_symbols.contains(expression)) unsupported("свойство-модуль или вариант перечисления вне вызова");
+    const object = try lowerExpr(ctx, property.object);
+    if (object.flow == .terminates) return terminated;
+    const object_type = ctx.checked.expression_types.get(property.object) orelse unsupported("свойство без типа объекта");
+    const type_entry = ctx.checked.types.get(object_type) orelse unsupported("свойство с неизвестным типом объекта");
+    const nominal = switch (type_entry.*) {
+        .nominal => |value| value,
+        else => unsupported("свойство не-структуры"),
+    };
+    const fields = ctx.checked.nominal_fields.get(nominal.symbol) orelse unsupported("поле generic-структуры");
+    for (fields, 0..) |field, index| {
+        if (!std.mem.eql(u8, field.name, property.property)) continue;
+        const result_type = ctx.checked.expression_types.get(expression) orelse field.typ;
+        const dst = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .get_property = .{ .dst = dst, .object = object.value, .field_index = @intCast(index) } });
+        return continuesWith(dst);
+    }
+    unsupported("неизвестное поле структуры");
 }
 
 fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: source.Span) !mir.ValueId {
@@ -358,25 +658,53 @@ fn lowerBinary(ctx: *LoweringContext, expression: ast.ExprId, binary: anytype) a
     return continuesWith(dst);
 }
 
-// Ported from `core/mir_lowering.odin`'s `lower_assign`/`lower_place`. Phase
-// 1a only lowers local-variable places (`Ident_Expr`) — no structs/arrays
-// exist in this lowering yet, so `Property_Expr`/`Index_Expr` targets would
-// need `unsupported()` regardless of scope. Assignment produces NO value
+// Assignment produces NO value
 // (matches Odin's `INVALID_VALUE`/`.Continues` and the bytecode compiler's
 // own `y = (x = 1)` restriction) — a well-typed program can never observe
 // this, since the type checker requires an if-expression's branches to share
 // a common value type before this lowering ever runs.
 fn lowerAssign(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcome {
-    const target = switch (ctx.tree.expr(binary.left).*) {
-        .ident => blk: {
+    switch (ctx.tree.expr(binary.left).*) {
+        .ident => {
             const symbol = ctx.resolution.expr_symbols.get(binary.left) orelse unsupported("неразрешённый идентификатор в присваивании");
-            break :blk ctx.symbol_to_local.get(symbol) orelse unsupported("присваивание не-локали (Фаза 3+)");
+            const target = ctx.symbol_to_local.get(symbol) orelse unsupported("присваивание не-локали (Фаза 3+)");
+            const rhs = try lowerExpr(ctx, binary.right);
+            if (rhs.flow == .terminates) return terminated;
+            try ctx.builder.emit(.{ .store_local = .{ .local = target, .src = rhs.value } });
+        },
+        .property => |property| {
+            const object = try lowerExpr(ctx, property.object);
+            if (object.flow == .terminates) return terminated;
+            const object_type = ctx.checked.expression_types.get(property.object) orelse unsupported("присваивание свойства без типа");
+            const entry = ctx.checked.types.get(object_type) orelse unsupported("присваивание свойства с неизвестным типом");
+            const nominal = switch (entry.*) {
+                .nominal => |value| value,
+                else => unsupported("присваивание свойства не-структуры"),
+            };
+            const fields = ctx.checked.nominal_fields.get(nominal.symbol) orelse unsupported("присваивание поля generic-структуры");
+            var field_index: ?u32 = null;
+            for (fields, 0..) |field, index| {
+                if (std.mem.eql(u8, field.name, property.property)) {
+                    field_index = @intCast(index);
+                    break;
+                }
+            }
+            const index = field_index orelse unsupported("присваивание неизвестному полю структуры");
+            const rhs = try lowerExpr(ctx, binary.right);
+            if (rhs.flow == .terminates) return terminated;
+            try ctx.builder.emit(.{ .set_property = .{ .object = object.value, .field_index = index, .value = rhs.value } });
+        },
+        .index => |index| {
+            const object = try lowerExpr(ctx, index.object);
+            if (object.flow == .terminates) return terminated;
+            const subscript = try lowerExpr(ctx, index.index);
+            if (subscript.flow == .terminates) return terminated;
+            const rhs = try lowerExpr(ctx, binary.right);
+            if (rhs.flow == .terminates) return terminated;
+            try ctx.builder.emit(.{ .set_index = .{ .object = object.value, .index = subscript.value, .value = rhs.value } });
         },
         else => unsupported("цель присваивания (Фаза 3+)"),
-    };
-    const rhs = try lowerExpr(ctx, binary.right);
-    if (rhs.flow == .terminates) return terminated;
-    try ctx.builder.emit(.{ .store_local = .{ .local = target, .src = rhs.value } });
+    }
     return continuesWith(mir.invalid_value);
 }
 
@@ -550,19 +878,173 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
                 const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
                 return emitCallValue(ctx, function_ref, args, result_type);
             }
+            if (try lowerEnumConstructor(ctx, symbol, call, result_type)) |outcome| return outcome;
+            if (try lowerStructConstructor(ctx, symbol, call, result_type)) |outcome| return outcome;
             if (try lowerNumericCastCall(ctx, symbol, call)) |outcome| return outcome;
+            if (try lowerLengthBuiltinCall(ctx, symbol, call, result_type)) |outcome| return outcome;
+            if (try lowerProcessBuiltinCall(ctx, symbol, call, result_type)) |outcome| return outcome;
         }
     }
 
     if (ctx.tree.expr(call.callee).* == .property) {
+        // A function imported from a local file is represented in the AST
+        // as `модуль.функция`, not as a bare identifier. Resolution has
+        // already associated that property expression with the importer-side
+        // symbol; lowerGraph rebinds that symbol to the exporter's global
+        // MIR FunctionId.
+        if (ctx.resolution.expr_symbols.get(call.callee)) |symbol| {
+            if (ctx.symbol_to_function.get(symbol)) |function_id| {
+                const function_ref = try emitFunctionRef(ctx, function_id);
+                const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+                return emitCallValue(ctx, function_ref, args, result_type);
+            }
+            if (try lowerEnumConstructor(ctx, symbol, call, result_type)) |outcome| return outcome;
+        }
         if (try lowerTimeBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
+        if (try lowerNetworkBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
+        if (try lowerStringBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerDomBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
+        if (try lowerArrayMethodCall(ctx, call, result_type)) |outcome| return outcome;
+        if (try lowerOptionMethodCall(ctx, call, result_type)) |outcome| return outcome;
     }
 
     const callee_outcome = try lowerExpr(ctx, call.callee);
     if (callee_outcome.flow == .terminates) return terminated;
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     return emitCallValue(ctx, callee_outcome.value, args, result_type);
+}
+
+fn lowerEnumConstructor(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .enum_variant) return null;
+    const definition = ctx.checked.enum_definitions.get(entry.owner_type) orelse return null;
+    var tag: ?u32 = null;
+    for (definition.variants, 0..) |variant, index| {
+        if (variant.symbol == symbol) {
+            tag = @intCast(index);
+            break;
+        }
+    }
+    const variant_tag = tag orelse return null;
+    if (call.arguments.len > 3) unsupported("вариант с более чем 3 полями");
+    const fields = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .build_variant = .{ .dst = dst, .type_name = "", .variant_name = entry.name, .tag = variant_tag, .fields = fields } });
+    return continuesWith(dst);
+}
+
+fn lowerArrayMethodCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const property = ctx.tree.expr(call.callee).property;
+    const object_type = ctx.checked.expression_types.get(property.object) orelse return null;
+    const entry = ctx.checked.types.get(object_type) orelse return null;
+    const element_type = switch (entry.*) {
+        .array => |value| value,
+        else => return null,
+    };
+    const is_i32 = wasm_module.wasmValTypeForStore(&ctx.checked.types, element_type) == wasm_module.wasm_i32;
+    const name = if (std.mem.eql(u8, property.property, "длина") and call.arguments.len == 0)
+        "@runtime::array_length"
+    else if (std.mem.eql(u8, property.property, "добавить") and call.arguments.len == 1)
+        if (is_i32) "@runtime::array_append_i32" else "@runtime::array_append_f64"
+    else if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 2)
+        if (is_i32) "@runtime::array_get_or_i32" else "@runtime::array_get_or_f64"
+    else
+        return null;
+
+    const receiver = try lowerExpr(ctx, property.object);
+    if (receiver.flow == .terminates) return terminated;
+    var values: std.ArrayList(mir.ValueId) = .empty;
+    defer values.deinit(ctx.allocator);
+    try values.append(ctx.allocator, receiver.value);
+    for (call.arguments) |argument| {
+        const value = try lowerExpr(ctx, argument);
+        if (value.flow == .terminates) return terminated;
+        try values.append(ctx.allocator, value.value);
+    }
+    const is_void = ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);
+    const dst = if (is_void) null else try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = name, .args = try valuesInArena(ctx, values.items) } });
+    return continuesWith(dst orelse mir.invalid_value);
+}
+
+// `Опция` is a two-tag ADT from the prelude (`Нет = 0`, `Есть = 1`). These
+// two accessors are sufficient for the conventional guarded pattern in the
+// todo AOT demo and reuse the same variant ABI as explicit `выбор`.
+fn lowerOptionMethodCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const property = ctx.tree.expr(call.callee).property;
+    const object_type = ctx.checked.expression_types.get(property.object) orelse return null;
+    const type_entry = ctx.checked.types.get(object_type) orelse return null;
+    const nominal = switch (type_entry.*) {
+        .nominal => |value| value,
+        else => return null,
+    };
+    const owner = ctx.resolution.symbols.get(nominal.symbol) orelse return null;
+    if (!std.mem.eql(u8, owner.name, "Опция")) return null;
+
+    const receiver = try lowerExpr(ctx, property.object);
+    if (receiver.flow == .terminates) return terminated;
+    if (std.mem.eql(u8, property.property, "есть") and call.arguments.len == 0) {
+        const dst = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .match_tag = .{ .dst = dst, .subject = receiver.value, .tag = 1 } });
+        return continuesWith(dst);
+    }
+    if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 1) {
+        // Both receiver and fallback are evaluated before selecting the
+        // result, exactly as for an ordinary Panos method call.
+        const option_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$option", object_type);
+        try ctx.builder.emit(.{ .store_local = .{ .local = option_local, .src = receiver.value } });
+        const fallback = try lowerExpr(ctx, call.arguments[0]);
+        if (fallback.flow == .terminates) return terminated;
+        const fallback_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$option_fallback", result_type);
+        try ctx.builder.emit(.{ .store_local = .{ .local = fallback_local, .src = fallback.value } });
+        const result_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$option_result", result_type);
+        const condition = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
+        const loaded_option = try ctx.builder.newValue(object_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = loaded_option, .local = option_local } });
+        try ctx.builder.emit(.{ .match_tag = .{ .dst = condition, .subject = loaded_option, .tag = 1 } });
+        const has_value = try ctx.builder.newBlock();
+        const no_value = try ctx.builder.newBlock();
+        const merge = try ctx.builder.newBlock();
+        ctx.builder.terminate(.{ .branch = .{ .cond = condition, .then_block = has_value, .else_block = no_value } });
+
+        ctx.builder.setCurrentBlock(has_value);
+        const value_option = try ctx.builder.newValue(object_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = value_option, .local = option_local } });
+        const value = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .get_variant_field = .{ .dst = value, .subject = value_option, .field_index = 0 } });
+        try ctx.builder.emit(.{ .store_local = .{ .local = result_local, .src = value } });
+        ctx.builder.terminate(.{ .jump = .{ .target = merge } });
+
+        ctx.builder.setCurrentBlock(no_value);
+        const default_value = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = default_value, .local = fallback_local } });
+        try ctx.builder.emit(.{ .store_local = .{ .local = result_local, .src = default_value } });
+        ctx.builder.terminate(.{ .jump = .{ .target = merge } });
+
+        ctx.builder.setCurrentBlock(merge);
+        const result = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = result, .local = result_local } });
+        return continuesWith(result);
+    }
+    return null;
+}
+
+fn lowerStructConstructor(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .type) return null;
+    const type_entry = ctx.checked.types.get(result_type) orelse return null;
+    const nominal = switch (type_entry.*) {
+        .nominal => |value| value,
+        else => return null,
+    };
+    if (nominal.symbol != symbol) return null;
+    const fields = ctx.checked.nominal_fields.get(symbol) orelse return null;
+    if (fields.len > 3) unsupported("структура с более чем 3 полями");
+    if (call.argument_names != null) unsupported("именованные аргументы конструктора структуры");
+    const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .new_aggregate = .{ .dst = dst, .type_name = entry.name, .elements = args } });
+    return continuesWith(dst);
 }
 
 // `Целое(x)`/`Число(x)` — bare (non-module) builtin cast calls, same real
@@ -584,6 +1066,97 @@ fn lowerNumericCastCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call: a
 
     const dst = try ctx.builder.newValue(ctx.checked.types.builtins.integer);
     try ctx.builder.emit(.{ .unary = .{ .dst = dst, .op = .int_trunc, .src = argument_outcome.value } });
+    return continuesWith(dst);
+}
+
+fn lowerLengthBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .builtin or entry.module_path != null or !std.mem.eql(u8, entry.name, "длина")) return null;
+    if (call.arguments.len != 1) unsupported("длина с числом аргументов != 1");
+
+    const argument_type = ctx.checked.expression_types.get(call.arguments[0]) orelse return null;
+    const type_entry = ctx.checked.types.get(argument_type) orelse return null;
+    if (type_entry.* != .primitive or type_entry.primitive != .string) return null;
+
+    const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = "строки::длина", .args = args } });
+    return continuesWith(dst);
+}
+
+fn lowerProcessBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .builtin or entry.module_path != null) return null;
+    if (std.mem.eql(u8, entry.name, "отправить") and call.arguments.len == 2) {
+        const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+        try ctx.builder.emit(.{ .send = .{ .process = args[0], .message = args[1] } });
+        return continuesWith(mir.invalid_value);
+    }
+    if (std.mem.eql(u8, entry.name, "получить") and call.arguments.len == 0) {
+        const dst = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .receive = .{ .dst = dst } });
+        return continuesWith(dst);
+    }
+    if (std.mem.eql(u8, entry.name, "себя") and call.arguments.len == 0) {
+        const dst = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = "@runtime::current_process", .args = &.{} } });
+        return continuesWith(dst);
+    }
+    return null;
+}
+
+// The JS string runtime owns the actual UTF-16 storage; Panos string values
+// remain opaque i32 handles in WASM. `строки.срез`/`.найти` deliberately use
+// Unicode scalar indices, matching the VM contract, rather than JS UTF-16
+// offsets. `в_число` constructs the standard Результат handle in that same
+// host runtime, so ordinary Panos `выбор` handles both outcomes unchanged.
+fn lowerStringBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "строки")) return null;
+
+    const property = ctx.tree.expr(call.callee).property;
+    const name = if (std.mem.eql(u8, property.property, "длина_байт"))
+        "строки::длина_байт"
+    else if (std.mem.eql(u8, property.property, "срез"))
+        "строки::срез"
+    else if (std.mem.eql(u8, property.property, "найти"))
+        "строки::найти"
+    else if (std.mem.eql(u8, property.property, "начинается_с"))
+        "строки::начинается_с"
+    else if (std.mem.eql(u8, property.property, "заменить"))
+        "строки::заменить"
+    else if (std.mem.eql(u8, property.property, "разбить"))
+        "строки::разбить"
+    else if (std.mem.eql(u8, property.property, "из_числа"))
+        "строки::из_числа"
+    else if (std.mem.eql(u8, property.property, "в_число"))
+        "строки::в_число"
+    else
+        unsupported("строки.свойство вызов (неподдерживаемая строковая операция в AOT WASM)");
+
+    const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = name, .args = args } });
+    return continuesWith(dst);
+}
+
+// AOT's deliberately narrow browser-network bridge. The host performs a
+// same-origin synchronous XHR because the current WASM ABI has no suspension
+// or continuation support; success is `Опция.Есть(тело)`, any failed request
+// is `Опция.Нет()`.
+fn lowerNetworkBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "сеть")) return null;
+
+    const property = ctx.tree.expr(call.callee).property;
+    if (!std.mem.eql(u8, property.property, "http_запрос_sync")) {
+        unsupported("сеть.свойство вызов (неподдерживаемая сетевая операция в AOT WASM)");
+    }
+    const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = "сеть::http_запрос_sync", .args = args } });
     return continuesWith(dst);
 }
 
@@ -618,20 +1191,10 @@ fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types
     return continuesWith(dst);
 }
 
-// `DOM.текст`/`.установить_текст`/`.на_клик` — the minimal, numeric-only
-// slice `wasm_emit.zig`'s `hostImportNameForBuiltin`/`builtinSignature`
-// know how to emit (see those two, `zig/core/wasm_emit.zig`): no
-// object-table runtime, no closures — `DOM.текст` returns a `Число`
-// (0 if the element is missing or its content doesn't parse as a
-// number, matching the host loader's own contract), and `.на_клик`'s
-// handler is looked up BY NAME on the host side, called with zero
-// arguments (no captured "context" — that would need a real closures
-// ABI, out of scope for this slice, same `AGENTS.md` Phase-1a-plus
-// framing `время.*` above already uses). Arguments (CSS selectors/
-// handler names) are ordinary `Строка` literals — `lowerCallArgs`
-// lowers them the same generic way as any other call, relying on
-// `lowerExpr`'s existing `.string` case (`const_value{.string=...}`,
-// resolved to a data-section byte offset only in `wasm_emit.zig`).
+// DOM supports the compatible numeric methods plus textual content/input
+// methods. The browser emitter transports every Panos `Строка` as an
+// opaque JS-runtime handle; click callbacks are still named, zero-argument
+// exports and cannot capture a Panos context yet.
 fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
@@ -643,9 +1206,21 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
     else if (std.mem.eql(u8, property.property, "установить_текст"))
         "DOM::установить_текст"
     else if (std.mem.eql(u8, property.property, "на_клик"))
-        "DOM::на_клик"
+        if (call.arguments.len == 3) "DOM::на_клик_контекст" else "DOM::на_клик"
+    else if (std.mem.eql(u8, property.property, "текст_строка"))
+        "DOM::текст_строка"
+    else if (std.mem.eql(u8, property.property, "установить_текст_строка"))
+        "DOM::установить_текст_строка"
+    else if (std.mem.eql(u8, property.property, "значение_поля"))
+        "DOM::значение_поля"
+    else if (std.mem.eql(u8, property.property, "установить_значение_поля"))
+        "DOM::установить_значение_поля"
+    else if (std.mem.eql(u8, property.property, "создать_и_добавить"))
+        "DOM::создать_и_добавить"
+    else if (std.mem.eql(u8, property.property, "после_кадра"))
+        "DOM::после_кадра"
     else
-        unsupported("DOM.свойство вызов (только текст/установить_текст/на_клик поддержаны)");
+        unsupported("DOM.свойство вызов (неподдерживаемый DOM-метод)");
 
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     const is_void = ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);

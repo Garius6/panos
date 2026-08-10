@@ -12,6 +12,7 @@ pub const mir = @import("mir.zig");
 pub const mir_builder = @import("mir_builder.zig");
 pub const mir_cfg = @import("mir_cfg.zig");
 pub const mir_lowering = @import("mir_lowering.zig");
+pub const mir_cps = @import("mir_cps.zig");
 pub const mir_validate = @import("mir_validate.zig");
 pub const wasm_stackify = @import("wasm_stackify.zig");
 pub const wasm_module = @import("wasm_module.zig");

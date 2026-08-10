@@ -174,6 +174,11 @@ pub const Function = struct {
     blocks: std.ArrayList(Block) = .empty,
     entry: BlockId = invalid_block,
     result_type: types.TypeId,
+    // A linked AOT module may contain functions lowered from several Panos
+    // source modules. Their TypeIds are scoped to different TypeStores, so
+    // the WASM emitter must classify a function's values through the store
+    // that created them, not through one arbitrary entry-module checker.
+    type_store: ?*const types.TypeStore = null,
     span: source.Span,
 
     pub fn deinit(self: *Function, allocator: std.mem.Allocator) void {

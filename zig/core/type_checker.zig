@@ -2821,14 +2821,66 @@ const Checker = struct {
                 return self.result.types.builtins.void;
             }
             if (self.isBuiltinModule(symbol, "DOM", "на_клик")) {
-                if (call.arguments.len != 2) {
-                    try self.report(call.span, "Type Error: DOM.на_клик() ожидает 2 аргумента", .{});
+                if (call.arguments.len != 2 and call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: DOM.на_клик() ожидает 2 или 3 аргумента", .{});
                     for (call.arguments) |argument| _ = try self.infer(argument);
                     return self.result.types.builtins.void;
                 }
                 for (call.arguments) |argument| {
                     if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
-                        try self.report(call.span, "Type Error: DOM.на_клик() ожидает селектор и имя обработчика типа Строка", .{});
+                        try self.report(call.span, "Type Error: DOM.на_клик() ожидает селектор, имя обработчика и необязательный контекст типа Строка", .{});
+                    }
+                }
+                return self.result.types.builtins.void;
+            }
+            if (self.isBuiltinModule(symbol, "DOM", "текст_строка") or self.isBuiltinModule(symbol, "DOM", "значение_поля")) {
+                const name = if (self.isBuiltinModule(symbol, "DOM", "текст_строка")) "текст_строка" else "значение_поля";
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: DOM.{s}() ожидает 1 аргумент", .{name});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: DOM.{s}() ожидает CSS-селектор типа Строка", .{name});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "DOM", "установить_текст_строка") or self.isBuiltinModule(symbol, "DOM", "установить_значение_поля")) {
+                const name = if (self.isBuiltinModule(symbol, "DOM", "установить_текст_строка")) "установить_текст_строка" else "установить_значение_поля";
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: DOM.{s}() ожидает 2 аргумента", .{name});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: DOM.{s}() ожидает селектор и значение типа Строка", .{name});
+                    }
+                }
+                return self.result.types.builtins.void;
+            }
+            if (self.isBuiltinModule(symbol, "DOM", "создать_и_добавить")) {
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: DOM.создать_и_добавить() ожидает 3 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: DOM.создать_и_добавить() ожидает родительский CSS-селектор, тег и id типа Строка", .{});
+                    }
+                }
+                return self.result.types.builtins.void;
+            }
+            if (self.isBuiltinModule(symbol, "DOM", "после_кадра")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: DOM.после_кадра() ожидает имя обработчика и контекст", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: DOM.после_кадра() ожидает имя обработчика и контекст типа Строка", .{});
                     }
                 }
                 return self.result.types.builtins.void;
@@ -3189,6 +3241,20 @@ const Checker = struct {
                     try self.report(call.span, "Type Error: сеть.http_запрос() ожидает Соответствие(Строка, Строка) четвёртым аргументом", .{});
                 }
                 return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "сеть", "http_запрос_sync")) {
+                const option_type = self.optionOf(self.result.types.builtins.string) orelse return self.result.types.poison();
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос_sync() ожидает 3 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return option_type;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: сеть.http_запрос_sync() ожидает метод, url и тело типа Строка", .{});
+                    }
+                }
+                return option_type;
             }
             if (self.isBuiltinModule(symbol, "сеть", "http_сервер_слушать")) {
                 const listener_symbol = self.findTypeSymbol("Слушатель") orelse return self.result.types.poison();

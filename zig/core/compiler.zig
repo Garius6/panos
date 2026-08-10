@@ -616,7 +616,7 @@ const FunctionCompiler = struct {
             // in the wrong field slot at runtime (e.g. a `Соответствие`
             // ending up in a `Строка`-typed slot) — a real bug, not
             // detected by type-checking, which discards on runtime
-          // access.
+            // access.
             for (arguments) |argument| try self.compileExpression(argument);
             if (arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
             const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(structure) });
@@ -1002,6 +1002,16 @@ const FunctionCompiler = struct {
             for (call.arguments) |argument| try self.compileExpression(argument);
             try self.function.emit(self.compiler.result.allocator, .{ .http_request_submit = {} });
             try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+            return true;
+        }
+        // Browser-only synchronous HTTP is lowered directly by the AOT MIR
+        // backend. `compileGraphForTarget` still invokes this shared bytecode
+        // compiler for diagnostics, but the VM target rejects this builtin
+        // before execution (target.zig: aot_wasm_only), so there must not be
+        // a pretend native bytecode implementation here.
+        if (call.arguments.len == 3 and std.mem.eql(u8, property.property, "http_запрос_sync")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.emitVoid();
             return true;
         }
         if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "http_сервер_слушать")) {

@@ -150,61 +150,54 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         output = output_owned.?;
     }
 
-    const reader = FileReader{ .io = init.io };
-    const bytes = reader.read(init.gpa, input) catch |err| {
-        try stderr.print("panos build: не удалось прочитать {s}: {t}\n", .{ input, err });
-        try stderr.flush();
-        std.process.exit(1);
-    };
-    defer init.gpa.free(bytes);
-
-    // `.aot_js_wasm`, NOT `analyzeSource`'s `.native` default — `panos
-    // build --target=wasm` produces AOT WASM, so type-checking under the
-    // NATIVE target profile silently applied the wrong `target_policy`
-    // gate (rejecting `DOM.*`, which IS meant to work here, while letting
-    // native-only builtins like `время.спать_мс` wrongly pass). Between
-    // the two AOT profiles, `.aot_js_wasm` is the least restrictive
-    // (allows `DOM.*` for the browser case) — this command has no
-    // separate `--target=wasm-wasi` flag to pick the stricter one, so a
-    // WASI-only program using a `DOM.*` call fails at `wasmtime run` time
-    // (unresolved import) instead of at build time, an acceptable trade
-    // matching this command's current single-profile scope.
-    var analysis = try panos_core.runner.analyzeSourceForTarget(init.gpa, input, bytes, .aot_js_wasm);
-    defer analysis.deinit();
-    if (analysis.diagnostics.items.items.len != 0) {
-        try writeAnalysisDiagnostics(stderr, &analysis);
-        if (analysis.hasErrors()) {
+    // AOT now follows the same module-loader/resolver/type-checker graph as
+    // native execution. MIR lowering still supports only its Phase-1
+    // language subset, but a plain local `импорт` no longer forces callers
+    // to paste the imported source into one file before building WASM.
+    var graph = panos_core.module_loader.Graph.init(init.gpa);
+    defer graph.deinit();
+    var global_search_roots: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (global_search_roots.items) |root| init.gpa.free(root);
+        global_search_roots.deinit(init.gpa);
+    }
+    if (init.environ_map.get("PANOS_STDLIB")) |stdlib_dir| {
+        try global_search_roots.append(init.gpa, try init.gpa.dupe(u8, stdlib_dir));
+    }
+    var exe_dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (std.process.executableDirPath(init.io, &exe_dir_buffer)) |len| {
+        try global_search_roots.append(init.gpa, try std.fmt.allocPrint(init.gpa, "{s}/std", .{exe_dir_buffer[0..len]}));
+    } else |_| {}
+    graph.global_search_roots = global_search_roots.items;
+    try graph.load(&FileReader{ .io = init.io }, input);
+    if (graph.diagnostics.items.items.len != 0) {
+        try writeModuleDiagnostics(stderr, &graph);
+        if (hasErrors(&graph.diagnostics)) {
             try stderr.flush();
             std.process.exit(1);
         }
     }
 
-    const tree = analysis.tree() orelse {
-        try stderr.print("panos build: не удалось разобрать {s}\n", .{input});
+    var compiled = try panos_core.module_compiler.compileGraphForTarget(init.gpa, &graph, .aot_js_wasm);
+    defer compiled.deinit();
+    try writeGraphDiagnostics(stderr, &graph, &compiled.diagnostics);
+    if (compiled.hasErrors()) {
         try stderr.flush();
         std.process.exit(1);
-    };
-    const resolution = analysis.resolution() orelse {
-        try stderr.print("panos build: резолвер не выполнился для {s}\n", .{input});
-        try stderr.flush();
-        std.process.exit(1);
-    };
-    const checked = analysis.checkedResult() orelse {
+    }
+    const entry_checked = if (compiled.modules[0].checked) |*value| value else {
         try stderr.print("panos build: тайпчекер не выполнился для {s}\n", .{input});
         try stderr.flush();
         std.process.exit(1);
     };
 
-    // `mir_lowering.zig`'s `unsupported()` is an uncatchable `@panic` for
-    // anything outside the Phase-1a subset (see that file's own scope
-    // note) — a source file using ADTs/closures/interfaces/`для`/methods/
-    // etc. will crash the build with that message rather than fail
-    // gracefully. Documented current limitation, not something this
-    // command works around.
-    var module = try panos_core.mir_lowering.lowerModule(init.gpa, tree, resolution, checked);
+    // `mir_lowering.zig` deliberately rejects language features outside
+    // the current AOT runtime (ADTs, closures, actors, async I/O, ...).
+    var module = try panos_core.mir_lowering.lowerGraph(init.gpa, &graph, &compiled);
     defer module.deinit(init.gpa);
+    try panos_core.mir_cps.prepare(&module);
 
-    const wasm_bytes = panos_core.wasm_emit.emitModule(init.gpa, checked, &module) catch |err| {
+    const wasm_bytes = panos_core.wasm_emit.emitModule(init.gpa, entry_checked, &module) catch |err| {
         try stderr.print("panos build: не удалось эмитировать WASM для {s}: {t}\n", .{ input, err });
         try stderr.flush();
         std.process.exit(1);

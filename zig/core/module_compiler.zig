@@ -297,10 +297,26 @@ const ImportContext = struct {
                 }
             }
         }
-        for (self.imported_types.items) |imported| {
+        var imported_type_index: usize = 0;
+        while (imported_type_index < self.imported_types.items.len) : (imported_type_index += 1) {
+            const imported = self.imported_types.items[imported_type_index];
             try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.store, imported.type_id);
         }
-        for (self.methods.items) |method| {
+        // Index-based, re-reading `self.methods.items` fresh each
+        // iteration — NOT `for (self.methods.items) |method|`, which
+        // captures a fixed slice. A transitively-discovered nominal with
+        // its OWN methods (below, the `.nominal` case) appends MORE
+        // entries to this exact list from inside this same loop — a
+        // captured slice keeps iterating over the OLD backing array after
+        // `ArrayList.append` reallocates it, walking freed memory (real,
+        // reproducible segfault: any imported function whose signature
+        // combines a transitively-imported nominal with a LOCAL struct
+        // that has a `реализация` block, e.g. `std/сеть/http.ps`'s
+        // `отправить_json(значение: json.Значение) -> Результат(Ответ,
+        // Ошибка)` — `Ответ` has methods).
+        var method_index: usize = 0;
+        while (method_index < self.methods.items.len) : (method_index += 1) {
+            const method = self.methods.items[method_index];
             try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, method.store, method.type_id);
         }
     }
@@ -1160,6 +1176,48 @@ test "module compiler accepts an imported nominal in an imported generic callbac
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "импорт \"./коллекции\" как кол\nимпорт \"./модель\" как модель\nфунк в_число(x: модель.Элемент) -> Число\nx.значение\nконец\nэкспорт функ старт() -> Число\nпер значения = кол.отобразить(массив(модель.Элемент(42)), в_число)\nзначения.получить(0, 0)\nконец" },
         .{ .path = "проект/коллекции.ps", .bytes = "экспорт функ отобразить[T, U](значения: Массив(T), преобразовать: функ(T) -> U) -> Массив(U)\nпер результат: Массив(U) = массив()\nдля значение в значения цикл\nрезультат.добавить(преобразовать(значение))\nконец\nрезультат\nконец" },
+        .{ .path = "проект/модель.ps", .bytes = "экспорт тип Элемент = структура\nзначение: Число\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Real, reproducible segfault found via std/сеть/http.ps's
+// `отправить_json(значение: json.Значение) -> Результат(Ответ, Ошибка)`:
+// importing a function whose signature combines a TRANSITIVELY-imported
+// nominal (`модель.Элемент` here, imported only via `сервис.ps`, never
+// directly by `main.ps`) with a LOCALLY-declared struct that has its OWN
+// `реализация` methods (`Обёртка.развернуть` here) crashed inside
+// `ImportContext.collect`'s `for (self.methods.items) |method|` loop —
+// `collectTransitiveNominals` (called from inside that exact loop, for
+// the `Обёртка` case) appends MORE entries to `self.methods` itself
+// (`.nominal`'s "definition has its own methods" branch), which can
+// reallocate the backing array out from under the `for` loop's already-
+// captured slice — the classic "mutate a collection while iterating a
+// captured slice of it" use-after-free. `модель.Элемент` alone (no local
+// struct with methods) never triggered it; `Обёртка` alone (no
+// transitive import) never triggered it either — needs both at once,
+// exactly like `отправить_json` (`json.Значение` transitive + local
+// `Ответ` with a `реализация` block).
+test "module compiler imports a function combining a transitive nominal with a local struct that has methods" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./сервис\" как сервис\nимпорт \"./модель\" как модель\nэкспорт функ старт() -> Число\nвыбор сервис.обернуть(модель.Элемент(42))\nРезультат.Успех(о) -> о.развернуть()\nРезультат.Неудача(_) -> -1\nконец\nконец" },
+        .{ .path = "проект/сервис.ps", .bytes = "импорт \"./модель\" как модель\nэкспорт тип Обёртка = структура\nзначение: Число\nконец\nреализация Обёртка\nфунк развернуть(это: Обёртка) -> Число\nэто.значение\nконец\nконец\nэкспорт функ обернуть(значение: модель.Элемент) -> Результат(Обёртка, Ошибка)\nРезультат.Успех(Обёртка(значение.значение))\nконец" },
         .{ .path = "проект/модель.ps", .bytes = "экспорт тип Элемент = структура\nзначение: Число\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);

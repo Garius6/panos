@@ -1216,6 +1216,17 @@ test "runner calls a real libc function through внешний, marshaling Int32
     }
 }
 
+test "runner reuses prepared внешний ABI across repeated calls" {
+    var result = try runSource(std.testing.allocator, "пример.ps", "внешний \"libc\" функ abs(значение: Целое(32)) -> Целое(32)\nэкспорт функ старт() -> Целое\nпер сумма: Целое = 0\nпер i: Целое = 0\nпока i < 100 цикл\n    сумма = сумма + abs(i - 50)\n    i = i + 1\nконец\nсумма\nконец");
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
+    switch (result.execution orelse return error.TestUnexpectedResult) {
+        .success => |output| try std.testing.expectEqualStrings("2500", output),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "runner marshals КСтрока arguments and return through внешний" {
     var length_result = try runSource(std.testing.allocator, "пример.ps", "внешний \"libc\" функ strlen(текст: КСтрока) -> Целое(64)\nэкспорт функ старт() -> Целое\nstrlen(\"привет\")\nконец");
     defer length_result.deinit();
@@ -1449,6 +1460,3 @@ fn testPipelineNeverPanics(allocator: std.mem.Allocator, smith: *std.testing.Smi
     var result = try runSource(allocator, "фазз.ps", buffer[0..len]);
     defer result.deinit();
 }
-
-
-

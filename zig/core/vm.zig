@@ -37,6 +37,48 @@ const StepOutcome = union(enum) {
     suspended,
 };
 
+// libffi описывает сигнатуру вызова (`ffi_cif`) и layout структур отдельно
+// от самих значений аргументов. И то, и другое неизменно для конкретной
+// bytecode-константы `внешний`-функции, поэтому готовим один раз и храним в
+// VM. Особенно важно для графических циклов: до кэша каждый DrawCube заново
+// выделял несколько буферов, строил ffi_type и вызывал ffi_prep_cif.
+const OwnedForeignStructType = struct {
+    ptr: *ffi.FfiType,
+    field_count: usize,
+};
+
+const PreparedForeignCall = struct {
+    cif: ffi.FfiCif = undefined,
+    arg_types: ?[]?*ffi.FfiType = null,
+    return_type: ?*ffi.FfiType = null,
+    owned_struct_types: std.ArrayList(OwnedForeignStructType) = .empty,
+    param_struct_offsets: ?[]?[]usize = null,
+    return_struct_offsets: ?[]usize = null,
+    cell_offsets: ?[]usize = null,
+    total_argument_cells: usize = 0,
+    argument_storage: ?[]u64 = null,
+    argument_values: ?[]?*anyopaque = null,
+    return_storage: ?[]u64 = null,
+
+    fn deinit(self: *PreparedForeignCall, allocator: std.mem.Allocator) void {
+        if (self.return_storage) |storage| allocator.free(storage);
+        if (self.argument_values) |values| allocator.free(values);
+        if (self.argument_storage) |storage| allocator.free(storage);
+        if (self.cell_offsets) |offsets| allocator.free(offsets);
+        if (self.return_struct_offsets) |offsets| allocator.free(offsets);
+        if (self.param_struct_offsets) |offsets| {
+            for (offsets) |maybe_offsets| if (maybe_offsets) |fields| allocator.free(fields);
+            allocator.free(offsets);
+        }
+        for (self.owned_struct_types.items) |entry| {
+            allocator.free(entry.ptr.elements.?[0 .. entry.field_count + 1]);
+            allocator.destroy(entry.ptr);
+        }
+        self.owned_struct_types.deinit(allocator);
+        if (self.arg_types) |types| allocator.free(types);
+    }
+};
+
 // Неблокирующий I/O. Payload — ТОЛЬКО плоские данные (никогда Value/GC-
 // указатели) — воркер-поток никогда не трогает vm.heap (не потокобезопасен,
 // см. gc.zig). content/err_message выделены на std.heap.page_allocator
@@ -1188,6 +1230,7 @@ pub const Vm = struct {
     // there, same as Odin.
     program_args: []const []const u8 = &.{},
     async_queue: AsyncQueue = .{},
+    foreign_call_cache: std.AutoHashMap(*const bytecode.ForeignFunctionConstant, *PreparedForeignCall),
     // Set on the FIRST `время.монотонно_мс()` call (native only — the
     // freestanding wasm32 side has no clock of its own at all, see
     // `timeMonotonic`) — every subsequent call reports elapsed time since
@@ -1211,6 +1254,7 @@ pub const Vm = struct {
             .allocator = allocator,
             .heap = gc.Heap.init(allocator),
             .program = program,
+            .foreign_call_cache = .init(allocator),
         };
     }
 
@@ -1227,6 +1271,12 @@ pub const Vm = struct {
         self.clearProcesses();
         self.processes.deinit(self.allocator);
         self.output.deinit(self.allocator);
+        var foreign_calls = self.foreign_call_cache.valueIterator();
+        while (foreign_calls.next()) |prepared| {
+            prepared.*.deinit(self.allocator);
+            self.allocator.destroy(prepared.*);
+        }
+        self.foreign_call_cache.deinit();
         self.heap.deinit();
         self.* = undefined;
     }
@@ -3550,8 +3600,9 @@ pub const Vm = struct {
             try self.fault("Runtime Error: константа вне границ пула", .{});
             return;
         }
-        const info = switch (compiled.constants.items[constant_index]) {
-            .foreign_function => |foreign| foreign,
+        const constant = &compiled.constants.items[constant_index];
+        const info: *const bytecode.ForeignFunctionConstant = switch (constant.*) {
+            .foreign_function => &constant.foreign_function,
             else => {
                 try self.fault("Runtime Error: константа не описывает 'внешний'-функцию", .{});
                 return;
@@ -3608,7 +3659,7 @@ pub const Vm = struct {
     // offsets come from libffi itself (`ffi_get_struct_offsets`) — C ABI
     // struct layout (padding for alignment) is NOT something to
     // reimplement by hand here.
-    fn packStruct(self: *Vm, dest: [*]u8, struct_type: *ffi.FfiType, layout: []const ast_types.ForeignMarshalKind, source: value.Value) anyerror!void {
+    fn packStruct(self: *Vm, dest: [*]u8, layout: []const ast_types.ForeignMarshalKind, offsets: []const usize, source: value.Value) anyerror!void {
         const aggregate = switch (source) {
             .aggregate => |a| a,
             else => {
@@ -3620,9 +3671,10 @@ pub const Vm = struct {
             try self.fault("Runtime Error: количество полей ff_структура не совпадает при 'внешний'-вызове", .{});
             return;
         }
-        const offsets = try self.allocator.alloc(usize, layout.len);
-        defer self.allocator.free(offsets);
-        _ = ffi.ffi_get_struct_offsets(ffi.defaultAbi(), struct_type, offsets.ptr);
+        if (offsets.len != layout.len) {
+            try self.fault("Runtime Error: layout ff_структура не совпадает при 'внешний'-вызове", .{});
+            return;
+        }
         for (layout, aggregate.elements, offsets) |kind, field_value, offset| {
             try self.packScalar(dest + offset, kind, field_value);
         }
@@ -3632,93 +3684,132 @@ pub const Vm = struct {
     // field access is purely positional, `vm.zig`'s `getProperty`/
     // `setProperty` never consult `.name`, see `buildStruct`) from raw C
     // ABI bytes.
-    fn unpackStruct(self: *Vm, source: [*]const u8, struct_type: *ffi.FfiType, layout: []const ast_types.ForeignMarshalKind) anyerror!value.Value {
-        const offsets = try self.allocator.alloc(usize, layout.len);
-        defer self.allocator.free(offsets);
-        _ = ffi.ffi_get_struct_offsets(ffi.defaultAbi(), struct_type, offsets.ptr);
+    fn unpackStruct(self: *Vm, source: [*]const u8, layout: []const ast_types.ForeignMarshalKind, offsets: []const usize) anyerror!value.Value {
+        if (offsets.len != layout.len) {
+            try self.fault("Runtime Error: layout ff_структура не совпадает при 'внешний'-вызове", .{});
+            return .{ .void = {} };
+        }
         const elements = try self.allocator.alloc(value.Value, layout.len);
         for (layout, offsets, elements) |kind, offset, *slot| slot.* = unpackScalar(kind, source + offset);
         const aggregate = try self.heap.createAggregate(null, elements);
         return .{ .aggregate = aggregate };
     }
 
-    // Marshals `arguments` through libffi and calls `info.fn_ptr`. Each
-    // argument gets its own 8-byte-aligned storage region, sized in whole
-    // 8-byte cells — 1 cell for every scalar (matches Odin's
-    // `arg_storage`/`avalue` in `core/vm_ffi_native.odin`), `ceil(size /
-    // 8)` cells for a struct-by-value argument (`size` only known AFTER
-    // `ffi_prep_cif` fills it in — struct cell counts are computed in a
-    // SECOND pass, after that call, not up front). One flat `[]u64`
-    // buffer for ALL cells (not one allocation per argument) — avoids
-    // ever reallocating out from under an `avalue[i]` pointer already
-    // handed to libffi.
-    fn invokeForeign(self: *Vm, info: bytecode.ForeignFunctionConstant, arguments: []const value.Value) anyerror!value.Value {
-        const nargs = info.param_kinds.len;
-        const atypes = try self.allocator.alloc(?*ffi.FfiType, nargs);
-        defer self.allocator.free(atypes);
-        // Struct `ffi_type`s are built per call (their `elements` array is
-        // sized to that struct's own field count) — freed alongside
-        // `atypes` once the call is done; `ffi_call` never keeps a
-        // reference past its own return.
-        var struct_type_allocs: std.ArrayList(struct { ptr: *ffi.FfiType, field_count: usize }) = .empty;
-        defer {
-            for (struct_type_allocs.items) |entry| {
-                self.allocator.free(entry.ptr.elements.?[0 .. entry.field_count + 1]);
-                self.allocator.destroy(entry.ptr);
-            }
-            struct_type_allocs.deinit(self.allocator);
+    fn cachedForeignCall(self: *Vm, info: *const bytecode.ForeignFunctionConstant) anyerror!?*PreparedForeignCall {
+        if (self.foreign_call_cache.get(info)) |prepared| return prepared;
+
+        const prepared = self.prepareForeignCall(info) catch |err| {
+            if (err == error.ForeignPreparationFailed) return null;
+            return err;
+        };
+        errdefer {
+            prepared.deinit(self.allocator);
+            self.allocator.destroy(prepared);
         }
-        for (info.param_kinds, info.param_struct_layouts, atypes) |kind, layout, *slot| {
+        try self.foreign_call_cache.put(info, prepared);
+        return prepared;
+    }
+
+    fn prepareForeignCall(self: *Vm, info: *const bytecode.ForeignFunctionConstant) anyerror!*PreparedForeignCall {
+        const prepared = try self.allocator.create(PreparedForeignCall);
+        prepared.* = .{};
+        errdefer {
+            prepared.deinit(self.allocator);
+            self.allocator.destroy(prepared);
+        }
+
+        const nargs = info.param_kinds.len;
+        const arg_types = try self.allocator.alloc(?*ffi.FfiType, nargs);
+        prepared.arg_types = arg_types;
+        const param_offsets = try self.allocator.alloc(?[]usize, nargs);
+        prepared.param_struct_offsets = param_offsets;
+        @memset(param_offsets, null);
+
+        for (info.param_kinds, info.param_struct_layouts, arg_types) |kind, layout, *slot| {
             if (kind == .struct_value) {
                 const struct_type = try ffi.buildStructFfiType(self.allocator, layout);
-                try struct_type_allocs.append(self.allocator, .{ .ptr = struct_type, .field_count = layout.len });
+                try prepared.owned_struct_types.append(self.allocator, .{ .ptr = struct_type, .field_count = layout.len });
                 slot.* = struct_type;
             } else {
                 slot.* = ffi.ffiTypeForMarshal(kind);
             }
         }
-        const rtype = if (info.return_kind == .struct_value) blk: {
+        const return_type = if (info.return_kind == .struct_value) blk: {
             const struct_type = try ffi.buildStructFfiType(self.allocator, info.return_struct_layout);
-            try struct_type_allocs.append(self.allocator, .{ .ptr = struct_type, .field_count = info.return_struct_layout.len });
+            try prepared.owned_struct_types.append(self.allocator, .{ .ptr = struct_type, .field_count = info.return_struct_layout.len });
             break :blk struct_type;
         } else ffi.ffiTypeForMarshal(info.return_kind);
+        prepared.return_type = return_type;
 
-        var cif: ffi.FfiCif = undefined;
-        const prep_status = ffi.ffi_prep_cif(&cif, ffi.defaultAbi(), @intCast(nargs), rtype, if (nargs > 0) atypes.ptr else null);
+        const prep_status = ffi.ffi_prep_cif(&prepared.cif, ffi.defaultAbi(), @intCast(nargs), return_type, if (nargs > 0) arg_types.ptr else null);
         if (prep_status != ffi.FFI_OK) {
             try self.fault("Runtime Error: ffi_prep_cif не удался (status={d})", .{prep_status});
-            return .{ .void = {} };
+            return error.ForeignPreparationFailed;
         }
 
-        // Now that `ffi_prep_cif` has run, every struct `FfiType.size` in
-        // `atypes`/`rtype` is real — compute per-argument cell counts.
+        // ffi_prep_cif вычислил настоящие размеры структур. Фиксируем и
+        // offsets, и буферы для последующих вызовов — они неизменны для
+        // этой сигнатуры и больше не должны попадать в горячий путь.
+        for (info.param_kinds, info.param_struct_layouts, arg_types, param_offsets) |kind, layout, arg_type, *slot| {
+            if (kind != .struct_value) continue;
+            const offsets = try self.allocator.alloc(usize, layout.len);
+            slot.* = offsets;
+            const offset_status = ffi.ffi_get_struct_offsets(ffi.defaultAbi(), arg_type.?, offsets.ptr);
+            if (offset_status != ffi.FFI_OK) {
+                try self.fault("Runtime Error: ffi_get_struct_offsets не удался (status={d})", .{offset_status});
+                return error.ForeignPreparationFailed;
+            }
+        }
+        if (info.return_kind == .struct_value) {
+            const offsets = try self.allocator.alloc(usize, info.return_struct_layout.len);
+            prepared.return_struct_offsets = offsets;
+            const offset_status = ffi.ffi_get_struct_offsets(ffi.defaultAbi(), return_type, offsets.ptr);
+            if (offset_status != ffi.FFI_OK) {
+                try self.fault("Runtime Error: ffi_get_struct_offsets не удался (status={d})", .{offset_status});
+                return error.ForeignPreparationFailed;
+            }
+        }
+
         const cell_offsets = try self.allocator.alloc(usize, nargs);
-        defer self.allocator.free(cell_offsets);
+        prepared.cell_offsets = cell_offsets;
         var total_cells: usize = 0;
-        for (info.param_kinds, atypes, cell_offsets) |kind, atype, *offset| {
+        for (info.param_kinds, arg_types, cell_offsets) |kind, arg_type, *offset| {
             offset.* = total_cells;
-            const bytes: usize = if (kind == .struct_value) atype.?.size else 8;
+            const bytes: usize = if (kind == .struct_value) arg_type.?.size else 8;
             total_cells += (bytes + 7) / 8;
         }
-        const return_cells: usize = if (info.return_kind == .struct_value) (rtype.size + 7) / 8 else 1;
+        prepared.total_argument_cells = total_cells;
+        const return_cells: usize = if (info.return_kind == .struct_value) (return_type.size + 7) / 8 else 1;
+        prepared.argument_storage = try self.allocator.alloc(u64, @max(1, total_cells));
+        prepared.argument_values = try self.allocator.alloc(?*anyopaque, nargs);
+        prepared.return_storage = try self.allocator.alloc(u64, @max(1, return_cells));
+        return prepared;
+    }
 
-        const arg_storage = try self.allocator.alloc(u64, @max(1, total_cells));
-        defer self.allocator.free(arg_storage);
-        const avalue = try self.allocator.alloc(?*anyopaque, nargs);
-        defer self.allocator.free(avalue);
+    // Marshals `arguments` and performs the actual FFI call. Signature
+    // preparation, layout calculation and storage allocation are cached by
+    // `prepareForeignCall`; only the values themselves are hot-path work.
+    fn invokeForeign(self: *Vm, info: *const bytecode.ForeignFunctionConstant, arguments: []const value.Value) anyerror!value.Value {
+        const prepared = (try self.cachedForeignCall(info)) orelse return .{ .void = {} };
+        const nargs = info.param_kinds.len;
+        const arg_types = prepared.arg_types.?;
+        const param_offsets = prepared.param_struct_offsets.?;
+        const cell_offsets = prepared.cell_offsets.?;
+        const argument_storage = prepared.argument_storage.?;
+        const argument_values = prepared.argument_values.?;
+        const return_storage = prepared.return_storage.?;
+
         // `КСтрока` arguments need a real null-terminated buffer that
-        // outlives the `ffi_call` below — borrowed-for-the-duration-of-
-        // this-call convention (see `docs/src/language/ffi.md` in the
-        // Odin tree): if the C function retains the pointer past its own
-        // return, that's outside this feature's guarantees.
+        // outlives the `ffi_call` below. This remains per-call because C
+        // receives the current panos string, unlike the ABI plan above.
         var cstring_storage: std.ArrayList([:0]u8) = .empty;
         defer {
             for (cstring_storage.items) |buffer| self.allocator.free(buffer);
             cstring_storage.deinit(self.allocator);
         }
 
-        for (info.param_kinds, info.param_struct_layouts, atypes, cell_offsets, 0..) |kind, layout, atype, cell_offset, index| {
-            const dest: [*]u8 = @ptrCast(&arg_storage[cell_offset]);
+        for (info.param_kinds, info.param_struct_layouts, arg_types, cell_offsets, 0..) |kind, layout, arg_type, cell_offset, index| {
+            const dest: [*]u8 = @ptrCast(&argument_storage[cell_offset]);
             switch (kind) {
                 .int8, .int32, .int64, .float32, .float64 => try self.packScalar(dest, kind, arguments[index]),
                 .c_string => {
@@ -3731,35 +3822,27 @@ pub const Vm = struct {
                     const cell: *[*:0]const u8 = @ptrCast(@alignCast(dest));
                     cell.* = buffer.ptr;
                 },
-                .struct_value => try self.packStruct(dest, atype.?, layout, arguments[index]),
+                .struct_value => try self.packStruct(dest, layout, param_offsets[index] orelse unreachable, arguments[index]),
                 .void, .pointer => unreachable,
             }
-            avalue[index] = dest;
+            _ = arg_type;
+            argument_values[index] = dest;
         }
 
-        const return_storage = try self.allocator.alloc(u64, @max(1, return_cells));
-        defer self.allocator.free(return_storage);
-        ffi.ffi_call(&cif, @ptrFromInt(info.fn_ptr), return_storage.ptr, if (nargs > 0) avalue.ptr else null);
+        ffi.ffi_call(&prepared.cif, @ptrFromInt(info.fn_ptr), return_storage.ptr, if (nargs > 0) argument_values.ptr else null);
         const return_bytes: [*]const u8 = @ptrCast(return_storage.ptr);
 
         return switch (info.return_kind) {
             .void => .{ .void = {} },
             .int8, .int32, .int64, .float32, .float64 => unpackScalar(info.return_kind, return_bytes),
             .c_string => blk: {
-                // panos ALWAYS copies a returned C string into a new
-                // managed string — never borrows C-owned memory,
-                // regardless of who actually owns it on the C side. A
-                // real NULL return (e.g. `getenv` on a missing variable)
-                // becomes an empty `Строка` — the marshal kind is a
-                // non-optional `КСтрока`, there is no way to express
-                // "no value" in this first slice's type mapping, and
-                // `std.mem.span` on a null pointer would otherwise crash.
+                // Panos always copies C-owned returned strings into the GC.
                 const raw: ?[*:0]const u8 = @as(*const ?[*:0]const u8, @ptrCast(@alignCast(return_bytes))).*;
                 const bytes = if (raw) |pointer| std.mem.span(pointer) else "";
                 const heap_string = try self.heap.createString(try self.allocator.dupe(u8, bytes));
                 break :blk .{ .heap_string = heap_string };
             },
-            .struct_value => try self.unpackStruct(return_bytes, rtype, info.return_struct_layout),
+            .struct_value => try self.unpackStruct(return_bytes, info.return_struct_layout, prepared.return_struct_offsets orelse unreachable),
             .pointer => unreachable,
         };
     }

@@ -1141,6 +1141,52 @@ const posix_env = struct {
     extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 };
 
+// MSVC's ucrt has no `setenv`/`unsetenv` symbols at all (it's `_putenv_s`
+// instead) — `posix_env`'s `extern "c"` declarations above would fail at
+// LINK time on Windows, not compile time, so this was never caught by a
+// plain compile-error scan. `SetEnvironmentVariableW` mutates the CURRENT
+// process's env block directly (no `std` binding for it in this Zig
+// version — same gap `resolver.zig`'s `WindowsDynLib` already worked
+// around for `LoadLibraryW`/`GetProcAddress`) — a spawned child inherits
+// that block automatically unless a caller overrides it, which is exactly
+// what `osExec`'s environ-hack needs on Windows too (see there).
+const windows_env = struct {
+    extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) c_int;
+    extern "kernel32" fn GetEnvironmentStringsW() callconv(.winapi) ?[*:0]const u16;
+    extern "kernel32" fn FreeEnvironmentStringsW(penv: [*:0]const u16) callconv(.winapi) c_int;
+
+    fn setenv(allocator: std.mem.Allocator, name: []const u8, env_value: []const u8) !c_int {
+        const name_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, name);
+        defer allocator.free(name_w);
+        const value_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, env_value);
+        defer allocator.free(value_w);
+        return if (SetEnvironmentVariableW(name_w, value_w) != 0) 0 else 1;
+    }
+
+    fn unsetenv(allocator: std.mem.Allocator, name: []const u8) !c_int {
+        const name_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, name);
+        defer allocator.free(name_w);
+        return if (SetEnvironmentVariableW(name_w, null) != 0) 0 else 1;
+    }
+
+    // `std.process.Environ.Block` resolves to `GlobalBlock` on Windows
+    // (only `.empty`/`.global`, see `Environ.zig`) — no way to hand it a
+    // custom block through the normal `createMap` entry point at all on
+    // this platform. Bypasses that by reading the live process
+    // environment block directly (same live-block idea as the POSIX
+    // `std.c.environ` read in `osExec` below) and feeding it through
+    // `Environ.Map.putWindowsBlock`, which only needs a raw UTF-16
+    // double-null-terminated pointer — no `Block`/`createMap` involved.
+    fn buildEnvironMap(allocator: std.mem.Allocator) !std.process.Environ.Map {
+        var map = std.process.Environ.Map.init(allocator);
+        errdefer map.deinit();
+        const raw = GetEnvironmentStringsW() orelse return map;
+        defer _ = FreeEnvironmentStringsW(raw);
+        try map.putWindowsBlock(.{ .ptr = raw });
+        return map;
+    }
+};
+
 // `ввод_вывод.печать`/`.строка`'s value-to-text conversion, also reused by
 // `runner.renderValue` for the CLI's final return-value line (same
 // contract, one implementation) — a structural dump (`Имя(поле1, поле2,
@@ -2043,6 +2089,13 @@ pub const Vm = struct {
         };
         if (comptime builtin.target.os.tag == .freestanding) {
             try self.fault("Runtime Panic: 'ос::установить_окружение' недоступно в этом runtime-таргете", .{});
+        } else if (comptime builtin.target.os.tag == .windows) {
+            const status = try windows_env.setenv(self.allocator, name, env_value);
+            if (status != 0) {
+                try self.pushErrorResultForModule("ос", "не удалось установить переменную окружения");
+            } else {
+                try self.pushSuccessResult(.{ .number = 0 });
+            }
         } else {
             const name_z = try self.allocator.dupeZ(u8, name);
             defer self.allocator.free(name_z);
@@ -2069,6 +2122,9 @@ pub const Vm = struct {
         };
         if (comptime builtin.target.os.tag == .freestanding) {
             try self.fault("Runtime Panic: 'ос::удалить_окружение' недоступно в этом runtime-таргете", .{});
+        } else if (comptime builtin.target.os.tag == .windows) {
+            const status = try windows_env.unsetenv(self.allocator, name);
+            try self.stack.append(self.allocator, .{ .boolean = status == 0 });
         } else {
             const name_z = try self.allocator.dupeZ(u8, name);
             defer self.allocator.free(name_z);
@@ -2135,10 +2191,19 @@ pub const Vm = struct {
             // установить_окружение`'s `setenv`, see `osEnvSet`) and
             // passing it explicitly via `RunOptions.environ_map` —
             // bypassing `Io.Threaded`'s broken auto-scan path entirely.
-            const raw_environ: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-            var environ_len: usize = 0;
-            while (raw_environ[environ_len] != null) : (environ_len += 1) {}
-            var environ_map = try std.process.Environ.createMap(.{ .block = .{ .slice = raw_environ[0..environ_len :null] } }, self.allocator);
+            // `std.process.Environ.Block` is `PosixBlock` (a `.slice` of
+            // `std.c.environ`-shaped entries) on POSIX, but `GlobalBlock`
+            // (no `.slice` field at all) on Windows — `windows_env.
+            // buildEnvironMap` reads the live block a different way there
+            // (`GetEnvironmentStringsW`, see its own comment).
+            var environ_map = if (comptime builtin.target.os.tag == .windows)
+                try windows_env.buildEnvironMap(self.allocator)
+            else blk: {
+                const raw_environ: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+                var environ_len: usize = 0;
+                while (raw_environ[environ_len] != null) : (environ_len += 1) {}
+                break :blk try std.process.Environ.createMap(.{ .block = .{ .slice = raw_environ[0..environ_len :null] } }, self.allocator);
+            };
             defer environ_map.deinit();
             // An empty `working_dir` means "run in the current directory"
             // (documented contract, matches every real panosiki caller —
@@ -2271,8 +2336,16 @@ pub const Vm = struct {
         defer line.deinit(self.allocator);
         var got_any = false;
         var buf: [1]u8 = undefined;
+        // `std.posix.read(std.posix.STDIN_FILENO, ...)` doesn't exist on
+        // Windows (`fd_t` there is handle-based, not a POSIX integer fd —
+        // `STDIN_FILENO` is a POSIX-only concept) — `std.Io.File.stdin()`
+        // + `.readStreaming` abstracts over both uniformly (already the
+        // pattern `submitFileRead`/`submitFileWrite` use for `фс.*` above).
+        var io: std.Io.Threaded = .init(self.allocator, .{});
+        defer io.deinit();
         while (true) {
-            const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch |err| {
+            const n = std.Io.File.stdin().readStreaming(io.io(), &.{&buf}) catch |err| {
+                if (err == error.EndOfStream) break;
                 try self.fault("Runtime Error: не удалось прочитать stdin: {s}", .{@errorName(err)});
                 return;
             };

@@ -791,6 +791,38 @@ const Resolver = struct {
             try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
         } else if (self.target_profile != .native) {
             try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
+        } else if ((comptime builtin.target.os.tag != .windows) and std.mem.eql(u8, foreign.library, "libc")) {
+            // `внешний "libc"` doesn't need to find and load a SEPARATE
+            // shared object file at all — libc is ALREADY linked into
+            // this very process (every native panos binary links libc).
+            // `dlopen(NULL, ...)` is POSIX for exactly this: "give me a
+            // handle to the running program's own already-loaded image"
+            // (main executable + every shared library already mapped
+            // in, libc included) — `std.c.dlopen`'s first param is
+            // `?[*:0]const u8`, so `null` is directly expressible, no
+            // need to drop to raw libc bindings by hand.
+            //
+            // Replaces an EARLIER version of this fix that hardcoded
+            // the filename `"libc.so.6"` for non-macOS/Windows — found
+            // wrong by inspection before it ever shipped: that's the
+            // glibc SONAME specifically, and doesn't exist AT ALL on
+            // musl-based Linux (Alpine and similar) — same class of
+            // "guessed a filename, wrong on a platform nobody tested"
+            // mistake the .so-vs-.so.6 fix was itself catching. dlopen
+            // (NULL) needs no filename, no libc-flavor knowledge, and
+            // is exactly as valid on macOS as it is on any POSIX system
+            // — used unconditionally for "libc" on every non-Windows
+            // target, not just Linux.
+            const handle = std.c.dlopen(null, .{ .LAZY = true }) orelse {
+                try self.report(foreign.span, "Resolve Error: библиотека 'libc' не найдена (dlopen(NULL) в этом процессе)", .{});
+                return;
+            };
+            const name_z = try self.result.arena.allocator().dupeZ(u8, foreign.name);
+            const fn_ptr = std.c.dlsym(handle, name_z) orelse {
+                try self.report(foreign.span, "Resolve Error: библиотека 'libc' не экспортирует символ '{s}'", .{foreign.name});
+                return;
+            };
+            try self.result.foreign_functions.put(symbol, @intFromPtr(fn_ptr));
         } else {
             const filename = try foreignLibraryFilename(self.result.arena.allocator(), foreign.library);
             const filename_z = try self.result.arena.allocator().dupeZ(u8, filename);
@@ -808,21 +840,6 @@ const Resolver = struct {
     }
 
     fn foreignLibraryFilename(allocator: std.mem.Allocator, logical_name: []const u8) ![]const u8 {
-        // `libc` on glibc Linux is a real, separate exception to the
-        // generic "name + suffix" rule below — found breaking CI (Linux
-        // runner, `внешний "libc"` test suite), never caught locally
-        // (macOS's `libc.dylib` genuinely exists as a loadable file).
-        // Unversioned `libc.so` is normally ONLY part of the `-dev`
-        // package (a linker SCRIPT for `-lc` at compile time, not a
-        // real shared object `dlopen` can load) — the actual runtime
-        // library glibc programs are already linked against is the
-        // versioned SONAME, near-universally `libc.so.6`. Narrow,
-        // deliberately not general (doesn't attempt musl's differently-
-        // named libc, e.g. Alpine) — this project's CI/dev targets are
-        // glibc Linux + macOS only.
-        if (builtin.target.os.tag != .macos and builtin.target.os.tag != .windows and std.mem.eql(u8, logical_name, "libc")) {
-            return allocator.dupe(u8, "libc.so.6");
-        }
         const suffix = switch (builtin.target.os.tag) {
             .macos, .ios, .tvos, .watchos => ".dylib",
             .windows => ".dll",

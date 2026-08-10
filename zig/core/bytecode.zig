@@ -34,6 +34,7 @@ pub const Constant = union(enum) {
     string: []const u8,
     function_ref: FunctionId,
     interface_vtable: []const FunctionId,
+    interface_vtables: []const []const FunctionId,
     foreign_function: ForeignFunctionConstant,
 };
 
@@ -227,6 +228,7 @@ pub const Instruction = union(Opcode) {
     cast_interface: u16,
     call_interface: struct {
         method_index: u16,
+        vtable_index: u16 = 0,
         argument_count: u16,
     },
     spawn: u16,

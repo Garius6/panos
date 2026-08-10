@@ -296,10 +296,11 @@ fn submitFileRead(vm: *Vm, path: []const u8, target_id: u64) void {
             std.heap.page_allocator.free(job.path);
             const payload: AsyncPayload = if (bytes) |content|
                 .{ .file_read = .{ .content = content, .err_message = null } }
-            else |err| .{ .file_read = .{
-                .content = null,
-                .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
-            } };
+            else |err|
+                .{ .file_read = .{
+                    .content = null,
+                    .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
+                } };
             job.queue.push(.{ .target_id = job.target_id, .payload = payload });
         }
     };
@@ -326,10 +327,11 @@ fn submitFileWrite(vm: *Vm, path: []const u8, content: []const u8, target_id: u6
             std.heap.page_allocator.free(job.content);
             const payload: AsyncPayload = if (write_error) |_|
                 .{ .file_write = .{ .bytes_written = bytes_written, .err_message = null } }
-            else |err| .{ .file_write = .{
-                .bytes_written = 0,
-                .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
-            } };
+            else |err|
+                .{ .file_write = .{
+                    .bytes_written = 0,
+                    .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"),
+                } };
             job.queue.push(.{ .target_id = job.target_id, .payload = payload });
         }
     };
@@ -1508,7 +1510,7 @@ pub const Vm = struct {
             .boolean => |constant_boolean| .{ .boolean = constant_boolean },
             .string => |string| .{ .string = string },
             .function_ref => |function_id| .{ .function_ref = function_id },
-            .interface_vtable => {
+            .interface_vtable, .interface_vtables => {
                 try self.fault("Runtime Error: vtable интерфейса нельзя использовать как значение", .{});
                 return;
             },
@@ -4156,8 +4158,14 @@ pub const Vm = struct {
     const Comparison = enum { less, less_equal, greater, greater_equal };
 
     fn compare(self: *Vm, comparison: Comparison) anyerror!void {
-        const right_value = try self.pop();
-        const left_value = try self.pop();
+        const right_value = switch (try self.pop()) {
+            .interface => |interface| interface.receiver,
+            else => |other| other,
+        };
+        const left_value = switch (try self.pop()) {
+            .interface => |interface| interface.receiver,
+            else => |other| other,
+        };
         const result = switch (right_value) {
             .number => |right| blk: {
                 const left = try self.number(left_value);
@@ -4396,7 +4404,7 @@ pub const Vm = struct {
                 const key = @intFromPtr(interface);
                 if (seen.get(key)) |existing| break :blk existing;
                 const receiver_copy = try self.deepCopyForSendInner(interface.receiver, seen);
-                const copied: value.Value = .{ .interface = try self.heap.createInterface(receiver_copy, interface.methods) };
+                const copied: value.Value = .{ .interface = try self.heap.createInterfacePackage(receiver_copy, interface.vtables) };
                 try seen.put(key, copied);
                 break :blk copied;
             },
@@ -4467,8 +4475,9 @@ pub const Vm = struct {
             try self.fault("Runtime Error: vtable интерфейса вне границ пула", .{});
             return;
         }
-        const methods = switch (compiled.constants.items[vtable_index]) {
-            .interface_vtable => |vtable| vtable,
+        const vtables = switch (compiled.constants.items[vtable_index]) {
+            .interface_vtable => |vtable| &.{vtable},
+            .interface_vtables => |tables| tables,
             else => {
                 try self.fault("Runtime Error: vtable интерфейса имеет неверный тип", .{});
                 return;
@@ -4482,7 +4491,7 @@ pub const Vm = struct {
                 return;
             },
         }
-        const interface = try self.heap.createInterface(receiver, methods);
+        const interface = try self.heap.createInterfacePackage(receiver, vtables);
         try self.stack.append(self.allocator, .{ .interface = interface });
     }
 
@@ -4500,11 +4509,16 @@ pub const Vm = struct {
                 return;
             },
         };
-        if (call_info.method_index >= interface.methods.len) {
+        if (call_info.vtable_index >= interface.vtables.len) {
+            try self.fault("Runtime Error: vtable интерфейсного метода не найдена", .{});
+            return;
+        }
+        const methods = interface.vtables[call_info.vtable_index];
+        if (call_info.method_index >= methods.len) {
             try self.fault("Runtime Error: метод не найден в vtable интерфейса", .{});
             return;
         }
-        self.stack.items[interface_index] = .{ .function_ref = interface.methods[call_info.method_index] };
+        self.stack.items[interface_index] = .{ .function_ref = methods[call_info.method_index] };
         try self.stack.insert(self.allocator, interface_index + 1, interface.receiver);
         try self.call(@intCast(argument_count + 1));
     }
@@ -8025,6 +8039,60 @@ test "VM dispatches an interface method through a generic bound parameter" {
     const outcome = try vm.run(@enumFromInt(2), &.{});
     switch (outcome) {
         .success => |runtime_value| try std.testing.expectEqualStrings("точка", runtime_value.stringBytes() orelse return error.TestUnexpectedResult),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "VM dispatches a second interface method through multiple generic bounds" {
+    const compiler = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Точка = структура
+        \\    x: Число
+        \\конец
+        \\тип Сдвигаемое = интерфейс
+        \\    функ сдвиг() -> Число
+        \\конец
+        \\реализация Печатаемое для Точка
+        \\    функ вСтроку(это: Точка) -> Строка
+        \\        "точка"
+        \\    конец
+        \\конец
+        \\реализация Сдвигаемое для Точка
+        \\    функ сдвиг(это: Точка) -> Число
+        \\        это.x + 1
+        \\    конец
+        \\конец
+        \\функ сдвинуть[T: Печатаемое + Сдвигаемое](значение: T) -> Число
+        \\    значение.сдвиг()
+        \\конец
+        \\функ старт() -> Число
+        \\    сдвинуть(Точка(41))
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const outcome = try vm.run(@enumFromInt(3), &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
         .runtime_error => return error.TestUnexpectedResult,
     }
 }

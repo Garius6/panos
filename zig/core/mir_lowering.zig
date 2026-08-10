@@ -879,7 +879,7 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
                 return emitCallValue(ctx, function_ref, args, result_type);
             }
             if (try lowerEnumConstructor(ctx, symbol, call, result_type)) |outcome| return outcome;
-            if (try lowerStructConstructor(ctx, symbol, call, result_type)) |outcome| return outcome;
+            if (try lowerStructConstructor(ctx, expression, symbol, call, result_type)) |outcome| return outcome;
             if (try lowerNumericCastCall(ctx, symbol, call)) |outcome| return outcome;
             if (try lowerLengthBuiltinCall(ctx, symbol, call, result_type)) |outcome| return outcome;
             if (try lowerProcessBuiltinCall(ctx, symbol, call, result_type)) |outcome| return outcome;
@@ -1029,7 +1029,7 @@ fn lowerOptionMethodCall(ctx: *LoweringContext, call: anytype, result_type: type
     return null;
 }
 
-fn lowerStructConstructor(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+fn lowerStructConstructor(ctx: *LoweringContext, expression: ast.ExprId, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
     if (entry.kind != .type) return null;
     const type_entry = ctx.checked.types.get(result_type) orelse return null;
@@ -1040,8 +1040,8 @@ fn lowerStructConstructor(ctx: *LoweringContext, symbol: symbols.SymbolId, call:
     if (nominal.symbol != symbol) return null;
     const fields = ctx.checked.nominal_fields.get(symbol) orelse return null;
     if (fields.len > 3) unsupported("структура с более чем 3 полями");
-    if (call.argument_names != null) unsupported("именованные аргументы конструктора структуры");
-    const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+    const arguments = ctx.checked.call_arguments.get(expression) orelse call.arguments;
+    const args = try lowerCallArgs(ctx, arguments) orelse return terminated;
     const dst = try ctx.builder.newValue(result_type);
     try ctx.builder.emit(.{ .new_aggregate = .{ .dst = dst, .type_name = entry.name, .elements = args } });
     return continuesWith(dst);

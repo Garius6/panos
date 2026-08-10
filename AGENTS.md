@@ -234,3 +234,9 @@ md`).
 единственным источником ПОЧЕМУ конкретные архитектурные решения были
 приняты именно так во время переноса, полезно при разборе кода, даже
 когда сам Odin-код уже недостижим.
+
+## Active Technologies
+- Zig 0.16.0; Panos source language + Zig standard library; existing bytecode VM and module compiler (011-fix-type-soundness)
+
+## Recent Changes
+- 011-fix-type-soundness: Added Zig 0.16.0; Panos source language + Zig standard library; existing bytecode VM and module compiler

@@ -52,15 +52,20 @@ pub const InterfaceImplementation = struct {
     methods: []const symbols.SymbolId,
 };
 
-pub const InterfaceCast = struct {
+pub const InterfaceCastEntry = struct {
     interface: symbols.SymbolId,
     arguments: []const types.TypeId,
     target: symbols.SymbolId,
 };
 
+pub const InterfaceCast = struct {
+    entries: []const InterfaceCastEntry,
+};
+
 pub const InterfaceCall = struct {
     interface: symbols.SymbolId,
     method_index: u16,
+    vtable_index: u16 = 0,
 };
 
 pub const ForInKind = enum {
@@ -130,6 +135,7 @@ pub const ImportedMethod = struct {
     symbol: symbols.SymbolId,
     store: *const types.TypeStore,
     type_id: types.TypeId,
+    parameter_names: []const []const u8 = &.{},
 };
 
 // An owner's interface implementation, re-hosted from the source module.
@@ -211,6 +217,7 @@ pub const CheckResult = struct {
     pattern_variants: std.AutoHashMap(ast.PatternId, symbols.SymbolId),
     pattern_types: std.AutoHashMap(ast.PatternId, types.TypeId),
     methods: std.ArrayList(MethodDefinition) = .empty,
+    imported_method_parameter_names: std.AutoHashMap(symbols.SymbolId, []const []const u8),
     method_calls: std.AutoHashMap(ast.ExprId, symbols.SymbolId),
     interface_calls: std.AutoHashMap(ast.ExprId, InterfaceCall),
     interface_casts: std.AutoHashMap(ast.ExprId, InterfaceCast),
@@ -241,6 +248,7 @@ pub const CheckResult = struct {
             .interface_casts = .init(allocator),
             .call_arguments = .init(allocator),
             .for_in_infos = .init(allocator),
+            .imported_method_parameter_names = .init(allocator),
         };
     }
 
@@ -251,6 +259,7 @@ pub const CheckResult = struct {
         self.interface_calls.deinit();
         self.method_calls.deinit();
         self.methods.deinit(self.allocator);
+        self.imported_method_parameter_names.deinit();
         self.pattern_types.deinit();
         self.pattern_variants.deinit();
         self.interface_implementations.deinit(self.allocator);
@@ -581,6 +590,7 @@ const Checker = struct {
                 else => return err,
             };
             try self.result.symbol_types.put(imported.symbol, copied);
+            try self.result.imported_method_parameter_names.put(imported.symbol, imported.parameter_names);
             const owner_parameters = owner_parameters_by_symbol.get(imported.owner) orelse &.{};
             try self.result.methods.append(self.result.allocator, .{
                 .owner = imported.owner,
@@ -2475,7 +2485,15 @@ const Checker = struct {
                     try self.report(span, "Type Error: присваивание возможно только переменной, полю или индексу", .{});
                 }
             },
-            .property, .index => {},
+            .property => {},
+            .index => |index| {
+                const object_type = try self.infer(index.object);
+                const object = self.result.types.get(object_type) orelse return;
+                switch (object.*) {
+                    .array, .map => {},
+                    else => try self.report(span, "Type Error: присваивание по индексу возможно только массиву или соответствию", .{}),
+                }
+            },
             else => try self.report(span, "Type Error: присваивание возможно только переменной, полю или индексу", .{}),
         }
     }
@@ -3659,7 +3677,7 @@ const Checker = struct {
                         const actual = try self.inferExpected(argument, expected);
                         if (!self.assignable(actual, expected)) {
                             try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
-                        } else if (try self.interfaceBoundOf(parameter, generic_parameters)) |bound| {
+                        } else if (try self.genericInterfaceBounds(parameter, generic_parameters)) |bounds| {
                             // Generic function whose parameter is bound by
                             // a user-defined interface (`функ ф[T: ИзTOML]
                             // (это: T, ...)`), called with a concrete
@@ -3686,7 +3704,7 @@ const Checker = struct {
                             // `inferInterfaceCall`) can compile `это.метод()`
                             // as an ordinary `call_interface` against that
                             // same vtable — no monomorphization needed.
-                            try self.registerInterfaceCast(argument, actual, try self.nominalType(bound, &.{}));
+                            try self.registerGenericInterfaceCasts(argument, actual, bounds);
                         } else {
                             try self.registerInterfaceCast(argument, actual, expected);
                         }
@@ -3821,6 +3839,7 @@ const Checker = struct {
     }
 
     fn functionParameterNames(self: *Checker, symbol: symbols.SymbolId) !?[]const []const u8 {
+        if (self.result.imported_method_parameter_names.get(symbol)) |names| return names;
         var functions = self.resolution.function_parameters.iterator();
         while (functions.next()) |entry| {
             const declaration = entry.key_ptr.*;
@@ -3967,6 +3986,28 @@ const Checker = struct {
         return null;
     }
 
+    fn genericInterfaceBounds(self: *const Checker, parameter: types.TypeId, generic_parameters: []const GenericParameter) !?[]const symbols.SymbolId {
+        const entry = self.result.types.get(parameter) orelse return null;
+        if (entry.* != .generic_parameter) return null;
+        for (generic_parameters) |candidate| {
+            if (!candidate.typ.eql(parameter)) continue;
+            var count: usize = 0;
+            for (candidate.bounds) |bound| {
+                if (!self.isComparableInterface(bound)) count += 1;
+            }
+            if (count == 0) return null;
+            const result = try self.result.arena.allocator().alloc(symbols.SymbolId, count);
+            var index: usize = 0;
+            for (candidate.bounds) |bound| {
+                if (self.isComparableInterface(bound)) continue;
+                result[index] = bound;
+                index += 1;
+            }
+            return result;
+        }
+        return null;
+    }
+
     fn nominalType(self: *Checker, symbol: symbols.SymbolId, arguments: []const types.TypeId) !types.TypeId {
         if (self.result.imported_nominal_identities.get(symbol)) |identity| {
             return self.result.types.nominalWithIdentity(symbol, identity, arguments);
@@ -4004,9 +4045,11 @@ const Checker = struct {
                 .function => |expected_function| {
                     if (actual_function.parameters.len != expected_function.parameters.len) return false;
                     for (actual_function.parameters, expected_function.parameters) |actual_parameter, expected_parameter| {
-                        if (!self.assignable(actual_parameter, expected_parameter)) return false;
+                        if (!self.isPoison(actual_parameter) and !self.isPoison(expected_parameter) and !self.result.types.eql(actual_parameter, expected_parameter)) return false;
                     }
-                    return self.assignable(actual_function.return_type, expected_function.return_type);
+                    return self.isPoison(actual_function.return_type) or self.isPoison(expected_function.return_type) or
+                        self.result.types.eql(actual_function.return_type, expected_function.return_type) or
+                        self.isType(actual_function.return_type, self.result.types.builtins.never);
                 },
                 else => {},
             },
@@ -4144,14 +4187,31 @@ const Checker = struct {
         if (!self.result.interface_definitions.contains(expected_nominal.symbol)) return;
         if (self.result.interface_definitions.contains(actual_nominal.symbol)) return;
         if (self.interfaceImplementation(expected_nominal.symbol, expected_nominal.arguments, actual_nominal.symbol) == null) return;
-        try self.result.interface_casts.put(expression, .{
+        const entries = try self.result.arena.allocator().dupe(InterfaceCastEntry, &.{.{
             .interface = expected_nominal.symbol,
             .arguments = expected_nominal.arguments,
             .target = actual_nominal.symbol,
-        });
+        }});
+        try self.result.interface_casts.put(expression, .{ .entries = entries });
+    }
+
+    fn registerGenericInterfaceCasts(self: *Checker, expression: ast.ExprId, actual: types.TypeId, bounds: []const symbols.SymbolId) !void {
+        const actual_entry = self.result.types.get(actual) orelse return;
+        const target = switch (actual_entry.*) {
+            .nominal => |nominal| nominal.symbol,
+            else => return,
+        };
+        var entries: std.ArrayList(InterfaceCastEntry) = .empty;
+        defer entries.deinit(self.result.allocator);
+        for (bounds) |bound| {
+            if (self.interfaceImplementation(bound, &.{}, target) == null) continue;
+            try entries.append(self.result.allocator, .{ .interface = bound, .arguments = &.{}, .target = target });
+        }
+        if (entries.items.len != 0) try self.result.interface_casts.put(expression, .{ .entries = try self.result.arena.allocator().dupe(InterfaceCastEntry, entries.items) });
     }
 
     fn inferInterfaceCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
+        if (call.argument_names != null) try self.report(call.span, "Type Error: именованные аргументы не поддержаны для интерфейсного вызова", .{});
         const object = self.result.types.get(object_type) orelse return null;
         const nominal = switch (object.*) {
             .nominal => |value| value,
@@ -4208,6 +4268,7 @@ const Checker = struct {
     // the runtime value here already carries a real vtable to dispatch
     // through.
     fn inferGenericBoundInterfaceCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
+        if (call.argument_names != null) try self.report(call.span, "Type Error: именованные аргументы не поддержаны для интерфейсного вызова", .{});
         const object = self.result.types.get(object_type) orelse return null;
         if (object.* != .generic_parameter) return null;
         var bounds: []const symbols.SymbolId = &.{};
@@ -4216,6 +4277,7 @@ const Checker = struct {
             bounds = parameter.bounds;
             break;
         }
+        var vtable_index: usize = 0;
         for (bounds) |bound| {
             if (self.isComparableInterface(bound)) continue;
             const definition = self.result.interface_definitions.get(bound) orelse continue;
@@ -4226,7 +4288,10 @@ const Checker = struct {
                     break;
                 }
             }
-            const index = method_index orelse continue;
+            const index = method_index orelse {
+                vtable_index += 1;
+                continue;
+            };
             const method = definition.methods[index];
             if (call.arguments.len != method.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов метода", .{});
             const shared = @min(call.arguments.len, method.parameters.len);
@@ -4242,6 +4307,7 @@ const Checker = struct {
             try self.result.interface_calls.put(expression, .{
                 .interface = bound,
                 .method_index = @intCast(index),
+                .vtable_index = @intCast(vtable_index),
             });
             return @as(?types.TypeId, method.return_type);
         }
@@ -4273,7 +4339,15 @@ const Checker = struct {
             try self.report(call.span, "Type Error: метод '{s}' должен принимать получатель первым параметром", .{property.property});
             return @as(?types.TypeId, try self.result.types.poison());
         }
-        if (call.arguments.len != function.parameters.len - 1) try self.report(call.span, "Type Error: неверное количество аргументов метода", .{});
+        const arguments = if (call.argument_names) |_| blk: {
+            const names = (try self.functionParameterNames(method.symbol)) orelse {
+                try self.report(call.span, "Type Error: именованные аргументы не поддержаны для этого вызова", .{});
+                break :blk call.arguments;
+            };
+            if (names.len == 0) break :blk call.arguments;
+            break :blk try self.reorderNamedArguments(expression, call, names[1..]);
+        } else call.arguments;
+        if (arguments.len != function.parameters.len - 1) try self.report(call.span, "Type Error: неверное количество аргументов метода", .{});
         if (nominal.arguments.len != method.owner_parameters.len) {
             try self.report(call.span, "Type Error: неверное количество параметров типа получателя", .{});
             return @as(?types.TypeId, try self.result.types.poison());
@@ -4281,8 +4355,8 @@ const Checker = struct {
         var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
         defer substitutions.deinit();
         for (method.owner_parameters, nominal.arguments) |parameter, argument| try substitutions.put(parameter.typ, argument);
-        const shared = @min(call.arguments.len, function.parameters.len - 1);
-        for (call.arguments[0..shared], function.parameters[1 .. shared + 1]) |argument, parameter| {
+        const shared = @min(arguments.len, function.parameters.len - 1);
+        for (arguments[0..shared], function.parameters[1 .. shared + 1]) |argument, parameter| {
             try self.inferGenericSubstitution(parameter, try self.infer(argument), &substitutions, call.span);
         }
         for (method.function_parameters) |parameter| {
@@ -4290,7 +4364,7 @@ const Checker = struct {
         }
         const receiver = try self.substituteGeneric(function.parameters[0], &substitutions);
         if (!self.assignable(object_type, receiver)) try self.report(call.span, "Type Error: получатель метода имеет неверный тип", .{});
-        for (call.arguments[0..shared], function.parameters[1 .. shared + 1]) |argument, parameter| {
+        for (arguments[0..shared], function.parameters[1 .. shared + 1]) |argument, parameter| {
             const expected = try self.substituteGeneric(parameter, &substitutions);
             const actual = try self.inferExpected(argument, expected);
             if (!self.assignable(actual, expected)) {
@@ -4538,6 +4612,8 @@ const Checker = struct {
         for (parameters, generic_parameters) |parameter, *generic_parameter| {
             var bounds: std.ArrayList(symbols.SymbolId) = .empty;
             defer bounds.deinit(self.result.allocator);
+            var seen_bounds = std.AutoHashMap(symbols.SymbolId, void).init(self.result.allocator);
+            defer seen_bounds.deinit();
             for (parameter.bounds) |bound_name| {
                 const bound = self.findTypeSymbol(bound_name) orelse {
                     try self.report(self.resolution.symbols.get(symbol).?.span, "Type Error: неизвестный интерфейс '{s}'", .{bound_name});
@@ -4547,6 +4623,11 @@ const Checker = struct {
                     try self.report(self.resolution.symbols.get(symbol).?.span, "Type Error: ограничение '{s}' должно быть интерфейсом", .{bound_name});
                     continue;
                 }
+                if (seen_bounds.contains(bound)) {
+                    try self.report(self.resolution.symbols.get(symbol).?.span, "Type Error: ограничение '{s}' указано повторно", .{bound_name});
+                    continue;
+                }
+                try seen_bounds.put(bound, {});
                 try bounds.append(self.result.allocator, bound);
             }
             generic_parameter.* = .{
@@ -4624,6 +4705,7 @@ const Checker = struct {
     }
 
     fn inferEnumVariantCall(self: *Checker, call: anytype, variant: EnumVariant) !types.TypeId {
+        if (call.argument_names != null) try self.report(call.span, "Type Error: именованные аргументы не поддержаны для конструктора варианта", .{});
         const entry = self.resolution.symbols.get(variant.symbol) orelse return self.result.types.poison();
         const definition = self.result.enum_definitions.get(entry.owner_type) orelse return self.result.types.poison();
         if (call.arguments.len != variant.fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора варианта", .{});
@@ -4656,6 +4738,7 @@ const Checker = struct {
     }
 
     fn inferEnumVariantCallExpected(self: *Checker, call: anytype, variant: EnumVariant, expected: types.TypeId) !types.TypeId {
+        if (call.argument_names != null) try self.report(call.span, "Type Error: именованные аргументы не поддержаны для конструктора варианта", .{});
         const entry = self.resolution.symbols.get(variant.symbol) orelse return self.result.types.poison();
         const expected_entry = self.result.types.get(expected) orelse return self.inferEnumVariantCall(call, variant);
         const nominal = switch (expected_entry.*) {
@@ -5266,6 +5349,22 @@ test "type checker enforces Comparable generic bounds" {
 
     try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("Type Error: тип аргумента не реализует ограничение 'Сравниваемое'", checked.diagnostics.items.items[0].message);
+}
+
+test "type checker rejects invalid index writes and unsupported named enum calls" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Ответ = перечисление\nДа(Число)\nконец\nфунк f() -> Пусто\n\"строка\"[0] = \"x\"\nпер ответ = Ответ.Да(значение = 1)\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 2), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: присваивание по индексу возможно только массиву или соответствию", checked.diagnostics.items.items[0].message);
+    try std.testing.expectEqualStrings("Type Error: именованные аргументы не поддержаны для конструктора варианта", checked.diagnostics.items.items[1].message);
 }
 
 test "type checker warns on code after an unconditional возврат" {

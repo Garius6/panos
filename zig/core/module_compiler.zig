@@ -90,6 +90,7 @@ const ImportContext = struct {
         self.constants.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.impls.deinit(self.allocator);
+        for (self.methods.items) |method| if (method.parameter_names.len != 0) self.allocator.free(method.parameter_names);
         self.methods.deinit(self.allocator);
         self.nominals.deinit(self.allocator);
         self.imported_types.deinit(self.allocator);
@@ -224,12 +225,19 @@ const ImportContext = struct {
             const target_symbol = target_resolution.decl_symbols.get(binding.origin.declaration) orelse continue;
             const signature = target_checked.symbol_types.get(target_symbol) orelse continue;
             const function_id = target_compiled.function_ids.get(target_symbol) orelse continue;
+            const parameters = target_resolution.function_parameters.get(binding.origin.declaration) orelse &.{};
+            const parameter_names: []const []const u8 = if (parameters.len == 0) &.{} else blk: {
+                const names = try self.allocator.alloc([]const u8, parameters.len);
+                for (parameters, names) |parameter, *name| name.* = target_resolution.symbols.get(parameter).?.name;
+                break :blk names;
+            };
             try self.methods.append(self.allocator, .{
                 .owner = binding.owner,
                 .name = binding.name,
                 .symbol = binding.symbol,
                 .store = &target_checked.types,
                 .type_id = signature,
+                .parameter_names = parameter_names,
             });
             try self.functions.append(self.allocator, .{
                 .symbol = binding.symbol,

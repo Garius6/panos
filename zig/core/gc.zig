@@ -143,9 +143,15 @@ pub const Heap = struct {
     }
 
     pub fn createInterface(self: *Heap, receiver: value.Value, methods: []const bytecode.FunctionId) !*value.Interface {
+        return self.createInterfacePackage(receiver, &.{methods});
+    }
+
+    pub fn createInterfacePackage(self: *Heap, receiver: value.Value, vtables: []const []const bytecode.FunctionId) !*value.Interface {
         const interface = try self.allocator.create(value.Interface);
         errdefer self.allocator.destroy(interface);
-        interface.* = .{ .receiver = receiver, .methods = methods };
+        const owned_vtables = try self.allocator.dupe([]const bytecode.FunctionId, vtables);
+        errdefer self.allocator.free(owned_vtables);
+        interface.* = .{ .receiver = receiver, .vtables = owned_vtables };
         try self.objects.append(self.allocator, .{ .interface = interface });
         return interface;
     }
@@ -248,7 +254,10 @@ pub const Heap = struct {
                 self.allocator.free(closure.captures);
                 self.allocator.destroy(closure);
             },
-            .interface => |interface| self.allocator.destroy(interface),
+            .interface => |interface| {
+                self.allocator.free(interface.vtables);
+                self.allocator.destroy(interface);
+            },
             .map => |map| {
                 map.deinit(self.allocator);
                 self.allocator.destroy(map);

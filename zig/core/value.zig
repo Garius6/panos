@@ -149,7 +149,7 @@ pub const HeapString = struct {
 pub const Interface = struct {
     header: GcHeader = .{},
     receiver: Value,
-    methods: []const bytecode.FunctionId,
+    vtables: []const []const bytecode.FunctionId,
 };
 
 pub const ProcessStatus = enum {

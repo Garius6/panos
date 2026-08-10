@@ -457,24 +457,29 @@ const FunctionCompiler = struct {
 
     fn emitInterfaceCast(self: *FunctionCompiler, expression: ast.ExprId) !void {
         const cast = self.compiler.checked.interface_casts.get(expression) orelse return;
-        const implementation = blk: {
-            for (self.compiler.checked.interface_implementations.items) |candidate| {
-                if (candidate.interface != cast.interface or candidate.target != cast.target or candidate.arguments.len != cast.arguments.len) continue;
-                for (candidate.arguments, cast.arguments) |actual, expected| {
-                    if (!self.compiler.checked.types.eql(actual, expected)) break;
-                } else break :blk candidate;
-            }
-            try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти реализацию интерфейса", .{});
-            return;
-        };
-        const methods = try self.compiler.program().arena.allocator().alloc(bytecode.FunctionId, implementation.methods.len);
-        for (implementation.methods, methods) |method, *function_id| {
-            function_id.* = self.compiler.result.function_ids.get(method) orelse {
-                try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти метод интерфейса", .{});
+        var vtables: std.ArrayList([]const bytecode.FunctionId) = .empty;
+        defer vtables.deinit(self.compiler.result.allocator);
+        for (cast.entries) |entry| {
+            const implementation = blk: {
+                for (self.compiler.checked.interface_implementations.items) |candidate| {
+                    if (candidate.interface != entry.interface or candidate.target != entry.target or candidate.arguments.len != entry.arguments.len) continue;
+                    for (candidate.arguments, entry.arguments) |actual, expected| {
+                        if (!self.compiler.checked.types.eql(actual, expected)) break;
+                    } else break :blk candidate;
+                }
+                try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти реализацию интерфейса", .{});
                 return;
             };
+            const methods = try self.compiler.program().arena.allocator().alloc(bytecode.FunctionId, implementation.methods.len);
+            for (implementation.methods, methods) |method, *function_id| {
+                function_id.* = self.compiler.result.function_ids.get(method) orelse {
+                    try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти метод интерфейса", .{});
+                    return;
+                };
+            }
+            try vtables.append(self.compiler.result.allocator, methods);
         }
-        const constant = try self.function.addConstant(self.compiler.result.allocator, .{ .interface_vtable = methods });
+        const constant = try self.function.addConstant(self.compiler.result.allocator, .{ .interface_vtables = try self.compiler.program().arena.allocator().dupe([]const bytecode.FunctionId, vtables.items) });
         try self.function.emit(self.compiler.result.allocator, .{ .cast_interface = constant });
     }
 
@@ -569,6 +574,7 @@ const FunctionCompiler = struct {
             for (call.arguments) |argument| try self.compileExpression(argument);
             try self.function.emit(self.compiler.result.allocator, .{ .call_interface = .{
                 .method_index = interface_call.method_index,
+                .vtable_index = interface_call.vtable_index,
                 .argument_count = @intCast(call.arguments.len),
             } });
             return;
@@ -584,9 +590,9 @@ const FunctionCompiler = struct {
             };
             try self.emitConstant(.{ .function_ref = function_id });
             try self.compileExpression(property.object);
-            for (call.arguments) |argument| try self.compileExpression(argument);
-            if (call.arguments.len == std.math.maxInt(u16)) return error.ArgumentLimitReached;
-            try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(call.arguments.len + 1) });
+            for (arguments) |argument| try self.compileExpression(argument);
+            if (arguments.len == std.math.maxInt(u16)) return error.ArgumentLimitReached;
+            try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(arguments.len + 1) });
             return;
         }
         if (try self.enumConstructor(call.callee)) |enumeration| {

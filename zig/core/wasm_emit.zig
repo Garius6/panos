@@ -285,6 +285,26 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) !Pro
                     b = else_outcome.fallthrough;
                     continue;
                 }
+                // Real bug found running actual code, not just reading
+                // it: this `if`/`else` was emitted with an empty
+                // (void) blocktype (see the `0x04, 0x40` above) — valid
+                // ONLY if code reachable from AT LEAST ONE branch could
+                // fall through to the `if`'s own `end` leaving the
+                // stack unchanged. Here NEITHER branch does (both
+                // diverged — `возврат`, `прервать`/`продолжить`, or
+                // panic — `then_outcome.ok`/`else_outcome.ok` both
+                // false) — every real `и`+`else` diverging shape (most
+                // commonly `если x тогда возврат Y конец` with no
+                // `иначе`, i.e. ANY early-return) hit this. Semantically
+                // the code point right after `end` is unreachable, but
+                // real WASM validators (confirmed against both
+                // `wat2wasm` and `wasmtime`, independent of any panos
+                // codegen) do NOT infer that automatically from "both
+                // branches diverged" — they need an EXPLICIT
+                // `unreachable` marker here, or they reject the whole
+                // module as invalid (not a runtime failure — it never
+                // even LOADS). One byte fixes it.
+                try ctx.code.append(ctx.allocator, 0x00); // unreachable
                 return .{ .fallthrough = mir.invalid_block, .ok = false };
             },
             .return_value => {
@@ -374,28 +394,43 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
                     // pushed by earlier instructions — see
                     // `scratch_i32_local`'s doc comment for why a scratch
                     // local is unavoidable here). Shuffle rhs through the
-                    // scratch local so both operands can be converted to
-                    // i32 in the right order, do the i32 op, convert the
-                    // i32 result back to f64 (matching every other
-                    // Phase-1a numeric op's f64 representation).
+                    // scratch local so both operands can be converted in
+                    // the right order, do the integer op, convert the
+                    // result back to f64 (matching every other Phase-1a
+                    // numeric op's f64 representation).
+                    //
+                    // i64, NOT i32 — real bug found running actual code:
+                    // `std/математика.pns`'s own PRNG seeds itself from
+                    // `время.сейчас_мс()` (unix-ms, ~1.8e12 — WAY past
+                    // i32's ~2.1e9 ceiling) precisely THROUGH a `%`
+                    // (`Целое(мс) % Целое(2147483647)`, deliberately
+                    // brings a huge timestamp down into range) — i32.
+                    // trunc_f64_s on that входной value traps
+                    // ("float unrepresentable in integer range") before
+                    // the modulo ever runs, defeating the exact use case
+                    // that motivated needing % in WASM at all. `Целое`
+                    // is documented (see математика.pns) to be exact up
+                    // to 2^53 in its f64 representation — i64 covers
+                    // that with enormous headroom, i32 doesn't come
+                    // close.
                     const scratch = ctx.reserveScratchLocal();
                     try code.append(allocator, 0x21); // local.set scratch  (pops rhs_f64)
                     try wasm_module.writeUleb128(code, allocator, scratch);
-                    try code.append(allocator, 0xAA); // i32.trunc_f64_s   (lhs_f64 -> lhs_i32)
+                    try code.append(allocator, 0xB0); // i64.trunc_f64_s   (lhs_f64 -> lhs_i64)
                     try code.append(allocator, 0x20); // local.get scratch (push rhs_f64 back)
                     try wasm_module.writeUleb128(code, allocator, scratch);
-                    try code.append(allocator, 0xAA); // i32.trunc_f64_s   (rhs_f64 -> rhs_i32)
+                    try code.append(allocator, 0xB0); // i64.trunc_f64_s   (rhs_f64 -> rhs_i64)
                     const int_opcode: u8 = switch (binary.op) {
-                        .modulo => 0x6F, // i32.rem_s
-                        .bit_and => 0x71, // i32.and
-                        .bit_or => 0x72, // i32.or
-                        .bit_xor => 0x73, // i32.xor
-                        .shift_left => 0x74, // i32.shl
-                        .shift_right => 0x75, // i32.shr_s
+                        .modulo => 0x81, // i64.rem_s
+                        .bit_and => 0x83, // i64.and
+                        .bit_or => 0x84, // i64.or
+                        .bit_xor => 0x85, // i64.xor
+                        .shift_left => 0x86, // i64.shl
+                        .shift_right => 0x87, // i64.shr_s
                         else => unreachable,
                     };
                     try code.append(allocator, int_opcode);
-                    try code.append(allocator, 0xB7); // f64.convert_i32_s
+                    try code.append(allocator, 0xB9); // f64.convert_i64_s
                     return binary.dst;
                 },
                 else => {},

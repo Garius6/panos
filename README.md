@@ -42,12 +42,18 @@
 Сборка из исходников (нужен [Zig](https://ziglang.org/download/) `0.16.0`):
 
 ```sh
-git clone https://github.com/Garius6/panos.git
+git clone --recurse-submodules https://github.com/Garius6/panos.git
 cd panos
 zig build              # CLI-интерпретатор → zig-out/bin/panos
 zig build lsp           # LSP-сервер
 zig build browser       # WASM-сборка для браузера
 ```
+
+Стандартная библиотека (`std/`) живёт в отдельном репозитории
+([panos-std](https://github.com/Garius6/panos-std)), подключённом как git
+submodule — `--recurse-submodules` обязателен, иначе `std/` останется
+пустой директорией и `zig build test`/`conformance` не найдут стандартные
+модули. Уже склонировали без него? `git submodule update --init`.
 
 Или через `just` (обёртки над теми же командами, см. `Justfile`):
 `just build` / `just build-lsp` / `just build-wasm` / `just build-all`.

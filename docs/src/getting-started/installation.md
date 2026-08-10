@@ -30,7 +30,7 @@ mv panos-macos-arm64 /usr/local/bin/panos
 тулчейн, что использует CI (см. `.github/workflows/*.yml`).
 
 ```sh
-git clone https://github.com/Garius6/panos.git
+git clone --recurse-submodules https://github.com/Garius6/panos.git
 cd panos
 
 # CLI-интерпретатор
@@ -49,6 +49,11 @@ just build-wasm
 
 `just build-all` собирает все три сразу. Полный список команд — в
 `Justfile` в корне репозитория.
+
+> Стандартная библиотека (`std/`) — отдельный репозиторий
+> ([panos-std](https://github.com/Garius6/panos-std)), подключённый как
+> git submodule. Без `--recurse-submodules` `std/` останется пустой —
+> дополните уже сделанный клон командой `git submodule update --init`.
 
 ## Проверка
 

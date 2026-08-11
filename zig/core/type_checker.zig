@@ -3112,8 +3112,16 @@ const Checker = struct {
                     for (call.arguments) |argument| _ = try self.infer(argument);
                     return self.result.types.builtins.string;
                 }
-                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.number), self.result.types.builtins.number)) {
-                    try self.report(call.span, "Type Error: строки.из_числа() ожидает Число", .{});
+                // Accepts Число OR Целое directly — both share one f64
+                // runtime representation, so there's no formatting
+                // difference to lose by not forcing a cast, and
+                // requiring `значение как Число` at every call site just
+                // to stringify a Целое (array length, loop counter,
+                // etc.) is pure ceremony `строки.из_целого` already
+                // exists to avoid needing in the first place.
+                const argument_type = try self.infer(call.arguments[0]);
+                if (!self.isPoison(argument_type) and !self.isNumeric(argument_type)) {
+                    try self.report(call.span, "Type Error: строки.из_числа() ожидает Число или Целое", .{});
                 }
                 return self.result.types.builtins.string;
             }

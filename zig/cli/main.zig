@@ -401,7 +401,7 @@ test "CLI imports the migration core" {
 }
 
 test "CLI runs exported start through the Zig pipeline" {
-    var result = try runSource(std.testing.allocator, "пример.ps", "функ сложить(a: Число, b: Число) -> Число\na + b\nконец\nэкспорт функ старт() -> Число\nсложить(2, 3)\nконец");
+    var result = try runSource(std.testing.allocator, "пример.ps", "функ сложить(a: Число, b: Число) -> Число\na + b\nконец\nэкспорт функ старт() -> Число\nсложить(2.0, 3.0)\nконец");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
     switch (result.execution orelse return error.TestUnexpectedResult) {
@@ -411,7 +411,7 @@ test "CLI runs exported start through the Zig pipeline" {
 }
 
 test "CLI records stable verbose pipeline summaries" {
-    var result = try runSourceWithVerbose(std.testing.allocator, "пример.ps", "функ старт() -> Число\n42\nконец", true);
+    var result = try runSourceWithVerbose(std.testing.allocator, "пример.ps", "функ старт() -> Число\n42.0\nконец", true);
     defer result.deinit();
 
     const info = result.verbose orelse return error.TestUnexpectedResult;

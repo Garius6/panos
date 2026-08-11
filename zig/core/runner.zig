@@ -375,7 +375,7 @@ pub fn renderValue(allocator: std.mem.Allocator, runtime_value: value.Value) ![]
 }
 
 test "runner executes an exported start function" {
-    var result = try runSource(std.testing.allocator, "пример.ps", "экспорт функ старт() -> Число\n2 + 3\nконец");
+    var result = try runSource(std.testing.allocator, "пример.ps", "экспорт функ старт() -> Число\n2.0 + 3.0\nконец");
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
@@ -394,7 +394,7 @@ test "runner accumulates frontend diagnostics without executing" {
 }
 
 test "checker accepts a valid program without an entry function" {
-    var result = try checkSource(std.testing.allocator, "библиотека.ps", "экспорт функ значение() -> Число\n42\nконец");
+    var result = try checkSource(std.testing.allocator, "библиотека.ps", "экспорт функ значение() -> Число\n42.0\nконец");
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
@@ -467,7 +467,7 @@ test "runner rejects imports before a single-file execution" {
 }
 
 test "analysis retains expressions and their inferred types" {
-    const input = "экспорт функ старт() -> Число\n42\nконец";
+    const input = "экспорт функ старт() -> Число\n42.0\nконец";
     var analysis = try analyzeSource(std.testing.allocator, "пример.ps", input);
     defer analysis.deinit();
 
@@ -482,9 +482,9 @@ test "analysis retains expressions and their inferred types" {
 test "runner executes the real embedded prelude's Option methods, not a hardcoded stand-in" {
     var result = try runSource(std.testing.allocator, "пример.ps",
         \\экспорт функ старт() -> Число
-        \\пер есть: Опция(Число) = Опция.Есть(41)
+        \\пер есть: Опция(Число) = Опция.Есть(41.0)
         \\пер нет: Опция(Число) = Опция.Нет()
-        \\есть.получить(0) + нет.получить(1)
+        \\есть.получить(0.0) + нет.получить(1.0)
         \\конец
     );
     defer result.deinit();
@@ -1067,7 +1067,7 @@ test "runner reports a Result failure when сеть.подключиться can
     // this test (the success path — real bytes over a real accepted TCP
     // connection — was verified manually against a live Python socket
     // server during development, see progress-report.md).
-    var result = try runSource(std.testing.allocator, "пример.ps", "экспорт функ старт() -> Булево\nсеть.подключиться(\"127.0.0.1\", 1).успех()\nконец");
+    var result = try runSource(std.testing.allocator, "пример.ps", "экспорт функ старт() -> Булево\nсеть.подключиться(\"127.0.0.1\", 1.0).успех()\nконец");
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
@@ -1329,7 +1329,7 @@ test "runner serves a real HTTP request through сеть.http_сервер_сл�
     const port: u16 = 18933;
     const source_text = std.fmt.comptimePrint(
         \\функ отработать(запрос: Запрос) -> Строка
-        \\    запрос.ответить(200, "text/plain", "привет-с-сервера")
+        \\    запрос.ответить(200.0, "text/plain", "привет-с-сервера")
         \\    запрос.путь()
         \\конец
         \\функ обработать(слушатель: Слушатель) -> Строка
@@ -1339,7 +1339,7 @@ test "runner serves a real HTTP request through сеть.http_сервер_сл�
         \\    конец
         \\конец
         \\экспорт функ старт() -> Строка
-        \\    выбор сеть.http_сервер_слушать({d})
+        \\    выбор сеть.http_сервер_слушать({d}.0)
         \\        Успех(слушатель) -> обработать(слушатель)
         \\        Неудача(ошибка) -> "listen-ошибка:" + ошибка.сообщение
         \\    конец
@@ -1389,7 +1389,7 @@ test "runner reads a custom request header through Запрос.заголово
         \\        Есть(текст) -> текст
         \\        Нет -> "отсутствует"
         \\    конец
-        \\    запрос.ответить(200, "text/plain", значение)
+        \\    запрос.ответить(200.0, "text/plain", значение)
         \\    значение
         \\конец
         \\функ обработать(слушатель: Слушатель) -> Строка
@@ -1399,7 +1399,7 @@ test "runner reads a custom request header through Запрос.заголово
         \\    конец
         \\конец
         \\экспорт функ старт() -> Строка
-        \\    выбор сеть.http_сервер_слушать({d})
+        \\    выбор сеть.http_сервер_слушать({d}.0)
         \\        Успех(слушатель) -> обработать(слушатель)
         \\        Неудача(ошибка) -> "listen-ошибка:" + ошибка.сообщение
         \\    конец

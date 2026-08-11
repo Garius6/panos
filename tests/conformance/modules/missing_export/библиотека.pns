@@ -4,5 +4,5 @@
 // doesn't exist here at all (`collectExports` only ever tracks exported
 // names — there's no separate "found but private" code path to test).
 функ есть_но_не_экспортирована() -> Число
-    1
+    1.0
 конец

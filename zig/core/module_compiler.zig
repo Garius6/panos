@@ -573,8 +573,8 @@ const MemoryReader = struct {
 
 test "module compiler executes imported primitive functions and constants" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./математика\" как мат\nэкспорт функ старт() -> Число\nмат.сложить(мат.ОТВЕТ, 2)\nконец" },
-        .{ .path = "проект/математика.ps", .bytes = "экспорт конст ОТВЕТ = 40\nэкспорт функ сложить(a: Число, b: Число) -> Число\na + b\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./математика\" как мат\nэкспорт функ старт() -> Число\nмат.сложить(мат.ОТВЕТ, 2.0)\nконец" },
+        .{ .path = "проект/математика.ps", .bytes = "экспорт конст ОТВЕТ = 40.0\nэкспорт функ сложить(a: Число, b: Число) -> Число\na + b\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
     defer graph.deinit();
@@ -612,7 +612,7 @@ test "module compiler checks imported function arguments" {
 
 test "module compiler executes a transitive imported function" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./удвоение\" как удв\nэкспорт функ старт() -> Число\nудв.применить(21)\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./удвоение\" как удв\nэкспорт функ старт() -> Число\nудв.применить(21.0)\nконец" },
         .{ .path = "проект/удвоение.ps", .bytes = "импорт \"./математика\" как мат\nэкспорт функ применить(x: Число) -> Число\nмат.сложить(x, x)\nконец" },
         .{ .path = "проект/математика.ps", .bytes = "экспорт функ сложить(a: Число, b: Число) -> Число\na + b\nконец" },
     } };
@@ -661,7 +661,7 @@ test "module compiler retains imported string constants in the shared program" {
 
 test "module compiler preserves opaque exported nominal types across function calls" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.создать(40)\nточки.добавить(точка, 2)\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.создать(40.0)\nточки.добавить(точка, 2.0)\nконец" },
         .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nэкспорт функ создать(x: Число) -> Точка\nТочка(x)\nконец\nэкспорт функ добавить(точка: Точка, значение: Число) -> Число\nточка.x + значение\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -701,8 +701,8 @@ test "module compiler keeps same-named nominal exports distinct" {
 
 test "module compiler dispatches a same-file impl method on an imported nominal type" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.Точка(41)\nточка.увеличить()\nконец" },
-        .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nреализация Точка\nфунк увеличить(это: Точка) -> Число\nэто.x + 1\nконец\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.Точка(41.0)\nточка.увеличить()\nконец" },
+        .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nреализация Точка\nфунк увеличить(это: Точка) -> Число\nэто.x + 1.0\nконец\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
     defer graph.deinit();
@@ -725,7 +725,7 @@ test "module compiler dispatches a same-file impl method on an imported nominal 
 
 test "module compiler constructs and matches an imported enum variant with no fields" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./цвета\" как цвета\nэкспорт функ старт() -> Число\nпер c: цвета.Цвет = цвета.Цвет.Красный()\nвыбор c\nКрасный -> 42\nЗелёный -> 0\nконец\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./цвета\" как цвета\nэкспорт функ старт() -> Число\nпер c: цвета.Цвет = цвета.Цвет.Красный()\nвыбор c\nКрасный -> 42.0\nЗелёный -> 0.0\nконец\nконец" },
         .{ .path = "проект/цвета.ps", .bytes = "экспорт тип Цвет = перечисление\nКрасный\nЗелёный\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -749,7 +749,7 @@ test "module compiler constructs and matches an imported enum variant with no fi
 
 test "module compiler constructs and matches an imported enum variant carrying a field" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./итог\" как итог\nэкспорт функ старт() -> Число\nпер r: итог.Итог = итог.Итог.Готово(41)\nвыбор r\nГотово(x) -> x + 1\nПусто -> 0\nконец\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./итог\" как итог\nэкспорт функ старт() -> Число\nпер r: итог.Итог = итог.Итог.Готово(41.0)\nвыбор r\nГотово(x) -> x + 1.0\nПусто -> 0.0\nконец\nконец" },
         .{ .path = "проект/итог.ps", .bytes = "экспорт тип Итог = перечисление\nГотово(Число)\nПусто\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -801,8 +801,8 @@ test "module compiler rejects a non-exhaustive match on an imported enum type" {
 
 test "module compiler dispatches an impl method on a value returned from an imported constructor function" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.создать(41)\nточка.увеличить()\nконец" },
-        .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nэкспорт функ создать(x: Число) -> Точка\nТочка(x)\nконец\nреализация Точка\nфунк увеличить(это: Точка) -> Число\nэто.x + 1\nконец\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.создать(41.0)\nточка.увеличить()\nконец" },
+        .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nэкспорт функ создать(x: Число) -> Точка\nТочка(x)\nконец\nреализация Точка\nфунк увеличить(это: Точка) -> Число\nэто.x + 1.0\nконец\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
     defer graph.deinit();
@@ -839,7 +839,7 @@ test "module compiler still rejects an unknown method on an imported nominal typ
 
 test "module compiler instantiates an imported generic struct's field with a concrete type argument" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./короб\" как короб\nэкспорт функ старт() -> Число\nпер к: короб.Коробка(Число) = короб.Коробка(42)\nк.значение\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./короб\" как короб\nэкспорт функ старт() -> Число\nпер к: короб.Коробка(Число) = короб.Коробка(42.0)\nк.значение\nконец" },
         .{ .path = "проект/короб.ps", .bytes = "экспорт тип Коробка[T] = структура\nзначение: T\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -863,7 +863,7 @@ test "module compiler instantiates an imported generic struct's field with a con
 
 test "module compiler dispatches a method on an imported generic struct with a concrete type argument" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./короб\" как короб\nэкспорт функ старт() -> Число\nпер к: короб.Коробка(Число) = короб.Коробка(42)\nк.развернуть(0)\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./короб\" как короб\nэкспорт функ старт() -> Число\nпер к: короб.Коробка(Число) = короб.Коробка(42.0)\nк.развернуть(0.0)\nконец" },
         .{ .path = "проект/короб.ps", .bytes = "экспорт тип Коробка[T] = структура\nзначение: T\nконец\nреализация Коробка\nфунк развернуть(это: Коробка, запас: T) -> T\nэто.значение\nконец\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -887,7 +887,7 @@ test "module compiler dispatches a method on an imported generic struct with a c
 
 test "module compiler constructs and matches an imported generic enum variant carrying a concrete-type field" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./короб\" как короб\nэкспорт функ старт() -> Число\nпер к: короб.Ящик(Число) = короб.Ящик.Есть(42)\nвыбор к\nЕсть(x) -> x\nПусто -> 0\nконец\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./короб\" как короб\nэкспорт функ старт() -> Число\nпер к: короб.Ящик(Число) = короб.Ящик.Есть(42.0)\nвыбор к\nЕсть(x) -> x\nПусто -> 0.0\nконец\nконец" },
         .{ .path = "проект/короб.ps", .bytes = "экспорт тип Ящик[T] = перечисление\nПусто\nЕсть(T)\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -911,7 +911,7 @@ test "module compiler constructs and matches an imported generic enum variant ca
 
 test "module compiler dispatches a method on an imported generic enum with a concrete type argument" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./короб\" как короб\nэкспорт функ старт() -> Число\nпер к: короб.Ящик(Число) = короб.Ящик.Есть(42)\nк.развернуть(0)\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./короб\" как короб\nэкспорт функ старт() -> Число\nпер к: короб.Ящик(Число) = короб.Ящик.Есть(42.0)\nк.развернуть(0.0)\nконец" },
         .{ .path = "проект/короб.ps", .bytes = "экспорт тип Ящик[T] = перечисление\nПусто\nЕсть(T)\nконец\nреализация Ящик\nфунк развернуть(это: Ящик, запас: T) -> T\nвыбор это\nЕсть(x) -> x\nПусто -> запас\nконец\nконец\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -935,7 +935,7 @@ test "module compiler dispatches a method on an imported generic enum with a con
 
 test "module compiler dispatches an interface-impl method as an ordinary cross-module call" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер первая: точки.Точка = точки.Точка(40)\nпер вторая: точки.Точка = точки.Точка(2)\nпервая.сравнить(вторая)\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер первая: точки.Точка = точки.Точка(40.0)\nпер вторая: точки.Точка = точки.Точка(2.0)\nпервая.сравнить(вторая)\nконец" },
         .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nреализация Сравниваемое для Точка\nфунк сравнить(это: Точка, другое: Точка) -> Число\nэто.x - другое.x\nконец\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -961,7 +961,7 @@ test "module compiler resolves a qualified impl target within its own declaring 
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "импорт \"./методы\"\nэкспорт функ старт() -> Число\nметоды.проверить()\nконец" },
         .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец" },
-        .{ .path = "проект/методы.ps", .bytes = "импорт \"./точки\" как точки\nреализация точки.Точка\nфунк увеличить(это: точки.Точка) -> Число\nэто.x + 1\nконец\nконец\nэкспорт функ проверить() -> Число\nпер точка: точки.Точка = точки.Точка(41)\nточка.увеличить()\nконец" },
+        .{ .path = "проект/методы.ps", .bytes = "импорт \"./точки\" как точки\nреализация точки.Точка\nфунк увеличить(это: точки.Точка) -> Число\nэто.x + 1.0\nконец\nконец\nэкспорт функ проверить() -> Число\nпер точка: точки.Точка = точки.Точка(41.0)\nточка.увеличить()\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
     defer graph.deinit();
@@ -984,7 +984,7 @@ test "module compiler resolves a qualified impl target within its own declaring 
 
 test "module compiler resolves a qualified interface-side impl target across a third module" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер a: точки.Точка = точки.Точка(40)\na.значение()\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер a: точки.Точка = точки.Точка(40.0)\na.значение()\nконец" },
         .{ .path = "проект/интерфейсы.ps", .bytes = "экспорт тип МойИнтерфейс = интерфейс\nфунк значение() -> Число\nконец" },
         .{ .path = "проект/точки.ps", .bytes = "импорт \"./интерфейсы\" как интерфейсы\nэкспорт тип Точка = структура\nx: Число\nконец\nреализация интерфейсы.МойИнтерфейс для Точка\nфунк значение(это: Точка) -> Число\nэто.x\nконец\nконец" },
     } };
@@ -1009,7 +1009,7 @@ test "module compiler resolves a qualified interface-side impl target across a t
 
 test "module compiler dispatches an imported struct's interface implementation via a generic bound" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nфунк макс[T: Сравниваемое](a: T, b: T) -> T\nесли a > b тогда a иначе b конец\nконец\nэкспорт функ старт() -> Число\nпер a: точки.Точка = точки.Точка(40)\nпер b: точки.Точка = точки.Точка(2)\nмакс(a, b).x\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nфунк макс[T: Сравниваемое](a: T, b: T) -> T\nесли a > b тогда a иначе b конец\nконец\nэкспорт функ старт() -> Число\nпер a: точки.Точка = точки.Точка(40.0)\nпер b: точки.Точка = точки.Точка(2.0)\nмакс(a, b).x\nконец" },
         .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nреализация Сравниваемое для Точка\nфунк сравнить(это: Точка, другое: Точка) -> Число\nэто.x - другое.x\nконец\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -1033,7 +1033,7 @@ test "module compiler dispatches an imported struct's interface implementation v
 
 test "module compiler preserves a prelude bound on an imported generic function" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./библиотека\" как библиотека\nэкспорт функ старт() -> Число\nпер a: библиотека.Точка = библиотека.Точка(40)\nпер b: библиотека.Точка = библиотека.Точка(2)\nбиблиотека.макс(a, b).x\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./библиотека\" как библиотека\nэкспорт функ старт() -> Число\nпер a: библиотека.Точка = библиотека.Точка(40.0)\nпер b: библиотека.Точка = библиотека.Точка(2.0)\nбиблиотека.макс(a, b).x\nконец" },
         .{ .path = "проект/библиотека.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nреализация Сравниваемое для Точка\nфунк сравнить(это: Точка, другое: Точка) -> Число\nэто.x - другое.x\nконец\nконец\nэкспорт функ макс[T: Сравниваемое](a: T, b: T) -> T\nесли a > b тогда a иначе b конец\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -1072,7 +1072,7 @@ test "module compiler rejects a value outside an imported generic function bound
 
 test "module compiler dispatches through a direct interface-typed cast on an imported struct" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер a: точки.Точка = точки.Точка(40)\nпер b: точки.Точка = точки.Точка(2)\nпер x: Сравниваемое = a\nx.сравнить(b)\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер a: точки.Точка = точки.Точка(40.0)\nпер b: точки.Точка = точки.Точка(2.0)\nпер x: Сравниваемое = a\nx.сравнить(b)\nконец" },
         .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nреализация Сравниваемое для Точка\nфунк сравнить(это: Точка, другое: Точка) -> Число\nэто.x - другое.x\nконец\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -1096,7 +1096,7 @@ test "module compiler dispatches through a direct interface-typed cast on an imp
 
 test "module compiler merges an appended prelude module unqualified into every real module" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "экспорт функ старт() -> Число\nпер к: Коробочка(Число) = Коробочка.Есть(42)\nк.развернуть(0)\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "экспорт функ старт() -> Число\nпер к: Коробочка(Число) = Коробочка.Есть(42.0)\nк.развернуть(0.0)\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
     defer graph.deinit();
@@ -1133,7 +1133,7 @@ test "module compiler merges an appended prelude module unqualified into every r
 
 test "module compiler constructs and reads exported structure fields" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.Точка(1)\nточка.x = 40\nточка.x + 2\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер точка: точки.Точка = точки.Точка(1.0)\nточка.x = 40.0\nточка.x + 2.0\nконец" },
         .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -1158,7 +1158,7 @@ test "module compiler constructs and reads exported structure fields" {
 test "module compiler preserves a transitive nominal field type" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "импорт \"./api\" как api\nэкспорт функ старт() -> Число\napi.создать().элемент.значение\nконец" },
-        .{ .path = "проект/api.ps", .bytes = "импорт \"./модель\" как модель\nэкспорт тип Ответ = структура\nэлемент: модель.Элемент\nконец\nэкспорт функ создать() -> Ответ\nОтвет(модель.Элемент(42))\nконец" },
+        .{ .path = "проект/api.ps", .bytes = "импорт \"./модель\" как модель\nэкспорт тип Ответ = структура\nэлемент: модель.Элемент\nконец\nэкспорт функ создать() -> Ответ\nОтвет(модель.Элемент(42.0))\nконец" },
         .{ .path = "проект/модель.ps", .bytes = "экспорт тип Элемент = структура\nзначение: Число\nконец" },
     } };
     var graph = module_loader.Graph.init(std.testing.allocator);
@@ -1182,7 +1182,7 @@ test "module compiler preserves a transitive nominal field type" {
 
 test "module compiler accepts an imported nominal in an imported generic callback" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./коллекции\" как кол\nимпорт \"./модель\" как модель\nфунк в_число(x: модель.Элемент) -> Число\nx.значение\nконец\nэкспорт функ старт() -> Число\nпер значения = кол.отобразить(массив(модель.Элемент(42)), в_число)\nзначения.получить(0, 0)\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./коллекции\" как кол\nимпорт \"./модель\" как модель\nфунк в_число(x: модель.Элемент) -> Число\nx.значение\nконец\nэкспорт функ старт() -> Число\nпер значения = кол.отобразить(массив(модель.Элемент(42.0)), в_число)\nзначения.получить(0, 0.0)\nконец" }, // index arg (Целое ok), default value arg fixed to Число
         .{ .path = "проект/коллекции.ps", .bytes = "экспорт функ отобразить[T, U](значения: Массив(T), преобразовать: функ(T) -> U) -> Массив(U)\nпер результат: Массив(U) = массив()\nдля значение в значения цикл\nрезультат.добавить(преобразовать(значение))\nконец\nрезультат\nконец" },
         .{ .path = "проект/модель.ps", .bytes = "экспорт тип Элемент = структура\nзначение: Число\nконец" },
     } };
@@ -1224,7 +1224,7 @@ test "module compiler accepts an imported nominal in an imported generic callbac
 // `Ответ` with a `реализация` block).
 test "module compiler imports a function combining a transitive nominal with a local struct that has methods" {
     const reader = MemoryReader{ .files = &.{
-        .{ .path = "проект/main.ps", .bytes = "импорт \"./сервис\" как сервис\nимпорт \"./модель\" как модель\nэкспорт функ старт() -> Число\nвыбор сервис.обернуть(модель.Элемент(42))\nРезультат.Успех(о) -> о.развернуть()\nРезультат.Неудача(_) -> -1\nконец\nконец" },
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./сервис\" как сервис\nимпорт \"./модель\" как модель\nэкспорт функ старт() -> Число\nвыбор сервис.обернуть(модель.Элемент(42.0))\nРезультат.Успех(о) -> о.развернуть()\nРезультат.Неудача(_) -> -1.0\nконец\nконец" },
         .{ .path = "проект/сервис.ps", .bytes = "импорт \"./модель\" как модель\nэкспорт тип Обёртка = структура\nзначение: Число\nконец\nреализация Обёртка\nфунк развернуть(это: Обёртка) -> Число\nэто.значение\nконец\nконец\nэкспорт функ обернуть(значение: модель.Элемент) -> Результат(Обёртка, Ошибка)\nРезультат.Успех(Обёртка(значение.значение))\nконец" },
         .{ .path = "проект/модель.ps", .bytes = "экспорт тип Элемент = структура\nзначение: Число\nконец" },
     } };

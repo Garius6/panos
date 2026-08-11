@@ -139,8 +139,8 @@ test "analyze loads a real multi-file graph from open, unsaved documents" {
     const allocator = std.testing.allocator;
     var documents = lsp.DocumentStore.init(allocator);
     defer documents.deinit();
-    try documents.replace("file:///проект/main.ps", "импорт \"./математика\" как мат\nэкспорт функ старт() -> Число\nмат.сложить(мат.ОТВЕТ, 2)\nконец");
-    try documents.replace("file:///проект/математика.ps", "экспорт конст ОТВЕТ = 40\nэкспорт функ сложить(a: Число, b: Число) -> Число\na + b\nконец");
+    try documents.replace("file:///проект/main.ps", "импорт \"./математика\" как мат\nэкспорт функ старт() -> Число\nмат.сложить(мат.ОТВЕТ, 2.0)\nконец");
+    try documents.replace("file:///проект/математика.ps", "экспорт конст ОТВЕТ = 40.0\nэкспорт функ сложить(a: Число, b: Число) -> Число\na + b\nконец");
 
     var io = std.Io.Threaded.init(allocator, .{});
     defer io.deinit();

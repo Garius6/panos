@@ -1030,6 +1030,7 @@ const Parser = struct {
     }
 
     fn parseExpression(self: *Parser, minimum_precedence: u8) anyerror!ast.ExprId {
+        const cast_precedence: u8 = 10;
         var left = try self.parsePrefix();
 
         while (true) {
@@ -1052,6 +1053,20 @@ const Parser = struct {
                         .span = spanFrom(self.astExprSpan(left), question.span),
                         .value = left,
                     } });
+                    continue;
+                }
+                // `x как Тип` binds tighter than every binary operator
+                // (precedence 10, just below unary's inner-operand
+                // recursion threshold of 11 — see `parsePrefix`'s
+                // `.minus`/`.negate`/`.tilde` case) but is NOT part of
+                // the unconditional postfix cluster above (unlike
+                // call/property/index/`?`) — gating it on
+                // `minimum_precedence` this way means it does NOT get
+                // swallowed into a unary operand's own `parseExpression(11)`
+                // recursion, so `-x как Целое` parses as `(-x) как
+                // Целое`, not `-(x как Целое)` — matches Rust's `as`.
+                if (cast_precedence >= minimum_precedence and self.at(.as)) {
+                    left = try self.parseCast(left);
                     continue;
                 }
             }
@@ -1397,12 +1412,25 @@ const Parser = struct {
         return self.result.ast.copySlice(ast.StmtId, statements.items);
     }
 
+    fn parseCast(self: *Parser, operand: ast.ExprId) anyerror!ast.ExprId {
+        _ = self.next(); // consume `как`
+        const target = try self.parseType();
+        const target_span = self.astTypeSpan(target);
+        return self.result.ast.addExpr(.{ .cast = .{
+            .span = spanFrom(self.astExprSpan(operand), target_span),
+            .operand = operand,
+            .target = target,
+            .target_span = target_span,
+        } });
+    }
+
     fn parseNumber(self: *Parser, value: token.Token) !ast.ExprId {
         const number = std.fmt.parseFloat(f64, value.lexeme) catch {
             try self.report(value.span, "Синтаксическая ошибка: некорректное число");
             return self.result.ast.addExpr(.{ .error_node = value.span });
         };
-        return self.result.ast.addExpr(.{ .number = .{ .span = value.span, .value = number } });
+        const is_integer_literal = std.mem.indexOfScalar(u8, value.lexeme, '.') == null;
+        return self.result.ast.addExpr(.{ .number = .{ .span = value.span, .value = number, .is_integer_literal = is_integer_literal } });
     }
 
     fn parseInterpolatedString(self: *Parser, start: token.Token) anyerror!ast.ExprId {

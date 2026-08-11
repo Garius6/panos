@@ -416,7 +416,7 @@ test "LSP document store revalidates unsaved document changes" {
     var documents = DocumentStore.init(std.testing.allocator);
     defer documents.deinit();
 
-    try documents.replace("file:///пример.ps", "экспорт функ старт() -> Число\n42\nконец");
+    try documents.replace("file:///пример.ps", "экспорт функ старт() -> Число\n42.0\nконец");
     var valid = (try documents.diagnose("file:///пример.ps")).?;
     defer valid.deinit();
     try std.testing.expectEqual(@as(usize, 0), valid.items.items.len);

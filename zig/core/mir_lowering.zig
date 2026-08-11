@@ -583,6 +583,7 @@ fn lowerExpr(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOutcome
             break :blk continuesWith(try lowerSymbolValueRef(ctx, symbol, expressionSpan(ctx.tree, expression)));
         },
         .unary => |unary| lowerUnary(ctx, expression, unary),
+        .cast => |cast| lowerCast(ctx, expression, cast),
         .binary => |binary| lowerBinary(ctx, expression, binary),
         .call => |call| lowerCall(ctx, expression, call),
         .property => |property| lowerProperty(ctx, expression, property),
@@ -1055,7 +1056,6 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
             }
             if (try lowerEnumConstructor(ctx, symbol, call, result_type)) |outcome| return outcome;
             if (try lowerStructConstructor(ctx, expression, symbol, call, result_type)) |outcome| return outcome;
-            if (try lowerNumericCastCall(ctx, symbol, call)) |outcome| return outcome;
             if (try lowerLengthBuiltinCall(ctx, symbol, call, result_type)) |outcome| return outcome;
             if (try lowerProcessBuiltinCall(ctx, symbol, call, result_type)) |outcome| return outcome;
         }
@@ -1248,22 +1248,17 @@ fn lowerStructConstructor(ctx: *LoweringContext, expression: ast.ExprId, symbol:
     return continuesWith(dst);
 }
 
-// `Целое(x)`/`Число(x)` — bare (non-module) builtin cast calls, same real
-// gap as `zig/core/compiler.zig`'s `compileNumericCastBuiltin` (see its
-// doc comment) — `mir_lowering.zig` needed the SAME fix independently
-// since it never routes through `compiler.zig` at all. `Число(x)` is a
+// `x как Целое` / `x как Число` — same real gap `compiler.zig`'s
+// `.cast` codegen fixes on the native/bytecode path (see its doc
+// comment) — `mir_lowering.zig` needs the SAME handling independently
+// since it never routes through `compiler.zig` at all. `Число` is a
 // pure no-op (identity — both share one f64 MIR/WASM representation),
-// `Целое(x)` truncates toward zero via `UnOp.int_trunc`.
-fn lowerNumericCastCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype) anyerror!?ExprOutcome {
-    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
-    if (entry.kind != .builtin or entry.module_path != null) return null;
-    const is_integer = std.mem.eql(u8, entry.name, "Целое");
-    if (!is_integer and !std.mem.eql(u8, entry.name, "Число")) return null;
-    if (call.arguments.len != 1) return unsupported("приведение типа с числом аргументов != 1");
-
-    const argument_outcome = try lowerExpr(ctx, call.arguments[0]);
+// `Целое` truncates toward zero via `UnOp.int_trunc`.
+fn lowerCast(ctx: *LoweringContext, expression: ast.ExprId, cast: anytype) anyerror!ExprOutcome {
+    const argument_outcome = try lowerExpr(ctx, cast.operand);
     if (argument_outcome.flow == .terminates) return terminated;
-    if (!is_integer) return continuesWith(argument_outcome.value);
+    const cast_type = ctx.checked.expression_types.get(expression) orelse return unsupported("не удалось определить тип каста");
+    if (!ctx.checked.types.eql(cast_type, ctx.checked.types.builtins.integer)) return continuesWith(argument_outcome.value);
 
     const dst = try ctx.builder.newValue(ctx.checked.types.builtins.integer);
     try ctx.builder.emit(.{ .unary = .{ .dst = dst, .op = .int_trunc, .src = argument_outcome.value } });
@@ -1465,10 +1460,10 @@ test "lowerModule lowers a recursive arithmetic function to a valid CFG" {
     const type_checker_mod = @import("type_checker.zig");
     const source_text =
         \\функ факториал(n: Число) -> Число
-        \\    если n < 2 тогда
-        \\        1
+        \\    если n < 2.0 тогда
+        \\        1.0
         \\    иначе
-        \\        n * факториал(n - 1)
+        \\        n * факториал(n - 1.0)
         \\    конец
         \\конец
     ;
@@ -1509,10 +1504,10 @@ test "lowerModule lowers пока into header/body/exit blocks, no back-edge whe
     // assignment-driven back-edge case.
     const source_text =
         \\функ цикл_тест(n: Число) -> Число
-        \\    пока n > 0 цикл
+        \\    пока n > 0.0 цикл
         \\        возврат n
         \\    конец
-        \\    0
+        \\    0.0
         \\конец
     ;
     var lexed = try lexer.tokenize(allocator, source_text, 0);
@@ -1550,11 +1545,11 @@ test "lowerModule lowers an accumulator пока loop with assignment, back-edge
     const type_checker_mod = @import("type_checker.zig");
     const source_text =
         \\функ сумма_до(предел: Число) -> Число
-        \\    пер итог: Число = 0
-        \\    пер i: Число = 1
+        \\    пер итог: Число = 0.0
+        \\    пер i: Число = 1.0
         \\    пока i < предел цикл
         \\        итог = итог + i
-        \\        i = i + 1
+        \\        i = i + 1.0
         \\    конец
         \\    итог
         \\конец

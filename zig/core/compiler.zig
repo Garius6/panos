@@ -429,6 +429,13 @@ const FunctionCompiler = struct {
                 };
                 try self.function.emit(self.compiler.result.allocator, instruction);
             },
+            .cast => |cast| {
+                try self.compileExpression(cast.operand);
+                const cast_type = self.compiler.checked.expression_types.get(expression) orelse return;
+                if (self.compiler.checked.types.eql(cast_type, self.compiler.checked.types.builtins.integer)) {
+                    try self.function.emit(self.compiler.result.allocator, .{ .int_cast = {} });
+                }
+            },
             .binary => |binary| try self.compileBinary(binary),
             .call => |call| try self.compileCall(expression, call),
             .tuple => |tuple| try self.compileSequence(tuple.elements, .build_tuple),
@@ -547,7 +554,6 @@ const FunctionCompiler = struct {
         const arguments = ordered_arguments orelse call.arguments;
         if (try self.compileErrorConstructor(call)) return;
         if (try self.compilePanicBuiltin(call)) return;
-        if (try self.compileNumericCastBuiltin(call)) return;
         if (try self.compileToDisplayStringBuiltin(call)) return;
         if (try self.compileFilesystemBuiltin(call)) return;
         if (try self.compileOsBuiltin(call)) return;
@@ -688,33 +694,6 @@ const FunctionCompiler = struct {
         }
         try self.compileExpression(call.arguments[0]);
         try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
-        return true;
-    }
-
-    // `Целое(x)`/`Число(x)` — real gap found auditing panosiki's `std/
-    // математика.ps`: registered as bare builtin NAMES (`resolver.zig`)
-    // for years, but never given actual codegen here, same failure mode
-    // as `встроку`/string interpolation ("вызвано значение, не являющееся
-    // функцией") — `docs/src/language/basic-types.md` §"Целое и Число"
-    // documents this as core, load-bearing syntax. Both directions share
-    // ONE f64 runtime representation (`Целое`/`Число` are the same
-    // `Value.number`, see `ARCHITECTURE.md`'s "Целое shares f64
-    // representation" note) — `Число(x)` is a pure no-op (nothing to
-    // truncate, compiles the argument and emits nothing extra); `Целое(x)`
-    // truncates toward zero via the SAME `int_cast` opcode the `/`
-    // int-division path already relies on conceptually (`vm.zig`'s
-    // `numericBinary(.int_divide)` already does `std.math.trunc`) — a
-    // no-op when the value already happens to be an integer, exactly
-    // matching the docs' "no-op при вызове на уже своём типе" contract.
-    fn compileNumericCastBuiltin(self: *FunctionCompiler, call: anytype) !bool {
-        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
-        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
-        if (entry.kind != .builtin or entry.module_path != null) return false;
-        if (call.arguments.len != 1 or !(std.mem.eql(u8, entry.name, "Целое") or std.mem.eql(u8, entry.name, "Число"))) return false;
-        try self.compileExpression(call.arguments[0]);
-        if (std.mem.eql(u8, entry.name, "Целое")) {
-            try self.function.emit(self.compiler.result.allocator, .{ .int_cast = {} });
-        }
         return true;
     }
 
@@ -2403,7 +2382,7 @@ test "compiler emits property and index assignments" {
 test "compiler emits closures for captured lambdas" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Число\nпер сдвиг = 2\nпер добавить: функ(Число) -> Число = функ(значение)\nзначение + сдвиг\nконец\nдобавить(3)\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ старт() -> Число\nпер сдвиг = 2.0\nпер добавить: функ(Число) -> Число = функ(значение)\nзначение + сдвиг\nконец\nдобавить(3.0)\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

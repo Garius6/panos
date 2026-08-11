@@ -331,7 +331,7 @@ fn appendResult(value: []const u8) void {
 }
 
 test "browser run returns the program result through the shared buffer" {
-    const input = "экспорт функ старт() -> Число\n2 + 3\nконец";
+    const input = "экспорт функ старт() -> Число\n2.0 + 3.0\nконец";
     @memcpy(source_buffer[0..input.len], input);
     panos_run(@intCast(input.len));
 
@@ -348,7 +348,7 @@ test "browser check serializes diagnostics for the editor contract" {
 }
 
 test "browser check does not require an entry function" {
-    const input = "экспорт функ значение() -> Число\n42\nконец";
+    const input = "экспорт функ значение() -> Число\n42.0\nконец";
     @memcpy(source_buffer[0..input.len], input);
     panos_check(@intCast(input.len));
 
@@ -372,11 +372,11 @@ test "browser check rejects a native filesystem builtin" {
 }
 
 test "browser hover returns an inferred type at a UTF-16 offset" {
-    const input = "экспорт функ старт() -> Число\n42\nконец";
+    const input = "экспорт функ старт() -> Число\n42.0\nконец";
     @memcpy(source_buffer[0..input.len], input);
     panos_hover(@intCast(input.len), 30);
 
-    try std.testing.expectEqualStrings("{\"type\":\"Число\",\"from\":30,\"to\":32}", result_buffer[0..result_len]);
+    try std.testing.expectEqualStrings("{\"type\":\"Число\",\"from\":30,\"to\":34}", result_buffer[0..result_len]);
 }
 
 test "browser completion exposes array methods after a dot" {

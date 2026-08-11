@@ -146,6 +146,12 @@ pub const Expr = union(enum) {
     number: struct {
         span: source.Span,
         value: f64,
+        // True when the source lexeme has no `.` — a purely syntactic
+        // fact, set by the parser from the raw lexeme text. Drives the
+        // literal's static type directly (`Целое` when true, `Число`
+        // when false) — see `type_checker.zig`'s `.number` case. No
+        // longer inferred from surrounding context.
+        is_integer_literal: bool,
     },
     boolean: struct {
         span: source.Span,
@@ -163,6 +169,18 @@ pub const Expr = union(enum) {
         span: source.Span,
         operator: token.TokenKind,
         operand: ExprId,
+    },
+    // `x как Тип` — explicit numeric cast (currently Число<->Целое
+    // only, see `type_checker.zig`'s `.cast` inference case). Binds
+    // tighter than binary operators but looser than unary (matches
+    // Rust's `as`: `-x как Целое` is `(-x) как Целое`, `x как Число +
+    // 1` is `(x как Число) + 1`) — parsed as a suffix loop right after
+    // `parseUnary()`, before entering binary precedence-climbing.
+    cast: struct {
+        span: source.Span,
+        operand: ExprId,
+        target: TypeId,
+        target_span: source.Span,
     },
     binary: struct {
         span: source.Span,
@@ -248,6 +266,7 @@ pub fn exprSpan(expression: Expr) source.Span {
         .string => |value| value.span,
         .ident => |value| value.span,
         .unary => |value| value.span,
+        .cast => |value| value.span,
         .binary => |value| value.span,
         .call => |value| value.span,
         .spawn => |value| value.span,
@@ -503,10 +522,12 @@ test "AST IDs remain stable when storage grows" {
     const first = try ast.addExpr(.{ .number = .{
         .span = .{ .file_id = 0, .start = 0, .end = 1 },
         .value = 1,
+        .is_integer_literal = true,
     } });
     const second = try ast.addExpr(.{ .number = .{
         .span = .{ .file_id = 0, .start = 2, .end = 3 },
         .value = 2,
+        .is_integer_literal = true,
     } });
 
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(first));
@@ -551,8 +572,8 @@ test "AST finds the most nested expression at a source offset" {
     var ast = Ast.init(std.testing.allocator);
     defer ast.deinit();
 
-    const left = try ast.addExpr(.{ .number = .{ .span = .{ .file_id = 2, .start = 4, .end = 5 }, .value = 1 } });
-    const right = try ast.addExpr(.{ .number = .{ .span = .{ .file_id = 2, .start = 8, .end = 9 }, .value = 2 } });
+    const left = try ast.addExpr(.{ .number = .{ .span = .{ .file_id = 2, .start = 4, .end = 5 }, .value = 1, .is_integer_literal = true } });
+    const right = try ast.addExpr(.{ .number = .{ .span = .{ .file_id = 2, .start = 8, .end = 9 }, .value = 2, .is_integer_literal = true } });
     const binary = try ast.addExpr(.{ .binary = .{
         .span = .{ .file_id = 2, .start = 4, .end = 9 },
         .left = left,

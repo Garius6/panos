@@ -1101,6 +1101,7 @@ const Resolver = struct {
                 if (symbol != symbols.invalid_symbol) try self.used_symbols.put(symbol, {});
             },
             .unary => |unary| try self.resolveExpression(tree, unary.operand),
+            .cast => |cast| try self.resolveExpression(tree, cast.operand),
             .binary => |binary| {
                 try self.resolveExpression(tree, binary.left);
                 try self.resolveExpression(tree, binary.right);

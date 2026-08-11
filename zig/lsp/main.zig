@@ -1645,7 +1645,7 @@ test "LSP server publishes diagnostics for opened and changed documents" {
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"line\":1,\"character\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "Resolve Error: неопределённое имя 'неизвестно'") != null);
 
-    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"contentChanges\":[{\"text\":\"экспорт функ старт() -> Число\\n42\\nконец\"}]}}", &output));
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"contentChanges\":[{\"text\":\"экспорт функ старт() -> Число\\n42.0\\nконец\"}]}}", &output));
     try std.testing.expect(std.mem.endsWith(u8, output.items(), "\"diagnostics\":[]}}"));
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":1,\"character\":1}}}", &output));

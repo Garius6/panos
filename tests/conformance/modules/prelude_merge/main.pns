@@ -1,9 +1,9 @@
 // No `импорт` at all — `Опция` comes from the embedded prelude, merged
 // unqualified into every module (see `module_loader.Graph.appendPreludeModule`).
 экспорт функ старт() -> Число
-    пер о: Опция(Число) = Опция.Есть(42)
+    пер о: Опция(Число) = Опция.Есть(42.0)
     выбор о
         Есть(x) -> x
-        Нет -> 0
+        Нет -> 0.0
     конец
 конец

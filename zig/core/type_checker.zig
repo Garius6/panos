@@ -1506,7 +1506,12 @@ const Checker = struct {
 
     fn infer(self: *Checker, expression: ast.ExprId) anyerror!types.TypeId {
         const inferred = switch (self.tree.expr(expression).*) {
-            .number => self.result.types.builtins.number,
+            // Purely syntactic now — `1` is always `Целое`, `1.0` is
+            // always `Число`, regardless of surrounding context (no
+            // implicit coercion either way, matching Rust `as`/Haskell
+            // `fromIntegral`, both requiring an explicit cast even for
+            // widening int->float).
+            .number => |number| if (number.is_integer_literal) self.result.types.builtins.integer else self.result.types.builtins.number,
             .boolean => self.result.types.builtins.boolean,
             .string => self.result.types.builtins.string,
             .ident => |ident| blk: {
@@ -1520,6 +1525,7 @@ const Checker = struct {
                 break :blk self.result.symbol_types.get(symbol) orelse try self.result.types.poison();
             },
             .unary => |unary| try self.inferUnary(unary),
+            .cast => |cast| try self.inferCast(cast),
             .binary => |binary| try self.inferBinary(binary),
             .call => |call| try self.inferCall(expression, call),
             .tuple => |tuple| blk: {
@@ -1679,25 +1685,17 @@ const Checker = struct {
     fn inferExpected(self: *Checker, expression: ast.ExprId, expected: types.TypeId) anyerror!types.TypeId {
         return switch (self.tree.expr(expression).*) {
             .lambda => |lambda| self.recordExpressionType(expression, try self.inferLambda(expression, lambda, expected)),
-            .number => |number| if (expected.eql(self.result.types.builtins.integer)) blk: {
-                if (number.value != std.math.trunc(number.value)) {
-                    try self.report(number.span, "Type Error: дробный литерал несовместим с Целое", .{});
-                }
-                break :blk self.recordExpressionType(expression, expected);
-            } else self.infer(expression),
-            .unary => |unary| if (expected.eql(self.result.types.builtins.integer) and unary.operator == .minus) blk: {
-                _ = try self.inferExpected(unary.operand, expected);
-                break :blk self.recordExpressionType(expression, expected);
-            } else self.infer(expression),
-            .binary => |binary| if (expected.eql(self.result.types.builtins.integer) and (binary.operator == .plus or binary.operator == .minus or binary.operator == .star)) blk: {
-                const left = try self.inferExpected(binary.left, expected);
-                const right = try self.inferExpected(binary.right, expected);
-                if (!self.assignable(left, expected) or !self.assignable(right, expected)) {
-                    try self.report(binary.span, "Type Error: целочисленное выражение содержит несовместимый операнд", .{});
-                    break :blk self.recordExpressionType(expression, try self.result.types.poison());
-                }
-                break :blk self.recordExpressionType(expression, expected);
-            } else self.infer(expression),
+            // `.number`/`.unary`/`.binary` used to have special cases
+            // here that FORCED a bare literal (which defaulted to
+            // `Число`) into `Целое` when the surrounding context
+            // expected it — no longer needed: a literal's type is now
+            // a purely syntactic fact (`1` is always `Целое`, `1.0`
+            // always `Число`, see `infer`'s `.number` case), so plain
+            // `self.infer(expression)` already produces the right type,
+            // and `inferBinary`'s own operand-type-match checks
+            // (`оператор '+' ожидает два числа одного типа` etc.)
+            // already give an equivalent diagnostic for a genuine
+            // mismatch — nothing lost by falling through to `infer`.
             .tuple => |tuple| blk: {
                 const expected_type = self.result.types.get(expected) orelse break :blk self.infer(expression);
                 if (expected_type.* != .tuple or expected_type.tuple.len != tuple.elements.len) break :blk self.infer(expression);
@@ -2444,11 +2442,29 @@ const Checker = struct {
         };
     }
 
+    // `x как Тип` — scoped ONLY to Число<->Целое for now (deliberately
+    // not unified with interface casting, which already has its own
+    // separate, implicit, assignment-boundary mechanism —
+    // `registerInterfaceCast`/`Cast_Interface`). Both directions are
+    // ALWAYS explicit, no implicit widening (Целое->Число) either —
+    // matches Rust `as`/Haskell `fromIntegral`.
+    fn inferCast(self: *Checker, cast: anytype) anyerror!types.TypeId {
+        const operand = try self.infer(cast.operand);
+        const target = try self.resolveType(cast.target);
+        if (!self.isPoison(operand) and !self.isNumeric(operand)) {
+            try self.report(cast.span, "Type Error: каст 'как' поддержан только между Число и Целое", .{});
+            return self.result.types.poison();
+        }
+        if (!self.isPoison(target) and !self.isNumeric(target)) {
+            try self.report(cast.target_span, "Type Error: каст 'как' поддержан только между Число и Целое", .{});
+            return self.result.types.poison();
+        }
+        return target;
+    }
+
     fn inferBinary(self: *Checker, binary: anytype) anyerror!types.TypeId {
-        var left = try self.infer(binary.left);
-        var right = try self.infer(binary.right);
-        left = try self.narrowIntegerLiteral(binary.left, left, right);
-        right = try self.narrowIntegerLiteral(binary.right, right, left);
+        const left = try self.infer(binary.left);
+        const right = try self.infer(binary.right);
         return switch (binary.operator) {
             .assign => blk: {
                 try self.checkAssignmentTarget(binary.left, binary.span);
@@ -2501,13 +2517,6 @@ const Checker = struct {
             },
             else => try self.result.types.poison(),
         };
-    }
-
-    fn narrowIntegerLiteral(self: *Checker, expression: ast.ExprId, inferred: types.TypeId, other: types.TypeId) !types.TypeId {
-        if (self.isType(inferred, self.result.types.builtins.number) and self.isType(other, self.result.types.builtins.integer)) {
-            return self.inferExpected(expression, self.result.types.builtins.integer);
-        }
-        return inferred;
     }
 
     fn checkAssignmentTarget(self: *Checker, expression: ast.ExprId, span: source.Span) !void {
@@ -2675,20 +2684,6 @@ const Checker = struct {
                     }
                 }
                 return self.result.types.builtins.error_value;
-            }
-            if (self.isBuiltin(symbol, "Целое") or self.isBuiltin(symbol, "Число")) {
-                const is_integer = self.isBuiltin(symbol, "Целое");
-                const target_type = if (is_integer) self.result.types.builtins.integer else self.result.types.builtins.number;
-                if (call.arguments.len != 1) {
-                    try self.report(call.span, "Type Error: {s}(x) ожидает 1 аргумент", .{if (is_integer) "Целое" else "Число"});
-                    for (call.arguments) |argument| _ = try self.infer(argument);
-                    return target_type;
-                }
-                const argument_type = try self.infer(call.arguments[0]);
-                if (!self.isType(argument_type, self.result.types.builtins.integer) and !self.isType(argument_type, self.result.types.builtins.number)) {
-                    try self.report(call.span, "Type Error: {s}(x) ожидает Число или Целое", .{if (is_integer) "Целое" else "Число"});
-                }
-                return target_type;
             }
             if (self.isBuiltin(symbol, "встроку")) {
                 if (call.arguments.len != 1) {
@@ -5124,7 +5119,7 @@ fn builtinType(store: *types.TypeStore, name: []const u8) ?types.TypeId {
 test "type checker verifies local arithmetic and direct calls" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ сложить(a: Число, b: Число) -> Число\na + b\nконец\nфунк старт() -> Число\nпер сумма: Число = сложить(1, 2)\nсумма\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ сложить(a: Число, b: Число) -> Число\na + b\nконец\nфунк старт() -> Число\nпер сумма: Число = сложить(1.0, 2.0)\nсумма\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5156,7 +5151,7 @@ test "type checker accumulates argument type diagnostics" {
 test "type checker checks control-flow conditions and branch results" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ выбрать(условие: Булево) -> Число\nесли условие тогда\n1\nиначе\n2\nконец\nконец\nфунк ошибка() -> Число\nесли 1 тогда\n\"нет\"\nиначе\n2\nконец\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ выбрать(условие: Булево) -> Число\nесли условие тогда\n1.0\nиначе\n2.0\nконец\nконец\nфунк ошибка() -> Число\nесли 1 тогда\n\"нет\"\nиначе\n2.0\nконец\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5173,7 +5168,7 @@ test "type checker checks control-flow conditions and branch results" {
 test "type checker infers collection elements through indexing" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ элемент() -> Число\nпер числа = массив(1, 2)\nпер цены = соответствие(\"яблоко\" = числа[0])\nцены[\"яблоко\"]\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ элемент() -> Число\nпер числа = массив(1.0, 2.0)\nпер цены = соответствие(\"яблоко\" = числа[0])\nцены[\"яблоко\"]\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5212,7 +5207,7 @@ test "type checker allows .длина() as a method on Строка, matching М
 test "type checker infers lambda parameters from a function annotation" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ применить(f: функ(Число) -> Число, x: Число) -> Число\nf(x)\nконец\nфунк старт() -> Число\nпер удвоить: функ(Число) -> Число = функ(значение)\nзначение * 2\nконец\nприменить(удвоить, 3)\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ применить(f: функ(Число) -> Число, x: Число) -> Число\nf(x)\nконец\nфунк старт() -> Число\nпер удвоить: функ(Число) -> Число = функ(значение)\nзначение * 2.0\nконец\nприменить(удвоить, 3.0)\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5242,7 +5237,7 @@ test "type checker preserves nominal user types in function signatures" {
 test "type checker checks struct constructors and field access" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "тип Точка = структура\nx: Число\ny: Число\nконец\nфунк взять_x() -> Число\nпер точка = Точка(3, 4)\nточка.x\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Точка = структура\nx: Число\ny: Число\nконец\nфунк взять_x() -> Число\nпер точка = Точка(3.0, 4.0)\nточка.x\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5260,7 +5255,7 @@ test "type checker checks struct constructors and field access" {
 test "type checker types destructuring and loop binders" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ сумма() -> Число\nпер (x, y) = (1, 2)\nпер результат = 0\nдля значение в массив(x, y) цикл\nрезультат = результат + значение\nконец\nпер целый_результат: Целое = 0\nдля индекс = 1 по 2 цикл\nцелый_результат = целый_результат + индекс\nконец\nрезультат\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ сумма() -> Число\nпер (x, y) = (1.0, 2.0)\nпер результат = 0.0\nдля значение в массив(x, y) цикл\nрезультат = результат + значение\nконец\nпер целый_результат: Целое = 0\nдля индекс = 1 по 2 цикл\nцелый_результат = целый_результат + индекс\nконец\nрезультат\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5301,6 +5296,14 @@ test "type checker rejects loop control outside a loop" {
     try std.testing.expectEqualStrings("недостижимый код", checked.diagnostics.items.items[2].message);
 }
 
+// NOTE: this test's original premise ("type checker narrows integer
+// literals in an expected context") no longer applies now that bare
+// integer literals are unconditionally Целое and there is no implicit
+// Целое<->Число coercion — there is nothing left to narrow. The old
+// "дробный литерал несовместим с Целое" diagnostic message was removed;
+// `пер дробь: Целое = 1.5` now fails through the generic assignability
+// check instead ("значение переменной не совпадает с аннотацией").
+// Assertion rewritten to check error count/type only, not message text.
 test "type checker narrows integer literals in an expected context" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -5314,7 +5317,6 @@ test "type checker narrows integer literals in an expected context" {
     defer checked.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
-    try std.testing.expectEqualStrings("Type Error: дробный литерал несовместим с Целое", checked.diagnostics.items.items[0].message);
     const sum = parsed.ast.decl(parsed.ast.program.?.declarations[1]).function;
     const expression = parsed.ast.stmt(sum.body[1]).expr.value;
     try std.testing.expectEqual(checked.types.builtins.integer, checked.expression_types.get(expression).?);
@@ -5345,7 +5347,7 @@ test "type checker validates operators and assignment targets" {
 test "type checker restricts top-level constants to literals" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "конст ПЛОХО = массив(1)\nконст НОРМА = -1\nфунк старт() -> Число\nНОРМА\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "конст ПЛОХО = массив(1)\nконст НОРМА = -1.0\nфунк старт() -> Число\nНОРМА\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5464,7 +5466,7 @@ test "type checker enforces Comparable generic bounds" {
 test "type checker rejects invalid index writes and unsupported named enum calls" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "тип Ответ = перечисление\nДа(Число)\nконец\nфунк f() -> Пусто\n\"строка\"[0] = \"x\"\nпер ответ = Ответ.Да(значение = 1)\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Ответ = перечисление\nДа(Число)\nконец\nфунк f() -> Пусто\n\"строка\"[0] = \"x\"\nпер ответ = Ответ.Да(значение = 1.0)\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5480,7 +5482,7 @@ test "type checker rejects invalid index writes and unsupported named enum calls
 test "type checker warns on code after an unconditional возврат" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Число\nвозврат 1\n2\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Число\nвозврат 1.0\n2.0\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5497,7 +5499,7 @@ test "type checker warns on code after an unconditional возврат" {
 test "type checker warns on code after an if/else where both branches return" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ f(x: Булево) -> Число\nесли x тогда\nвозврат 1\nиначе\nвозврат 2\nконец\n3\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f(x: Булево) -> Число\nесли x тогда\nвозврат 1.0\nиначе\nвозврат 2.0\nконец\n3.0\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5524,7 +5526,7 @@ test "type checker warns on code after an if/else where both branches return" {
 test "type checker unifies branches of a nested if-expression used as an else-branch's tail, with no type annotation anywhere" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "тип Т = структура\nx: Число\nконец\nфунк f(a: Т) -> Число\nпер b = если истина тогда\nТ(2)\nиначе\nесли ложь тогда\nТ(3)\nиначе\na\nконец\nконец\nb.x\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Т = структура\nx: Число\nконец\nфунк f(a: Т) -> Число\nпер b = если истина тогда\nТ(2.0)\nиначе\nесли ложь тогда\nТ(3.0)\nиначе\na\nконец\nконец\nb.x\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5550,7 +5552,7 @@ test "type checker unifies branches of a nested if-expression used as an else-br
 test "type checker infers массив() element type inside a выбор arm from the function's declared return type" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "тип E = перечисление\nА\nБ\nконец\nфунк f(e: E) -> Массив(Число)\nвыбор e\nE.А -> массив()\nE.Б -> массив(1)\nконец\nконец\nфунк старт() -> Массив(Число)\nf(E.А)\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип E = перечисление\nА\nБ\nконец\nфунк f(e: E) -> Массив(Число)\nвыбор e\nE.А -> массив()\nE.Б -> массив(1.0)\nконец\nконец\nфунк старт() -> Массив(Число)\nf(E.А)\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();
@@ -5572,7 +5574,7 @@ test "type checker does not warn when an if has no else (false path falls throug
     // pre-existing if-expression-value-type inference limitation this
     // exact shape hits with `возврат` in a lone then-branch (separate
     // from what this test is checking).
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ f(x: Булево) -> Число\nесли x тогда\nпаника(\"boom\")\nконец\n2\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ f(x: Булево) -> Число\nесли x тогда\nпаника(\"boom\")\nконец\n2.0\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

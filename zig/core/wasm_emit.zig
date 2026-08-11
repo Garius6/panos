@@ -1076,10 +1076,10 @@ test "emitModule produces a valid, executable .wasm for a recursive MIR function
 
     const source_text =
         \\функ факториал(n: Число) -> Число
-        \\    если n < 2 тогда
-        \\        1
+        \\    если n < 2.0 тогда
+        \\        1.0
         \\    иначе
-        \\        n * факториал(n - 1)
+        \\        n * факториал(n - 1.0)
         \\    конец
         \\конец
     ;
@@ -1149,11 +1149,11 @@ test "emitModule produces a valid, executable .wasm for a real iterating пок�
 
     const source_text =
         \\функ сумма_до(предел: Число) -> Число
-        \\    пер итог: Число = 0
-        \\    пер i: Число = 1
+        \\    пер итог: Число = 0.0
+        \\    пер i: Число = 1.0
         \\    пока i < предел цикл
         \\        итог = итог + i
-        \\        i = i + 1
+        \\        i = i + 1.0
         \\    конец
         \\    итог
         \\конец

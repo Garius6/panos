@@ -4970,8 +4970,18 @@ pub const Vm = struct {
             try self.fault("Runtime Error: метод не найден в vtable интерфейса", .{});
             return;
         }
-        self.stack.items[interface_index] = .{ .function_ref = methods[call_info.method_index] };
-        try self.stack.insert(self.allocator, interface_index + 1, interface.receiver);
+        const target_function_id = methods[call_info.method_index];
+        // A default method's own `это.другой_метод()` needs to dispatch
+        // through the vtable again — its compiled `это` parameter is
+        // the ABSTRACT interface type, not a concrete struct, so it
+        // needs the BOXED `.interface` value, not the raw underlying
+        // one an ordinary impl method (real field access on a concrete
+        // struct) requires. See `bytecode.Function.
+        // is_default_interface_method`'s doc comment.
+        const is_default = if (self.program.functionConst(target_function_id)) |target| target.is_default_interface_method else false;
+        const this_argument: value.Value = if (is_default) self.stack.items[interface_index] else interface.receiver;
+        self.stack.items[interface_index] = .{ .function_ref = target_function_id };
+        try self.stack.insert(self.allocator, interface_index + 1, this_argument);
         try self.call(@intCast(argument_count + 1));
     }
 
@@ -9049,6 +9059,321 @@ test "VM converts a crashed process into a failed Результат, not a VM-w
     switch (outcome) {
         .success => |runtime_value| switch (runtime_value) {
             .boolean => |flag| try std.testing.expect(flag),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+fn findStartFunction(resolved: anytype, compiled: anytype) ?bytecode.FunctionId {
+    var it = compiled.function_ids.iterator();
+    while (it.next()) |entry| {
+        const symbol_entry = resolved.symbols.get(entry.key_ptr.*) orelse continue;
+        if (std.mem.eql(u8, symbol_entry.name, "старт")) return entry.value_ptr.*;
+    }
+    return null;
+}
+
+// Regression: default methods on interfaces (`функ метод(это: Интерфейс
+// (...), ...) -> Тип ... конец` inside `тип X = интерфейс ... конец`) —
+// a method NOT overridden by an implementor falls back to this body,
+// which can itself call OTHER interface methods on `это` (dispatched
+// dynamically, exactly like an ordinary interface-typed call) and be
+// invoked directly on a concrete value with no explicit interface
+// annotation anywhere (`Диапазон(...).сумма()` — the whole point of the
+// feature, fluent chaining starting from a plain concrete value).
+test "VM dispatches an interface default method not overridden by the implementor" {
+    const compiler_mod = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver_mod = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Счётный[T] = интерфейс
+        \\    функ следующий() -> Опция(T)
+        \\    функ сумма(это: Счётный(T)) -> Число
+        \\        пер итог = 0.0
+        \\        пер продолжать = истина
+        \\        пока продолжать цикл
+        \\            выбор это.следующий()
+        \\                Есть(x) тогда
+        \\                    итог = итог + 1.0
+        \\                конец
+        \\                Нет тогда
+        \\                    продолжать = ложь
+        \\                конец
+        \\            конец
+        \\        конец
+        \\        итог
+        \\    конец
+        \\конец
+        \\тип Диапазон = структура
+        \\    текущее: Число
+        \\    предел: Число
+        \\конец
+        \\реализация Счётный для Диапазон
+        \\    функ следующий(это: Диапазон) -> Опция(Число)
+        \\        если это.текущее >= это.предел тогда
+        \\            Опция.Нет()
+        \\        иначе
+        \\            это.текущее = это.текущее + 1.0
+        \\            Опция.Есть(это.текущее)
+        \\        конец
+        \\    конец
+        \\конец
+        \\экспорт функ старт() -> Число
+        \\    Диапазон(0.0, 5.0).сумма()
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver_mod.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler_mod.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const start = findStartFunction(&resolved, &compiled) orelse return error.TestUnexpectedResult;
+    const outcome = try vm.run(start, &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 5), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// An implementor that DOES override a default method uses its own —
+// the fallback in `defineInterfaceImplementation` only fires when
+// `matched == null`.
+test "VM prefers an implementor's own override over an interface default method" {
+    const compiler_mod = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver_mod = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Счётный[T] = интерфейс
+        \\    функ следующий() -> Опция(T)
+        \\    функ сумма(это: Счётный(T)) -> Число
+        \\        99.0
+        \\    конец
+        \\конец
+        \\тип Диапазон = структура
+        \\    текущее: Число
+        \\    предел: Число
+        \\конец
+        \\реализация Счётный для Диапазон
+        \\    функ следующий(это: Диапазон) -> Опция(Число)
+        \\        Опция.Нет()
+        \\    конец
+        \\    функ сумма(это: Диапазон) -> Число
+        \\        7.0
+        \\    конец
+        \\конец
+        \\экспорт функ старт() -> Число
+        \\    Диапазон(0.0, 5.0).сумма()
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver_mod.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler_mod.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const start = findStartFunction(&resolved, &compiled) orelse return error.TestUnexpectedResult;
+    const outcome = try vm.run(start, &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 7), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Regression: a GENERIC struct implementing a GENERIC interface,
+// dispatched polymorphically at an arbitrary instantiation — real gap
+// found building a lazy-iterator-style default method (`отобразить[U]`)
+// that constructs+returns a wrapper struct cast to the interface.
+// Chains 3 separate fixes: `findInterfaceImplementation`'s substitution
+// fallback (exact-`eql` never matches a generic target's OWN
+// placeholders against a call site's concrete instantiation),
+// `inferInterfaceCall`'s method-level generic inference (`U`, distinct
+// from the interface's own `T`, previously never bound at all), and
+// `inferDefaultInterfaceMethodCall` substituting `implementation.
+// arguments` through the CONCRETE target before building the interface
+// type (previously left it still abstract). Also exercises
+// `inferGenericSubstitution`'s new `.function` case (`U` appears ONLY
+// inside a callback parameter's return position, nowhere else).
+test "VM dispatches a default method calling a generic struct that implements a generic interface" {
+    const compiler_mod = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver_mod = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип Ит[T] = интерфейс
+        \\    функ следующий() -> Опция(T)
+        \\    функ собрать(это: Ит(T)) -> Массив(T)
+        \\        пер результат: Массив(T) = массив()
+        \\        пер продолжать = истина
+        \\        пока продолжать цикл
+        \\            выбор это.следующий()
+        \\                Есть(x) тогда
+        \\                    результат.добавить(x)
+        \\                конец
+        \\                Нет тогда
+        \\                    продолжать = ложь
+        \\                конец
+        \\            конец
+        \\        конец
+        \\        результат
+        \\    конец
+        \\    функ отобразить[U](это: Ит(T), ф: функ(T) -> U) -> Ит(U)
+        \\        Отображённый(это, ф)
+        \\    конец
+        \\конец
+        \\тип Отображённый[T, U] = структура
+        \\    источник: Ит(T)
+        \\    ф: функ(T) -> U
+        \\конец
+        \\реализация Ит для Отображённый
+        \\    функ следующий(это: Отображённый) -> Опция(U)
+        \\        выбор это.источник.следующий()
+        \\            Есть(x) -> Опция.Есть(это.ф(x))
+        \\            Нет -> Опция.Нет()
+        \\        конец
+        \\    конец
+        \\конец
+        \\тип МассивИт[T] = структура
+        \\    массив: Массив(T)
+        \\    индекс: Целое
+        \\конец
+        \\реализация Ит для МассивИт
+        \\    функ следующий(это: МассивИт) -> Опция(T)
+        \\        если это.индекс >= это.массив.длина() тогда
+        \\            Опция.Нет()
+        \\        иначе
+        \\            пер знач = это.массив[это.индекс]
+        \\            это.индекс = это.индекс + 1
+        \\            Опция.Есть(знач)
+        \\        конец
+        \\    конец
+        \\конец
+        \\экспорт функ старт() -> Массив(Число)
+        \\    пер источник = МассивИт(массив(1.0, 2.0, 3.0), 0)
+        \\    источник.отобразить(функ(x: Число) -> Число
+        \\        x * 2.0
+        \\    конец).собрать()
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver_mod.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler_mod.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const start = findStartFunction(&resolved, &compiled) orelse return error.TestUnexpectedResult;
+    const outcome = try vm.run(start, &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .array => |array| {
+                try std.testing.expectEqual(@as(usize, 3), array.elements.len);
+                try std.testing.expectEqual(@as(f64, 2), array.elements[0].number);
+                try std.testing.expectEqual(@as(f64, 4), array.elements[1].number);
+                try std.testing.expectEqual(@as(f64, 6), array.elements[2].number);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Regression: `для x в ... цикл` over a value implementing `Итерируемое`
+// stopped recognizing ANY implementor at all the moment the interface
+// gained a second method (`отобразить`/`отфильтровать`/`взять`/
+// `собрать`, all default methods) — `iterableForIn`/
+// `interfaceIterableElement` hardcoded "Итерируемое has exactly ONE
+// method" (`следующий`), and the compiled `call_interface` for the
+// `.interface`-dispatch path hardcoded `method_index = 0`. Both now
+// look `следующий` up by name/index instead of assuming array length 1.
+test "VM for-in still dispatches следующий() after Итерируемое gained default methods" {
+    const compiler_mod = @import("compiler.zig");
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const resolver_mod = @import("resolver.zig");
+    const type_checker = @import("type_checker.zig");
+    const source =
+        \\тип СчётчикДо = структура
+        \\    текущее: Число
+        \\    предел: Число
+        \\конец
+        \\реализация Итерируемое для СчётчикДо
+        \\    функ следующий(это: СчётчикДо) -> Опция(Число)
+        \\        если это.текущее >= это.предел тогда
+        \\            Опция.Нет()
+        \\        иначе
+        \\            это.текущее = это.текущее + 1.0
+        \\            Опция.Есть(это.текущее)
+        \\        конец
+        \\    конец
+        \\конец
+        \\экспорт функ старт() -> Число
+        \\    пер сч = СчётчикДо(0.0, 5.0)
+        \\    пер сумма = 0.0
+        \\    для x в сч цикл
+        \\        сумма = сумма + x
+        \\    конец
+        \\    сумма
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(std.testing.allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver_mod.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+    var compiled = try compiler_mod.compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+
+    var vm = Vm.init(std.testing.allocator, &compiled.program);
+    defer vm.deinit();
+    const start = findStartFunction(&resolved, &compiled) orelse return error.TestUnexpectedResult;
+    const outcome = try vm.run(start, &.{});
+    switch (outcome) {
+        .success => |runtime_value| switch (runtime_value) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 15), number),
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

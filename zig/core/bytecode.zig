@@ -382,6 +382,13 @@ pub const Function = struct {
     capture_count: u16 = 0,
     returns_value: bool = true,
     local_count: u16 = 0,
+    // Compiled from an interface's default-method body (`это: Интерфейс
+    // (...)` receiver) — `vm.zig`'s `callInterface` passes the BOXED
+    // `.interface` value as this-arg for these (so a default method's
+    // own `это.другой_метод()` calls can dispatch through the vtable),
+    // unlike an ordinary impl method, which gets the RAW underlying
+    // value (needs real field access on a concrete struct).
+    is_default_interface_method: bool = false,
     instructions: std.ArrayList(Instruction) = .empty,
     constants: std.ArrayList(Constant) = .empty,
 

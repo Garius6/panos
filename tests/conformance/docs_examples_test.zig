@@ -199,6 +199,12 @@ test "every runnable panos code block in docs/src compiles and runs cleanly" {
                 try appendFailure(allocator, &failures, "{s} block #{d}: load error {s}\n", .{ file_path, index + 1, @errorName(err) });
                 continue;
             };
+            // Real prelude module, matching `cli/main.zig`'s `main()` —
+            // this harness exists to mirror what `panos run` actually
+            // does, and that now loads the real Опция/Результат/
+            // interface declarations instead of the type-checker's
+            // hardcoded stand-ins.
+            _ = try graph.appendPreludeModule(panos.prelude.SOURCE);
             if (firstError(&graph.diagnostics)) |message| {
                 failure_count += 1;
                 try appendFailure(allocator, &failures, "{s} block #{d}: {s}\n", .{ file_path, index + 1, message });

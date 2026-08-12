@@ -21,6 +21,7 @@ pub const module_loader = @import("module_loader.zig");
 pub const module_linker = @import("module_linker.zig");
 pub const module_compiler = @import("module_compiler.zig");
 pub const parser = @import("parser.zig");
+pub const prelude = @import("prelude.zig");
 pub const resolver = @import("resolver.zig");
 pub const runner = @import("runner.zig");
 pub const semantic_tokens = @import("semantic_tokens.zig");

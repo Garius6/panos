@@ -106,6 +106,13 @@ const Compiler = struct {
                     const function = self.tree.decl(method).function;
                     try self.predeclareFunction(method, function.name, function.parameters.len);
                 },
+                .interface_decl => |interface| for (interface.default_methods) |method| {
+                    const function = self.tree.decl(method).function;
+                    try self.predeclareFunction(method, function.name, function.parameters.len);
+                    const symbol = self.resolution.decl_symbols.get(method) orelse continue;
+                    const function_id = self.result.function_ids.get(symbol) orelse continue;
+                    if (self.program().function(function_id)) |compiled| compiled.is_default_interface_method = true;
+                },
                 else => {},
             }
         }
@@ -154,6 +161,7 @@ const Compiler = struct {
             switch (self.tree.decl(declaration).*) {
                 .function => try self.compileFunction(declaration),
                 .impl => |implementation| for (implementation.methods) |method| try self.compileFunction(method),
+                .interface_decl => |interface| for (interface.default_methods) |method| try self.compileFunction(method),
                 else => {},
             }
         }
@@ -467,12 +475,40 @@ const FunctionCompiler = struct {
         var vtables: std.ArrayList([]const bytecode.FunctionId) = .empty;
         defer vtables.deinit(self.compiler.result.allocator);
         for (cast.entries) |entry| {
+            // Exact `.arguments` match first — for a NON-generic target,
+            // `implementation.arguments` are already concrete, and this
+            // is what correctly picks between TWO `реализация` blocks
+            // for the SAME (interface, target) at different arguments
+            // (e.g. `реализация Получатель(Число) для Пара` AND
+            // `реализация Получатель(Строка) для Пара` — a real, tested
+            // feature; matching by symbols alone would have silently
+            // picked whichever came first, regardless of which one the
+            // cast site actually asked for).
+            //
+            // Falls back to symbol-only (interface, target) matching
+            // ONLY when exact fails — covers a GENERIC target (`entry.
+            // arguments` are this cast's CONCRETE instantiation,
+            // `implementation.arguments` are still expressed over the
+            // target's OWN placeholders, e.g. `[U_of_Отображённый]` —
+            // never exact-equal to any concrete instantiation). Safe
+            // WITHOUT re-deriving the same substitution logic here: a
+            // generic target can only ever have ONE `реализация` block
+            // per interface (unlike the non-generic multi-arg case
+            // above — panos generics aren't parametrized enough to
+            // write two DIFFERENT bodies for two different
+            // instantiations of the same generic target), and
+            // type-checking (`registerInterfaceCast`, via `type_checker
+            // .findInterfaceImplementation`) already verified THIS
+            // SPECIFIC cast is sound before ever recording it here.
             const implementation = blk: {
                 for (self.compiler.checked.interface_implementations.items) |candidate| {
                     if (candidate.interface != entry.interface or candidate.target != entry.target or candidate.arguments.len != entry.arguments.len) continue;
                     for (candidate.arguments, entry.arguments) |actual, expected| {
                         if (!self.compiler.checked.types.eql(actual, expected)) break;
                     } else break :blk candidate;
+                }
+                for (self.compiler.checked.interface_implementations.items) |candidate| {
+                    if (candidate.interface == entry.interface and candidate.target == entry.target) break :blk candidate;
                 }
                 try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти реализацию интерфейса", .{});
                 return;
@@ -1818,7 +1854,7 @@ const FunctionCompiler = struct {
             .interface => {
                 try self.function.emit(self.compiler.result.allocator, .{ .get_local = iterable_slot });
                 try self.function.emit(self.compiler.result.allocator, .{ .call_interface = .{
-                    .method_index = 0,
+                    .method_index = info.next_method_index,
                     .argument_count = 0,
                 } });
             },

@@ -633,9 +633,13 @@ const Parser = struct {
         _ = try self.expect(.interface, "Синтаксическая ошибка: ожидается 'интерфейс'");
         var methods: std.ArrayList(ast.MethodSignature) = .empty;
         defer methods.deinit(self.result.allocator);
+        var default_methods: std.ArrayList(ast.DeclId) = .empty;
+        defer default_methods.deinit(self.result.allocator);
 
         while (!self.at(.end) and !self.at(.eof)) {
-            try methods.append(self.result.allocator, try self.parseMethodSignature());
+            const parsed = try self.parseInterfaceMethod();
+            try methods.append(self.result.allocator, parsed.signature);
+            if (parsed.default_decl) |decl| try default_methods.append(self.result.allocator, decl);
             self.consumeSemicolons();
         }
         const end = try self.expect(.end, "Синтаксическая ошибка: интерфейс не закрыт 'конец'");
@@ -645,22 +649,75 @@ const Parser = struct {
             .doc = try self.result.ast.copyText(doc),
             .type_parameters = type_parameters,
             .methods = try self.result.ast.copySlice(ast.MethodSignature, methods.items),
+            .default_methods = try self.result.ast.copySlice(ast.DeclId, default_methods.items),
             .is_exported = is_exported,
             .annotations = annotations,
         } });
     }
 
-    fn parseMethodSignature(self: *Parser) !ast.MethodSignature {
+    const InterfaceMethodParse = struct {
+        signature: ast.MethodSignature,
+        default_decl: ?ast.DeclId,
+    };
+
+    // A method WITHOUT a body — `функ имя(...) -> Тип`, immediately
+    // followed by `конец`/the next `функ` — parses exactly as before
+    // (abstract signature only, `parameters` excludes any receiver,
+    // matching every interface method ever written so far). A method
+    // WITH a body — the receiver `это: Интерфейс(...)` is written
+    // EXPLICITLY as `parameters[0]` (same convention as any ordinary
+    // `реализация`-block method), body parsed the same tail
+    // `parseFunction` uses — registered as a REAL `.function` decl
+    // (`default_decl`) so it reuses that machinery for typechecking/
+    // compiling wholesale, PLUS a receiver-stripped `MethodSignature`
+    // (`parameters[1..]`) so the abstract-shape bookkeeping (interface
+    // definitions, impl validation) doesn't need a second code path.
+    fn parseInterfaceMethod(self: *Parser) !InterfaceMethodParse {
         const start = try self.expect(.function, "Синтаксическая ошибка: в интерфейсе ожидается 'функ'");
-        const name = try self.expect(.ident, "Синтаксическая ошибка: после 'функ' ожидается имя метода");
+        const name_token = try self.expect(.ident, "Синтаксическая ошибка: после 'функ' ожидается имя метода");
+        const name = try self.result.ast.copyText(name_token.lexeme);
+        const type_parameters = try self.parseTypeParameters();
         const parameters = try self.parseParameterList();
         _ = try self.expect(.arrow, "Синтаксическая ошибка: после параметров ожидается '-> Тип'");
         const return_type = try self.parseType();
-        return .{
-            .span = spanFrom(start.span, self.astTypeSpan(return_type)),
-            .name = try self.result.ast.copyText(name.lexeme),
+        if (self.at(.end) or self.at(.function)) {
+            return .{
+                .signature = .{
+                    .span = spanFrom(start.span, self.astTypeSpan(return_type)),
+                    .name = name,
+                    .parameters = parameters,
+                    .return_type = return_type,
+                },
+                .default_decl = null,
+            };
+        }
+        var body: std.ArrayList(ast.StmtId) = .empty;
+        defer body.deinit(self.result.allocator);
+        while (!self.at(.end) and !self.at(.eof)) {
+            try body.append(self.result.allocator, try self.parseStatement());
+            self.consumeSemicolons();
+        }
+        const body_end = try self.expect(.end, "Синтаксическая ошибка: тело метода интерфейса не закрыто 'конец'");
+        const default_decl = try self.result.ast.addDecl(.{ .function = .{
+            .span = spanFrom(start.span, body_end.span),
+            .name = name,
+            .name_span = name_token.span,
+            .doc = "",
+            .type_parameters = type_parameters,
             .parameters = parameters,
             .return_type = return_type,
+            .body = try self.result.ast.copySlice(ast.StmtId, body.items),
+            .is_exported = false,
+        } });
+        const abstract_parameters = if (parameters.len == 0) parameters else parameters[1..];
+        return .{
+            .signature = .{
+                .span = spanFrom(start.span, self.astTypeSpan(return_type)),
+                .name = name,
+                .parameters = abstract_parameters,
+                .return_type = return_type,
+            },
+            .default_decl = default_decl,
         };
     }
 

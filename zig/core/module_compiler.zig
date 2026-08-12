@@ -5,6 +5,7 @@ const compiler = @import("compiler.zig");
 const diagnostic = @import("diagnostic.zig");
 const module_linker = @import("module_linker.zig");
 const module_loader = @import("module_loader.zig");
+const prelude = @import("prelude.zig");
 const resolver = @import("resolver.zig");
 const symbols = @import("symbols.zig");
 const target_policy = @import("target.zig");
@@ -81,12 +82,21 @@ const ImportContext = struct {
     impls: std.ArrayList(type_checker.ImportedImpl) = .empty,
     functions: std.ArrayList(compiler.ImportedFunction) = .empty,
     constants: std.ArrayList(compiler.ImportedConstant) = .empty,
+    // Each `ImportedNominal.default_method_symbols` (when non-null) is a
+    // fresh allocation `bridgeDefaultMethodSymbols` makes with
+    // `self.allocator` (not arena-owned like most of what `nominals`
+    // otherwise just BORROWS) — tracked here so `deinit` actually frees
+    // them instead of leaking one array per cross-module interface with
+    // default methods.
+    default_method_symbol_arrays: std.ArrayList([]const ?symbols.SymbolId) = .empty,
 
     fn init(allocator: std.mem.Allocator) ImportContext {
         return .{ .allocator = allocator };
     }
 
     fn deinit(self: *ImportContext) void {
+        for (self.default_method_symbol_arrays.items) |array| self.allocator.free(array);
+        self.default_method_symbol_arrays.deinit(self.allocator);
         self.constants.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.impls.deinit(self.allocator);
@@ -95,6 +105,49 @@ const ImportContext = struct {
         self.nominals.deinit(self.allocator);
         self.imported_types.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    // Mints a LOCAL synthetic symbol standing in for each default
+    // method a SOURCE interface declares (parallel to `methods`,
+    // `null` where that method has no default) — the SAME "synthetic
+    // symbol + `imports.functions` entry" pattern already used for
+    // inherent methods elsewhere in this file, just for a default
+    // method's compiled function instead. Returns `null` (no array at
+    // all) when the interface has no default methods, matching
+    // `ImportedNominal.interface_methods` itself staying `null` for a
+    // non-interface nominal.
+    fn bridgeDefaultMethodSymbols(self: *ImportContext, resolution: *resolver.Resolution, definition_compiled: *const compiler.CompileResult, methods: []const type_checker.InterfaceMethod) !?[]const ?symbols.SymbolId {
+        var any_default = false;
+        for (methods) |method| {
+            if (method.default_symbol != null) {
+                any_default = true;
+                break;
+            }
+        }
+        if (!any_default) return null;
+        const result = try self.allocator.alloc(?symbols.SymbolId, methods.len);
+        errdefer self.allocator.free(result);
+        for (methods, result) |method, *slot| {
+            const source_default = method.default_symbol orelse {
+                slot.* = null;
+                continue;
+            };
+            const function_id = definition_compiled.function_ids.get(source_default) orelse {
+                slot.* = null;
+                continue;
+            };
+            const local_symbol = try resolution.symbols.add(.{
+                .name = method.name,
+                .kind = .function,
+                .module_path = "@transitive",
+                .is_exported = true,
+                .span = .{ .file_id = 0, .start = 0, .end = 0 },
+            });
+            try self.functions.append(self.allocator, .{ .symbol = local_symbol, .function_id = function_id });
+            slot.* = local_symbol;
+        }
+        try self.default_method_symbol_arrays.append(self.allocator, result);
+        return result;
     }
 
     fn collect(
@@ -143,7 +196,7 @@ const ImportContext = struct {
 
             switch (exported.kind) {
                 .type => {
-                    const identity = try nominalIdentity(nominal_identities, next_nominal_identity, origin);
+                    const identity = if (isPreludeTypeName(exported.name)) 0 else try nominalIdentity(nominal_identities, next_nominal_identity, origin);
                     const enum_definition = target_checked.enum_definitions.get(target_symbol);
                     const generic_struct = target_checked.generic_nominal_fields.get(target_symbol);
                     const interface_definition = target_checked.interface_definitions.get(target_symbol);
@@ -158,6 +211,7 @@ const ImportContext = struct {
                     const fields = if (generic_struct) |value| value.fields else target_checked.nominal_fields.get(target_symbol);
                     const enum_variants = if (enum_definition) |value| value.variants else null;
                     const interface_methods = if (interface_definition) |value| value.methods else null;
+                    const default_method_symbols = if (interface_methods) |value| try self.bridgeDefaultMethodSymbols(resolution, target_compiled, value) else null;
                     try self.nominals.append(self.allocator, .{
                         .store = &target_checked.types,
                         .definition_store = &target_checked.types,
@@ -168,6 +222,7 @@ const ImportContext = struct {
                         .enum_variants = enum_variants,
                         .generic_parameters = generic_parameters,
                         .interface_methods = interface_methods,
+                        .default_method_symbols = default_method_symbols,
                     });
                     for (graph.impls.items) |impl_export| {
                         if (impl_export.module != origin.module or impl_export.owner_declaration != origin.declaration) continue;
@@ -250,13 +305,6 @@ const ImportContext = struct {
         // bound; otherwise an imported `[T: Сравниваемое]`, for example,
         // silently loses its bound because its source SymbolId cannot be
         // compared with the importer's local SymbolId.
-        const prelude_type_names = [_][]const u8{
-            "Результат",
-            "Опция",
-            "Сравниваемое",
-            "Итерируемое",
-            "Печатаемое",
-        };
         var touched = bridged_modules.keyIterator();
         while (touched.next()) |module_index_ptr| {
             const target = &modules[module_index_ptr.*];
@@ -265,6 +313,21 @@ const ImportContext = struct {
             for (prelude_type_names) |name| {
                 const source_symbol = findLocalTypeSymbol(target_resolution, name) orelse continue;
                 const local_symbol = findLocalTypeSymbol(resolution, name) orelse continue;
+                // Identity-only, deliberately — a full-data entry (like
+                // the ordinary cross-module `.type` case above) would
+                // DUPLICATE registration: once a real prelude module is
+                // in the graph, THIS module's own copy of `Опция`/
+                // `Сравниваемое`/... already flows in fully populated
+                // through the ordinary `resolution.imported_symbols`
+                // loop above (they're unqualified-imported from the
+                // prelude module, same as any real `импорт`) — a SECOND
+                // full entry for the same `local_symbol` here would
+                // `owner_remaps.put` over the first one and leak it
+                // (confirmed via a real leak-checked test before this
+                // comment was written). This loop exists ONLY to align
+                // a THIRD module's (`target`'s) own separate copy with
+                // this one for signature/bound comparisons — pure
+                // identity, no data.
                 try self.nominals.append(self.allocator, .{
                     .store = &target_checked.types,
                     .definition_store = &target_checked.types,
@@ -286,29 +349,29 @@ const ImportContext = struct {
             const imported = self.nominals.items[nominal_index];
             if (imported.fields) |fields| {
                 for (fields) |field| {
-                    try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.definition_store, field.typ);
+                    try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, imported.definition_store, field.typ);
                 }
             }
             if (imported.enum_variants) |variants| {
                 for (variants) |variant| {
                     for (variant.fields) |field| {
-                        try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.definition_store, field);
+                        try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, imported.definition_store, field);
                     }
                 }
             }
             if (imported.interface_methods) |methods| {
                 for (methods) |method| {
                     for (method.parameters) |parameter| {
-                        try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.definition_store, parameter);
+                        try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, imported.definition_store, parameter);
                     }
-                    try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.definition_store, method.return_type);
+                    try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, imported.definition_store, method.return_type);
                 }
             }
         }
         var imported_type_index: usize = 0;
         while (imported_type_index < self.imported_types.items.len) : (imported_type_index += 1) {
             const imported = self.imported_types.items[imported_type_index];
-            try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, imported.store, imported.type_id);
+            try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, imported.store, imported.type_id);
         }
         // Index-based, re-reading `self.methods.items` fresh each
         // iteration — NOT `for (self.methods.items) |method|`, which
@@ -325,7 +388,7 @@ const ImportContext = struct {
         var method_index: usize = 0;
         while (method_index < self.methods.items.len) : (method_index += 1) {
             const method = self.methods.items[method_index];
-            try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, method.store, method.type_id);
+            try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, method.store, method.type_id);
         }
     }
 
@@ -335,18 +398,19 @@ const ImportContext = struct {
         modules: []const ModuleCompilation,
         nominal_identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
         next_nominal_identity: *u32,
+        graph: *const module_loader.Graph,
         external_store: *const types.TypeStore,
         external_type: types.TypeId,
     ) !void {
         const entry = external_store.get(external_type) orelse return error.InvalidImportedType;
         switch (entry.*) {
-            .tuple => |elements| for (elements) |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, element),
+            .tuple => |elements| for (elements) |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, element),
             .function => |function| {
-                for (function.parameters) |parameter| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, parameter);
-                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, function.return_type);
+                for (function.parameters) |parameter| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, parameter);
+                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, function.return_type);
             },
             .nominal => |nominal| {
-                for (nominal.arguments) |argument| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, argument);
+                for (nominal.arguments) |argument| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, argument);
                 for (self.nominals.items) |known| {
                     if (known.store == external_store and known.source_symbol == nominal.symbol) return;
                 }
@@ -396,6 +460,8 @@ const ImportContext = struct {
                     (if (value.parameters.len != 0) value.parameters else null)
                 else
                     null;
+                const transitive_interface_methods = if (interface_definition) |value| value.methods else null;
+                const transitive_default_method_symbols = if (transitive_interface_methods) |value| try self.bridgeDefaultMethodSymbols(resolution, definition_compiled, value) else null;
                 try self.nominals.append(self.allocator, .{
                     .store = external_store,
                     .definition_store = &definition_checked.types,
@@ -405,8 +471,40 @@ const ImportContext = struct {
                     .fields = if (generic_struct) |value| value.fields else definition_checked.nominal_fields.get(definition_symbol),
                     .enum_variants = if (enum_definition) |value| value.variants else null,
                     .generic_parameters = generic_parameters,
-                    .interface_methods = if (interface_definition) |value| value.methods else null,
+                    .interface_methods = transitive_interface_methods,
+                    .default_method_symbols = transitive_default_method_symbols,
                 });
+                // Same bridging the direct-import loop above does for a
+                // symbol reached via `resolution.imported_symbols` — a
+                // nominal reached ONLY transitively (through another
+                // function's signature, never named/imported directly)
+                // previously got its STRUCTURAL shape re-hosted (fields/
+                // methods, just above) but never its INTERFACE
+                // IMPLEMENTATIONS, since this whole `.nominal` case never
+                // consulted `graph.impls` at all. Real gap found via
+                // `коллекции.итератор(x)` (a prelude function returning
+                // `МассивИтератор(T)`, itself only prelude-declared,
+                // reachable ONLY through that return type from a
+                // consuming module that never names `МассивИтератор`
+                // anywhere) — its interface DEFAULT METHOD dispatch
+                // (`inferDefaultInterfaceMethodCall`) had nothing to find
+                // in the consuming module's OWN `interface_implementations`.
+                for (graph.impls.items) |impl_export| {
+                    if (impl_export.module != origin.module or impl_export.owner_declaration != origin.declaration) continue;
+                    for (definition_checked.interface_implementations.items) |implementation| {
+                        if (implementation.target != definition_symbol) continue;
+                        const interface_symbol = definition_resolution.symbols.get(implementation.interface) orelse continue;
+                        if (!std.mem.eql(u8, interface_symbol.name, impl_export.interface_name)) continue;
+                        try self.impls.append(self.allocator, .{
+                            .owner = local_symbol,
+                            .interface_name = impl_export.interface_name,
+                            .method_symbols = implementation.methods,
+                            .target_resolution = definition_resolution,
+                            .store = &definition_checked.types,
+                            .argument_type_ids = implementation.arguments,
+                        });
+                    }
+                }
                 // The source resolver never created a binding for this
                 // method in the importing module, so create one alongside
                 // the synthetic owner.  The compiler then links it to the
@@ -434,13 +532,13 @@ const ImportContext = struct {
                     try self.functions.append(self.allocator, .{ .symbol = local_method, .function_id = function_id });
                 }
             },
-            .array => |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, element),
+            .array => |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, element),
             .map => |map| {
-                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, map.key);
-                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, map.value);
+                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, map.key);
+                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, map.value);
             },
-            .process => |message| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, message),
-            .pointer => |pointee| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, external_store, pointee),
+            .process => |message| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, message),
+            .pointer => |pointee| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, pointee),
             else => {},
         }
     }
@@ -470,6 +568,42 @@ fn findLocalTypeSymbol(resolution: *const resolver.Resolution, name: []const u8)
         }
     }
     return null;
+}
+
+// `Опция`/`Результат`/6 interfaces — there is only ever ONE real
+// declaration (`prelude.zig`), unqualified-merged into every module, so
+// unlike an ordinary cross-module struct/enum (where two SEPARATELY
+// declared same-named types must NOT be conflated), any two
+// reconstructions of one of these must always compare equal. Used at
+// TWO sites: (1) `nominalIdentity`'s call site below — forces identity
+// 0 (matching how a module's own DIRECT, local use of e.g. `Опция
+// (Число)` already gets identity 0, never touching `nominalIdentity`
+// at all) instead of minting a fresh nonzero cross-module identity;
+// (2) the prelude-bridge loop, aligning a THIRD module's own copy.
+// Real gap found only once a real prelude module was actually
+// exercised for the first time: `реализация Итерируемое для X`, where
+// `следующий() -> Опция(T)` gets reconstructed via `copyImportedType`
+// (needs `Опция`'s bridge identity) while `Опция(Число)` used directly
+// in the SAME file never goes through that path at all (identity 0,
+// default) — a mismatched identity made `TypeStore.eql` treat them as
+// different types even though the symbol matched.
+const prelude_type_names = [_][]const u8{
+    "Результат",
+    "Опция",
+    "Сравниваемое",
+    "Итерируемое",
+    "Печатаемое",
+    "Копируемое",
+    "Равнозначное",
+    "Складываемое",
+    "Вычитаемое",
+    "Умножаемое",
+    "Делимое",
+};
+
+fn isPreludeTypeName(name: []const u8) bool {
+    for (prelude_type_names) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
+    return false;
 }
 
 fn nominalIdentity(
@@ -526,6 +660,7 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
             .nominals = imports.nominals.items,
             .methods = imports.methods.items,
             .impls = imports.impls.items,
+            .has_real_prelude = prelude_module != null,
         }, target_profile);
         const checked = &result.modules[module_index].checked.?;
         try result.appendDiagnostics(&checked.diagnostics);
@@ -1273,6 +1408,86 @@ test "module compiler imports a function combining a transitive nominal with a l
     switch (try machine.run(start, &.{})) {
         .success => |result| switch (result) {
             .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Real `panos run` (`cli/main.zig`'s `main`) now loads the REAL prelude
+// module (`graph.appendPreludeModule(prelude.SOURCE)`) instead of relying
+// on `type_checker.zig`'s hardcoded Опция/Результат/interface stand-ins
+// — this is the graph-pipeline equivalent of what `runner.zig`'s single-
+// file pipeline already did. Covers: `Опция` methods (`.получить`) work
+// through the real prelude module, AND a cross-module `импорт` + `<`
+// through `Сравниваемое` still works with the real prelude module in the
+// graph (this exact path leaked — a duplicate `ImportedNominal` entry
+// for the prelude's own generic types orphaned an owner_remap — before
+// the prelude-bridge loop in `ImportContext.collect` was fixed back to
+// identity-only).
+test "module compiler works end to end with a real prelude module in the graph" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер o: Опция(Число) = Опция.Есть(42.0)\nпер cmp = точки.Точка(1.0) < точки.Точка(2.0)\nвыбор cmp\nистина -> o.получить(0.0)\nложь -> -1.0\nконец\nконец" },
+        .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец\nреализация Сравниваемое для Точка\nфунк сравнить(это: Точка, другое: Точка) -> Число\nэто.x - другое.x\nконец\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+    _ = try graph.appendPreludeModule(prelude.SOURCE);
+    try std.testing.expectEqual(@as(usize, 0), graph.diagnostics.items.items.len);
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Regression: a default method on `Итерируемое` (prelude) dispatched
+// from a DIFFERENT module than where the concrete implementing type is
+// declared, reached ONLY transitively (through a function's return
+// type, never named/imported directly) — real gap found via
+// `итератор(массив).отфильтровать(...).отобразить(...).взять(...)
+// .собрать()`: `собрать`'s `default_symbol` (a symbol in the PRELUDE
+// module's own symbol space) was meaningless in the consuming module,
+// and `collectTransitiveNominals` never bridged interface
+// IMPLEMENTATIONS for a transitively-reached nominal at all (only its
+// structural shape) — `ImportedNominal.default_method_symbols` +
+// `bridgeDefaultMethodSymbols` (mint a local synthetic symbol per
+// default method, same pattern already used for inherent methods) fix
+// both halves.
+test "module compiler dispatches a chain of interface default methods across a module boundary" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "экспорт функ старт() -> Массив(Число)\nпер числа = массив(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)\nитератор(числа).отфильтровать(функ(x: Число) -> Булево\nx > 2.0\nконец).отобразить(функ(x: Число) -> Число\nx * 10.0\nконец).взять(3).собрать()\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+    _ = try graph.appendPreludeModule(prelude.SOURCE);
+    try std.testing.expectEqual(@as(usize, 0), graph.diagnostics.items.items.len);
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .array => |array| {
+                try std.testing.expectEqual(@as(usize, 3), array.elements.len);
+                try std.testing.expectEqual(@as(f64, 30), array.elements[0].number);
+                try std.testing.expectEqual(@as(f64, 40), array.elements[1].number);
+                try std.testing.expectEqual(@as(f64, 50), array.elements[2].number);
+            },
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

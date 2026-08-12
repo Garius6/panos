@@ -175,6 +175,7 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
     } else |_| {}
     graph.global_search_roots = global_search_roots.items;
     try graph.load(&FileReader{ .io = init.io }, input);
+    _ = try graph.appendPreludeModule(panos_core.prelude.SOURCE);
     if (graph.diagnostics.items.items.len != 0) {
         try writeModuleDiagnostics(stderr, &graph);
         if (hasErrors(&graph.diagnostics)) {
@@ -318,6 +319,13 @@ pub fn main(init: std.process.Init) !void {
     }
     graph.global_search_roots = global_search_roots.items;
     try graph.load(&FileReader{ .io = init.io }, file_path);
+    // Real prelude module (same as runner.zig's single-file pipeline and
+    // the LSP already do) instead of the type-checker's hardcoded
+    // Опция/Результат/interface stand-ins — `module_compiler.zig`'s
+    // `ImportContext.collect` bridges its real definitions into every
+    // other module, `preludePass` (`type_checker.zig`) skips its own
+    // hardcode once it detects this.
+    _ = try graph.appendPreludeModule(panos_core.prelude.SOURCE);
     if (graph.diagnostics.items.items.len != 0) {
         try writeModuleDiagnostics(stderr, &graph);
         if (hasErrors(&graph.diagnostics)) {

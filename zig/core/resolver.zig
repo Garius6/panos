@@ -732,6 +732,10 @@ const Resolver = struct {
                 },
                 .interface_decl => |value| {
                     _ = try self.registerDeclaration(declaration, value.name, .type, value.span, value.is_exported, false);
+                    for (value.default_methods) |method| {
+                        const function = tree.decl(method).function;
+                        _ = try self.registerMethod(method, function.name, function.span);
+                    }
                 },
                 .type_alias => |value| {
                     _ = try self.registerDeclaration(declaration, value.name, .type, value.span, value.is_exported, false);
@@ -1015,7 +1019,11 @@ const Resolver = struct {
                     const function = tree.decl(method).function;
                     try self.resolveFunction(method, function.parameters, function.body);
                 },
-                .import, .struct_decl, .interface_decl, .enum_decl, .foreign, .type_alias, .error_node => {},
+                .interface_decl => |value| for (value.default_methods) |method| {
+                    const function = tree.decl(method).function;
+                    try self.resolveFunction(method, function.parameters, function.body);
+                },
+                .import, .struct_decl, .enum_decl, .foreign, .type_alias, .error_node => {},
             }
         }
     }

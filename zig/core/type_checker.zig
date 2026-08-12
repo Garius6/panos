@@ -38,6 +38,10 @@ pub const InterfaceMethod = struct {
     name: []const u8,
     parameters: []const types.TypeId,
     return_type: types.TypeId,
+    // Non-null when this method has a default body (`interfacePass`) —
+    // the compiled function an implementor falls back to when it
+    // doesn't override this method itself (`defineInterfaceImplementation`).
+    default_symbol: ?symbols.SymbolId = null,
 };
 
 pub const InterfaceDefinition = struct {
@@ -127,6 +131,16 @@ pub const ImportedNominal = struct {
     // THIRD module implement/bound-check against an interface it never
     // declared itself (`реализация чужой_модуль.Интерфейс для Тип`).
     interface_methods: ?[]const InterfaceMethod = null,
+    // Parallel to `interface_methods` (same length) — the LOCAL (this
+    // module's own) synthetic symbol standing in for
+    // `interface_methods[i]`'s default-method body, or `null` if that
+    // method has no default. `interface_methods[i].default_symbol`
+    // itself is a symbol in the SOURCE module's own symbol space,
+    // meaningless here — `module_compiler.zig` mints a real local
+    // stand-in (same "synthetic symbol + imports.functions" pattern
+    // already used for inherent methods) and threads it through here,
+    // since only it has a mutable `resolver.Resolution` to mint into.
+    default_method_symbols: ?[]const ?symbols.SymbolId = null,
 };
 
 pub const ImportedMethod = struct {
@@ -163,6 +177,16 @@ pub const ImportContext = struct {
     nominals: []const ImportedNominal = &.{},
     methods: []const ImportedMethod = &.{},
     impls: []const ImportedImpl = &.{},
+    // True when a real prelude module (`module_loader.Graph.
+    // appendPreludeModule`) is present in the graph — `preludePass`
+    // skips its own hardcoded Опция/Результат/interface stand-ins in
+    // that case (this module's own `interfacePass`/`enumPass` handle it
+    // directly if IT is the prelude module; every other module gets the
+    // real definitions bridged in via `nominals`/`importIdentityPass`).
+    // Defaults false — every EXISTING caller (inline single-source
+    // tests, any graph built without `appendPreludeModule`) keeps
+    // exactly its previous behavior.
+    has_real_prelude: bool = false,
 };
 
 pub const IteratorDispatch = enum {
@@ -174,6 +198,14 @@ pub const ForInInfo = struct {
     kind: ForInKind,
     iterator_dispatch: IteratorDispatch = .direct,
     next_method: symbols.SymbolId = symbols.invalid_symbol,
+    // `следующий`'s position within the interface's OWN vtable — used
+    // only by `.iterator_dispatch = .interface`. Was hardcoded `0`
+    // (compiler.zig) on the assumption `следующий` is Итерируемое's
+    // ONLY method; still true by declaration order today (`prelude.
+    // zig`'s `следующий` comes first), but no longer guaranteed once
+    // Итерируемое gained default methods — computed properly instead of
+    // relying on that coincidence.
+    next_method_index: u16 = 0,
 };
 
 pub const MethodDefinition = struct {
@@ -297,6 +329,125 @@ pub const CheckResult = struct {
     }
 };
 
+pub fn nominalParametersOf(checked: *const CheckResult, symbol: symbols.SymbolId) []const GenericParameter {
+    if (checked.generic_nominal_fields.get(symbol)) |nominal| return nominal.parameters;
+    if (checked.enum_definitions.get(symbol)) |enumeration| return enumeration.parameters;
+    if (checked.interface_definitions.get(symbol)) |interface| return interface.parameters;
+    return &.{};
+}
+
+const generic_substitution_pair_limit = 8;
+const GenericSubstitutionPair = struct { placeholder: types.TypeId, concrete: types.TypeId };
+
+// `target_arguments` — the ACTUAL/instantiated generic arguments of
+// `target` at THIS call site (e.g. `Отображённый(Число, Строка)`'s
+// `[Число, Строка]`), separate from a candidate `InterfaceImplementation.
+// arguments` (an EXPRESSION over `target`'s OWN declared placeholders,
+// e.g. `[U_of_Отображённый]` for `реализация Итерируемое для
+// Отображённый`, since Отображённый's OWN `U` is what unified against
+// Итерируемое's `T`). Real gap found building a generic wrapper struct
+// implementing a generic interface polymorphically: the OLD exact-`eql`
+// match compared DIFFERENT TypeIds that only happen to be semantically
+// the same AFTER substitution — always failed for any generic struct/
+// generic interface pairing. Fast path (exact match) stays first —
+// covers the overwhelmingly common non-generic case (INCLUDING a
+// non-generic target implementing the SAME interface at several
+// different concrete argument sets, e.g. `реализация Получатель(Число)`
+// AND `реализация Получатель(Строка)` for the same struct — a real,
+// separately-tested feature dropping the arguments check entirely would
+// have broken) without the extra work; the substitution fallback only
+// runs when the target itself is generic and the exact match fails.
+// A free function (not a `Checker` method) so `compiler.zig`'s vtable
+// resolution — which only has a `*const CheckResult`, not a full
+// `Checker` — can reuse the SAME matching instead of a second,
+// independently-drifting copy.
+pub fn findInterfaceImplementation(checked: *const CheckResult, interface: symbols.SymbolId, arguments: []const types.TypeId, target: symbols.SymbolId, target_arguments: []const types.TypeId) ?InterfaceImplementation {
+    for (checked.interface_implementations.items) |implementation| {
+        if (implementation.interface != interface or implementation.target != target or implementation.arguments.len != arguments.len) continue;
+        var exact = true;
+        for (implementation.arguments, arguments) |actual, expected| {
+            if (!checked.types.eql(actual, expected)) {
+                exact = false;
+                break;
+            }
+        }
+        if (exact) return implementation;
+        const target_params = nominalParametersOf(checked, target);
+        if (target_params.len != target_arguments.len or target_params.len > generic_substitution_pair_limit) continue;
+        var buffer: [generic_substitution_pair_limit]GenericSubstitutionPair = undefined;
+        for (target_params, target_arguments, 0..) |param, concrete, i| buffer[i] = .{ .placeholder = param.typ, .concrete = concrete };
+        const pairs = buffer[0..target_params.len];
+        var matches_generically = true;
+        for (implementation.arguments, arguments) |pattern, expected| {
+            if (!matchesGenericPatternOf(checked, pattern, expected, pairs)) {
+                matches_generically = false;
+                break;
+            }
+        }
+        if (matches_generically) return implementation;
+    }
+    return null;
+}
+
+// Structural "does `pattern` (an expression over `pairs`' placeholder
+// TypeIds) match `concrete` once those placeholders are substituted" —
+// a non-allocating twin of `substituteGeneric` + `TypeStore.eql`
+// combined, deliberately NOT calling `substituteGeneric` itself (which
+// needs a mutable `*Checker`, `!types.TypeId`, and a heap-backed
+// `AutoHashMap` — would have forced `assignable`, one of the most-called
+// functions in this file, to become fallible/mutable-self, a large
+// ripple affecting dozens of call sites for a check that only needs a
+// yes/no answer).
+fn matchesGenericPatternOf(checked: *const CheckResult, pattern: types.TypeId, concrete: types.TypeId, pairs: []const GenericSubstitutionPair) bool {
+    const pattern_entry = checked.types.get(pattern) orelse return false;
+    if (pattern_entry.* == .generic_parameter) {
+        for (pairs) |pair| {
+            if (pair.placeholder.eql(pattern)) return checked.types.eql(pair.concrete, concrete);
+        }
+        return checked.types.eql(pattern, concrete);
+    }
+    const concrete_entry = checked.types.get(concrete) orelse return false;
+    return switch (pattern_entry.*) {
+        .tuple => |elements| switch (concrete_entry.*) {
+            .tuple => |concrete_elements| matchesGenericPatternSlicesOf(checked, elements, concrete_elements, pairs),
+            else => false,
+        },
+        .array => |element| switch (concrete_entry.*) {
+            .array => |concrete_element| matchesGenericPatternOf(checked, element, concrete_element, pairs),
+            else => false,
+        },
+        .map => |map| switch (concrete_entry.*) {
+            .map => |concrete_map| matchesGenericPatternOf(checked, map.key, concrete_map.key, pairs) and matchesGenericPatternOf(checked, map.value, concrete_map.value, pairs),
+            else => false,
+        },
+        .function => |function| switch (concrete_entry.*) {
+            .function => |concrete_function| matchesGenericPatternSlicesOf(checked, function.parameters, concrete_function.parameters, pairs) and matchesGenericPatternOf(checked, function.return_type, concrete_function.return_type, pairs),
+            else => false,
+        },
+        .nominal => |nominal| switch (concrete_entry.*) {
+            .nominal => |concrete_nominal| nominal.symbol == concrete_nominal.symbol and matchesGenericPatternSlicesOf(checked, nominal.arguments, concrete_nominal.arguments, pairs),
+            else => false,
+        },
+        .process => |message| switch (concrete_entry.*) {
+            .process => |concrete_message| matchesGenericPatternOf(checked, message, concrete_message, pairs),
+            else => false,
+        },
+        .pointer => |pointee| switch (concrete_entry.*) {
+            .pointer => |concrete_pointee| matchesGenericPatternOf(checked, pointee, concrete_pointee, pairs),
+            else => false,
+        },
+        else => checked.types.eql(pattern, concrete),
+    };
+}
+
+fn matchesGenericPatternSlicesOf(checked: *const CheckResult, patterns: []const types.TypeId, concretes: []const types.TypeId, pairs: []const GenericSubstitutionPair) bool {
+    if (patterns.len != concretes.len) return false;
+    for (patterns, concretes) |pattern, concrete| {
+        if (!matchesGenericPatternOf(checked, pattern, concrete, pairs)) return false;
+    }
+    return true;
+}
+
 const Checker = struct {
     tree: *const ast.Ast,
     resolution: *const resolver.Resolution,
@@ -308,6 +459,7 @@ const Checker = struct {
     next_generic_parameter: u32 = 1,
     target_profile: target_policy.TargetProfile,
     resolving_aliases: std.AutoHashMap(symbols.SymbolId, void),
+    has_real_prelude: bool = false,
 
     fn report(self: *Checker, span: source.Span, comptime format: []const u8, args: anytype) !void {
         const message = try std.fmt.allocPrint(self.result.arena.allocator(), format, args);
@@ -412,7 +564,7 @@ const Checker = struct {
                 var methods: std.ArrayList(InterfaceMethod) = .empty;
                 defer methods.deinit(self.result.allocator);
                 var unsupported = false;
-                for (source_methods) |source_method| {
+                for (source_methods, 0..) |source_method, method_index| {
                     var parameters: std.ArrayList(types.TypeId) = .empty;
                     defer parameters.deinit(self.result.allocator);
                     for (source_method.parameters) |parameter| {
@@ -433,10 +585,12 @@ const Checker = struct {
                         },
                         else => return err,
                     };
+                    const default_symbol = if (imported.default_method_symbols) |defaults| defaults[method_index] else null;
                     try methods.append(self.result.allocator, .{
                         .name = try self.result.arena.allocator().dupe(u8, source_method.name),
                         .parameters = try self.result.arena.allocator().dupe(types.TypeId, parameters.items),
                         .return_type = return_type,
+                        .default_symbol = default_symbol,
                     });
                 }
                 if (!unsupported) {
@@ -636,10 +790,31 @@ const Checker = struct {
             if (unsupported) continue;
             var methods: std.ArrayList(symbols.SymbolId) = .empty;
             defer methods.deinit(self.result.allocator);
+            const local_definition = self.result.interface_definitions.get(interface_symbol);
             for (imported.method_symbols) |source_method_symbol| {
                 const source_method = imported.target_resolution.symbols.get(source_method_symbol) orelse continue;
-                const method = self.inherentMethod(imported.owner, source_method.name) orelse continue;
-                try methods.append(self.result.allocator, method.symbol);
+                if (self.inherentMethod(imported.owner, source_method.name)) |method| {
+                    try methods.append(self.result.allocator, method.symbol);
+                    continue;
+                }
+                // Not an override — `source_method_symbol` is a DEFAULT
+                // method's symbol (from the SOURCE module's own symbol
+                // space, meaningless here). Fall back to THIS module's
+                // own (already correctly-bridged, see
+                // `default_method_symbols`) copy of the SAME interface's
+                // default for a method by this name — real gap found
+                // via `коллекции.итератор(x).собрать()`: every method a
+                // struct DOESN'T override used to make this whole impl
+                // silently vanish (`methods.items.len !=
+                // imported.method_symbols.len` below, ALWAYS true once
+                // even one default went unmatched).
+                if (local_definition) |definition| {
+                    if (self.interfaceMethod(definition, source_method.name)) |interface_method| {
+                        if (interface_method.default_symbol) |default_symbol| {
+                            try methods.append(self.result.allocator, default_symbol);
+                        }
+                    }
+                }
             }
             if (methods.items.len != imported.method_symbols.len) continue;
             try self.result.interface_implementations.append(self.result.allocator, .{
@@ -844,16 +1019,59 @@ const Checker = struct {
             const previous_generic_parameters = self.current_generic_parameters;
             self.current_generic_parameters = parameters;
             defer self.current_generic_parameters = previous_generic_parameters;
+            var owner_arguments: std.ArrayList(types.TypeId) = .empty;
+            defer owner_arguments.deinit(self.result.allocator);
+            for (parameters) |parameter| try owner_arguments.append(self.result.allocator, parameter.typ);
+            const receiver = try self.result.types.nominal(symbol, owner_arguments.items);
             var methods: std.ArrayList(InterfaceMethod) = .empty;
             defer methods.deinit(self.result.allocator);
             for (interface.methods) |method| {
+                const default_decl = self.findDefaultMethodDecl(interface.default_methods, method.name);
+                var default_symbol: ?symbols.SymbolId = null;
+                // A default method's OWN type parameters (`отобразить[U]
+                // (...)`) must be in scope BEFORE resolving anything —
+                // including the ABSTRACT signature's `method.parameters`/
+                // `.return_type` below, which reference the SAME `U`.
+                // Real bug found via a generic combinator: resolving the
+                // abstract shape first (before this scope existed) gave
+                // "неизвестный тип 'U'".
+                var method_scope = parameters;
+                if (default_decl) |decl| {
+                    const function = self.tree.decl(decl).function;
+                    default_symbol = self.resolution.decl_symbols.get(decl);
+                    if (default_symbol) |sym| {
+                        const method_own = try self.defineGenericParameters(sym, function.type_parameters);
+                        if (method_own.len != 0) {
+                            var combined: std.ArrayList(GenericParameter) = .empty;
+                            defer combined.deinit(self.result.allocator);
+                            try combined.appendSlice(self.result.allocator, parameters);
+                            try combined.appendSlice(self.result.allocator, method_own);
+                            method_scope = try self.result.arena.allocator().dupe(GenericParameter, combined.items);
+                        }
+                    }
+                }
+                const previous_method_scope = self.current_generic_parameters;
+                self.current_generic_parameters = method_scope;
+                defer self.current_generic_parameters = previous_method_scope;
+
                 var method_parameters: std.ArrayList(types.TypeId) = .empty;
                 defer method_parameters.deinit(self.result.allocator);
                 for (method.parameters) |parameter| try method_parameters.append(self.result.allocator, try self.resolveType(parameter.type_annotation.?));
+                const return_type = try self.resolveType(method.return_type);
+                if (default_decl) |decl| {
+                    const function = self.tree.decl(decl).function;
+                    try self.defineMethodSignature(decl, symbol, symbol, parameters, function.type_parameters, function.parameters, function.return_type);
+                    if (function.parameters.len == 0 or !std.mem.eql(u8, function.parameters[0].name, "это")) {
+                        try self.report(function.span, "Type Error: первый параметр default-метода должен называться 'это'", .{});
+                    } else if (!self.result.types.eql(try self.resolveType(function.parameters[0].type_annotation.?), receiver)) {
+                        try self.report(function.span, "Type Error: получатель default-метода должен иметь тип реализуемого интерфейса", .{});
+                    }
+                }
                 try methods.append(self.result.allocator, .{
                     .name = method.name,
                     .parameters = try self.result.arena.allocator().dupe(types.TypeId, method_parameters.items),
-                    .return_type = try self.resolveType(method.return_type),
+                    .return_type = return_type,
+                    .default_symbol = default_symbol,
                 });
             }
             try self.result.interface_definitions.put(symbol, .{
@@ -863,7 +1081,26 @@ const Checker = struct {
         }
     }
 
+    fn findDefaultMethodDecl(self: *const Checker, default_methods: []const ast.DeclId, name: []const u8) ?ast.DeclId {
+        for (default_methods) |decl| {
+            if (std.mem.eql(u8, self.tree.decl(decl).function.name, name)) return decl;
+        }
+        return null;
+    }
+
     fn preludePass(self: *Checker) !void {
+        // A real prelude module is in the graph (`appendPreludeModule`)
+        // — either THIS module IS the prelude module (its own
+        // `enumPass`/`interfacePass` handle its real `тип Опция[T] =
+        // перечисление ...`/`тип Сравниваемое = интерфейс ...`
+        // declarations directly, from its own AST), or it imports from
+        // one (`module_compiler.zig`'s prelude bridge feeds the real
+        // definitions in through `imports.nominals`/`importIdentityPass`
+        // instead). Either way, the hardcoded stand-ins below would be
+        // redundant at best — and, once default methods exist on
+        // interfaces, WRONG (they know nothing about a default method's
+        // body, only the abstract signature).
+        if (self.has_real_prelude) return;
         const option_symbol = self.findTypeSymbol("Опция") orelse return;
         const result_symbol = self.findTypeSymbol("Результат") orelse return;
         const comparable_symbol = self.findTypeSymbol("Сравниваемое") orelse return;
@@ -1244,6 +1481,14 @@ const Checker = struct {
                 matched = method;
             }
             const method = matched orelse {
+                if (interface_method.default_symbol) |default_symbol| {
+                    // Not overridden — falls back to the interface's own
+                    // default-method body, already fully type-checked
+                    // once at its own declaration site (`interfacePass`);
+                    // no signature re-validation needed here.
+                    try implementation_methods.append(self.result.allocator, default_symbol);
+                    continue;
+                }
                 try self.report(implementation.span, "Type Error: в реализации отсутствует метод '{s}'", .{interface_method.name});
                 valid = false;
                 continue;
@@ -1326,16 +1571,40 @@ const Checker = struct {
             return true;
         }
         for (function.parameters[1..], interface_method.parameters) |parameter, expected| {
-            if (!self.result.types.eql(parameter, try self.substituteGeneric(expected, substitutions))) {
+            if (!try self.matchesInterfaceMethodType(interface, receiver, parameter, expected, substitutions)) {
                 try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: сигнатура метода не совпадает с интерфейсом", .{});
                 return false;
             }
         }
-        if (!self.result.types.eql(function.return_type, try self.substituteGeneric(interface_method.return_type, substitutions))) {
+        if (!try self.matchesInterfaceMethodType(interface, receiver, function.return_type, interface_method.return_type, substitutions)) {
             try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: сигнатура метода не совпадает с интерфейсом", .{});
             return false;
         }
         return true;
+    }
+
+    // A REAL interface declaration (`prelude.zig`'s embedded source, or
+    // any user `тип X = интерфейс ... конец`) writes "Self" simply as
+    // the interface's OWN name — `равно(другое: Равнозначное) ->
+    // Булево`, not a synthesized generic placeholder (that placeholder
+    // trick only exists in the now-mostly-dead hardcoded
+    // `preludePass` stand-ins). A literal self-reference isn't a
+    // `.generic_parameter`, so `substituteGeneric` leaves it untouched
+    // and a plain `eql` against the impl's concrete parameter type
+    // always failed — real gap found only once the real prelude module
+    // path was exercised for the first time (`Равнозначное`/
+    // `Складываемое`/... have no `isComparableInterface`-style bypass).
+    fn isSelfReference(self: *const Checker, interface: symbols.SymbolId, type_id: types.TypeId) bool {
+        const entry = self.result.types.get(type_id) orelse return false;
+        return switch (entry.*) {
+            .nominal => |nominal| nominal.symbol == interface,
+            else => false,
+        };
+    }
+
+    fn matchesInterfaceMethodType(self: *Checker, interface: symbols.SymbolId, receiver: types.TypeId, actual: types.TypeId, expected: types.TypeId, substitutions: *const std.AutoHashMap(types.TypeId, types.TypeId)) !bool {
+        if (self.isSelfReference(interface, expected)) return self.result.types.eql(actual, receiver);
+        return self.result.types.eql(actual, try self.substituteGeneric(expected, substitutions));
     }
 
     fn bodyPass(self: *Checker) !void {
@@ -1345,6 +1614,9 @@ const Checker = struct {
                 .impl => |implementation| for (implementation.methods) |method| {
                     const function = self.tree.decl(method).function;
                     _ = function;
+                    try self.checkFunction(method, self.tree.decl(method).function.body);
+                },
+                .interface_decl => |interface| for (interface.default_methods) |method| {
                     try self.checkFunction(method, self.tree.decl(method).function.body);
                 },
                 else => {},
@@ -2313,9 +2585,9 @@ const Checker = struct {
                 if (try self.iterableForIn(iterable_type)) |info| {
                     try self.bindStatementValue(statement, info.element_type, loop.span, "Type Error: шаблон 'для (...)' не совпадает со значением Итерируемое");
                     try self.result.for_in_infos.put(statement, .{ .kind = .iterator, .next_method = info.next_method });
-                } else if (try self.interfaceIterableElement(iterable_type)) |element_type| {
-                    try self.bindStatementValue(statement, element_type, loop.span, "Type Error: шаблон 'для (...)' не совпадает со значением Итерируемое");
-                    try self.result.for_in_infos.put(statement, .{ .kind = .iterator, .iterator_dispatch = .interface });
+                } else if (try self.interfaceIterableElement(iterable_type)) |info| {
+                    try self.bindStatementValue(statement, info.element_type, loop.span, "Type Error: шаблон 'для (...)' не совпадает со значением Итерируемое");
+                    try self.result.for_in_infos.put(statement, .{ .kind = .iterator, .iterator_dispatch = .interface, .next_method_index = info.method_index });
                 } else {
                     try self.report(loop.span, "Type Error: тип не поддерживает 'для x в' (нужен Массив или Итерируемое)", .{});
                     try self.bindStatementPoison(statement);
@@ -2341,18 +2613,38 @@ const Checker = struct {
         };
         const iterable = self.findTypeSymbol("Итерируемое") orelse return null;
         const definition = self.result.interface_definitions.get(iterable) orelse return null;
-        if (definition.parameters.len != 1 or definition.methods.len != 1 or !std.mem.eql(u8, definition.methods[0].name, "следующий")) return null;
+        if (definition.parameters.len != 1) return null;
+        // `следующий` is looked up BY NAME/index, not assumed to be the
+        // interface's only method — real gap found once `Итерируемое`
+        // gained default methods (`отобразить`/`отфильтровать`/`взять`/
+        // `собрать`): the old `.methods.len != 1` check made for-in stop
+        // recognizing ANY `Итерируемое` implementor at all the moment a
+        // second method (default or not) existed on the interface.
+        // `implementation.methods` is always parallel to `definition.
+        // methods` (same order, same length — `defineInterfaceImplementation`
+        // builds it that way), so the SAME index picks out the matching
+        // compiled function.
+        const next_index = self.findMethodIndex(definition, "следующий") orelse return null;
         for (self.result.interface_implementations.items) |implementation| {
-            if (implementation.interface != iterable or implementation.target != target or implementation.arguments.len != 1 or implementation.methods.len != 1) continue;
+            if (implementation.interface != iterable or implementation.target != target or implementation.arguments.len != 1 or implementation.methods.len <= next_index) continue;
             return .{
                 .element_type = implementation.arguments[0],
-                .next_method = implementation.methods[0],
+                .next_method = implementation.methods[next_index],
             };
         }
         return null;
     }
 
-    fn interfaceIterableElement(self: *Checker, iterable_type: types.TypeId) !?types.TypeId {
+    fn findMethodIndex(_: *const Checker, definition: InterfaceDefinition, name: []const u8) ?usize {
+        for (definition.methods, 0..) |method, index| {
+            if (std.mem.eql(u8, method.name, name)) return index;
+        }
+        return null;
+    }
+
+    const InterfaceIterableElement = struct { element_type: types.TypeId, method_index: u16 };
+
+    fn interfaceIterableElement(self: *Checker, iterable_type: types.TypeId) !?InterfaceIterableElement {
         const iterable_entry = self.result.types.get(iterable_type) orelse return null;
         const nominal = switch (iterable_entry.*) {
             .nominal => |value| value,
@@ -2361,8 +2653,10 @@ const Checker = struct {
         const iterable = self.findTypeSymbol("Итерируемое") orelse return null;
         if (nominal.symbol != iterable or nominal.arguments.len != 1) return null;
         const definition = self.result.interface_definitions.get(iterable) orelse return null;
-        if (definition.parameters.len != 1 or definition.methods.len != 1 or !std.mem.eql(u8, definition.methods[0].name, "следующий")) return null;
-        return nominal.arguments[0];
+        if (definition.parameters.len != 1) return null;
+        const index = self.findMethodIndex(definition, "следующий") orelse return null;
+        if (index > std.math.maxInt(u16)) return null;
+        return .{ .element_type = nominal.arguments[0], .method_index = @intCast(index) };
     }
 
     fn inferForRange(self: *Checker, statement: ast.StmtId, range: anytype) anyerror!types.TypeId {
@@ -3785,6 +4079,7 @@ const Checker = struct {
                 if (try self.inferInterfaceCall(expression, call, property, object_type)) |method_type| return method_type;
                 if (try self.inferGenericBoundInterfaceCall(expression, call, property, object_type)) |method_type| return method_type;
                 if (try self.inferMethodCall(expression, call, property, object_type)) |method_type| return method_type;
+                if (try self.inferDefaultInterfaceMethodCall(expression, call, property, object_type)) |method_type| return method_type;
                 const object = self.result.types.get(object_type) orelse return self.result.types.poison();
                 switch (object.*) {
                     .array => |element| {
@@ -4374,7 +4669,7 @@ const Checker = struct {
         };
         if (self.result.interface_definitions.get(expected_nominal.symbol)) |interface| {
             if (interface.parameters.len != expected_nominal.arguments.len) return false;
-            return self.interfaceImplementation(expected_nominal.symbol, expected_nominal.arguments, actual_nominal.symbol) != null;
+            return self.interfaceImplementation(expected_nominal.symbol, expected_nominal.arguments, actual_nominal.symbol, actual_nominal.arguments) != null;
         }
         // Same generic struct/enum, argument-wise assignable (not `eql`)
         // type arguments — e.g. `Селектор(poison)` vs the declared
@@ -4418,10 +4713,7 @@ const Checker = struct {
     }
 
     fn nominalParameters(self: *const Checker, symbol: symbols.SymbolId) []const GenericParameter {
-        if (self.result.generic_nominal_fields.get(symbol)) |nominal| return nominal.parameters;
-        if (self.result.enum_definitions.get(symbol)) |enumeration| return enumeration.parameters;
-        if (self.result.interface_definitions.get(symbol)) |interface| return interface.parameters;
-        return &.{};
+        return nominalParametersOf(self.result, symbol);
     }
 
     fn methodBySymbol(self: *const Checker, symbol: symbols.SymbolId) ?MethodDefinition {
@@ -4445,14 +4737,23 @@ const Checker = struct {
         return null;
     }
 
-    fn interfaceImplementation(self: *const Checker, interface: symbols.SymbolId, arguments: []const types.TypeId, target: symbols.SymbolId) ?InterfaceImplementation {
-        for (self.result.interface_implementations.items) |implementation| {
-            if (implementation.interface != interface or implementation.target != target or implementation.arguments.len != arguments.len) continue;
-            for (implementation.arguments, arguments) |actual, expected| {
-                if (!self.result.types.eql(actual, expected)) break;
-            } else return implementation;
-        }
-        return null;
+    // `target_arguments` — the ACTUAL/instantiated generic arguments of
+    // `target` at THIS call site (e.g. `Отображённый(Число, Строка)`'s
+    // `[Число, Строка]`), separate from `implementation.arguments`
+    // (`interface_implementations`'s stored entry — an EXPRESSION over
+    // `target`'s OWN declared placeholders, e.g. `[U_of_Отображённый]`
+    // for `реализация Итерируемое для Отображённый`, since Отображённый's
+    // OWN `U` is what unified against Итерируемое's `T`). Real gap
+    // found building a generic wrapper struct implementing a generic
+    // interface polymorphically: the OLD exact-`eql` match compared
+    // DIFFERENT TypeIds that only happen to be semantically the same
+    // AFTER substitution (`Отображённый`'s own `U` vs some OTHER
+    // call site's `U`) — always failed for any generic struct/generic
+    // interface pairing. Fast path (exact match) stays first — covers
+    // the overwhelmingly common non-generic case without the extra
+    // work; the substitution fallback only runs when that fails.
+    fn interfaceImplementation(self: *const Checker, interface: symbols.SymbolId, arguments: []const types.TypeId, target: symbols.SymbolId, target_arguments: []const types.TypeId) ?InterfaceImplementation {
+        return findInterfaceImplementation(self.result, interface, arguments, target, target_arguments);
     }
 
     fn isComparableInterface(self: *const Checker, interface: symbols.SymbolId) bool {
@@ -4474,7 +4775,7 @@ const Checker = struct {
             .nominal => |value| value,
             else => return false,
         };
-        return self.interfaceImplementation(interface, &.{}, nominal.symbol) != null;
+        return self.interfaceImplementation(interface, &.{}, nominal.symbol, nominal.arguments) != null;
     }
 
     fn isImplementableNominal(self: *const Checker, symbol: symbols.SymbolId) bool {
@@ -4495,7 +4796,7 @@ const Checker = struct {
         };
         if (!self.result.interface_definitions.contains(expected_nominal.symbol)) return;
         if (self.result.interface_definitions.contains(actual_nominal.symbol)) return;
-        if (self.interfaceImplementation(expected_nominal.symbol, expected_nominal.arguments, actual_nominal.symbol) == null) return;
+        if (self.interfaceImplementation(expected_nominal.symbol, expected_nominal.arguments, actual_nominal.symbol, actual_nominal.arguments) == null) return;
         const entries = try self.result.arena.allocator().dupe(InterfaceCastEntry, &.{.{
             .interface = expected_nominal.symbol,
             .arguments = expected_nominal.arguments,
@@ -4506,14 +4807,15 @@ const Checker = struct {
 
     fn registerGenericInterfaceCasts(self: *Checker, expression: ast.ExprId, actual: types.TypeId, bounds: []const symbols.SymbolId) !void {
         const actual_entry = self.result.types.get(actual) orelse return;
-        const target = switch (actual_entry.*) {
-            .nominal => |nominal| nominal.symbol,
+        const nominal = switch (actual_entry.*) {
+            .nominal => |value| value,
             else => return,
         };
+        const target = nominal.symbol;
         var entries: std.ArrayList(InterfaceCastEntry) = .empty;
         defer entries.deinit(self.result.allocator);
         for (bounds) |bound| {
-            if (self.interfaceImplementation(bound, &.{}, target) == null) continue;
+            if (self.interfaceImplementation(bound, &.{}, target, nominal.arguments) == null) continue;
             try entries.append(self.result.allocator, .{ .interface = bound, .arguments = &.{}, .target = target });
         }
         if (entries.items.len != 0) try self.result.interface_casts.put(expression, .{ .entries = try self.result.arena.allocator().dupe(InterfaceCastEntry, entries.items) });
@@ -4567,12 +4869,34 @@ const Checker = struct {
         const self_type = self.result.interface_self_placeholders.get(nominal.symbol);
         if (self_type) |placeholder| try substitutions.put(placeholder, object_type);
         const shared = @min(call.arguments.len, method.parameters.len);
+        // A default method may declare ITS OWN generic parameters
+        // (`отобразить[U](это: Итерируемое(T), ф: функ(T) -> U) ->
+        // Итерируемое(U)`) — separate from the interface's own `T`
+        // (already bound above via `definition.parameters`). Same
+        // pre-pass `inferMethodCall` already uses for an ordinary
+        // struct method's own generics: infer each argument's RAW type
+        // first and unify against the (still-unsubstituted) parameter
+        // type, so `U` is bound before anything below needs it. Real
+        // gap found building `отобразить`: without this, `U` stayed an
+        // unresolved bare placeholder in the callback parameter's
+        // expected type, and again in the return type — a lambda
+        // argument could never match either.
+        if (method.default_symbol) |default_symbol| {
+            if (self.methodBySymbol(default_symbol)) |definition_info| {
+                for (call.arguments[0..shared], method.parameters[0..shared]) |argument, parameter| {
+                    try self.inferGenericSubstitution(parameter, try self.infer(argument), &substitutions, call.span);
+                }
+                for (definition_info.function_parameters) |parameter| {
+                    if (!substitutions.contains(parameter.typ)) try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
+                }
+            }
+        }
         for (call.arguments[0..shared], method.parameters[0..shared]) |argument, parameter| {
             const expected = try self.substituteGeneric(parameter, &substitutions);
             const actual = try self.inferExpected(argument, expected);
             if (!self.assignable(actual, expected)) {
                 try self.report(call.span, "Type Error: аргумент метода не совпадает с типом параметра", .{});
-            } else if (self_type == null or !parameter.eql(self_type.?)) {
+            } else if ((self_type == null or !parameter.eql(self_type.?)) and !self.isSelfReference(nominal.symbol, parameter)) {
                 // A Self-typed PARAMETER is the one case where boxing
                 // must NOT happen: the vtable-resolved concrete method
                 // (`callInterface`, `vm.zig`) expects the SAME raw
@@ -4586,7 +4910,15 @@ const Checker = struct {
                 // found fixing the call site's type (see
                 // `interface_self_placeholders`): the TYPE substitution
                 // is still needed (so an unrelated non-implementing
-                // value is rejected), just not the runtime cast.
+                // value is rejected), just not the runtime cast. `!self.
+                // isSelfReference(...)` covers the SAME footgun for a
+                // REAL (non-hardcoded) interface declaration, where Self
+                // is written as the interface's own bare name directly
+                // (`другое: Равнозначное`) rather than a synthesized
+                // placeholder — `interface_self_placeholders` is empty
+                // for those (nothing minted one), so the placeholder
+                // check alone isn't enough once `preludePass`'s hardcode
+                // is skipped.
                 try self.registerInterfaceCast(argument, actual, expected);
             }
         }
@@ -4596,6 +4928,68 @@ const Checker = struct {
             .method_index = @intCast(index),
         });
         return @as(?types.TypeId, try self.substituteGeneric(method.return_type, &substitutions));
+    }
+
+    // `a.взять(3)` where `a`'s static type is a CONCRETE struct/enum
+    // (not the interface itself, not a bound generic parameter) that
+    // implements an interface declaring `взять` as a DEFAULT method,
+    // not overridden — the whole point of default methods (fluent
+    // chaining starting from an ordinary concrete value, e.g.
+    // `коллекции.итератор(массив).отобразить(f)`) needs this: neither
+    // `inferInterfaceCall` (object isn't the interface type) nor
+    // `inferMethodCall` (no inherent method by this name) fire.
+    // Boxes the receiver (`registerInterfaceCast`, same mechanism a
+    // `пер x: Интерфейс = a` cast already uses) and delegates the rest
+    // to `inferInterfaceCall` — no duplicated parameter/return
+    // substitution logic. Any FURTHER call in a chain
+    // (`.взять(3).отобразить(g)`) needs no special handling here at
+    // all: the previous default method's return type is the ABSTRACT
+    // interface type (via `interface_self_placeholders`/
+    // `isSelfReference`), so it goes through the ordinary
+    // `inferInterfaceCall` path directly.
+    fn inferDefaultInterfaceMethodCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
+        const object = self.result.types.get(object_type) orelse return null;
+        const nominal = switch (object.*) {
+            .nominal => |value| value,
+            else => return null,
+        };
+        for (self.result.interface_implementations.items) |implementation| {
+            if (implementation.target != nominal.symbol) continue;
+            const definition = self.result.interface_definitions.get(implementation.interface) orelse continue;
+            var has_default_method = false;
+            for (definition.methods) |method| {
+                if (std.mem.eql(u8, method.name, property.property) and method.default_symbol != null) {
+                    has_default_method = true;
+                    break;
+                }
+            }
+            if (!has_default_method) continue;
+            // `implementation.arguments` are expressed in terms of
+            // `nominal.symbol`'s OWN declared placeholders (e.g.
+            // `МассивИт[T]`'s own `T`, unified against `Ит`'s `T` when
+            // the impl was checked) — NOT concrete types, whenever the
+            // target itself is generic. Must substitute through
+            // `nominal.arguments` (THIS call site's actual, concrete
+            // instantiation) to get the real interface type — using
+            // `implementation.arguments` as-is left `interface_type`
+            // still abstract, so argument type-checking against it
+            // (e.g. a lambda parameter inferred from `функ(T) -> ...`)
+            // failed even for the simplest non-generic-method case.
+            const target_params = self.nominalParameters(nominal.symbol);
+            var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+            defer substitutions.deinit();
+            if (target_params.len == nominal.arguments.len) {
+                for (target_params, nominal.arguments) |parameter, argument| try substitutions.put(parameter.typ, argument);
+            }
+            var interface_arguments: std.ArrayList(types.TypeId) = .empty;
+            defer interface_arguments.deinit(self.result.allocator);
+            for (implementation.arguments) |argument| try interface_arguments.append(self.result.allocator, try self.substituteGeneric(argument, &substitutions));
+            const interface_type = try self.result.types.nominal(implementation.interface, interface_arguments.items);
+            if (!self.assignable(object_type, interface_type)) continue;
+            try self.registerInterfaceCast(property.object, object_type, interface_type);
+            return try self.inferInterfaceCall(expression, call, property, interface_type);
+        }
+        return null;
     }
 
     // `это.метод()` where `это`'s static type is a bare GENERIC
@@ -5215,6 +5609,22 @@ const Checker = struct {
                 try self.inferGenericSubstitution(map.key, argument_type.map.key, substitutions, span);
                 try self.inferGenericSubstitution(map.value, argument_type.map.value, substitutions, span);
             },
+            // Real gap found building a generic combinator struct that
+            // stores a callback field (`ф: функ(T) -> U`) — a struct
+            // constructor call unifies each ARGUMENT's type against its
+            // FIELD's declared type via this same function, but with no
+            // `.function` case, a type parameter appearing ONLY inside
+            // a function-typed field/argument (like `U` here — it never
+            // occurs anywhere else in the struct) could never be
+            // inferred at all ("не удалось вывести type-параметр").
+            .function => |parameter_function| {
+                const argument_type = self.result.types.get(argument) orelse return;
+                if (argument_type.* != .function or argument_type.function.parameters.len != parameter_function.parameters.len) return;
+                for (parameter_function.parameters, argument_type.function.parameters) |nested_parameter, nested_argument| {
+                    try self.inferGenericSubstitution(nested_parameter, nested_argument, substitutions, span);
+                }
+                try self.inferGenericSubstitution(parameter_function.return_type, argument_type.function.return_type, substitutions, span);
+            },
             .nominal => |nominal| {
                 const argument_type = self.result.types.get(argument) orelse return;
                 if (argument_type.* != .nominal or argument_type.nominal.symbol != nominal.symbol or argument_type.nominal.arguments.len != nominal.arguments.len) return;
@@ -5324,6 +5734,7 @@ pub fn checkWithImportContextForTarget(
         .result = &result,
         .target_profile = target_profile,
         .resolving_aliases = .init(allocator),
+        .has_real_prelude = imports.has_real_prelude,
     };
     defer checker.resolving_aliases.deinit();
     var owner_remaps = std.AutoHashMap(symbols.SymbolId, std.AutoHashMap(types.TypeId, types.TypeId)).init(allocator);

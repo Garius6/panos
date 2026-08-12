@@ -370,6 +370,13 @@ pub const Decl = union(enum) {
         doc: []const u8,
         type_parameters: []const []const u8,
         methods: []const MethodSignature,
+        // Default methods — full `.function` decls (receiver `это:
+        // Интерфейс(...)` written explicitly, like any other method),
+        // parsed alongside the abstract-signature-only entries above
+        // whenever a method has a body. Each also gets a matching
+        // (receiver-stripped) entry in `methods` for the existing
+        // signature-shape machinery.
+        default_methods: []const DeclId = &.{},
         is_exported: bool,
         annotations: []const Annotation = &.{},
     },

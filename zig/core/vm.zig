@@ -2127,7 +2127,7 @@ pub const Vm = struct {
     }
 
     fn osVersion(self: *Vm) anyerror!void {
-        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, "0.3.5"));
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, "0.3.6"));
         try self.stack.append(self.allocator, .{ .heap_string = heap_string });
     }
 

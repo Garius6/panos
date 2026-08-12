@@ -380,6 +380,22 @@ pub fn build(b: *std.Build) void {
     });
     matrix_native_tests.root_module.linkLibrary(sqlite_lib);
     matrix_native_tests.root_module.addObjectFile(libffi_archive);
+    // Multi-file cases (`импорт`) — `runTier`/`computeOutcome` reject any
+    // `импорт` outright (see `runner.zig`'s `reportUnsupportedImports`),
+    // so every genuinely multi-file fixture needs this SEPARATE tier
+    // (`computeOutcomeGraph`, real `module_loader.Graph` + `module_compiler.
+    // compileGraph`) instead — see `matrix_runner.zig`'s doc comment there.
+    const matrix_graph_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/conformance/matrix_graph_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    matrix_graph_tests.root_module.linkLibrary(sqlite_lib);
+    matrix_graph_tests.root_module.addObjectFile(libffi_archive);
     const matrix_aot_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/conformance/matrix_aot_test.zig"),
@@ -490,6 +506,7 @@ pub fn build(b: *std.Build) void {
     const run_matrix_semantic_tests = b.addRunArtifact(matrix_semantic_tests);
     const run_matrix_runtime_tests = b.addRunArtifact(matrix_runtime_tests);
     const run_matrix_native_tests = b.addRunArtifact(matrix_native_tests);
+    const run_matrix_graph_tests = b.addRunArtifact(matrix_graph_tests);
     const run_matrix_aot_tests = b.addRunArtifact(matrix_aot_tests);
     const run_lexer_conformance_tests = b.addRunArtifact(lexer_conformance_tests);
     const run_parser_conformance_tests = b.addRunArtifact(parser_conformance_tests);
@@ -565,6 +582,7 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&run_outcome_tests.step);
     conformance_step.dependOn(&run_matrix_semantic_tests.step);
     conformance_step.dependOn(&run_matrix_native_tests.step);
+    conformance_step.dependOn(&run_matrix_graph_tests.step);
     conformance_step.dependOn(&run_lexer_conformance_tests.step);
     conformance_step.dependOn(&run_parser_conformance_tests.step);
     conformance_step.dependOn(&run_modules_conformance_tests.step);

@@ -166,6 +166,550 @@
         "stdout": "12499997500000\n",
         "result": "12499997500000"
       }
+    },
+    {
+      "id": "graph-impl-qualified-target",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/impl_qualified_target_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "точка",
+        "result": "точка"
+      }
+    },
+    {
+      "id": "graph-interface-cross-module",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/interface_cross_module_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "точка",
+        "result": "точка"
+      }
+    },
+    {
+      "id": "graph-qualified-generic",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/qualified_generic_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "true",
+        "result": "true"
+      }
+    },
+    {
+      "id": "graph-qualified-generic-not-exported",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/qualified_generic_fixture_main_not_exported.pns",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "resolver",
+            "severity": "err",
+            "path": "fixtures/qualified_generic_fixture_main_not_exported.pns",
+            "start_byte": 152,
+            "end_byte": 195,
+            "message": "Resolve Error: у модуля 'либ' нет экспорта 'НеЭкспортированная'"
+          }
+        ]
+      }
+    },
+    {
+      "id": "graph-qualified-generic-wrong-arity",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/qualified_generic_fixture_main_wrong_arity.pns",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "type_checker",
+            "severity": "err",
+            "path": "fixtures/qualified_generic_fixture_main_wrong_arity.pns",
+            "start_byte": 144,
+            "end_byte": 175,
+            "message": "Type Error: неверное количество аргументов конструктора структуры"
+          },
+          {
+            "phase": "type_checker",
+            "severity": "err",
+            "path": "fixtures/qualified_generic_fixture_main_wrong_arity.pns",
+            "start_byte": 62,
+            "end_byte": 186,
+            "message": "Type Error: функция должна возвращать объявленный тип"
+          },
+          {
+            "phase": "type_checker",
+            "severity": "err",
+            "path": "fixtures/qualified_generic_fixture_main_wrong_arity.pns",
+            "start_byte": 188,
+            "end_byte": 237,
+            "message": "Type Error: функция должна возвращать объявленный тип"
+          }
+        ]
+      }
+    },
+    {
+      "id": "graph-generic-cross-module",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/generic_cross_module_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "true",
+        "result": "true"
+      }
+    },
+    {
+      "id": "graph-bounded-generic-iface",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/bounded_generic_iface_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "42",
+        "result": "42"
+      }
+    },
+    {
+      "id": "graph-spawn-qualified",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/spawn_qualified_fixture_main.pns",
+      "expected": {
+        "status": "runtime_error",
+        "exit_code": 1,
+        "stdout": "",
+        "result": "Runtime Panic: Runtime Panic: эхо получило: привет",
+        "deviation": {
+          "id": "DEV-005",
+          "rationale": "The doubled 'Runtime Panic: ' prefix is pre-existing behavior (child-process panic message re-wrapped by the observer's own signal-handling panic) — recorded as-is, not investigated as part of wiring this fixture into the manifest; a real formatting quality gap, flagged separately, not a regression introduced here."
+        }
+      }
+    },
+    {
+      "id": "graph-spawn-qualified-bad-module",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/spawn_qualified_bad_module_fixture_main.pns",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "resolver",
+            "severity": "err",
+            "path": "fixtures/spawn_qualified_bad_module_fixture_main.pns",
+            "start_byte": 280,
+            "end_byte": 334,
+            "message": "Resolve Error: неопределённое имя 'несуществующий_модуль_вообще'"
+          }
+        ]
+      }
+    },
+    {
+      "id": "graph-spawn-qualified-not-function",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/spawn_qualified_not_function_fixture_main.pns",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "type_checker",
+            "severity": "err",
+            "path": "fixtures/spawn_qualified_not_function_fixture_main.pns",
+            "start_byte": 377,
+            "end_byte": 418,
+            "message": "Type Error: вызвано значение, не являющееся функцией"
+          }
+        ]
+      }
+    },
+    {
+      "id": "graph-adt-main",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/adt_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "Фигура.Круг(9)",
+        "stdout": "Фигура.Круг(9)"
+      }
+    },
+    {
+      "id": "graph-adt-private-main",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/adt_fixture_private_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "0",
+        "stdout": "0"
+      }
+    },
+    {
+      "id": "graph-adt-private-use",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/adt_fixture_private_use.pns",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "resolver",
+            "severity": "err",
+            "path": "fixtures/adt_fixture_private_use.pns",
+            "start_byte": 107,
+            "end_byte": 118,
+            "message": "Resolve Error: у модуля 'ф' нет экспорта 'Круг'"
+          },
+          {
+            "phase": "resolver",
+            "severity": "warning",
+            "path": "fixtures/adt_fixture_private_use.pns",
+            "start_byte": 95,
+            "end_byte": 121,
+            "message": "неиспользованная переменная 'к'"
+          }
+        ]
+      }
+    },
+    {
+      "id": "graph-adt-short",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/adt_fixture_short.pns",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "resolver",
+            "severity": "err",
+            "path": "fixtures/adt_fixture_short.pns",
+            "start_byte": 107,
+            "end_byte": 118,
+            "message": "Resolve Error: у модуля 'ф' нет экспорта 'Круг'"
+          }
+        ]
+      }
+    },
+    {
+      "id": "graph-archive",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/archive_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-collections",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/collections_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-const-private",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/const_fixture_main_private.pns",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "resolver",
+            "severity": "err",
+            "path": "fixtures/const_fixture_main_private.pns",
+            "start_byte": 87,
+            "end_byte": 112,
+            "message": "Resolve Error: у модуля 'либ' нет экспорта 'ПРИВАТНАЯ'"
+          }
+        ]
+      }
+    },
+    {
+      "id": "graph-const",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/const_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-flags",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/flags_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-http-router",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/http_router_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-http-url",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/http_url_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-json",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/json_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-math",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/math_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-module",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/module_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "42",
+        "stdout": "42"
+      }
+    },
+    {
+      "id": "graph-module-missing-import",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/module_fixture_missing_import_main.pns",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "parser",
+            "severity": "err",
+            "path": "fixtures/module_fixture_missing_import_main.pns",
+            "start_byte": 0,
+            "end_byte": 68,
+            "message": "Module Loader Error: не удалось загрузить модуль 'fixtures/не_существует_вообще_никогда.pns': FileNotFound"
+          }
+        ]
+      }
+    },
+    {
+      "id": "graph-module-nested",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/module_fixture_nested_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "42",
+        "stdout": "42"
+      }
+    },
+    {
+      "id": "graph-random",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/random_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-stdlib",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/stdlib_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "42",
+        "stdout": "42"
+      }
+    },
+    {
+      "id": "graph-supervisor-dynamic-add",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/supervisor_dynamic_add_fixture_main.pns",
+      "expected": {
+        "status": "runtime_error",
+        "exit_code": 1,
+        "result": "Runtime Panic: Runtime Panic: супервизор (один-за-одного): 'динамический-рабочий' превысил лимит перезапусков (1 за 60000мс): Runtime Panic: динамический рабочий сломался",
+        "stdout": ""
+      }
+    },
+    {
+      "id": "graph-supervisor-dynamic-remove",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/supervisor_dynamic_remove_fixture_main.pns",
+      "expected": {
+        "status": "runtime_error",
+        "exit_code": 1,
+        "result": "Runtime Panic: Runtime Panic: супервизор (один-за-одного): 'падающая-после-удаления' превысил лимит перезапусков (1 за 60000мс): Runtime Panic: удаление: рабочий сломался",
+        "stdout": ""
+      }
+    },
+    {
+      "id": "graph-supervisor",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/supervisor_fixture_main.pns",
+      "expected": {
+        "status": "runtime_error",
+        "exit_code": 1,
+        "result": "Runtime Panic: супервизор (один-за-одного): 'падающий-рабочий' превысил лимит перезапусков (1 за 60000мс): Runtime Panic: рабочий сломался",
+        "stdout": ""
+      }
+    },
+    {
+      "id": "graph-supervisor-narrow-window",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/supervisor_narrow_window_fixture_main.pns",
+      "expected": {
+        "status": "runtime_error",
+        "exit_code": 1,
+        "result": "Runtime Error: все процессы заблокированы в ожидании сообщений (дедлок)",
+        "stdout": ""
+      }
+    },
+    {
+      "id": "graph-supervisor-one-for-all",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/supervisor_one_for_all_fixture_main.pns",
+      "expected": {
+        "status": "runtime_error",
+        "exit_code": 1,
+        "result": "Runtime Panic: супервизор (групповой рестарт): краш 'падающая' исчерпал лимит групповых перезапусков (1 за 60000мс): Runtime Panic: бум",
+        "stdout": ""
+      }
+    },
+    {
+      "id": "graph-supervisor-rest-for-one",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/supervisor_rest_for_one_fixture_main.pns",
+      "expected": {
+        "status": "runtime_error",
+        "exit_code": 1,
+        "result": "Runtime Panic: супервизор (групповой рестарт): краш 'падающая' исчерпал лимит групповых перезапусков (1 за 60000мс): Runtime Panic: бум",
+        "stdout": ""
+      }
+    },
+    {
+      "id": "graph-test",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/test_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "0",
+        "stdout": "0"
+      }
+    },
+    {
+      "id": "graph-toml",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/toml_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-slog",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/слог_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "[ОТЛАДКА] тест\n[ИНФО] тест\n[ПРЕДУПРЕЖДЕНИЕ] тест\n[ОШИБКА] тест\n[КРИТИЧНО] тест\ntrue",
+        "stdout": "[ОТЛАДКА] тест\n[ИНФО] тест\n[ПРЕДУПРЕЖДЕНИЕ] тест\n[ОШИБКА] тест\n[КРИТИЧНО] тест\ntrue"
+      }
     }
   ]
 }

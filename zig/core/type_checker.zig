@@ -2981,14 +2981,28 @@ const Checker = struct {
     }
 
     fn inferBinary(self: *Checker, binary: anytype) anyerror!types.TypeId {
+        // `.assign` handled BEFORE the eager `left`/`right` infer below —
+        // unlike every other operator, its RHS needs the LHS's type as
+        // INFERENCE CONTEXT (`inferExpected`, the same mechanism a `пер
+        // x: T = ...` binding already uses), not just a post-hoc
+        // compatibility check. `это.поле = Опция.Нет()` (a bare enum-
+        // variant constructor call with no argument to infer T from)
+        // failed "не удалось вывести type-параметр 'T'" — `Опция.Нет()`
+        // was inferred BLIND (`self.infer`, no expected type in scope)
+        // before `left`'s type was ever consulted, even though
+        // `inferExpected`'s `.call` case already knows how to resolve an
+        // enum-variant constructor against an expected type (exactly
+        // what makes the `пер`-binding form of the same code work).
+        if (binary.operator == .assign) {
+            const left = try self.infer(binary.left);
+            try self.checkAssignmentTarget(binary.left, binary.span);
+            const right = try self.inferExpected(binary.right, left);
+            if (!self.assignable(right, left)) try self.report(binary.span, "Type Error: присваивание несовместимых типов", .{});
+            return self.result.types.builtins.void;
+        }
         const left = try self.infer(binary.left);
         const right = try self.infer(binary.right);
         return switch (binary.operator) {
-            .assign => blk: {
-                try self.checkAssignmentTarget(binary.left, binary.span);
-                if (!self.assignable(right, left)) try self.report(binary.span, "Type Error: присваивание несовместимых типов", .{});
-                break :blk self.result.types.builtins.void;
-            },
             .equal, .not_equal => blk: {
                 if (!self.isPoison(left) and !self.isPoison(right) and !self.result.types.eql(left, right)) {
                     try self.report(binary.span, "Type Error: оператор сравнения ожидает значения одного типа", .{});
@@ -3879,6 +3893,12 @@ const Checker = struct {
                 const array_type = try self.result.types.array(field_pair);
                 const result_type = self.resultOfString(array_type) orelse return self.result.types.poison();
                 return self.checkStringArgsBuiltin(call, "синтаксис.поля", 2, result_type);
+            }
+            if (self.isBuiltinModule(symbol, "синтаксис", "импорты")) {
+                const import_pair = try self.result.types.tuple(&.{ self.result.types.builtins.string, self.result.types.builtins.string });
+                const array_type = try self.result.types.array(import_pair);
+                const result_type = self.resultOfString(array_type) orelse return self.result.types.poison();
+                return self.checkStringArgsBuiltin(call, "синтаксис.импорты", 1, result_type);
             }
             if (self.isBuiltinModule(symbol, "синтаксис", "аннотации")) {
                 const array_type = try self.result.types.array(self.result.types.builtins.string);
@@ -6153,6 +6173,32 @@ test "type checker resolves aliases before and after their declaration" {
     defer parsed.deinit();
     var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
     defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "type checker infers a bare enum-variant constructor assigned to a property from the field's declared type" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "тип Т = структура\n" ++
+            "примечание: Опция(Строка)\n" ++
+            "конец\n" ++
+            "функ f() -> Пусто\n" ++
+            "пер t = Т(Опция.Нет())\n" ++
+            "t.примечание = Опция.Нет()\n" ++
+            "конец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
     var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
     defer checked.deinit();
 

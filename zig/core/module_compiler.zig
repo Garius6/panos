@@ -275,6 +275,85 @@ const ImportContext = struct {
         }
     }
 
+    // Bridges CONCRETE (non-interface) methods for `owner_symbol` — the
+    // `graph.methods` counterpart of `appendMatchingImpls` above (same
+    // "scan the WHOLE graph by owner_module/owner_declaration, not just
+    // `own_module`'s own imports" shape, since `реализация X для
+    // Модуль.Тип` can live in a THIRD file relative to both the type's
+    // own module and any given consumer — codegen's `_gen.ps` pattern).
+    //
+    // Needed alongside `appendMatchingImpls` (not instead of it) because a
+    // nominal reached ONLY TRANSITIVELY — through another module's field/
+    // return type, never named/imported directly by `own_module` — used
+    // to get its methods bridged ONLY from `definition_checked.methods`
+    // (the type's OWN declaring module's typecheck results), which can
+    // only ever contain SAME-FILE `реализация` blocks: the declaring
+    // module never imports its own `_gen.ps` counterpart, so a
+    // third-file method attach was invisible to it. Real gap found via
+    // codegen's cross-file nested-struct JSON support: `Фигура.центр:
+    // а.Точка` (a.Точка's `.в_json()` implemented in `a_gen.ps`) — `это.
+    // центр.в_json()` inside `b_gen.ps` (itself reached via `Фигура`'s
+    // field, not a direct import of `a`) failed "у типа нет поля
+    // 'в_json'" even though the exact same method resolves fine on a
+    // DIRECTLY-imported `a.Точка` value in the same file (`b_gen.ps`
+    // reaches `а.Точка` via TWO separate paths — its own `импорт "./a"
+    // как а` AND transitively through `Фигура.центр` — each path mints
+    // its OWN local symbol, `TypeStore.eql`'s identity check unifies them
+    // for type-compatibility purposes, but method lookup is keyed by
+    // symbol, and only the directly-imported one got bridged, via
+    // `module_linker.zig`'s `buildExportsForTarget`, which does the same
+    // `graph.methods` scan this mirrors).
+    fn appendMatchingMethods(
+        self: *ImportContext,
+        graph: *const module_loader.Graph,
+        modules: []const ModuleCompilation,
+        resolution: *resolver.Resolution,
+        own_module: usize,
+        origin_module: usize,
+        origin_declaration: ast.DeclId,
+        owner_symbol: symbols.SymbolId,
+    ) !void {
+        for (graph.methods.items) |method_export| {
+            if (method_export.owner_module != origin_module or method_export.owner_declaration != origin_declaration) continue;
+            // Same rationale as `appendMatchingImpls`'s identical check —
+            // a method declared IN `own_module` itself is already a plain
+            // local declaration there, not something to bridge (and
+            // `modules[own_module].checked`/`.compiled` don't exist yet
+            // while `own_module` is still being collected).
+            if (method_export.module == own_module) continue;
+            const method_module = &modules[method_export.module];
+            const method_resolution = if (method_module.resolution) |*value| value else return error.ImportNotCompiled;
+            const method_checked = if (method_module.checked) |*value| value else return error.ImportNotChecked;
+            const method_compiled = if (method_module.compiled) |*value| value else return error.ImportNotCompiled;
+            const source_method_symbol = method_resolution.decl_symbols.get(method_export.declaration) orelse continue;
+            const source_method = method_resolution.symbols.get(source_method_symbol) orelse continue;
+            const function_id = method_compiled.function_ids.get(source_method_symbol) orelse continue;
+            const signature = method_checked.symbol_types.get(source_method_symbol) orelse continue;
+            const local_method = try resolution.symbols.add(.{
+                .name = source_method.name,
+                .kind = .function,
+                .module_path = "@transitive",
+                .is_exported = true,
+                .span = source_method.span,
+            });
+            const parameters = method_resolution.function_parameters.get(method_export.declaration) orelse &.{};
+            const parameter_names: []const []const u8 = if (parameters.len == 0) &.{} else blk: {
+                const names = try self.allocator.alloc([]const u8, parameters.len);
+                for (parameters, names) |parameter, *name| name.* = method_resolution.symbols.get(parameter).?.name;
+                break :blk names;
+            };
+            try self.methods.append(self.allocator, .{
+                .owner = owner_symbol,
+                .name = source_method.name,
+                .symbol = local_method,
+                .store = &method_checked.types,
+                .type_id = signature,
+                .parameter_names = parameter_names,
+            });
+            try self.functions.append(self.allocator, .{ .symbol = local_method, .function_id = function_id });
+        }
+    }
+
     fn collect(
         self: *ImportContext,
         resolution: *resolver.Resolution,
@@ -602,32 +681,13 @@ const ImportContext = struct {
                 // (`inferDefaultInterfaceMethodCall`) had nothing to find
                 // in the consuming module's OWN `interface_implementations`.
                 try self.appendMatchingImpls(graph, modules, resolution, own_module, origin.module, origin.declaration, local_symbol);
-                // The source resolver never created a binding for this
-                // method in the importing module, so create one alongside
-                // the synthetic owner.  The compiler then links it to the
-                // already compiled source function exactly as for a direct
-                // import.
-                for (definition_checked.methods.items) |method| {
-                    if (method.owner != definition_symbol) continue;
-                    const source_method = definition_resolution.symbols.get(method.symbol) orelse continue;
-                    const function_id = definition_compiled.function_ids.get(method.symbol) orelse continue;
-                    const local_method = try resolution.symbols.add(.{
-                        .name = source_method.name,
-                        .kind = .function,
-                        .module_path = "@transitive",
-                        .is_exported = true,
-                        .span = source_method.span,
-                    });
-                    const signature = definition_checked.symbol_types.get(method.symbol) orelse continue;
-                    try self.methods.append(self.allocator, .{
-                        .owner = local_symbol,
-                        .name = source_method.name,
-                        .symbol = local_method,
-                        .store = &definition_checked.types,
-                        .type_id = signature,
-                    });
-                    try self.functions.append(self.allocator, .{ .symbol = local_method, .function_id = function_id });
-                }
+                // `graph.methods`-wide scan (not just `definition_checked.
+                // methods`, which only ever sees SAME-FILE `реализация`
+                // blocks — the type's own declaring module never imports
+                // its own third-file `_gen.ps` counterpart) — see
+                // `appendMatchingMethods`'s doc comment for the real gap
+                // this closes.
+                try self.appendMatchingMethods(graph, modules, resolution, own_module, origin.module, origin.declaration, local_symbol);
             },
             .array => |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, element),
             .map => |map| {
@@ -733,6 +793,12 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
 
     result.modules = try allocator.alloc(ModuleCompilation, graph.modules.items.len);
     @memset(result.modules, .{});
+    // Phase 1: resolve EVERY module first, in any order — `ImportScope`
+    // is built purely from `graph.exports`/`graph.imports` (computed once
+    // at load time by `collectExports`/`registerModule`, see
+    // `module_linker.zig`'s `buildExportsForTarget`), never from another
+    // module's OWN resolve/check/compile results — so resolution has no
+    // real inter-module ordering dependency at all, unlike Phase 2 below.
     for (graph.order.items) |module_index| {
         const module = &graph.modules.items[module_index];
         var scope = try module_linker.ImportScope.initWithPrelude(allocator, graph, module_index, prelude_module);
@@ -747,10 +813,78 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
         const resolution = &result.modules[module_index].resolution.?;
         try result.appendDiagnostics(&resolution.diagnostics);
         if (result.hasErrors()) return result;
+    }
+
+    // Phase 2: typecheck + compile. `graph.order` (plain import-edge
+    // topological order) is used as the INITIAL queue, but is not
+    // actually sufficient by itself: `ImportContext.appendMatchingImpls`
+    // scans `graph.impls` for ANY `реализация` matching an imported
+    // type's origin, REGARDLESS of whether the impl-declaring module is
+    // itself imported by the module being processed — the qualified
+    // "third-file impl" shape (codegen's `_gen.ps` pattern: `реализация
+    // json.ВJSON для json_fixture.Заказ`, written in neither
+    // `json_fixture.ps` nor the consumer) means a module can depend on
+    // another module's `.checked`/`.compiled` state WITHOUT there being
+    // any import edge between them at all — an ordering constraint
+    // `graph.order`'s plain DFS over import edges cannot see or encode.
+    // Real, previously-unknown bug found via a genuine diamond import
+    // (`main` imports both `A` and `B`, `B` also imports `A`, and a
+    // THIRD file `A_gen` — imported only by `main`, not by `B` —
+    // implements an interface for `A`'s type): `B` is processed before
+    // `A_gen` in plain topological order (nothing requires otherwise —
+    // `B` never imports `A_gen`), but `B`'s own `collect()` still touches
+    // `A_gen`'s impl while scanning `A`'s import, `A_gen.checked` isn't
+    // populated yet → `error.ImportNotChecked`/`ImportNotCompiled`, a
+    // hard crash for a perfectly valid program.
+    //
+    // Fixed with a worklist instead of a single topological pass: a
+    // module whose `collect()` hits a not-yet-ready dependency (this
+    // hidden impl-driven edge is the ONLY thing that can trigger it —
+    // every OTHER `ImportNotCompiled`/`ImportNotChecked` site in
+    // `ImportContext` looks up a module `own_module` ACTUALLY imports,
+    // already guaranteed ready by `graph.order`) is pushed to the back
+    // of the queue and retried later, instead of hard-failing. `stalled`
+    // counts consecutive requeues with zero forward progress — reaching
+    // the current queue length means every remaining module failed on a
+    // full pass, a genuine unresolvable case (not seen in practice; would
+    // need a real cycle between qualified impl targets across files) —
+    // propagate the underlying error rather than looping forever.
+    var queue: std.ArrayList(usize) = .empty;
+    defer queue.deinit(allocator);
+    try queue.appendSlice(allocator, graph.order.items);
+    var stalled: usize = 0;
+    while (queue.items.len != 0) {
+        if (stalled >= queue.items.len) {
+            // Nothing in the queue made progress across a full pass — the
+            // graph state is otherwise unchanged since the last attempt at
+            // this exact module, so re-running `collect` is expected to
+            // fail identically and `try` propagates that error out of
+            // `compileGraphForTarget`. Only reachable for a genuine cycle
+            // between qualified impl targets across files (see the doc
+            // comment above) — not by any currently-existing panos code.
+            const module_index = queue.items[0];
+            const resolution = &result.modules[module_index].resolution.?;
+            var imports = ImportContext.init(allocator);
+            defer imports.deinit();
+            try imports.collect(resolution, result.modules, &result.nominal_identities, &result.next_nominal_identity, graph, module_index);
+            unreachable;
+        }
+
+        const module_index = queue.orderedRemove(0);
+        const module = &graph.modules.items[module_index];
+        const resolution = &result.modules[module_index].resolution.?;
 
         var imports = ImportContext.init(allocator);
         defer imports.deinit();
-        try imports.collect(resolution, result.modules, &result.nominal_identities, &result.next_nominal_identity, graph, module_index);
+        imports.collect(resolution, result.modules, &result.nominal_identities, &result.next_nominal_identity, graph, module_index) catch |err| switch (err) {
+            error.ImportNotCompiled, error.ImportNotChecked => {
+                try queue.append(allocator, module_index);
+                stalled += 1;
+                continue;
+            },
+            else => return err,
+        };
+        stalled = 0;
 
         result.modules[module_index].checked = try type_checker.checkWithImportContextForTarget(allocator, &module.tree, resolution, .{
             .symbols = imports.imported_types.items,

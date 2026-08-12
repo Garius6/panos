@@ -983,6 +983,8 @@ const FunctionCompiler = struct {
             .{ .syntax_structs = {} }
         else if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "поля"))
             .{ .syntax_fields = {} }
+        else if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "импорты"))
+            .{ .syntax_imports = {} }
         else if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "аннотации"))
             .{ .syntax_annotations = {} }
         else if (call.arguments.len == 3 and std.mem.eql(u8, property.property, "аргумент_аннотации"))

@@ -164,6 +164,7 @@ pub const Opcode = enum {
     gzip_decompress,
     syntax_structs,
     syntax_fields,
+    syntax_imports,
     syntax_annotations,
     syntax_annotation_arg,
     syntax_field_annotations,
@@ -336,6 +337,7 @@ pub const Instruction = union(Opcode) {
     gzip_decompress: void,
     syntax_structs: void,
     syntax_fields: void,
+    syntax_imports: void,
     syntax_annotations: void,
     syntax_annotation_arg: void,
     syntax_field_annotations: void,
@@ -410,18 +412,22 @@ pub const Function = struct {
     }
 };
 
-pub const ComparableMethod = struct {
-    type_name: []const u8,
-    function_id: FunctionId,
-};
-
-// Same name-keyed dispatch table shape as `ComparableMethod` — `отправить`
-// needs to know, at RUNTIME (the message's exact struct name is only known
-// once it's an actual `Aggregate` on the heap, same as `Сравниваемое`'s
-// existing dispatch), whether the type being sent declared a custom
-// `реализация Копируемое`. Restoring copy-on-send (ROADMAP.md Стадия 24) —
-// see `vm.zig`'s `send`/`deepCopyForSend`.
-pub const CopyableMethod = struct {
+// Name-keyed dispatch table shared by two unrelated single-method
+// interfaces: `Сравниваемое` (comparison operators need to know, at
+// RUNTIME — the value's exact struct name is only known once it's an
+// actual `Aggregate` on the heap — whether the type declared a custom
+// `реализация Сравниваемое`) and `Копируемое` (same lookup shape,
+// `отправить`/message-send needs it to know whether to run a custom
+// copy-on-send — restoring ROADMAP.md Стадия 24, see `vm.zig`'s
+// `send`/`deepCopyForSend`). One table keyed by `interface_name` instead
+// of two structurally-identical `ArrayList`s — `addComparableMethod`/
+// `comparableMethod`/`addCopyableMethod`/`copyableMethod` below stay as
+// thin wrappers with their ORIGINAL signatures, so `compiler.zig`'s
+// `registerSingleMethodInterface` (calls them as function pointers) and
+// `vm.zig`'s lookup call sites need no changes at all — purely an
+// internal storage merge.
+pub const SingleMethodInterface = struct {
+    interface_name: []const u8,
     type_name: []const u8,
     function_id: FunctionId,
 };
@@ -430,8 +436,7 @@ pub const Program = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     functions: std.ArrayList(Function) = .empty,
-    comparable_methods: std.ArrayList(ComparableMethod) = .empty,
-    copyable_methods: std.ArrayList(CopyableMethod) = .empty,
+    single_method_interfaces: std.ArrayList(SingleMethodInterface) = .empty,
     entry: FunctionId = invalid_function,
 
     pub fn init(allocator: std.mem.Allocator) Program {
@@ -443,8 +448,7 @@ pub const Program = struct {
 
     pub fn deinit(self: *Program) void {
         for (self.functions.items) |*compiled_function| compiled_function.deinit(self.allocator);
-        self.comparable_methods.deinit(self.allocator);
-        self.copyable_methods.deinit(self.allocator);
+        self.single_method_interfaces.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.arena.deinit();
         self.* = undefined;
@@ -476,42 +480,40 @@ pub const Program = struct {
         return self.arena.allocator().dupe(u8, value);
     }
 
-    pub fn addComparableMethod(self: *Program, type_name: []const u8, function_id: FunctionId) !void {
-        try self.comparable_methods.append(self.allocator, .{
+    fn addSingleMethodInterfaceMethod(self: *Program, interface_name: []const u8, type_name: []const u8, function_id: FunctionId) !void {
+        try self.single_method_interfaces.append(self.allocator, .{
+            .interface_name = interface_name,
             .type_name = try self.copyString(type_name),
             .function_id = function_id,
         });
+    }
+
+    fn singleMethodInterfaceMethod(self: *const Program, interface_name: []const u8, type_name: []const u8) ?FunctionId {
+        for (self.single_method_interfaces.items) |method| {
+            if (std.mem.eql(u8, method.interface_name, interface_name) and std.mem.eql(u8, method.type_name, type_name)) return method.function_id;
+        }
+        const separator = std.mem.indexOfScalar(u8, type_name, '.') orelse return null;
+        const owner = type_name[0..separator];
+        for (self.single_method_interfaces.items) |method| {
+            if (std.mem.eql(u8, method.interface_name, interface_name) and std.mem.eql(u8, method.type_name, owner)) return method.function_id;
+        }
+        return null;
+    }
+
+    pub fn addComparableMethod(self: *Program, type_name: []const u8, function_id: FunctionId) !void {
+        try self.addSingleMethodInterfaceMethod("Сравниваемое", type_name, function_id);
     }
 
     pub fn comparableMethod(self: *const Program, type_name: []const u8) ?FunctionId {
-        for (self.comparable_methods.items) |method| {
-            if (std.mem.eql(u8, method.type_name, type_name)) return method.function_id;
-        }
-        const separator = std.mem.indexOfScalar(u8, type_name, '.') orelse return null;
-        const owner = type_name[0..separator];
-        for (self.comparable_methods.items) |method| {
-            if (std.mem.eql(u8, method.type_name, owner)) return method.function_id;
-        }
-        return null;
+        return self.singleMethodInterfaceMethod("Сравниваемое", type_name);
     }
 
     pub fn addCopyableMethod(self: *Program, type_name: []const u8, function_id: FunctionId) !void {
-        try self.copyable_methods.append(self.allocator, .{
-            .type_name = try self.copyString(type_name),
-            .function_id = function_id,
-        });
+        try self.addSingleMethodInterfaceMethod("Копируемое", type_name, function_id);
     }
 
     pub fn copyableMethod(self: *const Program, type_name: []const u8) ?FunctionId {
-        for (self.copyable_methods.items) |method| {
-            if (std.mem.eql(u8, method.type_name, type_name)) return method.function_id;
-        }
-        const separator = std.mem.indexOfScalar(u8, type_name, '.') orelse return null;
-        const owner = type_name[0..separator];
-        for (self.copyable_methods.items) |method| {
-            if (std.mem.eql(u8, method.type_name, owner)) return method.function_id;
-        }
-        return null;
+        return self.singleMethodInterfaceMethod("Копируемое", type_name);
     }
 };
 

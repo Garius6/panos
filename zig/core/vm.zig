@@ -1613,6 +1613,7 @@ pub const Vm = struct {
             .gzip_decompress => try self.gzipDecompress(),
             .syntax_structs => try self.syntaxStructs(),
             .syntax_fields => try self.syntaxFields(),
+            .syntax_imports => try self.syntaxImports(),
             .syntax_annotations => try self.syntaxAnnotations(),
             .syntax_annotation_arg => try self.syntaxAnnotationArg(),
             .syntax_field_annotations => try self.syntaxFieldAnnotations(),
@@ -3316,6 +3317,61 @@ pub const Vm = struct {
                 for (parsed.ast.program.?.declarations) |decl_id| {
                     switch (parsed.ast.decl(decl_id).*) {
                         .struct_decl => |s| try elements.append(self.allocator, .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, s.name)) }),
+                        else => {},
+                    }
+                }
+                const array = try self.heap.createArray(try elements.toOwnedSlice(self.allocator));
+                try self.pushSuccessResult(.{ .array = array });
+            },
+        }
+    }
+
+    // (алиас, путь-как-написан) для каждого `импорт "путь" [как алиас]`
+    // в файле — НЕобаliased импорты (`импорт математика`, без "как")
+    // пропускаются: у них нет qualified-имени для codegen'а разрешать
+    // (модуль связывается под собственным именем неявно), а этот builtin
+    // существует ИМЕННО для разрешения квалифицированных ссылок вида
+    // "алиас.Тип" на путь исходного файла (codegen'у нужного для
+    // вложенных структур в другом файле) — не общая интроспекция всех
+    // импортов. Путь — КАК НАПИСАН в исходнике (не резолвлен через
+    // PANOS_STDLIB/модули/расширения — это чистый AST-парс одного файла,
+    // без module_loader'а), вызывающему коду нужно самому разрешить его
+    // относительно директории `путь` (см. std/путь.pns).
+    fn syntaxImports(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("синтаксис::импорты", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "синтаксис::импорты", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const path = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: синтаксис.импорты() ожидает путь типа Строка", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'синтаксис::импорты' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        switch (try self.parseSyntaxSource(path)) {
+            .fail => |message| {
+                defer self.allocator.free(message);
+                try self.pushErrorResultForModule("синтаксис", message);
+            },
+            .ok => |parsed_result| {
+                var parsed = parsed_result;
+                defer parsed.deinit();
+                var elements: std.ArrayList(value.Value) = .empty;
+                errdefer elements.deinit(self.allocator);
+                for (parsed.ast.program.?.declarations) |decl_id| {
+                    switch (parsed.ast.decl(decl_id).*) {
+                        .import => |imp| {
+                            const alias = imp.alias orelse continue;
+                            const pair_elements = try self.allocator.alloc(value.Value, 2);
+                            pair_elements[0] = .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, alias)) };
+                            pair_elements[1] = .{ .heap_string = try self.heap.createString(try self.allocator.dupe(u8, imp.path)) };
+                            const pair = try self.heap.createAggregate(null, pair_elements);
+                            try elements.append(self.allocator, .{ .aggregate = pair });
+                        },
                         else => {},
                     }
                 }

@@ -418,6 +418,21 @@ pub fn build(b: *std.Build) void {
     });
     modules_conformance_tests.root_module.linkLibrary(sqlite_lib);
     modules_conformance_tests.root_module.addObjectFile(libffi_archive);
+    // Every ```panos block in docs/src/**/*.md, run through the same
+    // `runner.runSource` path `panos run` uses — see the test file's own
+    // doc comment for why this exists (a whole class of bug this session
+    // only ever surfaced via a manual, one-off sweep).
+    const docs_examples_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/conformance/docs_examples_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    docs_examples_tests.root_module.linkLibrary(sqlite_lib);
+    docs_examples_tests.root_module.addObjectFile(libffi_archive);
     const demo_parser_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test_ps_parser_test.zig"),
@@ -480,6 +495,7 @@ pub fn build(b: *std.Build) void {
     const run_parser_conformance_tests = b.addRunArtifact(parser_conformance_tests);
     const run_modules_conformance_tests = b.addRunArtifact(modules_conformance_tests);
     const run_demo_parser_tests = b.addRunArtifact(demo_parser_tests);
+    const run_docs_examples_tests = b.addRunArtifact(docs_examples_tests);
     const run_native_integration_tests = b.addRunArtifact(native_integration_tests);
     const aot_runtime_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -544,7 +560,7 @@ pub fn build(b: *std.Build) void {
     // `bench` below) and the `aot`/native-integration tiers (see `aot`/
     // `integration` below) — each has a different cost profile and doesn't
     // belong in the same "did I break the language" everyday check.
-    const conformance_step = b.step("conformance", "Validate language conformance (manifest + lexer/parser/modules fixtures)");
+    const conformance_step = b.step("conformance", "Validate language conformance (manifest + lexer/parser/modules fixtures + docs/src examples)");
     conformance_step.dependOn(&run_manifest_tests.step);
     conformance_step.dependOn(&run_outcome_tests.step);
     conformance_step.dependOn(&run_matrix_semantic_tests.step);
@@ -553,6 +569,7 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&run_parser_conformance_tests.step);
     conformance_step.dependOn(&run_modules_conformance_tests.step);
     conformance_step.dependOn(&run_demo_parser_tests.step);
+    conformance_step.dependOn(&run_docs_examples_tests.step);
 
     // `zig build integration` — native-only resources (SQLite/FFI/HTTP),
     // exercising real files/sockets/dynamic libraries, not mocks.

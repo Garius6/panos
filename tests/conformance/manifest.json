@@ -710,6 +710,18 @@
         "result": "[ОТЛАДКА] тест\n[ИНФО] тест\n[ПРЕДУПРЕЖДЕНИЕ] тест\n[ОШИБКА] тест\n[КРИТИЧНО] тест\ntrue",
         "stdout": "[ОТЛАДКА] тест\n[ИНФО] тест\n[ПРЕДУПРЕЖДЕНИЕ] тест\n[ОШИБКА] тест\n[КРИТИЧНО] тест\ntrue"
       }
+    },
+    {
+      "id": "graph-type-alias",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/type_alias_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "30",
+        "result": "30"
+      }
     }
   ]
 }

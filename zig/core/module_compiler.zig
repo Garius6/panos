@@ -77,6 +77,7 @@ pub const GraphCompileResult = struct {
 const ImportContext = struct {
     allocator: std.mem.Allocator,
     imported_types: std.ArrayList(type_checker.ImportedSymbolType) = .empty,
+    type_aliases: std.ArrayList(type_checker.ImportedSymbolType) = .empty,
     nominals: std.ArrayList(type_checker.ImportedNominal) = .empty,
     methods: std.ArrayList(type_checker.ImportedMethod) = .empty,
     impls: std.ArrayList(type_checker.ImportedImpl) = .empty,
@@ -103,6 +104,7 @@ const ImportContext = struct {
         for (self.methods.items) |method| if (method.parameter_names.len != 0) self.allocator.free(method.parameter_names);
         self.methods.deinit(self.allocator);
         self.nominals.deinit(self.allocator);
+        self.type_aliases.deinit(self.allocator);
         self.imported_types.deinit(self.allocator);
         self.* = undefined;
     }
@@ -401,6 +403,29 @@ const ImportContext = struct {
 
             switch (exported.kind) {
                 .type => {
+                    // A TYPE ALIAS (`тип Обработчик = функ(Число) -> Число`)
+                    // is not a nominal at all — no fields/enum variants/
+                    // interface methods, `target_checked.enum_definitions`
+                    // /`generic_nominal_fields`/`interface_definitions`
+                    // are all correctly null for it, so the nominal-
+                    // bridging block below would mint an EMPTY opaque
+                    // nominal with no usable shape. Bridge it as an alias
+                    // instead — `target_checked.type_aliases` is always
+                    // populated for every declared alias by now (`type_
+                    // checker.zig`'s `eagerAliasResolutionPass`, forced
+                    // regardless of whether the DEFINING module ever
+                    // references its own alias locally — this exact case:
+                    // a `_lib.pns` that declares an alias purely for other
+                    // modules to import never triggers lazy resolution on
+                    // its own).
+                    if (target_checked.type_aliases.get(target_symbol)) |aliased_type| {
+                        try self.type_aliases.append(self.allocator, .{
+                            .symbol = imported_symbol,
+                            .store = &target_checked.types,
+                            .type_id = aliased_type,
+                        });
+                        continue;
+                    }
                     const identity = if (isPreludeTypeName(exported.name)) 0 else try nominalIdentity(nominal_identities, next_nominal_identity, origin);
                     const enum_definition = target_checked.enum_definitions.get(target_symbol);
                     const generic_struct = target_checked.generic_nominal_fields.get(target_symbol);
@@ -888,6 +913,7 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
 
         result.modules[module_index].checked = try type_checker.checkWithImportContextForTarget(allocator, &module.tree, resolution, .{
             .symbols = imports.imported_types.items,
+            .type_aliases = imports.type_aliases.items,
             .nominals = imports.nominals.items,
             .methods = imports.methods.items,
             .impls = imports.impls.items,

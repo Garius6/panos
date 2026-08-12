@@ -187,6 +187,20 @@ pub const ImportedImpl = struct {
 
 pub const ImportContext = struct {
     symbols: []const ImportedSymbolType = &.{},
+    // A qualified reference to a TYPE ALIAS (`lib.Обработчик`, `тип
+    // Обработчик = функ(Число) -> Число` in `lib`) — reuses
+    // `ImportedSymbolType`'s exact shape (symbol/store/type_id) since
+    // bridging one is structurally identical to bridging an imported
+    // function's signature (`imports.symbols` below): copy the
+    // ALREADY-RESOLVED aliased `TypeId` from the defining module's own
+    // store into this module's, via `copyImportedType`. Kept as a
+    // SEPARATE list (not merged into `symbols`) because the two feed
+    // different result maps — `symbols` populates `symbol_types` (VALUE
+    // symbols: functions/constants), this populates `type_aliases` (TYPE
+    // symbols, consulted by `resolveType`'s `.qualified` case). Generic
+    // type aliases are out of scope here (`ImportedSymbolType.
+    // generic_parameters` is ignored for entries in this list).
+    type_aliases: []const ImportedSymbolType = &.{},
     nominals: []const ImportedNominal = &.{},
     methods: []const ImportedMethod = &.{},
     impls: []const ImportedImpl = &.{},
@@ -809,6 +823,13 @@ const Checker = struct {
             };
             try self.result.symbol_types.put(imported.symbol, copied);
         }
+        for (imports.type_aliases) |imported| {
+            const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals, null) catch |err| switch (err) {
+                error.UnsupportedImportedType => continue,
+                else => return err,
+            };
+            try self.result.type_aliases.put(imported.symbol, copied);
+        }
         for (imports.methods) |imported| {
             const owner_remap = owner_remaps.getPtr(imported.owner);
             const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals, owner_remap) catch |err| switch (err) {
@@ -969,6 +990,30 @@ const Checker = struct {
             };
             const symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
             try self.result.alias_type_nodes.put(symbol, alias.aliased_type);
+        }
+    }
+
+    // Force-resolves EVERY declared alias into `self.result.type_aliases`
+    // regardless of whether this module's OWN code ever references it —
+    // `resolveAlias` is otherwise purely lazy (only resolved the first
+    // time a REFERENCE is type-checked), which is fine for same-module
+    // use but leaves an EXPORTED-ONLY alias (declared, never used
+    // locally — e.g. a type alias meant purely for other modules to
+    // import) with no entry at all by the time this module's `CheckResult`
+    // is done. `module_compiler.zig`'s cross-module bridging needs that
+    // entry to exist unconditionally so a qualified reference
+    // (`lib.Обработчик`) in a DIFFERENT module can find the real aliased
+    // shape (e.g. a function type) instead of falling back to an opaque
+    // nominal with no callable shape at all — real gap found via exactly
+    // that scenario (`тип Обработчик = функ(Число) -> Число`, declared in
+    // one file, only ever REFERENCED from another).
+    fn eagerAliasResolutionPass(self: *Checker) !void {
+        var it = self.result.alias_type_nodes.keyIterator();
+        while (it.next()) |symbol_ptr| {
+            const symbol = symbol_ptr.*;
+            if (self.result.type_aliases.contains(symbol)) continue;
+            const span = if (self.resolution.symbols.get(symbol)) |entry| entry.span else source.Span{ .file_id = 0, .start = 0, .end = 0 };
+            _ = try self.resolveAlias(symbol, span);
         }
     }
 
@@ -4624,6 +4669,18 @@ const Checker = struct {
                     try self.report(qualified.span, "Type Error: неизвестный тип '{s}.{s}'", .{ qualified.module_name, qualified.name });
                     break :blk try self.result.types.poison();
                 };
+                // A qualified TYPE ALIAS (`lib.Обработчик`) bridged via
+                // `ImportContext.type_aliases` — checked BEFORE
+                // `nominalType` below, which would otherwise wrap it as
+                // an opaque nominal with no callable/structural shape at
+                // all (real bug: a qualified alias for a function type
+                // was never recognized as callable across a module
+                // boundary, even though the exact same alias resolved
+                // fine when referenced unqualified within its own file —
+                // see `resolveType`'s `.ident` case, which already
+                // checks `alias_type_nodes` this way for the same-module
+                // case).
+                if (self.result.type_aliases.get(symbol)) |aliased| break :blk aliased;
                 var arguments: std.ArrayList(types.TypeId) = .empty;
                 defer arguments.deinit(self.result.allocator);
                 for (qualified.parameters) |parameter| try arguments.append(self.result.allocator, try self.resolveType(parameter));
@@ -5843,6 +5900,7 @@ pub fn checkWithImportContextForTarget(
     var owner_parameters_by_symbol = std.AutoHashMap(symbols.SymbolId, []const GenericParameter).init(allocator);
     defer owner_parameters_by_symbol.deinit();
     try checker.typeAliasPass();
+    try checker.eagerAliasResolutionPass();
     try checker.preludePass();
     try checker.enumPass();
     try checker.interfacePass();

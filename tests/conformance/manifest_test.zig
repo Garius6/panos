@@ -11,6 +11,6 @@ test "populated manifest validates through the public parser" {
     // `matrix_{semantic,runtime,native,aot}_test.zig` callers) for the
     // tests that actually RUN them against Zig and check the recorded
     // outcome.
-    try std.testing.expectEqual(@as(usize, 48), parsed.value.cases.len);
+    try std.testing.expectEqual(@as(usize, 49), parsed.value.cases.len);
     try std.testing.expectEqualStrings("semantic-undefined-name", parsed.value.cases[0].id);
 }

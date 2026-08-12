@@ -16,7 +16,7 @@ test "integration: file_roundtrip.ps writes then reads a real file" {
     const source = @embedFile("native/file_roundtrip.pns");
     var result = try panos_core.runner.runSource(std.testing.allocator, "file_roundtrip.pns", source);
     defer result.deinit();
-    defer deleteTempFile("zzz_integration_native_file.tmp");
+    defer deleteTempFile(".zig-cache/zzz_integration_native_file.tmp");
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
     switch (result.execution orelse return error.TestUnexpectedResult) {
         .success => |output| try std.testing.expectEqualStrings("панос-интеграция", output),
@@ -28,7 +28,7 @@ test "integration: sqlite_roundtrip.ps creates, inserts, and queries a real SQLi
     const source = @embedFile("native/sqlite_roundtrip.pns");
     var result = try panos_core.runner.runSource(std.testing.allocator, "sqlite_roundtrip.pns", source);
     defer result.deinit();
-    defer deleteTempFile("zzz_integration_native_sqlite.tmp");
+    defer deleteTempFile(".zig-cache/zzz_integration_native_sqlite.tmp");
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
     switch (result.execution orelse return error.TestUnexpectedResult) {
         .success => |output| try std.testing.expectEqualStrings("панос", output),

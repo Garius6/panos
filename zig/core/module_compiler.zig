@@ -116,6 +116,18 @@ const ImportContext = struct {
     // all) when the interface has no default methods, matching
     // `ImportedNominal.interface_methods` itself staying `null` for a
     // non-interface nominal.
+    //
+    // WARNING for future callers: this mints a FRESH synthetic symbol on
+    // every call, with no dedup of its own — every existing caller
+    // (`collect`'s direct-import loop and `collectTransitiveNominals`)
+    // is only safe because BOTH append to the same `self.nominals` array
+    // and dedup against it BEFORE calling this (`collectTransitiveNominals`
+    // explicitly scans `self.nominals.items` for an already-known
+    // `(store, source_symbol)` pair and returns early). A third
+    // collection path that calls this without first checking
+    // `self.nominals` the same way would silently double-mint symbols
+    // for the same interface — not a crash, just duplicate/leaked
+    // synthetic bindings.
     fn bridgeDefaultMethodSymbols(self: *ImportContext, resolution: *resolver.Resolution, definition_compiled: *const compiler.CompileResult, methods: []const type_checker.InterfaceMethod) !?[]const ?symbols.SymbolId {
         var any_default = false;
         for (methods) |method| {
@@ -148,6 +160,38 @@ const ImportContext = struct {
         }
         try self.default_method_symbol_arrays.append(self.allocator, result);
         return result;
+    }
+
+    // Shared by the direct-import (`collect`) and transitive-import
+    // (`collectTransitiveNominals`) paths — both re-host a nominal's
+    // interface implementations the same way, differing only in which
+    // module/resolution/target symbol the source data comes from.
+    fn appendMatchingImpls(
+        self: *ImportContext,
+        graph: *const module_loader.Graph,
+        origin_module: usize,
+        origin_declaration: ast.DeclId,
+        source_checked: *const type_checker.CheckResult,
+        source_resolution: *const resolver.Resolution,
+        source_target_symbol: symbols.SymbolId,
+        owner_symbol: symbols.SymbolId,
+    ) !void {
+        for (graph.impls.items) |impl_export| {
+            if (impl_export.module != origin_module or impl_export.owner_declaration != origin_declaration) continue;
+            for (source_checked.interface_implementations.items) |implementation| {
+                if (implementation.target != source_target_symbol) continue;
+                const interface_symbol = source_resolution.symbols.get(implementation.interface) orelse continue;
+                if (!std.mem.eql(u8, interface_symbol.name, impl_export.interface_name)) continue;
+                try self.impls.append(self.allocator, .{
+                    .owner = owner_symbol,
+                    .interface_name = impl_export.interface_name,
+                    .method_symbols = implementation.methods,
+                    .target_resolution = source_resolution,
+                    .store = &source_checked.types,
+                    .argument_type_ids = implementation.arguments,
+                });
+            }
+        }
     }
 
     fn collect(
@@ -224,22 +268,7 @@ const ImportContext = struct {
                         .interface_methods = interface_methods,
                         .default_method_symbols = default_method_symbols,
                     });
-                    for (graph.impls.items) |impl_export| {
-                        if (impl_export.module != origin.module or impl_export.owner_declaration != origin.declaration) continue;
-                        for (target_checked.interface_implementations.items) |implementation| {
-                            if (implementation.target != target_symbol) continue;
-                            const interface_symbol = target_resolution.symbols.get(implementation.interface) orelse continue;
-                            if (!std.mem.eql(u8, interface_symbol.name, impl_export.interface_name)) continue;
-                            try self.impls.append(self.allocator, .{
-                                .owner = imported_symbol,
-                                .interface_name = impl_export.interface_name,
-                                .method_symbols = implementation.methods,
-                                .target_resolution = target_resolution,
-                                .store = &target_checked.types,
-                                .argument_type_ids = implementation.arguments,
-                            });
-                        }
-                    }
+                    try self.appendMatchingImpls(graph, origin.module, origin.declaration, target_checked, target_resolution, target_symbol, imported_symbol);
                 },
                 .function => {
                     const signature = target_checked.symbol_types.get(target_symbol) orelse continue;
@@ -489,22 +518,7 @@ const ImportContext = struct {
                 // anywhere) — its interface DEFAULT METHOD dispatch
                 // (`inferDefaultInterfaceMethodCall`) had nothing to find
                 // in the consuming module's OWN `interface_implementations`.
-                for (graph.impls.items) |impl_export| {
-                    if (impl_export.module != origin.module or impl_export.owner_declaration != origin.declaration) continue;
-                    for (definition_checked.interface_implementations.items) |implementation| {
-                        if (implementation.target != definition_symbol) continue;
-                        const interface_symbol = definition_resolution.symbols.get(implementation.interface) orelse continue;
-                        if (!std.mem.eql(u8, interface_symbol.name, impl_export.interface_name)) continue;
-                        try self.impls.append(self.allocator, .{
-                            .owner = local_symbol,
-                            .interface_name = impl_export.interface_name,
-                            .method_symbols = implementation.methods,
-                            .target_resolution = definition_resolution,
-                            .store = &definition_checked.types,
-                            .argument_type_ids = implementation.arguments,
-                        });
-                    }
-                }
+                try self.appendMatchingImpls(graph, origin.module, origin.declaration, definition_checked, definition_resolution, definition_symbol, local_symbol);
                 // The source resolver never created a binding for this
                 // method in the importing module, so create one alongside
                 // the synthetic owner.  The compiler then links it to the

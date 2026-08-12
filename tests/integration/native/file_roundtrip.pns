@@ -1,6 +1,6 @@
 экспорт функ старт() -> Строка
-    фс.записать("zzz_integration_native_file.tmp", "панос-интеграция")
-    выбор фс.прочитать("zzz_integration_native_file.tmp")
+    фс.записать(".zig-cache/zzz_integration_native_file.tmp", "панос-интеграция")
+    выбор фс.прочитать(".zig-cache/zzz_integration_native_file.tmp")
         Успех(содержимое) -> содержимое
         Неудача(ошибка) -> "ошибка:" + ошибка.сообщение
     конец

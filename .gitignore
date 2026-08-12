@@ -16,3 +16,4 @@ docs/book/
 zig-out/
 /panos
 /panos-lsp
+.projectile

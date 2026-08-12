@@ -183,30 +183,30 @@ const Compiler = struct {
         }
     }
 
-    fn registerComparableMethods(self: *Compiler) !void {
+    // Shared by `registerComparableMethods`/`registerCopyableMethods` —
+    // both scan for a single-method interface implementation by name and
+    // register the compiled method under the target struct's name, only
+    // differing in which interface they look for and which `Program.add*`
+    // table they feed. `отправить` needs the copyable one to look up a
+    // custom `клонировать()` override by the message's runtime struct name
+    // (see `vm.zig`'s `send`), restoring copy-on-send (ROADMAP.md Стадия 24).
+    fn registerSingleMethodInterface(self: *Compiler, interface_name: []const u8, register: *const fn (*bytecode.Program, []const u8, bytecode.FunctionId) std.mem.Allocator.Error!void) !void {
         for (self.checked.interface_implementations.items) |implementation| {
             const interface = self.resolution.symbols.get(implementation.interface) orelse continue;
-            if (!std.mem.eql(u8, interface.name, "Сравниваемое")) continue;
+            if (!std.mem.eql(u8, interface.name, interface_name)) continue;
             const target = self.resolution.symbols.get(implementation.target) orelse continue;
             const method_symbol = implementation.methods[0];
             const method = self.result.function_ids.get(method_symbol) orelse continue;
-            try self.program().addComparableMethod(target.name, method);
+            try register(self.program(), target.name, method);
         }
     }
 
-    // Same pattern as `registerComparableMethods` — `отправить` needs to
-    // look up a custom `клонировать()` override by the message's runtime
-    // struct name (see `vm.zig`'s `send`), restoring copy-on-send
-    // (ROADMAP.md Стадия 24).
+    fn registerComparableMethods(self: *Compiler) !void {
+        try self.registerSingleMethodInterface("Сравниваемое", bytecode.Program.addComparableMethod);
+    }
+
     fn registerCopyableMethods(self: *Compiler) !void {
-        for (self.checked.interface_implementations.items) |implementation| {
-            const interface = self.resolution.symbols.get(implementation.interface) orelse continue;
-            if (!std.mem.eql(u8, interface.name, "Копируемое")) continue;
-            const target = self.resolution.symbols.get(implementation.target) orelse continue;
-            const method_symbol = implementation.methods[0];
-            const method = self.result.function_ids.get(method_symbol) orelse continue;
-            try self.program().addCopyableMethod(target.name, method);
-        }
+        try self.registerSingleMethodInterface("Копируемое", bytecode.Program.addCopyableMethod);
     }
 
     fn compileLambdas(self: *Compiler) !void {
@@ -490,16 +490,17 @@ const FunctionCompiler = struct {
             // arguments` are this cast's CONCRETE instantiation,
             // `implementation.arguments` are still expressed over the
             // target's OWN placeholders, e.g. `[U_of_Отображённый]` —
-            // never exact-equal to any concrete instantiation). Safe
-            // WITHOUT re-deriving the same substitution logic here: a
-            // generic target can only ever have ONE `реализация` block
-            // per interface (unlike the non-generic multi-arg case
-            // above — panos generics aren't parametrized enough to
-            // write two DIFFERENT bodies for two different
-            // instantiations of the same generic target), and
-            // type-checking (`registerInterfaceCast`, via `type_checker
-            // .findInterfaceImplementation`) already verified THIS
-            // SPECIFIC cast is sound before ever recording it here.
+            // never exact-equal to any concrete instantiation). This
+            // relies on a generic target having only ONE `реализация`
+            // block per interface, which is NOT statically enforced
+            // anywhere — so unlike the exact-match pass above (which
+            // genuinely can't be ambiguous, since two candidates with
+            // identical `.arguments` would be a duplicate `реализация`
+            // caught elsewhere), the fallback keeps scanning for a
+            // SECOND symbol-only match and reports an error instead of
+            // silently picking whichever came first: picking wrong here
+            // means compiling the WRONG vtable, not just a wrong static
+            // type — a real, not merely theoretical, correctness risk.
             const implementation = blk: {
                 for (self.compiler.checked.interface_implementations.items) |candidate| {
                     if (candidate.interface != entry.interface or candidate.target != entry.target or candidate.arguments.len != entry.arguments.len) continue;
@@ -507,9 +508,16 @@ const FunctionCompiler = struct {
                         if (!self.compiler.checked.types.eql(actual, expected)) break;
                     } else break :blk candidate;
                 }
+                var fallback: ?type_checker.InterfaceImplementation = null;
                 for (self.compiler.checked.interface_implementations.items) |candidate| {
-                    if (candidate.interface == entry.interface and candidate.target == entry.target) break :blk candidate;
+                    if (candidate.interface != entry.interface or candidate.target != entry.target) continue;
+                    if (fallback != null) {
+                        try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: неоднозначная реализация интерфейса — несколько подходящих 'реализация' блоков", .{});
+                        return;
+                    }
+                    fallback = candidate;
                 }
+                if (fallback) |candidate| break :blk candidate;
                 try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти реализацию интерфейса", .{});
                 return;
             };
@@ -2437,6 +2445,51 @@ test "compiler emits closures for captured lambdas" {
     try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
     try std.testing.expectEqual(@as(u16, 1), compiled.program.functions.items[1].capture_count);
     try std.testing.expectEqual(bytecode.Instruction{ .build_closure = .{ .function_id = @enumFromInt(1), .capture_count = 1 } }, compiled.program.functions.items[0].instructions.items[3]);
+}
+
+test "compiler rejects vtable-ambiguous interface cast when a generic target implements the same interface twice" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "тип Ит[T] = интерфейс\n" ++
+            "функ х(это: Ит(T)) -> T\n" ++
+            "это.х()\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "тип Обёртка[T] = структура\n" ++
+            "знач: T\n" ++
+            "конец\n" ++
+            "реализация Ит для Обёртка\n" ++
+            "функ х(это: Обёртка) -> T\n" ++
+            "это.знач\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "реализация Ит для Обёртка\n" ++
+            "функ х(это: Обёртка) -> T\n" ++
+            "это.знач\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "функ показать(значение: Ит(Число)) -> Число\n" ++
+            "значение.х()\n" ++
+            "конец\n" ++
+            "функ старт() -> Число\n" ++
+            "показать(Обёртка(1.0))\n" ++
+            "конец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    var compiled = try compile(std.testing.allocator, &parsed.ast, &resolved, &checked);
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), compiled.diagnostics.items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, compiled.diagnostics.items.items[0].message, "неоднозначная реализация интерфейса") != null);
 }
 
 test "compiler diagnostics outlive the compilation pass" {

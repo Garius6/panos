@@ -373,6 +373,21 @@ pub fn findInterfaceImplementation(checked: *const CheckResult, interface: symbo
         }
         if (exact) return implementation;
         const target_params = nominalParametersOf(checked, target);
+        // A target with more than `generic_substitution_pair_limit`
+        // generic parameters silently falls through to "not found" here
+        // rather than a clearer "too many generic parameters" diagnostic
+        // — deliberately not fixed with a `report()` call: this function
+        // (via `interfaceImplementation`) is reached through `assignable`,
+        // a `*const Checker`, extremely pervasively-called, SPECULATIVE
+        // compatibility query (many call sites just want a bool, without
+        // committing to "this IS a type error" — the eventual real
+        // diagnostic, if any, is reported by whichever caller actually
+        // needed the answer). Reporting from here would need `assignable`
+        // itself to become mutable/fallible, a large ripple for a case
+        // that in practice is never hit (8 generic parameters on one
+        // target is not a realistic program). Fail-closed (silently
+        // "not found", same as any other non-match) is safe; only the
+        // error TEXT would be misleading if this were ever actually hit.
         if (target_params.len != target_arguments.len or target_params.len > generic_substitution_pair_limit) continue;
         var buffer: [generic_substitution_pair_limit]GenericSubstitutionPair = undefined;
         for (target_params, target_arguments, 0..) |param, concrete, i| buffer[i] = .{ .placeholder = param.typ, .concrete = concrete };
@@ -404,6 +419,15 @@ fn matchesGenericPatternOf(checked: *const CheckResult, pattern: types.TypeId, c
         for (pairs) |pair| {
             if (pair.placeholder.eql(pattern)) return checked.types.eql(pair.concrete, concrete);
         }
+        // `pattern` is a generic placeholder with no entry in `pairs` —
+        // it belongs to some OTHER generic scope than the one being
+        // substituted here (a caller bug: `pairs` should always cover
+        // every placeholder actually reachable from `pattern`). Falls
+        // back to plain identity comparison, which is almost always
+        // false and therefore fail-closed (a spurious "no match" is
+        // safe; a spurious match would not be) — not a reported error,
+        // since this is an internal invariant check, not a user-facing
+        // type mismatch.
         return checked.types.eql(pattern, concrete);
     }
     const concrete_entry = checked.types.get(concrete) orelse return false;
@@ -3039,16 +3063,10 @@ const Checker = struct {
     // pass only makes the two DISTINGUISHABLE in the type representation
     // itself (`types.zig`'s `Type.unconstrained`), it does not change
     // when either one is treated as "unconstrained" for checking
-    // purposes. Use `isUnconstrained` below when the distinction itself
-    // (not just "skip checking") actually matters.
+    // purposes.
     fn isPoison(self: *const Checker, type_id: types.TypeId) bool {
         const entry = self.result.types.get(type_id) orelse return false;
         return entry.* == .poison or entry.* == .unconstrained;
-    }
-
-    fn isUnconstrained(self: *const Checker, type_id: types.TypeId) bool {
-        const entry = self.result.types.get(type_id) orelse return false;
-        return entry.* == .unconstrained;
     }
 
     fn isNever(self: *const Checker, type_id: types.TypeId) bool {
@@ -4953,6 +4971,14 @@ const Checker = struct {
             .nominal => |value| value,
             else => return null,
         };
+        // Scan the FULL implementation list before deciding — a value
+        // whose concrete struct implements two DIFFERENT interfaces that
+        // both declare a default method of the same name must be
+        // rejected as ambiguous, not silently resolved to whichever
+        // interface happens to appear first in `interface_implementations`
+        // (an emergent, typechecker-pass-order artifact the user has no
+        // control over).
+        var matched_interface_type: ?types.TypeId = null;
         for (self.result.interface_implementations.items) |implementation| {
             if (implementation.target != nominal.symbol) continue;
             const definition = self.result.interface_definitions.get(implementation.interface) orelse continue;
@@ -4986,10 +5012,15 @@ const Checker = struct {
             for (implementation.arguments) |argument| try interface_arguments.append(self.result.allocator, try self.substituteGeneric(argument, &substitutions));
             const interface_type = try self.result.types.nominal(implementation.interface, interface_arguments.items);
             if (!self.assignable(object_type, interface_type)) continue;
-            try self.registerInterfaceCast(property.object, object_type, interface_type);
-            return try self.inferInterfaceCall(expression, call, property, interface_type);
+            if (matched_interface_type) |_| {
+                try self.report(call.span, "Type Error: неоднозначный вызов default-метода '{s}' — реализован несколькими интерфейсами", .{property.property});
+                return try self.result.types.poison();
+            }
+            matched_interface_type = interface_type;
         }
-        return null;
+        const interface_type = matched_interface_type orelse return null;
+        try self.registerInterfaceCast(property.object, object_type, interface_type);
+        return try self.inferInterfaceCall(expression, call, property, interface_type);
     }
 
     // `это.метод()` where `это`'s static type is a bare GENERIC
@@ -6330,6 +6361,54 @@ test "type checker allows a self-typed interface method call through an interfac
     defer checked.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "type checker rejects a default-method call ambiguous between two interfaces" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "тип А = интерфейс\n" ++
+            "функ обязательныйА() -> Число\n" ++
+            "функ показать(это: А) -> Строка\n" ++
+            "\"a\"\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "тип Б = интерфейс\n" ++
+            "функ обязательныйБ() -> Число\n" ++
+            "функ показать(это: Б) -> Строка\n" ++
+            "\"b\"\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "тип Коробка = структура\n" ++
+            "х: Число\n" ++
+            "конец\n" ++
+            "реализация А для Коробка\n" ++
+            "функ обязательныйА(это: Коробка) -> Число\n" ++
+            "1.0\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "реализация Б для Коробка\n" ++
+            "функ обязательныйБ(это: Коробка) -> Число\n" ++
+            "2.0\n" ++
+            "конец\n" ++
+            "конец\n" ++
+            "функ старт() -> Строка\n" ++
+            "Коробка(1.0).показать()\n" ++
+            "конец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, checked.diagnostics.items.items[0].message, "неоднозначный вызов default-метода") != null);
 }
 
 test "type checker does not warn when an if has no else (false path falls through)" {

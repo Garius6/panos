@@ -150,6 +150,7 @@ fn formatTypeName(
             break :blk std.fmt.allocPrint(allocator, "Соответствие({s}, {s})", .{ key, mapped_value });
         },
         .process => |message| formatWrappedType(allocator, store, symbol_store, "Процесс", message),
+        .message => |payload| formatWrappedType(allocator, store, symbol_store, "Сообщение", payload),
         .pointer => |pointee| formatWrappedType(allocator, store, symbol_store, "Указатель", pointee),
         .generic_parameter => |identifier| std.fmt.allocPrint(allocator, "T{d}", .{identifier}),
         .poison => allocator.dupe(u8, "<ошибка типа>"),

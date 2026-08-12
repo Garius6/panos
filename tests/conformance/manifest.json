@@ -722,6 +722,27 @@
         "stdout": "30",
         "result": "30"
       }
+    },
+    {
+      "id": "graph-spawn-qualified-bad-type",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/spawn_qualified_bad_type_fixture_main.pns",
+      "expected": {
+        "status": "diagnostic",
+        "exit_code": 1,
+        "stdout": "",
+        "diagnostics": [
+          {
+            "phase": "type_checker",
+            "severity": "err",
+            "path": "fixtures/spawn_qualified_bad_type_fixture_main.pns",
+            "start_byte": 476,
+            "end_byte": 545,
+            "message": "Type Error: отправляемое значение не совпадает с типом сообщения процесса"
+          }
+        ]
+      }
     }
   ]
 }

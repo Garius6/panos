@@ -70,6 +70,20 @@ pub const Type = union(enum) {
     // so `запусти`/`ждать` treat T as "the eventual result", matching what
     // was previously a separate `Задача(R)` type before it was folded in.
     process: TypeId,
+    // `Сообщение(T)` — a marker return-type for a `-> Пусто`-shaped actor
+    // function DECLARING (not letting the checker infer) the message type
+    // its `получить()`/`выбор получить() ... конец` body accepts. Exists
+    // ONLY in return-type-annotation position (`resolveType`'s `.generic`
+    // case is the sole place that constructs it) — a value of this type
+    // is never actually produced or held anywhere, matching how the
+    // function's body never needs to return a real value for it (see
+    // `checkFunction`'s void-like exhaustiveness exemption). `запусти`
+    // reads T straight off it (`inferSpawn`) to type the resulting
+    // `Процесс(T)` handle from the callee's SIGNATURE alone — no
+    // analysis of the callee's body needed, unlike the general case this
+    // replaces for actor-shaped spawns (see `process`'s own doc comment
+    // above).
+    message: TypeId,
     pointer: TypeId,
     generic_parameter: u32,
     poison: void,
@@ -177,9 +191,14 @@ pub const TypeStore = struct {
         return self.add(.{ .map = .{ .key = key, .value = value } });
     }
 
-    pub fn process(self: *TypeStore, message: TypeId) !TypeId {
-        try self.ensureOwned(message);
-        return self.add(.{ .process = message });
+    pub fn process(self: *TypeStore, payload: TypeId) !TypeId {
+        try self.ensureOwned(payload);
+        return self.add(.{ .process = payload });
+    }
+
+    pub fn message(self: *TypeStore, payload: TypeId) !TypeId {
+        try self.ensureOwned(payload);
+        return self.add(.{ .message = payload });
     }
 
     pub fn pointer(self: *TypeStore, pointee: TypeId) !TypeId {
@@ -234,6 +253,10 @@ pub const TypeStore = struct {
             },
             .process => |left_message| switch (right_type.*) {
                 .process => |right_message| self.eql(left_message, right_message),
+                else => false,
+            },
+            .message => |left_payload| switch (right_type.*) {
+                .message => |right_payload| self.eql(left_payload, right_payload),
                 else => false,
             },
             .pointer => |left_pointee| switch (right_type.*) {

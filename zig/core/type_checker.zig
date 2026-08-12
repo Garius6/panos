@@ -973,6 +973,16 @@ const Checker = struct {
                 try self.copyImportedTypeOrPoison(external_store, map.value, nominals, generic_remap),
             ),
             .process => |message| self.result.types.process(try self.copyImportedTypeOrPoison(external_store, message, nominals, generic_remap)),
+            // `Сообщение(T)` never actually needs cross-module copying in
+            // practice (it only ever appears as a function's OWN declared
+            // return type, consulted locally by `checkFunction`/
+            // `inferSpawn`/the `получить` builtin — never stored in a
+            // field, variable, or generic argument that would need
+            // re-hosting into another module's store) — still handled
+            // here structurally, same shape as `.process`, for
+            // completeness rather than relying on this switch being
+            // silently non-exhaustive.
+            .message => |payload| self.result.types.message(try self.copyImportedTypeOrPoison(external_store, payload, nominals, generic_remap)),
             .pointer => |pointee| self.result.types.pointer(try self.copyImportedTypeOrPoison(external_store, pointee, nominals, generic_remap)),
             .generic_parameter => blk: {
                 const remap = generic_remap orelse return error.UnsupportedImportedType;
@@ -1778,9 +1788,15 @@ const Checker = struct {
         for (parameter_symbols, function_type.parameters) |parameter_symbol, parameter_type| {
             try self.result.symbol_types.put(parameter_symbol, parameter_type);
         }
-        const expected_body = if (self.isType(function_type.return_type, self.result.types.builtins.void)) null else function_type.return_type;
+        // `Сообщение(T)` is void-shaped for THIS purpose — declared purely
+        // to tell a caller's `запусти` what message type the body's
+        // `получить()` accepts, not a real value the body needs to
+        // produce (same exemption `Пусто` already gets: an infinite
+        // `получить()`-loop actor never "returns" in the normal sense).
+        const is_void_like = self.isType(function_type.return_type, self.result.types.builtins.void) or self.isMessageType(function_type.return_type);
+        const expected_body = if (is_void_like) null else function_type.return_type;
         const actual = try self.inferBlockExpected(body, expected_body, false);
-        if (!self.isType(function_type.return_type, self.result.types.builtins.void) and !self.assignable(actual, function_type.return_type)) {
+        if (!is_void_like and !self.assignable(actual, function_type.return_type)) {
             const span = self.tree.decl(declaration).function.span;
             try self.report(span, "Type Error: функция должна возвращать объявленный тип", .{});
         }
@@ -2162,14 +2178,17 @@ const Checker = struct {
             },
         };
         const call_return_type = try self.inferCall(spawn.call, call);
-        // An ordinary long-lived actor is written as a `-> Пусто` function
-        // driven by `получить()` in a loop — `Процесс(T)`'s T on THAT kind
-        // of spawn conventionally annotates the MESSAGE type the actor
-        // accepts, not its (void) return value, and that message type is
-        // not something this checker can infer (would need analyzing
-        // `получить()` call sites inside the callee — a separate, larger
-        // inference feature) — so it stays poison, unchecked, exactly as
-        // before, to avoid breaking every existing actor-style spawn.
+        // A long-lived actor DECLARES its accepted message type via `->
+        // Сообщение(T)` (see `types.zig`'s `Type.message` doc comment) —
+        // read straight off the callee's own signature, no body analysis
+        // needed. Plain `-> Пусто` (the old, still-supported actor shape
+        // with no declared message type) stays `Процесс(poison)`,
+        // unchecked, exactly as before — this is an opt-in annotation,
+        // not a requirement, so every actor that hasn't been updated to
+        // declare `Сообщение(T)` keeps working identically.
+        if (self.messagePayload(call_return_type)) |payload| {
+            return self.result.types.process(payload);
+        }
         // A function that actually RETURNS a value is being used
         // task-style instead (one-shot computation, result read back via
         // `ждать`) — for that case T becomes the real return type, so
@@ -3177,6 +3196,55 @@ const Checker = struct {
         return self.isType(type_id, self.result.types.builtins.never);
     }
 
+    // Shared by `отправить`/`отправить_или` — checks the message argument
+    // against the handle's `Процесс(T)` T (`inferExpected`, same
+    // mechanism a `пер x: T = ...` binding uses, so an enum-variant
+    // constructor like `Команда.Пинг(...)` sent bare still infers
+    // correctly). T is only ever REAL when the target actor declared `->
+    // Сообщение(T)`; plain `-> Пусто` actors keep `Процесс(poison)` (see
+    // `inferSpawn`), so this is a no-op check for every actor that
+    // hasn't opted in — poison is universally assignable, `assignable`'s
+    // own check already short-circuits true for it.
+    fn checkSendMessageType(self: *Checker, span: source.Span, handle: ast.ExprId, message: ast.ExprId) !void {
+        const handle_type = try self.infer(handle);
+        const handle_entry = self.result.types.get(handle_type) orelse return;
+        const expected = switch (handle_entry.*) {
+            .process => |payload| payload,
+            .poison => {
+                _ = try self.infer(message);
+                return;
+            },
+            else => {
+                try self.report(span, "Type Error: отправить() ожидает Процесс(T) первым аргументом", .{});
+                _ = try self.infer(message);
+                return;
+            },
+        };
+        const actual = try self.inferExpected(message, expected);
+        if (self.assignable(actual, expected)) {
+            try self.registerInterfaceCast(message, actual, expected);
+        } else if (!self.isPoison(expected)) {
+            try self.report(span, "Type Error: отправляемое значение не совпадает с типом сообщения процесса", .{});
+        }
+    }
+
+    fn isMessageType(self: *const Checker, type_id: types.TypeId) bool {
+        const entry = self.result.types.get(type_id) orelse return false;
+        return entry.* == .message;
+    }
+
+    // The `T` inside a `-> Сообщение(T)` return-type annotation — `null`
+    // for anything else (including plain `Пусто`, which callers must
+    // check for separately when they want to distinguish "no declared
+    // message type" from "declared void").
+    fn messagePayload(self: *const Checker, type_id: types.TypeId) ?types.TypeId {
+        const entry = self.result.types.get(type_id) orelse return null;
+        return switch (entry.*) {
+            .message => |payload| payload,
+            else => null,
+        };
+    }
+
     fn isErrorConstructor(self: *const Checker, symbol: symbols.SymbolId) bool {
         const entry = self.resolution.symbols.get(symbol) orelse return false;
         return entry.kind == .builtin and std.mem.eql(u8, entry.name, "Ошибка");
@@ -4078,6 +4146,15 @@ const Checker = struct {
             if (self.isBuiltin(symbol, "получить")) {
                 if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить() не принимает аргументы", .{});
                 for (call.arguments) |argument| _ = try self.infer(argument);
+                // Typed when the ENCLOSING function declared `->
+                // Сообщение(T)` (`self.current_return`, set for the
+                // duration of `checkFunction`'s body check) — a purely
+                // LOCAL read of the already-declared signature, not
+                // inference. Stays poison for every other function shape
+                // (including plain `Пусто`), exactly как before.
+                if (self.current_return) |return_type| {
+                    if (self.messagePayload(return_type)) |payload| return payload;
+                }
                 return self.result.types.poison();
             }
             if (self.isBuiltin(symbol, "себя")) {
@@ -4112,8 +4189,12 @@ const Checker = struct {
                 return self.result.types.builtins.void;
             }
             if (self.isBuiltin(symbol, "отправить")) {
-                if (call.arguments.len != 2) try self.report(call.span, "Type Error: отправить() ожидает 2 аргумент(а)", .{});
-                for (call.arguments) |argument| _ = try self.infer(argument);
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: отправить() ожидает 2 аргумент(а)", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                try self.checkSendMessageType(call.span, call.arguments[0], call.arguments[1]);
                 return self.result.types.builtins.void;
             }
             if (self.isBuiltin(symbol, "наблюдать")) {
@@ -4158,8 +4239,12 @@ const Checker = struct {
                 return self.result.types.builtins.void;
             }
             if (self.isBuiltin(symbol, "отправить_или")) {
-                if (call.arguments.len != 2) try self.report(call.span, "Type Error: отправить_или() ожидает 2 аргумент(а)", .{});
-                for (call.arguments) |argument| _ = try self.infer(argument);
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: отправить_или() ожидает 2 аргумент(а)", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.resultOfString(self.result.types.builtins.void) orelse self.result.types.poison();
+                }
+                try self.checkSendMessageType(call.span, call.arguments[0], call.arguments[1]);
                 return self.resultOfString(self.result.types.builtins.void) orelse self.result.types.poison();
             }
             if (self.isBuiltin(symbol, "отмена")) {
@@ -4643,6 +4728,7 @@ const Checker = struct {
                 if (std.mem.eql(u8, generic.name, "Массив") and generic.parameters.len == 1) break :blk try self.result.types.array(try self.resolveType(generic.parameters[0]));
                 if (std.mem.eql(u8, generic.name, "Соответствие") and generic.parameters.len == 2) break :blk try self.result.types.map(try self.resolveType(generic.parameters[0]), try self.resolveType(generic.parameters[1]));
                 if (std.mem.eql(u8, generic.name, "Процесс") and generic.parameters.len == 1) break :blk try self.result.types.process(try self.resolveType(generic.parameters[0]));
+                if (std.mem.eql(u8, generic.name, "Сообщение") and generic.parameters.len == 1) break :blk try self.result.types.message(try self.resolveType(generic.parameters[0]));
                 if (self.findTypeSymbol(generic.name)) |symbol| {
                     var arguments: std.ArrayList(types.TypeId) = .empty;
                     defer arguments.deinit(self.result.allocator);

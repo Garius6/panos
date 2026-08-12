@@ -475,52 +475,36 @@ const FunctionCompiler = struct {
         var vtables: std.ArrayList([]const bytecode.FunctionId) = .empty;
         defer vtables.deinit(self.compiler.result.allocator);
         for (cast.entries) |entry| {
-            // Exact `.arguments` match first — for a NON-generic target,
-            // `implementation.arguments` are already concrete, and this
-            // is what correctly picks between TWO `реализация` blocks
-            // for the SAME (interface, target) at different arguments
-            // (e.g. `реализация Получатель(Число) для Пара` AND
-            // `реализация Получатель(Строка) для Пара` — a real, tested
-            // feature; matching by symbols alone would have silently
-            // picked whichever came first, regardless of which one the
-            // cast site actually asked for).
-            //
-            // Falls back to symbol-only (interface, target) matching
-            // ONLY when exact fails — covers a GENERIC target (`entry.
-            // arguments` are this cast's CONCRETE instantiation,
-            // `implementation.arguments` are still expressed over the
-            // target's OWN placeholders, e.g. `[U_of_Отображённый]` —
-            // never exact-equal to any concrete instantiation). This
-            // relies on a generic target having only ONE `реализация`
-            // block per interface, which is NOT statically enforced
-            // anywhere — so unlike the exact-match pass above (which
-            // genuinely can't be ambiguous, since two candidates with
-            // identical `.arguments` would be a duplicate `реализация`
-            // caught elsewhere), the fallback keeps scanning for a
-            // SECOND symbol-only match and reports an error instead of
-            // silently picking whichever came first: picking wrong here
-            // means compiling the WRONG vtable, not just a wrong static
-            // type — a real, not merely theoretical, correctness risk.
-            const implementation = blk: {
-                for (self.compiler.checked.interface_implementations.items) |candidate| {
-                    if (candidate.interface != entry.interface or candidate.target != entry.target or candidate.arguments.len != entry.arguments.len) continue;
-                    for (candidate.arguments, entry.arguments) |actual, expected| {
-                        if (!self.compiler.checked.types.eql(actual, expected)) break;
-                    } else break :blk candidate;
-                }
-                var fallback: ?type_checker.InterfaceImplementation = null;
-                for (self.compiler.checked.interface_implementations.items) |candidate| {
-                    if (candidate.interface != entry.interface or candidate.target != entry.target) continue;
-                    if (fallback != null) {
-                        try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: неоднозначная реализация интерфейса — несколько подходящих 'реализация' блоков", .{});
-                        return;
-                    }
-                    fallback = candidate;
-                }
-                if (fallback) |candidate| break :blk candidate;
+            // Reuses `type_checker.findInterfaceImplementation` (exact
+            // `.arguments` match first — picks correctly between TWO
+            // `реализация` blocks for the SAME (interface, target) at
+            // different arguments, e.g. `реализация Получатель(Число)
+            // для Пара` AND `реализация Получатель(Строка) для Пара`;
+            // falls back to a precise generic-pattern match, via
+            // `entry.target_arguments`, only when the target itself is
+            // generic and exact fails) instead of an independent copy of
+            // the same matching logic. Opts into the `ambiguous` output
+            // param — unlike `assignable`'s speculative, boolean-only
+            // uses of the same function, picking the wrong candidate
+            // HERE means compiling the wrong vtable at runtime, not just
+            // a wrong static type, so a second matching candidate is a
+            // hard error rather than "pick the first one".
+            var ambiguous = false;
+            const implementation = type_checker.findInterfaceImplementation(
+                self.compiler.checked,
+                entry.interface,
+                entry.arguments,
+                entry.target,
+                entry.target_arguments,
+                &ambiguous,
+            ) orelse {
                 try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: не удалось найти реализацию интерфейса", .{});
                 return;
             };
+            if (ambiguous) {
+                try self.compiler.report(expressionSpan(self.compiler.tree, expression), "Compiler Error: неоднозначная реализация интерфейса — несколько подходящих 'реализация' блоков", .{});
+                return;
+            }
             const methods = try self.compiler.program().arena.allocator().alloc(bytecode.FunctionId, implementation.methods.len);
             for (implementation.methods, methods) |method, *function_id| {
                 function_id.* = self.compiler.result.function_ids.get(method) orelse {

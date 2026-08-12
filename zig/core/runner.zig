@@ -951,6 +951,40 @@ test "runner introspects a real target file through синтаксис.*" {
     }
 }
 
+test "синтаксис.поля renders full generic type text, not a literal placeholder" {
+    const target_path = "zzz_runner_syntax_generic_field.ps";
+    var io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io.deinit();
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = target_path, .data =
+        \\тип Заказ = структура
+        \\    позиции: Массив(Число)
+        \\    примечание: Опция(Строка)
+        \\конец
+    });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), target_path) catch {};
+
+    var result = try runSource(std.testing.allocator, "пример.ps",
+        \\экспорт функ старт() -> Строка
+        \\пер путь = "zzz_runner_syntax_generic_field.ps"
+        \\выбор синтаксис.поля(путь, "Заказ")
+        \\Успех(поля) тогда
+        \\    пер первое = поля.получить(0, ("?", "?"))
+        \\    пер второе = поля.получить(1, ("?", "?"))
+        \\    первое.1 + "|" + второе.1
+        \\конец
+        \\Неудача(о) -> о.сообщение
+        \\конец
+        \\конец
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
+    switch (result.execution orelse return error.TestUnexpectedResult) {
+        .success => |output| try std.testing.expectEqualStrings("Массив(Число)|Опция(Строка)", output),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "runner reports Опция.Нет when an annotation argument is absent" {
     const target_path = "zzz_runner_syntax_no_arg.ps";
     var io = std.Io.Threaded.init(std.testing.allocator, .{});

@@ -55,7 +55,19 @@ pub const Export = struct {
 // method is never reachable by a qualified name (`модуль.метод`), only by
 // dispatch on a value of the owner's nominal type.
 pub const MethodExport = struct {
+    // The module where this method's `функ` body is PHYSICALLY written
+    // (an impl block's own file) — used to dereference `.declaration`
+    // into a real AST node/compiled artifact.
     module: usize,
+    // The module where the TARGET struct/enum is declared — usually
+    // equal to `module` (same-file or consumer-file impl), but distinct
+    // for a qualified target declared in a THIRD file (`реализация X
+    // для Модуль.Тип`, e.g. a codegen-generated `_gen.ps`). Used to
+    // match this method against the RIGHT `Export` entry when building
+    // a consumer's import view (`module_linker.zig`'s
+    // `buildExportsForTarget`) — matching by `module` there would only
+    // ever find same-file impls.
+    owner_module: usize,
     owner_declaration: ast.DeclId,
     declaration: ast.DeclId,
     name: []const u8,
@@ -79,9 +91,25 @@ pub const VariantExport = struct {
 // `InterfaceImplementation` entry itself, not just its methods (which
 // `MethodExport` already covers as ordinary inherent methods).
 pub const ImplExport = struct {
+    // See `MethodExport.module` — the module where the `реализация`
+    // block itself is written.
     module: usize,
+    // See `MethodExport.owner_module` — the module declaring the
+    // target struct/enum (may differ from `module` for a qualified
+    // target in a third file).
+    owner_module: usize,
     owner_declaration: ast.DeclId,
     interface_name: []const u8,
+    // Non-null when the INTERFACE side is also qualified (`реализация
+    // Модуль.Интерфейс для ...` — e.g. codegen's `json.ВJSON`) — the
+    // module/declaration where the interface is itself declared, needed
+    // by `module_compiler.zig` to resolve the interface to a real local
+    // symbol in a consuming module (a bare-name lookup can't find it —
+    // the consumer only has it in scope as `модуль.Интерфейс`, never
+    // unqualified). `null` for a local (unqualified) interface name,
+    // resolved the existing way (`findTypeSymbol` by bare name).
+    interface_module: ?usize = null,
+    interface_declaration: ?ast.DeclId = null,
     span: source.Span,
 };
 
@@ -308,7 +336,6 @@ pub const Graph = struct {
         }
         try self.module_indices.put(stored_path, index);
         try self.collectExports(index);
-        try self.collectMethods(index);
 
         const declarations = self.modules.items[index].tree.program.?.declarations;
         for (declarations) |declaration| {
@@ -326,6 +353,11 @@ pub const Graph = struct {
                 .native_module = resolved.native_module,
             });
         }
+        // Must run AFTER the import loop above — a qualified impl
+        // target (`реализация X для Модуль.Тип`) resolves `Модуль` via
+        // `self.imports`, which only has entries for THIS module's own
+        // imports once that loop has finished.
+        try self.collectMethods(index);
         try self.order.append(self.allocator, index);
         return index;
     }
@@ -478,12 +510,25 @@ pub const Graph = struct {
                 .impl => |value| value,
                 else => continue,
             };
-            if (implementation.target_module != null) continue;
-            const owner_declaration = self.findExportedTypeDeclaration(module, implementation.target_type) orelse continue;
+            // A qualified target (`реализация X для Модуль.Тип`) means
+            // the struct lives in ANOTHER module — resolve that alias
+            // via THIS module's own import table (populated by the
+            // caller before `collectMethods` runs, see `registerModule`/
+            // `appendPreludeModule`) to find which module to search for
+            // the exported declaration. An unresolvable alias (typo,
+            // native-builtin target, etc.) skips this impl silently —
+            // matches the existing silent-skip-on-unknown-target
+            // behavior for the unqualified case below (`orelse continue`).
+            const owner_module = if (implementation.target_module) |alias|
+                self.resolveImportedModule(module, alias) orelse continue
+            else
+                module;
+            const owner_declaration = self.findExportedTypeDeclaration(owner_module, implementation.target_type) orelse continue;
             for (implementation.methods) |method_declaration| {
                 const function = tree.decl(method_declaration).function;
                 try self.methods.append(self.allocator, .{
                     .module = module,
+                    .owner_module = owner_module,
                     .owner_declaration = owner_declaration,
                     .declaration = method_declaration,
                     .name = function.name,
@@ -491,16 +536,43 @@ pub const Graph = struct {
                 });
             }
             if (implementation.interface_name) |interface_name| {
-                if (implementation.interface_module == null) {
-                    try self.impls.append(self.allocator, .{
-                        .module = module,
-                        .owner_declaration = owner_declaration,
-                        .interface_name = interface_name,
-                        .span = implementation.span,
-                    });
+                // Same alias-resolution as the target above, for a
+                // qualified interface (`реализация Модуль.Интерфейс для
+                // ...`, e.g. codegen's `json.ВJSON`) — `null` interface
+                // module/declaration stays the existing local-name path.
+                var interface_module: ?usize = null;
+                var interface_declaration: ?ast.DeclId = null;
+                if (implementation.interface_module) |alias| {
+                    const resolved = self.resolveImportedModule(module, alias) orelse continue;
+                    const interface_decl = self.findExportedTypeDeclaration(resolved, interface_name) orelse continue;
+                    interface_module = resolved;
+                    interface_declaration = interface_decl;
                 }
+                try self.impls.append(self.allocator, .{
+                    .module = module,
+                    .owner_module = owner_module,
+                    .owner_declaration = owner_declaration,
+                    .interface_name = interface_name,
+                    .interface_module = interface_module,
+                    .interface_declaration = interface_declaration,
+                    .span = implementation.span,
+                });
             }
         }
+    }
+
+    // Resolves an import ALIAS (as written in `module`'s own source,
+    // e.g. `"точки"` from `импорт "./точки" как точки`) to the target
+    // module's index, by scanning `self.imports` — populated for a
+    // module's OWN direct imports before `collectMethods` runs on it
+    // (see call sites). Returns `null` for an unresolvable alias
+    // (typo) or a native-builtin import (`.target == null`) — a
+    // qualified impl target can only ever be a real file module.
+    fn resolveImportedModule(self: *const Graph, module: usize, alias: []const u8) ?usize {
+        for (self.imports.items) |import| {
+            if (import.importer == module and std.mem.eql(u8, import.alias, alias)) return import.target;
+        }
+        return null;
     }
 
     fn findExportedTypeDeclaration(self: *const Graph, module: usize, name: []const u8) ?ast.DeclId {

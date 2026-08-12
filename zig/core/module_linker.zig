@@ -25,7 +25,7 @@ pub const ImportScope = struct {
 
         if (prelude_module) |target| {
             if (target != importer) {
-                const exports = try buildExportsForTarget(allocator, &result.arena, graph, target);
+                const exports = try buildExportsForTarget(allocator, &result.arena, graph, target, importer);
                 try modules.append(allocator, .{
                     .alias = "",
                     .span = .{ .file_id = 0, .start = 0, .end = 0 },
@@ -73,7 +73,7 @@ pub const ImportScope = struct {
                 });
                 continue;
             };
-            const exports = try buildExportsForTarget(allocator, &result.arena, graph, target);
+            const exports = try buildExportsForTarget(allocator, &result.arena, graph, target, importer);
             try modules.append(allocator, .{
                 .alias = import.alias,
                 .span = import.span,
@@ -84,7 +84,7 @@ pub const ImportScope = struct {
         return result;
     }
 
-    fn buildExportsForTarget(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator, graph: *const module_loader.Graph, target: usize) ![]const resolver.ImportedExport {
+    fn buildExportsForTarget(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator, graph: *const module_loader.Graph, target: usize, importer: usize) ![]const resolver.ImportedExport {
         var exports: std.ArrayList(resolver.ImportedExport) = .empty;
         defer exports.deinit(allocator);
         for (graph.exports.items) |exported| {
@@ -95,9 +95,23 @@ pub const ImportScope = struct {
             defer variants.deinit(allocator);
             if (exported.kind == .type) {
                 for (graph.methods.items) |method| {
-                    if (method.module != target or method.owner_declaration != exported.declaration) continue;
+                    if (method.owner_module != target or method.owner_declaration != exported.declaration) continue;
+                    // A qualified-target impl declared in THIS SAME
+                    // module (`importer`) that also happens to import
+                    // the struct's own file — the method is already a
+                    // plain LOCAL declaration there, not something to
+                    // bridge as "imported" (bridging it would make
+                    // `importer`'s own `collect()` try to read its OWN
+                    // not-yet-populated `checked`/`compiled` results,
+                    // `error.ImportNotChecked` — real crash found via
+                    // the exact codegen-shaped 3-file test: связка.ps
+                    // implements a qualified interface for точки.Точка,
+                    // and ALSO gets imported directly by consumers of
+                    // связка's own OTHER exports).
+                    if (method.module == importer) continue;
                     try methods.append(allocator, .{
                         .name = method.name,
+                        .module = method.module,
                         .declaration = method.declaration,
                         .span = method.span,
                     });

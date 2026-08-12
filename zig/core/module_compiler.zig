@@ -162,32 +162,113 @@ const ImportContext = struct {
         return result;
     }
 
+    // Does `target` (a symbol within `impl_resolution`, an interface
+    // implementation's `.target`) refer to the SAME struct/enum as
+    // `{origin_module, origin_declaration}`? Two cases: `target` is
+    // itself an import within `impl_resolution` (the common
+    // cross-module case, including a THIRD file — compare origins
+    // directly); or `target` has no import origin at all, meaning it's
+    // a LOCAL declaration in `impl_resolution`'s own module (the
+    // same-file impl case) — then it matches only if that module IS
+    // `origin_module` and `target` is exactly the symbol THAT module's
+    // own resolver minted for `origin_declaration`.
+    fn implementationTargetMatches(impl_resolution: *const resolver.Resolution, target: symbols.SymbolId, impl_own_module: usize, origin_module: usize, origin_declaration: ast.DeclId) bool {
+        if (impl_resolution.imported_symbols.get(target)) |origin| {
+            return origin.module == origin_module and origin.declaration == origin_declaration;
+        }
+        if (impl_own_module != origin_module) return false;
+        return (impl_resolution.decl_symbols.get(origin_declaration) orelse return false) == target;
+    }
+
+    // Reverse lookup — does `resolution` (some OTHER module, not
+    // necessarily the impl's own) have a local symbol standing in for
+    // `{module, declaration}`? Used to resolve a qualified INTERFACE
+    // (codegen's `json.ВJSON`) to a symbol the CONSUMING module can
+    // actually use — a bare-name lookup can't find it there (only in
+    // scope as `модуль.Интерфейс`). `resolution.imported_symbols` is
+    // small (one entry per named cross-module reference in a single
+    // file), a linear scan here is not a hot path.
+    fn findLocalSymbolForOrigin(resolution: *const resolver.Resolution, module: usize, declaration: ast.DeclId) ?symbols.SymbolId {
+        var it = resolution.imported_symbols.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.module == module and entry.value_ptr.declaration == declaration) return entry.key_ptr.*;
+        }
+        return null;
+    }
+
     // Shared by the direct-import (`collect`) and transitive-import
     // (`collectTransitiveNominals`) paths — both re-host a nominal's
     // interface implementations the same way, differing only in which
     // module/resolution/target symbol the source data comes from.
+    //
+    // `impl_export.module` (where the `реализация` block is physically
+    // written) may DIFFER from `origin_module` (where the target struct
+    // is declared) — a qualified impl target in a THIRD file (codegen's
+    // `_gen.ps` shape: `реализация json.ВJSON для json_fixture.Заказ`,
+    // written in neither json_fixture.ps nor the consumer). So this
+    // fetches `interface_implementations` from the IMPL's OWN module's
+    // checked results (`modules[impl_export.module]`), not the target's
+    // — and matches `implementation.target` against `{origin_module,
+    // origin_declaration}` by ORIGIN, not raw `SymbolId` equality
+    // (`implementation.target` lives in the impl module's OWN symbol
+    // table, a DIFFERENT space than `origin_declaration`'s target
+    // module OR the consuming module calling this function — comparing
+    // them directly only ever coincidentally worked for the two
+    // previously-supported shapes, where impl/target/consumer symbol
+    // spaces happened to overlap).
     fn appendMatchingImpls(
         self: *ImportContext,
         graph: *const module_loader.Graph,
+        modules: []const ModuleCompilation,
+        resolution: *const resolver.Resolution,
+        own_module: usize,
         origin_module: usize,
         origin_declaration: ast.DeclId,
-        source_checked: *const type_checker.CheckResult,
-        source_resolution: *const resolver.Resolution,
-        source_target_symbol: symbols.SymbolId,
         owner_symbol: symbols.SymbolId,
     ) !void {
         for (graph.impls.items) |impl_export| {
-            if (impl_export.module != origin_module or impl_export.owner_declaration != origin_declaration) continue;
-            for (source_checked.interface_implementations.items) |implementation| {
-                if (implementation.target != source_target_symbol) continue;
-                const interface_symbol = source_resolution.symbols.get(implementation.interface) orelse continue;
+            if (impl_export.owner_module != origin_module or impl_export.owner_declaration != origin_declaration) continue;
+            // A `реализация` block declared IN THIS SAME module (`own_module`
+            // — e.g. a consumer file that imports a struct and also
+            // implements a qualified interface for it locally) is already
+            // registered directly by that module's own `signaturePass`
+            // (`defineInterfaceImplementation`) — bridging it here too would
+            // read `modules[own_module].checked`, which doesn't exist yet
+            // (we're INSIDE collecting for `own_module` right now, its
+            // `checked` is only set after `collect()` returns) —
+            // `error.ImportNotChecked`, a real crash found via this exact
+            // shape (both the "impl in consumer" and "impl in a third file
+            // that's ALSO imported directly for other exports" tests).
+            if (impl_export.module == own_module) continue;
+            const impl_module = &modules[impl_export.module];
+            const impl_resolution = if (impl_module.resolution) |*value| value else return error.ImportNotCompiled;
+            const impl_checked = if (impl_module.checked) |*value| value else return error.ImportNotChecked;
+            for (impl_checked.interface_implementations.items) |implementation| {
+                if (!implementationTargetMatches(impl_resolution, implementation.target, impl_export.module, origin_module, origin_declaration)) continue;
+                const interface_symbol = impl_resolution.symbols.get(implementation.interface) orelse continue;
                 if (!std.mem.eql(u8, interface_symbol.name, impl_export.interface_name)) continue;
+                // A qualified interface (codegen's `json.ВJSON`) needs a
+                // LOCAL symbol in the CONSUMING module's own resolution
+                // to be usable by `type_checker.zig` (a bare-name lookup
+                // there can't find it — it's only in scope as
+                // `модуль.Интерфейс`, never unqualified). Resolved by
+                // ORIGIN, same principle as the target match above; a
+                // consumer that never itself imports the interface's
+                // module gets `null` here and this impl is skipped for
+                // it (degrades to "not found", not a crash — matches
+                // the existing skip-on-unresolvable pattern throughout
+                // this function).
+                const interface_local_symbol = if (impl_export.interface_module) |interface_module|
+                    findLocalSymbolForOrigin(resolution, interface_module, impl_export.interface_declaration.?) orelse continue
+                else
+                    null;
                 try self.impls.append(self.allocator, .{
                     .owner = owner_symbol,
                     .interface_name = impl_export.interface_name,
+                    .interface_symbol = interface_local_symbol,
                     .method_symbols = implementation.methods,
-                    .target_resolution = source_resolution,
-                    .store = &source_checked.types,
+                    .target_resolution = impl_resolution,
+                    .store = &impl_checked.types,
                     .argument_type_ids = implementation.arguments,
                 });
             }
@@ -201,6 +282,7 @@ const ImportContext = struct {
         nominal_identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
         next_nominal_identity: *u32,
         graph: *const module_loader.Graph,
+        own_module: usize,
     ) !void {
         // `Результат`/`Опция` are prelude types — EVERY module gets its
         // OWN freshly-minted symbol for them (the embedded prelude source
@@ -268,7 +350,7 @@ const ImportContext = struct {
                         .interface_methods = interface_methods,
                         .default_method_symbols = default_method_symbols,
                     });
-                    try self.appendMatchingImpls(graph, origin.module, origin.declaration, target_checked, target_resolution, target_symbol, imported_symbol);
+                    try self.appendMatchingImpls(graph, modules, resolution, own_module, origin.module, origin.declaration, imported_symbol);
                 },
                 .function => {
                     const signature = target_checked.symbol_types.get(target_symbol) orelse continue;
@@ -378,29 +460,29 @@ const ImportContext = struct {
             const imported = self.nominals.items[nominal_index];
             if (imported.fields) |fields| {
                 for (fields) |field| {
-                    try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, imported.definition_store, field.typ);
+                    try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, imported.definition_store, field.typ);
                 }
             }
             if (imported.enum_variants) |variants| {
                 for (variants) |variant| {
                     for (variant.fields) |field| {
-                        try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, imported.definition_store, field);
+                        try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, imported.definition_store, field);
                     }
                 }
             }
             if (imported.interface_methods) |methods| {
                 for (methods) |method| {
                     for (method.parameters) |parameter| {
-                        try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, imported.definition_store, parameter);
+                        try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, imported.definition_store, parameter);
                     }
-                    try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, imported.definition_store, method.return_type);
+                    try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, imported.definition_store, method.return_type);
                 }
             }
         }
         var imported_type_index: usize = 0;
         while (imported_type_index < self.imported_types.items.len) : (imported_type_index += 1) {
             const imported = self.imported_types.items[imported_type_index];
-            try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, imported.store, imported.type_id);
+            try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, imported.store, imported.type_id);
         }
         // Index-based, re-reading `self.methods.items` fresh each
         // iteration — NOT `for (self.methods.items) |method|`, which
@@ -417,7 +499,7 @@ const ImportContext = struct {
         var method_index: usize = 0;
         while (method_index < self.methods.items.len) : (method_index += 1) {
             const method = self.methods.items[method_index];
-            try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, method.store, method.type_id);
+            try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, method.store, method.type_id);
         }
     }
 
@@ -428,18 +510,19 @@ const ImportContext = struct {
         nominal_identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
         next_nominal_identity: *u32,
         graph: *const module_loader.Graph,
+        own_module: usize,
         external_store: *const types.TypeStore,
         external_type: types.TypeId,
     ) !void {
         const entry = external_store.get(external_type) orelse return error.InvalidImportedType;
         switch (entry.*) {
-            .tuple => |elements| for (elements) |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, element),
+            .tuple => |elements| for (elements) |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, element),
             .function => |function| {
-                for (function.parameters) |parameter| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, parameter);
-                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, function.return_type);
+                for (function.parameters) |parameter| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, parameter);
+                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, function.return_type);
             },
             .nominal => |nominal| {
-                for (nominal.arguments) |argument| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, argument);
+                for (nominal.arguments) |argument| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, argument);
                 for (self.nominals.items) |known| {
                     if (known.store == external_store and known.source_symbol == nominal.symbol) return;
                 }
@@ -518,7 +601,7 @@ const ImportContext = struct {
                 // anywhere) — its interface DEFAULT METHOD dispatch
                 // (`inferDefaultInterfaceMethodCall`) had nothing to find
                 // in the consuming module's OWN `interface_implementations`.
-                try self.appendMatchingImpls(graph, origin.module, origin.declaration, definition_checked, definition_resolution, definition_symbol, local_symbol);
+                try self.appendMatchingImpls(graph, modules, resolution, own_module, origin.module, origin.declaration, local_symbol);
                 // The source resolver never created a binding for this
                 // method in the importing module, so create one alongside
                 // the synthetic owner.  The compiler then links it to the
@@ -546,13 +629,13 @@ const ImportContext = struct {
                     try self.functions.append(self.allocator, .{ .symbol = local_method, .function_id = function_id });
                 }
             },
-            .array => |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, element),
+            .array => |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, element),
             .map => |map| {
-                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, map.key);
-                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, map.value);
+                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, map.key);
+                try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, map.value);
             },
-            .process => |message| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, message),
-            .pointer => |pointee| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, external_store, pointee),
+            .process => |message| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, message),
+            .pointer => |pointee| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, pointee),
             else => {},
         }
     }
@@ -667,7 +750,7 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
 
         var imports = ImportContext.init(allocator);
         defer imports.deinit();
-        try imports.collect(resolution, result.modules, &result.nominal_identities, &result.next_nominal_identity, graph);
+        try imports.collect(resolution, result.modules, &result.nominal_identities, &result.next_nominal_identity, graph, module_index);
 
         result.modules[module_index].checked = try type_checker.checkWithImportContextForTarget(allocator, &module.tree, resolution, .{
             .symbols = imports.imported_types.items,
@@ -1100,6 +1183,96 @@ test "module compiler dispatches an interface-impl method as an ordinary cross-m
     switch (try machine.run(start, &.{})) {
         .success => |result| switch (result) {
             .number => |number| try std.testing.expectEqual(@as(f64, 38), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Both the interface AND the target are qualified (`реализация
+// интерфейсы.МойИнтерфейс для точки.Точка`), and the impl block itself
+// is written in the CONSUMING file (main.ps) — this is the shape that
+// exposed two real bugs, both now fixed:
+// (1) pass ordering — `signaturePass` (processes `реализация` blocks,
+//     including the `isImplementableNominal` check) used to run BEFORE
+//     `importSignaturePass` (populates `nominal_fields` for imported
+//     nominals), so a qualified target's `nominal_fields` entry didn't
+//     exist yet when checked, and every such `реализация` was rejected
+//     with "интерфейс может реализовать только структура или
+//     перечисление" even for a real struct;
+// (2) `interfaceMethodMatches`'s receiver type was built via a raw
+//     `types.nominal(owner, ...)` (identity=0) instead of `nominalType`
+//     (real bridged identity) — `TypeStore.eql`'s nominal case switches
+//     to strict identity comparison the moment either side is non-zero,
+//     so the receiver never matched the method's `это: точки.Точка`
+//     parameter type (which WAS resolved with the real identity via
+//     `resolveType`'s own `.qualified` case), rejected as "первый
+//     аргумент метода должен иметь тип реализующего типа".
+//
+// NOT covered here (a separate, larger gap, still open): an impl block
+// written in a THIRD file — neither the struct's own file nor the
+// consumer's — is invisible to any OTHER file that imports only the
+// struct's module (module_loader.zig's `collectMethods` skips qualified
+// targets entirely, `target_module != null => continue`, so such impls
+// never enter `graph.methods`/`graph.impls` at all) — exactly the shape
+// a codegen-generated `_gen.ps` file needs (separate from both the
+// source struct's file and whatever imports the generated file).
+test "module compiler resolves both qualified interface and qualified target declared in the consumer" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./интерфейсы\" как интерфейсы\nимпорт \"./точки\" как точки\nреализация интерфейсы.МойИнтерфейс для точки.Точка\nфунк значение(это: точки.Точка) -> Число\nэто.x\nконец\nконец\nэкспорт функ старт() -> Число\nточки.Точка(40.0).значение()\nконец" },
+        .{ .path = "проект/интерфейсы.ps", .bytes = "экспорт тип МойИнтерфейс = интерфейс\nфунк значение() -> Число\nконец" },
+        .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 40), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Impl declared in a THIRD file — neither the struct's own file
+// (точки.ps) nor the file that actually calls the method (main.ps) —
+// mirrors a codegen-generated `_gen.ps`: separate from both the source
+// struct's file and whatever imports the generated file. main.ps
+// imports точки.ps directly (for the constructor) AND связка.ps (for
+// the side effect of registering the impl — exactly what a generated
+// `импорт "./<файл>_gen"` does). Was rejected with "у типа нет поля
+// 'значение'" before the module_loader/module_linker/resolver fix —
+// `collectMethods` (module_loader.zig) skipped any qualified impl
+// target entirely, so `graph.methods`/`graph.impls` never got an entry
+// for this shape at all.
+test "module compiler resolves an impl declared in a third file, separate from both the struct and the consumer" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nимпорт \"./связка\" как связка\nэкспорт функ старт() -> Число\nточки.Точка(40.0).значение()\nконец" },
+        .{ .path = "проект/интерфейсы.ps", .bytes = "экспорт тип МойИнтерфейс = интерфейс\nфунк значение() -> Число\nконец" },
+        .{ .path = "проект/точки.ps", .bytes = "экспорт тип Точка = структура\nx: Число\nконец" },
+        .{ .path = "проект/связка.ps", .bytes = "импорт \"./интерфейсы\" как интерфейсы\nимпорт \"./точки\" как точки\nреализация интерфейсы.МойИнтерфейс для точки.Точка\nфунк значение(это: точки.Точка) -> Число\nэто.x\nконец\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 40), number),
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

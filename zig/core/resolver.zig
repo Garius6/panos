@@ -124,6 +124,14 @@ pub const ImportedSymbolOrigin = struct {
 // declaration like other imported exports.
 pub const ImportedMethodExport = struct {
     name: []const u8,
+    // The module where this method's `функ` body is physically written
+    // (an impl block's own file) — needed separately from the owning
+    // export's `origin.module` (the STRUCT's module) because a
+    // qualified impl target (`реализация X для Модуль.Тип`) can live in
+    // a THIRD file, distinct from both the struct's and the consumer's.
+    // `declaration` below is a `DeclId` into THIS module's own AST, not
+    // the struct's.
+    module: usize,
     declaration: ast.DeclId,
     span: source.Span,
 };
@@ -585,7 +593,7 @@ const Resolver = struct {
                 } else {
                     try members.values.put(exported.name, member);
                 }
-                const owner_origin = exported.origin orelse continue;
+                if (exported.origin == null) continue;
                 for (exported.methods) |method| {
                     const method_symbol = try self.result.symbols.add(.{
                         .name = method.name,
@@ -596,7 +604,7 @@ const Resolver = struct {
                         .owner = member,
                         .name = method.name,
                         .symbol = method_symbol,
-                        .origin = .{ .module = owner_origin.module, .declaration = method.declaration },
+                        .origin = .{ .module = method.module, .declaration = method.declaration },
                     });
                 }
                 if (exported.variants.len != 0) {
@@ -641,7 +649,7 @@ const Resolver = struct {
                 else => return err,
             };
             if (exported.origin) |origin| try self.result.imported_symbols.put(member, origin);
-            const owner_origin = exported.origin orelse continue;
+            if (exported.origin == null) continue;
             for (exported.methods) |method| {
                 const method_symbol = try self.result.symbols.add(.{
                     .name = method.name,
@@ -652,7 +660,7 @@ const Resolver = struct {
                     .owner = member,
                     .name = method.name,
                     .symbol = method_symbol,
-                    .origin = .{ .module = owner_origin.module, .declaration = method.declaration },
+                    .origin = .{ .module = method.module, .declaration = method.declaration },
                 });
             }
             if (exported.variants.len != 0) {

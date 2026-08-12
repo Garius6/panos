@@ -60,6 +60,11 @@ pub const InterfaceCastEntry = struct {
     interface: symbols.SymbolId,
     arguments: []const types.TypeId,
     target: symbols.SymbolId,
+    // The target's OWN generic instantiation at this cast site (e.g.
+    // `Отображённый(Число, Строка)`'s `[Число, Строка]`) — needed by
+    // `findInterfaceImplementation`'s generic-pattern fallback when the
+    // compiler re-resolves the vtable at codegen time.
+    target_arguments: []const types.TypeId,
 };
 
 pub const InterfaceCast = struct {
@@ -163,6 +168,14 @@ pub const ImportedMethod = struct {
 pub const ImportedImpl = struct {
     owner: symbols.SymbolId,
     interface_name: []const u8,
+    // Set when the interface itself is QUALIFIED (`реализация
+    // Модуль.Интерфейс для ...`, e.g. codegen's `json.ВJSON`) AND the
+    // importing module has its own local symbol for it — `interface_name`
+    // alone can't be resolved by `findTypeSymbol` in that case (it's
+    // only in scope as `модуль.Интерфейс`, never unqualified). `null`
+    // falls back to the existing bare-name lookup (local/unqualified
+    // interface, the common case).
+    interface_symbol: ?symbols.SymbolId = null,
     // References the source module's own `InterfaceImplementation.methods`
     // and `Resolution` directly (both alive for the whole graph compile) —
     // names are looked up on demand, no separate name-list allocation.
@@ -361,7 +374,17 @@ const GenericSubstitutionPair = struct { placeholder: types.TypeId, concrete: ty
 // resolution — which only has a `*const CheckResult`, not a full
 // `Checker` — can reuse the SAME matching instead of a second,
 // independently-drifting copy.
-pub fn findInterfaceImplementation(checked: *const CheckResult, interface: symbols.SymbolId, arguments: []const types.TypeId, target: symbols.SymbolId, target_arguments: []const types.TypeId) ?InterfaceImplementation {
+// `ambiguous` — opt-in (default `null`, preserving the original
+// first-match-wins behavior for every EXISTING caller, all of which go
+// through `assignable`'s pervasive, speculative compatibility checks and
+// only care about a yes/no answer). When passed, the generic-fallback
+// branch keeps scanning after its first match instead of returning
+// immediately, and sets `ambiguous.*` if a SECOND generic match is found
+// — `compiler.zig`'s `emitInterfaceCast` (the only caller that resolves
+// an ACTUAL vtable for codegen, where picking the wrong candidate means
+// compiling the wrong method, not just a wrong static type) opts in.
+pub fn findInterfaceImplementation(checked: *const CheckResult, interface: symbols.SymbolId, arguments: []const types.TypeId, target: symbols.SymbolId, target_arguments: []const types.TypeId, ambiguous: ?*bool) ?InterfaceImplementation {
+    var found: ?InterfaceImplementation = null;
     for (checked.interface_implementations.items) |implementation| {
         if (implementation.interface != interface or implementation.target != target or implementation.arguments.len != arguments.len) continue;
         var exact = true;
@@ -399,9 +422,19 @@ pub fn findInterfaceImplementation(checked: *const CheckResult, interface: symbo
                 break;
             }
         }
-        if (matches_generically) return implementation;
+        if (matches_generically) {
+            if (ambiguous) |flag| {
+                if (found != null) {
+                    flag.* = true;
+                    break;
+                }
+                found = implementation;
+            } else {
+                return implementation;
+            }
+        }
     }
-    return null;
+    return found;
 }
 
 // Structural "does `pattern` (an expression over `pairs`' placeholder
@@ -796,7 +829,7 @@ const Checker = struct {
             });
         }
         for (imports.impls) |imported| {
-            const interface_symbol = self.findTypeSymbol(imported.interface_name) orelse continue;
+            const interface_symbol = imported.interface_symbol orelse self.findTypeSymbol(imported.interface_name) orelse continue;
             const owner_remap = owner_remaps.getPtr(imported.owner);
             var arguments: std.ArrayList(types.TypeId) = .empty;
             defer arguments.deinit(self.result.allocator);
@@ -1582,7 +1615,19 @@ const Checker = struct {
         var owner_arguments: std.ArrayList(types.TypeId) = .empty;
         defer owner_arguments.deinit(self.result.allocator);
         for (owner_parameters) |parameter| try owner_arguments.append(self.result.allocator, parameter.typ);
-        const receiver = try self.result.types.nominal(owner, owner_arguments.items);
+        // `nominalType` (not a raw `types.nominal`) — for a QUALIFIED impl
+        // target (`owner` resolved cross-module via `findQualifiedTypeSymbol`),
+        // `resolveType`'s OWN `.qualified` case (which resolved the METHOD's
+        // `это: Модуль.Тип` receiver parameter) already goes through
+        // `nominalType` to attach the real bridged `imported_nominal_identities`
+        // value. Building `receiver` here via a raw `types.nominal` left it
+        // at the default identity=0 — `TypeStore.eql`'s nominal comparison
+        // switches to STRICT identity-equality the moment either side has a
+        // non-zero identity (`types.zig`'s `.nominal` case), so a real match
+        // (same symbol) was rejected as "first argument must have the
+        // implementing type" purely because of this identity mismatch, not
+        // an actual type mismatch.
+        const receiver = try self.nominalType(owner, owner_arguments.items);
         if (!self.result.types.eql(function.parameters[0], receiver)) {
             try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: первый аргумент метода должен иметь тип реализующего типа", .{});
             return false;
@@ -4771,7 +4816,7 @@ const Checker = struct {
     // the overwhelmingly common non-generic case without the extra
     // work; the substitution fallback only runs when that fails.
     fn interfaceImplementation(self: *const Checker, interface: symbols.SymbolId, arguments: []const types.TypeId, target: symbols.SymbolId, target_arguments: []const types.TypeId) ?InterfaceImplementation {
-        return findInterfaceImplementation(self.result, interface, arguments, target, target_arguments);
+        return findInterfaceImplementation(self.result, interface, arguments, target, target_arguments, null);
     }
 
     fn isComparableInterface(self: *const Checker, interface: symbols.SymbolId) bool {
@@ -4819,6 +4864,7 @@ const Checker = struct {
             .interface = expected_nominal.symbol,
             .arguments = expected_nominal.arguments,
             .target = actual_nominal.symbol,
+            .target_arguments = actual_nominal.arguments,
         }});
         try self.result.interface_casts.put(expression, .{ .entries = entries });
     }
@@ -4834,7 +4880,7 @@ const Checker = struct {
         defer entries.deinit(self.result.allocator);
         for (bounds) |bound| {
             if (self.interfaceImplementation(bound, &.{}, target, nominal.arguments) == null) continue;
-            try entries.append(self.result.allocator, .{ .interface = bound, .arguments = &.{}, .target = target });
+            try entries.append(self.result.allocator, .{ .interface = bound, .arguments = &.{}, .target = target, .target_arguments = nominal.arguments });
         }
         if (entries.items.len != 0) try self.result.interface_casts.put(expression, .{ .entries = try self.result.arena.allocator().dupe(InterfaceCastEntry, entries.items) });
     }
@@ -5796,8 +5842,25 @@ pub fn checkWithImportContextForTarget(
     // were declared with the exact same annotation.
     try checker.importIdentityPass(imports, &owner_remaps, &owner_parameters_by_symbol);
     try checker.nominalPass();
-    try checker.signaturePass();
+    // Must run BEFORE `signaturePass` — a `реализация Интерфейс для
+    // Модуль.Тип` (qualified impl TARGET) is processed by `signaturePass`
+    // and needs `nominal_fields`/`generic_nominal_fields` for the
+    // IMPORTED target symbol already populated (via `isImplementableNominal`,
+    // called from `defineInterfaceImplementation`) — `importSignaturePass`
+    // is exactly what populates those maps for imported nominals. Running
+    // it after `signaturePass` (the old order) meant EVERY qualified impl
+    // target failed `isImplementableNominal` unconditionally (nominal_fields
+    // was still empty for it at that point), rejecting all such `реализация`
+    // blocks with "интерфейс может реализовать только структура или
+    // перечисление" even for a real struct — real gap found while building
+    // codegen's json generator (a `_gen.ps` file implementing
+    // `json.ВJSON для Модуль.Тип` is EXACTLY this shape). `importSignaturePass`
+    // itself only depends on `owner_remaps`/`owner_parameters_by_symbol`
+    // (from `importIdentityPass`, already run) and `imports.nominals`
+    // (static input) — nothing `signaturePass` produces, so this reorder
+    // is safe.
     try checker.importSignaturePass(imports, &owner_remaps, &owner_parameters_by_symbol);
+    try checker.signaturePass();
     try checker.constantPass();
     try checker.bodyPass();
     return result;

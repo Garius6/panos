@@ -3249,15 +3249,43 @@ pub const Vm = struct {
     // graph for this file at all, it's a throwaway parse) — just the raw
     // syntax, for human/codegen consumption. Mirrors Odin's
     // `type_node_to_string` (`core/syntax_parser.odin`).
-    fn typeNodeText(allocator: std.mem.Allocator, tree: *const ast_types.Ast, id: ast_types.TypeId) ![]u8 {
+    fn typeNodeText(allocator: std.mem.Allocator, tree: *const ast_types.Ast, id: ast_types.TypeId) anyerror![]u8 {
         return switch (tree.typeNode(id).*) {
             .ident => |node| allocator.dupe(u8, node.name),
-            .generic => |node| std.fmt.allocPrint(allocator, "{s}(...)", .{node.name}),
-            .qualified => |node| std.fmt.allocPrint(allocator, "{s}.{s}", .{ node.module_name, node.name }),
-            .tuple => allocator.dupe(u8, "(кортеж)"),
+            .generic => |node| blk: {
+                const params = try typeNodeTextList(allocator, tree, node.parameters);
+                defer allocator.free(params);
+                break :blk std.fmt.allocPrint(allocator, "{s}({s})", .{ node.name, params });
+            },
+            .qualified => |node| blk: {
+                if (node.parameters.len == 0) break :blk std.fmt.allocPrint(allocator, "{s}.{s}", .{ node.module_name, node.name });
+                const params = try typeNodeTextList(allocator, tree, node.parameters);
+                defer allocator.free(params);
+                break :blk std.fmt.allocPrint(allocator, "{s}.{s}({s})", .{ node.module_name, node.name, params });
+            },
+            .tuple => |node| blk: {
+                const elements = try typeNodeTextList(allocator, tree, node.elements);
+                defer allocator.free(elements);
+                break :blk std.fmt.allocPrint(allocator, "({s})", .{elements});
+            },
             .function => allocator.dupe(u8, "(тип функции)"),
             .error_node => allocator.dupe(u8, "<ошибка типа>"),
         };
+    }
+
+    // Comma-joins the rendered text of each type in `ids` — shared by
+    // `.generic`/`.qualified`/`.tuple` above, each of which wraps a list
+    // of nested type arguments the same way.
+    fn typeNodeTextList(allocator: std.mem.Allocator, tree: *const ast_types.Ast, ids: []const ast_types.TypeId) anyerror![]u8 {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+        for (ids, 0..) |id, index| {
+            if (index != 0) try result.appendSlice(allocator, ", ");
+            const rendered = try typeNodeText(allocator, tree, id);
+            defer allocator.free(rendered);
+            try result.appendSlice(allocator, rendered);
+        }
+        return result.toOwnedSlice(allocator);
     }
 
     fn syntaxStructs(self: *Vm) anyerror!void {

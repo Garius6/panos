@@ -1094,6 +1094,38 @@ test "module compiler dispatches through a direct interface-typed cast on an imp
     }
 }
 
+// Regression: `inferInterfaceCall`/`inferGenericBoundInterfaceCall` are
+// tried speculatively for EVERY `.property(...)` call and fall through
+// to the next candidate (here: a qualified struct constructor) on a
+// non-match, but used to report "именованные аргументы не поддержаны
+// для интерфейсного вызова" as a side effect BEFORE confirming the call
+// was actually theirs to handle — wrongly rejecting a plain cross-module
+// named-argument constructor call (`модуль.Тип(поле = x, ...)`) that has
+// nothing to do with interfaces at all.
+test "module compiler accepts a qualified struct constructor with named arguments" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./основа\" как основа\nэкспорт функ старт() -> Строка\nпер s = основа.Спавн(имя = \"рабочий\", приоритет = 1)\ns.имя\nконец" },
+        .{ .path = "проект/основа.ps", .bytes = "экспорт тип Спавн = структура\nимя: Строка\nприоритет: Целое\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| {
+            const bytes = result.stringBytes() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("рабочий", bytes);
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "module compiler merges an appended prelude module unqualified into every real module" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "экспорт функ старт() -> Число\nпер к: Коробочка(Число) = Коробочка.Есть(42.0)\nк.развернуть(0.0)\nконец" },

@@ -198,6 +198,10 @@ pub const Opcode = enum {
     http_request_body,
     http_request_header,
     http_request_respond,
+    str_to_bytes,
+    str_to_runes,
+    str_from_runes,
+    str_code_point,
 };
 
 pub const Instruction = union(Opcode) {
@@ -366,6 +370,10 @@ pub const Instruction = union(Opcode) {
     http_request_body: void,
     http_request_header: void,
     http_request_respond: void,
+    str_to_bytes: void,
+    str_to_runes: void,
+    str_from_runes: void,
+    str_code_point: void,
 };
 
 pub const Function = struct {

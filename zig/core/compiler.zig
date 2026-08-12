@@ -912,6 +912,10 @@ const FunctionCompiler = struct {
             .{ .name = "цифра_или_буква", .argc = 1, .instr = .{ .str_is_digit_or_letter = {} } },
             .{ .name = "это_буква", .argc = 1, .instr = .{ .str_is_letter = {} } },
             .{ .name = "это_цифра", .argc = 1, .instr = .{ .str_is_digit = {} } },
+            .{ .name = "в_байты", .argc = 1, .instr = .{ .str_to_bytes = {} } },
+            .{ .name = "в_руны", .argc = 1, .instr = .{ .str_to_runes = {} } },
+            .{ .name = "из_рун", .argc = 1, .instr = .{ .str_from_runes = {} } },
+            .{ .name = "кодовая_точка", .argc = 1, .instr = .{ .str_code_point = {} } },
         };
         for (ops) |op| {
             if (call.arguments.len == op.argc and std.mem.eql(u8, property.property, op.name)) {

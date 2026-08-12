@@ -65,6 +65,10 @@ pub fn nativeModuleExports(name: []const u8) ?[]const []const u8 {
             "цифра_или_буква",
             "это_буква",
             "это_цифра",
+            "в_байты",
+            "в_руны",
+            "из_рун",
+            "кодовая_точка",
         } },
         .{ .name = "DOM", .exports = &.{ "текст", "установить_текст", "на_клик", "текст_строка", "установить_текст_строка", "значение_поля", "установить_значение_поля", "создать_и_добавить", "после_кадра" } },
         .{ .name = "сжатие", .exports = &.{"разжать_gzip"} },
@@ -394,10 +398,11 @@ const Resolver = struct {
         // native (no way to build them out of other panos-level string
         // ops) — this was always meant to be a native module like `фс`/
         // `время`, not a `std/*.ps` library, and simply never got ported.
-        // Scoped to exactly the 18 functions panosiki/std actually call;
-        // docs also mention `в_байты`/`в_руны`/`из_рун`/`кодовая_точка`,
-        // none of which any real caller needs yet — left for a follow-up
-        // rather than built speculatively.
+        // Scoped to the 18 functions panosiki/std actually calls, plus
+        // the 4 mass-conversion primitives docs/src/language/basic-types.md
+        // §"Байты" also documents (`в_байты`/`в_руны`/`из_рун`/
+        // `кодовая_точка`) — real gap found via a docs-example sweep
+        // (those 4 doc examples never compiled at all before this).
         try self.installBuiltinModule("строки", &.{
             "байт",
             "длина_байт",
@@ -420,6 +425,10 @@ const Resolver = struct {
             "цифра_или_буква",
             "это_буква",
             "это_цифра",
+            "в_байты",
+            "в_руны",
+            "из_рун",
+            "кодовая_точка",
         });
         // `DOM` — AOT WASM only (`target.zig`'s `builtinAvailability`), a
         // Numeric methods stay compatible with the first AOT DOM slice;
@@ -492,11 +501,21 @@ const Resolver = struct {
         // declared return type is some bare `.generic_parameter` — which
         // is exactly what `type_checker.zig`'s `preludePass` mints for
         // this entry (a throwaway placeholder, not tied to any real
-        // declared type parameter). `Складываемое`/`Вычитаемое`/
-        // `Умножаемое`/`Делимое`/`Равнозначное` are still not added here —
-        // no known real caller depends on any of them, unlike
-        // `Копируемое` — but the SAME technique would work for them too.
+        // declared type parameter).
         try self.installPreludeInterface("Копируемое");
+        // `Складываемое`/`Вычитаемое`/`Умножаемое`/`Делимое`/`Равнозначное`
+        // — same SAME technique as `Копируемое` just above, now applied
+        // (`type_checker.zig`'s `preludePass` mints a placeholder per
+        // interface). Real gap found via a docs-example sweep —
+        // `prelude-interfaces.md` documents `Равнозначное`/`Складываемое`
+        // with real code examples that never actually compiled, because
+        // these 5 were declared in the embedded prelude source
+        // (`prelude.zig`) but never installed here at all.
+        try self.installPreludeInterface("Равнозначное");
+        try self.installPreludeInterface("Складываемое");
+        try self.installPreludeInterface("Вычитаемое");
+        try self.installPreludeInterface("Умножаемое");
+        try self.installPreludeInterface("Делимое");
     }
 
     fn installBuiltinModule(self: *Resolver, name: []const u8, exports: []const []const u8) !void {
@@ -772,11 +791,31 @@ const Resolver = struct {
             .span = span,
         });
         self.scopes.declare(&self.result.symbols, symbol) catch |err| switch (err) {
-            error.DuplicateSymbol => try self.report(span, "Resolve Error: символ '{s}' уже объявлен", .{name}),
+            error.DuplicateSymbol => {
+                if (kind == .type and isReservedBuiltinTypeName(name)) {
+                    try self.report(span, "Resolve Error: имя '{s}' зарезервировано встроенным типом, выберите другое имя для своего типа", .{name});
+                } else {
+                    try self.report(span, "Resolve Error: символ '{s}' уже объявлен", .{name});
+                }
+            },
             else => return err,
         };
         try self.result.decl_symbols.put(declaration, symbol);
         return symbol;
+    }
+
+    // Bare (unqualified, non-module-namespaced) builtin type names —
+    // unlike `сеть.*`/`строки.*`/`бд.*` builtins, these collide directly
+    // with any user `тип X = ...` of the same name (`installBuiltinType`
+    // declares them straight into the root scope). Listed here just to
+    // give a clearer diagnostic than the generic "уже объявлен" when a
+    // user picks one of these fairly ordinary words for their own type —
+    // most commonly `Запрос`, common enough to be a real trap (see
+    // `installBuiltinType` call sites above for the authoritative list).
+    fn isReservedBuiltinTypeName(name: []const u8) bool {
+        const reserved = [_][]const u8{ "Файл", "Соединение", "Слушатель", "Запрос", "Соединение_БД" };
+        for (reserved) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
+        return false;
     }
 
     // Loads `foreign.library` (an ARBITRARY, user-named shared library —

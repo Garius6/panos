@@ -213,6 +213,19 @@ pub const CheckResult = struct {
     generic_nominal_fields: std.AutoHashMap(symbols.SymbolId, GenericNominal),
     enum_definitions: std.AutoHashMap(symbols.SymbolId, EnumDefinition),
     interface_definitions: std.AutoHashMap(symbols.SymbolId, InterfaceDefinition),
+    // Which throwaway `genericParameter` placeholder (`preludePass`, e.g.
+    // `Сравниваемое.сравнить(другое: <placeholder>)`) stands for "the
+    // SAME type as whatever implements this interface" — needed ONLY at
+    // an interface-TYPED call site (`x: Сравниваемое; x.сравнить(y)`,
+    // `inferInterfaceCall`). Impl-time validation (`defineInterfaceImplementation`)
+    // already resolves the placeholder correctly via ordinary generic
+    // unification against the concrete impl; the call site has no
+    // concrete type to unify against (the value could be ANY
+    // implementor), so the only sound substitution is the INTERFACE type
+    // itself — real gap found via a regression: `x.сравнить(y)` left the
+    // placeholder unsubstituted, so `y`'s concrete type could never be
+    // assignable to it.
+    interface_self_placeholders: std.AutoHashMap(symbols.SymbolId, types.TypeId),
     interface_implementations: std.ArrayList(InterfaceImplementation) = .empty,
     pattern_variants: std.AutoHashMap(ast.PatternId, symbols.SymbolId),
     pattern_types: std.AutoHashMap(ast.PatternId, types.TypeId),
@@ -241,6 +254,7 @@ pub const CheckResult = struct {
             .generic_nominal_fields = .init(allocator),
             .enum_definitions = .init(allocator),
             .interface_definitions = .init(allocator),
+            .interface_self_placeholders = .init(allocator),
             .pattern_variants = .init(allocator),
             .pattern_types = .init(allocator),
             .method_calls = .init(allocator),
@@ -264,6 +278,7 @@ pub const CheckResult = struct {
         self.pattern_variants.deinit();
         self.interface_implementations.deinit(self.allocator);
         self.interface_definitions.deinit();
+        self.interface_self_placeholders.deinit();
         self.enum_definitions.deinit();
         self.generic_nominal_fields.deinit();
         self.generic_function_parameters.deinit();
@@ -852,6 +867,8 @@ const Checker = struct {
         const option_symbol = self.findTypeSymbol("Опция") orelse return;
         const result_symbol = self.findTypeSymbol("Результат") orelse return;
         const comparable_symbol = self.findTypeSymbol("Сравниваемое") orelse return;
+        const comparable_self = try self.result.types.genericParameter(self.next_generic_parameter);
+        self.next_generic_parameter += 1;
         const iterable_symbol = self.findTypeSymbol("Итерируемое") orelse return;
         const printable_symbol = self.findTypeSymbol("Печатаемое");
         const option_parameters = try self.defineGenericEnumParameters(&.{"T"});
@@ -908,7 +925,7 @@ const Checker = struct {
                 .name = "Сигнал",
                 .fields = try self.result.arena.allocator().dupe(types.TypeId, &.{
                     try self.result.types.tuple(&.{
-                        self.result.types.builtins.number,
+                        self.result.types.builtins.integer,
                         try self.result.types.nominal(option_symbol, &.{self.result.types.builtins.string}),
                     }),
                 }),
@@ -927,15 +944,42 @@ const Checker = struct {
             });
         }
         const comparable_methods = try self.result.arena.allocator().alloc(InterfaceMethod, 1);
+        // `.parameters` MUST be arena-allocated, not `&.{x}` (a
+        // single-runtime-value anonymous array literal materializes on
+        // THIS FUNCTION's stack in Zig, not in static/arena storage —
+        // the slice silently dangles the moment `preludePass` returns).
+        // Real bug found fixing the Равнозначное/Складываемое family
+        // below: `interfaceMethodMatches`'s generic branch (used by
+        // every OTHER interface) reads `interface_method.parameters`
+        // directly and got garbage; `Сравниваемое` itself never
+        // surfaced this because `isComparableInterface` short-circuits
+        // BEFORE that read (its own hardcoded parameter-count/type
+        // check never touches `interface_method.parameters` at all) —
+        // but the same dangling slice could still bite any OTHER code
+        // path that reads `Сравниваемое`'s stored parameters directly.
+        //
+        // Parameter is a genuine Self-typed placeholder (was
+        // `builtins.never` — a sentinel that only ever "worked" for a
+        // DIRECT `x.сравнить(y)` interface-typed call by accident, via
+        // the dangling-pointer bug above making `interfaceMethodMatches`
+        // read back garbage that happened to be the poison sentinel,
+        // which `assignable` treats as always-compatible; once the
+        // pointer was fixed to be valid, `never` correctly rejected
+        // every concrete argument, since nothing is assignable to
+        // `Никогда` as an EXPECTED type). Matches the placeholder
+        // technique the other 5 self-typed interfaces below use;
+        // `interface_self_placeholders` (see its own doc comment) is
+        // what makes it actually resolve at a call site.
         comparable_methods[0] = .{
             .name = "сравнить",
-            .parameters = &.{self.result.types.builtins.never},
+            .parameters = try self.result.arena.allocator().dupe(types.TypeId, &.{comparable_self}),
             .return_type = self.result.types.builtins.number,
         };
         try self.result.interface_definitions.put(comparable_symbol, .{
             .parameters = &.{},
             .methods = comparable_methods,
         });
+        try self.result.interface_self_placeholders.put(comparable_symbol, comparable_self);
         const iterable_parameters = try self.defineGenericEnumParameters(&.{"T"});
         const iterable_methods = try self.result.arena.allocator().alloc(InterfaceMethod, 1);
         iterable_methods[0] = .{
@@ -983,6 +1027,65 @@ const Checker = struct {
                 .parameters = &.{},
                 .methods = clone_methods,
             });
+            try self.result.interface_self_placeholders.put(symbol, self_placeholder);
+        }
+        // `Равнозначное`/`Складываемое`/`Вычитаемое`/`Умножаемое`/`Делимое`
+        // — declared in the embedded prelude source (`prelude.zig`)
+        // alongside `Сравниваемое`/`Итерируемое`/`Печатаемое`/
+        // `Копируемое`, but never actually installed here — real gap
+        // found via a docs-example sweep (`prelude-interfaces.md`'s own
+        // documented examples for these two failed to compile). Same
+        // technique `Копируемое` already uses for its Self-typed
+        // RETURN: a throwaway generic-parameter placeholder, minted once
+        // per interface here, unified against whichever concrete type
+        // each `реализация X для Y` actually declares. `равно`'s
+        // PARAMETER is also Self-typed (`равно(другое: Равнозначное) ->
+        // Булево`) — same placeholder used for the parameter type this
+        // time, no special-casing needed: `defineInterfaceImplementation`
+        // already unifies parameter types via the same generic-
+        // substitution machinery as return types.
+        const equatable_self = try self.result.types.genericParameter(self.next_generic_parameter);
+        self.next_generic_parameter += 1;
+        if (self.findTypeSymbol("Равнозначное")) |symbol| {
+            const equatable_methods = try self.result.arena.allocator().alloc(InterfaceMethod, 1);
+            equatable_methods[0] = .{
+                .name = "равно",
+                .parameters = try self.result.arena.allocator().dupe(types.TypeId, &.{equatable_self}),
+                .return_type = self.result.types.builtins.boolean,
+            };
+            try self.result.interface_definitions.put(symbol, .{
+                .parameters = &.{},
+                .methods = equatable_methods,
+            });
+            try self.result.interface_self_placeholders.put(symbol, equatable_self);
+        }
+        // `Складываемое`/`Вычитаемое`/`Умножаемое`/`Делимое` all share the
+        // exact same shape — `функ X(другое: Тип) -> Тип`, parameter AND
+        // return both Self-typed — so a single loop mints one fresh
+        // placeholder per interface (each interface's Self is its OWN
+        // type, not shared across interfaces) and reuses it for both
+        // positions.
+        const arithmetic_interfaces = [_]struct { name: []const u8, method: []const u8 }{
+            .{ .name = "Складываемое", .method = "сложить" },
+            .{ .name = "Вычитаемое", .method = "вычесть" },
+            .{ .name = "Умножаемое", .method = "умножить" },
+            .{ .name = "Делимое", .method = "разделить" },
+        };
+        for (arithmetic_interfaces) |entry| {
+            const symbol = self.findTypeSymbol(entry.name) orelse continue;
+            const self_placeholder = try self.result.types.genericParameter(self.next_generic_parameter);
+            self.next_generic_parameter += 1;
+            const methods = try self.result.arena.allocator().alloc(InterfaceMethod, 1);
+            methods[0] = .{
+                .name = entry.method,
+                .parameters = try self.result.arena.allocator().dupe(types.TypeId, &.{self_placeholder}),
+                .return_type = self_placeholder,
+            };
+            try self.result.interface_definitions.put(symbol, .{
+                .parameters = &.{},
+                .methods = methods,
+            });
+            try self.result.interface_self_placeholders.put(symbol, self_placeholder);
         }
     }
 
@@ -1638,14 +1741,23 @@ const Checker = struct {
                 const element_entry = self.result.types.get(element_type) orelse break :blk try self.result.types.poison();
                 break :blk switch (element_entry.*) {
                     .process => |r| r,
-                    .poison => try self.result.types.poison(),
+                    // `массив()` (empty, no elements to infer an element
+                    // type from) — real bug found via a docs-example
+                    // sweep: post the poison/`unconstrained` split, an
+                    // empty array literal infers `Массив(unconstrained)`,
+                    // NOT `Массив(poison)` (`infer`'s `.array` case) —
+                    // this switch only ever special-cased `.poison`, so
+                    // the documented `выбор ожидание(массив())` idiom
+                    // ("block on mailbox + signals only, no watched
+                    // processes") always spuriously errored.
+                    .poison, .unconstrained => try self.result.types.poison(),
                     else => blk2: {
                         try self.report(select.span, "Type Error: 'ожидание' ожидает Массив(Процесс(R))", .{});
                         break :blk2 try self.result.types.poison();
                     },
                 };
             },
-            .poison => return self.result.types.poison(),
+            .poison, .unconstrained => return self.result.types.poison(),
             else => blk: {
                 try self.report(select.span, "Type Error: 'ожидание' ожидает Массив(Процесс(R))", .{});
                 break :blk try self.result.types.poison();
@@ -1925,7 +2037,19 @@ const Checker = struct {
             try self.report(match.span, "Type Error: выбор не поддерживает этот тип", .{});
             return self.result.types.poison();
         }
-        var covered = std.AutoHashMap(symbols.SymbolId, void).init(self.result.allocator);
+        // Value = "has a fully catch-all (unrefined) arm for this variant
+        // already been seen". Two arms for the SAME variant are only
+        // genuinely duplicate/unreachable once one of them has no field
+        // narrowing at all (`Клик -> ...` after an earlier `Клик ->
+        // ...`, or any arm after that) — `выбор` tries arms in order, so
+        // a catch-all arm makes every later arm for that variant dead
+        // code regardless of its own narrowing. Two arms with DIFFERENT
+        // field patterns (e.g. `Клик(x: 0, y)` then `Клик(x, y)` —
+        // literal-narrowed then a plain binder) are NOT duplicates: the
+        // second only catches what the first didn't. Previously this
+        // flagged ANY repeated variant symbol regardless of narrowing,
+        // rejecting that idiom outright.
+        var covered = std.AutoHashMap(symbols.SymbolId, bool).init(self.result.allocator);
         defer covered.deinit();
         var fallback_seen = false;
         var true_covered = false;
@@ -1935,10 +2059,22 @@ const Checker = struct {
             if (fallback_seen) try self.report(arm.span, "Type Error: шаблон после универсальной ветки недостижим", .{});
             if (try self.inferMatchPattern(arm.pattern, subject_type, true)) |variant| {
                 if (enum_definition != null) {
-                    if (covered.contains(variant)) {
-                        try self.report(arm.span, "Type Error: вариант перечисления повторён в выборе", .{});
+                    // Unlike `isCatchAllPattern` (used below for
+                    // `fallback_seen`, which asks "catch-all for the
+                    // WHOLE match"), this asks "given we already know
+                    // this arm targets `variant`, does it narrow the
+                    // variant's OWN fields at all?" — a bare `Клик` or
+                    // `Клик(x, y)` (plain binders) is fully generic for
+                    // that variant; `Клик(x: 0, y)` is not.
+                    const is_fully_generic = self.isVariantPatternFullyGeneric(arm.pattern);
+                    if (covered.get(variant)) |already_catch_all| {
+                        if (already_catch_all) {
+                            try self.report(arm.span, "Type Error: вариант перечисления повторён в выборе", .{});
+                        } else if (is_fully_generic) {
+                            try covered.put(variant, true);
+                        }
                     } else {
-                        try covered.put(variant, {});
+                        try covered.put(variant, is_fully_generic);
                     }
                 }
             }
@@ -2109,6 +2245,25 @@ const Checker = struct {
 
     fn isCatchAllPattern(self: *const Checker, pattern_id: ast.PatternId) bool {
         if (self.patternVariant(pattern_id) != null) return false;
+        return switch (self.tree.pattern(pattern_id).*) {
+            .wildcard, .ident => true,
+            .constructor => |constructor| blk: {
+                for (constructor.arguments) |argument| {
+                    if (!self.isCatchAllPattern(argument)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
+    // Same recursive "are all sub-patterns unrefined" check as
+    // `isCatchAllPattern`'s `.constructor` case, but WITHOUT that
+    // function's own top-level `patternVariant != null` guard — that
+    // guard means "this pattern targets one specific variant, so it's
+    // not a catch-all for the whole `выбор`", which is the wrong
+    // question here (see call site in `inferMatchExpected`).
+    fn isVariantPatternFullyGeneric(self: *const Checker, pattern_id: ast.PatternId) bool {
         return switch (self.tree.pattern(pattern_id).*) {
             .wildcard, .ident => true,
             .constructor => |constructor| blk: {
@@ -2478,7 +2633,7 @@ const Checker = struct {
                 break :blk self.result.types.builtins.boolean;
             },
             .less, .less_equal, .greater, .greater_equal => blk: {
-                const comparable = self.isComparableGeneric(left) and self.result.types.eql(left, right);
+                const comparable = (self.isComparableGeneric(left) or self.isComparableNominal(left)) and self.result.types.eql(left, right);
                 if (!self.isPoison(left) and !self.isPoison(right) and !comparable and (!self.isNumeric(left) or !self.isNumeric(right) or !self.result.types.eql(left, right))) {
                     try self.report(binary.span, "Type Error: оператор сравнения ожидает два числа одного типа", .{});
                 }
@@ -2557,6 +2712,27 @@ const Checker = struct {
             for (parameter.bounds) |bound| {
                 if (self.isComparableInterface(bound)) return true;
             }
+        }
+        return false;
+    }
+
+    // `isComparableGeneric` only covers `<`/`>` inside a `[T:
+    // Сравниваемое]`-bounded generic — a CONCRETE type (`тип Деньги =
+    // структура ... конец`) with `реализация Сравниваемое для Деньги`
+    // used directly (`Деньги(1.0) < Деньги(2.0)`, no generic involved
+    // at all) has no bound to check, so it fell through to the plain
+    // `isNumeric` rejection. This checks the concrete-type path: does
+    // ANY registered `реализация Сравниваемое для <this type's own
+    // struct/enum symbol>` exist.
+    fn isComparableNominal(self: *const Checker, type_id: types.TypeId) bool {
+        const entry = self.result.types.get(type_id) orelse return false;
+        const nominal = switch (entry.*) {
+            .nominal => |value| value,
+            else => return false,
+        };
+        const comparable_symbol = self.findTypeSymbol("Сравниваемое") orelse return false;
+        for (self.result.interface_implementations.items) |implementation| {
+            if (implementation.interface == comparable_symbol and implementation.target == nominal.symbol) return true;
         }
         return false;
     }
@@ -3094,6 +3270,51 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.string;
             }
+            if (self.isBuiltinModule(symbol, "строки", "в_байты")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.в_байты() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return try self.result.types.array(self.result.types.builtins.integer);
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.в_байты() ожидает строку", .{});
+                }
+                return try self.result.types.array(self.result.types.builtins.integer);
+            }
+            if (self.isBuiltinModule(symbol, "строки", "в_руны")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.в_руны() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return try self.result.types.array(self.result.types.builtins.integer);
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.в_руны() ожидает строку", .{});
+                }
+                return try self.result.types.array(self.result.types.builtins.integer);
+            }
+            if (self.isBuiltinModule(symbol, "строки", "из_рун")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.из_рун() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                const array_type = try self.result.types.array(self.result.types.builtins.integer);
+                if (!self.assignable(try self.inferExpected(call.arguments[0], array_type), array_type)) {
+                    try self.report(call.span, "Type Error: строки.из_рун() ожидает Массив(Целое)", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "строки", "кодовая_точка")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: строки.кодовая_точка() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.integer;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: строки.кодовая_точка() ожидает строку", .{});
+                }
+                return self.result.types.builtins.integer;
+            }
             if (self.isBuiltinModule(symbol, "строки", "в_число")) {
                 const result_type = self.resultOfString(self.result.types.builtins.number) orelse return self.result.types.poison();
                 if (call.arguments.len != 1) {
@@ -3501,7 +3722,13 @@ const Checker = struct {
                 for (call.arguments) |argument| _ = try self.infer(argument);
                 const option = self.findTypeSymbol("Опция") orelse return self.result.types.poison();
                 const reason = try self.result.types.nominal(option, &.{self.result.types.builtins.string});
-                return self.result.types.tuple(&.{ self.result.types.builtins.number, reason });
+                // Process id is discrete (`Целое`), matching the docs
+                // (`processes.md`) and `строки.из_целого`'s own expected
+                // argument type — the VM's actual runtime `Value` is a
+                // plain f64 regardless (`queueSignal`'s `@floatFromInt`),
+                // so this is a type-checker-only correction, no bytecode
+                // change needed.
+                return self.result.types.tuple(&.{ self.result.types.builtins.integer, reason });
             }
             if (self.isBuiltin(symbol, "ограничить_почту")) {
                 if (call.arguments.len != 1) try self.report(call.span, "Type Error: ограничить_почту() ожидает 1 аргумент", .{});
@@ -4293,7 +4520,6 @@ const Checker = struct {
     }
 
     fn inferInterfaceCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
-        if (call.argument_names != null) try self.report(call.span, "Type Error: именованные аргументы не поддержаны для интерфейсного вызова", .{});
         const object = self.result.types.get(object_type) orelse return null;
         const nominal = switch (object.*) {
             .nominal => |value| value,
@@ -4313,17 +4539,54 @@ const Checker = struct {
         }
         const index = method_index orelse return null;
         const method = definition.methods[index];
+        // Deliberately deferred to HERE (not the top of the function) —
+        // this dispatcher is tried speculatively for every `.property`
+        // call and falls through to the next candidate (constructor
+        // call, ordinary method call, ...) on `null`; reporting eagerly
+        // at the top fired as a side effect for calls that AREN'T
+        // interface calls at all and get resolved by a later fallback —
+        // real bug found via a qualified struct constructor with named
+        // args (`модуль.Тип(поле = x, ...)`), wrongly rejected even
+        // though it never reaches this point as an actual interface
+        // dispatch.
+        if (call.argument_names != null) try self.report(call.span, "Type Error: именованные аргументы не поддержаны для интерфейсного вызова", .{});
         if (call.arguments.len != method.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов метода", .{});
         var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
         defer substitutions.deinit();
         for (definition.parameters, nominal.arguments) |parameter, argument| try substitutions.put(parameter.typ, argument);
+        // Self-typed method (`сравнить(другое: Сравниваемое) -> Число`,
+        // `равно`, the 4 arithmetic ops, `клонировать() -> Копируемое`)
+        // dispatched through an INTERFACE-typed value (not a concrete
+        // struct) — there's no concrete type to resolve "Self" to here
+        // (the value could be any implementor), so the only sound
+        // substitution is the interface type itself; `assignable` already
+        // accepts a concrete argument against an interface-typed expected
+        // type via `interfaceImplementation` lookup. See
+        // `interface_self_placeholders`'s doc comment for the regression
+        // this fixes.
+        const self_type = self.result.interface_self_placeholders.get(nominal.symbol);
+        if (self_type) |placeholder| try substitutions.put(placeholder, object_type);
         const shared = @min(call.arguments.len, method.parameters.len);
         for (call.arguments[0..shared], method.parameters[0..shared]) |argument, parameter| {
             const expected = try self.substituteGeneric(parameter, &substitutions);
             const actual = try self.inferExpected(argument, expected);
             if (!self.assignable(actual, expected)) {
                 try self.report(call.span, "Type Error: аргумент метода не совпадает с типом параметра", .{});
-            } else {
+            } else if (self_type == null or !parameter.eql(self_type.?)) {
+                // A Self-typed PARAMETER is the one case where boxing
+                // must NOT happen: the vtable-resolved concrete method
+                // (`callInterface`, `vm.zig`) expects the SAME raw
+                // concrete value the receiver itself carries (it was
+                // compiled as e.g. `сравнить(это: Точка, другое: Точка)`,
+                // not `другое: <interface>`) — casting the argument to
+                // the interface type here would hand it a boxed
+                // `.interface` value at the call site, which then fails
+                // ordinary field access inside the callee ("доступ к
+                // полю поддержан только для структуры"). Real regression
+                // found fixing the call site's type (see
+                // `interface_self_placeholders`): the TYPE substitution
+                // is still needed (so an unrelated non-implementing
+                // value is rejected), just not the runtime cast.
                 try self.registerInterfaceCast(argument, actual, expected);
             }
         }
@@ -4350,7 +4613,6 @@ const Checker = struct {
     // the runtime value here already carries a real vtable to dispatch
     // through.
     fn inferGenericBoundInterfaceCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
-        if (call.argument_names != null) try self.report(call.span, "Type Error: именованные аргументы не поддержаны для интерфейсного вызова", .{});
         const object = self.result.types.get(object_type) orelse return null;
         if (object.* != .generic_parameter) return null;
         var bounds: []const symbols.SymbolId = &.{};
@@ -4375,6 +4637,11 @@ const Checker = struct {
                 continue;
             };
             const method = definition.methods[index];
+            // Deferred here (not the top of the function), same reason as
+            // `inferInterfaceCall`'s identical fix — this dispatcher is
+            // also tried speculatively per bound and falls through on
+            // `null`.
+            if (call.argument_names != null) try self.report(call.span, "Type Error: именованные аргументы не поддержаны для интерфейсного вызова", .{});
             if (call.arguments.len != method.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов метода", .{});
             const shared = @min(call.arguments.len, method.parameters.len);
             for (call.arguments[0..shared], method.parameters[0..shared]) |argument, parameter| {
@@ -4401,7 +4668,11 @@ const Checker = struct {
         if (object.* != .process) return null;
         if (!std.mem.eql(u8, property.property, "номер")) return null;
         try self.checkMethodArity(call, "номер", 0);
-        return self.result.types.builtins.number;
+        // Discrete process id — must match `получить_сигнал()`'s `id`
+        // (also `Целое`, see that builtin's handling above) so
+        // `id == p.номер()` type-checks; both are the same u64 process
+        // id at runtime regardless.
+        return self.result.types.builtins.integer;
     }
 
     fn inferMethodCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
@@ -5561,6 +5832,84 @@ test "type checker infers массив() element type inside a выбор arm fr
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
     var lexed = try lexer.tokenize(std.testing.allocator, "тип E = перечисление\nА\nБ\nконец\nфунк f(e: E) -> Массив(Число)\nвыбор e\nE.А -> массив()\nE.Б -> массив(1.0)\nконец\nконец\nфунк старт() -> Массив(Число)\nf(E.А)\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+// Regression: two `выбор` arms for the SAME enum variant with DIFFERENT
+// field patterns (one literal-narrowed, one a plain binder) used to be
+// flagged as "вариант перечисления повторён" even though the second arm
+// only catches what the first didn't — the old check compared variant
+// SYMBOLS only, ignoring field narrowing entirely.
+test "type checker allows a literal-narrowed match arm followed by a plain binder for the same variant" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Событие = перечисление\nКлик(Число, Число)\nконец\nфунк f() -> Строка\nпер e = Событие.Клик(1.0, 2.0)\nвыбор e\nСобытие.Клик(1.0, y) -> \"a\"\nСобытие.Клик(x, y) -> \"b\"\nконец\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+// Two FULLY GENERIC (unnarrowed) arms for the same variant are still a
+// genuine duplicate/unreachable-arm error — the fix above must not
+// swallow this case.
+test "type checker still rejects two fully generic match arms for the same variant" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Событие = перечисление\nКлик(Число, Число)\nконец\nфунк f() -> Строка\nпер e = Событие.Клик(1.0, 2.0)\nвыбор e\nСобытие.Клик(x, y) -> \"a\"\nСобытие.Клик(a, b) -> \"b\"\nконец\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: вариант перечисления повторён в выборе", checked.diagnostics.items.items[0].message);
+}
+
+// Regression: `Сравниваемое` (`<`) used to only work inside a
+// `[T: Сравниваемое]`-bounded generic (`isComparableGeneric`) — a
+// CONCRETE type's own `реализация Сравниваемое` used directly, no
+// generic involved, fell through to the plain `isNumeric` rejection.
+test "type checker allows Сравниваемое comparison on a concrete type outside any generic context" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Деньги = структура\nкопейки: Число\nконец\nреализация Сравниваемое для Деньги\nфунк сравнить(это: Деньги, другое: Деньги) -> Число\nэто.копейки - другое.копейки\nконец\nконец\nфунк f() -> Булево\nДеньги(150.0) < Деньги(300.0)\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+// Regression: calling a Self-typed interface method (`сравнить(другое:
+// Сравниваемое) -> Число`) directly through an interface-TYPED variable
+// (`x: Сравниваемое`) left the Self placeholder unsubstituted at the
+// call site, so a concrete argument of the implementing type was never
+// assignable to it — fixed via `interface_self_placeholders`.
+test "type checker allows a self-typed interface method call through an interface-typed variable" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator, "тип Деньги = структура\nкопейки: Число\nконец\nреализация Сравниваемое для Деньги\nфунк сравнить(это: Деньги, другое: Деньги) -> Число\nэто.копейки - другое.копейки\nконец\nконец\nфунк f() -> Число\nпер x: Сравниваемое = Деньги(1.0)\nx.сравнить(Деньги(2.0))\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

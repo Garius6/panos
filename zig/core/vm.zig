@@ -1587,6 +1587,10 @@ pub const Vm = struct {
             .str_len_bytes => try self.strLenBytes(),
             .str_slice_bytes => try self.strSliceBytes(),
             .str_from_bytes => try self.strFromBytes(),
+            .str_to_bytes => try self.strToBytes(),
+            .str_to_runes => try self.strToRunes(),
+            .str_from_runes => try self.strFromRunes(),
+            .str_code_point => try self.strCodePoint(),
             .str_to_number => try self.strToNumber(),
             .str_number_to_str => try self.strNumberToStr(),
             .str_int_to_str => try self.strIntToStr(),
@@ -2574,6 +2578,102 @@ pub const Vm = struct {
         }
         const result = try self.heap.createString(bytes);
         try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    // Mass (whole-string) counterpart to `строки.байт`/`длина_байт` — same
+    // element type/shape as `из_байтов`'s input, just produced instead of
+    // consumed.
+    fn strToBytes(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.в_байты() ожидает строку", .{});
+            return;
+        };
+        const elements = try self.allocator.alloc(value.Value, string.len);
+        errdefer self.allocator.free(elements);
+        for (string, 0..) |byte, index| elements[index] = .{ .number = @floatFromInt(byte) };
+        const array = try self.heap.createArray(elements);
+        try self.stack.append(self.allocator, .{ .array = array });
+    }
+
+    // Mass (whole-string) rune decode — `Массив(Целое)` of codepoint
+    // values, same UTF-8 decoding as `строки.длина`/`срез` (`Utf8View`).
+    fn strToRunes(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.в_руны() ожидает строку", .{});
+            return;
+        };
+        var view = std.unicode.Utf8View.init(string) catch {
+            try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+            return;
+        };
+        var codepoints = std.ArrayList(value.Value).empty;
+        errdefer codepoints.deinit(self.allocator);
+        var iterator = view.iterator();
+        while (iterator.nextCodepoint()) |codepoint| {
+            try codepoints.append(self.allocator, .{ .number = @floatFromInt(codepoint) });
+        }
+        const array = try self.heap.createArray(try codepoints.toOwnedSlice(self.allocator));
+        try self.stack.append(self.allocator, .{ .array = array });
+    }
+
+    // Inverse of `в_руны` — encodes each codepoint back to UTF-8, same
+    // validation shape as `из_байтов` (range-check every element before
+    // committing any output).
+    fn strFromRunes(self: *Vm) anyerror!void {
+        const array_value = try self.pop();
+        const array = switch (array_value) {
+            .array => |a| a,
+            else => {
+                try self.fault("Runtime Error: строки.из_рун() ожидает Массив(Целое)", .{});
+                return;
+            },
+        };
+        var bytes = std.ArrayList(u8).empty;
+        errdefer bytes.deinit(self.allocator);
+        for (array.elements) |element| {
+            const n = try self.number(element);
+            if (n < 0 or n > 0x10FFFF or n != std.math.trunc(n)) {
+                try self.fault("Runtime Error: строки.из_рун(): элемент вне диапазона codepoint", .{});
+                return;
+            }
+            const codepoint: u21 = @intFromFloat(n);
+            var buffer: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(codepoint, &buffer) catch {
+                try self.fault("Runtime Error: строки.из_рун(): недопустимый codepoint", .{});
+                return;
+            };
+            try bytes.appendSlice(self.allocator, buffer[0..len]);
+        }
+        const result = try self.heap.createString(try bytes.toOwnedSlice(self.allocator));
+        try self.stack.append(self.allocator, .{ .heap_string = result });
+    }
+
+    // First rune's codepoint value — same "decode just the FIRST
+    // codepoint, ignore the rest" contract as `strIsDigit`/`strIsLetter`
+    // above, for the common `строки.кодовая_точка(s[i])` (single-rune
+    // slice) call shape the docs example uses.
+    fn strCodePoint(self: *Vm) anyerror!void {
+        const string_value = try self.pop();
+        const string = string_value.stringBytes() orelse {
+            try self.fault("Runtime Error: строки.кодовая_точка() ожидает строку", .{});
+            return;
+        };
+        if (string.len == 0) {
+            try self.fault("Runtime Error: строки.кодовая_точка(): пустая строка", .{});
+            return;
+        }
+        var view = std.unicode.Utf8View.init(string) catch {
+            try self.fault("Runtime Error: строка содержит некорректный UTF-8", .{});
+            return;
+        };
+        var iterator = view.iterator();
+        const codepoint = iterator.nextCodepoint() orelse {
+            try self.fault("Runtime Error: строки.кодовая_точка(): пустая строка", .{});
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .number = @floatFromInt(codepoint) });
     }
 
     fn strToNumber(self: *Vm) anyerror!void {
@@ -8656,7 +8756,7 @@ test "VM returns the current process" {
     const parser = @import("parser.zig");
     const resolver = @import("resolver.zig");
     const type_checker = @import("type_checker.zig");
-    var lexed = try lexer.tokenize(std.testing.allocator, "функ номер_себя() -> Число\nсебя().номер()\nконец", 0);
+    var lexed = try lexer.tokenize(std.testing.allocator, "функ номер_себя() -> Целое\nсебя().номер()\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

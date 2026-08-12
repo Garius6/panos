@@ -7,6 +7,11 @@ on:
         description: "Тег релиза (должен уже существовать, например v0.3.6)"
         required: true
         type: string
+      include_windows:
+        description: "Собрать также windows-amd64 (сейчас падает, см. комментарий у matrix — включать только вручную для отладки)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -31,6 +36,15 @@ jobs:
             suffix: macos-arm64
             ext: ""
 
+          # windows-2022: native-таргет zig на этом раннере резолвится в
+          # GNU/MinGW ABI по умолчанию, а external/libffi/lib/windows-amd64/
+          # libffi.lib собран под MSVC — lld-link не находит
+          # libLIBCMT.a/libOLDNAMES.a. Падает с v0.3.0, не починено. Матрица
+          # включает эту запись всегда, но КАЖДЫЙ шаг ниже пропускается
+          # (`if: matrix.os != 'windows-2022' || inputs.include_windows`),
+          # если явно не запросили `include_windows: true` при ручном
+          # запуске — так job виден в списке (не молча отсутствует), но
+          # реально не собирается и не валит остальную матрицу.
           - os: windows-2022
             suffix: windows-amd64
             ext: ".exe"
@@ -39,6 +53,7 @@ jobs:
 
     steps:
       - name: Получить исходники
+        if: matrix.os != 'windows-2022' || inputs.include_windows
         uses: actions/checkout@v4
 
       # T057 (specs/010-zig-migration): release binaries now come from the
@@ -47,23 +62,27 @@ jobs:
       # release build is never the FIRST time this exact platform/optimize
       # combination has been compiled.
       - name: Установить Zig
+        if: matrix.os != 'windows-2022' || inputs.include_windows
         uses: mlugg/setup-zig@v2
         with:
           version: "0.16.0"
 
       - name: Собрать panos
+        if: matrix.os != 'windows-2022' || inputs.include_windows
         shell: bash
         run: |
           set -euo pipefail
           zig build -Doptimize=ReleaseFast
 
       - name: Собрать panos-lsp
+        if: matrix.os != 'windows-2022' || inputs.include_windows
         shell: bash
         run: |
           set -euo pipefail
           zig build lsp -Doptimize=ReleaseFast
 
       - name: Подготовить файлы релиза
+        if: matrix.os != 'windows-2022' || inputs.include_windows
         shell: bash
         run: |
           set -euo pipefail
@@ -79,6 +98,7 @@ jobs:
             "dist/panos-lsp-${{ matrix.suffix }}${{ matrix.ext }}"
 
       - name: Сохранить результат сборки
+        if: matrix.os != 'windows-2022' || inputs.include_windows
         uses: actions/upload-artifact@v4
         with:
           name: panos-${{ matrix.suffix }}
@@ -105,6 +125,8 @@ jobs:
 
       - name: Проверить состав релиза
         shell: bash
+        env:
+          INCLUDE_WINDOWS: ${{ inputs.include_windows }}
         run: |
           set -euo pipefail
 
@@ -112,8 +134,11 @@ jobs:
           test -f dist/panos-lsp-linux-amd64
           test -f dist/panos-macos-arm64
           test -f dist/panos-lsp-macos-arm64
-          test -f dist/panos-windows-amd64.exe
-          test -f dist/panos-lsp-windows-amd64.exe
+
+          if [ "$INCLUDE_WINDOWS" = "true" ]; then
+            test -f dist/panos-windows-amd64.exe
+            test -f dist/panos-lsp-windows-amd64.exe
+          fi
 
           find dist -maxdepth 1 -type f -print
 

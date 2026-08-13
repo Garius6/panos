@@ -270,7 +270,47 @@ fn expandSpawn(
     // Downstream instructions (the user's own code after `запусти ...`,
     // e.g. `пер proc = ...`) may reference `dst` too — redirect exactly
     // like `mir_cps.zig`'s suspend-point handling does.
-    for (original.instructions.items[spawn_index + 1 ..]) |tail_instruction| {
+    //
+    // `.frame_store` needs special handling here, not just a blind
+    // substitute: by the time `expandSpawn` runs (AFTER `mir_cps.
+    // prepare`), the user's `пер proc = запусти ...` has ALREADY been
+    // rewritten by `mir_cps.zig`'s own `.store_local` case into
+    // `load_local{dst=F,local=frame_local}` (frame pointer reload,
+    // emitted FIRST, unchanged by the substitution below since it
+    // doesn't reference `dst`) followed by `frame_store{frame=F,...,
+    // src=dst}`. A blind substitute here inserts a FRESH `loadLocal
+    // (dst_local)` for `src` right before the (rewritten) frame_store —
+    // making `src` the freshest value, with `frame`(F) produced earlier/
+    // buried — backwards from `frame_store` codegen's `[src, frame]`
+    // convention (frame must be freshest). Confirmed via wasmtime: `proc`
+    // ended up reading garbage (0) instead of the real spawned handle,
+    // since the write actually happened at the WRONG address. Fix:
+    // detect this exact `load_local(frame_local)` + `frame_store{src=
+    // dst}` pair and re-synthesize it in the correct order — dropping
+    // the stale frame reload (now dead) and emitting a fresh one AFTER
+    // the fresh src reload.
+    var ti: usize = 0;
+    const tail = original.instructions.items[spawn_index + 1 ..];
+    while (ti < tail.len) : (ti += 1) {
+        const tail_instruction = tail[ti];
+        // Lookahead: is THIS a frame-pointer reload whose sole purpose
+        // (per mir_cps.zig's `.store_local` rewrite) is feeding the VERY
+        // NEXT instruction's `frame_store{src=dst}`? If so, DON'T emit
+        // it — its value would be dead-but-unconsumed once the next
+        // iteration re-synthesizes a fresh one in the correct order.
+        if (tail_instruction == .load_local and tail_instruction.load_local.local == frame_local and
+            ti + 1 < tail.len and tail[ti + 1] == .frame_store and tail[ti + 1].frame_store.src == dst and
+            tail[ti + 1].frame_store.frame == tail_instruction.load_local.dst)
+        {
+            continue;
+        }
+        if (tail_instruction == .frame_store and tail_instruction.frame_store.src == dst) {
+            const fs = tail_instruction.frame_store;
+            const fresh_src = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
+            const fresh_frame = try wasm_heap.frameValue(builder, frame_local, layout.ptr_type);
+            try builder.emit(.{ .frame_store = .{ .frame = fresh_frame, .slot = fs.slot, .src = fresh_src } });
+            continue;
+        }
         var rewritten = tail_instruction;
         if (mir_cps.referencesValue(rewritten, dst)) {
             const fresh = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);

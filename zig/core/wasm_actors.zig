@@ -304,11 +304,27 @@ fn expandSend(
     builder.currentFunction().block(block_id).instructions = prefix;
     builder.terminated = false;
 
-    const message = send.message;
+    // `send.process` and `send.message` are BOTH pre-existing values
+    // (`отправить(process_expr, message_expr)` evaluates left to right,
+    // so `process` is produced FIRST and `message` SECOND/freshest —
+    // `message` is very often itself a `build_variant` result, an
+    // entire construction sequence deep). Consuming `process` first (the
+    // original code's order) blindly popped whatever was ACTUALLY on
+    // top of the real WASM stack at that point — `message`, not
+    // `process` — since `store_local`'s codegen is just a raw
+    // `local.set`, it doesn't care what the MIR's `src` field claims,
+    // only what's really on top. Confirmed via wasmtime: this silently
+    // swapped `message`/`process`. Fix: consume in REVERSE-of-production
+    // (LIFO) order, same class of bug already found and fixed in
+    // `wasm_objects.zig`'s `build_variant`/`new_aggregate` field loops —
+    // store `message` first (it's topmost), THEN `process` (now exposed).
+    const message_type = function.valueType(send.message);
+    const message_local = try wasm_heap.storeLocal(builder, "@message", message_type, send.message);
     // `process`/`count` are each used more than once below — single-use
     // invariant, same fix as everywhere else in this file: store once,
     // reload fresh per use.
     const process_local = try wasm_heap.storeLocal(builder, "@target", layout.ptr_type, send.process);
+    const message = try wasm_heap.loadLocal(builder, message_local, message_type);
 
     const process_for_count = try wasm_heap.loadLocal(builder, process_local, layout.ptr_type);
     const count = try builder.newValue(layout.idx_type);
@@ -318,15 +334,28 @@ fn expandSend(
     const process_for_head = try wasm_heap.loadLocal(builder, process_local, layout.ptr_type);
     const head = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .frame_load = .{ .dst = head, .frame = process_for_head, .slot = mir_cps.mailbox_head_slot } });
-    const eight = try wasm_heap.addressConst(builder, layout.idx_type, 8);
     const count_for_tail = try wasm_heap.loadLocal(builder, count_local, layout.idx_type);
     const tail_pre = try wasm_heap.binOp(builder, layout.idx_type, .add, head, count_for_tail);
     const mask = try wasm_heap.addressConst(builder, layout.idx_type, mir_cps.mailbox_cap - 1);
     const tail = try wasm_heap.binOp(builder, layout.idx_type, .bit_and, tail_pre, mask);
+    // `eight` produced IMMEDIATELY after `tail` (adjacent — no other
+    // value's producer runs between them) so `tail_bytes` consumes
+    // exactly `[tail, eight]`, then `base`'s own two operands
+    // (`ring_base_bytes`/`process_for_base`) are produced and consumed
+    // together right before `addr`'s own add — `tail_bytes` sits safely
+    // buried underneath that net-stack-neutral pair the whole time.
+    // Originally `eight` was produced between `head` and `count_for_tail`
+    // — `.binary`'s i32 codegen does ZERO stack manipulation (just emits
+    // the raw opcode, `wasm_emit.zig` ~line 545: assumes `lhs`/`rhs` are
+    // ALREADY the top two stack values, pushed back-to-back with nothing
+    // interposed) — so the wedged `eight` made `tail_pre`'s `i32.add`
+    // silently compute `8 + count` instead of `head + count`, orphaning
+    // `head` on the stack to corrupt everything emitted after it.
+    const eight = try wasm_heap.addressConst(builder, layout.idx_type, 8);
+    const tail_bytes = try wasm_heap.binOp(builder, layout.idx_type, .multiply, tail, eight);
     const ring_base_bytes = try wasm_heap.addressConst(builder, layout.ptr_type, mir_cps.mailbox_ring_base * 8);
     const process_for_base = try wasm_heap.loadLocal(builder, process_local, layout.ptr_type);
     const base = try wasm_heap.binOp(builder, layout.idx_type, .add, process_for_base, ring_base_bytes);
-    const tail_bytes = try wasm_heap.binOp(builder, layout.idx_type, .multiply, tail, eight);
     const addr = try wasm_heap.binOp(builder, layout.idx_type, .add, base, tail_bytes);
     try builder.emit(.{ .mem_store = .{ .addr = addr, .src = message } });
     const one = try wasm_heap.addressConst(builder, layout.idx_type, 1);
@@ -395,15 +424,23 @@ fn buildScheduler(
         try emitSchedulerRound(&builder, allocator, layout, frame0_local, done0_local, done1_local, old_start, actor_step, child_frame_slot);
     }
 
+    // Termination only waits on `done0` (`старт`, the "main" process) —
+    // NOT `done1` (the spawned background actor) too. A spawned actor is
+    // routinely a persistent server that loops forever by design (this
+    // fixture's own `счётчик`: every `получить()` immediately recurses
+    // into another `получить()`, never actually returning) — requiring
+    // it to ALSO finish before the program can end made every such
+    // (entirely normal, "fire and forget" background actor) program
+    // trap on "превышен лимит раундов" after `старт` had already
+    // produced its real result. `старт` finishing is what the program's
+    // own result depends on; a still-suspended background actor at that
+    // point is ordinary, expected actor semantics, not an error.
     const d0 = try builder.newValue(layout.bool_type);
     try builder.emit(.{ .load_local = .{ .dst = d0, .local = done0_local } });
-    const d1 = try builder.newValue(layout.bool_type);
-    try builder.emit(.{ .load_local = .{ .dst = d1, .local = done1_local } });
-    const both_done = try wasm_heap.binOp(&builder, layout.bool_type, .bit_and, d0, d1);
 
     const trap_block = try builder.newBlock();
     const finish_block = try builder.newBlock();
-    builder.terminate(.{ .branch = .{ .cond = both_done, .then_block = finish_block, .else_block = trap_block } });
+    builder.terminate(.{ .branch = .{ .cond = d0, .then_block = finish_block, .else_block = trap_block } });
 
     builder.setCurrentBlock(trap_block);
     builder.terminate(.{ .unreachable_term = .{ .reason = "актор: превышен лимит раундов планировщика (Phase 1, 16 раундов)" } });

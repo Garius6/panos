@@ -641,7 +641,27 @@ fn rewriteInstructionStream(
         const message_slot = message_slot_base + (state - 1);
         const function = builder.currentFunction();
 
-        // Mailbox/signal check.
+        // Mailbox/signal check — lives in its OWN block (`recheck_block`),
+        // not inlined into whatever block was current when this suspend
+        // point was reached. This block is BOTH the natural fallthrough
+        // from the code above AND (via `resume_blocks`, below) the entry
+        // dispatch's OWN jump target for this state — the has()-check
+        // must be genuinely RE-RUN on every resume, not skipped, because
+        // `wasm_actors.zig`'s scheduler calls a suspended function's step
+        // repeatedly, on every round, with NO guarantee a new message
+        // has actually arrived by the time it's called again. Originally
+        // the dispatch target was `have_block` directly (skipping the
+        // check) — matching the file's own documented intent ("mirroring
+        // the native VM's ip-rollback suspend contract", i.e. resuming
+        // rolls back to BEFORE the check, not past it) but not what the
+        // code actually did. Confirmed via wasmtime: this made a resumed
+        // function unconditionally pop the mailbox even when empty,
+        // underflowing the unsigned `count` field to a huge value that
+        // then poisoned address arithmetic into an out-of-bounds write.
+        const recheck_block = try builder.newBlock();
+        builder.terminate(.{ .jump = .{ .target = recheck_block } });
+        builder.setCurrentBlock(recheck_block);
+
         const check_frame = try frameValue(builder, frame_local, ptr_type);
         const has = try builder.newValue(bool_type);
         try builder.emit(.{ .call_builtin = .{ .dst = has, .name = kind.?.has, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{check_frame}) } });
@@ -685,7 +705,7 @@ fn rewriteInstructionStream(
         const pop_frame = try frameValue(builder, frame_local, ptr_type);
         const popped = try builder.newValue(message_type);
         try builder.emit(.{ .call_builtin = .{ .dst = popped, .name = kind.?.pop, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{pop_frame}) } });
-        try resume_blocks.put(state, have_block);
+        try resume_blocks.put(state, recheck_block);
 
         // The ORIGINAL `dst` (the receive's own ValueId) is redirected to
         // an ordinary WASM local — every later instruction referencing it

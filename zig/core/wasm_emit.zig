@@ -645,6 +645,8 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
                 .negate_number => try code.append(allocator, 0x9A), // f64.neg
                 .negate_bool => try code.append(allocator, 0x45), // i32.eqz
                 .int_trunc => try code.append(allocator, 0x9C), // f64.trunc
+                .to_i32 => try code.append(allocator, 0xAA), // i32.trunc_f64_s
+                .from_i32 => try code.append(allocator, 0xB7), // f64.convert_i32_s
                 .bit_not => return unsupported("побитовое НЕ (вне Phase 1a)"),
             }
             return unary.dst;
@@ -774,76 +776,18 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try wasm_module.writeUleb128(code, allocator, import_index);
             return call.dst;
         },
-        .new_aggregate => |aggregate| {
-            const import_index = ctx.builtin_index.get(try structNewBuiltinName(ctx.function, aggregate.elements)) orelse return unsupported("конструктор структуры без runtime-импорта");
-            try code.append(allocator, 0x10); // call
-            try wasm_module.writeUleb128(code, allocator, import_index);
-            return aggregate.dst;
-        },
-        .get_property => |property| {
-            try code.append(allocator, 0x41); // i32.const field index
-            try wasm_module.writeSleb128(code, allocator, @intCast(property.field_index));
-            const getter_name = if (wasmType(ctx, property.dst) == wasm_module.wasm_i32) "@runtime::struct_get_i32" else "@runtime::struct_get_f64";
-            const import_index = ctx.builtin_index.get(getter_name) orelse return unsupported("чтение поля структуры без runtime-импорта");
-            try code.append(allocator, 0x10); // call
-            try wasm_module.writeUleb128(code, allocator, import_index);
-            return property.dst;
-        },
-        .set_property => |property| {
-            try code.append(allocator, 0x41); // i32.const field index
-            try wasm_module.writeSleb128(code, allocator, @intCast(property.field_index));
-            const setter_name = if (wasmType(ctx, property.value) == wasm_module.wasm_i32) "@runtime::struct_set_i32" else "@runtime::struct_set_f64";
-            const import_index = ctx.builtin_index.get(setter_name) orelse return unsupported("запись поля структуры без runtime-импорта");
-            try code.append(allocator, 0x10); // call(handle, value, field)
-            try wasm_module.writeUleb128(code, allocator, import_index);
-            return null;
-        },
-        .new_array => |array| {
-            if (array.elements.len != 0) return unsupported("new_array с inline-элементами");
-            const import_index = ctx.builtin_index.get("@runtime::array_new") orelse return unsupported("массив без runtime-импорта");
-            try code.append(allocator, 0x10); // call
-            try wasm_module.writeUleb128(code, allocator, import_index);
-            return array.dst;
-        },
-        .get_index => |index| {
-            const getter_name = if (wasmType(ctx, index.dst) == wasm_module.wasm_i32) "@runtime::array_get_i32" else "@runtime::array_get_f64";
-            const import_index = ctx.builtin_index.get(getter_name) orelse return unsupported("индексирование массива без runtime-импорта");
-            try code.append(allocator, 0x10); // call(handle, index)
-            try wasm_module.writeUleb128(code, allocator, import_index);
-            return index.dst;
-        },
-        .set_index => |index| {
-            const setter_name = if (wasmType(ctx, index.value) == wasm_module.wasm_i32) "@runtime::array_set_i32" else "@runtime::array_set_f64";
-            const import_index = ctx.builtin_index.get(setter_name) orelse return unsupported("запись массива без runtime-импорта");
-            try code.append(allocator, 0x10); // call(handle, index, value)
-            try wasm_module.writeUleb128(code, allocator, import_index);
-            return null;
-        },
-        .build_variant => |variant| {
-            try code.append(allocator, 0x41); // i32.const tag follows fields
-            try wasm_module.writeSleb128(code, allocator, @intCast(variant.tag));
-            const import_index = ctx.builtin_index.get(try variantNewBuiltinName(ctx.function, variant.fields)) orelse return unsupported("вариант без runtime-импорта");
-            try code.append(allocator, 0x10);
-            try wasm_module.writeUleb128(code, allocator, import_index);
-            return variant.dst;
-        },
-        .match_tag => |match| {
-            try code.append(allocator, 0x41);
-            try wasm_module.writeSleb128(code, allocator, @intCast(match.tag));
-            const import_index = ctx.builtin_index.get("@runtime::variant_match") orelse return unsupported("проверка variant без runtime-импорта");
-            try code.append(allocator, 0x10);
-            try wasm_module.writeUleb128(code, allocator, import_index);
-            return match.dst;
-        },
-        .get_variant_field => |field| {
-            try code.append(allocator, 0x41);
-            try wasm_module.writeSleb128(code, allocator, @intCast(field.field_index));
-            const name = if (wasmType(ctx, field.dst) == wasm_module.wasm_i32) "@runtime::variant_get_i32" else "@runtime::variant_get_f64";
-            const import_index = ctx.builtin_index.get(name) orelse return unsupported("чтение поля variant без runtime-импорта");
-            try code.append(allocator, 0x10);
-            try wasm_module.writeUleb128(code, allocator, import_index);
-            return field.dst;
-        },
+        // `wasm_objects.zig`'s `expand()` runs on every module BEFORE
+        // this emitter and rewrites every one of these nine instruction
+        // kinds into `frame_load`/`frame_store`/`mem_load`/`mem_store`/
+        // `.call` — real in-module linear-memory code, zero host
+        // imports. Reaching this arm at all means `expand()` was
+        // skipped or missed a case — a genuine `wasm_objects.zig` bug,
+        // not a normal "feature not supported yet" gap, so this fails
+        // loudly (mirrors the identical invariant `mir_cps.zig`
+        // documents for actor instructions never reaching codegen
+        // un-rewritten) instead of silently falling back to the OLD
+        // JS-host object-table imports this file used to emit here.
+        .new_aggregate, .get_property, .set_property, .new_array, .get_index, .set_index, .build_variant, .match_tag, .get_variant_field => return unsupported("структура/массив/вариант должны быть развёрнуты wasm_objects.zig до кодогенерации"),
         else => return unsupported("вид MIR-инструкции"),
     }
 }
@@ -875,24 +819,45 @@ pub fn emitFunctionWasm(
         const store = function.type_store orelse &checked.types;
         try out.append(allocator, wasm_module.wasmValTypeForStore(store, function.locals.items[i].type_id));
     }
-    // Declaration order must match the index order handed out by
-    // `reserveScratchLocal`/`reserveFrameScratch`/`reserveFrameStoreScratch`
-    // (`nextFrameStoreScratchIndex`) above.
-    if (ctx.scratch_i32_local != null) {
-        try wasm_module.writeUleb128(&out, allocator, 1);
-        try out.append(allocator, wasm_module.wasm_f64);
+    // Declaration order must match the ACTUAL index each scratch local was
+    // handed out at by `reserveScratchLocal`/`reserveFrameScratch`/
+    // `reserveFrameStoreScratch` (`nextFrameStoreScratchIndex`) — indices
+    // are assigned in ENCOUNTER order (whichever scratch kind a function's
+    // instruction stream needs first gets the lowest index), which is NOT
+    // necessarily scratch_i32_local/frame/i32/f64 field-declaration order
+    // (e.g. a function whose first `mem_store` has an f64 `src` reserves
+    // `frame_store_scratch_f64` before `frame_store_scratch_i32` ever gets
+    // touched). Emitting declarations in fixed field order regardless
+    // produced a real, confirmed-via-wasmtime bug: the local at a given
+    // index could be declared as the WRONG WASM value type, causing
+    // "type mismatch: expected i32, found f64" at validation. Sort the
+    // present scratch locals by their actual assigned index instead.
+    var scratch_decls: [4]struct { index: u32, wasm_type: u8 } = undefined;
+    var scratch_decl_count: usize = 0;
+    if (ctx.scratch_i32_local) |index| {
+        scratch_decls[scratch_decl_count] = .{ .index = index, .wasm_type = wasm_module.wasm_f64 };
+        scratch_decl_count += 1;
     }
-    if (ctx.frame_store_scratch_frame != null) {
-        try wasm_module.writeUleb128(&out, allocator, 1);
-        try out.append(allocator, wasm_module.wasm_i32);
+    if (ctx.frame_store_scratch_frame) |index| {
+        scratch_decls[scratch_decl_count] = .{ .index = index, .wasm_type = wasm_module.wasm_i32 };
+        scratch_decl_count += 1;
     }
-    if (ctx.frame_store_scratch_i32 != null) {
-        try wasm_module.writeUleb128(&out, allocator, 1);
-        try out.append(allocator, wasm_module.wasm_i32);
+    if (ctx.frame_store_scratch_i32) |index| {
+        scratch_decls[scratch_decl_count] = .{ .index = index, .wasm_type = wasm_module.wasm_i32 };
+        scratch_decl_count += 1;
     }
-    if (ctx.frame_store_scratch_f64 != null) {
+    if (ctx.frame_store_scratch_f64) |index| {
+        scratch_decls[scratch_decl_count] = .{ .index = index, .wasm_type = wasm_module.wasm_f64 };
+        scratch_decl_count += 1;
+    }
+    std.mem.sort(@TypeOf(scratch_decls[0]), scratch_decls[0..scratch_decl_count], {}, struct {
+        fn lessThan(_: void, a: @TypeOf(scratch_decls[0]), b: @TypeOf(scratch_decls[0])) bool {
+            return a.index < b.index;
+        }
+    }.lessThan);
+    for (scratch_decls[0..scratch_decl_count]) |decl| {
         try wasm_module.writeUleb128(&out, allocator, 1);
-        try out.append(allocator, wasm_module.wasm_f64);
+        try out.append(allocator, decl.wasm_type);
     }
     try out.appendSlice(allocator, ctx.code.items);
     try out.append(allocator, 0x0B); // end функции

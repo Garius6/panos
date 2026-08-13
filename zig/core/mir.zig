@@ -60,6 +60,16 @@ pub const UnOp = enum {
     negate_bool,
     bit_not,
     int_trunc,
+    // `wasm_objects.zig` — array indices arrive from user code as `Число`
+    // (f64), but real linear-memory addressing needs i32. Distinct from
+    // `int_trunc` (which stays in f64 space, `Число` truncation, not a
+    // WASM-level representation change). `to_i32` traps
+    // (`i32.trunc_f64_s`) on a negative-after-truncation or out-of-i32-
+    // range input — a bad array index crashes the module rather than
+    // surfacing a clean panos-level error; a known, accepted Phase-1 gap
+    // (see `wasm_objects.zig`'s own doc comment).
+    to_i32,
+    from_i32,
 };
 
 pub const ConstValue = union(enum) {

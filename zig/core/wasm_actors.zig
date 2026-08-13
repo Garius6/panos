@@ -6,6 +6,7 @@ const types = @import("types.zig");
 const source = @import("source.zig");
 const symbols = @import("symbols.zig");
 const wasm_module = @import("wasm_module.zig");
+const wasm_heap = @import("wasm_heap.zig");
 
 // Turns `mir_cps.zig`'s CPS-rewritten step functions into a REAL,
 // self-contained WASM program: builds the generic mailbox/signal/alloc
@@ -42,113 +43,20 @@ fn unsupported(comptime what: []const u8) error{ActorExpandUnsupported} {
 
 const scheduler_rounds: u32 = 16;
 
-fn findFunctionByName(module: *const mir.Module, name: []const u8) ?mir.FunctionId {
-    for (module.functions.items) |function| {
-        if (std.mem.eql(u8, function.name, name)) return function.id;
-    }
-    return null;
-}
-
-fn frameValue(builder: *mir_builder.Builder, frame_local: mir.LocalId, ptr_type: types.TypeId) !mir.ValueId {
-    const dst = try builder.newValue(ptr_type);
-    try builder.emit(.{ .load_local = .{ .dst = dst, .local = frame_local } });
-    return dst;
-}
-
-fn addressConst(builder: *mir_builder.Builder, ptr_type: types.TypeId, value: u32) !mir.ValueId {
-    const dst = try builder.newValue(ptr_type);
-    try builder.emit(.{ .const_value = .{ .dst = dst, .value = .{ .address = value } } });
-    return dst;
-}
-
-fn boolConst(builder: *mir_builder.Builder, bool_type: types.TypeId, value: bool) !mir.ValueId {
-    const dst = try builder.newValue(bool_type);
-    try builder.emit(.{ .const_value = .{ .dst = dst, .value = .{ .boolean = value } } });
-    return dst;
-}
-
-fn binOp(builder: *mir_builder.Builder, result_type: types.TypeId, op: mir.BinOp, lhs: mir.ValueId, rhs: mir.ValueId) !mir.ValueId {
-    const dst = try builder.newValue(result_type);
-    try builder.emit(.{ .binary = .{ .dst = dst, .op = op, .lhs = lhs, .rhs = rhs } });
-    return dst;
-}
-
-fn cmpOp(builder: *mir_builder.Builder, bool_type: types.TypeId, op: mir.CmpOp, lhs: mir.ValueId, rhs: mir.ValueId) !mir.ValueId {
-    const dst = try builder.newValue(bool_type);
-    try builder.emit(.{ .compare = .{ .dst = dst, .op = op, .lhs = lhs, .rhs = rhs } });
-    return dst;
-}
-
-fn notOp(builder: *mir_builder.Builder, bool_type: types.TypeId, value: mir.ValueId) !mir.ValueId {
-    const dst = try builder.newValue(bool_type);
-    try builder.emit(.{ .unary = .{ .dst = dst, .op = .negate_bool, .src = value } });
-    return dst;
-}
-
-// This whole file's #1 rule: a `ValueId` is a STACK VALUE, consumed
-// by its single use the moment `wasm_emit.zig` replays it — reusing one
-// across two or more later instructions (`mir_validate.zig`'s "single-
-// use инвариант") is invalid MIR, not just a style question. Any value
-// this file needs more than once MUST go through a real `Local` (store
-// once, reload fresh at each use) — exactly what `frameValue` already
-// does for the frame pointer; `storeLocal`/`loadLocal` below generalize
-// that to every other repeated value (found by actually running
-// `mir_validate.zig` over hand-built output, not by reading alone).
-fn storeLocal(builder: *mir_builder.Builder, name: []const u8, type_id: types.TypeId, value: mir.ValueId) !mir.LocalId {
-    const local = try builder.newLocal(dummy_symbol, name, type_id);
-    try builder.emit(.{ .store_local = .{ .local = local, .src = value } });
-    return local;
-}
-
-fn loadLocal(builder: *mir_builder.Builder, local: mir.LocalId, type_id: types.TypeId) !mir.ValueId {
-    const dst = try builder.newValue(type_id);
-    try builder.emit(.{ .load_local = .{ .dst = dst, .local = local } });
-    return dst;
-}
-
-const dummy_span: source.Span = .{ .file_id = 0, .start = 0, .end = 0 };
-const dummy_symbol: symbols.SymbolId = @enumFromInt(0);
-
-const Layout = struct {
-    ptr_type: types.TypeId,
-    idx_type: types.TypeId, // reused `Булево` — plain i32, no string-concat codegen collision (see mir_cps.zig's own `ptr_type` comment)
-    bool_type: types.TypeId,
-};
-
 // --- Generic runtime functions ----------------------------------------
 
-fn buildAlloc(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: Layout) !mir.FunctionId {
-    const id = try mir_builder.newFunction(module, allocator, "@actor_alloc", dummy_symbol, layout.ptr_type, dummy_span);
+fn buildHas(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, name: []const u8, count_slot: u32) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, name, wasm_heap.dummy_symbol, layout.bool_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
-    const size_local = try builder.newLocal(dummy_symbol, "size", layout.idx_type);
-    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{size_local});
-    builder.currentFunction().type_store = type_store;
-
-    const size = try builder.newValue(layout.idx_type);
-    try builder.emit(.{ .load_local = .{ .dst = size, .local = size_local } });
-    const ptr = try builder.newValue(layout.ptr_type);
-    try builder.emit(.{ .global_get = .{ .dst = ptr, .global = 0 } });
-    const ptr_local = try storeLocal(&builder, "ptr", layout.ptr_type, ptr); // `ptr` used twice below (add, return) — must go through a Local
-    const ptr_for_add = try loadLocal(&builder, ptr_local, layout.ptr_type);
-    const new_ptr = try binOp(&builder, layout.ptr_type, .add, ptr_for_add, size);
-    try builder.emit(.{ .global_set = .{ .global = 0, .src = new_ptr } });
-    const ptr_for_return = try loadLocal(&builder, ptr_local, layout.ptr_type);
-    builder.terminate(.{ .return_value = .{ .value = ptr_for_return } });
-    return id;
-}
-
-fn buildHas(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: Layout, name: []const u8, count_slot: u32) !mir.FunctionId {
-    const id = try mir_builder.newFunction(module, allocator, name, dummy_symbol, layout.bool_type, dummy_span);
-    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
-    const frame_local = try builder.newLocal(dummy_symbol, "frame", layout.ptr_type);
+    const frame_local = try builder.newLocal(wasm_heap.dummy_symbol, "frame", layout.ptr_type);
     builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{frame_local});
     builder.currentFunction().type_store = type_store;
 
-    const frame = try frameValue(&builder, frame_local, layout.ptr_type);
+    const frame = try wasm_heap.frameValue(&builder, frame_local, layout.ptr_type);
     const count = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .frame_load = .{ .dst = count, .frame = frame, .slot = count_slot } });
-    const zero = try addressConst(&builder, layout.idx_type, 0);
-    const has = try cmpOp(&builder, layout.bool_type, .not_equal, count, zero);
+    const zero = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    const has = try wasm_heap.cmpOp(&builder, layout.bool_type, .not_equal, count, zero);
     builder.terminate(.{ .return_value = .{ .value = has } });
     return id;
 }
@@ -161,7 +69,7 @@ fn buildPop(
     allocator: std.mem.Allocator,
     module: *mir.Module,
     type_store: *const types.TypeStore,
-    layout: Layout,
+    layout: wasm_heap.PtrLayout,
     name: []const u8,
     payload_type: types.TypeId,
     count_slot: u32,
@@ -169,44 +77,44 @@ fn buildPop(
     ring_base_slot: u32,
     cap: u32,
 ) !mir.FunctionId {
-    const id = try mir_builder.newFunction(module, allocator, name, dummy_symbol, payload_type, dummy_span);
+    const id = try mir_builder.newFunction(module, allocator, name, wasm_heap.dummy_symbol, payload_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
-    const frame_local = try builder.newLocal(dummy_symbol, "frame", layout.ptr_type);
+    const frame_local = try builder.newLocal(wasm_heap.dummy_symbol, "frame", layout.ptr_type);
     builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{frame_local});
     builder.currentFunction().type_store = type_store;
 
-    const frame1 = try frameValue(&builder, frame_local, layout.ptr_type);
+    const frame1 = try wasm_heap.frameValue(&builder, frame_local, layout.ptr_type);
     const head = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .frame_load = .{ .dst = head, .frame = frame1, .slot = head_slot } });
-    const head_local = try storeLocal(&builder, "head", layout.idx_type, head); // used twice below (addr math, head+1)
+    const head_local = try wasm_heap.storeLocal(&builder, "head", layout.idx_type, head); // used twice below (addr math, head+1)
 
     // addr = frame + ring_base_slot*8 + head*8
-    const frame2 = try frameValue(&builder, frame_local, layout.ptr_type);
-    const ring_base_bytes = try addressConst(&builder, layout.ptr_type, ring_base_slot * 8);
-    const base = try binOp(&builder, layout.ptr_type, .add, frame2, ring_base_bytes);
-    const eight = try addressConst(&builder, layout.idx_type, 8);
-    const head_for_addr = try loadLocal(&builder, head_local, layout.idx_type);
-    const head_bytes = try binOp(&builder, layout.idx_type, .multiply, head_for_addr, eight);
-    const addr = try binOp(&builder, layout.ptr_type, .add, base, head_bytes);
+    const frame2 = try wasm_heap.frameValue(&builder, frame_local, layout.ptr_type);
+    const ring_base_bytes = try wasm_heap.addressConst(&builder, layout.ptr_type, ring_base_slot * 8);
+    const base = try wasm_heap.binOp(&builder, layout.idx_type, .add, frame2, ring_base_bytes);
+    const eight = try wasm_heap.addressConst(&builder, layout.idx_type, 8);
+    const head_for_addr = try wasm_heap.loadLocal(&builder, head_local, layout.idx_type);
+    const head_bytes = try wasm_heap.binOp(&builder, layout.idx_type, .multiply, head_for_addr, eight);
+    const addr = try wasm_heap.binOp(&builder, layout.idx_type, .add, base, head_bytes);
     const message = try builder.newValue(payload_type);
     try builder.emit(.{ .mem_load = .{ .dst = message, .addr = addr } });
 
     // head = (head + 1) & (cap - 1)
-    const head_for_inc = try loadLocal(&builder, head_local, layout.idx_type);
-    const one = try addressConst(&builder, layout.idx_type, 1);
-    const head_plus_one = try binOp(&builder, layout.idx_type, .add, head_for_inc, one);
-    const mask = try addressConst(&builder, layout.idx_type, cap - 1);
-    const head_new = try binOp(&builder, layout.idx_type, .bit_and, head_plus_one, mask);
-    const frame3 = try frameValue(&builder, frame_local, layout.ptr_type);
+    const head_for_inc = try wasm_heap.loadLocal(&builder, head_local, layout.idx_type);
+    const one = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const head_plus_one = try wasm_heap.binOp(&builder, layout.idx_type, .add, head_for_inc, one);
+    const mask = try wasm_heap.addressConst(&builder, layout.idx_type, cap - 1);
+    const head_new = try wasm_heap.binOp(&builder, layout.idx_type, .bit_and, head_plus_one, mask);
+    const frame3 = try wasm_heap.frameValue(&builder, frame_local, layout.ptr_type);
     try builder.emit(.{ .frame_store = .{ .frame = frame3, .slot = head_slot, .src = head_new } });
 
     // count -= 1
-    const frame4 = try frameValue(&builder, frame_local, layout.ptr_type);
+    const frame4 = try wasm_heap.frameValue(&builder, frame_local, layout.ptr_type);
     const count = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .frame_load = .{ .dst = count, .frame = frame4, .slot = count_slot } });
-    const one_again = try addressConst(&builder, layout.idx_type, 1);
-    const count_new = try binOp(&builder, layout.idx_type, .subtract, count, one_again);
-    const frame5 = try frameValue(&builder, frame_local, layout.ptr_type);
+    const one_again = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const count_new = try wasm_heap.binOp(&builder, layout.idx_type, .subtract, count, one_again);
+    const frame5 = try wasm_heap.frameValue(&builder, frame_local, layout.ptr_type);
     try builder.emit(.{ .frame_store = .{ .frame = frame5, .slot = count_slot, .src = count_new } });
 
     builder.terminate(.{ .return_value = .{ .value = message } });
@@ -222,8 +130,8 @@ pub const Runtime = struct {
     signal_pop_i32: mir.FunctionId,
 };
 
-fn buildRuntime(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: Layout) !Runtime {
-    _ = try buildAlloc(allocator, module, type_store, layout);
+fn buildRuntime(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !Runtime {
+    _ = try wasm_heap.findOrBuildAlloc(allocator, module, type_store, layout);
     const mailbox_has = try buildHas(allocator, module, type_store, layout, "@actor_mailbox_has", mir_cps.mailbox_count_slot);
     const signal_has = try buildHas(allocator, module, type_store, layout, "@actor_signal_has", mir_cps.signal_count_slot);
     const mailbox_pop_f64 = try buildPop(allocator, module, type_store, layout, "@actor_mailbox_pop_f64", type_store.builtins.number, mir_cps.mailbox_count_slot, mir_cps.mailbox_head_slot, mir_cps.mailbox_ring_base, mir_cps.mailbox_cap);
@@ -314,7 +222,7 @@ fn expandSpawn(
     builder: *mir_builder.Builder,
     block_id: mir.BlockId,
     spawn_index: usize,
-    layout: Layout,
+    layout: wasm_heap.PtrLayout,
     frame_local: mir.LocalId,
     target_total_slots: u32,
     child_frame_slot: u32,
@@ -336,24 +244,27 @@ fn expandSpawn(
     builder.currentFunction().block(block_id).instructions = replacement;
     builder.terminated = false;
 
-    const size_const = try addressConst(builder, layout.idx_type, target_total_slots * 8);
-    try builder.emit(.{ .call = .{ .dst = dst, .callee = findAllocId(module_of(builder)).?, .args = try dupeOne(module_of(builder), size_const) } });
+    const size_const = try wasm_heap.addressConst(builder, layout.idx_type, target_total_slots * 8);
+    // Guaranteed already built — `expand()` calls `buildRuntime` (which
+    // creates it) before `expandSpawn` ever runs.
+    const alloc_id = wasm_heap.findFunctionByName(builder.module, wasm_heap.alloc_function_name).?;
+    try builder.emit(.{ .call = .{ .dst = dst, .callee = alloc_id, .args = try wasm_heap.dupeOne(builder.module, size_const) } });
     // `dst` is used below for EVERY arg's `frame_store`, the child-slot
     // stash, AND possibly further downstream (the user's own `пер proc =
     // запусти ...`) — single-use invariant, same fix as `mir_cps.zig`'s
     // `Redirect`: store once, reload fresh at each use.
-    const dst_local = try storeLocal(builder, "@spawned", layout.ptr_type, dst);
+    const dst_local = try wasm_heap.storeLocal(builder, "@spawned", layout.ptr_type, dst);
 
     for (args, 0..) |arg, i| {
-        const dst_for_arg = try loadLocal(builder, dst_local, layout.ptr_type);
+        const dst_for_arg = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
         try builder.emit(.{ .frame_store = .{ .frame = dst_for_arg, .slot = mir_cps.frame_prefix_slots + @as(u32, @intCast(i)), .src = arg } });
     }
 
     // `src` computed BEFORE `frame` — see `wasm_emit.zig`'s
     // `EmitContext.frame_store_scratch_frame` doc comment (stack order
     // `frame_store` codegen expects is `[src, frame]`).
-    const dst_for_stash = try loadLocal(builder, dst_local, layout.ptr_type);
-    const own_frame = try frameValue(builder, frame_local, layout.ptr_type);
+    const dst_for_stash = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
+    const own_frame = try wasm_heap.frameValue(builder, frame_local, layout.ptr_type);
     try builder.emit(.{ .frame_store = .{ .frame = own_frame, .slot = child_frame_slot, .src = dst_for_stash } });
 
     // Downstream instructions (the user's own code after `запусти ...`,
@@ -362,7 +273,7 @@ fn expandSpawn(
     for (original.instructions.items[spawn_index + 1 ..]) |tail_instruction| {
         var rewritten = tail_instruction;
         if (mir_cps.referencesValue(rewritten, dst)) {
-            const fresh = try loadLocal(builder, dst_local, layout.ptr_type);
+            const fresh = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
             rewritten = mir_cps.substituteValue(rewritten, dst, fresh);
         }
         try builder.emit(rewritten);
@@ -373,32 +284,6 @@ fn expandSpawn(
     original.instructions.deinit(allocator);
 }
 
-// Arena-allocated (`module.arena`), NOT the passed-in `allocator` —
-// `.call.args` is an instruction slice field, freed all at once with the
-// module (see `mir.Module.arena`'s own doc comment), never individually
-// by `Function.deinit`. Using the wrong allocator here is a real,
-// silent leak — found by running this code under a leak-checking
-// allocator, not by reading alone.
-fn dupeOne(module: *mir.Module, value: mir.ValueId) ![]const mir.ValueId {
-    return module.arena.allocator().dupe(mir.ValueId, &.{value});
-}
-
-fn module_of(builder: *mir_builder.Builder) *mir.Module {
-    return builder.module;
-}
-
-var g_alloc_id: ?mir.FunctionId = null;
-fn findAllocId(module: *mir.Module) ?mir.FunctionId {
-    if (g_alloc_id) |id| return id;
-    for (module.functions.items) |function| {
-        if (std.mem.eql(u8, function.name, "@actor_alloc")) {
-            g_alloc_id = function.id;
-            return function.id;
-        }
-    }
-    return null;
-}
-
 // Rewrites the SINGLE `.send` in place: pushes `message` into `process`'s
 // mailbox ring buffer.
 fn expandSend(
@@ -406,7 +291,7 @@ fn expandSend(
     builder: *mir_builder.Builder,
     block_id: mir.BlockId,
     send_index: usize,
-    layout: Layout,
+    layout: wasm_heap.PtrLayout,
 ) !void {
     const function = builder.currentFunction();
     var original = function.blockConst(block_id).*;
@@ -423,31 +308,31 @@ fn expandSend(
     // `process`/`count` are each used more than once below — single-use
     // invariant, same fix as everywhere else in this file: store once,
     // reload fresh per use.
-    const process_local = try storeLocal(builder, "@target", layout.ptr_type, send.process);
+    const process_local = try wasm_heap.storeLocal(builder, "@target", layout.ptr_type, send.process);
 
-    const process_for_count = try loadLocal(builder, process_local, layout.ptr_type);
+    const process_for_count = try wasm_heap.loadLocal(builder, process_local, layout.ptr_type);
     const count = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .frame_load = .{ .dst = count, .frame = process_for_count, .slot = mir_cps.mailbox_count_slot } });
-    const count_local = try storeLocal(builder, "@count", layout.idx_type, count);
+    const count_local = try wasm_heap.storeLocal(builder, "@count", layout.idx_type, count);
 
-    const process_for_head = try loadLocal(builder, process_local, layout.ptr_type);
+    const process_for_head = try wasm_heap.loadLocal(builder, process_local, layout.ptr_type);
     const head = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .frame_load = .{ .dst = head, .frame = process_for_head, .slot = mir_cps.mailbox_head_slot } });
-    const eight = try addressConst(builder, layout.idx_type, 8);
-    const count_for_tail = try loadLocal(builder, count_local, layout.idx_type);
-    const tail_pre = try binOp(builder, layout.idx_type, .add, head, count_for_tail);
-    const mask = try addressConst(builder, layout.idx_type, mir_cps.mailbox_cap - 1);
-    const tail = try binOp(builder, layout.idx_type, .bit_and, tail_pre, mask);
-    const ring_base_bytes = try addressConst(builder, layout.ptr_type, mir_cps.mailbox_ring_base * 8);
-    const process_for_base = try loadLocal(builder, process_local, layout.ptr_type);
-    const base = try binOp(builder, layout.ptr_type, .add, process_for_base, ring_base_bytes);
-    const tail_bytes = try binOp(builder, layout.idx_type, .multiply, tail, eight);
-    const addr = try binOp(builder, layout.ptr_type, .add, base, tail_bytes);
+    const eight = try wasm_heap.addressConst(builder, layout.idx_type, 8);
+    const count_for_tail = try wasm_heap.loadLocal(builder, count_local, layout.idx_type);
+    const tail_pre = try wasm_heap.binOp(builder, layout.idx_type, .add, head, count_for_tail);
+    const mask = try wasm_heap.addressConst(builder, layout.idx_type, mir_cps.mailbox_cap - 1);
+    const tail = try wasm_heap.binOp(builder, layout.idx_type, .bit_and, tail_pre, mask);
+    const ring_base_bytes = try wasm_heap.addressConst(builder, layout.ptr_type, mir_cps.mailbox_ring_base * 8);
+    const process_for_base = try wasm_heap.loadLocal(builder, process_local, layout.ptr_type);
+    const base = try wasm_heap.binOp(builder, layout.idx_type, .add, process_for_base, ring_base_bytes);
+    const tail_bytes = try wasm_heap.binOp(builder, layout.idx_type, .multiply, tail, eight);
+    const addr = try wasm_heap.binOp(builder, layout.idx_type, .add, base, tail_bytes);
     try builder.emit(.{ .mem_store = .{ .addr = addr, .src = message } });
-    const one = try addressConst(builder, layout.idx_type, 1);
-    const count_for_inc = try loadLocal(builder, count_local, layout.idx_type);
-    const count_new = try binOp(builder, layout.idx_type, .add, count_for_inc, one);
-    const process_for_store = try loadLocal(builder, process_local, layout.ptr_type);
+    const one = try wasm_heap.addressConst(builder, layout.idx_type, 1);
+    const count_for_inc = try wasm_heap.loadLocal(builder, count_local, layout.idx_type);
+    const count_new = try wasm_heap.binOp(builder, layout.idx_type, .add, count_for_inc, one);
+    const process_for_store = try wasm_heap.loadLocal(builder, process_local, layout.ptr_type);
     try builder.emit(.{ .frame_store = .{ .frame = process_for_store, .slot = mir_cps.mailbox_count_slot, .src = count_new } });
 
     try builder.currentFunction().block(block_id).instructions.appendSlice(allocator, original.instructions.items[send_index + 1 ..]);
@@ -463,37 +348,38 @@ fn buildScheduler(
     allocator: std.mem.Allocator,
     module: *mir.Module,
     type_store: *const types.TypeStore,
-    layout: Layout,
+    layout: wasm_heap.PtrLayout,
     old_start: mir.FunctionId,
     old_start_total_slots: u32,
     child_frame_slot: u32,
     actor_step: mir.FunctionId,
     original_result_type: types.TypeId,
 ) !void {
-    const new_start = try mir_builder.newFunction(module, allocator, "старт", dummy_symbol, original_result_type, dummy_span);
+    const new_start = try mir_builder.newFunction(module, allocator, "старт", wasm_heap.dummy_symbol, original_result_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, new_start);
     builder.currentFunction().parameters = &.{};
     builder.currentFunction().type_store = type_store;
 
-    const size0 = try addressConst(&builder, layout.idx_type, old_start_total_slots * 8);
+    const size0 = try wasm_heap.addressConst(&builder, layout.idx_type, old_start_total_slots * 8);
     const frame0 = try builder.newValue(layout.ptr_type);
-    try builder.emit(.{ .call = .{ .dst = frame0, .callee = findAllocId(module).?, .args = try dupeOne(module, size0) } });
+    const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
+    try builder.emit(.{ .call = .{ .dst = frame0, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, size0) } });
     // `frame0` used more than once below — store once, reload fresh per use.
-    const frame0_local = try storeLocal(&builder, "frame0", layout.ptr_type, frame0);
+    const frame0_local = try wasm_heap.storeLocal(&builder, "frame0", layout.ptr_type, frame0);
     // `src` computed BEFORE `frame` — see `wasm_emit.zig`'s
     // `EmitContext.frame_store_scratch_frame` doc comment (stack order
     // `frame_store` codegen expects is `[src, frame]`).
-    const zero_addr = try addressConst(&builder, layout.ptr_type, 0);
-    const frame0_for_init = try loadLocal(&builder, frame0_local, layout.ptr_type);
+    const zero_addr = try wasm_heap.addressConst(&builder, layout.ptr_type, 0);
+    const frame0_for_init = try wasm_heap.loadLocal(&builder, frame0_local, layout.ptr_type);
     try builder.emit(.{ .frame_store = .{ .frame = frame0_for_init, .slot = child_frame_slot, .src = zero_addr } });
-    const done0_local = try builder.newLocal(dummy_symbol, "done0", layout.bool_type);
-    const done1_local = try builder.newLocal(dummy_symbol, "done1", layout.bool_type);
-    const false0 = try boolConst(&builder, layout.bool_type, false);
+    const done0_local = try builder.newLocal(wasm_heap.dummy_symbol, "done0", layout.bool_type);
+    const done1_local = try builder.newLocal(wasm_heap.dummy_symbol, "done1", layout.bool_type);
+    const false0 = try wasm_heap.boolConst(&builder, layout.bool_type, false);
     try builder.emit(.{ .store_local = .{ .local = done0_local, .src = false0 } });
     // process 1 (the spawned actor) doesn't exist until process 0's own
     // step function reaches its `.spawn` — treated as "done" (skip) until
     // its frame pointer (slot `child_frame_slot` of frame0) is non-zero.
-    const true1 = try boolConst(&builder, layout.bool_type, true);
+    const true1 = try wasm_heap.boolConst(&builder, layout.bool_type, true);
     try builder.emit(.{ .store_local = .{ .local = done1_local, .src = true1 } });
 
     var round: u32 = 0;
@@ -505,7 +391,7 @@ fn buildScheduler(
     try builder.emit(.{ .load_local = .{ .dst = d0, .local = done0_local } });
     const d1 = try builder.newValue(layout.bool_type);
     try builder.emit(.{ .load_local = .{ .dst = d1, .local = done1_local } });
-    const both_done = try binOp(&builder, layout.bool_type, .bit_and, d0, d1);
+    const both_done = try wasm_heap.binOp(&builder, layout.bool_type, .bit_and, d0, d1);
 
     const trap_block = try builder.newBlock();
     const finish_block = try builder.newBlock();
@@ -518,7 +404,7 @@ fn buildScheduler(
     if (type_store.eql(original_result_type, type_store.builtins.void)) {
         builder.terminate(.{ .return_value = .{ .value = null } });
     } else {
-        const frame0_final = try frameValue(&builder, frame0_local, layout.ptr_type);
+        const frame0_final = try wasm_heap.frameValue(&builder, frame0_local, layout.ptr_type);
         const result = try builder.newValue(original_result_type);
         try builder.emit(.{ .frame_load = .{ .dst = result, .frame = frame0_final, .slot = mir_cps.result_slot } });
         builder.terminate(.{ .return_value = .{ .value = result } });
@@ -535,7 +421,7 @@ fn buildScheduler(
 fn emitSchedulerRound(
     builder: *mir_builder.Builder,
     allocator: std.mem.Allocator,
-    layout: Layout,
+    layout: wasm_heap.PtrLayout,
     frame0_local: mir.LocalId,
     done0_local: mir.LocalId,
     done1_local: mir.LocalId,
@@ -548,7 +434,7 @@ fn emitSchedulerRound(
     {
         const d0 = try builder.newValue(layout.bool_type);
         try builder.emit(.{ .load_local = .{ .dst = d0, .local = done0_local } });
-        const not_done0 = try notOp(builder, layout.bool_type, d0);
+        const not_done0 = try wasm_heap.notOp(builder, layout.bool_type, d0);
         const call_block = try builder.newBlock();
         // `skip_block` is a REAL, distinct block — not `after_block`
         // itself. `wasm_stackify.findMerge` looks for a merge block
@@ -567,9 +453,9 @@ fn emitSchedulerRound(
         builder.terminate(.{ .branch = .{ .cond = not_done0, .then_block = call_block, .else_block = skip_block } });
 
         builder.setCurrentBlock(call_block);
-        const frame0 = try frameValue(builder, frame0_local, layout.ptr_type);
+        const frame0 = try wasm_heap.frameValue(builder, frame0_local, layout.ptr_type);
         const r0 = try builder.newValue(layout.bool_type);
-        try builder.emit(.{ .call = .{ .dst = r0, .callee = old_start, .args = try dupeOne(builder.module, frame0) } });
+        try builder.emit(.{ .call = .{ .dst = r0, .callee = old_start, .args = try wasm_heap.dupeOne(builder.module, frame0) } });
         try builder.emit(.{ .store_local = .{ .local = done0_local, .src = r0 } });
         builder.terminate(.{ .jump = .{ .target = after_block } });
 
@@ -581,15 +467,15 @@ fn emitSchedulerRound(
     // Process 1 (the spawned actor) — only if spawned (frame pointer
     // non-zero) AND not already done.
     {
-        const frame0 = try frameValue(builder, frame0_local, layout.ptr_type);
+        const frame0 = try wasm_heap.frameValue(builder, frame0_local, layout.ptr_type);
         const frame1 = try builder.newValue(layout.ptr_type);
         try builder.emit(.{ .frame_load = .{ .dst = frame1, .frame = frame0, .slot = child_frame_slot } });
-        const zero = try addressConst(builder, layout.ptr_type, 0);
-        const spawned = try cmpOp(builder, layout.bool_type, .not_equal, frame1, zero);
+        const zero = try wasm_heap.addressConst(builder, layout.ptr_type, 0);
+        const spawned = try wasm_heap.cmpOp(builder, layout.bool_type, .not_equal, frame1, zero);
         const d1 = try builder.newValue(layout.bool_type);
         try builder.emit(.{ .load_local = .{ .dst = d1, .local = done1_local } });
-        const not_done1 = try notOp(builder, layout.bool_type, d1);
-        const should_run = try binOp(builder, layout.bool_type, .bit_and, spawned, not_done1);
+        const not_done1 = try wasm_heap.notOp(builder, layout.bool_type, d1);
+        const should_run = try wasm_heap.binOp(builder, layout.bool_type, .bit_and, spawned, not_done1);
 
         const call_block = try builder.newBlock();
         const skip_block = try builder.newBlock(); // see the `Process 0` comment above — must be distinct from `after_block`
@@ -597,11 +483,11 @@ fn emitSchedulerRound(
         builder.terminate(.{ .branch = .{ .cond = should_run, .then_block = call_block, .else_block = skip_block } });
 
         builder.setCurrentBlock(call_block);
-        const frame0b = try frameValue(builder, frame0_local, layout.ptr_type);
+        const frame0b = try wasm_heap.frameValue(builder, frame0_local, layout.ptr_type);
         const frame1b = try builder.newValue(layout.ptr_type);
         try builder.emit(.{ .frame_load = .{ .dst = frame1b, .frame = frame0b, .slot = child_frame_slot } });
         const r1 = try builder.newValue(layout.bool_type);
-        try builder.emit(.{ .call = .{ .dst = r1, .callee = actor_step, .args = try dupeOne(builder.module, frame1b) } });
+        try builder.emit(.{ .call = .{ .dst = r1, .callee = actor_step, .args = try wasm_heap.dupeOne(builder.module, frame1b) } });
         try builder.emit(.{ .store_local = .{ .local = done1_local, .src = r1 } });
         builder.terminate(.{ .jump = .{ .target = after_block } });
 
@@ -615,7 +501,7 @@ fn emitSchedulerRound(
 pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, frame_info: *const std.AutoHashMap(mir.FunctionId, mir_cps.FrameInfo)) !void {
     if (frame_info.count() == 0) return;
 
-    const start_id = findFunctionByName(module, "старт") orelse return unsupported("модуль без функции старт()");
+    const start_id = wasm_heap.findFunctionByName(module, "старт") orelse return unsupported("модуль без функции старт()");
     const start_info = frame_info.get(start_id) orelse return unsupported("старт() должен вызывать получить() хотя бы раз, чтобы использовать акторы (Phase 1)");
 
     // Locate the single `.spawn` inside старт's (already CPS-rewritten)
@@ -646,7 +532,7 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     const actor_id = spawn_target orelse return unsupported("не удалось определить статическую цель запусти");
     const actor_info = frame_info.get(actor_id) orelse return unsupported("заспавненная функция должна вызывать получить() (Phase 1)");
 
-    const layout = Layout{ .ptr_type = type_store.builtins.string, .idx_type = type_store.builtins.boolean, .bool_type = type_store.builtins.boolean };
+    const layout = wasm_heap.PtrLayout{ .ptr_type = type_store.builtins.string, .idx_type = type_store.builtins.boolean, .bool_type = type_store.builtins.boolean };
 
     const runtime = try buildRuntime(allocator, module, type_store, layout);
     rewireSuspendCalls(module, runtime);

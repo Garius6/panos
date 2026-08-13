@@ -311,7 +311,13 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         std.process.exit(1);
     };
     defer module.deinit(init.gpa);
-    try panos_core.mir_cps.prepare(&module);
+    var frame_info = try panos_core.mir_cps.prepare(init.gpa, &module);
+    defer frame_info.deinit();
+    panos_core.wasm_actors.expand(init.gpa, &module, &entry_checked.types, &frame_info) catch |err| {
+        try stderr.print("panos build: акторы: {t}\n", .{err});
+        try stderr.flush();
+        std.process.exit(1);
+    };
 
     const wasm_bytes = panos_core.wasm_emit.emitModule(init.gpa, entry_checked, &module) catch |err| {
         try stderr.print("panos build: не удалось эмитировать WASM для {s}: {t}\n", .{ input, err });

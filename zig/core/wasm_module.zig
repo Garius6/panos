@@ -23,6 +23,23 @@ pub fn wasmValTypeForStore(store: *const types.TypeStore, type_id: types.TypeId)
     if (store.eql(type_id, store.builtins.string)) return wasm_i32;
     if (store.get(type_id)) |entry| switch (entry.*) {
         .nominal, .array, .process => return wasm_i32,
+        // `поison`/`unconstrained` reaching codegen at ALL means one
+        // specific thing in practice, not "type checking gave up
+        // generically": `type_checker.zig`'s `получить()` handling
+        // (~line 4146) stays poison unless the enclosing function
+        // declares `-> Сообщение(T)` — a real, separate limitation that
+        // never infers from match-arm narrowing for the far more common
+        // `-> Пусто` actor idiom (`docs/processes.md`'s own `счётчик`
+        // example). Any OTHER poison value would mean a real type error
+        // was already reported, which stops compilation before this
+        // function ever runs — so this default is safe to specialize:
+        // a received message is consumed via `match_tag`/
+        // `get_variant_field` (always an i32 variant handle) far more
+        // often than as a raw `Число`. Found by actually running
+        // `wasm2wat`/`wasmtime` against real actor output and chasing a
+        // cascade of i32/f64 mismatches back to this single default,
+        // not by reading alone.
+        .poison, .unconstrained => return wasm_i32,
         else => {},
     };
     return wasm_f64;

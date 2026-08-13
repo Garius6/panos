@@ -2573,6 +2573,43 @@ const Checker = struct {
                 if (subject_entry.* == .poison or subject_entry.* == .unconstrained) {
                     if (self.resolution.pattern_symbols.get(pattern_id)) |variant| {
                         try self.result.pattern_variants.put(pattern_id, variant);
+                        // Real bug found running actual code, not just
+                        // reading: a `poison`/`unconstrained` SUBJECT
+                        // (`получить()`'s own type whenever the
+                        // enclosing function isn't declared `->
+                        // Сообщение(T)` — see that builtin's own
+                        // handling above) used to short-circuit here
+                        // WITHOUT ever recursing into the pattern's own
+                        // field arguments — every field binding
+                        // (`Тип.Вариант(шаг, отвечающему)`'s `шаг`/
+                        // `отвечающему`) was left with no
+                        // `symbol_types` entry at all, silently staying
+                        // poison too, and poisoning any ordinary
+                        // arithmetic done on them afterward. `Тип.
+                        // Вариант` is explicitly qualified — the ENUM
+                        // identity doesn't need `subject_type` at all,
+                        // only its (possibly generic) TYPE ARGUMENTS
+                        // do; for the common non-generic case those
+                        // don't exist, so the variant's own declared
+                        // field types can be used directly.
+                        if (self.enumVariant(variant)) |enum_variant| {
+                            const owner = self.resolution.symbols.get(variant);
+                            const definition = if (owner) |o| self.result.enum_definitions.get(o.owner_type) else null;
+                            if (definition != null and definition.?.parameters.len == 0) {
+                                if (constructor.field_names != null) try self.report(constructor.span, "Type Error: именованные поля шаблона перечисления пока не поддержаны", .{});
+                                const fields = enum_variant.fields;
+                                if (constructor.arguments.len != fields.len) try self.report(constructor.span, "Type Error: неверное количество полей шаблона варианта", .{});
+                                const shared = @min(constructor.arguments.len, fields.len);
+                                for (constructor.arguments[0..shared], fields[0..shared]) |argument, field| {
+                                    _ = try self.inferMatchPattern(argument, field, false);
+                                }
+                            }
+                            // A GENERIC enum's field types depend on
+                            // `subject_type`'s own (unknown, since it's
+                            // poison) type arguments — no way to resolve
+                            // concrete field types here; those bindings
+                            // stay poison, same as before this fix.
+                        }
                         return variant;
                     }
                     return null;

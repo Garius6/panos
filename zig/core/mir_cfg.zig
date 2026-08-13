@@ -35,7 +35,7 @@ pub fn successors(terminator: mir.Terminator) Successors {
     return switch (terminator) {
         .jump => |jump| .{ .blocks = .{ jump.target, undefined }, .count = 1 },
         .branch => |branch| .{ .blocks = .{ branch.then_block, branch.else_block }, .count = 2 },
-        .return_value, .unreachable_term, .none => .{},
+        .return_value, .unreachable_term, .none, .suspend_return => .{},
     };
 }
 

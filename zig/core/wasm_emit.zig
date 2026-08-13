@@ -1,5 +1,6 @@
 const std = @import("std");
 const mir = @import("mir.zig");
+const mir_cps = @import("mir_cps.zig");
 const mir_cfg = @import("mir_cfg.zig");
 const mir_validate = @import("mir_validate.zig");
 const type_checker = @import("type_checker.zig");
@@ -65,11 +66,65 @@ const EmitContext = struct {
     // first reserved: `function.locals.items.len`, i.e. right past every
     // real MIR local).
     scratch_i32_local: ?u32 = null,
+    // `frame_store` (`mir_cps.zig`'s CPS rewrite output, and
+    // `wasm_actors.zig`'s hand-built functions) needs to compute an
+    // ADDRESS (frame + slot*8, real i32 arithmetic). The REAL stack
+    // order at this instruction's own arm, confirmed by actually running
+    // real output through `wasm2wat`/`wasmtime` (not assumed): `[src,
+    // frame]` — `frame` is a value BOTH callers construct via a fresh
+    // `frameValue()`/`loadLocal()` call emitted immediately adjacent to
+    // this instruction (so it's always the LAST, i.e. topmost, thing
+    // pushed), while `src` is very often a value produced much EARLIER
+    // (e.g. converting an existing `store_local{src}` into
+    // `frame_store` — `src`'s own producer is wherever it already was
+    // in the instruction stream, unmovable) — the reverse of the
+    // "operands pre-pushed in field-declaration order" convention
+    // `.binary`/etc rely on. Needs TWO scratch locals live at once (pop
+    // frame off the top first, then src, so the address math can run on
+    // a clean stack) — `frame` is always `ptr_type` (i32), `src`'s WASM
+    // type (i32 handle vs f64 number) depends on what's being stored, so
+    // (like `scratch_i32_local` above) this needs one local per src type
+    // PLUS one dedicated for frame; only ever declared if a function
+    // actually contains a `frame_store`.
+    frame_store_scratch_frame: ?u32 = null,
+    frame_store_scratch_i32: ?u32 = null,
+    frame_store_scratch_f64: ?u32 = null,
 
     fn reserveScratchLocal(self: *EmitContext) u32 {
         if (self.scratch_i32_local) |index| return index;
         const index: u32 = @intCast(self.function.locals.items.len);
         self.scratch_i32_local = index;
+        return index;
+    }
+
+    fn nextFrameStoreScratchIndex(self: *const EmitContext) u32 {
+        var index: u32 = @intCast(self.function.locals.items.len);
+        if (self.scratch_i32_local != null) index += 1;
+        if (self.frame_store_scratch_frame != null) index += 1;
+        if (self.frame_store_scratch_i32 != null) index += 1;
+        if (self.frame_store_scratch_f64 != null) index += 1;
+        return index;
+    }
+
+    fn reserveFrameScratch(self: *EmitContext) u32 {
+        if (self.frame_store_scratch_frame) |index| return index;
+        const index = self.nextFrameStoreScratchIndex();
+        self.frame_store_scratch_frame = index;
+        return index;
+    }
+
+    fn reserveFrameStoreScratch(self: *EmitContext, wasm_type: u8) u32 {
+        if (wasm_type == wasm_module.wasm_i32) {
+            if (self.frame_store_scratch_i32) |index| return index;
+        } else {
+            if (self.frame_store_scratch_f64) |index| return index;
+        }
+        const index = self.nextFrameStoreScratchIndex();
+        if (wasm_type == wasm_module.wasm_i32) {
+            self.frame_store_scratch_i32 = index;
+        } else {
+            self.frame_store_scratch_f64 = index;
+        }
         return index;
     }
 
@@ -174,14 +229,26 @@ fn computeUseCount(allocator: std.mem.Allocator, function: *const mir.Function) 
                 .build_variant => |variant| for (variant.fields) |field| try countUse(&counts, field),
                 .match_tag => |match| try countUse(&counts, match.subject),
                 .get_variant_field => |field| try countUse(&counts, field.subject),
-                .const_value, .load_local, .function_ref => {},
+                .frame_load => |load| try countUse(&counts, load.frame),
+                .frame_store => |store| {
+                    try countUse(&counts, store.frame);
+                    try countUse(&counts, store.src);
+                },
+                .call => |call| for (call.args) |arg| try countUse(&counts, arg),
+                .global_set => |set| try countUse(&counts, set.src),
+                .mem_load => |load| try countUse(&counts, load.addr),
+                .mem_store => |store| {
+                    try countUse(&counts, store.addr);
+                    try countUse(&counts, store.src);
+                },
+                .const_value, .load_local, .function_ref, .global_get => {},
                 else => return unsupported("вид MIR-инструкции при подсчёте использований"),
             }
         }
         switch (block.terminator) {
             .branch => |branch| try countUse(&counts, branch.cond),
             .return_value => |return_term| if (return_term.value) |value| try countUse(&counts, value),
-            .jump, .unreachable_term, .none => {},
+            .jump, .unreachable_term, .none, .suspend_return => {},
         }
     }
     return counts;
@@ -205,7 +272,11 @@ const ProcessOutcome = struct { fallthrough: mir.BlockId, ok: bool };
 // normally falls through to `stop_at` (caller continues from there),
 // otherwise `{_, false}` — every path in the region either returned/
 // panicked, or went to a loop via `br`.
-fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) !ProcessOutcome {
+// `anyerror`, not inferred — `processFrom`/`emitBranch` are now mutually
+// recursive (the loop-header case can call `emitBranch`, which calls
+// `processFrom`), and Zig can't infer an error set across a dependency
+// cycle between two functions.
+fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) anyerror!ProcessOutcome {
     var b = start;
     while (true) {
         if (b == stop_at) return .{ .fallthrough = b, .ok = true };
@@ -217,7 +288,6 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) !Pro
                 .branch => |value| value,
                 else => return unsupported("loop header без branch-terminator'а"),
             };
-            const identified = try wasm_stackify.identifyLoopBodyAndExit(ctx.allocator, ctx.function, b, branch.then_block, branch.else_block);
 
             try ctx.code.appendSlice(ctx.allocator, &.{ 0x03, 0x40 }); // loop (empty blocktype)
             try ctx.scope_stack.append(ctx.allocator, .{ .kind = .loop, .header = b });
@@ -226,22 +296,79 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) !Pro
             // cond цикл`), it must be recomputed every iteration via `br 0`
             // back to the loop's start, not once before the first entry.
             try emitBlockInstructions(ctx, block);
-            try ctx.code.appendSlice(ctx.allocator, &.{ 0x04, 0x40 }); // if (empty blocktype)
-            try ctx.scope_stack.append(ctx.allocator, .{ .kind = .if_scope });
-            // The return of processFrom(body, ...) is intentionally
-            // ignored: the body ALWAYS either reaches stop_at=exit (e.g.
-            // via прервать, possibly from a nested если/иначе) or ends via
-            // back-edge-br/return/unreachable — either way the body is
-            // fully emitted by this point; what exactly happened doesn't
-            // matter here, exit_block follows regardless.
-            _ = try processFrom(ctx, identified.body, identified.exit);
-            _ = ctx.scope_stack.pop(); // if
-            try ctx.code.append(ctx.allocator, 0x05); // else — empty
-            try ctx.code.append(ctx.allocator, 0x0B); // end if
+
+            // `identifyLoopBodyAndExit`'s assumption — exactly ONE side of
+            // the header's own branch loops back (the body), the other
+            // falls through to a block after the loop (the exit) — holds
+            // for every ordinary `пока` loop (`mir_lowering.zig`'s
+            // `lowerWhile` only ever produces that single-body-single-exit
+            // shape). It does NOT hold for `mir_cps.zig`'s dispatch-entry
+            // loop header: a self-tail-call can make BOTH branches
+            // eventually loop back (or return/suspend deep inside),
+            // with no CFG edge to "after the loop" at all — found by
+            // actually running that shape and hitting "br-цель не
+            // найдена среди открытых scope" here, not by reading alone.
+            // Checked directly via `canReach` (not
+            // `identifyLoopBodyAndExit`, which can't express "both/
+            // neither") so the common case below is BYTE-IDENTICAL to
+            // before this fix — zero behavior change for any program
+            // that already compiled.
+            const then_reaches_header = try wasm_stackify.canReach(ctx.allocator, ctx.function, branch.then_block, b);
+            const else_reaches_header = try wasm_stackify.canReach(ctx.allocator, ctx.function, branch.else_block, b);
+
+            var loop_outcome: ProcessOutcome = undefined;
+            if (then_reaches_header != else_reaches_header) {
+                const identified: struct { body: mir.BlockId, exit: mir.BlockId } = if (then_reaches_header)
+                    .{ .body = branch.then_block, .exit = branch.else_block }
+                else
+                    .{ .body = branch.else_block, .exit = branch.then_block };
+                try ctx.code.appendSlice(ctx.allocator, &.{ 0x04, 0x40 }); // if (empty blocktype)
+                try ctx.scope_stack.append(ctx.allocator, .{ .kind = .if_scope });
+                // The return of processFrom(body, ...) is intentionally
+                // ignored: the body ALWAYS either reaches stop_at=exit
+                // (e.g. via прервать, possibly from a nested если/иначе)
+                // or ends via back-edge-br/return/unreachable — either
+                // way the body is fully emitted by this point; what
+                // exactly happened doesn't matter here, exit_block
+                // follows regardless.
+                _ = try processFrom(ctx, identified.body, identified.exit);
+                _ = ctx.scope_stack.pop(); // if
+                try ctx.code.append(ctx.allocator, 0x05); // else — empty
+                try ctx.code.append(ctx.allocator, 0x0B); // end if
+                loop_outcome = .{ .fallthrough = identified.exit, .ok = true };
+            } else {
+                // BOTH (or, degenerate, NEITHER) side reaches back — no
+                // clean body/exit split exists at this branch. Fall back
+                // to the same general merge/diverge handling ordinary
+                // (non-header) branches already use — still nested
+                // inside this SAME open `loop` scope, so a `br` found
+                // deep inside either side still resolves correctly via
+                // `findBrDepth`.
+                loop_outcome = try emitBranch(ctx, b, branch, mir.invalid_block);
+            }
+
             _ = ctx.scope_stack.pop(); // loop
             try ctx.code.append(ctx.allocator, 0x0B); // end loop
 
-            b = identified.exit;
+            if (!loop_outcome.ok) {
+                // Real bug found running actual code, not just reading:
+                // every OTHER divergent path in this file (an ordinary
+                // `.branch`'s own both-diverged fallback, `.return_value`,
+                // `.unreachable_term`, `.suspend_return`) writes an
+                // explicit terminating byte (`return`/`unreachable`)
+                // before signaling `ok = false` upward — this is the
+                // ONE spot that didn't: `emitBranch`'s own internal
+                // `unreachable` (when IT can't find a fallthrough)
+                // satisfies ONLY the if/else block's own (void)
+                // blocktype, not what comes AFTER the loop closes. With
+                // nothing here, a suspend-capable function's `i32`
+                // result requirement at the function's own trailing
+                // `end` had nothing on the stack — confirmed via
+                // `wasmtime`: "expected i32 but nothing on stack".
+                try ctx.code.append(ctx.allocator, 0x00); // unreachable
+                return .{ .fallthrough = mir.invalid_block, .ok = false };
+            }
+            b = loop_outcome.fallthrough;
             continue;
         }
 
@@ -261,51 +388,10 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) !Pro
                 continue;
             },
             .branch => |branch| {
-                const merge = wasm_stackify.findMerge(ctx.function, &ctx.idom, b, branch.then_block, branch.else_block);
-                const sub_stop = merge orelse stop_at;
-
-                // cond is already on the stack.
-                try ctx.code.appendSlice(ctx.allocator, &.{ 0x04, 0x40 }); // if (empty blocktype)
-                try ctx.scope_stack.append(ctx.allocator, .{ .kind = .if_scope });
-                const then_outcome = try processFrom(ctx, branch.then_block, sub_stop);
-                try ctx.code.append(ctx.allocator, 0x05); // else
-                const else_outcome = try processFrom(ctx, branch.else_block, sub_stop);
-                try ctx.code.append(ctx.allocator, 0x0B); // end if
-                _ = ctx.scope_stack.pop();
-
-                if (merge != null) {
-                    b = merge.?;
-                    continue;
-                }
-                if (then_outcome.ok) {
-                    b = then_outcome.fallthrough;
-                    continue;
-                }
-                if (else_outcome.ok) {
-                    b = else_outcome.fallthrough;
-                    continue;
-                }
-                // Real bug found running actual code, not just reading
-                // it: this `if`/`else` was emitted with an empty
-                // (void) blocktype (see the `0x04, 0x40` above) — valid
-                // ONLY if code reachable from AT LEAST ONE branch could
-                // fall through to the `if`'s own `end` leaving the
-                // stack unchanged. Here NEITHER branch does (both
-                // diverged — `возврат`, `прервать`/`продолжить`, or
-                // panic — `then_outcome.ok`/`else_outcome.ok` both
-                // false) — every real `и`+`else` diverging shape (most
-                // commonly `если x тогда возврат Y конец` with no
-                // `иначе`, i.e. ANY early-return) hit this. Semantically
-                // the code point right after `end` is unreachable, but
-                // real WASM validators (confirmed against both
-                // `wat2wasm` and `wasmtime`, independent of any panos
-                // codegen) do NOT infer that automatically from "both
-                // branches diverged" — they need an EXPLICIT
-                // `unreachable` marker here, or they reject the whole
-                // module as invalid (not a runtime failure — it never
-                // even LOADS). One byte fixes it.
-                try ctx.code.append(ctx.allocator, 0x00); // unreachable
-                return .{ .fallthrough = mir.invalid_block, .ok = false };
+                const outcome = try emitBranch(ctx, b, branch, stop_at);
+                if (!outcome.ok) return .{ .fallthrough = mir.invalid_block, .ok = false };
+                b = outcome.fallthrough;
+                continue;
             },
             .return_value => {
                 try ctx.code.append(ctx.allocator, 0x0F); // return
@@ -316,8 +402,65 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) !Pro
                 return .{ .fallthrough = mir.invalid_block, .ok = false };
             },
             .none => return unsupported("блок без terminator'а"),
+            // Same control-flow opcode as `.return_value` (`0x0F`, WASM
+            // `return`), but UNLIKE it, no preceding instruction pushed a
+            // value — `mir_cps.zig` rewrites every suspend-capable
+            // function's result type to `Булево` (done/suspended status,
+            // see `mir_cps.zig`'s `result_slot` doc comment), so this
+            // terminator pushes the `false` ("still running") status
+            // itself, right here, unconditionally.
+            .suspend_return => {
+                try ctx.code.append(ctx.allocator, 0x41); // i32.const 0 (false — suspended)
+                try wasm_module.writeSleb128(&ctx.code, ctx.allocator, 0);
+                try ctx.code.append(ctx.allocator, 0x0F); // return
+                return .{ .fallthrough = mir.invalid_block, .ok = false };
+            },
         }
     }
+}
+
+// Shared by ordinary (non-loop-header) `.branch` terminators AND (since
+// this fix) a loop-header's own branch when it doesn't have the simple
+// "one side loops back, one side exits" shape `identifyLoopBodyAndExit`
+// assumes — see `processFrom`'s loop-header case for why. `stop_at` is
+// where to converge if BOTH sides actually fall through with no dominance
+// merge (only relevant for the ordinary-branch call site — the loop-
+// header call site passes `mir.invalid_block`, which can never match, on
+// purpose: there's no meaningful outer boundary to fall back to there).
+fn emitBranch(ctx: *EmitContext, b: mir.BlockId, branch: anytype, stop_at: mir.BlockId) !ProcessOutcome {
+    const merge = wasm_stackify.findMerge(ctx.function, &ctx.idom, b, branch.then_block, branch.else_block);
+    const sub_stop = merge orelse stop_at;
+
+    // cond is already on the stack.
+    try ctx.code.appendSlice(ctx.allocator, &.{ 0x04, 0x40 }); // if (empty blocktype)
+    try ctx.scope_stack.append(ctx.allocator, .{ .kind = .if_scope });
+    const then_outcome = try processFrom(ctx, branch.then_block, sub_stop);
+    try ctx.code.append(ctx.allocator, 0x05); // else
+    const else_outcome = try processFrom(ctx, branch.else_block, sub_stop);
+    try ctx.code.append(ctx.allocator, 0x0B); // end if
+    _ = ctx.scope_stack.pop();
+
+    if (merge != null) return .{ .fallthrough = merge.?, .ok = true };
+    if (then_outcome.ok) return .{ .fallthrough = then_outcome.fallthrough, .ok = true };
+    if (else_outcome.ok) return .{ .fallthrough = else_outcome.fallthrough, .ok = true };
+    // Real bug found running actual code, not just reading it: this
+    // `if`/`else` was emitted with an empty (void) blocktype (see the
+    // `0x04, 0x40` above) — valid ONLY if code reachable from AT LEAST
+    // ONE branch could fall through to the `if`'s own `end` leaving the
+    // stack unchanged. Here NEITHER branch does (both diverged —
+    // `возврат`, `прервать`/`продолжить`, or panic —
+    // `then_outcome.ok`/`else_outcome.ok` both false) — every real
+    // `если`+`иначе` diverging shape (most commonly `если x тогда
+    // возврат Y конец` with no `иначе`, i.e. ANY early-return) hit this.
+    // Semantically the code point right after `end` is unreachable, but
+    // real WASM validators (confirmed against both `wat2wasm` and
+    // `wasmtime`, independent of any panos codegen) do NOT infer that
+    // automatically from "both branches diverged" — they need an
+    // EXPLICIT `unreachable` marker here, or they reject the whole
+    // module as invalid (not a runtime failure — it never even LOADS).
+    // One byte fixes it.
+    try ctx.code.append(ctx.allocator, 0x00); // unreachable
+    return .{ .fallthrough = mir.invalid_block, .ok = false };
 }
 
 // `mir_bytecode.odin`'s replay model doesn't care whether an instruction's
@@ -365,6 +508,10 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
                     try code.append(allocator, 0x10); // call
                     try wasm_module.writeUleb128(code, allocator, import_index);
                 },
+                .address => |a| {
+                    try code.append(allocator, 0x41); // i32.const
+                    try wasm_module.writeSleb128(code, allocator, @intCast(a));
+                },
             }
             return c.dst;
         },
@@ -386,8 +533,31 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
                 try wasm_module.writeUleb128(code, allocator, import_index);
                 return binary.dst;
             }
-            const is_int = wasmType(ctx, binary.dst) == wasm_module.wasm_i32;
-            _ = is_int; // Phase-1a binary ops are all f64 — Целое shares f64 representation (same convention as the bytecode VM).
+            // Phase-1a user-facing numbers (`Целое`/`Число`) are always
+            // f64 (see the modulo/bitwise comment below) — a
+            // GENUINELY-i32-typed dst only ever comes from
+            // `wasm_actors.zig`'s own hand-built runtime functions
+            // (ring-buffer head/count/mask arithmetic), never from
+            // ordinary `mir_lowering.zig` output. Both operands are
+            // already real i32 values on the stack in that case (no
+            // f64 conversion dance needed at all — simpler than the
+            // f64 path below, not just a variant of it).
+            if (wasmType(ctx, binary.dst) == wasm_module.wasm_i32) {
+                const int_opcode: u8 = switch (binary.op) {
+                    .add => 0x6A, // i32.add
+                    .subtract => 0x6B, // i32.sub
+                    .multiply => 0x6C, // i32.mul
+                    .divide, .int_divide => 0x6D, // i32.div_s
+                    .modulo => 0x6F, // i32.rem_s
+                    .bit_and => 0x71, // i32.and
+                    .bit_or => 0x72, // i32.or
+                    .bit_xor => 0x73, // i32.xor
+                    .shift_left => 0x74, // i32.shl
+                    .shift_right => 0x75, // i32.shr_s
+                };
+                try code.append(allocator, int_opcode);
+                return binary.dst;
+            }
             switch (binary.op) {
                 .modulo, .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => {
                     // Stack on entry: [lhs_f64, rhs_f64] (both already
@@ -491,6 +661,112 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try wasm_module.writeUleb128(code, allocator, function_index);
             return call.dst;
         },
+        .call => |call| {
+            for (call.args) |_| {} // already on the stack, same convention as `.call_value`.
+            const function_index = ctx.func_index.get(call.callee) orelse return unsupported("функция не найдена в индексе модуля");
+            try code.append(allocator, 0x10); // call
+            try wasm_module.writeUleb128(code, allocator, function_index);
+            return call.dst;
+        },
+        // CPS rewrite output (`mir_cps.zig`) — `frame` is an opaque i32
+        // linear-memory address, `slot` a compile-time word index within
+        // it (8 bytes/slot, wide enough for either an f64 number or an
+        // i32 handle). `frame` is a single operand, already on the stack
+        // (pushed by its own producer before this arm runs) — no
+        // reordering needed, unlike `frame_store` below.
+        .frame_load => |load| {
+            try code.append(allocator, 0x41); // i32.const slot*8
+            try wasm_module.writeSleb128(code, allocator, @as(i64, load.slot) * 8);
+            try code.append(allocator, 0x6A); // i32.add
+            const dst_type = wasmType(ctx, load.dst);
+            try code.append(allocator, if (dst_type == wasm_module.wasm_i32) 0x28 else 0x2B); // i32.load / f64.load
+            try wasm_module.writeUleb128(code, allocator, if (dst_type == wasm_module.wasm_i32) 2 else 3); // align
+            try wasm_module.writeUleb128(code, allocator, 0); // offset
+            return load.dst;
+        },
+        // `frame` and `src` are BOTH already pushed (stack: [frame, src])
+        // by the time this arm runs — same convention as `.binary`. To
+        // compute the store ADDRESS (frame + slot*8) without losing
+        // `src`, park `src` in a type-matched scratch local, do the
+        // address arithmetic on the now-exposed `frame`, then reload
+        // `src` — same scratch-local reordering trick already used by
+        // `.binary`'s modulo/bitwise ops above.
+        .frame_store => |store| {
+            // Stack on entry: [src, frame] — see `EmitContext.
+            // frame_store_scratch_frame`'s doc comment. Pop frame first
+            // (it's on top), then src, so the address math below runs
+            // against a clean stack.
+            const frame_scratch = ctx.reserveFrameScratch();
+            try code.append(allocator, 0x21); // local.set frame_scratch (pops frame)
+            try wasm_module.writeUleb128(code, allocator, frame_scratch);
+            const src_type = wasmType(ctx, store.src);
+            const value_scratch = ctx.reserveFrameStoreScratch(src_type);
+            try code.append(allocator, 0x21); // local.set value_scratch (pops src)
+            try wasm_module.writeUleb128(code, allocator, value_scratch);
+
+            try code.append(allocator, 0x20); // local.get frame_scratch
+            try wasm_module.writeUleb128(code, allocator, frame_scratch);
+            try code.append(allocator, 0x41); // i32.const slot*8
+            try wasm_module.writeSleb128(code, allocator, @as(i64, store.slot) * 8);
+            try code.append(allocator, 0x6A); // i32.add -> address
+            try code.append(allocator, 0x20); // local.get value_scratch (push src back)
+            try wasm_module.writeUleb128(code, allocator, value_scratch);
+            try code.append(allocator, if (src_type == wasm_module.wasm_i32) 0x36 else 0x39); // i32.store / f64.store
+            try wasm_module.writeUleb128(code, allocator, if (src_type == wasm_module.wasm_i32) 2 else 3); // align
+            try wasm_module.writeUleb128(code, allocator, 0); // offset
+            return null;
+        },
+        .global_get => |get| {
+            try code.append(allocator, 0x23); // global.get
+            try wasm_module.writeUleb128(code, allocator, get.global);
+            return get.dst;
+        },
+        .global_set => |set| {
+            try code.append(allocator, 0x24); // global.set
+            try wasm_module.writeUleb128(code, allocator, set.global);
+            return null;
+        },
+        // Single operand (`addr`), already fully computed and on the
+        // stack by its own producer — no offset math needed here, unlike
+        // `frame_load` above.
+        .mem_load => |load| {
+            const dst_type = wasmType(ctx, load.dst);
+            try code.append(allocator, if (dst_type == wasm_module.wasm_i32) 0x28 else 0x2B); // i32.load / f64.load
+            try wasm_module.writeUleb128(code, allocator, if (dst_type == wasm_module.wasm_i32) 2 else 3);
+            try wasm_module.writeUleb128(code, allocator, 0);
+            return load.dst;
+        },
+        // `addr` and `src` are both pre-pushed in exactly the order WASM
+        // `*.store` wants ([address, value]) — unlike `frame_store`, no
+        // offset arithmetic has to be inserted BETWEEN them, so no
+        // scratch-local reordering is needed here.
+        // Stack on entry: `[src, addr]`, NOT `[addr, src]` — same root
+        // cause as `frame_store` above (`addr` is freshly computed
+        // right up against this instruction by every current caller,
+        // while `src` is very often a pre-existing value from earlier —
+        // e.g. `wasm_actors.zig`'s `expandSend`, where `src` is
+        // `.send`'s own, already-produced `message` operand). Reuses
+        // the SAME scratch locals `frame_store` uses (`addr` is
+        // `ptr_type`/i32, exactly like `frame`) — the two instructions
+        // never interleave within a single store, so sharing is safe.
+        .mem_store => |store| {
+            const addr_scratch = ctx.reserveFrameScratch();
+            try code.append(allocator, 0x21); // local.set addr_scratch (pops addr)
+            try wasm_module.writeUleb128(code, allocator, addr_scratch);
+            const src_type = wasmType(ctx, store.src);
+            const value_scratch = ctx.reserveFrameStoreScratch(src_type);
+            try code.append(allocator, 0x21); // local.set value_scratch (pops src)
+            try wasm_module.writeUleb128(code, allocator, value_scratch);
+
+            try code.append(allocator, 0x20); // local.get addr_scratch
+            try wasm_module.writeUleb128(code, allocator, addr_scratch);
+            try code.append(allocator, 0x20); // local.get value_scratch
+            try wasm_module.writeUleb128(code, allocator, value_scratch);
+            try code.append(allocator, if (src_type == wasm_module.wasm_i32) 0x36 else 0x39); // i32.store / f64.store
+            try wasm_module.writeUleb128(code, allocator, if (src_type == wasm_module.wasm_i32) 2 else 3);
+            try wasm_module.writeUleb128(code, allocator, 0);
+            return null;
+        },
         .call_builtin => |call| {
             for (call.args) |_| {} // время.сейчас_мс/монотонно_мс take no args — nothing to replay yet.
             const import_index = ctx.builtin_index.get(call.name) orelse return unsupported("call_builtin без соответствующего host-импорта");
@@ -587,15 +863,34 @@ pub fn emitFunctionWasm(
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    const has_scratch = ctx.scratch_i32_local != null;
-    const n_body_locals = function.locals.items.len - function.parameters.len + @as(usize, if (has_scratch) 1 else 0);
+    var extra_scratch_count: usize = 0;
+    if (ctx.scratch_i32_local != null) extra_scratch_count += 1;
+    if (ctx.frame_store_scratch_frame != null) extra_scratch_count += 1;
+    if (ctx.frame_store_scratch_i32 != null) extra_scratch_count += 1;
+    if (ctx.frame_store_scratch_f64 != null) extra_scratch_count += 1;
+    const n_body_locals = function.locals.items.len - function.parameters.len + extra_scratch_count;
     try wasm_module.writeUleb128(&out, allocator, n_body_locals);
     for (function.parameters.len..function.locals.items.len) |i| {
         try wasm_module.writeUleb128(&out, allocator, 1);
         const store = function.type_store orelse &checked.types;
         try out.append(allocator, wasm_module.wasmValTypeForStore(store, function.locals.items[i].type_id));
     }
-    if (has_scratch) {
+    // Declaration order must match the index order handed out by
+    // `reserveScratchLocal`/`reserveFrameScratch`/`reserveFrameStoreScratch`
+    // (`nextFrameStoreScratchIndex`) above.
+    if (ctx.scratch_i32_local != null) {
+        try wasm_module.writeUleb128(&out, allocator, 1);
+        try out.append(allocator, wasm_module.wasm_f64);
+    }
+    if (ctx.frame_store_scratch_frame != null) {
+        try wasm_module.writeUleb128(&out, allocator, 1);
+        try out.append(allocator, wasm_module.wasm_i32);
+    }
+    if (ctx.frame_store_scratch_i32 != null) {
+        try wasm_module.writeUleb128(&out, allocator, 1);
+        try out.append(allocator, wasm_module.wasm_i32);
+    }
+    if (ctx.frame_store_scratch_f64 != null) {
         try wasm_module.writeUleb128(&out, allocator, 1);
         try out.append(allocator, wasm_module.wasm_f64);
     }
@@ -937,6 +1232,13 @@ fn validateOrFail(allocator: std.mem.Allocator, checked: *const type_checker.Che
     }
 }
 
+// Both consumed by `wasm_actors.zig` when it synthesizes the bump
+// allocator/scheduler MIR functions — kept here since they describe a
+// property of the MODULE ASSEMBLY (memory/global section layout), not of
+// the actor runtime's own logic.
+pub const actor_heap_global_index: u32 = 0;
+pub const actor_heap_bytes: u32 = 1 << 20;
+
 pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, module: *const mir.Module) ![]u8 {
     try validateOrFail(allocator, checked, module);
 
@@ -951,7 +1253,20 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     var strings = try collectStringConstants(allocator, module);
     defer allocator.free(strings.data);
     defer strings.offsets.deinit();
-    const needs_memory = strings.data.len != 0;
+    const has_actors = mir_cps.usesActorMemory(module);
+    const needs_memory = strings.data.len != 0 or has_actors;
+    // Actor process/frame/mailbox records live in the SAME linear memory
+    // as string literals, past the string data blob (8-byte aligned —
+    // wide enough for either an i32 handle or an f64 number in every
+    // `frame_load`/`frame_store` slot). Fixed 1 MiB Phase-1 heap, no
+    // growth — plenty for the single request/reply actor this backend
+    // currently supports; revisit once Phase 2 needs more processes.
+    // `@max(_, 8)` — `wasm_actors.zig`'s scheduler uses address 0 as a
+    // "not yet spawned" sentinel for the one child-process slot; a
+    // module with zero string literals would otherwise start the heap
+    // at literally byte 0, making a real first allocation
+    // indistinguishable from "nothing allocated yet".
+    const actor_heap_base: u32 = @max(@as(u32, @intCast(std.mem.alignForward(usize, strings.data.len, 8))), 8);
 
     var func_index: std.AutoHashMap(mir.FunctionId, u32) = .init(allocator);
     defer func_index.deinit();
@@ -1013,18 +1328,35 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     var data_section: std.ArrayList(u8) = .empty;
     defer data_section.deinit(allocator);
     if (needs_memory) {
-        const pages: u32 = @intCast((strings.data.len + 65535) / 65536);
+        const total_bytes: u32 = actor_heap_base + (if (has_actors) actor_heap_bytes else 0);
+        const pages: u32 = (total_bytes + 65535) / 65536;
         try wasm_module.writeUleb128(&memory_section, allocator, 1); // 1 memory
         try memory_section.append(allocator, 0x00); // limits: min only, no max
         try wasm_module.writeUleb128(&memory_section, allocator, @max(pages, 1));
 
-        try wasm_module.writeUleb128(&data_section, allocator, 1); // 1 active segment
-        try data_section.append(allocator, 0x00); // flags: active, memory 0
-        try data_section.append(allocator, 0x41); // i32.const
-        try wasm_module.writeSleb128(&data_section, allocator, 0); // offset 0
-        try data_section.append(allocator, 0x0B); // end
-        try wasm_module.writeUleb128(&data_section, allocator, strings.data.len);
-        try data_section.appendSlice(allocator, strings.data);
+        if (strings.data.len != 0) {
+            try wasm_module.writeUleb128(&data_section, allocator, 1); // 1 active segment
+            try data_section.append(allocator, 0x00); // flags: active, memory 0
+            try data_section.append(allocator, 0x41); // i32.const
+            try wasm_module.writeSleb128(&data_section, allocator, 0); // offset 0
+            try data_section.append(allocator, 0x0B); // end
+            try wasm_module.writeUleb128(&data_section, allocator, strings.data.len);
+            try data_section.appendSlice(allocator, strings.data);
+        }
+    }
+
+    // Single mutable i32 global: the bump-allocator's next-free pointer
+    // (`actor_heap_global_index`), initialized past the string blob.
+    // Absent entirely for any module without actor instructions.
+    var global_section: std.ArrayList(u8) = .empty;
+    defer global_section.deinit(allocator);
+    if (has_actors) {
+        try wasm_module.writeUleb128(&global_section, allocator, 1); // 1 global
+        try global_section.append(allocator, wasm_module.wasm_i32);
+        try global_section.append(allocator, 0x01); // mutable
+        try global_section.append(allocator, 0x41); // i32.const
+        try wasm_module.writeSleb128(&global_section, allocator, @intCast(actor_heap_base));
+        try global_section.append(allocator, 0x0B); // end
     }
 
     var export_section: std.ArrayList(u8) = .empty;
@@ -1060,9 +1392,18 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     if (builtin_count != 0) try wasm_module.writeSection(&out, allocator, 2, import_section.items);
     try wasm_module.writeSection(&out, allocator, 3, function_section.items);
     if (needs_memory) try wasm_module.writeSection(&out, allocator, 5, memory_section.items);
+    if (has_actors) try wasm_module.writeSection(&out, allocator, 6, global_section.items);
     try wasm_module.writeSection(&out, allocator, 7, export_section.items);
     try wasm_module.writeSection(&out, allocator, 10, code_section.items);
-    if (needs_memory) try wasm_module.writeSection(&out, allocator, 11, data_section.items);
+    // `strings.data.len != 0`, NOT `needs_memory` — a module can need
+    // memory purely for the actor heap with ZERO string literals (no
+    // data segment to write at all); the Data section is fully
+    // optional in WASM, but writing it with EMPTY content (no even a
+    // "0 segments" count) produces a truncated section a real parser
+    // rejects ("unable to read u32 leb128: data segment count") —
+    // found by actually running `wasmtime`/`wasm2wat` against real
+    // output, not by reading alone.
+    if (strings.data.len != 0) try wasm_module.writeSection(&out, allocator, 11, data_section.items);
     return try out.toOwnedSlice(allocator);
 }
 

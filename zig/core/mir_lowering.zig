@@ -1293,6 +1293,11 @@ fn lowerProcessBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call
         try ctx.builder.emit(.{ .receive = .{ .dst = dst } });
         return continuesWith(dst);
     }
+    if (std.mem.eql(u8, entry.name, "получить_сигнал") and call.arguments.len == 0) {
+        const dst = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .receive_signal = .{ .dst = dst } });
+        return continuesWith(dst);
+    }
     if (std.mem.eql(u8, entry.name, "себя") and call.arguments.len == 0) {
         const dst = try ctx.builder.newValue(result_type);
         try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = "@runtime::current_process", .args = &.{} } });

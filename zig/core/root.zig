@@ -18,6 +18,7 @@ pub const mir_validate = @import("mir_validate.zig");
 pub const wasm_stackify = @import("wasm_stackify.zig");
 pub const wasm_module = @import("wasm_module.zig");
 pub const wasm_emit = @import("wasm_emit.zig");
+pub const wasm_actors = @import("wasm_actors.zig");
 pub const module_loader = @import("module_loader.zig");
 pub const module_linker = @import("module_linker.zig");
 pub const module_compiler = @import("module_compiler.zig");

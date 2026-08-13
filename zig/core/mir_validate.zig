@@ -150,6 +150,18 @@ fn instrRefs(allocator: std.mem.Allocator, instruction: mir.Instruction) !struct
             dst = v.dst;
             try operands.append(allocator, v.src);
         },
+        .frame_load => |v| {
+            dst = v.dst;
+            try operands.append(allocator, v.frame);
+        },
+        .frame_store => |v| try operands.appendSlice(allocator, &.{ v.frame, v.src }),
+        .global_get => |v| dst = v.dst,
+        .global_set => |v| try operands.append(allocator, v.src),
+        .mem_load => |v| {
+            dst = v.dst;
+            try operands.append(allocator, v.addr);
+        },
+        .mem_store => |v| try operands.appendSlice(allocator, &.{ v.addr, v.src }),
     }
     return .{ .dst = dst, .operands = try operands.toOwnedSlice(allocator) };
 }
@@ -271,6 +283,7 @@ pub fn validateFunction(allocator: std.mem.Allocator, module: *const mir.Module,
                 }
             },
             .unreachable_term => {},
+            .suspend_return => {},
         }
 
         for (blk.instructions.items) |instruction| {

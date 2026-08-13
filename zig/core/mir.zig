@@ -66,6 +66,14 @@ pub const ConstValue = union(enum) {
     number: f64,
     boolean: bool,
     string: []const u8,
+    // Raw i32 literal (`i32.const`, unlike `.number`'s always-f64
+    // `Целое`/`Число` representation) — `mir_cps.zig`/`wasm_actors.zig`
+    // need genuine i32 constants for frame/heap pointer arithmetic and
+    // resume-state tags, which must round-trip through i32 ops exactly
+    // (`.number`'s f64->i64->i32 conversion dance, used elsewhere for
+    // `%`/bitwise ops, is unnecessary overhead for values that are never
+    // meant to be a user-visible `Число` in the first place).
+    address: u32,
 };
 
 pub const InterfaceMethodBinding = struct {
@@ -113,6 +121,36 @@ pub const Instruction = union(enum) {
     send: struct { process: ValueId, message: ValueId },
     receive: struct { dst: ValueId },
     receive_signal: struct { dst: ValueId },
+    // CPS rewrite output (`mir_cps.zig`) — a suspend-capable function's
+    // locals are NOT ordinary WASM locals (those reset to zero on every
+    // fresh call into the function; a resumed actor step needs its state
+    // to survive ACROSS separate WASM calls). `frame` is the function's
+    // own frame pointer (an opaque linear-memory address, passed in as
+    // the step function's one real parameter — see `wasm_actors.zig`),
+    // `slot` a compiler-assigned offset within it. Only ever appear in a
+    // function `mir_cps.zig` has already rewritten — a function that
+    // never suspends keeps plain `load_local`/`store_local` untouched.
+    frame_load: struct { dst: ValueId, frame: ValueId, slot: u32 },
+    frame_store: struct { frame: ValueId, slot: u32, src: ValueId },
+    // `wasm_actors.zig`'s bump-allocator heap pointer — the ONE piece of
+    // process-wide mutable state that can't live in any single function's
+    // frame (every process's allocation shares it). A real WASM Global
+    // (mutable i32), index `global` into the module's (currently
+    // single-entry) global section — never emitted at all for a module
+    // with no actor instructions.
+    global_get: struct { dst: ValueId, global: u32 },
+    global_set: struct { global: u32, src: ValueId },
+    // Like `frame_load`/`frame_store` but the address is a fully computed
+    // RUNTIME i32 value, not `frame + compile-time slot*8` — needed for
+    // `wasm_actors.zig`'s mailbox ring buffer (message index only known
+    // at runtime, e.g. `frame + ring_base_bytes + head*8`). `frame_load`/
+    // `frame_store` can't express this at all (`slot: u32` is a Zig
+    // struct field, never a `ValueId`) — kept separate rather than
+    // generalizing them, since every OTHER caller (the CPS rewrite
+    // itself) only ever needs compile-time-constant slots and benefits
+    // from that being visible in the instruction shape.
+    mem_load: struct { dst: ValueId, addr: ValueId },
+    mem_store: struct { addr: ValueId, src: ValueId },
     // `?`-operator — an ordinary instruction, not a terminator: early
     // return on failure is runtime semantics INSIDE one opcode already
     // today (unpacks Опция/Результат/any 2-variant ADT, panics or returns
@@ -139,6 +177,16 @@ pub const Terminator = union(enum) {
     branch: struct { cond: ValueId, then_block: BlockId, else_block: BlockId },
     return_value: struct { value: ?ValueId },
     unreachable_term: struct { reason: []const u8 },
+    // CPS rewrite output (`mir_cps.zig`) — a suspend-capable function's
+    // step-block hits this instead of `return_value` when its mailbox/
+    // signal check comes up empty: the frame's `state` slot has already
+    // been set to the matching `ResumeEdge.state` via `frame_store`
+    // (see `Instruction.frame_store`), and this terminator just needs
+    // `wasm_actors.zig`'s scheduler to see "not done yet" distinctly
+    // from an ordinary completion value — including a genuine `Пусто`
+    // completion (`return_value{.value = null}`), which must NOT be
+    // confused with "still running".
+    suspend_return,
 };
 
 pub const Local = struct {

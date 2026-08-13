@@ -173,9 +173,25 @@ fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator
     switch (instruction) {
         .new_aggregate => |v| {
             const dst_local = try buildAllocInto(builder, allocator, layout, @as(u32, @intCast(v.elements.len)) * 8);
-            for (v.elements, 0..) |element, i| {
+            // Iterate elements in REVERSE. `v.elements` are all
+            // PRE-EXISTING values (each field expression is evaluated
+            // adjacent to the ORIGINAL, unexpanded `.new_aggregate`
+            // instruction, in order) — meaning by the time this expansion
+            // runs, they're ALL already sitting on the real WASM stack in
+            // production order, with the LAST element topmost. Storing
+            // element 0 FIRST (ascending) grabbed the wrong (topmost,
+            // last-produced) value as `src` for `frame_store` — confirmed
+            // via wasmtime as a genuine stack-corruption bug (a LATER,
+            // unrelated instruction ended up consuming a stray leftover
+            // value with the wrong type). Storing in reverse consumes
+            // each element exactly when it's actually topmost; `slot`
+            // still equals the element's own index, independent of
+            // consumption order.
+            var i = v.elements.len;
+            while (i > 0) {
+                i -= 1;
                 const frame = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
-                try builder.emit(.{ .frame_store = .{ .frame = frame, .slot = @intCast(i), .src = element } });
+                try builder.emit(.{ .frame_store = .{ .frame = frame, .slot = @intCast(i), .src = v.elements[i] } });
             }
             try builder.emit(.{ .load_local = .{ .dst = v.dst, .local = dst_local } });
         },
@@ -187,13 +203,29 @@ fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator
         },
         .build_variant => |v| {
             const dst_local = try buildAllocInto(builder, allocator, layout, (1 + @as(u32, @intCast(v.fields.len))) * 8);
-            const tag_frame = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
-            const tag_const = try wasm_heap.addressConst(builder, layout.idx_type, v.tag);
-            try builder.emit(.{ .frame_store = .{ .frame = tag_frame, .slot = 0, .src = tag_const } });
-            for (v.fields, 0..) |field, i| {
+            // `src` (`tag_const`) must be produced BEFORE `frame` (`tag_frame`)
+            // — `frame_store` needs stack `[src, frame]` with `frame`
+            // topmost/freshest (see `wasm_emit.zig`'s
+            // `EmitContext.frame_store_scratch_frame` doc comment). The field
+            // loop below already gets this right (its own `frame` reload sits
+            // right before each `frame_store`, after the pre-existing
+            // `field` value) — this tag-store had the two swapped, which
+            // corrupted the real WASM stack (confirmed via wasmtime: caused
+            // an unrelated later local to receive the wrong value/type,
+            // "type mismatch: expected f64, found i32").
+            // `v.fields` are pre-existing values too — same reverse-order
+            // requirement as `.new_aggregate` above (stored AFTER the tag,
+            // since the tag write happens first and is unaffected: `tag_const`
+            // is produced fresh, right here, not a pre-existing value).
+            var i = v.fields.len;
+            while (i > 0) {
+                i -= 1;
                 const frame = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
-                try builder.emit(.{ .frame_store = .{ .frame = frame, .slot = @intCast(1 + i), .src = field } });
+                try builder.emit(.{ .frame_store = .{ .frame = frame, .slot = @intCast(1 + i), .src = v.fields[i] } });
             }
+            const tag_const = try wasm_heap.addressConst(builder, layout.idx_type, v.tag);
+            const tag_frame = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
+            try builder.emit(.{ .frame_store = .{ .frame = tag_frame, .slot = 0, .src = tag_const } });
             try builder.emit(.{ .load_local = .{ .dst = v.dst, .local = dst_local } });
         },
         .match_tag => |v| {

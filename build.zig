@@ -527,6 +527,30 @@ pub fn build(b: *std.Build) void {
     // compile them itself.
     run_aot_runtime_tests.step.dependOn(&install_runtime_wasi.step);
     run_aot_runtime_tests.step.dependOn(&install_runtime_js.step);
+    // Struct/array/variant and actor host-import elimination — these
+    // build a real `.wasm` module in-process (lowering -> wasm_objects/
+    // wasm_actors expansion -> wasm_emit) and run it under `wasmtime`,
+    // unlike aot_runtime_tests above which only shells out against
+    // ALREADY-built runtime `.wasm` files — no install-step dependency
+    // needed.
+    const aot_objects_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/wasm/aot_objects_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    const run_aot_objects_tests = b.addRunArtifact(aot_objects_tests);
+    const aot_actors_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/wasm/aot_actors_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    const run_aot_actors_tests = b.addRunArtifact(aot_actors_tests);
 
     // `zig build test` — the everyday dev-loop step: pure per-file unit
     // tests only. Real gap found auditing this project's own test suite
@@ -602,6 +626,8 @@ pub fn build(b: *std.Build) void {
     const aot_step = b.step("aot", "Run the WASM/wasmtime AOT test suite");
     aot_step.dependOn(&run_matrix_aot_tests.step);
     aot_step.dependOn(&run_aot_runtime_tests.step);
+    aot_step.dependOn(&run_aot_objects_tests.step);
+    aot_step.dependOn(&run_aot_actors_tests.step);
 
     // `zig build bench` — the `runtime`-tier manifest cases, which embed
     // `tests/conformance/benchmarks/*.ps` (`фиб(30)` recursion, a

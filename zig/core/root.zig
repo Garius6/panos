@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const ast = @import("ast.zig");
+pub const bundle = @import("bundle.zig");
 pub const bytecode = @import("bytecode.zig");
 pub const compiler = @import("compiler.zig");
 pub const diagnostic = @import("diagnostic.zig");

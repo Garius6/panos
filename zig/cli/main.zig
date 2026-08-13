@@ -106,6 +106,101 @@ fn writeAnalysisDiagnostics(writer: *std.Io.Writer, analysis: *const panos_core.
     }
 }
 
+// `panos build --compile <файл.pns> [-o выход]` — Bun-style standalone
+// executable. See `zig/core/bundle.zig`'s module doc comment for the full
+// design (embeds SOURCE, not compiled bytecode — recompiles at every
+// startup of the produced binary). This command runs the ordinary
+// `module_loader.Graph.load` exactly like a normal `panos <file>` run
+// (real `$PANOS_STDLIB`/exe-relative `std/` search — at BUILD time we
+// genuinely want the real stdlib, so `bundle.collect` can capture
+// whichever modules the program actually used), then hands the resulting
+// graph to `bundle.collect` to walk it into an embeddable bundle.
+fn runCompile(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writer, input: []const u8, output_arg: []const u8) !void {
+    if (input.len == 0) {
+        try stderr.print("panos build --compile <файл.pns> [-o выход]\n", .{});
+        try stderr.flush();
+        std.process.exit(1);
+    }
+
+    var output_owned: ?[]u8 = null;
+    defer if (output_owned) |owned| init.gpa.free(owned);
+    var output = output_arg;
+    if (output.len == 0) {
+        const base = if (std.mem.endsWith(u8, input, ".pns"))
+            input[0 .. input.len - 4]
+        else if (std.mem.endsWith(u8, input, ".ps"))
+            input[0 .. input.len - 3]
+        else
+            input;
+        output_owned = try init.gpa.dupe(u8, base);
+        output = output_owned.?;
+    }
+
+    var graph = panos_core.module_loader.Graph.init(init.gpa);
+    defer graph.deinit();
+    var global_search_roots: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (global_search_roots.items) |root| init.gpa.free(root);
+        global_search_roots.deinit(init.gpa);
+    }
+    if (init.environ_map.get("PANOS_STDLIB")) |stdlib_dir| {
+        try global_search_roots.append(init.gpa, try init.gpa.dupe(u8, stdlib_dir));
+    }
+    var exe_dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (std.process.executableDirPath(init.io, &exe_dir_buffer)) |len| {
+        try global_search_roots.append(init.gpa, try std.fmt.allocPrint(init.gpa, "{s}/std", .{exe_dir_buffer[0..len]}));
+    } else |_| {}
+    graph.global_search_roots = global_search_roots.items;
+    try graph.load(&FileReader{ .io = init.io }, input);
+    if (graph.diagnostics.items.items.len != 0) {
+        try writeModuleDiagnostics(stderr, &graph);
+        if (hasErrors(&graph.diagnostics)) {
+            try stderr.flush();
+            std.process.exit(1);
+        }
+    }
+
+    var bundle = try panos_core.bundle.collect(init.gpa, init.io, &graph, global_search_roots.items);
+    defer bundle.deinit();
+    const bundle_bytes = try panos_core.bundle.serialize(init.gpa, &bundle);
+    defer init.gpa.free(bundle_bytes);
+
+    var exe_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const exe_path_len = std.process.executablePath(init.io, &exe_path_buffer) catch {
+        try stderr.print("panos build --compile: не удалось определить путь к собственному исполняемому файлу\n", .{});
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    const base_binary = try std.Io.Dir.cwd().readFileAlloc(init.io, exe_path_buffer[0..exe_path_len], init.gpa, .limited(256 * 1024 * 1024));
+    defer init.gpa.free(base_binary);
+
+    const combined = try panos_core.bundle.appendTrailer(init.gpa, base_binary, bundle_bytes);
+    defer init.gpa.free(combined);
+
+    std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output, .data = combined }) catch |err| {
+        try stderr.print("panos build --compile: не удалось записать {s}: {t}\n", .{ output, err });
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    // Executable bit — the source binary this was copied from already has
+    // it, but `writeFile`/`createFile` above start a NEW file at the
+    // default (non-executable) mode, not inherited from anywhere.
+    var output_file = std.Io.Dir.cwd().openFile(init.io, output, .{}) catch |err| {
+        try stderr.print("panos build --compile: записан {s}, но не удалось выставить право на выполнение: {t}\n", .{ output, err });
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    defer output_file.close(init.io);
+    output_file.setPermissions(init.io, .executable_file) catch |err| {
+        try stderr.print("panos build --compile: записан {s}, но не удалось выставить право на выполнение: {t}\n", .{ output, err });
+        try stderr.flush();
+        std.process.exit(1);
+    };
+
+    try stdout.print("panos build --compile: записан {s} ({d} модул(ей/ь) в bundle)\n", .{ output, bundle.entries.len });
+    try stdout.flush();
+}
+
 // `panos build --target=wasm <файл.ps> [-o выход.wasm]` — T048. Deliberately
 // single-file only: `mir_lowering.zig` lowers exactly ONE `ast.Ast` (see its
 // own scope note), and `runner.analyzeSource`'s single-file entry point
@@ -118,12 +213,15 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
     var target: []const u8 = "";
     var input: []const u8 = "";
     var output: []const u8 = "";
+    var compile = false;
 
     while (arguments.next()) |arg| {
         if (std.mem.eql(u8, arg, "--target")) {
             target = arguments.next() orelse "";
         } else if (std.mem.startsWith(u8, arg, "--target=")) {
             target = arg["--target=".len..];
+        } else if (std.mem.eql(u8, arg, "--compile")) {
+            compile = true;
         } else if (std.mem.eql(u8, arg, "-o")) {
             output = arguments.next() orelse "";
         } else {
@@ -131,8 +229,13 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         }
     }
 
+    if (compile) {
+        try runCompile(init, stdout, stderr, input, output);
+        return;
+    }
+
     if (!std.mem.eql(u8, target, "wasm")) {
-        try stderr.print("panos build: поддерживается только --target=wasm (получено: \"{s}\")\n", .{target});
+        try stderr.print("panos build: поддерживается --target=wasm или --compile (получено таргет: \"{s}\")\n", .{target});
         try stderr.flush();
         std.process.exit(1);
     }
@@ -249,6 +352,31 @@ pub fn main(init: std.process.Init) !void {
     var stderr_file_writer: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &stderr_buffer);
     const stderr = &stderr_file_writer.interface;
 
+    // Standalone-executable check (`panos build --compile`, see `zig/core/
+    // bundle.zig`) — FIRST thing, before any normal argv parsing: an
+    // ordinary `panos <file>` invocation (no trailer) pays for exactly one
+    // small positional read of its own last 16 bytes (`bundle.readTrailer`'s
+    // own doc comment), everything else below is unchanged. A fat binary
+    // has NO separate "which file" argument — the binary itself IS the
+    // program, so every real argv entry becomes `program_args` directly.
+    var exe_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (std.process.executablePath(init.io, &exe_path_buffer)) |exe_path_len| {
+        if (panos_core.bundle.readTrailer(init.io, init.gpa, exe_path_buffer[0..exe_path_len]) catch null) |bundle_bytes| {
+            defer init.gpa.free(bundle_bytes);
+            var fat_arguments = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+            defer fat_arguments.deinit();
+            _ = fat_arguments.next(); // argv[0] — the fat binary's own path
+            var fat_program_args: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (fat_program_args.items) |argument| init.gpa.free(argument);
+                fat_program_args.deinit(init.gpa);
+            }
+            while (fat_arguments.next()) |argument| try fat_program_args.append(init.gpa, try init.gpa.dupe(u8, argument));
+            try runFatBinary(init, stdout, stderr, bundle_bytes, fat_program_args.items);
+            return;
+        }
+    } else |_| {}
+
     var arguments = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer arguments.deinit();
     _ = arguments.next();
@@ -295,8 +423,6 @@ pub fn main(init: std.process.Init) !void {
     }
     while (arguments.next()) |argument| try program_args.append(init.gpa, try init.gpa.dupe(u8, argument));
 
-    var graph = panos_core.module_loader.Graph.init(init.gpa);
-    defer graph.deinit();
     var global_search_roots: std.ArrayList([]const u8) = .empty;
     defer {
         for (global_search_roots.items) |root| init.gpa.free(root);
@@ -317,8 +443,33 @@ pub fn main(init: std.process.Init) !void {
         // context) — tier 4 is simply unavailable then, not a fatal error;
         // tiers 1-3 still work exactly as documented.
     }
-    graph.global_search_roots = global_search_roots.items;
-    try graph.load(&FileReader{ .io = init.io }, file_path);
+
+    try runGraph(init, stdout, stderr, FileReader{ .io = init.io }, file_path, global_search_roots.items, program_args.items, verbose, profile_ffi);
+}
+
+// Shared by the normal file-based `panos <file>` path above (`reader` =
+// `FileReader`, real disk) and the standalone-executable fat-binary path
+// below (`reader` = `bundle.BundleReader`, in-memory `.pns` content) —
+// `anytype` so both satisfy `module_loader.Graph.load`'s duck-typed
+// `reader` interface without a shared base type. Identical to the
+// previous inline body of `main()` from `graph.load` through the final
+// `switch (execution)` — no behavioral change for the existing file-based
+// path, purely an extraction so the fat-binary path can reuse it exactly.
+fn runGraph(
+    init: std.process.Init,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    reader: anytype,
+    entry_path: []const u8,
+    global_search_roots: []const []const u8,
+    program_args: []const []const u8,
+    verbose: bool,
+    profile_ffi: bool,
+) !void {
+    var graph = panos_core.module_loader.Graph.init(init.gpa);
+    defer graph.deinit();
+    graph.global_search_roots = global_search_roots;
+    try graph.load(&reader, entry_path);
     // Real prelude module (same as runner.zig's single-file pipeline and
     // the LSP already do) instead of the type-checker's hardcoded
     // Опция/Результат/interface stand-ins — `module_compiler.zig`'s
@@ -360,7 +511,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var machine = panos_core.vm.Vm.init(init.gpa, &compiled.program);
-    machine.program_args = program_args.items;
+    machine.program_args = program_args;
     machine.foreign_profile_enabled = profile_ffi;
     defer machine.deinit();
     const execution = try machine.run(start, &.{});
@@ -402,6 +553,61 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         },
     }
+}
+
+// Runs a standalone-executable bundle embedded via `panos build --compile`
+// (`zig/core/bundle.zig`). `.pns` content is served straight from memory
+// (`bundle.BundleReader`, no temp directory at all for it) — a real temp
+// directory is only created on disk if the bundle carries at least one
+// `внешний`-library entry, since `dlopen`/`LoadLibraryW` need a real file.
+// Both cases share `runGraph` unchanged, parameterized only by `reader`.
+fn runFatBinary(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writer, bundle_bytes: []const u8, program_args: []const []const u8) !void {
+    var decoded = panos_core.bundle.deserialize(init.gpa, bundle_bytes) catch |err| {
+        try stderr.print("panos: повреждённый встроенный bundle: {t}\n", .{err});
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    defer decoded.deinit();
+
+    // A namespace prefix for every entry's virtual path — used to build
+    // `entry_path` for `graph.load` below regardless of whether anything
+    // is ever actually written to disk under it. Only `внешний`-library
+    // entries (if any) get REAL bytes written here; `.pns` content is
+    // served by `BundleReader` straight from `decoded`, never touching
+    // this directory at all.
+    const now_ns = std.Io.Timestamp.now(init.io, .real).nanoseconds;
+    const temp_root = try std.fmt.allocPrint(init.gpa, ".panos-fat-{d}", .{now_ns});
+    defer init.gpa.free(temp_root);
+    defer std.Io.Dir.cwd().deleteTree(init.io, temp_root) catch {};
+
+    for (decoded.entries) |entry| {
+        if (!entry.is_library) continue;
+        const full_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{ temp_root, entry.path });
+        defer init.gpa.free(full_path);
+        if (std.fs.path.dirname(full_path)) |dir| try std.Io.Dir.cwd().createDirPath(init.io, dir);
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = full_path, .data = entry.content });
+    }
+
+    const entry_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{ temp_root, decoded.entry_path });
+    defer init.gpa.free(entry_path);
+
+    // A SINGLE synthetic root, not the real `$PANOS_STDLIB`/exe-relative
+    // `std/` — a standalone executable carries its ENTIRE dependency
+    // closure (including any `std/` modules it used) inside the bundle
+    // itself, never touching the real filesystem for it (see `bundle.
+    // collect`'s/`bundle.bundleKey`'s doc comments for why this exact
+    // shape — `module_loader.zig`'s own bare-name candidate search tries
+    // `{root}/{name}(.pns|.ps)` for each `global_search_roots` entry, and
+    // `bundleKey` stores exactly matching `"std/{name}.pns"` bundle keys
+    // for anything reached this way at build time). Pulling in the REAL
+    // `$PANOS_STDLIB` here would make a "standalone" binary's behavior
+    // depend on what happens to be installed on the machine running it —
+    // exactly what this feature exists to avoid.
+    const synthetic_root = try std.fmt.allocPrint(init.gpa, "{s}/std", .{temp_root});
+    defer init.gpa.free(synthetic_root);
+    const global_search_roots = [_][]const u8{synthetic_root};
+
+    try runGraph(init, stdout, stderr, panos_core.bundle.BundleReader{ .bundle = &decoded, .temp_root = temp_root }, entry_path, &global_search_roots, program_args, false, false);
 }
 
 test "CLI imports the migration core" {

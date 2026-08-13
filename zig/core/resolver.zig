@@ -238,6 +238,64 @@ pub const Resolution = struct {
     }
 };
 
+// Extracted as a standalone function (not just a `Resolver` method) so
+// `bundle.zig` (standalone-executable embedding, `panos build --compile`)
+// can resolve the SAME path-style `внешний "./lib.so"` a real compile
+// would, WITHOUT needing a whole `Resolver` instance — it only ever needs
+// this one pure computation (given a `.pns` file's own path and the
+// logical library name as written, what real file path does `внешний`
+// resolve it to). `Resolver.foreignLibraryFilename` below is now a thin
+// wrapper supplying its own `self.source_path`.
+pub fn resolveForeignLibraryPath(allocator: std.mem.Allocator, source_path: []const u8, logical_name: []const u8) ![]const u8 {
+    const suffix = switch (builtin.target.os.tag) {
+        .macos, .ios, .tvos, .watchos => ".dylib",
+        .windows => ".dll",
+        else => ".so",
+    };
+    // A path-like library reference (contains '/') is an explicit
+    // file path, not a bare logical name resolved via the OS
+    // loader's own search path (LD_LIBRARY_PATH/DYLD_.../PATH) — a
+    // bare logical name (`"libc"`, `"raylib"`) never contains '/'.
+    // Resolved the same way `импорт` resolves a relative module path
+    // (`module_loader.resolveImportPath`): against the DIRECTORY of
+    // THIS `.pns`/`.ps` file (`source_path`), not the process's
+    // current working directory — a library shipped next to a
+    // script keeps working regardless of where `panos` is invoked
+    // from. An already-absolute path, or an inline/test caller with
+    // no real `source_path` (empty — nothing to be relative
+    // to), is used exactly as given, which then resolves against the
+    // process's own CWD via the OS loader — the same fallback
+    // `импорт` itself uses (`importer_path.len == 0`).
+    if (std.mem.indexOfScalar(u8, logical_name, '/') != null) {
+        const suffixed = if (std.mem.endsWith(u8, logical_name, suffix))
+            logical_name
+        else
+            try std.fmt.allocPrint(allocator, "{s}{s}", .{ logical_name, suffix });
+        defer if (suffixed.ptr != logical_name.ptr) allocator.free(suffixed);
+
+        if (suffixed[0] == '/' or source_path.len == 0) return allocator.dupe(u8, suffixed);
+        const directory = std.fs.path.dirname(source_path) orelse "";
+        if (directory.len == 0) return allocator.dupe(u8, suffixed);
+        // Strips a leading "./" (but not "../", which is meaningful)
+        // before joining — purely cosmetic, "dir/./libs/x.so" would
+        // still resolve fine, this just keeps reported paths and
+        // `Resolve Error` messages readable.
+        const relative = if (std.mem.startsWith(u8, suffixed, "./")) suffixed[2..] else suffixed;
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, relative });
+    }
+    // Windows has no file called "libc.dll" — the C runtime there is
+    // `msvcrt.dll` (present on every Windows version since NT4, the
+    // same universal-CRT-analog role `dlopen(NULL)` fills on POSIX
+    // above). Only "libc" gets this special case; any other bare
+    // library name still goes through the generic `<name>.dll`
+    // suffix rule.
+    if (comptime builtin.target.os.tag == .windows) {
+        if (std.mem.eql(u8, logical_name, "libc")) return allocator.dupe(u8, "msvcrt.dll");
+    }
+    if (std.mem.endsWith(u8, logical_name, suffix)) return allocator.dupe(u8, logical_name);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ logical_name, suffix });
+}
+
 const Resolver = struct {
     result: *Resolution,
     scopes: symbols.ScopeStack,
@@ -959,53 +1017,7 @@ const Resolver = struct {
     } else struct {};
 
     fn foreignLibraryFilename(self: *Resolver, allocator: std.mem.Allocator, logical_name: []const u8) ![]const u8 {
-        const suffix = switch (builtin.target.os.tag) {
-            .macos, .ios, .tvos, .watchos => ".dylib",
-            .windows => ".dll",
-            else => ".so",
-        };
-        // A path-like library reference (contains '/') is an explicit
-        // file path, not a bare logical name resolved via the OS
-        // loader's own search path (LD_LIBRARY_PATH/DYLD_.../PATH) — a
-        // bare logical name (`"libc"`, `"raylib"`) never contains '/'.
-        // Resolved the same way `импорт` resolves a relative module path
-        // (`module_loader.resolveImportPath`): against the DIRECTORY of
-        // THIS `.pns`/`.ps` file (`self.source_path`), not the process's
-        // current working directory — a library shipped next to a
-        // script keeps working regardless of where `panos` is invoked
-        // from. An already-absolute path, or an inline/test caller with
-        // no real `self.source_path` (empty — nothing to be relative
-        // to), is used exactly as given, which then resolves against the
-        // process's own CWD via the OS loader — the same fallback
-        // `импорт` itself uses (`importer_path.len == 0`).
-        if (std.mem.indexOfScalar(u8, logical_name, '/') != null) {
-            const suffixed = if (std.mem.endsWith(u8, logical_name, suffix))
-                logical_name
-            else
-                try std.fmt.allocPrint(allocator, "{s}{s}", .{ logical_name, suffix });
-            defer if (suffixed.ptr != logical_name.ptr) allocator.free(suffixed);
-
-            if (suffixed[0] == '/' or self.source_path.len == 0) return allocator.dupe(u8, suffixed);
-            const directory = std.fs.path.dirname(self.source_path) orelse "";
-            if (directory.len == 0) return allocator.dupe(u8, suffixed);
-            // Strips a leading "./" (but not "../", which is meaningful)
-            // before joining — purely cosmetic, "dir/./libs/x.so" would
-            // still resolve fine, this just keeps reported paths and
-            // `Resolve Error` messages readable.
-            const relative = if (std.mem.startsWith(u8, suffixed, "./")) suffixed[2..] else suffixed;
-            return std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, relative });
-        }
-        // Windows has no file called "libc.dll" — the C runtime there is
-        // `msvcrt.dll` (present on every Windows version since NT4, the
-        // same universal-CRT-analog role `dlopen(NULL)` fills on POSIX
-        // above). Only "libc" gets this special case; any other bare
-        // library name still goes through the generic `<name>.dll`
-        // suffix rule.
-        if (comptime builtin.target.os.tag == .windows) {
-            if (std.mem.eql(u8, logical_name, "libc")) return allocator.dupe(u8, "msvcrt.dll");
-        }
-        if (std.mem.endsWith(u8, logical_name, suffix)) return allocator.dupe(u8, logical_name);
-        return std.fmt.allocPrint(allocator, "{s}{s}", .{ logical_name, suffix });
+        return resolveForeignLibraryPath(allocator, self.source_path, logical_name);
     }
 
     fn registerMethod(self: *Resolver, declaration: ast.DeclId, name: []const u8, span: source.Span) !symbols.SymbolId {

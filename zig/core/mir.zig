@@ -161,6 +161,15 @@ pub const Instruction = union(enum) {
     // from that being visible in the instruction shape.
     mem_load: struct { dst: ValueId, addr: ValueId },
     mem_store: struct { addr: ValueId, src: ValueId },
+    // Byte-granular siblings of `mem_load`/`mem_store` above — those are
+    // always word-granular (4 or 8 bytes, picked from `dst`/`src`'s own
+    // type). String work (`wasm_strings.zig`) needs single-byte access:
+    // UTF-8 byte inspection, byte-by-byte copy loops, digit-string
+    // construction. `dst`/`src` are always `idx_type` (i32) here — a
+    // byte value zero-extended into i32 on load, only the low byte
+    // stored on store (`i32.load8_u`/`i32.store8`).
+    mem_load8: struct { dst: ValueId, addr: ValueId },
+    mem_store8: struct { addr: ValueId, src: ValueId },
     // `?`-operator — an ordinary instruction, not a terminator: early
     // return on failure is runtime semantics INSIDE one opcode already
     // today (unpacks Опция/Результат/any 2-variant ADT, panics or returns

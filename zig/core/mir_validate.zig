@@ -162,6 +162,11 @@ fn instrRefs(allocator: std.mem.Allocator, instruction: mir.Instruction) !struct
             try operands.append(allocator, v.addr);
         },
         .mem_store => |v| try operands.appendSlice(allocator, &.{ v.addr, v.src }),
+        .mem_load8 => |v| {
+            dst = v.dst;
+            try operands.append(allocator, v.addr);
+        },
+        .mem_store8 => |v| try operands.appendSlice(allocator, &.{ v.addr, v.src }),
     }
     return .{ .dst = dst, .operands = try operands.toOwnedSlice(allocator) };
 }

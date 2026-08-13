@@ -174,7 +174,7 @@ pub fn hasActorInstructions(module: *const mir.Module) bool {
 pub fn usesActorMemory(module: *const mir.Module) bool {
     for (module.functions.items) |function| for (function.blocks.items) |block|
         for (block.instructions.items) |instruction| switch (instruction) {
-            .frame_load, .frame_store, .global_get, .global_set, .mem_load, .mem_store => return true,
+            .frame_load, .frame_store, .global_get, .global_set, .mem_load, .mem_store, .mem_load8, .mem_store8 => return true,
             else => {},
         };
     return false;

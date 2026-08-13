@@ -241,6 +241,11 @@ fn computeUseCount(allocator: std.mem.Allocator, function: *const mir.Function) 
                     try countUse(&counts, store.addr);
                     try countUse(&counts, store.src);
                 },
+                .mem_load8 => |load| try countUse(&counts, load.addr),
+                .mem_store8 => |store| {
+                    try countUse(&counts, store.addr);
+                    try countUse(&counts, store.src);
+                },
                 .const_value, .load_local, .function_ref, .global_get => {},
                 else => return unsupported("вид MIR-инструкции при подсчёте использований"),
             }
@@ -767,6 +772,35 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try code.append(allocator, if (src_type == wasm_module.wasm_i32) 0x36 else 0x39); // i32.store / f64.store
             try wasm_module.writeUleb128(code, allocator, if (src_type == wasm_module.wasm_i32) 2 else 3);
             try wasm_module.writeUleb128(code, allocator, 0);
+            return null;
+        },
+        // Byte-granular siblings of `mem_load`/`mem_store` above — same
+        // stack conventions (single operand for load; `[src, addr]` with
+        // addr freshest for store, same shared scratch locals since
+        // `src` here is always i32), just `i32.load8_u`/`i32.store8`
+        // (opcodes `0x2D`/`0x3A`) with byte alignment (0) instead of the
+        // word-granular opcodes/alignment above.
+        .mem_load8 => |load| {
+            try code.append(allocator, 0x2D); // i32.load8_u
+            try wasm_module.writeUleb128(code, allocator, 0); // align (byte)
+            try wasm_module.writeUleb128(code, allocator, 0); // offset
+            return load.dst;
+        },
+        .mem_store8 => {
+            const addr_scratch = ctx.reserveFrameScratch();
+            try code.append(allocator, 0x21); // local.set addr_scratch (pops addr)
+            try wasm_module.writeUleb128(code, allocator, addr_scratch);
+            const value_scratch = ctx.reserveFrameStoreScratch(wasm_module.wasm_i32);
+            try code.append(allocator, 0x21); // local.set value_scratch (pops src)
+            try wasm_module.writeUleb128(code, allocator, value_scratch);
+
+            try code.append(allocator, 0x20); // local.get addr_scratch
+            try wasm_module.writeUleb128(code, allocator, addr_scratch);
+            try code.append(allocator, 0x20); // local.get value_scratch
+            try wasm_module.writeUleb128(code, allocator, value_scratch);
+            try code.append(allocator, 0x3A); // i32.store8
+            try wasm_module.writeUleb128(code, allocator, 0); // align (byte)
+            try wasm_module.writeUleb128(code, allocator, 0); // offset
             return null;
         },
         .call_builtin => |call| {

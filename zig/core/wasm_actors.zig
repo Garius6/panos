@@ -377,10 +377,18 @@ fn buildScheduler(
     const false0 = try wasm_heap.boolConst(&builder, layout.bool_type, false);
     try builder.emit(.{ .store_local = .{ .local = done0_local, .src = false0 } });
     // process 1 (the spawned actor) doesn't exist until process 0's own
-    // step function reaches its `.spawn` — treated as "done" (skip) until
-    // its frame pointer (slot `child_frame_slot` of frame0) is non-zero.
-    const true1 = try wasm_heap.boolConst(&builder, layout.bool_type, true);
-    try builder.emit(.{ .store_local = .{ .local = done1_local, .src = true1 } });
+    // step function reaches its `.spawn` — `emitSchedulerRound`'s own
+    // `spawned` check (frame pointer at `child_frame_slot` non-zero)
+    // already gates against running it before that point, so `done1`
+    // itself must start `false`: initializing it `true` here meant
+    // `not_done1` was permanently `false`, so `should_run = spawned AND
+    // not_done1` could NEVER become true even after spawning — process 1
+    // never ran a single step, ever. Confirmed via wasmtime: the actor
+    // round-trip compiled and ran without trapping/crashing but always
+    // returned the receiver's zero-initialized mailbox slot instead of
+    // the real reply, because the reply was never actually produced.
+    const false1 = try wasm_heap.boolConst(&builder, layout.bool_type, false);
+    try builder.emit(.{ .store_local = .{ .local = done1_local, .src = false1 } });
 
     var round: u32 = 0;
     while (round < scheduler_rounds) : (round += 1) {

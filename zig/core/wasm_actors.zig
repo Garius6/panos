@@ -327,7 +327,7 @@ fn expandSpawn(
         var rewritten = tail_instruction;
         if (mir_cps.referencesValue(rewritten, dst)) {
             const fresh = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
-            rewritten = mir_cps.substituteValue(rewritten, dst, fresh);
+            rewritten = try mir_cps.substituteValue(builder.module.arena.allocator(), rewritten, dst, fresh);
         }
         try builder.emit(rewritten);
     }

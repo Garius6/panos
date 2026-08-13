@@ -568,7 +568,14 @@ fn rewriteInstructionStream(
                 if (!referencesValue(instruction, redirect.old)) continue;
                 const fresh = try builder.newValue(redirect.type_id);
                 try builder.emit(.{ .load_local = .{ .dst = fresh, .local = redirect.local } });
-                instruction = substituteValue(instruction, redirect.old, fresh);
+                // Module arena, NOT the `allocator` parameter — a
+                // substituted array field gets stored into a PERSISTED
+                // instruction living in `module`, so it needs the same
+                // module-owned lifetime every other instruction-owned
+                // slice in this codebase uses (e.g. `wasm_heap.dupeOne`),
+                // not a scratch allocator that may get freed out from
+                // under it once this function returns.
+                instruction = try substituteValue(builder.module.arena.allocator(), instruction, redirect.old, fresh);
             }
 
             // Self-tail-call: `функ ф(...) -> Т \n ... \n ф(new_args) \n
@@ -776,17 +783,59 @@ pub fn referencesValue(instruction: mir.Instruction, target: mir.ValueId) bool {
         .send => |i| i.process == target or i.message == target,
         .try_unwrap => |i| i.src == target,
         .frame_store => |i| i.src == target,
+        // The RAW receive result (before any pattern-match field
+        // extraction) flowing directly into a call/aggregate/spawn's
+        // own argument list — no current fixture does this (every
+        // actor idiom this codebase exercises destructures via
+        // match_tag/get_variant_field first, both already covered
+        // above), but it's the same class of gap the two ACTUALLY-HIT
+        // bugs this session came from (wasm_objects.zig's build_variant/
+        // new_aggregate field-order bug, wasm_actors.zig's expandSpawn
+        // arg-order bug) — closing it defensively rather than waiting
+        // for a third occurrence.
+        .call => |i| for (i.args) |a| {
+            if (a == target) break true;
+        } else false,
+        .call_value => |i| i.callee == target or for (i.args) |a| {
+            if (a == target) break true;
+        } else false,
+        .new_aggregate => |i| for (i.elements) |e| {
+            if (e == target) break true;
+        } else false,
+        .new_array => |i| for (i.elements) |e| {
+            if (e == target) break true;
+        } else false,
+        .build_variant => |i| for (i.fields) |f| {
+            if (f == target) break true;
+        } else false,
+        .spawn => |i| i.callee == target or for (i.args) |a| {
+            if (a == target) break true;
+        } else false,
         else => false,
     };
 }
 
-pub fn substituteValue(instruction: mir.Instruction, old: mir.ValueId, new: mir.ValueId) mir.Instruction {
+// `allocator` is ONLY needed for the array-field cases (`.call`/
+// `.call_value`/`.new_aggregate`/`.new_array`/`.build_variant`/
+// `.spawn`'s `args`/`elements`/`fields`) — substituting inside a `[]const
+// ValueId` needs a fresh owned copy, unlike every other case here which
+// just reassigns a single `ValueId` field in place.
+pub fn substituteValue(allocator: std.mem.Allocator, instruction: mir.Instruction, old: mir.ValueId, new: mir.ValueId) !mir.Instruction {
     if (old == new) return instruction;
     const sub = struct {
         fn v(value: mir.ValueId, o: mir.ValueId, n: mir.ValueId) mir.ValueId {
             return if (value == o) n else value;
         }
     }.v;
+    const subSlice = struct {
+        fn f(alloc: std.mem.Allocator, values: []const mir.ValueId, o: mir.ValueId, n: mir.ValueId) ![]const mir.ValueId {
+            const out_slice = try alloc.dupe(mir.ValueId, values);
+            for (out_slice) |*value| {
+                if (value.* == o) value.* = n;
+            }
+            return out_slice;
+        }
+    }.f;
     var out = instruction;
     switch (out) {
         .copy => |*i| i.src = sub(i.src, old, new),
@@ -821,6 +870,18 @@ pub fn substituteValue(instruction: mir.Instruction, old: mir.ValueId, new: mir.
         },
         .try_unwrap => |*i| i.src = sub(i.src, old, new),
         .frame_store => |*i| i.src = sub(i.src, old, new),
+        .call => |*i| i.args = try subSlice(allocator, i.args, old, new),
+        .call_value => |*i| {
+            i.callee = sub(i.callee, old, new);
+            i.args = try subSlice(allocator, i.args, old, new);
+        },
+        .new_aggregate => |*i| i.elements = try subSlice(allocator, i.elements, old, new),
+        .new_array => |*i| i.elements = try subSlice(allocator, i.elements, old, new),
+        .build_variant => |*i| i.fields = try subSlice(allocator, i.fields, old, new),
+        .spawn => |*i| {
+            i.callee = sub(i.callee, old, new);
+            i.args = try subSlice(allocator, i.args, old, new);
+        },
         else => {},
     }
     return out;

@@ -255,9 +255,22 @@ fn expandSpawn(
     // `Redirect`: store once, reload fresh at each use.
     const dst_local = try wasm_heap.storeLocal(builder, "@spawned", layout.ptr_type, dst);
 
-    for (args, 0..) |arg, i| {
+    // Iterate args in REVERSE. `args` are all PRE-EXISTING values
+    // (`.spawn`'s own arguments, each evaluated adjacent to the
+    // ORIGINAL, unexpanded `.spawn` instruction, in order) — by the
+    // time this loop runs they're ALL already sitting on the real WASM
+    // stack in production order, with the LAST arg topmost. Storing
+    // arg 0 first (ascending) would grab the wrong (topmost, last-
+    // produced) value as `src` — same bug class already found and fixed
+    // in `wasm_objects.zig`'s `build_variant`/`new_aggregate` field
+    // loops (`888a0c0`). Never exercised until now since every actor
+    // fixture built so far spawns a function with 0 or 1 parameters —
+    // 2+ genuinely needs this fix.
+    var ai = args.len;
+    while (ai > 0) {
+        ai -= 1;
         const dst_for_arg = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
-        try builder.emit(.{ .frame_store = .{ .frame = dst_for_arg, .slot = mir_cps.frame_prefix_slots + @as(u32, @intCast(i)), .src = arg } });
+        try builder.emit(.{ .frame_store = .{ .frame = dst_for_arg, .slot = mir_cps.frame_prefix_slots + @as(u32, @intCast(ai)), .src = args[ai] } });
     }
 
     // `src` computed BEFORE `frame` — see `wasm_emit.zig`'s

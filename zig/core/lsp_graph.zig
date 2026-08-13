@@ -110,10 +110,21 @@ pub const GraphAnalysis = struct {
     }
 };
 
-pub fn analyze(allocator: std.mem.Allocator, io: std.Io, documents: *const lsp.DocumentStore, entry_uri: []const u8) !GraphAnalysis {
+pub fn analyze(allocator: std.mem.Allocator, io: std.Io, documents: *const lsp.DocumentStore, entry_uri: []const u8, global_search_roots: []const []const u8) !GraphAnalysis {
     const entry_path = uriToPath(entry_uri) orelse return error.NotAFileUri;
     var graph = module_loader.Graph.init(allocator);
     errdefer graph.deinit();
+    // Without this, any import resolved via `$PANOS_STDLIB`/exe-relative
+    // `std/` (not a same-directory relative `./...` import) never loads at
+    // all — `Module Loader Error: не удалось загрузить модуль`, silently
+    // caught by every caller (`definition`/`references` in `lsp/main.zig`
+    // return `null` on ANY `analyze` error), surfacing to the user as a
+    // bare "не найдено определение" for the target symbol, with no
+    // diagnostic ever shown. Real gap found: `cli/main.zig`'s real `panos`
+    // binary sets this (`$PANOS_STDLIB` then exe-relative `std/`, see its
+    // own comment) before every `graph.load`; this LSP-side graph builder
+    // never did, for ANY caller, since the day this file was added.
+    graph.global_search_roots = global_search_roots;
     const reader = Reader{ .io = io, .documents = documents };
     try graph.load(&reader, entry_path);
     _ = try graph.appendPreludeModule(prelude.SOURCE);
@@ -145,7 +156,7 @@ test "analyze loads a real multi-file graph from open, unsaved documents" {
     var io = std.Io.Threaded.init(allocator, .{});
     defer io.deinit();
 
-    var analysis = try analyze(allocator, io.io(), &documents, "file:///проект/main.ps");
+    var analysis = try analyze(allocator, io.io(), &documents, "file:///проект/main.ps", &.{});
     defer analysis.deinit();
 
     try std.testing.expect(!analysis.hasErrors());

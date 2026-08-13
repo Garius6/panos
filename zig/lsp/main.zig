@@ -45,6 +45,15 @@ pub const ResponseBuffer = struct {
 pub const Server = struct {
     allocator: std.mem.Allocator,
     documents: core_lsp.DocumentStore,
+    // `$PANOS_STDLIB`/exe-relative `std/` search roots for `lsp_graph.
+    // analyze`'s `module_loader.Graph` — empty by default (every existing
+    // test constructs a `Server` via bare `init`, exercising only same-
+    // directory relative imports, which need no search roots at all).
+    // Populated once, for the real binary's whole lifetime, by `main`
+    // below (mirrors `cli/main.zig`'s own one-time setup) — computing it
+    // per-request would be wasteful and `$PANOS_STDLIB`/the exe path
+    // never change while the server process is running.
+    global_search_roots: []const []const u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator) Server {
         return .{
@@ -348,7 +357,7 @@ pub const Server = struct {
 
         var io = std.Io.Threaded.init(self.allocator, .{});
         defer io.deinit();
-        var analysis = lsp_graph.analyze(self.allocator, io.io(), &self.documents, context.uri) catch {
+        var analysis = lsp_graph.analyze(self.allocator, io.io(), &self.documents, context.uri, self.global_search_roots) catch {
             try writeResponse(output, request_id, "null");
             return;
         };
@@ -414,7 +423,7 @@ pub const Server = struct {
 
         var io = std.Io.Threaded.init(self.allocator, .{});
         defer io.deinit();
-        var analysis = lsp_graph.analyze(self.allocator, io.io(), &self.documents, context.uri) catch {
+        var analysis = lsp_graph.analyze(self.allocator, io.io(), &self.documents, context.uri, self.global_search_roots) catch {
             try writeResponse(output, request_id, "null");
             return;
         };
@@ -476,7 +485,7 @@ pub const Server = struct {
         while (document_iterator.next()) |document_entry| {
             const other_uri = document_entry.key_ptr.*;
             if (std.mem.eql(u8, other_uri, context.uri)) continue;
-            var other_analysis = lsp_graph.analyze(self.allocator, io.io(), &self.documents, other_uri) catch continue;
+            var other_analysis = lsp_graph.analyze(self.allocator, io.io(), &self.documents, other_uri, self.global_search_roots) catch continue;
             defer other_analysis.deinit();
             const other_resolved = other_analysis.entryResolution() orelse continue;
             const other_tree = other_analysis.entryTree();
@@ -1604,6 +1613,29 @@ pub fn main(init: std.process.Init) !void {
     defer server.deinit();
     var output = ResponseBuffer.init(init.gpa);
     defer output.deinit();
+
+    // Same `$PANOS_STDLIB`-then-exe-relative-`std/` search as `cli/main.
+    // zig`'s real `panos` binary (see its own comment) — computed once,
+    // for the whole server lifetime, and freed only at process exit
+    // (this loop runs until the client disconnects, matching how `panos`
+    // itself scopes its own equivalent `defer` to the whole `run`).
+    var global_search_roots: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (global_search_roots.items) |root| init.gpa.free(root);
+        global_search_roots.deinit(init.gpa);
+    }
+    if (init.environ_map.get("PANOS_STDLIB")) |stdlib_dir| {
+        try global_search_roots.append(init.gpa, try init.gpa.dupe(u8, stdlib_dir));
+    }
+    var exe_dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (std.process.executableDirPath(init.io, &exe_dir_buffer)) |len| {
+        try global_search_roots.append(init.gpa, try std.fmt.allocPrint(init.gpa, "{s}/std", .{exe_dir_buffer[0..len]}));
+    } else |_| {
+        // No real executable path (e.g. some sandboxed/embedded launch
+        // context) — tier 4 is simply unavailable then, not a fatal
+        // error; `$PANOS_STDLIB` still works.
+    }
+    server.global_search_roots = global_search_roots.items;
 
     while (true) {
         // A transport-framing error (missing/invalid `Content-Length`, a

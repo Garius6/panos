@@ -203,18 +203,67 @@ test "DOM.на_клик_замыкание compiles and registers the fixed invo
 
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "dom_on_click_closure") != null);
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@invoke_closure_click") != null);
-    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_bytes_to_permanent") != null);
+    // Scalar-only captures (this fixture) go through Stage C's raw-copy
+    // path (`classifyCapture` → `.scalar`, no promotion CALL needed at
+    // all) — `@runtime_alloc_permanent` is still required (the box+env
+    // allocations themselves always need the permanent region,
+    // regardless of what's inside them).
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@runtime_alloc_permanent") != null);
     // `wasm_gc_arena.zig` must have wrapped the trampoline too (Task 45's
     // `module.dom_handler_names` addition) — the ORIGINAL trampoline
     // function survives renamed under the arena-wrapper convention.
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_@invoke_closure_click") != null);
 }
 
-// The scalar-only capture restriction (a `Строка` capture in a
-// `DOM.на_клик_замыкание` handler must be rejected, not silently
-// miscompiled) is deliberately NOT an automated test here — the
-// diagnostic fires via `unsupported()`'s own `std.debug.print`, which
-// corrupts `zig test`'s `--listen=-` protocol when triggered from code
-// under test (documented gotcha, see `aot_tree_shaking_test.zig`'s own
-// mixed-generic test). Verified manually via the CLI instead
+test "DOM.на_клик_замыкание capturing a Строка directly promotes it via @promote_to_permanent (Stage C)" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\функ старт() -> Пусто
+        \\пер текст: Строка = "привет"
+        \\DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\    DOM.установить_текст_строка("#результат", текст)
+        \\конец)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
+}
+
+test "DOM.на_клик_замыкание capturing a struct with a Строка field promotes the field too (Stage C)" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\тип Задача = структура
+        \\    id:    Число
+        \\    текст: Строка
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\пер задача: Задача = Задача(7.0, "купить хлеб")
+        \\DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\    DOM.установить_текст_строка("#результат", задача.текст)
+        \\конец)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@runtime_alloc_permanent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
+}
+
+// The remaining-unsupported-cases restriction (a `Массив`/`Процесс`
+// capture in a `DOM.на_клик_замыкание` handler must be rejected, not
+// silently miscompiled) is deliberately NOT an automated test here —
+// the diagnostic fires via `unsupported()`'s own `std.debug.print`,
+// which corrupts `zig test`'s `--listen=-` protocol when triggered from
+// code under test (documented gotcha, see `aot_tree_shaking_test.zig`'s
+// own mixed-generic test). Verified manually via the CLI instead
 // (`panos build --target=wasm`), see `project_panos_wasm_aot_closures`.

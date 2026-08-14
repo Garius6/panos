@@ -2518,20 +2518,48 @@ fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types
 // methods. The browser emitter transports every Panos `Строка` as an
 // opaque JS-runtime handle; click callbacks are still named, zero-argument
 // exports and cannot capture a Panos context yet.
-// `true` for a "flat scalar" capture (Число/Булево/Целое — copied by
-// raw 8-byte value, no pointer chasing needed) vs a "pointer-carrying"
-// capture (Строка/Массив/struct/`Процесс`/another closure — needs
-// Stage C's not-yet-built recursive promotion). Mirrors the same
-// `.nominal`/`.array`/`.process`/`.function` split `wasm_module.
-// wasmValTypeForStore` already encodes; `Строка` is handled specially
-// since it's a primitive builtin type with no `.get()` entry, not a
-// `.nominal`.
-fn isScalarCaptureType(checked: *const type_checker.CheckResult, type_id: types.TypeId) bool {
-    if (checked.types.eql(type_id, checked.types.builtins.string)) return false;
-    const entry = checked.types.get(type_id) orelse return true;
+// WASM AOT closures, Stage C — type-directed classification of a
+// captured value, decided entirely at COMPILE TIME from the capture's
+// own static type (no runtime type tag exists to drive real recursion
+// in emitted code — same reasoning `.new_aggregate`'s per-field
+// expansion in `wasm_objects.zig` already relies on).
+//   `.scalar`        — Число/Булево/Целое: raw 8-byte copy, no
+//                       pointer-chasing needed at all.
+//   `.string`        — Строка: promote via the existing
+//                       `wasm_heap.findOrBuildPromoteToPermanent`.
+//   `.struct_simple`  — a nominal struct whose OWN fields are ALL
+//                       `.scalar`/`.string` (one level only — a field
+//                       that's itself a struct/array is `.unsupported`
+//                       for now, a real deferred gap, not silently
+//                       wrong: nested promotion would need genuine
+//                       recursion through THIS SAME classification,
+//                       which the current one-level implementation in
+//                       `promoteSimpleStructToPermanent` doesn't do
+//                       yet).
+//   `.unsupported`    — Массив (needs a RUNTIME loop over a dynamic
+//                       element count — not a compile-time-unrolled
+//                       shape like a struct's fixed field list, real
+//                       deferred gap), `Процесс` (actors+closures
+//                       interaction unexplored), another closure
+//                       (`.function` — capturing a closure inside a
+//                       closure has its own env-chaining question, out
+//                       of scope), or a struct with a non-simple field.
+const CaptureKind = enum { scalar, string, struct_simple, unsupported };
+
+fn classifyCapture(checked: *const type_checker.CheckResult, type_id: types.TypeId) CaptureKind {
+    if (checked.types.eql(type_id, checked.types.builtins.string)) return .string;
+    const entry = checked.types.get(type_id) orelse return .scalar;
     return switch (entry.*) {
-        .nominal, .array, .process, .function => false,
-        else => true,
+        .nominal => |nominal| blk: {
+            const fields = checked.nominal_fields.get(nominal.symbol) orelse break :blk .unsupported;
+            for (fields) |field| {
+                const field_kind = classifyCapture(checked, field.typ);
+                if (field_kind != .scalar and field_kind != .string) break :blk .unsupported;
+            }
+            break :blk .struct_simple;
+        },
+        .array, .process, .function => .unsupported,
+        else => .scalar,
     };
 }
 
@@ -2560,19 +2588,78 @@ fn findOrBuildInvokeClosureClickTrampoline(allocator: std.mem.Allocator, module:
     return id;
 }
 
+// Promotes ONE already-loaded value (`old_value`, typed `value_type`)
+// into the permanent region, per `classifyCapture`'s classification —
+// the shared leaf operation both `promoteClosureBoxToPermanent` (env
+// slots) and `promoteSimpleStructToPermanent` (struct fields) reduce
+// to. `.scalar` is a no-op (the raw value IS already permanent-region-
+// safe — it carries no pointer at all). `.unsupported` never reaches
+// here — rejected earlier, before any lowering happens, by
+// `lowerDomClickClosure`'s own pre-check.
+fn promoteCaptureValue(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, value_type: types.TypeId, old_value: mir.ValueId) !mir.ValueId {
+    return switch (classifyCapture(ctx.checked, value_type)) {
+        .scalar => old_value,
+        .string => blk: {
+            const promote_id = try wasm_heap.findOrBuildPromoteToPermanent(ctx.allocator, ctx.builder.module, &ctx.checked.types, layout);
+            const promoted = try ctx.builder.newValue(layout.ptr_type);
+            try ctx.builder.emit(.{ .call = .{ .dst = promoted, .callee = promote_id, .args = try wasm_heap.dupeOne(ctx.builder.module, old_value) } });
+            break :blk promoted;
+        },
+        .struct_simple => try promoteSimpleStructToPermanent(ctx, layout, value_type, old_value),
+        .unsupported => unreachable,
+    };
+}
+
+// A "simple" struct (per `classifyCapture` — every field is
+// `.scalar`/`.string`, exactly one level, no further nesting):
+// allocate a same-field-count copy in the permanent region, promote or
+// raw-copy each field individually. Same 8-byte-slot `frame_load`/
+// `frame_store` layout `wasm_objects.zig` already established for
+// plain structs (no tag slot — that's a variant-only convention).
+fn promoteSimpleStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, struct_type: types.TypeId, old_struct_ptr: mir.ValueId) anyerror!mir.ValueId {
+    const module = ctx.builder.module;
+    const type_entry = ctx.checked.types.get(struct_type) orelse return unsupported("захват структуры неизвестного типа (Stage C)");
+    const nominal = switch (type_entry.*) {
+        .nominal => |value| value,
+        else => return unsupported("захват не-структуры как структуры (Stage C)"),
+    };
+    const fields = ctx.checked.nominal_fields.get(nominal.symbol) orelse return unsupported("захват generic-структуры (Stage C)");
+
+    const old_struct_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_struct", layout.ptr_type, old_struct_ptr);
+
+    const alloc_permanent_id = try wasm_heap.findOrBuildAllocPermanent(ctx.allocator, module, &ctx.checked.types, layout);
+    const struct_size = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, @intCast(fields.len * 8));
+    const new_struct = try ctx.builder.newValue(layout.ptr_type);
+    try ctx.builder.emit(.{ .call = .{ .dst = new_struct, .callee = alloc_permanent_id, .args = try wasm_heap.dupeOne(module, struct_size) } });
+    const new_struct_local = try wasm_heap.storeLocal(&ctx.builder, "@click_new_struct", layout.ptr_type, new_struct);
+
+    for (fields, 0..) |field, j| {
+        const old_struct_for_load = try wasm_heap.loadLocal(&ctx.builder, old_struct_local, layout.ptr_type);
+        const old_field_val = try ctx.builder.newValue(field.typ);
+        try ctx.builder.emit(.{ .frame_load = .{ .dst = old_field_val, .frame = old_struct_for_load, .slot = @intCast(j) } });
+
+        const promoted_field = try promoteCaptureValue(ctx, layout, field.typ, old_field_val);
+
+        const new_struct_for_store = try wasm_heap.loadLocal(&ctx.builder, new_struct_local, layout.ptr_type);
+        try ctx.builder.emit(.{ .frame_store = .{ .frame = new_struct_for_store, .slot = @intCast(j), .src = promoted_field } });
+    }
+
+    return try wasm_heap.loadLocal(&ctx.builder, new_struct_local, layout.ptr_type);
+}
+
 // Rebuilds a `.build_closure`-produced box (table_index + env_ptr,
 // currently in the ordinary RESETTABLE arena) directly in the
-// PERMANENT region — needed even though Stage B restricts captures to
-// SCALAR values: the captured VALUES being scalar avoids Stage C's
-// recursive-pointer-chasing problem, but the box+env ALLOCATIONS
-// THEMSELVES are still pointers that JS holds raw across a separate
-// later export call (the click) — same class of problem `на_клик_
-// контекст`'s context string already had, one level up the pointer
-// chain. `capture_count` is compile-time known (the lambda's own
-// `lambda_captures.len`) — the env has no length header to read, so
-// `wasm_heap.findOrBuildPromoteBytesToPermanent` takes the size as an
-// explicit argument instead.
-fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, box_value: mir.ValueId, capture_count: usize) !mir.ValueId {
+// PERMANENT region — needed even for SCALAR-only captures (Stage B):
+// the box+env ALLOCATIONS themselves are still pointers that JS holds
+// raw across a separate later export call (the click), regardless of
+// what's inside them. Stage C extends this from a flat byte copy (only
+// correct when every slot is scalar) to a per-slot, TYPE-DIRECTED copy
+// — a `Строка`/simple-struct slot gets its OWN pointed-to data promoted
+// too (`promoteCaptureValue`), not just its raw pointer bit-pattern
+// (which would otherwise dangle after the next arena reset — the exact
+// bug this whole function exists to avoid, one level up the pointer
+// chain from `на_клик_контекст`'s own context-string promotion).
+fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, box_value: mir.ValueId, captures: []const symbols.SymbolId) !mir.ValueId {
     const module = ctx.builder.module;
     const box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_box", layout.ptr_type, box_value);
 
@@ -2582,25 +2669,37 @@ fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayo
     const table_index_local = try wasm_heap.storeLocal(&ctx.builder, "@click_table_index", layout.idx_type, table_index);
 
     const promoted_env_local = env_blk: {
-        if (capture_count == 0) {
+        if (captures.len == 0) {
             const zero = try wasm_heap.addressConst(&ctx.builder, layout.ptr_type, 0);
             break :env_blk try wasm_heap.storeLocal(&ctx.builder, "@click_env", layout.ptr_type, zero);
         }
         const box_for_env = try wasm_heap.loadLocal(&ctx.builder, box_local, layout.ptr_type);
         const four = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 4);
         const env_addr = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .add, box_for_env, four);
-        const env_ptr = try ctx.builder.newValue(layout.ptr_type);
-        try ctx.builder.emit(.{ .mem_load = .{ .dst = env_ptr, .addr = env_addr } });
+        const old_env_ptr = try ctx.builder.newValue(layout.ptr_type);
+        try ctx.builder.emit(.{ .mem_load = .{ .dst = old_env_ptr, .addr = env_addr } });
+        const old_env_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_env", layout.ptr_type, old_env_ptr);
 
-        const promote_id = try wasm_heap.findOrBuildPromoteBytesToPermanent(ctx.allocator, module, &ctx.checked.types, layout);
-        const size_const = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, @intCast(capture_count * 8));
-        const arena = module.arena.allocator();
-        var promote_args: std.ArrayList(mir.ValueId) = .empty;
-        try promote_args.append(arena, env_ptr);
-        try promote_args.append(arena, size_const);
-        const promoted = try ctx.builder.newValue(layout.ptr_type);
-        try ctx.builder.emit(.{ .call = .{ .dst = promoted, .callee = promote_id, .args = try promote_args.toOwnedSlice(arena) } });
-        break :env_blk try wasm_heap.storeLocal(&ctx.builder, "@click_env", layout.ptr_type, promoted);
+        const alloc_permanent_id = try wasm_heap.findOrBuildAllocPermanent(ctx.allocator, module, &ctx.checked.types, layout);
+        const new_env_size = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, @intCast(captures.len * 8));
+        const new_env = try ctx.builder.newValue(layout.ptr_type);
+        try ctx.builder.emit(.{ .call = .{ .dst = new_env, .callee = alloc_permanent_id, .args = try wasm_heap.dupeOne(module, new_env_size) } });
+        const new_env_local = try wasm_heap.storeLocal(&ctx.builder, "@click_new_env", layout.ptr_type, new_env);
+
+        for (captures, 0..) |capture_symbol, i| {
+            const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
+
+            const old_env_for_load = try wasm_heap.loadLocal(&ctx.builder, old_env_local, layout.ptr_type);
+            const old_slot_val = try ctx.builder.newValue(capture_type);
+            try ctx.builder.emit(.{ .frame_load = .{ .dst = old_slot_val, .frame = old_env_for_load, .slot = @intCast(i) } });
+
+            const promoted_val = try promoteCaptureValue(ctx, layout, capture_type, old_slot_val);
+
+            const new_env_for_store = try wasm_heap.loadLocal(&ctx.builder, new_env_local, layout.ptr_type);
+            try ctx.builder.emit(.{ .frame_store = .{ .frame = new_env_for_store, .slot = @intCast(i), .src = promoted_val } });
+        }
+
+        break :env_blk new_env_local;
     };
 
     const alloc_permanent_id = try wasm_heap.findOrBuildAllocPermanent(ctx.allocator, module, &ctx.checked.types, layout);
@@ -2638,8 +2737,8 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     const captures = ctx.resolution.lambda_captures.get(handler_expr) orelse &.{};
     for (captures) |capture_symbol| {
         const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
-        if (!isScalarCaptureType(ctx.checked, capture_type)) {
-            return unsupported("DOM.на_клик_замыкание(): захват значений с внутренними указателями (Строка/Массив/структура) пока не поддержан (Stage B — см. Stage C, project_panos_wasm_aot_closures)");
+        if (classifyCapture(ctx.checked, capture_type) == .unsupported) {
+            return unsupported("DOM.на_клик_замыкание(): захват массива/процесса/замыкания/структуры со вложенным указателем пока не поддержан (Stage C ограничение, project_panos_wasm_aot_closures)");
         }
     }
 
@@ -2654,7 +2753,7 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
         .bool_type = ctx.checked.types.builtins.boolean,
     };
     _ = try findOrBuildInvokeClosureClickTrampoline(ctx.allocator, ctx.builder.module, &ctx.checked.types, layout);
-    const promoted_box = try promoteClosureBoxToPermanent(ctx, layout, handler_outcome.value, captures.len);
+    const promoted_box = try promoteClosureBoxToPermanent(ctx, layout, handler_outcome.value, captures);
 
     const arena = ctx.builder.module.arena.allocator();
     var args: std.ArrayList(mir.ValueId) = .empty;

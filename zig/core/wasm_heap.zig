@@ -219,6 +219,181 @@ fn buildAlloc(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     return id;
 }
 
+pub const permanent_alloc_function_name = "@runtime_alloc_permanent";
+
+// Global 1: the permanent-region bump pointer (mutable, starts at
+// `actor_heap_base`, per `wasm_emit.zig`'s memory layout). Global 2: an
+// IMMUTABLE ceiling constant — the fixed boundary between the permanent
+// region and the arena (`global 0`) — `wasm_emit.zig` computes and
+// writes its real value at final module assembly, AFTER this function
+// has already been built as MIR; referencing it by global INDEX here
+// (rather than needing the actual numeric value at MIR-construction
+// time) is what makes that ordering work, the same way `buildAlloc`
+// above only ever needs to know global 0's INDEX, never its value.
+pub const permanent_heap_global_index: u32 = 1;
+pub const permanent_ceiling_global_index: u32 = 2;
+
+// Fixed budget for the permanent region — one WASM page. Generous for
+// the actual use case (a handful of small DOM-handler context-id
+// strings), a documented Phase 1 limitation otherwise (see
+// `buildAllocPermanent`'s own doc comment) — consumed by
+// `wasm_emit.zig` to size the reserved gap in the module's memory
+// layout.
+pub const permanent_reserved_bytes: u32 = 65536;
+
+// Phase 1 GC (arena reset at every JS-invoked entry-point call,
+// `wasm_gc_arena.zig`) needs SOMETHING to survive the reset — a DOM
+// handler's context argument (`DOM.на_клик_контекст`/`.после_кадра`),
+// which JS captures RAW across two SEPARATE future export calls (see
+// `project_panos_elm_architecture_dom_storage_design`/this session's
+// research — confirmed live in `demo/todo-app/frontend/main.pns`'s
+// `обработать_переключить`). An unconditional arena reset would free
+// that string out from under JS on the very next click. This second,
+// non-resettable bump region is where such values get PROMOTED (copied)
+// at the exact `на_клик_контекст`/`после_кадра` lowering site
+// (`mir_lowering.zig`) — everything else keeps going through the
+// ordinary arena (`buildAlloc`/global 0).
+//
+// Deliberately NOT growable via `memory.grow` like the arena — fixed
+// budget (`wasm_emit.zig`'s reserved gap), trapping with a clear
+// diagnostic if exceeded. A real per-object collector (Phase 2, see
+// `project_panos_elm_architecture_dom_storage_design`) would replace
+// this workaround with a genuine GC root instead of a capacity limit;
+// Phase 1 accepts the limit as documented scope, not a silent failure.
+fn buildAllocPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, permanent_alloc_function_name, dummy_symbol, layout.ptr_type, dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const size_local = try builder.newLocal(dummy_symbol, "size", layout.idx_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{size_local});
+    builder.currentFunction().type_store = type_store;
+
+    const size = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .load_local = .{ .dst = size, .local = size_local } });
+    const ptr = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .global_get = .{ .dst = ptr, .global = permanent_heap_global_index } });
+    const ptr_local = try storeLocal(&builder, "ptr", layout.ptr_type, ptr);
+    const ptr_for_add = try loadLocal(&builder, ptr_local, layout.ptr_type);
+    const new_ptr = try binOp(&builder, layout.idx_type, .add, ptr_for_add, size);
+    const new_ptr_local = try storeLocal(&builder, "new_ptr", layout.idx_type, new_ptr);
+
+    // Operand emission order matters for the stack machine, not
+    // declared `lhs`/`rhs` — see `buildAlloc`'s own comment on this
+    // exact class of bug (found and fixed there first). `new_ptr`
+    // loaded first, `ceiling` second, so `.greater`'s `lhs`/`rhs`
+    // actually lines up with the emitted stack order.
+    const new_ptr_for_cmp = try loadLocal(&builder, new_ptr_local, layout.idx_type);
+    const ceiling = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .global_get = .{ .dst = ceiling, .global = permanent_ceiling_global_index } });
+    const overflow = try cmpOp(&builder, layout.bool_type, .greater, new_ptr_for_cmp, ceiling);
+
+    const overflow_block = try builder.newBlock();
+    const ok_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = overflow, .then_block = overflow_block, .else_block = ok_block } });
+
+    builder.setCurrentBlock(overflow_block);
+    builder.terminate(.{ .unreachable_term = .{ .reason = "постоянная область WASM-кучи исчерпана (Phase 1 GC, фиксированный бюджет)" } });
+
+    builder.setCurrentBlock(ok_block);
+    const new_ptr_for_set = try loadLocal(&builder, new_ptr_local, layout.idx_type);
+    try builder.emit(.{ .global_set = .{ .global = permanent_heap_global_index, .src = new_ptr_for_set } });
+    const ptr_for_return = try loadLocal(&builder, ptr_local, layout.ptr_type);
+    builder.terminate(.{ .return_value = .{ .value = ptr_for_return } });
+    return id;
+}
+
+pub fn findOrBuildAllocPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
+    if (findFunctionByName(module, permanent_alloc_function_name)) |id| return id;
+    return buildAllocPermanent(allocator, module, type_store, layout);
+}
+
+// Byte-for-byte copy loop, `count_local` bytes from `src_base_local` to
+// `dst_base_local` — duplicated from `wasm_strings.zig`'s own (private)
+// `emitByteCopyLoop` rather than importing it: `wasm_strings.zig`
+// already imports THIS file (`wasm_heap.zig`) as the shared lower-level
+// substrate, so the reverse import would be circular. Kept in exact
+// lockstep with that version's shape (same instruction sequence,
+// same "byte reloaded before dst_addr is computed" stack-order note).
+fn emitByteCopyLoop(builder: *mir_builder.Builder, layout: PtrLayout, src_base_local: mir.LocalId, dst_base_local: mir.LocalId, count_local: mir.LocalId) !void {
+    const i_local = try builder.newLocal(dummy_symbol, "@i", layout.idx_type);
+    const zero = try addressConst(builder, layout.idx_type, 0);
+    try builder.emit(.{ .store_local = .{ .local = i_local, .src = zero } });
+
+    const loop_header = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_header);
+    const i_for_cmp = try loadLocal(builder, i_local, layout.idx_type);
+    const count_for_cmp = try loadLocal(builder, count_local, layout.idx_type);
+    const keep_going = try cmpOp(builder, layout.bool_type, .less, i_for_cmp, count_for_cmp);
+    const loop_body = try builder.newBlock();
+    const loop_exit = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = keep_going, .then_block = loop_body, .else_block = loop_exit } });
+
+    builder.setCurrentBlock(loop_body);
+    const i_for_src = try loadLocal(builder, i_local, layout.idx_type);
+    const src_base_r = try loadLocal(builder, src_base_local, layout.idx_type);
+    const src_addr = try binOp(builder, layout.idx_type, .add, src_base_r, i_for_src);
+    const byte = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load8 = .{ .dst = byte, .addr = src_addr } });
+    const byte_local = try storeLocal(builder, "@byte", layout.idx_type, byte);
+    const byte_reload = try loadLocal(builder, byte_local, layout.idx_type);
+
+    const i_for_dst = try loadLocal(builder, i_local, layout.idx_type);
+    const dst_base_r = try loadLocal(builder, dst_base_local, layout.idx_type);
+    const dst_addr = try binOp(builder, layout.idx_type, .add, dst_base_r, i_for_dst);
+    try builder.emit(.{ .mem_store8 = .{ .addr = dst_addr, .src = byte_reload } });
+
+    const i_next_src = try loadLocal(builder, i_local, layout.idx_type);
+    const one = try addressConst(builder, layout.idx_type, 1);
+    const i_next = try binOp(builder, layout.idx_type, .add, i_next_src, one);
+    try builder.emit(.{ .store_local = .{ .local = i_local, .src = i_next } });
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_exit);
+}
+
+pub const promote_to_permanent_function_name = "@promote_to_permanent";
+
+// `@promote_to_permanent(src: Строка) -> Строка`: copies a whole
+// length-prefixed string (`[u32 byte_length][bytes...]` — see
+// `wasm_strings.zig`'s own doc comment for this layout) from wherever
+// it currently lives (arena, or even the read-only data section for a
+// literal) into the permanent region, byte-for-byte including its
+// length header — the copy doesn't need to interpret the length at
+// all beyond using it as the byte count, since the header is just the
+// first 4 bytes of the very same buffer being copied.
+fn buildPromoteToPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, promote_to_permanent_function_name, dummy_symbol, layout.ptr_type, dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const src_local = try builder.newLocal(dummy_symbol, "src", layout.ptr_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{src_local});
+    builder.currentFunction().type_store = type_store;
+
+    const src_for_len = try loadLocal(&builder, src_local, layout.ptr_type);
+    const len = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load = .{ .dst = len, .addr = src_for_len } });
+    const four = try addressConst(&builder, layout.idx_type, 4);
+    const total_size = try binOp(&builder, layout.idx_type, .add, len, four);
+    const total_size_local = try storeLocal(&builder, "total_size", layout.idx_type, total_size);
+
+    const alloc_id = try findOrBuildAllocPermanent(allocator, module, type_store, layout);
+    const size_for_call = try loadLocal(&builder, total_size_local, layout.idx_type);
+    const dst = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = dst, .callee = alloc_id, .args = try dupeOne(module, size_for_call) } });
+    const dst_local = try storeLocal(&builder, "dst", layout.ptr_type, dst);
+
+    try emitByteCopyLoop(&builder, layout, src_local, dst_local, total_size_local);
+
+    const dst_for_return = try loadLocal(&builder, dst_local, layout.ptr_type);
+    builder.terminate(.{ .return_value = .{ .value = dst_for_return } });
+    return id;
+}
+
+pub fn findOrBuildPromoteToPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
+    if (findFunctionByName(module, promote_to_permanent_function_name)) |id| return id;
+    return buildPromoteToPermanent(allocator, module, type_store, layout);
+}
+
 // Real bug found while extracting this from `wasm_actors.zig`: the
 // original had a process-global `var g_alloc_id: ?mir.FunctionId = null`
 // cache — stale across separate compilations within the same process

@@ -596,6 +596,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_aot_tree_shaking_tests = b.addRunArtifact(aot_tree_shaking_tests);
+    const aot_gc_arena_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/wasm/aot_gc_arena_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    const run_aot_gc_arena_tests = b.addRunArtifact(aot_gc_arena_tests);
 
     // `zig build test` — the everyday dev-loop step: pure per-file unit
     // tests only. Real gap found auditing this project's own test suite
@@ -678,6 +687,7 @@ pub fn build(b: *std.Build) void {
     aot_step.dependOn(&run_aot_interfaces_tests.step);
     aot_step.dependOn(&run_aot_generic_bound_tests.step);
     aot_step.dependOn(&run_aot_tree_shaking_tests.step);
+    aot_step.dependOn(&run_aot_gc_arena_tests.step);
 
     // `zig build bench` — the `runtime`-tier manifest cases, which embed
     // `tests/conformance/benchmarks/*.ps` (`фиб(30)` recursion, a

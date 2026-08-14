@@ -8,6 +8,7 @@ const symbols = @import("symbols.zig");
 const type_checker = @import("type_checker.zig");
 const types = @import("types.zig");
 const wasm_module = @import("wasm_module.zig");
+const wasm_heap = @import("wasm_heap.zig");
 
 // Not tied to any real declared variable — same "dummy" convention
 // `wasm_heap.zig` already established for compiler-synthesized locals.
@@ -596,13 +597,14 @@ fn addDomHandlerRoots(
     compiled: anytype,
     set: *ReachableSet,
     worklist: *std.ArrayList(ReachKey),
+    handler_names: *std.ArrayList([]const u8),
 ) !void {
     for (graph.order.items) |module_index| {
         const resolution = if (compiled.modules[module_index].resolution) |*value| value else continue;
         const checked = if (compiled.modules[module_index].checked) |*value| value else continue;
         const tree = &graph.modules.items[module_index].tree;
         const program = tree.program orelse continue;
-        try scanDomHandlerRootsInDecls(allocator, graph, compiled, tree, resolution, checked, set, worklist, module_index, program.declarations);
+        try scanDomHandlerRootsInDecls(allocator, graph, compiled, tree, resolution, checked, set, worklist, handler_names, module_index, program.declarations);
     }
 }
 
@@ -615,6 +617,7 @@ fn scanDomHandlerRootsInDecls(
     checked: *const type_checker.CheckResult,
     set: *ReachableSet,
     worklist: *std.ArrayList(ReachKey),
+    handler_names: *std.ArrayList([]const u8),
     module_index: usize,
     declarations: []const ast.DeclId,
 ) !void {
@@ -622,11 +625,11 @@ fn scanDomHandlerRootsInDecls(
         const body: []const ast.StmtId = switch (tree.decl(decl_id).*) {
             .function => |function| function.body,
             .impl => |implementation| blk: {
-                for (implementation.methods) |method_decl_id| try scanDomHandlerRootsInDecls(allocator, graph, compiled, tree, resolution, checked, set, worklist, module_index, &.{method_decl_id});
+                for (implementation.methods) |method_decl_id| try scanDomHandlerRootsInDecls(allocator, graph, compiled, tree, resolution, checked, set, worklist, handler_names, module_index, &.{method_decl_id});
                 break :blk &.{};
             },
             .interface_decl => |interface| blk: {
-                for (interface.default_methods) |method_decl_id| try scanDomHandlerRootsInDecls(allocator, graph, compiled, tree, resolution, checked, set, worklist, module_index, &.{method_decl_id});
+                for (interface.default_methods) |method_decl_id| try scanDomHandlerRootsInDecls(allocator, graph, compiled, tree, resolution, checked, set, worklist, handler_names, module_index, &.{method_decl_id});
                 break :blk &.{};
             },
             else => &.{},
@@ -637,7 +640,7 @@ fn scanDomHandlerRootsInDecls(
         // ALREADY known to run, not resurrecting dead code via its own
         // handler-registration calls.
         if (symbol == null or !set.contains(.{ .module_index = module_index, .symbol = symbol.? })) continue;
-        try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, body);
+        try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, body);
     }
 }
 
@@ -648,16 +651,17 @@ fn scanDomHandlerRootsInStmts(
     tree: *const ast.Ast,
     set: *ReachableSet,
     worklist: *std.ArrayList(ReachKey),
+    handler_names: *std.ArrayList([]const u8),
     module_index: usize,
     statements: []const ast.StmtId,
 ) !void {
     for (statements) |statement| {
         switch (tree.stmt(statement).*) {
-            .return_stmt => |v| if (v.value) |value| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, value),
-            .let => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.value),
-            .expr => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.value),
-            .for_in => |v| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.body),
-            .for_range => |v| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.body),
+            .return_stmt => |v| if (v.value) |value| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, value),
+            .let => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.value),
+            .expr => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.value),
+            .for_in => |v| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.body),
+            .for_range => |v| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.body),
             .continue_stmt, .break_stmt, .error_node => {},
         }
     }
@@ -670,6 +674,7 @@ fn scanDomHandlerRootsInExpr(
     tree: *const ast.Ast,
     set: *ReachableSet,
     worklist: *std.ArrayList(ReachKey),
+    handler_names: *std.ArrayList([]const u8),
     module_index: usize,
     expression: ast.ExprId,
 ) anyerror!void {
@@ -684,45 +689,46 @@ fn scanDomHandlerRootsInExpr(
                         if (tree.expr(argument).* != .string) continue;
                         const handler_name = tree.expr(argument).string.value;
                         try addRootByName(allocator, graph, compiled, set, worklist, handler_name);
+                        try handler_names.append(allocator, handler_name);
                     }
                 }
             }
-            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, call.callee);
-            for (call.arguments) |argument| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, argument);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, call.callee);
+            for (call.arguments) |argument| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, argument);
         },
-        .unary => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.operand),
-        .cast => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.operand),
+        .unary => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.operand),
+        .cast => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.operand),
         .binary => |v| {
-            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.left);
-            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.right);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.left);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.right);
         },
-        .spawn => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.call),
-        .select_wait => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.source),
-        .property => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.object),
+        .spawn => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.call),
+        .select_wait => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.source),
+        .property => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.object),
         .if_expr => |v| {
-            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.condition);
-            try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.then_branch);
-            try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.else_branch);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.condition);
+            try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.then_branch);
+            try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.else_branch);
         },
         .while_expr => |v| {
-            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.condition);
-            try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.body);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.condition);
+            try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.body);
         },
-        .tuple => |v| for (v.elements) |element| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, element),
-        .lambda => |v| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.body),
-        .array => |v| for (v.elements) |element| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, element),
+        .tuple => |v| for (v.elements) |element| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, element),
+        .lambda => |v| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.body),
+        .array => |v| for (v.elements) |element| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, element),
         .map => |v| for (v.entries) |entry| {
-            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, entry.key);
-            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, entry.value);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, entry.key);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, entry.value);
         },
         .index => |v| {
-            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.object);
-            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.index);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.object);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.index);
         },
-        .try_expr => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.value),
+        .try_expr => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.value),
         .match_expr => |v| {
-            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.subject);
-            for (v.arms) |arm| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, arm.body);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.subject);
+            for (v.arms) |arm| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, arm.body);
         },
         .number, .boolean, .string, .ident, .error_node => {},
     }
@@ -763,10 +769,18 @@ pub const ReachabilityResult = struct {
     // reports these as a clear diagnostic instead of silently
     // miscompiling one of the two instantiations.
     conflicts: std.ArrayList(ReachKey),
+    // Every function name found registered as a `на_клик`/
+    // `.после_кадра` handler during `addDomHandlerRoots` — see
+    // `mir.Module.dom_handler_names`'s own doc comment for why
+    // `wasm_gc_arena.zig` needs this. Borrowed slices into AST memory
+    // (`graph`/`compiled`'s lifetime) — `lowerGraph` dupes them into
+    // `mir.Module`'s own arena before this result is torn down.
+    dom_handler_names: std.ArrayList([]const u8),
 
     pub fn deinit(self: *ReachabilityResult, allocator: std.mem.Allocator) void {
         self.reachable.deinit();
         self.conflicts.deinit(allocator);
+        self.dom_handler_names.deinit(allocator);
     }
 };
 
@@ -809,11 +823,11 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
     // separately, no explicit import edges pointing AT it — actually
     // sorts FIRST, not last; confirmed by `module_loader.zig`'s own test
     // `expectEqual(prelude_index, graph.order.items[0])`).
-    if (graph.modules.items.len == 0) return .{ .reachable = set, .conflicts = .empty };
+    if (graph.modules.items.len == 0) return .{ .reachable = set, .conflicts = .empty, .dom_handler_names = .empty };
     const entry_module_index: usize = 0;
-    const entry_resolution = if (compiled.modules[entry_module_index].resolution) |*value| value else return .{ .reachable = set, .conflicts = .empty };
+    const entry_resolution = if (compiled.modules[entry_module_index].resolution) |*value| value else return .{ .reachable = set, .conflicts = .empty, .dom_handler_names = .empty };
     const entry_tree = &graph.modules.items[entry_module_index].tree;
-    const entry_program = entry_tree.program orelse return .{ .reachable = set, .conflicts = .empty };
+    const entry_program = entry_tree.program orelse return .{ .reachable = set, .conflicts = .empty, .dom_handler_names = .empty };
     for (entry_program.declarations) |decl_id| {
         const function = switch (entry_tree.decl(decl_id).*) {
             .function => |value| value,
@@ -833,7 +847,9 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
         try walkStmts(allocator, compiled, tree, resolution, checked, &set, &worklist, &mixed, item.module_index, body);
     }
 
-    try addDomHandlerRoots(allocator, graph, compiled, &set, &worklist);
+    var dom_handler_names: std.ArrayList([]const u8) = .empty;
+    errdefer dom_handler_names.deinit(allocator);
+    try addDomHandlerRoots(allocator, graph, compiled, &set, &worklist, &dom_handler_names);
     while (worklist.pop()) |item| {
         const resolution = if (compiled.modules[item.module_index].resolution) |*value| value else continue;
         const checked = if (compiled.modules[item.module_index].checked) |*value| value else continue;
@@ -849,7 +865,7 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
         if (entry.value_ptr.count() > 1) try conflicts.append(allocator, entry.key_ptr.*);
     }
 
-    return .{ .reachable = set, .conflicts = conflicts };
+    return .{ .reachable = set, .conflicts = conflicts, .dom_handler_names = dom_handler_names };
 }
 
 // Link the already resolved/type-checked module graph into one AOT MIR
@@ -942,6 +958,23 @@ pub fn lowerGraph(
         }
         try lowerMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index]);
     }
+
+    // `reachability.dom_handler_names` holds borrowed slices into AST
+    // memory (`graph`'s lifetime) — dupe into `module.arena` (dedup by
+    // the same name possibly registered from more than one call site)
+    // so `wasm_gc_arena.zig` can rely on them staying valid for as long
+    // as the module itself does, without needing `graph`/`compiled`
+    // still around.
+    var seen_handler_names: std.StringHashMap(void) = .init(allocator);
+    defer seen_handler_names.deinit();
+    var handler_names_owned: std.ArrayList([]const u8) = .empty;
+    const module_arena = module.arena.allocator();
+    for (reachability.dom_handler_names.items) |name| {
+        if (seen_handler_names.contains(name)) continue;
+        try seen_handler_names.put(name, {});
+        try handler_names_owned.append(module_arena, try module_arena.dupe(u8, name));
+    }
+    module.dom_handler_names = try handler_names_owned.toOwnedSlice(module_arena);
 
     return module;
 }
@@ -2366,7 +2399,42 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
     else
         return unsupported("DOM.свойство вызов (неподдерживаемый DOM-метод)");
 
-    const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+    var args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+
+    // `на_клик_контекст`/`после_кадра`'s context argument is captured
+    // RAW by the JS loader (`aot-dom-loader.js`'s `dom_on_click_context`/
+    // `dom_after_frame`) and handed back UNCHANGED to a handler invoked
+    // in a wholly SEPARATE, later export call — see
+    // `project_panos_elm_architecture_dom_storage_design`/
+    // `project_panos_wasm_aot_memory_growth_fix` for the full research.
+    // `wasm_gc_arena.zig`'s per-call arena reset (Phase 1 GC) would free
+    // this value out from under JS on the very next event if it stayed
+    // in the ordinary arena. Promote (copy) it into the non-resettable
+    // permanent region here, at the exact point it's about to be handed
+    // to the host import — everything else keeps going through the
+    // ordinary arena, no call-graph analysis needed (see
+    // `wasm_heap.findOrBuildPromoteToPermanent`'s own doc comment).
+    const context_arg_index: ?usize = if (std.mem.eql(u8, name, "DOM::на_клик_контекст"))
+        2
+    else if (std.mem.eql(u8, name, "DOM::после_кадра"))
+        1
+    else
+        null;
+    if (context_arg_index) |idx| {
+        const layout = wasm_heap.PtrLayout{
+            .ptr_type = ctx.checked.types.builtins.string,
+            .idx_type = ctx.checked.types.builtins.boolean,
+            .bool_type = ctx.checked.types.builtins.boolean,
+        };
+        const promote_id = try wasm_heap.findOrBuildPromoteToPermanent(ctx.allocator, ctx.builder.module, &ctx.checked.types, layout);
+        const promoted = try ctx.builder.newValue(layout.ptr_type);
+        try ctx.builder.emit(.{ .call = .{ .dst = promoted, .callee = promote_id, .args = try wasm_heap.dupeOne(ctx.builder.module, args[idx]) } });
+        const arena = ctx.builder.module.arena.allocator();
+        const new_args = try arena.dupe(mir.ValueId, args);
+        new_args[idx] = promoted;
+        args = new_args;
+    }
+
     const is_void = ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);
     if (is_void) {
         try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = name, .args = args } });

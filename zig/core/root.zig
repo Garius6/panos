@@ -23,6 +23,7 @@ pub const wasm_objects = @import("wasm_objects.zig");
 pub const wasm_strings = @import("wasm_strings.zig");
 pub const wasm_interfaces = @import("wasm_interfaces.zig");
 pub const wasm_heap = @import("wasm_heap.zig");
+pub const wasm_gc_arena = @import("wasm_gc_arena.zig");
 pub const module_loader = @import("module_loader.zig");
 pub const module_linker = @import("module_linker.zig");
 pub const module_compiler = @import("module_compiler.zig");

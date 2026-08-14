@@ -334,6 +334,13 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         try stderr.flush();
         std.process.exit(1);
     };
+    // Phase 1 GC (per-call arena reset) — last, after every other pass
+    // has finished deciding the module's final function set/names.
+    panos_core.wasm_gc_arena.expand(init.gpa, &module, &entry_checked.types) catch |err| {
+        try stderr.print("panos build: GC-обёртка: {t}\n", .{err});
+        try stderr.flush();
+        std.process.exit(1);
+    };
 
     const wasm_bytes = panos_core.wasm_emit.emitModule(init.gpa, entry_checked, &module, iface_result.table) catch |err| {
         try stderr.print("panos build: не удалось эмитировать WASM для {s}: {t}\n", .{ input, err });

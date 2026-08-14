@@ -7,6 +7,7 @@ const type_checker = @import("type_checker.zig");
 const types = @import("types.zig");
 const wasm_module = @import("wasm_module.zig");
 const wasm_stackify = @import("wasm_stackify.zig");
+const wasm_heap = @import("wasm_heap.zig");
 
 // Ported from `core/wasm_emit.odin` (~1922 lines there) — scoped to
 // EXACTLY what `mir_lowering.zig` can produce (see that file's own scope
@@ -1579,6 +1580,21 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         try wasm_module.writeUleb128(&function_section, allocator, builtin_count + i);
     }
 
+    // `wasm_gc_arena.zig`'s per-call arena-reset (Phase 1 GC — see
+    // `project_panos_elm_architecture_dom_storage_design`/
+    // `project_panos_wasm_aot_memory_growth_fix`) needs a SECOND,
+    // non-resettable bump region for values that must survive across
+    // separate JS-invoked export calls (DOM handler context pointers,
+    // promoted at their `mir_lowering.zig` lowering site via
+    // `wasm_heap.findOrBuildAllocPermanent`) — only reserved when the
+    // module actually built that function (`uses_permanent_heap`),
+    // sitting in a fixed gap right after the string data, with the
+    // ordinary bump arena (`global 0`) starting after IT instead of
+    // directly after the string data as before.
+    const uses_permanent_heap = wasm_heap.findFunctionByName(module, wasm_heap.permanent_alloc_function_name) != null;
+    const permanent_reserved_bytes: u32 = if (uses_permanent_heap) wasm_heap.permanent_reserved_bytes else 0;
+    const arena_base: u32 = actor_heap_base + permanent_reserved_bytes;
+
     // Linear memory holds only the flat blob of literal strings. Dynamic
     // strings are host handles; this deliberately avoids a WASM GC/heap in
     // the first browser runtime ABI.
@@ -1587,7 +1603,7 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     var data_section: std.ArrayList(u8) = .empty;
     defer data_section.deinit(allocator);
     if (needs_memory) {
-        const total_bytes: u32 = actor_heap_base + (if (has_actors) actor_heap_bytes else 0);
+        const total_bytes: u32 = arena_base + (if (has_actors) actor_heap_bytes else 0);
         const pages: u32 = (total_bytes + 65535) / 65536;
         try wasm_module.writeUleb128(&memory_section, allocator, 1); // 1 memory
         try memory_section.append(allocator, 0x00); // limits: min only, no max
@@ -1604,18 +1620,41 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         }
     }
 
-    // Single mutable i32 global: the bump-allocator's next-free pointer
-    // (`actor_heap_global_index`), initialized past the string blob.
-    // Absent entirely for any module without actor instructions.
+    // Global 0: the arena bump pointer (`actor_heap_global_index`),
+    // initialized past the permanent-region gap (if any). Absent
+    // entirely for any module that never touches the heap at all.
+    // Globals 1/2 (permanent bump pointer + its immutable ceiling) are
+    // ONLY present when `uses_permanent_heap` — most modules (no DOM
+    // handler context args) never need them.
     var global_section: std.ArrayList(u8) = .empty;
     defer global_section.deinit(allocator);
     if (has_actors) {
-        try wasm_module.writeUleb128(&global_section, allocator, 1); // 1 global
+        try wasm_module.writeUleb128(&global_section, allocator, @as(usize, if (uses_permanent_heap) 3 else 1));
         try global_section.append(allocator, wasm_module.wasm_i32);
         try global_section.append(allocator, 0x01); // mutable
         try global_section.append(allocator, 0x41); // i32.const
-        try wasm_module.writeSleb128(&global_section, allocator, @intCast(actor_heap_base));
+        try wasm_module.writeSleb128(&global_section, allocator, @intCast(arena_base));
         try global_section.append(allocator, 0x0B); // end
+        if (uses_permanent_heap) {
+            // Global 1: permanent bump pointer, mutable, starts right
+            // after the string data (`actor_heap_base`).
+            try global_section.append(allocator, wasm_module.wasm_i32);
+            try global_section.append(allocator, 0x01); // mutable
+            try global_section.append(allocator, 0x41); // i32.const
+            try wasm_module.writeSleb128(&global_section, allocator, @intCast(actor_heap_base));
+            try global_section.append(allocator, 0x0B); // end
+            // Global 2: the permanent region's ceiling — IMMUTABLE,
+            // same value as global 0's own initial value (`arena_base`).
+            // `buildAllocPermanent` (`wasm_heap.zig`) only ever needs
+            // this global's INDEX at MIR-construction time, not the
+            // actual number — the real value is only known here, after
+            // `strings.data.len` has been finalized.
+            try global_section.append(allocator, wasm_module.wasm_i32);
+            try global_section.append(allocator, 0x00); // immutable
+            try global_section.append(allocator, 0x41); // i32.const
+            try wasm_module.writeSleb128(&global_section, allocator, @intCast(arena_base));
+            try global_section.append(allocator, 0x0B); // end
+        }
     }
 
     var export_section: std.ArrayList(u8) = .empty;

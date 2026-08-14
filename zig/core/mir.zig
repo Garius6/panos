@@ -327,6 +327,15 @@ pub const Module = struct {
     // whole pass, free it all at once" shape `compiler.zig`'s
     // `CompileResult.arena` already uses for the bytecode side.
     arena: std.heap.ArenaAllocator,
+    // Every top-level function name registered as a `DOM.на_клик`/
+    // `.на_клик_контекст`/`.после_кадра` handler (by string-literal
+    // argument), collected once during `mir_lowering.zig`'s tree-shaking
+    // reachability walk (`addDomHandlerRoots`) — reused by
+    // `wasm_gc_arena.zig` to know exactly which functions are genuine
+    // JS-invoked entry points (alongside `старт`) that need a bump-
+    // pointer checkpoint/restore wrapper. Allocated in `arena` above,
+    // so no separate lifetime to manage.
+    dom_handler_names: [][]const u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator) Module {
         return .{

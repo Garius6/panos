@@ -89,8 +89,8 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     // returned null and `buildAllocInto`'s `.?` unwrap panicked.
     _ = try wasm_heap.findOrBuildAlloc(allocator, module, type_store, layout);
 
-    var ctx = ExpandCtx{ .layout = layout, .type_store = type_store, .array_runtime = null };
-    if (usesArrays(module)) ctx.array_runtime = try buildArrayRuntime(allocator, module, type_store, layout);
+    var array_runtime: ?ArrayRuntime = null;
+    if (usesArrays(module)) array_runtime = try buildArrayRuntime(allocator, module, type_store, layout);
 
     // Snapshot the function id LIST before mutating — `buildArrayRuntime`
     // above already appended new functions to `module.functions`; those
@@ -102,11 +102,36 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     var index: usize = 0;
     while (index < module.functions.items.len) : (index += 1) {
         const function_id: mir.FunctionId = @enumFromInt(index);
+        // Each function may belong to a DIFFERENT source module, hence a
+        // DIFFERENT `types.TypeStore` instance (`TypeId.owner` is
+        // deliberately store-specific — see `types.zig`'s own "makes
+        // accidental cross-store use fail" doc comment). New locals
+        // created below (`dst_local` etc.) must be typed against THIS
+        // function's own store, not the caller-supplied top-level
+        // `type_store` (only the ENTRY module's) — same cross-module bug
+        // already found and fixed in `wasm_interfaces.zig`'s own
+        // per-function derivation, found there while getting a prelude
+        // default method (`Итерируемое::отобразить`, non-entry module)
+        // to construct a struct for the first time ever — a silently
+        // mistyped local (declared f64, holding a real i32 alloc
+        // pointer) that only `wasmtime`'s own validator ever caught.
+        // `array_runtime`'s OWN functions stay on the global entry store
+        // — they're compiler-synthesized helpers, self-consistent
+        // internally, and every CALLER already types their own `dst`
+        // independently (same reasoning already established for
+        // `@runtime_alloc`).
+        const function_store = module.functions.items[index].type_store orelse type_store;
+        const function_layout = wasm_heap.PtrLayout{
+            .ptr_type = function_store.builtins.string,
+            .idx_type = function_store.builtins.boolean,
+            .bool_type = function_store.builtins.boolean,
+        };
+        const function_ctx = ExpandCtx{ .layout = function_layout, .type_store = function_store, .array_runtime = array_runtime };
         const block_count = module.functions.items[index].blocks.items.len;
         var block_index: usize = 0;
         while (block_index < block_count) : (block_index += 1) {
             var builder = mir_builder.Builder{ .module = module, .allocator = allocator, .function_id = function_id };
-            try expandBlock(&builder, allocator, @enumFromInt(block_index), ctx);
+            try expandBlock(&builder, allocator, @enumFromInt(block_index), function_ctx);
         }
     }
 }

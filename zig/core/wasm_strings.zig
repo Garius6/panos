@@ -116,8 +116,6 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
         .from_number = from_number,
         .to_number = to_number,
     };
-    const ctx = ExpandCtx{ .layout = layout, .type_store = type_store, .runtime = runtime };
-
     // Same "re-scan module.functions.items fresh each time" reasoning as
     // wasm_objects.zig: buildConcat/buildEqual above already appended
     // new functions, but neither's OWN body contains string ops itself
@@ -125,11 +123,26 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     var index: usize = 0;
     while (index < module.functions.items.len) : (index += 1) {
         const function_id: mir.FunctionId = @enumFromInt(index);
+        // Per-function store/layout — same cross-module `TypeId` bug
+        // class already found and fixed in `wasm_objects.zig`/
+        // `wasm_interfaces.zig` (see either's own doc comment): a
+        // string op inside a NON-entry-module function must type any
+        // new local it creates against THAT function's own store.
+        // `runtime`'s own helper functions stay on the global entry
+        // store (compiler-synthesized, self-consistent, callers type
+        // their own `dst` independently).
+        const function_store = module.functions.items[index].type_store orelse type_store;
+        const function_layout = wasm_heap.PtrLayout{
+            .ptr_type = function_store.builtins.string,
+            .idx_type = function_store.builtins.boolean,
+            .bool_type = function_store.builtins.boolean,
+        };
+        const function_ctx = ExpandCtx{ .layout = function_layout, .type_store = function_store, .runtime = runtime };
         const block_count = module.functions.items[index].blocks.items.len;
         var block_index: usize = 0;
         while (block_index < block_count) : (block_index += 1) {
             var builder = mir_builder.Builder{ .module = module, .allocator = allocator, .function_id = function_id };
-            try expandBlock(&builder, allocator, @enumFromInt(block_index), ctx);
+            try expandBlock(&builder, allocator, @enumFromInt(block_index), function_ctx);
         }
     }
 }

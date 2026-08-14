@@ -52,11 +52,15 @@ test "spawned actor with 2 constructor args: exercises expandSpawn's reverse-ord
     defer module.deinit(allocator);
 
     try panos.wasm_objects.expand(allocator, &module, &checked.types);
+    // See `aot_actors_test.zig`'s own comment: `.call_value` now always
+    // needs `wasm_interfaces.expand` to have run first.
+    const iface_result = try panos.wasm_interfaces.expand(allocator, &module, &checked.types);
+    defer allocator.free(iface_result.table);
     var frame_info = try panos.mir_cps.prepare(allocator, &module);
     defer frame_info.deinit();
     try panos.wasm_actors.expand(allocator, &module, &checked.types, &frame_info);
 
-    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, &.{});
+    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, iface_result.table);
     defer allocator.free(wasm_bytes);
 
     const wasm_path = "zzz_actors_multiarg_test.wasm";

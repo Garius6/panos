@@ -22,7 +22,10 @@ pub fn wasmValTypeForStore(store: *const types.TypeStore, type_id: types.TypeId)
     // struct fields, but all nominal values share this representation.
     if (store.eql(type_id, store.builtins.string)) return wasm_i32;
     if (store.get(type_id)) |entry| switch (entry.*) {
-        .nominal, .array, .process => return wasm_i32,
+        // First-class function values are opaque i32 WASM table indices
+        // (see `wasm_interfaces.zig`'s `.function_ref` rewrite) — same
+        // "opaque i32 handle" category as nominal/array/process values.
+        .nominal, .array, .process, .function => return wasm_i32,
         // `поison`/`unconstrained` reaching codegen at ALL means one
         // specific thing in practice, not "type checking gave up
         // generically": `type_checker.zig`'s `получить()` handling

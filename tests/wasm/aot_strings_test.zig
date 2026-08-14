@@ -23,10 +23,16 @@ fn buildAndRun(allocator: std.mem.Allocator, io: std.Io, source: []const u8, was
 
     try panos.wasm_objects.expand(allocator, &module, &checked.types);
     try panos.wasm_strings.expand(allocator, &module, &checked.types);
+    // First-class function values (any `.call_value`, including a plain
+    // recursive/self call) now ALWAYS depend on `wasm_interfaces.expand`
+    // having rewritten `.function_ref` into a real WASM table index
+    // first — see `wasm_interfaces.zig`'s own doc comment.
+    const iface_result = try panos.wasm_interfaces.expand(allocator, &module, &checked.types);
+    defer allocator.free(iface_result.table);
     var frame_info = try panos.mir_cps.prepare(allocator, &module);
     defer frame_info.deinit();
 
-    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, &.{});
+    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, iface_result.table);
     defer allocator.free(wasm_bytes);
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = wasm_path, .data = wasm_bytes });

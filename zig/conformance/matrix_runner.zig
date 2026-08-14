@@ -249,7 +249,22 @@ fn computeAotOutcome(allocator: std.mem.Allocator, io: std.Io, path: []const u8)
 
     var module = try panos.mir_lowering.lowerModule(allocator, &parsed.ast, &resolved, &checked);
     defer module.deinit(allocator);
-    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, &.{});
+    // Same expansion pipeline `cli/main.zig`'s real `panos build
+    // --target=wasm` always runs, in the same order — skipping straight
+    // to `emitModule` (as this used to do) only worked for cases that
+    // never touched structs/strings/interfaces/first-class function
+    // values/actors; `.call_value` now ALWAYS depends on
+    // `wasm_interfaces.expand` having rewritten `.function_ref` into a
+    // real WASM table index first (see `wasm_interfaces.zig`'s own doc
+    // comment), so even a plain recursive function call needs this now.
+    try panos.wasm_objects.expand(allocator, &module, &checked.types);
+    try panos.wasm_strings.expand(allocator, &module, &checked.types);
+    const iface_result = try panos.wasm_interfaces.expand(allocator, &module, &checked.types);
+    defer allocator.free(iface_result.table);
+    var frame_info = try panos.mir_cps.prepare(allocator, &module);
+    defer frame_info.deinit();
+    try panos.wasm_actors.expand(allocator, &module, &checked.types, &frame_info);
+    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, iface_result.table);
     defer allocator.free(wasm_bytes);
 
     const wasm_path = "zzz_matrix_aot_test.wasm";

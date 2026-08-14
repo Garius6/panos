@@ -45,6 +45,36 @@ fn signatureShapeKey(allocator: std.mem.Allocator, params: []const u8, result: ?
     return try key.toOwnedSlice(allocator);
 }
 
+// Shared by `emitModule`'s two shape-collecting scans (interface-table
+// member functions, and every `.call_value` call site's own required
+// shape) — registers one new type-section entry per DISTINCT shape,
+// no-op if already registered. `total_functions` is `module.functions.
+// items.len` (the shared type-section entries start right after every
+// ordinary function's own unique entry).
+fn registerInterfaceShape(
+    allocator: std.mem.Allocator,
+    interface_type_index: *std.StringHashMap(u32),
+    interface_shape_types: *std.ArrayList(u8),
+    interface_shape_count: *u32,
+    builtin_count: usize,
+    total_functions: usize,
+    params: []const u8,
+    result: ?u8,
+) !void {
+    const key = try signatureShapeKey(allocator, params, result);
+    if (interface_type_index.contains(key)) {
+        allocator.free(key);
+        return;
+    }
+    try interface_type_index.put(key, @as(u32, @intCast(builtin_count)) + @as(u32, @intCast(total_functions)) + interface_shape_count.*);
+    interface_shape_count.* += 1;
+    interface_shape_types.append(allocator, 0x60) catch unreachable; // functype
+    try wasm_module.writeUleb128(interface_shape_types, allocator, params.len);
+    try interface_shape_types.appendSlice(allocator, params);
+    try wasm_module.writeUleb128(interface_shape_types, allocator, if (result != null) 1 else 0);
+    if (result) |result_type| try interface_shape_types.append(allocator, result_type);
+}
+
 const EmitContext = struct {
     allocator: std.mem.Allocator,
     checked: *const type_checker.CheckResult,
@@ -703,12 +733,53 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try ctx.value_to_function.put(function_ref.dst, function_ref.function);
             return null;
         },
+        // Two shapes reach here: (1) a STATICALLY known named-function
+        // call (the common case — `mir_lowering.zig`'s ident/method_calls/
+        // module-import fast paths) — `callee` traces back to a
+        // `.function_ref` in the SAME function, tracked in
+        // `value_to_function`, and this is an ordinary direct `call` (no
+        // indirection needed, and critically: `.function_ref` for these
+        // pushes NOTHING onto the real stack, so `call.args` are the
+        // ONLY real stack contents — the callee is resolved purely at
+        // compile time via the map). (2) a genuinely dynamic function
+        // VALUE (`ф(x)` where `ф` is a parameter/field/local, not a
+        // statically-known callee, or a value routed through
+        // `mir_lowering.zig`'s `storeCalleeLocal`/`reloadCalleeLocal`) —
+        // `call_indirect`, same mechanism `.call_indirect` itself uses
+        // (shared type-index-by-shape scheme). `.function_ref` for THESE
+        // is rewritten to a real i32 table-index constant by
+        // `wasm_interfaces.zig` before this ever runs. Two cases are
+        // deliberately excluded from that rewrite and therefore MUST hit
+        // the value_to_function fast path here, never call_indirect: (a)
+        // `.spawn`'s own callee (`wasm_actors.zig`'s `resolveSpawnTarget`
+        // scans for a literal un-rewritten `.function_ref`), and (b) a
+        // SELF-recursive call, since `wasm_actors.zig` reuses/renames a
+        // function's OWN `FunctionId` in place when turning it into an
+        // actor's scheduler function — a table entry registered against
+        // that FunctionId BEFORE the rename would point at the WRONG
+        // (post-rename) signature by the time `emitModule` builds the
+        // Table/Element sections, an "indirect call type mismatch" trap
+        // confirmed via `wasmtime` (a recursive actor handler calling
+        // itself, `wasm_interfaces.zig`'s own `spawnCallees`-style
+        // exclusion, extended to `.call_value`'s own callee below).
         .call_value => |call| {
             for (call.args) |_| {} // args are already on the stack — replayed earlier, in order, by their own instructions.
-            const function_id = ctx.value_to_function.get(call.callee) orelse return unsupported("вызов через динамическое значение (нет call_indirect/таблицы функций в Phase 1a)");
-            const function_index = ctx.func_index.get(function_id) orelse return unsupported("функция не найдена в индексе модуля");
-            try code.append(allocator, 0x10); // call
-            try wasm_module.writeUleb128(code, allocator, function_index);
+            if (ctx.value_to_function.get(call.callee)) |function_id| {
+                const function_index = ctx.func_index.get(function_id) orelse return unsupported("функция не найдена в индексе модуля");
+                try code.append(allocator, 0x10); // call
+                try wasm_module.writeUleb128(code, allocator, function_index);
+                return call.dst;
+            }
+            var params: std.ArrayList(u8) = .empty;
+            defer params.deinit(allocator);
+            for (call.args) |arg| try params.append(allocator, wasmType(ctx, arg));
+            const result: ?u8 = if (call.dst) |dst| wasmType(ctx, dst) else null;
+            const key = try signatureShapeKey(allocator, params.items, result);
+            defer allocator.free(key);
+            const type_index = ctx.interface_type_index.get(key) orelse return unsupported("вызов через динамическое значение: тип не найден в общей таблице типов интерфейса");
+            try code.append(allocator, 0x11); // call_indirect
+            try wasm_module.writeUleb128(code, allocator, type_index);
+            try code.append(allocator, 0x00); // tableidx 0
             return call.dst;
         },
         .call => |call| {
@@ -1385,18 +1456,35 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         }
         const is_void = store.eql(function.result_type, store.builtins.void);
         const result: ?u8 = if (is_void) null else wasm_module.wasmValTypeForStore(store, function.result_type);
-        const key = try signatureShapeKey(allocator, params.items, result);
-        if (interface_type_index.contains(key)) {
-            allocator.free(key);
-            continue;
-        }
-        try interface_type_index.put(key, builtin_count + @as(u32, @intCast(module.functions.items.len)) + interface_shape_count);
-        interface_shape_count += 1;
-        interface_shape_types.append(allocator, 0x60) catch unreachable; // functype
-        try wasm_module.writeUleb128(&interface_shape_types, allocator, params.items.len);
-        try interface_shape_types.appendSlice(allocator, params.items);
-        try wasm_module.writeUleb128(&interface_shape_types, allocator, if (result != null) 1 else 0);
-        if (result) |result_type| try interface_shape_types.append(allocator, result_type);
+        try registerInterfaceShape(allocator, &interface_type_index, &interface_shape_types, &interface_shape_count, builtin_count, module.functions.items.len, params.items, result);
+    }
+
+    // A `.call_value` call site's OWN required shape (from its args/dst
+    // types) may have NO real registered callee anywhere in the compiled
+    // program — the whole prelude compiles unconditionally (no tree-
+    // shaking, see this file's own commit history), so a generic
+    // callback body (e.g. `отобразить`'s `ф(значение)`) can be compiled
+    // and reachable-in-principle from `call_indirect`'s codegen even
+    // when NOTHING in this particular program ever actually calls it
+    // with a real closure. Without this, such a site's shape would have
+    // no type-section entry at all and fail to emit, even though the
+    // code is dead in practice. Harmless if genuinely unreachable at
+    // runtime; if it WERE reachable with a mismatched real callee,
+    // `call_indirect` traps at that point — same behavior any WASM
+    // engine gives for a genuine type mismatch.
+    for (module.functions.items) |function| {
+        const store = function.type_store orelse &checked.types;
+        for (function.blocks.items) |block| for (block.instructions.items) |instruction| {
+            const call = switch (instruction) {
+                .call_value => |v| v,
+                else => continue,
+            };
+            var params: std.ArrayList(u8) = .empty;
+            defer params.deinit(allocator);
+            for (call.args) |arg| try params.append(allocator, wasm_module.wasmValTypeForStore(store, function.valueType(arg)));
+            const result: ?u8 = if (call.dst) |dst| wasm_module.wasmValTypeForStore(store, function.valueType(dst)) else null;
+            try registerInterfaceShape(allocator, &interface_type_index, &interface_shape_types, &interface_shape_count, builtin_count, module.functions.items.len, params.items, result);
+        };
     }
 
     // Import types come FIRST in the type section — import type index `i`
@@ -1622,7 +1710,20 @@ test "emitModule produces a valid, executable .wasm for a recursive MIR function
     var module = try mir_lowering.lowerModule(allocator, &parsed.ast, &resolved, &checked);
     defer module.deinit(allocator);
 
-    const wasm_bytes = try emitModule(allocator, &checked, &module, &.{});
+    // The recursive self-call here compiles to `.function_ref` +
+    // `.call_value` (see `mir_lowering.zig`'s `lowerCall`) — `.call_value`
+    // ALWAYS lowers to `call_indirect` now (first-class function values,
+    // not just interfaces, need this — see `wasm_interfaces.zig`'s own
+    // doc comment), which depends on `wasm_interfaces.expand` having
+    // already rewritten `.function_ref` into a real i32 table-index
+    // constant. Every real caller (`cli/main.zig`) always runs this pass
+    // before `emitModule`; this test skipped it before `.call_value`
+    // needed real dispatch machinery, which is no longer true.
+    const wasm_interfaces = @import("wasm_interfaces.zig");
+    const iface_result = try wasm_interfaces.expand(allocator, &module, &checked.types);
+    defer allocator.free(iface_result.table);
+
+    const wasm_bytes = try emitModule(allocator, &checked, &module, iface_result.table);
     defer allocator.free(wasm_bytes);
     try std.testing.expect(std.mem.eql(u8, wasm_bytes[0..4], &.{ 0x00, 0x61, 0x73, 0x6D }));
 

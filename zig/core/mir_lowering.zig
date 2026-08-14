@@ -9,6 +9,10 @@ const type_checker = @import("type_checker.zig");
 const types = @import("types.zig");
 const wasm_module = @import("wasm_module.zig");
 
+// Not tied to any real declared variable — same "dummy" convention
+// `wasm_heap.zig` already established for compiler-synthesized locals.
+const dummy_symbol: symbols.SymbolId = @enumFromInt(0);
+
 // AST (post resolve+typecheck) → MIR. Ported from `core/mir_lowering.odin`
 // (~2000 lines there) — works at the SAME pipeline point `compiler.zig`
 // already does: reads the already-computed resolver/type-checker side
@@ -899,8 +903,40 @@ fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: so
 }
 
 fn emitFunctionRef(ctx: *LoweringContext, function_id: mir.FunctionId) !mir.ValueId {
-    const dst = try ctx.builder.newValue(ctx.checked.types.builtins.void);
+    // A function reference is a genuine first-class VALUE (storable in a
+    // local/field, passable as an argument, callable through
+    // `call_value`) — typed `boolean` here purely as a stand-in for "i32
+    // opaque handle" (see `wasm_module.wasmValTypeForStore`'s `.function`
+    // case: any function-typed value maps to i32, same category as
+    // nominal/array/process). The exact declared type doesn't matter
+    // beyond that WASM-type-category selection.
+    const dst = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
     try ctx.builder.emit(.{ .function_ref = .{ .dst = dst, .function = function_id } });
+    return dst;
+}
+
+// `.call_value`'s callee must be the LAST-produced operand by the time
+// WASM codegen turns it into `call_indirect` (`[args..., table_index]`,
+// index popped topmost) — but every call site here computes the callee
+// BEFORE its arguments (matching the language's own left-to-right
+// evaluation order, callee-before-args, mirrored from `compiler.zig`'s
+// `compileCall`). Routes the callee through an ordinary Local
+// (target-agnostic MIR, no WASM-specific knowledge needed here) so it
+// can be re-produced fresh, after every argument, right at the call
+// site — same "buried value" fix shape as `wasm_interfaces.zig`'s own
+// `.cast_interface`/`.invoke_interface` expansions, just done here at
+// the MIR level since ordinary Locals are backend-agnostic.
+fn storeCalleeLocal(ctx: *LoweringContext, callee: mir.ValueId) !mir.LocalId {
+    const callee_type = ctx.builder.currentFunction().valueType(callee);
+    const local = try ctx.builder.newLocal(dummy_symbol, "@callee", callee_type);
+    try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = callee } });
+    return local;
+}
+
+fn reloadCalleeLocal(ctx: *LoweringContext, local: mir.LocalId) !mir.ValueId {
+    const callee_type = ctx.builder.currentFunction().locals.items[@intFromEnum(local)].type_id;
+    const dst = try ctx.builder.newValue(callee_type);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = dst, .local = local } });
     return dst;
 }
 
@@ -1247,8 +1283,10 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
 
     const callee_outcome = try lowerExpr(ctx, call.callee);
     if (callee_outcome.flow == .terminates) return terminated;
+    const callee_local = try storeCalleeLocal(ctx, callee_outcome.value);
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
-    return emitCallValue(ctx, callee_outcome.value, args, result_type);
+    const callee = try reloadCalleeLocal(ctx, callee_local);
+    return emitCallValue(ctx, callee, args, result_type);
 }
 
 fn lowerEnumConstructor(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {

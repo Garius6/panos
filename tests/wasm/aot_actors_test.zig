@@ -54,6 +54,15 @@ test "actor request/reply round trip: spawn + 2-field variant message + reply, n
     defer module.deinit(allocator);
 
     try panos.wasm_objects.expand(allocator, &module, &checked.types);
+    // First-class function values (any `.call_value`, including
+    // `запусти`'s own callee resolution path once actor expansion runs)
+    // now ALWAYS depend on `wasm_interfaces.expand` having rewritten
+    // `.function_ref` into a real WASM table index first — see
+    // `wasm_interfaces.zig`'s own doc comment. Must run BEFORE
+    // `mir_cps.prepare`/`wasm_actors.expand`, same order `cli/main.zig`
+    // uses.
+    const iface_result = try panos.wasm_interfaces.expand(allocator, &module, &checked.types);
+    defer allocator.free(iface_result.table);
     var frame_info = try panos.mir_cps.prepare(allocator, &module);
     defer frame_info.deinit();
     try panos.wasm_actors.expand(allocator, &module, &checked.types, &frame_info);
@@ -71,7 +80,7 @@ test "actor request/reply round trip: spawn + 2-field variant message + reply, n
         }
     }
 
-    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, &.{});
+    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, iface_result.table);
     defer allocator.free(wasm_bytes);
 
     const wasm_path = "zzz_actors_test.wasm";

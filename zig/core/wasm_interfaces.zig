@@ -112,11 +112,13 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
             .bool_type = function_store.builtins.boolean,
         };
         const function_ctx = ExpandCtx{ .layout = function_layout, .type_store = function_store };
+        var direct_call_callees = try directCallCallees(allocator, &module.functions.items[index]);
+        defer direct_call_callees.deinit();
         const block_count = module.functions.items[index].blocks.items.len;
         var block_index: usize = 0;
         while (block_index < block_count) : (block_index += 1) {
             var builder = mir_builder.Builder{ .module = module, .allocator = allocator, .function_id = function_id };
-            try expandBlock(&builder, allocator, @enumFromInt(block_index), function_ctx, &table, &table_index_of, &wrapper_of);
+            try expandBlock(&builder, allocator, @enumFromInt(block_index), function_ctx, &table, &table_index_of, &wrapper_of, &direct_call_callees);
         }
     }
 
@@ -205,13 +207,60 @@ fn wrapperFor(module: *mir.Module, allocator: std.mem.Allocator, fallback_type_s
     return wrapper_id;
 }
 
+// Also gates first-class function VALUES (`.function_ref` used as
+// anything other than `.spawn`'s own statically-resolved callee — see
+// `directCallCallees`/`.function_ref`'s rewrite in `expandInstruction`) —
+// both features share this pass's alloc/table infrastructure, and a
+// program using ONE without the OTHER shouldn't pay for either's setup.
 fn usesInterfaces(module: *const mir.Module) bool {
     for (module.functions.items) |function| for (function.blocks.items) |block|
         for (block.instructions.items) |instruction| switch (instruction) {
-            .cast_interface, .invoke_interface => return true,
+            .cast_interface, .invoke_interface, .function_ref, .call_value => return true,
             else => {},
         };
     return false;
+}
+
+// Two callee kinds must NEVER have their `.function_ref` rewritten into
+// a real i32 table constant — both stay as a literal, no-op-producing
+// `.function_ref`, resolved by a downstream direct-call scan instead of
+// `call_indirect`:
+//
+// 1. `.spawn`'s own callee — `wasm_actors.zig`'s `resolveSpawnTarget`
+//    scans for a matching `.function_ref` instruction (`wasm_actors.
+//    expand` runs AFTER this pass, so rewriting it away here would
+//    silently break every `запусти` call).
+//
+// 2. `.call_value`'s own callee, for every STATICALLY known named call
+//    (`mir_lowering.zig`'s ident/method_calls/module-import fast paths
+//    — the common case, `.function_ref` feeds `call_value.callee`
+//    DIRECTLY, no intervening store/reload). `wasm_emit.zig`'s
+//    `value_to_function` map resolves these into an ordinary direct
+//    `call`, no indirection needed. Rewriting these into table entries
+//    is not just wasted work — for a SELF-recursive call specifically,
+//    it is actively wrong: `wasm_actors.zig` reuses/renames a function's
+//    OWN `FunctionId` in place when turning it into an actor scheduler
+//    function, so a table entry registered against that `FunctionId`
+//    BEFORE the rename ends up pointing at the WRONG (post-rename)
+//    signature by the time `emitModule` builds the Table/Element
+//    sections — confirmed via `wasmtime`: "indirect call type mismatch"
+//    trapping a recursive actor message handler calling itself. (A
+//    call_value whose callee comes from `mir_lowering.zig`'s
+//    `storeCalleeLocal`/`reloadCalleeLocal` — the genuinely dynamic
+//    fallback path — uses a FRESH `ValueId` from the reload, never the
+//    original `.function_ref`'s own `dst`, so it's naturally excluded
+//    from this set and still gets rewritten as needed.)
+//
+// Collected per-function (matching `resolveSpawnTarget`'s own
+// whole-function scan) before any rewriting happens.
+fn directCallCallees(allocator: std.mem.Allocator, function: *const mir.Function) !std.AutoHashMap(mir.ValueId, void) {
+    var set: std.AutoHashMap(mir.ValueId, void) = .init(allocator);
+    for (function.blocks.items) |block| for (block.instructions.items) |instruction| switch (instruction) {
+        .spawn => |v| try set.put(v.callee, {}),
+        .call_value => |v| try set.put(v.callee, {}),
+        else => {},
+    };
+    return set;
 }
 
 fn tableIndexFor(table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), allocator: std.mem.Allocator, function_id: mir.FunctionId) !u32 {
@@ -222,7 +271,7 @@ fn tableIndexFor(table: *std.ArrayList(mir.FunctionId), table_index_of: *std.Aut
     return index;
 }
 
-fn expandBlock(builder: *mir_builder.Builder, allocator: std.mem.Allocator, block_id: mir.BlockId, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId)) !void {
+fn expandBlock(builder: *mir_builder.Builder, allocator: std.mem.Allocator, block_id: mir.BlockId, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), direct_call_callees: *const std.AutoHashMap(mir.ValueId, void)) !void {
     const function = builder.currentFunction();
     var original = function.blockConst(block_id).*;
     function.block(block_id).instructions = .empty;
@@ -230,19 +279,31 @@ fn expandBlock(builder: *mir_builder.Builder, allocator: std.mem.Allocator, bloc
     builder.terminated = false;
 
     for (original.instructions.items) |instruction| {
-        try expandInstruction(builder, allocator, instruction, ctx, table, table_index_of, wrapper_of);
+        try expandInstruction(builder, allocator, instruction, ctx, table, table_index_of, wrapper_of, direct_call_callees);
     }
     builder.terminate(original.terminator);
     original.instructions.deinit(allocator);
 }
 
-fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator, instruction: mir.Instruction, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId)) !void {
+fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator, instruction: mir.Instruction, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), direct_call_callees: *const std.AutoHashMap(mir.ValueId, void)) !void {
     switch (instruction) {
         .cast_interface => |v| {
             try expandCastInterface(builder, allocator, v, ctx, table, table_index_of, wrapper_of);
         },
         .invoke_interface => |v| {
             try expandInvokeInterface(builder, ctx, v);
+        },
+        // Rewrites a function reference into a real i32 WASM table
+        // index (`.const_value{.address}`) — see `usesInterfaces`'s and
+        // `directCallCallees`'s own doc comments for why `.spawn`'s own
+        // callee is deliberately excluded.
+        .function_ref => |v| {
+            if (direct_call_callees.contains(v.dst)) {
+                try builder.emit(instruction);
+                return;
+            }
+            const table_index = try tableIndexFor(table, table_index_of, allocator, v.function);
+            try builder.emit(.{ .const_value = .{ .dst = v.dst, .value = .{ .address = table_index } } });
         },
         else => try builder.emit(instruction),
     }

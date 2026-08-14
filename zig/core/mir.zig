@@ -89,6 +89,17 @@ pub const ConstValue = union(enum) {
 pub const InterfaceMethodBinding = struct {
     method_name: []const u8,
     function: FunctionId,
+    // True when `function` is the interface's OWN default-method body
+    // (`тип X = интерфейс \n функ м(это: X, ...) -> ... \n <тело> \n
+    // конец`), not a concrete type's `реализация` override. A default
+    // method's `это` parameter is the ABSTRACT interface value itself
+    // (so it can keep dispatching polymorphically via `это.
+    // другой_метод()`), not the raw underlying concrete value an
+    // ordinary override expects — `wasm_interfaces.zig` needs this to
+    // decide which shape of `это` a given vtable slot's callee wants.
+    // Mirrors `bytecode.Function.is_default_interface_method`'s exact
+    // rationale on the native backend (`vm.zig`'s `callInterface`).
+    is_default: bool = false,
 };
 
 // Three-address, one simple operation per instruction — mirrors

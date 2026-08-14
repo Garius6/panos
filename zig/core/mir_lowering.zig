@@ -176,19 +176,37 @@ fn reserveMethods(
     symbol_to_function: *std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
 ) !void {
     for (program.declarations) |decl_id| {
-        const implementation = switch (tree.decl(decl_id).*) {
-            .impl => |value| value,
-            else => continue,
-        };
-        for (implementation.methods) |method_decl_id| {
-            const function = tree.decl(method_decl_id).function;
-            if (function.type_parameters.len > 0) continue; // generics — Phase 2
-            const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
-            const result_type = functionReturnType(checked, symbol);
-            const name = try mangledMethodName(module, implementation.target_type, function.name);
-            const function_id = try mir_builder.newFunction(module, allocator, name, symbol, result_type, function.span);
-            module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
-            try symbol_to_function.put(symbol, function_id);
+        switch (tree.decl(decl_id).*) {
+            .impl => |implementation| for (implementation.methods) |method_decl_id| {
+                const function = tree.decl(method_decl_id).function;
+                if (function.type_parameters.len > 0) continue; // generics — Phase 2
+                const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
+                const result_type = functionReturnType(checked, symbol);
+                const name = try mangledMethodName(module, implementation.target_type, function.name);
+                const function_id = try mir_builder.newFunction(module, allocator, name, symbol, result_type, function.span);
+                module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
+                try symbol_to_function.put(symbol, function_id);
+            },
+            // Default interface methods (`тип X = интерфейс \n функ м(это:
+            // X(...), ...) -> ... \n <тело> \n конец`) — a SEPARATE
+            // declaration kind from `.impl` (mirrors `compiler.zig`'s own
+            // `predeclareFunctions`: `.impl` and `.interface_decl` handled
+            // as two arms of the same switch, not one). `это`'s receiver
+            // here is the ABSTRACT interface type, not a concrete struct —
+            // reserved the SAME way regardless (mangled `"{Интерфейс}::
+            // {метод}"` name, ordinary `newFunction` — the interface-vs-
+            // concrete distinction only matters for the CALLING convention,
+            // handled separately in `wasm_interfaces.zig`).
+            .interface_decl => |interface| for (interface.default_methods) |method_decl_id| {
+                const function = tree.decl(method_decl_id).function;
+                const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
+                const result_type = functionReturnType(checked, symbol);
+                const name = try mangledMethodName(module, interface.name, function.name);
+                const function_id = try mir_builder.newFunction(module, allocator, name, symbol, result_type, function.span);
+                module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
+                try symbol_to_function.put(symbol, function_id);
+            },
+            else => {},
         }
     }
 }
@@ -203,16 +221,21 @@ fn lowerMethods(
     symbol_to_function: *const std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
 ) !void {
     for (program.declarations) |decl_id| {
-        const implementation = switch (tree.decl(decl_id).*) {
-            .impl => |value| value,
-            else => continue,
-        };
-        for (implementation.methods) |method_decl_id| {
-            const function = tree.decl(method_decl_id).function;
-            if (function.type_parameters.len > 0) continue;
-            const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
-            const function_id = symbol_to_function.get(symbol) orelse continue;
-            try lowerFunctionBody(allocator, tree, resolution, checked, module, function_id, method_decl_id, function.body, symbol_to_function);
+        switch (tree.decl(decl_id).*) {
+            .impl => |implementation| for (implementation.methods) |method_decl_id| {
+                const function = tree.decl(method_decl_id).function;
+                if (function.type_parameters.len > 0) continue;
+                const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
+                const function_id = symbol_to_function.get(symbol) orelse continue;
+                try lowerFunctionBody(allocator, tree, resolution, checked, module, function_id, method_decl_id, function.body, symbol_to_function);
+            },
+            .interface_decl => |interface| for (interface.default_methods) |method_decl_id| {
+                const function = tree.decl(method_decl_id).function;
+                const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
+                const function_id = symbol_to_function.get(symbol) orelse continue;
+                try lowerFunctionBody(allocator, tree, resolution, checked, module, function_id, method_decl_id, function.body, symbol_to_function);
+            },
+            else => {},
         }
     }
 }
@@ -619,7 +642,8 @@ fn applyInterfaceCast(ctx: *LoweringContext, expression: ast.ExprId, outcome: Ex
         if (definition.methods.len != implementation.methods.len) return unsupported("несоответствие количества методов интерфейса");
         for (definition.methods, implementation.methods) |method, method_symbol| {
             const function_id = ctx.symbol_to_function.get(method_symbol) orelse return unsupported("не удалось найти метод интерфейса");
-            try vtable.append(ctx.builder.module.arena.allocator(), .{ .method_name = method.name, .function = function_id });
+            const is_default = method.default_symbol != null and method.default_symbol.? == method_symbol;
+            try vtable.append(ctx.builder.module.arena.allocator(), .{ .method_name = method.name, .function = function_id, .is_default = is_default });
         }
     }
     // Same WASM representation (opaque i32 handle) either way — the
@@ -1218,6 +1242,7 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
         if (try lowerDomBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerArrayMethodCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerOptionMethodCall(ctx, call, result_type)) |outcome| return outcome;
+        if (try lowerResultMethodCall(ctx, call, result_type)) |outcome| return outcome;
     }
 
     const callee_outcome = try lowerExpr(ctx, call.callee);
@@ -1341,6 +1366,123 @@ fn lowerOptionMethodCall(ctx: *LoweringContext, call: anytype, result_type: type
     return null;
 }
 
+// `Результат(T,E)`'s sibling of `lowerOptionMethodCall` — same reason:
+// `type_checker.zig`'s `inferPreludeEnumMethod` hard-codes the return
+// TYPE for `.успех()`/`.ошибка()`/etc. by property-name string compare,
+// entirely bypassing `checked.method_calls` (the map ordinary
+// `реализация`-declared methods populate) — even though `prelude.zig`
+// ALSO declares real `реализация Результат` bodies for these exact
+// names. Those real bodies exist for the native bytecode backend
+// (`compiler.zig` doesn't share this type-checker fast path the same
+// way) but are effectively unreachable from THIS backend's call sites:
+// `checked.method_calls.get(expression)` is null for every `.успех()`-
+// shaped call, so `lowerCall` never finds them, regardless of whether
+// the call is external user code OR (as found investigating this)
+// `Результат::ошибка`'s OWN body calling `это.успех()` internally —
+// hand-rolling the same `match_tag`/`get_variant_field` codegen here
+// fixes BOTH at once, since `lowerCall` is used uniformly everywhere.
+// `Успех`=tag 0, `Неудача`=tag 1 (`prelude.zig`'s own declaration
+// order). Scope matches `lowerOptionMethodCall`'s own precedent —
+// covers the methods actually needed so far, not the full 13-method
+// surface `inferPreludeEnumMethod` type-checks (ожидать/ожидать_ошибку/
+// запас/заменить_значение/заменить_ошибку/опция/ошибка_опция still fall
+// through to the generic-property-access `unsupported` path — a known,
+// narrower-scoped-on-purpose gap, not silently mishandled).
+fn lowerResultMethodCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const property = ctx.tree.expr(call.callee).property;
+    const object_type = ctx.checked.expression_types.get(property.object) orelse return null;
+    const type_entry = ctx.checked.types.get(object_type) orelse return null;
+    const nominal = switch (type_entry.*) {
+        .nominal => |value| value,
+        else => return null,
+    };
+    const owner = ctx.resolution.symbols.get(nominal.symbol) orelse return null;
+    if (!std.mem.eql(u8, owner.name, "Результат")) return null;
+
+    const receiver = try lowerExpr(ctx, property.object);
+    if (receiver.flow == .terminates) return terminated;
+
+    if (std.mem.eql(u8, property.property, "успех") and call.arguments.len == 0) {
+        const dst = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .match_tag = .{ .dst = dst, .subject = receiver.value, .tag = 0 } });
+        return continuesWith(dst);
+    }
+    if (std.mem.eql(u8, property.property, "ошибка") and call.arguments.len == 0) {
+        const dst = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .match_tag = .{ .dst = dst, .subject = receiver.value, .tag = 1 } });
+        return continuesWith(dst);
+    }
+    // `значение()`/`причина()`: extract the matching variant's field,
+    // trap (`.unreachable_term`) on the wrong tag — matches
+    // `prelude.zig`'s own `паника("нет значения")`/`паника("нет
+    // ошибки")` bodies (message text lost under WASM AOT, same
+    // documented gap as `lowerPanicBuiltinCall`).
+    if ((std.mem.eql(u8, property.property, "значение") or std.mem.eql(u8, property.property, "причина")) and call.arguments.len == 0) {
+        const want_success = std.mem.eql(u8, property.property, "значение");
+        const receiver_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$result", object_type);
+        try ctx.builder.emit(.{ .store_local = .{ .local = receiver_local, .src = receiver.value } });
+        const condition = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
+        const loaded = try ctx.builder.newValue(object_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = loaded, .local = receiver_local } });
+        try ctx.builder.emit(.{ .match_tag = .{ .dst = condition, .subject = loaded, .tag = if (want_success) 0 else 1 } });
+        const ok_block = try ctx.builder.newBlock();
+        const panic_block = try ctx.builder.newBlock();
+        ctx.builder.terminate(.{ .branch = .{ .cond = condition, .then_block = ok_block, .else_block = panic_block } });
+
+        ctx.builder.setCurrentBlock(panic_block);
+        ctx.builder.terminate(.{ .unreachable_term = .{ .reason = if (want_success) "нет значения" else "нет ошибки" } });
+
+        ctx.builder.setCurrentBlock(ok_block);
+        const ok_loaded = try ctx.builder.newValue(object_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = ok_loaded, .local = receiver_local } });
+        const dst = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .get_variant_field = .{ .dst = dst, .subject = ok_loaded, .field_index = 0 } });
+        return continuesWith(dst);
+    }
+    // `получить(запасное)`/`получить_ошибку(запасное)`: same branch-
+    // extract-or-fallback shape as `lowerOptionMethodCall`'s own
+    // `получить`.
+    if ((std.mem.eql(u8, property.property, "получить") or std.mem.eql(u8, property.property, "получить_ошибку")) and call.arguments.len == 1) {
+        const want_success = std.mem.eql(u8, property.property, "получить");
+        const result_local_name = if (want_success) "$result" else "$result_err";
+        const receiver_local = try ctx.builder.newLocal(symbols.invalid_symbol, result_local_name, object_type);
+        try ctx.builder.emit(.{ .store_local = .{ .local = receiver_local, .src = receiver.value } });
+        const fallback = try lowerExpr(ctx, call.arguments[0]);
+        if (fallback.flow == .terminates) return terminated;
+        const fallback_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$result_fallback", result_type);
+        try ctx.builder.emit(.{ .store_local = .{ .local = fallback_local, .src = fallback.value } });
+        const out_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$result_out", result_type);
+        const condition = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
+        const loaded = try ctx.builder.newValue(object_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = loaded, .local = receiver_local } });
+        try ctx.builder.emit(.{ .match_tag = .{ .dst = condition, .subject = loaded, .tag = if (want_success) 0 else 1 } });
+        const matched = try ctx.builder.newBlock();
+        const unmatched = try ctx.builder.newBlock();
+        const merge = try ctx.builder.newBlock();
+        ctx.builder.terminate(.{ .branch = .{ .cond = condition, .then_block = matched, .else_block = unmatched } });
+
+        ctx.builder.setCurrentBlock(matched);
+        const matched_loaded = try ctx.builder.newValue(object_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = matched_loaded, .local = receiver_local } });
+        const value = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .get_variant_field = .{ .dst = value, .subject = matched_loaded, .field_index = 0 } });
+        try ctx.builder.emit(.{ .store_local = .{ .local = out_local, .src = value } });
+        ctx.builder.terminate(.{ .jump = .{ .target = merge } });
+
+        ctx.builder.setCurrentBlock(unmatched);
+        const default_value = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = default_value, .local = fallback_local } });
+        try ctx.builder.emit(.{ .store_local = .{ .local = out_local, .src = default_value } });
+        ctx.builder.terminate(.{ .jump = .{ .target = merge } });
+
+        ctx.builder.setCurrentBlock(merge);
+        const result = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = result, .local = out_local } });
+        return continuesWith(result);
+    }
+    return null;
+}
+
 fn lowerStructConstructor(ctx: *LoweringContext, expression: ast.ExprId, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
     if (entry.kind != .type) return null;
@@ -1350,7 +1492,7 @@ fn lowerStructConstructor(ctx: *LoweringContext, expression: ast.ExprId, symbol:
         else => return null,
     };
     if (nominal.symbol != symbol) return null;
-    const fields = ctx.checked.nominal_fields.get(symbol) orelse return null;
+    const fields = fieldsForNominalSymbol(ctx, symbol) orelse return null;
     if (fields.len > 3) return unsupported("структура с более чем 3 полями");
     const arguments = ctx.checked.call_arguments.get(expression) orelse call.arguments;
     const args = try lowerCallArgs(ctx, arguments) orelse return terminated;

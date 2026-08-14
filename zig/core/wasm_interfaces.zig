@@ -65,7 +65,6 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
         .bool_type = type_store.builtins.boolean,
     };
     _ = try wasm_heap.findOrBuildAlloc(allocator, module, type_store, layout);
-    const ctx = ExpandCtx{ .layout = layout, .type_store = type_store };
 
     // Assigned in first-seen order while rewriting `.cast_interface`
     // sites below — a plain `AutoHashMap` walk order isn't stable across
@@ -76,19 +75,134 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     var table: std.ArrayList(mir.FunctionId) = .empty;
     var table_index_of: std.AutoHashMap(mir.FunctionId, u32) = .init(allocator);
     defer table_index_of.deinit();
+    // Ordinary (non-default) methods placed in an interface vtable need
+    // a thin unwrap-the-box WRAPPER (see `wrapperFor`'s own doc comment)
+    // — memoized per ORIGINAL FunctionId so the same method reached via
+    // multiple casts only gets ONE wrapper, appended to `module.functions`
+    // lazily the first time it's needed (safe mid-loop: the outer `while`
+    // below re-checks `module.functions.items.len` every iteration, same
+    // pattern `wasm_objects.zig`'s own runtime-function construction
+    // already established).
+    var wrapper_of: std.AutoHashMap(mir.FunctionId, mir.FunctionId) = .init(allocator);
+    defer wrapper_of.deinit();
 
     var index: usize = 0;
     while (index < module.functions.items.len) : (index += 1) {
         const function_id: mir.FunctionId = @enumFromInt(index);
+        // Each function in the module graph may belong to a DIFFERENT
+        // source file/module, hence a DIFFERENT `types.TypeStore`
+        // instance (`TypeId.owner` is deliberately store-specific — see
+        // `types.zig`'s own doc comment: "makes accidental cross-store
+        // use fail"). Box/vtable-array values created below must be
+        // typed against THIS function's own store, not the caller-
+        // supplied top-level `type_store` (which is only the ENTRY
+        // module's) — using the wrong store here silently produced a
+        // `TypeId` that `wasm_emit.zig` could never look up later
+        // (`store.get` returns null for a foreign owner), defaulting
+        // that value's WASM type to f64 instead of i32 and corrupting
+        // the `call_indirect` type-index computation. Found by tracing
+        // `Итерируемое::собрать` (a prelude function, non-entry module)
+        // failing `call_indirect: тип не найден` — `это`'s own type
+        // resolved fine (same store), but the box value built here for
+        // `.следующий()`'s receiver did not.
+        const function_store = module.functions.items[index].type_store orelse type_store;
+        const function_layout = wasm_heap.PtrLayout{
+            .ptr_type = function_store.builtins.string,
+            .idx_type = function_store.builtins.boolean,
+            .bool_type = function_store.builtins.boolean,
+        };
+        const function_ctx = ExpandCtx{ .layout = function_layout, .type_store = function_store };
         const block_count = module.functions.items[index].blocks.items.len;
         var block_index: usize = 0;
         while (block_index < block_count) : (block_index += 1) {
             var builder = mir_builder.Builder{ .module = module, .allocator = allocator, .function_id = function_id };
-            try expandBlock(&builder, allocator, @enumFromInt(block_index), ctx, &table, &table_index_of);
+            try expandBlock(&builder, allocator, @enumFromInt(block_index), function_ctx, &table, &table_index_of, &wrapper_of);
         }
     }
 
     return .{ .table = try table.toOwnedSlice(allocator) };
+}
+
+// Ordinary `реализация X для Y` methods expect `это` as the RAW
+// underlying concrete value (real field access on a real struct) —
+// but every interface vtable slot is called uniformly through the SAME
+// boxed `это` (see `expandInvokeInterface`), since a DEFAULT interface
+// method's `это` must stay the ABSTRACT boxed value (to keep
+// dispatching polymorphically via `это.другой_метод()` — mirrors
+// `vm.zig`'s own `callInterface`/`is_default_interface_method` split
+// exactly, same reasoning, WASM-shaped). Rather than making
+// `expandInvokeInterface` runtime-branch on which kind of callee it
+// might hit (WASM has no "inspect this function" reflection), every
+// ORDINARY method gets a trampoline here instead: unwrap the box once
+// (`mem_load` box+0), forward to the real method with the raw receiver
+// + the rest of the args unchanged. Default methods need NO wrapper —
+// the box IS already the shape they expect.
+fn wrapperFor(module: *mir.Module, allocator: std.mem.Allocator, fallback_type_store: *const types.TypeStore, wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), target: mir.FunctionId) !mir.FunctionId {
+    if (wrapper_of.get(target)) |existing| return existing;
+
+    // Copy everything needed from the target BEFORE calling
+    // `mir_builder.newFunction`/`beginFunction` below — both APPEND to
+    // `module.functions`, which can reallocate the backing array and
+    // invalidate a raw `*mir.Function` held across the call (`mir_builder
+    // .zig`'s own module doc comment).
+    const target_function = &module.functions.items[@intFromEnum(target)];
+    // The wrapper's own types (box param, receiver, result) must come
+    // from the TARGET's store, not the CALLER's (`.cast_interface` site)
+    // — the target may live in a different module than the cast site
+    // (e.g. a prelude default method casting a struct declared in the
+    // SAME prelude module, wrapped and called from an entry-module
+    // function). Using the caller's store here would reproduce the
+    // exact cross-store `TypeId` bug `expand()`'s own per-function
+    // `type_store` derivation was added to fix.
+    const target_type_store = target_function.type_store orelse fallback_type_store;
+    const target_layout = wasm_heap.PtrLayout{
+        .ptr_type = target_type_store.builtins.string,
+        .idx_type = target_type_store.builtins.boolean,
+        .bool_type = target_type_store.builtins.boolean,
+    };
+    const target_name = try module.arena.allocator().dupe(u8, target_function.name);
+    const target_result_type = target_function.result_type;
+    const target_extra_param_types = try allocator.alloc(types.TypeId, target_function.parameters.len - 1);
+    defer allocator.free(target_extra_param_types);
+    for (target_function.parameters[1..], target_extra_param_types) |local, *out| {
+        out.* = target_function.locals.items[@intFromEnum(local)].type_id;
+    }
+
+    const wrapper_name = try std.fmt.allocPrint(module.arena.allocator(), "@iface_wrap_{s}", .{target_name});
+    const wrapper_id = try mir_builder.newFunction(module, allocator, wrapper_name, wasm_heap.dummy_symbol, target_result_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, wrapper_id);
+
+    const box_param = try builder.newLocal(wasm_heap.dummy_symbol, "box", target_layout.ptr_type);
+    var params: std.ArrayList(mir.LocalId) = .empty;
+    try params.append(allocator, box_param);
+    var extra_locals: std.ArrayList(mir.LocalId) = .empty;
+    for (target_extra_param_types) |t| {
+        const p = try builder.newLocal(wasm_heap.dummy_symbol, "a", t);
+        try params.append(allocator, p);
+        try extra_locals.append(allocator, p);
+    }
+    builder.currentFunction().parameters = try params.toOwnedSlice(allocator);
+    builder.currentFunction().type_store = target_type_store;
+
+    const box_val = try wasm_heap.loadLocal(&builder, box_param, target_layout.ptr_type);
+    const receiver = try builder.newValue(target_layout.ptr_type);
+    try builder.emit(.{ .mem_load = .{ .dst = receiver, .addr = box_val } });
+
+    const arena = module.arena.allocator();
+    var args: std.ArrayList(mir.ValueId) = .empty;
+    try args.append(arena, receiver);
+    for (extra_locals.items) |local| {
+        const t = builder.currentFunction().locals.items[@intFromEnum(local)].type_id;
+        try args.append(arena, try wasm_heap.loadLocal(&builder, local, t));
+    }
+
+    const is_void = target_type_store.eql(target_result_type, target_type_store.builtins.void);
+    const dst = if (is_void) null else try builder.newValue(target_result_type);
+    try builder.emit(.{ .call = .{ .dst = dst, .callee = target, .args = try args.toOwnedSlice(arena) } });
+    builder.terminate(.{ .return_value = .{ .value = dst } });
+
+    try wrapper_of.put(target, wrapper_id);
+    return wrapper_id;
 }
 
 fn usesInterfaces(module: *const mir.Module) bool {
@@ -108,7 +222,7 @@ fn tableIndexFor(table: *std.ArrayList(mir.FunctionId), table_index_of: *std.Aut
     return index;
 }
 
-fn expandBlock(builder: *mir_builder.Builder, allocator: std.mem.Allocator, block_id: mir.BlockId, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32)) !void {
+fn expandBlock(builder: *mir_builder.Builder, allocator: std.mem.Allocator, block_id: mir.BlockId, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId)) !void {
     const function = builder.currentFunction();
     var original = function.blockConst(block_id).*;
     function.block(block_id).instructions = .empty;
@@ -116,16 +230,16 @@ fn expandBlock(builder: *mir_builder.Builder, allocator: std.mem.Allocator, bloc
     builder.terminated = false;
 
     for (original.instructions.items) |instruction| {
-        try expandInstruction(builder, allocator, instruction, ctx, table, table_index_of);
+        try expandInstruction(builder, allocator, instruction, ctx, table, table_index_of, wrapper_of);
     }
     builder.terminate(original.terminator);
     original.instructions.deinit(allocator);
 }
 
-fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator, instruction: mir.Instruction, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32)) !void {
+fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator, instruction: mir.Instruction, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId)) !void {
     switch (instruction) {
         .cast_interface => |v| {
-            try expandCastInterface(builder, allocator, v, ctx, table, table_index_of);
+            try expandCastInterface(builder, allocator, v, ctx, table, table_index_of, wrapper_of);
         },
         .invoke_interface => |v| {
             try expandInvokeInterface(builder, ctx, v);
@@ -140,7 +254,7 @@ fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator
 // `emitConstString` already established for per-byte string content),
 // then `alloc(8)` for the box itself (`receiver` at offset 0, the
 // vtable array's own address at offset 4).
-fn expandCastInterface(builder: *mir_builder.Builder, allocator: std.mem.Allocator, v: anytype, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32)) !void {
+fn expandCastInterface(builder: *mir_builder.Builder, allocator: std.mem.Allocator, v: anytype, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId)) !void {
     const layout = ctx.layout;
     const module = builder.module;
     const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
@@ -162,7 +276,12 @@ fn expandCastInterface(builder: *mir_builder.Builder, allocator: std.mem.Allocat
     const vtable_array_local = try wasm_heap.storeLocal(builder, "@vtable", layout.ptr_type, vtable_array);
 
     for (v.vtable, 0..) |binding, i| {
-        const table_index = try tableIndexFor(table, table_index_of, allocator, binding.function);
+        // Ordinary (non-default) methods get routed through a thin
+        // unwrap-the-box wrapper — see `wrapperFor`'s own doc comment for
+        // why. Default methods use their own FunctionId directly (the
+        // box IS the shape they expect for `это`).
+        const callee = if (binding.is_default) binding.function else try wrapperFor(module, allocator, ctx.type_store, wrapper_of, binding.function);
+        const table_index = try tableIndexFor(table, table_index_of, allocator, callee);
         const table_index_const = try wasm_heap.addressConst(builder, layout.idx_type, table_index);
         const offset = try wasm_heap.addressConst(builder, layout.idx_type, @intCast(i * 4));
         const vtable_array_for_addr = try wasm_heap.loadLocal(builder, vtable_array_local, layout.ptr_type);
@@ -205,52 +324,47 @@ fn expandCastInterface(builder: *mir_builder.Builder, allocator: std.mem.Allocat
     try builder.emit(.{ .load_local = .{ .dst = v.dst, .local = box_local } });
 }
 
-// Unwraps the box (`receiver`, `vtable_ptr`), reads the vtable slot at
-// `method_index*4` (the ONLY genuinely dynamic part — a runtime i32,
-// not known until the program actually runs), then `.call_indirect`
-// with `[receiver] ++ args` (receiver first, matching every OTHER
-// method-call convention in this codebase — `это` is `parameters[0]`,
-// see `reserveMethods`/`lowerMethods`).
+// Reads the vtable slot at `method_index*4` (the ONLY genuinely dynamic
+// part — a runtime i32, not known until the program actually runs),
+// then `.call_indirect` with `[box] ++ args` — the BOX ITSELF (not an
+// unwrapped receiver) is passed uniformly to every vtable slot; see
+// `wrapperFor`'s doc comment for why (ordinary methods get a thin
+// unwrap-the-box wrapper generated at their `.cast_interface` site,
+// default methods already expect the box directly as `это`).
 fn expandInvokeInterface(builder: *mir_builder.Builder, ctx: ExpandCtx, v: anytype) !void {
     const layout = ctx.layout;
 
     const box_for_receiver = v.receiver;
-    const receiver_local = try wasm_heap.storeLocal(builder, "@iface_box", layout.ptr_type, box_for_receiver);
+    const box_local = try wasm_heap.storeLocal(builder, "@iface_box", layout.ptr_type, box_for_receiver);
 
     // `v.args` are ALSO pre-existing values (from the original
     // instruction stream, produced before this `.invoke_interface`) —
     // routed through Locals immediately, same reasoning as `v.receiver`
     // above and `v.src` in `expandCastInterface`, since they're only
-    // actually needed much later (after the box-unwrap/vtable-lookup
-    // code below).
+    // actually needed much later (after the vtable-lookup code below).
     const arg_locals = try builder.module.arena.allocator().alloc(mir.LocalId, v.args.len);
     for (v.args, arg_locals) |arg, *local| {
         local.* = try wasm_heap.storeLocal(builder, "@iface_arg", builder.currentFunction().valueType(arg), arg);
     }
 
-    const box_for_load = try wasm_heap.loadLocal(builder, receiver_local, layout.ptr_type);
-    const receiver = try builder.newValue(layout.ptr_type);
-    try builder.emit(.{ .mem_load = .{ .dst = receiver, .addr = box_for_load } });
-    const receiver_value_local = try wasm_heap.storeLocal(builder, "@receiver", layout.ptr_type, receiver);
-
     const four = try wasm_heap.addressConst(builder, layout.idx_type, 4);
-    const box_for_vtable = try wasm_heap.loadLocal(builder, receiver_local, layout.ptr_type);
+    const box_for_vtable = try wasm_heap.loadLocal(builder, box_local, layout.ptr_type);
     const vtable_field_addr = try wasm_heap.binOp(builder, layout.idx_type, .add, box_for_vtable, four);
     const vtable_array = try builder.newValue(layout.ptr_type);
     try builder.emit(.{ .mem_load = .{ .dst = vtable_array, .addr = vtable_field_addr } });
     const vtable_array_local = try wasm_heap.storeLocal(builder, "@vtable", layout.ptr_type, vtable_array);
 
     // `call_indirect`'s WASM stack requirement is `[args..., table_index]`
-    // (the index popped FIRST/topmost) — args (receiver + real args) must
+    // (the index popped FIRST/topmost) — args (box + real args) must
     // therefore be produced BEFORE `table_index`, not after, even though
     // the vtable slot needed to COMPUTE `table_index` was already read
     // above; the read (`mem_load` into `table_index`'s own ValueId) is
     // deferred to right before the call specifically to keep it the
     // LAST-produced operand.
-    const receiver_for_call = try wasm_heap.loadLocal(builder, receiver_value_local, layout.ptr_type);
+    const box_for_call = try wasm_heap.loadLocal(builder, box_local, layout.ptr_type);
     const arena = builder.module.arena.allocator();
     var args: std.ArrayList(mir.ValueId) = .empty;
-    try args.append(arena, receiver_for_call);
+    try args.append(arena, box_for_call);
     for (arg_locals) |local| {
         const arg_type = builder.currentFunction().locals.items[@intFromEnum(local)].type_id;
         try args.append(arena, try wasm_heap.loadLocal(builder, local, arg_type));

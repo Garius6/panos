@@ -13,6 +13,7 @@ const wasm_module = @import("wasm_module.zig");
 // `wasm_heap.zig` already established for compiler-synthesized locals.
 const dummy_symbol: symbols.SymbolId = @enumFromInt(0);
 
+
 // AST (post resolve+typecheck) → MIR. Ported from `core/mir_lowering.odin`
 // (~2000 lines there) — works at the SAME pipeline point `compiler.zig`
 // already does: reads the already-computed resolver/type-checker side
@@ -149,7 +150,7 @@ pub fn lowerModule(
         module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
         try symbol_to_function.put(symbol, function_id);
     }
-    try reserveMethods(&module, allocator, tree, resolution, checked, program, &symbol_to_function);
+    try reserveMethods(&module, allocator, tree, resolution, checked, program, &symbol_to_function, null, 0);
 
     for (program.declarations) |decl_id| {
         const function = switch (tree.decl(decl_id).*) {
@@ -198,13 +199,15 @@ fn reserveMethods(
     checked: *const type_checker.CheckResult,
     program: anytype,
     symbol_to_function: *std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
+    reachable: ?*const ReachableSet,
+    module_index: usize,
 ) !void {
     for (program.declarations) |decl_id| {
         switch (tree.decl(decl_id).*) {
             .impl => |implementation| for (implementation.methods) |method_decl_id| {
                 const function = tree.decl(method_decl_id).function;
-                if (function.type_parameters.len > 0) continue; // generics — Phase 2
                 const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
+                if (!isReachable(reachable, module_index, symbol)) continue;
                 const result_type = functionReturnType(checked, symbol);
                 const name = try mangledMethodName(module, implementation.target_type, function.name);
                 const function_id = try mir_builder.newFunction(module, allocator, name, symbol, result_type, function.span);
@@ -224,6 +227,7 @@ fn reserveMethods(
             .interface_decl => |interface| for (interface.default_methods) |method_decl_id| {
                 const function = tree.decl(method_decl_id).function;
                 const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
+                if (!isReachable(reachable, module_index, symbol)) continue;
                 const result_type = functionReturnType(checked, symbol);
                 const name = try mangledMethodName(module, interface.name, function.name);
                 const function_id = try mir_builder.newFunction(module, allocator, name, symbol, result_type, function.span);
@@ -248,7 +252,6 @@ fn lowerMethods(
         switch (tree.decl(decl_id).*) {
             .impl => |implementation| for (implementation.methods) |method_decl_id| {
                 const function = tree.decl(method_decl_id).function;
-                if (function.type_parameters.len > 0) continue;
                 const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
                 const function_id = symbol_to_function.get(symbol) orelse continue;
                 try lowerFunctionBody(allocator, tree, resolution, checked, module, function_id, method_decl_id, function.body, symbol_to_function);
@@ -264,6 +267,447 @@ fn lowerMethods(
     }
 }
 
+// --- Tree-shaking -----------------------------------------------------
+//
+// `cli/main.zig`'s AOT build path always links the FULL prelude into the
+// module graph, unconditionally — every declaration, whether or not the
+// actual program calls it. Every "AOT (wasm) не поддерживает X" build
+// failure hit across this whole multi-session WASM-AOT initiative
+// (generic struct fields, interface dispatch, default interface methods,
+// closures-as-values, cross-module TypeStore bugs...) was in prelude code
+// NO test program was even using — just reachable-in-principle. Without
+// reachability filtering, the NEXT unfamiliar prelude feature blocks the
+// NEXT program the exact same way, forever. This must run BEFORE
+// lowering (not as a dead-code-eliminate pass on the already-lowered MIR
+// module) — an unreachable declaration that fails to LOWER aborts the
+// whole build before any later pass could ever get a chance to discard
+// it.
+//
+// `SymbolId` is scoped per-module (a fresh `Resolution` per file — see
+// `lowerGraph`'s own "Imported symbols are freshly minted in the
+// importing Resolution" comment above), so a bare `SymbolId` is not
+// globally unique across the graph; every reachability key carries its
+// owning module index alongside the symbol.
+const ReachKey = struct {
+    module_index: usize,
+    symbol: symbols.SymbolId,
+};
+pub const ReachableSet = std.AutoHashMap(ReachKey, void);
+
+fn isReachable(reachable: ?*const ReachableSet, module_index: usize, symbol: symbols.SymbolId) bool {
+    // `null` — no filtering at all (the single-file `lowerModule` path
+    // used by unit tests, which has no real module graph / entry point
+    // to compute reachability from) — every declaration compiles,
+    // exactly like before tree-shaking existed.
+    const set = reachable orelse return true;
+    return set.contains(.{ .module_index = module_index, .symbol = symbol });
+}
+
+fn markReachable(allocator: std.mem.Allocator, set: *ReachableSet, worklist: *std.ArrayList(ReachKey), module_index: usize, symbol: symbols.SymbolId) !void {
+    const key = ReachKey{ .module_index = module_index, .symbol = symbol };
+    if (set.contains(key)) return;
+    try set.put(key, {});
+    try worklist.append(allocator, key);
+}
+
+// A referenced symbol may be a LOCAL declaration in `module_index`'s own
+// module, or an IMPORT ALIAS — `resolution.imported_symbols` (freshly
+// minted per importing module, see `lowerGraph`'s own comment) redirects
+// an alias straight to the exporting declaration's OWN module + symbol,
+// the exact same redirect `lowerGraph`'s existing "Imported symbols..."
+// loop already performs for `function_maps` — reused here unchanged.
+fn recordReference(
+    allocator: std.mem.Allocator,
+    compiled: anytype,
+    resolution: *const resolver.Resolution,
+    set: *ReachableSet,
+    worklist: *std.ArrayList(ReachKey),
+    module_index: usize,
+    symbol: symbols.SymbolId,
+) !void {
+    if (resolution.imported_symbols.get(symbol)) |origin| {
+        const target_resolution = if (compiled.modules[origin.module].resolution) |*value| value else return;
+        const target_symbol = target_resolution.decl_symbols.get(origin.declaration) orelse return;
+        try markReachable(allocator, set, worklist, origin.module, target_symbol);
+        return;
+    }
+    try markReachable(allocator, set, worklist, module_index, symbol);
+}
+
+// Finds the body of whichever declaration (top-level function, `.impl`
+// method, or `.interface_decl` default method) owns `symbol` in this
+// module — a plain linear scan (not a pre-built reverse index): this
+// runs once per worklist item, not a hot path, and program sizes here
+// are small enough that the extra bookkeeping of a cached reverse map
+// isn't worth it.
+fn findSymbolBody(tree: *const ast.Ast, resolution: *const resolver.Resolution, symbol: symbols.SymbolId) ?[]const ast.StmtId {
+    const program = tree.program orelse return null;
+    for (program.declarations) |decl_id| {
+        switch (tree.decl(decl_id).*) {
+            .function => |function| {
+                if ((resolution.decl_symbols.get(decl_id) orelse continue) == symbol) return function.body;
+            },
+            .impl => |implementation| for (implementation.methods) |method_decl_id| {
+                if ((resolution.decl_symbols.get(method_decl_id) orelse continue) == symbol) return tree.decl(method_decl_id).function.body;
+            },
+            .interface_decl => |interface| for (interface.default_methods) |method_decl_id| {
+                if ((resolution.decl_symbols.get(method_decl_id) orelse continue) == symbol) return tree.decl(method_decl_id).function.body;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+// Every interface cast anywhere in reachable code pulls in the concrete
+// implementation it resolves to — mirrors `applyInterfaceCast`'s own
+// vtable-building loop exactly (same `findInterfaceImplementation` call,
+// same default-vs-override method selection), just marking symbols
+// reachable instead of emitting MIR. Checked at EVERY expression (not
+// just calls) — `registerInterfaceCast` (type_checker.zig) attaches a
+// cast to let-bindings/returns/params/array-or-map-elements, not only
+// call arguments.
+fn recordInterfaceCastEdges(
+    allocator: std.mem.Allocator,
+    compiled: anytype,
+    checked: *const type_checker.CheckResult,
+    resolution: *const resolver.Resolution,
+    set: *ReachableSet,
+    worklist: *std.ArrayList(ReachKey),
+    module_index: usize,
+    expression: ast.ExprId,
+) !void {
+    const cast = checked.interface_casts.get(expression) orelse return;
+    for (cast.entries) |entry| {
+        var ambiguous = false;
+        const implementation = type_checker.findInterfaceImplementation(checked, entry.interface, entry.arguments, entry.target, entry.target_arguments, &ambiguous) orelse continue;
+        for (implementation.methods) |method_symbol| {
+            try recordReference(allocator, compiled, resolution, set, worklist, module_index, method_symbol);
+        }
+    }
+}
+
+fn walkExpr(
+    allocator: std.mem.Allocator,
+    compiled: anytype,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    checked: *const type_checker.CheckResult,
+    set: *ReachableSet,
+    worklist: *std.ArrayList(ReachKey),
+    module_index: usize,
+    expression: ast.ExprId,
+) anyerror!void {
+    if (resolution.expr_symbols.get(expression)) |symbol| {
+        try recordReference(allocator, compiled, resolution, set, worklist, module_index, symbol);
+    }
+    if (checked.method_calls.get(expression)) |symbol| {
+        try recordReference(allocator, compiled, resolution, set, worklist, module_index, symbol);
+    }
+    try recordInterfaceCastEdges(allocator, compiled, checked, resolution, set, worklist, module_index, expression);
+
+    switch (tree.expr(expression).*) {
+        .number, .boolean, .string, .ident, .error_node => {},
+        .unary => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.operand),
+        .cast => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.operand),
+        .binary => |v| {
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.left);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.right);
+        },
+        .call => |v| {
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.callee);
+            for (v.arguments) |argument| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, argument);
+        },
+        .spawn => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.call),
+        .select_wait => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.source),
+        .property => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.object),
+        .if_expr => |v| {
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.condition);
+            try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.then_branch);
+            try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.else_branch);
+        },
+        .while_expr => |v| {
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.condition);
+            try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.body);
+        },
+        .tuple => |v| for (v.elements) |element| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, element),
+        .lambda => |v| try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.body),
+        .array => |v| for (v.elements) |element| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, element),
+        .map => |v| for (v.entries) |entry| {
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, entry.key);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, entry.value);
+        },
+        .index => |v| {
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.object);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.index);
+        },
+        .try_expr => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.value),
+        .match_expr => |v| {
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.subject);
+            for (v.arms) |arm| {
+                if (tree.pattern(arm.pattern).* == .literal) try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, tree.pattern(arm.pattern).literal.value);
+                try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, arm.body);
+            }
+        },
+    }
+}
+
+fn walkStmts(
+    allocator: std.mem.Allocator,
+    compiled: anytype,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    checked: *const type_checker.CheckResult,
+    set: *ReachableSet,
+    worklist: *std.ArrayList(ReachKey),
+    module_index: usize,
+    statements: []const ast.StmtId,
+) anyerror!void {
+    for (statements) |statement| {
+        switch (tree.stmt(statement).*) {
+            .return_stmt => |v| if (v.value) |value| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, value),
+            .let => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.value),
+            .expr => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.value),
+            .for_in => |v| {
+                try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.iterable);
+                try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.body);
+            },
+            .for_range => |v| {
+                try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.start);
+                try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.end);
+                try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.body);
+            },
+            .continue_stmt, .break_stmt, .error_node => {},
+        }
+    }
+}
+
+// `DOM.на_клик` (2-arg form, no context, OR 3-arg form — SAME source-
+// level property name either way, `lowerDomBuiltinCall` disambiguates
+// by argument COUNT into `DOM::на_клик`/`DOM::на_клик_контекст`
+// internally) and `DOM.после_кадра` take a handler function's NAME as a
+// STRING LITERAL argument (`aot-dom-loader.js`'s `instance.exports[name]`
+// — resolved by STRING at runtime, invisible to the ordinary call-graph
+// walk above). Scans every string-literal argument to one of these
+// calls anywhere in ALREADY-reachable code (a second pass, after the
+// main worklist settles once) and, for each one that exactly matches
+// some top-level function's own name, adds that function as an extra
+// root. Caller re-drains the worklist to a fixpoint afterward — a
+// newly-added handler can itself reference more calls/casts/handlers.
+fn addDomHandlerRoots(
+    allocator: std.mem.Allocator,
+    graph: anytype,
+    compiled: anytype,
+    set: *ReachableSet,
+    worklist: *std.ArrayList(ReachKey),
+) !void {
+    for (graph.order.items) |module_index| {
+        const resolution = if (compiled.modules[module_index].resolution) |*value| value else continue;
+        const checked = if (compiled.modules[module_index].checked) |*value| value else continue;
+        const tree = &graph.modules.items[module_index].tree;
+        const program = tree.program orelse continue;
+        try scanDomHandlerRootsInDecls(allocator, graph, compiled, tree, resolution, checked, set, worklist, module_index, program.declarations);
+    }
+}
+
+fn scanDomHandlerRootsInDecls(
+    allocator: std.mem.Allocator,
+    graph: anytype,
+    compiled: anytype,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    checked: *const type_checker.CheckResult,
+    set: *ReachableSet,
+    worklist: *std.ArrayList(ReachKey),
+    module_index: usize,
+    declarations: []const ast.DeclId,
+) !void {
+    for (declarations) |decl_id| {
+        const body: []const ast.StmtId = switch (tree.decl(decl_id).*) {
+            .function => |function| function.body,
+            .impl => |implementation| blk: {
+                for (implementation.methods) |method_decl_id| try scanDomHandlerRootsInDecls(allocator, graph, compiled, tree, resolution, checked, set, worklist, module_index, &.{method_decl_id});
+                break :blk &.{};
+            },
+            .interface_decl => |interface| blk: {
+                for (interface.default_methods) |method_decl_id| try scanDomHandlerRootsInDecls(allocator, graph, compiled, tree, resolution, checked, set, worklist, module_index, &.{method_decl_id});
+                break :blk &.{};
+            },
+            else => &.{},
+        };
+        const symbol = resolution.decl_symbols.get(decl_id);
+        // Only scan a declaration reachable via the main worklist — the
+        // whole point is finding string-literal roots inside code that's
+        // ALREADY known to run, not resurrecting dead code via its own
+        // handler-registration calls.
+        if (symbol == null or !set.contains(.{ .module_index = module_index, .symbol = symbol.? })) continue;
+        try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, body);
+    }
+}
+
+fn scanDomHandlerRootsInStmts(
+    allocator: std.mem.Allocator,
+    graph: anytype,
+    compiled: anytype,
+    tree: *const ast.Ast,
+    set: *ReachableSet,
+    worklist: *std.ArrayList(ReachKey),
+    module_index: usize,
+    statements: []const ast.StmtId,
+) !void {
+    for (statements) |statement| {
+        switch (tree.stmt(statement).*) {
+            .return_stmt => |v| if (v.value) |value| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, value),
+            .let => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.value),
+            .expr => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.value),
+            .for_in => |v| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.body),
+            .for_range => |v| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.body),
+            .continue_stmt, .break_stmt, .error_node => {},
+        }
+    }
+}
+
+fn scanDomHandlerRootsInExpr(
+    allocator: std.mem.Allocator,
+    graph: anytype,
+    compiled: anytype,
+    tree: *const ast.Ast,
+    set: *ReachableSet,
+    worklist: *std.ArrayList(ReachKey),
+    module_index: usize,
+    expression: ast.ExprId,
+) anyerror!void {
+    switch (tree.expr(expression).*) {
+        .call => |call| {
+            if (tree.expr(call.callee).* == .property) {
+                const property = tree.expr(call.callee).property;
+                const is_handler_call = std.mem.eql(u8, property.property, "на_клик") or
+                    std.mem.eql(u8, property.property, "после_кадра");
+                if (is_handler_call) {
+                    for (call.arguments) |argument| {
+                        if (tree.expr(argument).* != .string) continue;
+                        const handler_name = tree.expr(argument).string.value;
+                        try addRootByName(allocator, graph, compiled, set, worklist, handler_name);
+                    }
+                }
+            }
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, call.callee);
+            for (call.arguments) |argument| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, argument);
+        },
+        .unary => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.operand),
+        .cast => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.operand),
+        .binary => |v| {
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.left);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.right);
+        },
+        .spawn => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.call),
+        .select_wait => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.source),
+        .property => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.object),
+        .if_expr => |v| {
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.condition);
+            try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.then_branch);
+            try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.else_branch);
+        },
+        .while_expr => |v| {
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.condition);
+            try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.body);
+        },
+        .tuple => |v| for (v.elements) |element| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, element),
+        .lambda => |v| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, v.body),
+        .array => |v| for (v.elements) |element| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, element),
+        .map => |v| for (v.entries) |entry| {
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, entry.key);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, entry.value);
+        },
+        .index => |v| {
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.object);
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.index);
+        },
+        .try_expr => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.value),
+        .match_expr => |v| {
+            try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, module_index, v.subject);
+            for (v.arms) |arm| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, module_index, arm.body);
+        },
+        .number, .boolean, .string, .ident, .error_node => {},
+    }
+}
+
+// A DOM-handler name is always a plain top-level `функ`, never a method
+// (see `dom_on_click_context`'s own doc comment in `aot-dom-loader.js`:
+// "name remains a static exported function") — search every module's
+// top-level function declarations for a name match, add the FIRST one
+// found (handler names are meant to be unambiguous top-level entry
+// points; a genuine collision across modules would already be a
+// same-module-shadowing question the resolver itself handles elsewhere,
+// out of scope here).
+fn addRootByName(allocator: std.mem.Allocator, graph: anytype, compiled: anytype, set: *ReachableSet, worklist: *std.ArrayList(ReachKey), name: []const u8) !void {
+    for (graph.order.items) |module_index| {
+        const resolution = if (compiled.modules[module_index].resolution) |*value| value else continue;
+        const tree = &graph.modules.items[module_index].tree;
+        const program = tree.program orelse continue;
+        for (program.declarations) |decl_id| {
+            const function = switch (tree.decl(decl_id).*) {
+                .function => |value| value,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, function.name, name)) continue;
+            const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
+            try markReachable(allocator, set, worklist, module_index, symbol);
+            return;
+        }
+    }
+}
+
+pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, compiled: anytype) !ReachableSet {
+    var set: ReachableSet = .init(allocator);
+    errdefer set.deinit();
+    var worklist: std.ArrayList(ReachKey) = .empty;
+    defer worklist.deinit(allocator);
+
+    // Module index 0 is ALWAYS the entry module — `graph.load(...)` (the
+    // very first call, before `appendPreludeModule`/any import) assigns
+    // it, and `cli/main.zig` itself relies on this exact convention
+    // (`compiled.modules[0]`) — NOT `graph.order.items[len - 1]` (that
+    // ordering is dependency-topological, and the prelude — appended
+    // separately, no explicit import edges pointing AT it — actually
+    // sorts FIRST, not last; confirmed by `module_loader.zig`'s own test
+    // `expectEqual(prelude_index, graph.order.items[0])`).
+    if (graph.modules.items.len == 0) return set;
+    const entry_module_index: usize = 0;
+    const entry_resolution = if (compiled.modules[entry_module_index].resolution) |*value| value else return set;
+    const entry_tree = &graph.modules.items[entry_module_index].tree;
+    const entry_program = entry_tree.program orelse return set;
+    for (entry_program.declarations) |decl_id| {
+        const function = switch (entry_tree.decl(decl_id).*) {
+            .function => |value| value,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, function.name, "старт")) continue;
+        const symbol = entry_resolution.decl_symbols.get(decl_id) orelse continue;
+        try markReachable(allocator, &set, &worklist, entry_module_index, symbol);
+        break;
+    }
+
+    while (worklist.pop()) |item| {
+        const resolution = if (compiled.modules[item.module_index].resolution) |*value| value else continue;
+        const checked = if (compiled.modules[item.module_index].checked) |*value| value else continue;
+        const tree = &graph.modules.items[item.module_index].tree;
+        const body = findSymbolBody(tree, resolution, item.symbol) orelse continue;
+        try walkStmts(allocator, compiled, tree, resolution, checked, &set, &worklist, item.module_index, body);
+    }
+
+    try addDomHandlerRoots(allocator, graph, compiled, &set, &worklist);
+    while (worklist.pop()) |item| {
+        const resolution = if (compiled.modules[item.module_index].resolution) |*value| value else continue;
+        const checked = if (compiled.modules[item.module_index].checked) |*value| value else continue;
+        const tree = &graph.modules.items[item.module_index].tree;
+        const body = findSymbolBody(tree, resolution, item.symbol) orelse continue;
+        try walkStmts(allocator, compiled, tree, resolution, checked, &set, &worklist, item.module_index, body);
+    }
+
+    return set;
+}
+
 // Link the already resolved/type-checked module graph into one AOT MIR
 // module. The bytecode compiler has its own linker; this deliberately keeps
 // an AOT-specific, small equivalent so WASM does not inherit bytecode VM
@@ -276,6 +720,12 @@ pub fn lowerGraph(
 ) !mir.Module {
     var module = mir.Module.init(allocator);
     errdefer module.deinit(allocator);
+
+    // Tree-shaking — see `computeReachableSymbols`'s own doc comment for
+    // why this MUST run before any lowering happens, not as a dead-code-
+    // eliminate pass afterward.
+    var reachable = try computeReachableSymbols(allocator, graph, compiled);
+    defer reachable.deinit();
 
     var function_maps: std.ArrayList(std.AutoHashMap(symbols.SymbolId, mir.FunctionId)) = .empty;
     defer {
@@ -298,14 +748,14 @@ pub fn lowerGraph(
                 .function => |value| value,
                 else => continue,
             };
-            if (function.type_parameters.len != 0) continue;
             const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
+            if (!isReachable(&reachable, module_index, symbol)) continue;
             const result_type = functionReturnType(checked, symbol);
             const function_id = try mir_builder.newFunction(&module, allocator, function.name, symbol, result_type, function.span);
             module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
             try function_maps.items[module_index].put(symbol, function_id);
         }
-        try reserveMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index]);
+        try reserveMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index], &reachable, module_index);
     }
 
     // Imported symbols are freshly minted in the importing Resolution. Map
@@ -332,7 +782,6 @@ pub fn lowerGraph(
                 .function => |value| value,
                 else => continue,
             };
-            if (function.type_parameters.len != 0) continue;
             const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
             const function_id = function_maps.items[module_index].get(symbol) orelse continue;
             try lowerFunctionBody(allocator, tree, resolution, checked, &module, function_id, decl_id, function.body, &function_maps.items[module_index]);

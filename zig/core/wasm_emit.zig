@@ -1069,6 +1069,7 @@ fn hostImportNameForBuiltin(name: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "DOM::установить_текст")) return "dom_set_text_num";
     if (std.mem.eql(u8, name, "DOM::на_клик")) return "dom_on_click_num";
     if (std.mem.eql(u8, name, "DOM::на_клик_контекст")) return "dom_on_click_context";
+    if (std.mem.eql(u8, name, "DOM::на_клик_замыкание")) return "dom_on_click_closure";
     if (std.mem.eql(u8, name, "DOM::текст_строка")) return "dom_get_text_string";
     if (std.mem.eql(u8, name, "DOM::установить_текст_строка")) return "dom_set_text_string";
     if (std.mem.eql(u8, name, "DOM::значение_поля")) return "dom_get_input_value";
@@ -1111,6 +1112,8 @@ fn builtinSignature(name: []const u8) !BuiltinSignature {
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
     if (std.mem.eql(u8, name, "DOM::на_клик_контекст"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
+    if (std.mem.eql(u8, name, "DOM::на_клик_замыкание"))
+        return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
     if (std.mem.eql(u8, name, "DOM::текст_строка") or std.mem.eql(u8, name, "DOM::значение_поля"))
         return .{ .params = &.{wasm_module.wasm_i32}, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "DOM::установить_текст_строка") or std.mem.eql(u8, name, "DOM::установить_значение_поля"))

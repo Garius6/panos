@@ -394,6 +394,44 @@ pub fn findOrBuildPromoteToPermanent(allocator: std.mem.Allocator, module: *mir.
     return buildPromoteToPermanent(allocator, module, type_store, layout);
 }
 
+pub const promote_bytes_to_permanent_function_name = "@promote_bytes_to_permanent";
+
+// `@promote_bytes_to_permanent(src: Строка, size: idx) -> Строка`: like
+// `@promote_to_permanent` above, but `size` is an explicit RUNTIME
+// argument instead of read from a length-prefix header — for copying a
+// fixed-size raw block with no such header, e.g. a WASM AOT closure's
+// environment allocation (`mir_lowering.zig`'s `на_клик_замыкание`
+// lowering, Stage B — the closure's ENV/BOX must live in the permanent
+// region too, not just its (currently scalar-only) captured VALUES, or
+// the box pointer itself would dangle across the next arena reset —
+// same class of problem `@promote_to_permanent` already solves for
+// `на_клик_контекст`'s context string, one level up the pointer chain).
+fn buildPromoteBytesToPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, promote_bytes_to_permanent_function_name, dummy_symbol, layout.ptr_type, dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const src_local = try builder.newLocal(dummy_symbol, "src", layout.ptr_type);
+    const size_local = try builder.newLocal(dummy_symbol, "size", layout.idx_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{ src_local, size_local });
+    builder.currentFunction().type_store = type_store;
+
+    const alloc_id = try findOrBuildAllocPermanent(allocator, module, type_store, layout);
+    const size_for_call = try loadLocal(&builder, size_local, layout.idx_type);
+    const dst = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = dst, .callee = alloc_id, .args = try dupeOne(module, size_for_call) } });
+    const dst_local = try storeLocal(&builder, "dst", layout.ptr_type, dst);
+
+    try emitByteCopyLoop(&builder, layout, src_local, dst_local, size_local);
+
+    const dst_for_return = try loadLocal(&builder, dst_local, layout.ptr_type);
+    builder.terminate(.{ .return_value = .{ .value = dst_for_return } });
+    return id;
+}
+
+pub fn findOrBuildPromoteBytesToPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
+    if (findFunctionByName(module, promote_bytes_to_permanent_function_name)) |id| return id;
+    return buildPromoteBytesToPermanent(allocator, module, type_store, layout);
+}
+
 // Real bug found while extracting this from `wasm_actors.zig`: the
 // original had a process-global `var g_alloc_id: ?mir.FunctionId = null`
 // cache — stale across separate compilations within the same process

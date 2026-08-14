@@ -3654,6 +3654,36 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.void;
             }
+            // WASM AOT closures, Stage B — a REAL closure value instead
+            // of a static exported handler NAME + one Строка context
+            // (`DOM.на_клик`'s existing 2/3-arg forms above). The
+            // handler is a genuine `функ() -> Пусто` value — captures do
+            // the job the old "context" string argument used to.
+            // Deliberately a SEPARATE method name (not an overload of
+            // `на_клик`) — hand-rolled per-builtin type-checking here has
+            // no shared union-type-argument machinery, and reusing the
+            // same name would need one; a new name is additive and keeps
+            // `на_клик`'s existing contract/callers untouched. Only a
+            // STRUCTURAL "is this a function-typed value" check — a
+            // real signature match (zero params, void return) is not
+            // enforced yet, see `project_panos_wasm_aot_closures`.
+            if (self.isBuiltinModule(symbol, "DOM", "на_клик_замыкание")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: DOM.на_клик_замыкание() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: DOM.на_клик_замыкание() ожидает CSS-селектор типа Строка первым аргументом", .{});
+                }
+                const handler_type = try self.infer(call.arguments[1]);
+                const handler_entry = self.result.types.get(handler_type);
+                const is_function = handler_entry != null and handler_entry.?.* == .function;
+                if (!is_function) {
+                    try self.report(call.span, "Type Error: DOM.на_клик_замыкание() ожидает замыкание (функ() -> Пусто) вторым аргументом", .{});
+                }
+                return self.result.types.builtins.void;
+            }
             if (self.isBuiltinModule(symbol, "DOM", "текст_строка") or self.isBuiltinModule(symbol, "DOM", "значение_поля")) {
                 const name = if (self.isBuiltinModule(symbol, "DOM", "текст_строка")) "текст_строка" else "значение_поля";
                 if (call.arguments.len != 1) {

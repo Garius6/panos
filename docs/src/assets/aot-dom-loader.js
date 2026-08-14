@@ -160,6 +160,24 @@ export async function loadAotDomProgram(programWasmUrl) {
 				registerClick(el, () => handler(contextPtr))
 			}
 		},
+		// `DOM.на_клик_замыкание(selector, замыкание)` — a REAL closure
+		// (WASM AOT closures Stage B), not a static name lookup. A
+		// closure has no export name at all — `boxPtr` is already a
+		// pointer into the PERMANENT (non-arena-reset) region on the
+		// WASM side (`mir_lowering.zig`'s `promoteClosureBoxToPermanent`)
+		// — it's held here raw and handed, unchanged, to the ONE fixed
+		// trampoline export (`@invoke_closure_click`, Stage B's single
+		// handler shape — `функ() -> Пусто`, captures carry all state)
+		// on every click. `@invoke_closure_click` internally does the
+		// unbox+`call_indirect` dance (WASM-side, `wasm_interfaces.zig`'s
+		// `expandCallValue`) — this loader just forwards the pointer.
+		dom_on_click_closure: (selectorPtr, boxPtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			const trampoline = instance.exports["@invoke_closure_click"]
+			if (el && typeof trampoline === "function") {
+				registerClick(el, () => trampoline(boxPtr))
+			}
+		},
 		dom_get_text_string: (selectorPtr) => {
 			const el = document.querySelector(readString(selectorPtr))
 			return writeString(el?.textContent ?? "")

@@ -993,6 +993,15 @@ pub fn lowerGraph(
         try seen_handler_names.put(name, {});
         try handler_names_owned.append(module_arena, try module_arena.dupe(u8, name));
     }
+    // `DOM.на_клик_замыкание`'s trampoline (Stage B) isn't found by the
+    // string-literal-name scan above at all — closures have no literal
+    // name — but it's still a genuine JS-invoked entry point (on every
+    // click) needing `wasm_gc_arena.zig`'s checkpoint/restore wrap, same
+    // as any name-based handler. A presence check is enough (fixed name,
+    // built at most once per module by `findOrBuildInvokeClosureClickTrampoline`).
+    if (wasm_heap.findFunctionByName(&module, invoke_closure_click_trampoline_name) != null) {
+        try handler_names_owned.append(module_arena, invoke_closure_click_trampoline_name);
+    }
     module.dom_handler_names = try handler_names_owned.toOwnedSlice(module_arena);
 
     return module;
@@ -2509,12 +2518,161 @@ fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types
 // methods. The browser emitter transports every Panos `Строка` as an
 // opaque JS-runtime handle; click callbacks are still named, zero-argument
 // exports and cannot capture a Panos context yet.
+// `true` for a "flat scalar" capture (Число/Булево/Целое — copied by
+// raw 8-byte value, no pointer chasing needed) vs a "pointer-carrying"
+// capture (Строка/Массив/struct/`Процесс`/another closure — needs
+// Stage C's not-yet-built recursive promotion). Mirrors the same
+// `.nominal`/`.array`/`.process`/`.function` split `wasm_module.
+// wasmValTypeForStore` already encodes; `Строка` is handled specially
+// since it's a primitive builtin type with no `.get()` entry, not a
+// `.nominal`.
+fn isScalarCaptureType(checked: *const type_checker.CheckResult, type_id: types.TypeId) bool {
+    if (checked.types.eql(type_id, checked.types.builtins.string)) return false;
+    const entry = checked.types.get(type_id) orelse return true;
+    return switch (entry.*) {
+        .nominal, .array, .process, .function => false,
+        else => true,
+    };
+}
+
+pub const invoke_closure_click_trampoline_name = "@invoke_closure_click";
+
+// One FIXED trampoline, shared by every `DOM.на_клик_замыкание`
+// registration in the module — Stage B's handler shape is always
+// `функ() -> Пусто` (captures carry all the state a handler needs, no
+// event-argument passing yet), so exactly ONE shape is ever needed.
+// Body is just `.call_value{callee: box_param, args: &.{}}` — deliberately
+// NOT hand-unboxed here: `wasm_interfaces.zig`'s existing `expandCallValue`
+// already does the unbox-then-`call_indirect` rewrite for ANY closure-typed
+// `.call_value`, generically, later in the pipeline — reusing it here
+// avoids duplicating that logic for a second time.
+fn findOrBuildInvokeClosureClickTrampoline(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
+    if (wasm_heap.findFunctionByName(module, invoke_closure_click_trampoline_name)) |id| return id;
+    const id = try mir_builder.newFunction(module, allocator, invoke_closure_click_trampoline_name, dummy_symbol, type_store.builtins.void, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const box_local = try builder.newLocal(dummy_symbol, "box", layout.ptr_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{box_local});
+    builder.currentFunction().type_store = type_store;
+
+    const box_val = try wasm_heap.loadLocal(&builder, box_local, layout.ptr_type);
+    try builder.emit(.{ .call_value = .{ .dst = null, .callee = box_val, .args = &.{} } });
+    builder.terminate(.{ .return_value = .{ .value = null } });
+    return id;
+}
+
+// Rebuilds a `.build_closure`-produced box (table_index + env_ptr,
+// currently in the ordinary RESETTABLE arena) directly in the
+// PERMANENT region — needed even though Stage B restricts captures to
+// SCALAR values: the captured VALUES being scalar avoids Stage C's
+// recursive-pointer-chasing problem, but the box+env ALLOCATIONS
+// THEMSELVES are still pointers that JS holds raw across a separate
+// later export call (the click) — same class of problem `на_клик_
+// контекст`'s context string already had, one level up the pointer
+// chain. `capture_count` is compile-time known (the lambda's own
+// `lambda_captures.len`) — the env has no length header to read, so
+// `wasm_heap.findOrBuildPromoteBytesToPermanent` takes the size as an
+// explicit argument instead.
+fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, box_value: mir.ValueId, capture_count: usize) !mir.ValueId {
+    const module = ctx.builder.module;
+    const box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_box", layout.ptr_type, box_value);
+
+    const box_for_table = try wasm_heap.loadLocal(&ctx.builder, box_local, layout.ptr_type);
+    const table_index = try ctx.builder.newValue(layout.idx_type);
+    try ctx.builder.emit(.{ .mem_load = .{ .dst = table_index, .addr = box_for_table } });
+    const table_index_local = try wasm_heap.storeLocal(&ctx.builder, "@click_table_index", layout.idx_type, table_index);
+
+    const promoted_env_local = env_blk: {
+        if (capture_count == 0) {
+            const zero = try wasm_heap.addressConst(&ctx.builder, layout.ptr_type, 0);
+            break :env_blk try wasm_heap.storeLocal(&ctx.builder, "@click_env", layout.ptr_type, zero);
+        }
+        const box_for_env = try wasm_heap.loadLocal(&ctx.builder, box_local, layout.ptr_type);
+        const four = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 4);
+        const env_addr = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .add, box_for_env, four);
+        const env_ptr = try ctx.builder.newValue(layout.ptr_type);
+        try ctx.builder.emit(.{ .mem_load = .{ .dst = env_ptr, .addr = env_addr } });
+
+        const promote_id = try wasm_heap.findOrBuildPromoteBytesToPermanent(ctx.allocator, module, &ctx.checked.types, layout);
+        const size_const = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, @intCast(capture_count * 8));
+        const arena = module.arena.allocator();
+        var promote_args: std.ArrayList(mir.ValueId) = .empty;
+        try promote_args.append(arena, env_ptr);
+        try promote_args.append(arena, size_const);
+        const promoted = try ctx.builder.newValue(layout.ptr_type);
+        try ctx.builder.emit(.{ .call = .{ .dst = promoted, .callee = promote_id, .args = try promote_args.toOwnedSlice(arena) } });
+        break :env_blk try wasm_heap.storeLocal(&ctx.builder, "@click_env", layout.ptr_type, promoted);
+    };
+
+    const alloc_permanent_id = try wasm_heap.findOrBuildAllocPermanent(ctx.allocator, module, &ctx.checked.types, layout);
+    const box_size = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 8);
+    const new_box = try ctx.builder.newValue(layout.ptr_type);
+    try ctx.builder.emit(.{ .call = .{ .dst = new_box, .callee = alloc_permanent_id, .args = try wasm_heap.dupeOne(module, box_size) } });
+    const new_box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_new_box", layout.ptr_type, new_box);
+
+    const table_index_for_store = try wasm_heap.loadLocal(&ctx.builder, table_index_local, layout.idx_type);
+    const new_box_for_table = try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
+    try ctx.builder.emit(.{ .mem_store = .{ .addr = new_box_for_table, .src = table_index_for_store } });
+
+    const env_for_store = try wasm_heap.loadLocal(&ctx.builder, promoted_env_local, layout.ptr_type);
+    const four2 = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 4);
+    const new_box_for_env_addr = try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
+    const env_field_addr = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .add, new_box_for_env_addr, four2);
+    try ctx.builder.emit(.{ .mem_store = .{ .addr = env_field_addr, .src = env_for_store } });
+
+    return try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
+}
+
+// `DOM.на_клик_замыкание(selector, замыкание)` — WASM AOT closures,
+// Stage B. Deliberately requires the handler argument to be a literal
+// `.lambda` expression AT THE CALL SITE (not an arbitrary closure-typed
+// value from elsewhere) — this is what makes the capture list
+// statically inspectable here via `lambda_captures`, needed for the
+// scalar-only restriction below. See `project_panos_wasm_aot_closures`.
+fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutcome {
+    if (call.arguments.len != 2) return unsupported("DOM.на_клик_замыкание() ожидает 2 аргумента");
+    const handler_expr = call.arguments[1];
+    switch (ctx.tree.expr(handler_expr).*) {
+        .lambda => {},
+        else => return unsupported("DOM.на_клик_замыкание() ожидает лямбда-выражение непосредственно на месте вызова (Stage B)"),
+    }
+    const captures = ctx.resolution.lambda_captures.get(handler_expr) orelse &.{};
+    for (captures) |capture_symbol| {
+        const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
+        if (!isScalarCaptureType(ctx.checked, capture_type)) {
+            return unsupported("DOM.на_клик_замыкание(): захват значений с внутренними указателями (Строка/Массив/структура) пока не поддержан (Stage B — см. Stage C, project_panos_wasm_aot_closures)");
+        }
+    }
+
+    const selector = try lowerExpr(ctx, call.arguments[0]);
+    if (selector.flow == .terminates) return terminated;
+    const handler_outcome = try lowerExpr(ctx, handler_expr);
+    if (handler_outcome.flow == .terminates) return terminated;
+
+    const layout = wasm_heap.PtrLayout{
+        .ptr_type = ctx.checked.types.builtins.string,
+        .idx_type = ctx.checked.types.builtins.boolean,
+        .bool_type = ctx.checked.types.builtins.boolean,
+    };
+    _ = try findOrBuildInvokeClosureClickTrampoline(ctx.allocator, ctx.builder.module, &ctx.checked.types, layout);
+    const promoted_box = try promoteClosureBoxToPermanent(ctx, layout, handler_outcome.value, captures.len);
+
+    const arena = ctx.builder.module.arena.allocator();
+    var args: std.ArrayList(mir.ValueId) = .empty;
+    try args.append(arena, selector.value);
+    try args.append(arena, promoted_box);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = "DOM::на_клик_замыкание", .args = try args.toOwnedSlice(arena) } });
+    return continuesWith(mir.invalid_value);
+}
+
 fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
     if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "DOM")) return null;
 
     const property = ctx.tree.expr(call.callee).property;
+    if (std.mem.eql(u8, property.property, "на_клик_замыкание")) {
+        return try lowerDomClickClosure(ctx, call);
+    }
     const name = if (std.mem.eql(u8, property.property, "текст"))
         "DOM::текст"
     else if (std.mem.eql(u8, property.property, "установить_текст"))

@@ -23,10 +23,51 @@ fn wasmtimeInvoke(allocator: std.mem.Allocator, io: std.Io, wasm_path: []const u
     });
 }
 
-// Full pipeline, mirroring `cli/main.zig`'s `runBuild` — same shape as
-// `aot_gc_arena_test.zig`'s own helper (closures need `wasm_interfaces.
-// expand` in its real position, same as GC needs `wasm_gc_arena.expand`).
-fn buildAndRun(allocator: std.mem.Allocator, io: std.Io, source: []const u8, wasm_path: []const u8) !std.process.RunResult {
+const MemoryReader = struct {
+    files: []const struct { path: []const u8, bytes: []const u8 },
+
+    pub fn read(self: *const MemoryReader, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        for (self.files) |file| {
+            if (std.mem.eql(u8, file.path, path)) return allocator.dupe(u8, file.bytes);
+        }
+        return error.FileNotFound;
+    }
+};
+
+// `DOM.*` needs the graph-aware resolution path (prelude merge +
+// `module_loader`'s native-module recognition) — bare `resolver.resolve`
+// (`buildBytes` below) doesn't understand `импорт DOM` at all. Same
+// shape as `aot_tree_shaking_test.zig`/`aot_gc_arena_test.zig`'s own
+// DOM-touching helpers.
+fn buildGraphBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const reader = MemoryReader{ .files = &.{.{ .path = "программа.ps", .bytes = source }} };
+    var graph = panos.module_loader.Graph.init(allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "программа");
+    _ = try graph.appendPreludeModule(panos.prelude.SOURCE);
+    try std.testing.expectEqual(@as(usize, 0), graph.diagnostics.items.items.len);
+
+    var compiled = try panos.module_compiler.compileGraphForTarget(allocator, &graph, .aot_js_wasm);
+    defer compiled.deinit();
+    try std.testing.expect(!compiled.hasErrors());
+
+    var module = try panos.mir_lowering.lowerGraph(allocator, &graph, &compiled);
+    defer module.deinit(allocator);
+
+    const type_store = &compiled.modules[0].checked.?.types;
+    try panos.wasm_objects.expand(allocator, &module, type_store);
+    try panos.wasm_strings.expand(allocator, &module, type_store);
+    const iface_result = try panos.wasm_interfaces.expand(allocator, &module, type_store);
+    defer allocator.free(iface_result.table);
+    var frame_info = try panos.mir_cps.prepare(allocator, &module);
+    defer frame_info.deinit();
+    try panos.wasm_actors.expand(allocator, &module, type_store, &frame_info);
+    try panos.wasm_gc_arena.expand(allocator, &module, type_store);
+
+    return panos.wasm_emit.emitModule(allocator, &compiled.modules[0].checked.?, &module, iface_result.table);
+}
+
+fn buildBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     var lexed = try panos.lexer.tokenize(allocator, source, 0);
     defer lexed.deinit();
     var parsed = try panos.parser.parse(allocator, lexed.tokens.items);
@@ -49,7 +90,14 @@ fn buildAndRun(allocator: std.mem.Allocator, io: std.Io, source: []const u8, was
     defer frame_info.deinit();
     try panos.wasm_actors.expand(allocator, &module, &checked.types, &frame_info);
 
-    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, iface_result.table);
+    return panos.wasm_emit.emitModule(allocator, &checked, &module, iface_result.table);
+}
+
+// Full pipeline, mirroring `cli/main.zig`'s `runBuild` — same shape as
+// `aot_gc_arena_test.zig`'s own helper (closures need `wasm_interfaces.
+// expand` in its real position, same as GC needs `wasm_gc_arena.expand`).
+fn buildAndRun(allocator: std.mem.Allocator, io: std.Io, source: []const u8, wasm_path: []const u8) !std.process.RunResult {
+    const wasm_bytes = try buildBytes(allocator, source);
     defer allocator.free(wasm_bytes);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = wasm_path, .data = wasm_bytes });
     return wasmtimeInvoke(allocator, io, wasm_path, "старт");
@@ -127,3 +175,46 @@ test "a closure returned from a function and passed to a higher-order function w
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("21\n", result.stdout);
 }
+
+// Stage B (`DOM.на_клик_замыкание`) — structural-only, matching
+// `aot_tree_shaking_test.zig`'s/`aot_gc_arena_test.zig`'s own DOM test
+// precedent: no host provides `env::dom_on_click_closure` outside a
+// real browser/JS loader, so this can't be invoked through bare
+// `wasmtime run`. The deep end-to-end proof (a captured Число surviving
+// across two SEPARATE simulated clicks, after an intervening arena
+// reset) was done via a Node/wasmtime harness with a stub host import
+// during development — see `project_panos_wasm_aot_closures`.
+test "DOM.на_клик_замыкание compiles and registers the fixed invoke_closure_click trampoline" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\импорт строки
+        \\
+        \\функ старт() -> Пусто
+        \\пер счётчик: Число = 42.0
+        \\DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\    DOM.установить_текст_строка("#результат", строки.из_числа(счётчик))
+        \\конец)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "dom_on_click_closure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@invoke_closure_click") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_bytes_to_permanent") != null);
+    // `wasm_gc_arena.zig` must have wrapped the trampoline too (Task 45's
+    // `module.dom_handler_names` addition) — the ORIGINAL trampoline
+    // function survives renamed under the arena-wrapper convention.
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_@invoke_closure_click") != null);
+}
+
+// The scalar-only capture restriction (a `Строка` capture in a
+// `DOM.на_клик_замыкание` handler must be rejected, not silently
+// miscompiled) is deliberately NOT an automated test here — the
+// diagnostic fires via `unsupported()`'s own `std.debug.print`, which
+// corrupts `zig test`'s `--listen=-` protocol when triggered from code
+// under test (documented gotcha, see `aot_tree_shaking_test.zig`'s own
+// mixed-generic test). Verified manually via the CLI instead
+// (`panos build --target=wasm`), see `project_panos_wasm_aot_closures`.

@@ -71,6 +71,11 @@ fn instrRefs(allocator: std.mem.Allocator, instruction: mir.Instruction) !struct
             try operands.append(allocator, v.callee);
             try operands.appendSlice(allocator, v.args);
         },
+        .call_indirect => |v| {
+            dst = v.dst;
+            try operands.append(allocator, v.table_index);
+            try operands.appendSlice(allocator, v.args);
+        },
         .call_builtin => |v| {
             dst = v.dst;
             try operands.appendSlice(allocator, v.args);

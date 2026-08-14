@@ -329,7 +329,7 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         std.process.exit(1);
     };
 
-    const wasm_bytes = panos_core.wasm_emit.emitModule(init.gpa, entry_checked, &module) catch |err| {
+    const wasm_bytes = panos_core.wasm_emit.emitModule(init.gpa, entry_checked, &module, &.{}) catch |err| {
         try stderr.print("panos build: не удалось эмитировать WASM для {s}: {t}\n", .{ input, err });
         try stderr.flush();
         std.process.exit(1);

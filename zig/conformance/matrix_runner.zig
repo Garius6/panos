@@ -249,7 +249,7 @@ fn computeAotOutcome(allocator: std.mem.Allocator, io: std.Io, path: []const u8)
 
     var module = try panos.mir_lowering.lowerModule(allocator, &parsed.ast, &resolved, &checked);
     defer module.deinit(allocator);
-    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module);
+    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, &.{});
     defer allocator.free(wasm_bytes);
 
     const wasm_path = "zzz_matrix_aot_test.wasm";

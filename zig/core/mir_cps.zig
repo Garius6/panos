@@ -777,7 +777,9 @@ pub fn referencesValue(instruction: mir.Instruction, target: mir.ValueId) bool {
         .get_index => |i| i.object == target or i.index == target,
         .set_index => |i| i.object == target or i.index == target or i.value == target,
         .cast_interface => |i| i.src == target,
-        .invoke_interface => |i| i.receiver == target,
+        .invoke_interface => |i| i.receiver == target or for (i.args) |a| {
+            if (a == target) break true;
+        } else false,
         .match_tag => |i| i.subject == target,
         .get_variant_field => |i| i.subject == target,
         .send => |i| i.process == target or i.message == target,
@@ -797,6 +799,9 @@ pub fn referencesValue(instruction: mir.Instruction, target: mir.ValueId) bool {
             if (a == target) break true;
         } else false,
         .call_value => |i| i.callee == target or for (i.args) |a| {
+            if (a == target) break true;
+        } else false,
+        .call_indirect => |i| i.table_index == target or for (i.args) |a| {
             if (a == target) break true;
         } else false,
         .new_aggregate => |i| for (i.elements) |e| {
@@ -861,7 +866,10 @@ pub fn substituteValue(allocator: std.mem.Allocator, instruction: mir.Instructio
             i.value = sub(i.value, old, new);
         },
         .cast_interface => |*i| i.src = sub(i.src, old, new),
-        .invoke_interface => |*i| i.receiver = sub(i.receiver, old, new),
+        .invoke_interface => |*i| {
+            i.receiver = sub(i.receiver, old, new);
+            i.args = try subSlice(allocator, i.args, old, new);
+        },
         .match_tag => |*i| i.subject = sub(i.subject, old, new),
         .get_variant_field => |*i| i.subject = sub(i.subject, old, new),
         .send => |*i| {
@@ -873,6 +881,10 @@ pub fn substituteValue(allocator: std.mem.Allocator, instruction: mir.Instructio
         .call => |*i| i.args = try subSlice(allocator, i.args, old, new),
         .call_value => |*i| {
             i.callee = sub(i.callee, old, new);
+            i.args = try subSlice(allocator, i.args, old, new);
+        },
+        .call_indirect => |*i| {
+            i.table_index = sub(i.table_index, old, new);
             i.args = try subSlice(allocator, i.args, old, new);
         },
         .new_aggregate => |*i| i.elements = try subSlice(allocator, i.elements, old, new),

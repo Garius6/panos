@@ -71,7 +71,7 @@ test "actor request/reply round trip: spawn + 2-field variant message + reply, n
         }
     }
 
-    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module);
+    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, &.{});
     defer allocator.free(wasm_bytes);
 
     const wasm_path = "zzz_actors_test.wasm";

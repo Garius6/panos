@@ -54,7 +54,7 @@ test "array object-table smoke: append + index + length + get_or, no host import
         }
     }
 
-    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module);
+    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, &.{});
     defer allocator.free(wasm_bytes);
 
     const wasm_path = "zzz_objects_test.wasm";

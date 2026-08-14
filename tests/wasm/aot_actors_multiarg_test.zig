@@ -56,7 +56,7 @@ test "spawned actor with 2 constructor args: exercises expandSpawn's reverse-ord
     defer frame_info.deinit();
     try panos.wasm_actors.expand(allocator, &module, &checked.types, &frame_info);
 
-    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module);
+    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, &.{});
     defer allocator.free(wasm_bytes);
 
     const wasm_path = "zzz_actors_multiarg_test.wasm";

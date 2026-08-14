@@ -121,7 +121,20 @@ pub const Instruction = union(enum) {
     get_index: struct { dst: ValueId, object: ValueId, index: ValueId },
     set_index: struct { object: ValueId, index: ValueId, value: ValueId },
     cast_interface: struct { dst: ValueId, src: ValueId, vtable: []const InterfaceMethodBinding },
-    invoke_interface: struct { dst: ?ValueId, receiver: ValueId, method_name: []const u8, args: []const ValueId },
+    invoke_interface: struct { dst: ?ValueId, receiver: ValueId, method_name: []const u8, method_index: u16 = 0, args: []const ValueId },
+    // WASM-only (`wasm_interfaces.zig`'s own expansion of `.invoke_interface`
+    // — never produced by `mir_lowering.zig`, never seen by the native
+    // bytecode compiler). `table_index` is a RUNTIME value (loaded from an
+    // interface box's vtable at the call site — which concrete function it
+    // resolves to is only known once the program runs), unlike `.call`'s
+    // compile-time-fixed `callee: FunctionId`. `wasm_emit.zig` derives the
+    // `call_indirect` type check purely from `args`/`dst`'s own MIR types
+    // (same as `.call`), and separately ensures (function-section building)
+    // that every function ever placed in the WASM function table shares one
+    // deduplicated type entry per distinct signature shape — `call_indirect`
+    // traps on ANY literal type-index mismatch, even for structurally
+    // identical signatures under two separate type-section entries.
+    call_indirect: struct { dst: ?ValueId, table_index: ValueId, args: []const ValueId },
     build_variant: struct { dst: ValueId, type_name: []const u8, variant_name: []const u8, tag: u32, fields: []const ValueId },
     match_tag: struct { dst: ValueId, subject: ValueId, tag: u32 },
     get_variant_field: struct { dst: ValueId, subject: ValueId, field_index: u32 },

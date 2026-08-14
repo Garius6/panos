@@ -22,6 +22,29 @@ const wasm_stackify = @import("wasm_stackify.zig");
 const ScopeKind = enum { loop, if_scope };
 const Scope = struct { kind: ScopeKind, header: mir.BlockId = mir.invalid_block };
 
+// Serializes a WASM function signature (param types + optional result
+// type) into a byte key suitable for a `StringHashMap` — used to give
+// EVERY function callable through the interface table a SHARED type
+// index for its structural shape, instead of the ordinary one-type-
+// per-function scheme the rest of this file uses. `call_indirect`
+// validates the runtime callee's OWN type-section index against the
+// literal typeidx baked into the call site — it does NOT do structural
+// matching across separate (even byte-identical) type entries, so two
+// different concrete implementations of the same interface method
+// (different functions, hence different individual type indices under
+// the ordinary scheme) would make `call_indirect` trap for every
+// implementation except whichever one happens to share the literal
+// index used at the call site. `0xFE` separates params from the result
+// byte (`0xFD` for void) — neither collides with `wasm_i32`(0x7F)/
+// `wasm_f64`(0x7C), the only two WASM value types this backend emits.
+fn signatureShapeKey(allocator: std.mem.Allocator, params: []const u8, result: ?u8) ![]u8 {
+    var key: std.ArrayList(u8) = .empty;
+    try key.appendSlice(allocator, params);
+    try key.append(allocator, 0xFE);
+    try key.append(allocator, result orelse 0xFD);
+    return try key.toOwnedSlice(allocator);
+}
+
 const EmitContext = struct {
     allocator: std.mem.Allocator,
     checked: *const type_checker.CheckResult,
@@ -50,6 +73,13 @@ const EmitContext = struct {
     // the module's own static data section (see `collectStringConstants`)
     // — empty for any module with no string literals at all.
     string_offsets: *const std.StringHashMap(u32),
+    // `signatureShapeKey(params, result) -> shared type-section index` —
+    // only populated for modules with a non-empty interface function
+    // table; `.call_indirect`'s own codegen looks up its call site's
+    // (args, dst) shape here to find the SAME shared type index the
+    // table's member functions were assigned in `emitModule`'s Function
+    // section overrides.
+    interface_type_index: *const std.StringHashMap(u32),
     // Lazily reserved the first time a function needs `%`/bitwise ops
     // (see `.binary`'s `.modulo`/`.bit_*`/`.shift_*` cases) — WASM's f64
     // has no modulo/bitwise instructions at all, only i32/i64 do, and
@@ -128,7 +158,7 @@ const EmitContext = struct {
         return index;
     }
 
-    fn init(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, function: *const mir.Function, func_index: *const std.AutoHashMap(mir.FunctionId, u32), builtin_index: *const std.StringHashMap(u32), string_offsets: *const std.StringHashMap(u32)) !EmitContext {
+    fn init(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, function: *const mir.Function, func_index: *const std.AutoHashMap(mir.FunctionId, u32), builtin_index: *const std.StringHashMap(u32), string_offsets: *const std.StringHashMap(u32), interface_type_index: *const std.StringHashMap(u32)) !EmitContext {
         var cfg = try mir_cfg.computeCfgInfo(allocator, function);
         errdefer cfg.deinit();
         var rpo_index = try wasm_stackify.buildRpoIndex(allocator, &cfg);
@@ -150,6 +180,7 @@ const EmitContext = struct {
             .use_count = use_count,
             .builtin_index = builtin_index,
             .string_offsets = string_offsets,
+            .interface_type_index = interface_type_index,
         };
     }
 
@@ -207,6 +238,10 @@ fn computeUseCount(allocator: std.mem.Allocator, function: *const mir.Function) 
                 .unary => |unary| try countUse(&counts, unary.src),
                 .call_value => |call| {
                     try countUse(&counts, call.callee);
+                    for (call.args) |arg| try countUse(&counts, arg);
+                },
+                .call_indirect => |call| {
+                    try countUse(&counts, call.table_index);
                     for (call.args) |arg| try countUse(&counts, arg);
                 },
                 .call_builtin => |call| for (call.args) |arg| try countUse(&counts, arg),
@@ -683,6 +718,32 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try wasm_module.writeUleb128(code, allocator, function_index);
             return call.dst;
         },
+        // WASM-only, produced exclusively by `wasm_interfaces.zig`'s own
+        // expansion of `.invoke_interface`. Stack on entry: `[args...,
+        // table_index]` — `table_index` (the runtime-resolved WASM table
+        // slot) must be the LAST-produced/topmost operand, matching
+        // `call_indirect`'s own WASM semantics (pops the index first, args
+        // matching the type signature underneath). The type index is
+        // derived from `args`/`dst`'s OWN MIR types (never a raw
+        // `FunctionId` — the callee isn't statically known), looked up in
+        // `interface_type_index` — see `signatureShapeKey`'s doc comment
+        // for why every candidate callee MUST already share this exact
+        // type-section entry (`emitModule`'s Function-section override for
+        // `interface_table` members).
+        .call_indirect => |call| {
+            for (call.args) |_| {} // already on the stack, same convention as `.call`.
+            var params: std.ArrayList(u8) = .empty;
+            defer params.deinit(allocator);
+            for (call.args) |arg| try params.append(allocator, wasmType(ctx, arg));
+            const result: ?u8 = if (call.dst) |dst| wasmType(ctx, dst) else null;
+            const key = try signatureShapeKey(allocator, params.items, result);
+            defer allocator.free(key);
+            const type_index = ctx.interface_type_index.get(key) orelse return unsupported("call_indirect: тип не найден в общей таблице типов интерфейса");
+            try code.append(allocator, 0x11); // call_indirect
+            try wasm_module.writeUleb128(code, allocator, type_index);
+            try code.append(allocator, 0x00); // tableidx 0
+            return call.dst;
+        },
         // CPS rewrite output (`mir_cps.zig`) — `frame` is an opaque i32
         // linear-memory address, `slot` a compile-time word index within
         // it (8 bytes/slot, wide enough for either an f64 number or an
@@ -841,8 +902,9 @@ pub fn emitFunctionWasm(
     func_index: *const std.AutoHashMap(mir.FunctionId, u32),
     builtin_index: *const std.StringHashMap(u32),
     string_offsets: *const std.StringHashMap(u32),
+    interface_type_index: *const std.StringHashMap(u32),
 ) ![]u8 {
-    var ctx = try EmitContext.init(allocator, checked, function, func_index, builtin_index, string_offsets);
+    var ctx = try EmitContext.init(allocator, checked, function, func_index, builtin_index, string_offsets, interface_type_index);
     defer ctx.deinit();
 
     _ = try processFrom(&ctx, function.entry, mir.invalid_block);
@@ -1253,7 +1315,17 @@ fn validateOrFail(allocator: std.mem.Allocator, checked: *const type_checker.Che
 pub const actor_heap_global_index: u32 = 0;
 pub const actor_heap_bytes: u32 = 1 << 20;
 
-pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, module: *const mir.Module) ![]u8 {
+// `interface_table`: every `mir.FunctionId` that must be reachable via
+// `call_indirect` (a WASM function-table entry), in the exact order they
+// should be placed in the table (table index == position in this
+// slice). Empty for any module with no interface dispatch — the Table/
+// Element sections are omitted entirely in that case (WASM makes both
+// fully optional). Deliberately a plain caller-supplied list rather than
+// derived internally: the ORDER must match whatever a caller (currently
+// only test code — `wasm_interfaces.zig`'s expansion pass will be the
+// real producer once wired in) already baked into `.call_indirect`
+// call-site table-index constants elsewhere in the module.
+pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, module: *const mir.Module, interface_table: []const mir.FunctionId) ![]u8 {
     try validateOrFail(allocator, checked, module);
 
     var builtin_names = try collectBuiltinNames(allocator, module);
@@ -1286,13 +1358,54 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     defer func_index.deinit();
     for (module.functions.items, 0..) |function, i| try func_index.put(function.id, builtin_count + @as(u32, @intCast(i)));
 
+    // For every function reachable via `call_indirect` (`interface_table`),
+    // compute its WASM param/result shape and assign ONE SHARED type-
+    // section index per distinct shape (see `signatureShapeKey`'s own doc
+    // comment for why this can't just reuse each function's ordinary
+    // individual type index). New entries are appended to the type
+    // section AFTER every builtin/function's own (unique) entry, starting
+    // at index `builtin_count + module.functions.items.len`.
+    var interface_type_index: std.StringHashMap(u32) = .init(allocator);
+    defer {
+        var it = interface_type_index.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        interface_type_index.deinit();
+    }
+    var interface_shape_types: std.ArrayList(u8) = .empty;
+    defer interface_shape_types.deinit(allocator);
+    var interface_shape_count: u32 = 0;
+    for (interface_table) |function_id| {
+        const function = &module.functions.items[@intFromEnum(function_id)];
+        const store = function.type_store orelse &checked.types;
+        var params: std.ArrayList(u8) = .empty;
+        defer params.deinit(allocator);
+        for (function.parameters) |local| {
+            const local_type = function.locals.items[@intFromEnum(local)].type_id;
+            try params.append(allocator, wasm_module.wasmValTypeForStore(store, local_type));
+        }
+        const is_void = store.eql(function.result_type, store.builtins.void);
+        const result: ?u8 = if (is_void) null else wasm_module.wasmValTypeForStore(store, function.result_type);
+        const key = try signatureShapeKey(allocator, params.items, result);
+        if (interface_type_index.contains(key)) {
+            allocator.free(key);
+            continue;
+        }
+        try interface_type_index.put(key, builtin_count + @as(u32, @intCast(module.functions.items.len)) + interface_shape_count);
+        interface_shape_count += 1;
+        interface_shape_types.append(allocator, 0x60) catch unreachable; // functype
+        try wasm_module.writeUleb128(&interface_shape_types, allocator, params.items.len);
+        try interface_shape_types.appendSlice(allocator, params.items);
+        try wasm_module.writeUleb128(&interface_shape_types, allocator, if (result != null) 1 else 0);
+        if (result) |result_type| try interface_shape_types.append(allocator, result_type);
+    }
+
     // Import types come FIRST in the type section — import type index `i`
     // is simply `i` for `i < builtin_count`, per each builtin's own
     // `builtinSignature` (NOT uniformly `() -> f64` any more — `DOM.*`
     // needs real params/void results too).
     var type_section: std.ArrayList(u8) = .empty;
     defer type_section.deinit(allocator);
-    try wasm_module.writeUleb128(&type_section, allocator, builtin_count + module.functions.items.len);
+    try wasm_module.writeUleb128(&type_section, allocator, builtin_count + module.functions.items.len + interface_shape_count);
     for (builtin_names.items) |name| {
         const signature = try builtinSignature(name);
         try type_section.append(allocator, 0x60); // functype
@@ -1313,6 +1426,7 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         try wasm_module.writeUleb128(&type_section, allocator, if (is_void) 0 else 1);
         if (!is_void) try type_section.append(allocator, wasm_module.wasmValTypeForStore(store, function.result_type));
     }
+    try type_section.appendSlice(allocator, interface_shape_types.items);
 
     var import_section: std.ArrayList(u8) = .empty;
     defer import_section.deinit(allocator);
@@ -1329,10 +1443,35 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         }
     }
 
+    var interface_table_members: std.AutoHashMap(mir.FunctionId, void) = .init(allocator);
+    defer interface_table_members.deinit();
+    for (interface_table) |function_id| try interface_table_members.put(function_id, {});
+
     var function_section: std.ArrayList(u8) = .empty;
     defer function_section.deinit(allocator);
     try wasm_module.writeUleb128(&function_section, allocator, module.functions.items.len);
-    for (0..module.functions.items.len) |i| try wasm_module.writeUleb128(&function_section, allocator, builtin_count + i);
+    for (module.functions.items, 0..) |function, i| {
+        // A function reachable via `call_indirect` gets the SHARED type
+        // index for its shape instead of its own unique one — see
+        // `interface_type_index`'s own construction above.
+        if (interface_table_members.contains(function.id)) {
+            const store = function.type_store orelse &checked.types;
+            var params: std.ArrayList(u8) = .empty;
+            defer params.deinit(allocator);
+            for (function.parameters) |local| {
+                const local_type = function.locals.items[@intFromEnum(local)].type_id;
+                try params.append(allocator, wasm_module.wasmValTypeForStore(store, local_type));
+            }
+            const is_void = store.eql(function.result_type, store.builtins.void);
+            const result: ?u8 = if (is_void) null else wasm_module.wasmValTypeForStore(store, function.result_type);
+            const key = try signatureShapeKey(allocator, params.items, result);
+            defer allocator.free(key);
+            const shared_index = interface_type_index.get(key).?;
+            try wasm_module.writeUleb128(&function_section, allocator, shared_index);
+            continue;
+        }
+        try wasm_module.writeUleb128(&function_section, allocator, builtin_count + i);
+    }
 
     // Linear memory holds only the flat blob of literal strings. Dynamic
     // strings are host handles; this deliberately avoids a WASM GC/heap in
@@ -1389,11 +1528,38 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         try wasm_module.writeUleb128(&export_section, allocator, 0); // memidx 0
     }
 
+    // One `funcref` table, sized exactly to `interface_table` — every
+    // entry filled by a single active element segment (offset 0), no
+    // holes. Omitted entirely (both sections) when `interface_table` is
+    // empty, matching every other optional section in this function
+    // (`needs_memory`/`has_actors`).
+    var table_section: std.ArrayList(u8) = .empty;
+    defer table_section.deinit(allocator);
+    var element_section: std.ArrayList(u8) = .empty;
+    defer element_section.deinit(allocator);
+    if (interface_table.len != 0) {
+        try wasm_module.writeUleb128(&table_section, allocator, 1); // 1 table
+        try table_section.append(allocator, 0x70); // funcref
+        try table_section.append(allocator, 0x00); // limits: min only, no max
+        try wasm_module.writeUleb128(&table_section, allocator, interface_table.len);
+
+        try wasm_module.writeUleb128(&element_section, allocator, 1); // 1 active segment
+        try element_section.append(allocator, 0x00); // flags: active, table 0
+        try element_section.append(allocator, 0x41); // i32.const
+        try wasm_module.writeSleb128(&element_section, allocator, 0); // offset 0
+        try element_section.append(allocator, 0x0B); // end
+        try wasm_module.writeUleb128(&element_section, allocator, interface_table.len);
+        for (interface_table) |function_id| {
+            const index = func_index.get(function_id) orelse return unsupported("функция интерфейсной таблицы не найдена в индексе модуля");
+            try wasm_module.writeUleb128(&element_section, allocator, index);
+        }
+    }
+
     var code_section: std.ArrayList(u8) = .empty;
     defer code_section.deinit(allocator);
     try wasm_module.writeUleb128(&code_section, allocator, module.functions.items.len);
     for (module.functions.items) |function| {
-        const body = try emitFunctionWasm(allocator, checked, &function, &func_index, &builtin_index, &strings.offsets);
+        const body = try emitFunctionWasm(allocator, checked, &function, &func_index, &builtin_index, &strings.offsets, &interface_type_index);
         defer allocator.free(body);
         try wasm_module.writeUleb128(&code_section, allocator, body.len);
         try code_section.appendSlice(allocator, body);
@@ -1405,9 +1571,13 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     try wasm_module.writeSection(&out, allocator, 1, type_section.items);
     if (builtin_count != 0) try wasm_module.writeSection(&out, allocator, 2, import_section.items);
     try wasm_module.writeSection(&out, allocator, 3, function_section.items);
+    if (interface_table.len != 0) try wasm_module.writeSection(&out, allocator, 4, table_section.items);
     if (needs_memory) try wasm_module.writeSection(&out, allocator, 5, memory_section.items);
     if (has_actors) try wasm_module.writeSection(&out, allocator, 6, global_section.items);
     try wasm_module.writeSection(&out, allocator, 7, export_section.items);
+    // Element section (9) between Export(7)/Start(8, unused) and Code(10)
+    // — fixed WASM canonical section order.
+    if (interface_table.len != 0) try wasm_module.writeSection(&out, allocator, 9, element_section.items);
     try wasm_module.writeSection(&out, allocator, 10, code_section.items);
     // `strings.data.len != 0`, NOT `needs_memory` — a module can need
     // memory purely for the actor heap with ZERO string literals (no
@@ -1452,7 +1622,7 @@ test "emitModule produces a valid, executable .wasm for a recursive MIR function
     var module = try mir_lowering.lowerModule(allocator, &parsed.ast, &resolved, &checked);
     defer module.deinit(allocator);
 
-    const wasm_bytes = try emitModule(allocator, &checked, &module);
+    const wasm_bytes = try emitModule(allocator, &checked, &module, &.{});
     defer allocator.free(wasm_bytes);
     try std.testing.expect(std.mem.eql(u8, wasm_bytes[0..4], &.{ 0x00, 0x61, 0x73, 0x6D }));
 
@@ -1527,7 +1697,7 @@ test "emitModule produces a valid, executable .wasm for a real iterating пок�
     var module = try mir_lowering.lowerModule(allocator, &parsed.ast, &resolved, &checked);
     defer module.deinit(allocator);
 
-    const wasm_bytes = try emitModule(allocator, &checked, &module);
+    const wasm_bytes = try emitModule(allocator, &checked, &module, &.{});
     defer allocator.free(wasm_bytes);
 
     var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
@@ -1574,5 +1744,5 @@ test "emitModule fails cleanly on a malformed MIR module instead of crashing" {
     // stack-machine replay (which would otherwise index out of bounds).
     builder.terminate(.{ .jump = .{ .target = @enumFromInt(99) } });
 
-    try std.testing.expectError(error.InvalidMir, emitModule(allocator, &checked, &module));
+    try std.testing.expectError(error.InvalidMir, emitModule(allocator, &checked, &module, &.{}));
 }

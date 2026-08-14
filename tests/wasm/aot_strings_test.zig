@@ -26,7 +26,7 @@ fn buildAndRun(allocator: std.mem.Allocator, io: std.Io, source: []const u8, was
     var frame_info = try panos.mir_cps.prepare(allocator, &module);
     defer frame_info.deinit();
 
-    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module);
+    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, &.{});
     defer allocator.free(wasm_bytes);
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = wasm_path, .data = wasm_bytes });

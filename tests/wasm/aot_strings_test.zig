@@ -94,3 +94,70 @@ test "string inequality after concat" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("1\n", result.stdout);
 }
+
+test "длина is rune count, длина_байт is byte count, начинается_с" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\функ старт() -> Булево
+        \\    (длина("привет") == 6.0) и (строки.длина_байт("привет") == 12.0)
+        \\        и строки.начинается_с("привет мир", "привет")
+        \\        и (не строки.начинается_с("привет мир", "мир"))
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_str4.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRun(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1\n", result.stdout);
+}
+
+test "срез is rune-indexed, найти returns rune index or -1" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\функ старт() -> Булево
+        \\    (строки.срез("привет мир", 1.0, 5.0) == "риве")
+        \\        и (строки.найти("привет мир", "мир", 0.0) == 7.0)
+        \\        и (строки.найти("привет мир", "xyz", 0.0) == -1.0)
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_str5.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRun(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1\n", result.stdout);
+}
+
+test "заменить replaces all occurrences, byte-level, empty target is a no-op" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\функ старт() -> Булево
+        \\    (строки.заменить("аабб", "аа", "x") == "xбб")
+        \\        и (строки.заменить("aabbaabb", "aa", "x") == "xbbxbb")
+        \\        и (строки.заменить("hello", "z", "y") == "hello")
+        \\        и (строки.заменить("привет", "", "X") == "привет")
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_str6.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRun(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1\n", result.stdout);
+}

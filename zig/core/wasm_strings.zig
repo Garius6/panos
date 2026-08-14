@@ -54,6 +54,7 @@ const StringRuntime = struct {
     index_of: mir.FunctionId,
     slice: mir.FunctionId,
     find: mir.FunctionId,
+    replace: mir.FunctionId,
 };
 
 const ExpandCtx = struct {
@@ -76,18 +77,23 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     const rune_byte_offset = try buildRuneByteOffset(allocator, module, type_store, layout, utf8_width);
     const byte_to_rune_count = try buildByteToRuneCount(allocator, module, type_store, layout, utf8_width);
     const index_of = try buildIndexOf(allocator, module, type_store, layout);
+    const concat = try buildConcat(allocator, module, type_store, layout);
+    const length = try buildLength(allocator, module, type_store, layout, utf8_width);
+    const slice = try buildSlice(allocator, module, type_store, layout, rune_byte_offset);
+    const find = try buildFind(allocator, module, type_store, layout, rune_byte_offset, index_of, byte_to_rune_count);
     const runtime = StringRuntime{
-        .concat = try buildConcat(allocator, module, type_store, layout),
+        .concat = concat,
         .equal = try buildEqual(allocator, module, type_store, layout),
         .byte_length = try buildByteLength(allocator, module, type_store, layout),
         .starts_with = try buildStartsWith(allocator, module, type_store, layout),
         .utf8_width = utf8_width,
-        .length = try buildLength(allocator, module, type_store, layout, utf8_width),
+        .length = length,
         .rune_byte_offset = rune_byte_offset,
         .byte_to_rune_count = byte_to_rune_count,
         .index_of = index_of,
-        .slice = try buildSlice(allocator, module, type_store, layout, rune_byte_offset),
-        .find = try buildFind(allocator, module, type_store, layout, rune_byte_offset, index_of, byte_to_rune_count),
+        .slice = slice,
+        .find = find,
+        .replace = try buildReplace(allocator, module, type_store, layout, length, slice, find, concat),
     };
     const ctx = ExpandCtx{ .layout = layout, .type_store = type_store, .runtime = runtime };
 
@@ -171,6 +177,7 @@ fn expandInstruction(builder: *mir_builder.Builder, instruction: mir.Instruction
                 if (std.mem.eql(u8, v.name, "строки::длина")) break :blk ctx.runtime.length;
                 if (std.mem.eql(u8, v.name, "строки::срез")) break :blk ctx.runtime.slice;
                 if (std.mem.eql(u8, v.name, "строки::найти")) break :blk ctx.runtime.find;
+                if (std.mem.eql(u8, v.name, "строки::заменить")) break :blk ctx.runtime.replace;
                 break :blk null;
             };
             if (callee) |fn_id| {
@@ -1094,5 +1101,192 @@ fn buildFind(allocator: std.mem.Allocator, module: *mir.Module, type_store: *con
     const rune_index_f64 = try builder.newValue(type_store.builtins.number);
     try builder.emit(.{ .unary = .{ .dst = rune_index_f64, .op = .from_i32, .src = rune_index } });
     builder.terminate(.{ .return_value = .{ .value = rune_index_f64 } });
+    return id;
+}
+
+// `@string_replace(s, target, replacement) -> Строка`: replaces ALL
+// occurrences of `target` with `replacement`. Empty `target` returns a
+// copy of `s` unchanged (matches `vm.zig`'s `strReplace` exactly).
+// Deliberately built on TOP of the already-verified @string_find/
+// @string_slice/@string_concat/@string_length rather than a second
+// hand-rolled byte-manipulation pass — an earlier from-scratch
+// two-pass byte-copy version had a real, hard-to-isolate bug (silently
+// undercounting matches for one input, genuinely infinite-looping for
+// another) that this reuse-based version avoids by construction: all
+// the byte-level arithmetic risk is already covered by those other
+// functions' own tests.
+fn buildReplace(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, length: mir.FunctionId, slice: mir.FunctionId, find: mir.FunctionId, concat: mir.FunctionId) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, "@string_replace", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const s_local = try builder.newLocal(wasm_heap.dummy_symbol, "s", layout.ptr_type);
+    const target_local = try builder.newLocal(wasm_heap.dummy_symbol, "target", layout.ptr_type);
+    const replacement_local = try builder.newLocal(wasm_heap.dummy_symbol, "replacement", layout.ptr_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{ s_local, target_local, replacement_local });
+    builder.currentFunction().type_store = type_store;
+    const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
+    const number_type = type_store.builtins.number;
+
+    const t1 = try wasm_heap.loadLocal(&builder, target_local, layout.ptr_type);
+    const target_byte_len = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load = .{ .dst = target_byte_len, .addr = t1 } });
+    const target_byte_len_local = try wasm_heap.storeLocal(&builder, "target_byte_len", layout.idx_type, target_byte_len);
+
+    const target_byte_len_for_cmp = try wasm_heap.loadLocal(&builder, target_byte_len_local, layout.idx_type);
+    const zero_t = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    const target_empty = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, target_byte_len_for_cmp, zero_t);
+    const copy_verbatim_block = try builder.newBlock();
+    const do_replace_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = target_empty, .then_block = copy_verbatim_block, .else_block = do_replace_block } });
+
+    builder.setCurrentBlock(copy_verbatim_block);
+    {
+        const s1 = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+        const s_len = try builder.newValue(layout.idx_type);
+        try builder.emit(.{ .mem_load = .{ .dst = s_len, .addr = s1 } });
+        const s_len_local = try wasm_heap.storeLocal(&builder, "s_len", layout.idx_type, s_len);
+
+        const four1 = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+        const s_len_for_size = try wasm_heap.loadLocal(&builder, s_len_local, layout.idx_type);
+        const alloc_size = try wasm_heap.binOp(&builder, layout.idx_type, .add, four1, s_len_for_size);
+        const handle = try builder.newValue(layout.ptr_type);
+        try builder.emit(.{ .call = .{ .dst = handle, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, alloc_size) } });
+        const handle_local = try wasm_heap.storeLocal(&builder, "handle", layout.ptr_type, handle);
+
+        const s_len_for_header = try wasm_heap.loadLocal(&builder, s_len_local, layout.idx_type);
+        const handle_for_header = try wasm_heap.loadLocal(&builder, handle_local, layout.ptr_type);
+        try builder.emit(.{ .mem_store = .{ .addr = handle_for_header, .src = s_len_for_header } });
+
+        const four2 = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+        const s_for_src = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+        const src_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, s_for_src, four2);
+        const src_base_local = try wasm_heap.storeLocal(&builder, "src_base", layout.idx_type, src_base);
+        const four3 = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+        const handle_for_dst = try wasm_heap.loadLocal(&builder, handle_local, layout.ptr_type);
+        const dst_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, handle_for_dst, four3);
+        const dst_base_local = try wasm_heap.storeLocal(&builder, "dst_base", layout.idx_type, dst_base);
+        try emitByteCopyLoop(&builder, layout, src_base_local, dst_base_local, s_len_local);
+
+        const handle_final = try wasm_heap.loadLocal(&builder, handle_local, layout.ptr_type);
+        builder.terminate(.{ .return_value = .{ .value = handle_final } });
+    }
+
+    builder.setCurrentBlock(do_replace_block);
+    const target_for_len = try wasm_heap.loadLocal(&builder, target_local, layout.ptr_type);
+    const target_rune_len = try builder.newValue(number_type);
+    try builder.emit(.{ .call = .{ .dst = target_rune_len, .callee = length, .args = try wasm_heap.dupeOne(module, target_for_len) } });
+    const target_rune_len_local = try wasm_heap.storeLocal(&builder, "target_rune_len", number_type, target_rune_len);
+
+    // result starts as a fresh empty string (alloc(4), header=0).
+    const four_r = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const result_init = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = result_init, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, four_r) } });
+    const result_init_local = try wasm_heap.storeLocal(&builder, "@result_init", layout.ptr_type, result_init);
+    const zero_hdr = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    const result_init_for_header = try wasm_heap.loadLocal(&builder, result_init_local, layout.ptr_type);
+    try builder.emit(.{ .mem_store = .{ .addr = result_init_for_header, .src = zero_hdr } });
+    const result_local = try builder.newLocal(wasm_heap.dummy_symbol, "@result", layout.ptr_type);
+    const result_init_reload = try wasm_heap.loadLocal(&builder, result_init_local, layout.ptr_type);
+    try builder.emit(.{ .store_local = .{ .local = result_local, .src = result_init_reload } });
+
+    const search_start_local = try builder.newLocal(wasm_heap.dummy_symbol, "@search_start", number_type);
+    const zero_ss = try wasm_heap.numberConst(&builder, number_type, 0);
+    try builder.emit(.{ .store_local = .{ .local = search_start_local, .src = zero_ss } });
+
+    const loop_header = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_header);
+    const s_for_find = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const target_for_find = try wasm_heap.loadLocal(&builder, target_local, layout.ptr_type);
+    const search_start_for_find = try wasm_heap.loadLocal(&builder, search_start_local, number_type);
+    const found_rune = try builder.newValue(number_type);
+    try builder.emit(.{ .call = .{ .dst = found_rune, .callee = find, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ s_for_find, target_for_find, search_start_for_find }) } });
+    const found_rune_local = try wasm_heap.storeLocal(&builder, "@found_rune", number_type, found_rune);
+
+    const found_rune_for_cmp = try wasm_heap.loadLocal(&builder, found_rune_local, number_type);
+    const neg_one_number = try wasm_heap.numberConst(&builder, number_type, -1);
+    // `cond` must be the KEEP-GOING condition with `then_block` as the
+    // loop body (matching every other loop in this file, e.g. line 213
+    // above) — an earlier version used `not_found` (the STOP condition)
+    // with `then=tail(exit)`/`else=match(continue)`, backwards from that
+    // convention. `wasm_stackify`'s loop-header detection picks body/exit
+    // by which target can reach back to the header (`canReach`), NOT by
+    // trusting the then/else labels at face value — with the polarity
+    // inverted, it reassigned body/exit to match reachability but left
+    // the branch CONDITION itself untouched, so the emitted `if` tested
+    // "not found" while running the loop-continuing code, and the
+    // exit/tail code fell through unconditionally after the loop instead
+    // of only running on non-match. Found via wasm-objdump: the `if`
+    // (cond=not_found) body contained the match/concat/br-back logic, and
+    // the `else` was empty with tail code unconditionally following the
+    // loop.
+    const found = try wasm_heap.cmpOp(&builder, layout.bool_type, .not_equal, found_rune_for_cmp, neg_one_number);
+    const tail_block = try builder.newBlock();
+    const match_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = found, .then_block = match_block, .else_block = tail_block } });
+
+    builder.setCurrentBlock(tail_block);
+    {
+        // `s_rune_len` (the 3rd `@string_slice` arg) must be produced
+        // LAST, immediately before the call — `.call`'s args are
+        // replayed in the order listed, assuming each is genuinely
+        // fresh/adjacent (same convention this whole file follows);
+        // producing it FIRST left it buried under the other two args,
+        // a real bug caught by wasmtime's own validator ("type mismatch:
+        // expected f64, found i32" — the args ended up shifted by one).
+        //
+        // `result_for_final` must be produced BEFORE `remaining` — the
+        // final concat's args are `[result_for_final, remaining]`, so
+        // `result_for_final` needs to be earliest-produced/bottom and
+        // `remaining` freshest/top. An earlier version computed
+        // `remaining` first (to keep it adjacent to its own 3-arg slice
+        // call) then loaded `result_for_final` last — which put it on
+        // TOP of `remaining` instead of underneath, silently producing a
+        // rotated result ("bbxbbx" instead of "xbbxbb") rather than a
+        // validator error, since both operands are the same i32 handle
+        // type (no type mismatch to catch it).
+        const result_for_final = try wasm_heap.loadLocal(&builder, result_local, layout.ptr_type);
+        const s_for_remaining = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+        const search_start_for_remaining = try wasm_heap.loadLocal(&builder, search_start_local, number_type);
+        const s_for_slen = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+        const s_rune_len = try builder.newValue(number_type);
+        try builder.emit(.{ .call = .{ .dst = s_rune_len, .callee = length, .args = try wasm_heap.dupeOne(module, s_for_slen) } });
+        const remaining = try builder.newValue(layout.ptr_type);
+        try builder.emit(.{ .call = .{ .dst = remaining, .callee = slice, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ s_for_remaining, search_start_for_remaining, s_rune_len }) } });
+        const final_result = try builder.newValue(layout.ptr_type);
+        try builder.emit(.{ .call = .{ .dst = final_result, .callee = concat, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ result_for_final, remaining }) } });
+        builder.terminate(.{ .return_value = .{ .value = final_result } });
+    }
+
+    builder.setCurrentBlock(match_block);
+    // `result_for_partial1` loaded BEFORE `segment` is computed — the
+    // concat call below needs args `[result, segment]` in that
+    // PRODUCTION order (result first/bottom, segment last/freshest);
+    // computing segment first (as an earlier version of this code did)
+    // left it buried under the later-loaded result, backwards from
+    // what `.call`'s "args replayed in listed order" codegen assumes
+    // (caught by wasmtime's validator — a type mismatch one arg over).
+    const result_for_partial1 = try wasm_heap.loadLocal(&builder, result_local, layout.ptr_type);
+    const s_for_segment = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const search_start_for_segment = try wasm_heap.loadLocal(&builder, search_start_local, number_type);
+    const found_rune_for_segment = try wasm_heap.loadLocal(&builder, found_rune_local, number_type);
+    const segment = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = segment, .callee = slice, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ s_for_segment, search_start_for_segment, found_rune_for_segment }) } });
+    const partial1 = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = partial1, .callee = concat, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ result_for_partial1, segment }) } });
+    const partial1_local = try wasm_heap.storeLocal(&builder, "@partial1", layout.ptr_type, partial1);
+
+    const partial1_reload = try wasm_heap.loadLocal(&builder, partial1_local, layout.ptr_type);
+    const replacement_reload = try wasm_heap.loadLocal(&builder, replacement_local, layout.ptr_type);
+    const partial2 = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = partial2, .callee = concat, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ partial1_reload, replacement_reload }) } });
+    try builder.emit(.{ .store_local = .{ .local = result_local, .src = partial2 } });
+
+    const found_rune_for_next = try wasm_heap.loadLocal(&builder, found_rune_local, number_type);
+    const target_rune_len_for_next = try wasm_heap.loadLocal(&builder, target_rune_len_local, number_type);
+    const search_start_next = try wasm_heap.binOp(&builder, number_type, .add, found_rune_for_next, target_rune_len_for_next);
+    try builder.emit(.{ .store_local = .{ .local = search_start_local, .src = search_start_next } });
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
     return id;
 }

@@ -54,6 +54,19 @@ pub fn boolConst(builder: *mir_builder.Builder, bool_type: types.TypeId, value: 
     return dst;
 }
 
+// `addressConst` above always emits `.address` (i32.const) — wrong for
+// an f64-typed (`Число`) value, which needs `.number` (f64.const).
+// Found as a real bug (`wasm_strings.zig`'s `@string_replace`, needing
+// an f64-typed -1.0 sentinel to compare against `@string_find`'s
+// rune-index return) — using `addressConst` there would have produced
+// an invalid module (WASM validator: "type mismatch: expected f64
+// found i32").
+pub fn numberConst(builder: *mir_builder.Builder, number_type: types.TypeId, value: f64) !mir.ValueId {
+    const dst = try builder.newValue(number_type);
+    try builder.emit(.{ .const_value = .{ .dst = dst, .value = .{ .number = value } } });
+    return dst;
+}
+
 pub fn binOp(builder: *mir_builder.Builder, result_type: types.TypeId, op: mir.BinOp, lhs: mir.ValueId, rhs: mir.ValueId) !mir.ValueId {
     const dst = try builder.newValue(result_type);
     try builder.emit(.{ .binary = .{ .dst = dst, .op = op, .lhs = lhs, .rhs = rhs } });

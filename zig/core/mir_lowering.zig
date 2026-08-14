@@ -1147,6 +1147,7 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
             if (try lowerEnumConstructor(ctx, symbol, call, result_type)) |outcome| return outcome;
             if (try lowerStructConstructor(ctx, expression, symbol, call, result_type)) |outcome| return outcome;
             if (try lowerLengthBuiltinCall(ctx, symbol, call, result_type)) |outcome| return outcome;
+            if (try lowerPanicBuiltinCall(ctx, symbol, call)) |outcome| return outcome;
             if (try lowerProcessBuiltinCall(ctx, symbol, call, result_type)) |outcome| return outcome;
         }
     }
@@ -1388,6 +1389,31 @@ fn lowerLengthBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call:
     const dst = try ctx.builder.newValue(result_type);
     try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = "строки::длина", .args = args } });
     return continuesWith(dst);
+}
+
+// `паника(текст)` — native compiler compiles the message expression
+// then emits a `.panic` bytecode instruction that halts with that exact
+// runtime string (`compiler.zig`'s `compilePanicBuiltin`). WASM has no
+// analogous "trap with a runtime message" primitive — `unreachable`
+// (opcode `0x00`, already used via `.unreachable_term` for non-
+// exhaustive `выбор` at `mir_lowering.zig:719` and `wasm_strings.zig`'s
+// own invalid-UTF-8/out-of-range panics) takes no operand at all. The
+// message argument is still LOWERED (via `lowerCallArgs`, same as every
+// other builtin here) so any `unsupported()` inside IT still surfaces
+// correctly, but its VALUE is discarded — the message text itself is
+// unrecoverably lost under WASM AOT, a known, accepted gap (matches
+// this codebase's own established practice for this class of WASM-only
+// divergence, e.g. `wasm_strings.zig`'s из_числа/в_число doc comments)
+// rather than blocking on it.
+fn lowerPanicBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype) anyerror!?ExprOutcome {
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .builtin or entry.module_path != null or !std.mem.eql(u8, entry.name, "паника")) return null;
+    if (call.arguments.len != 1) return unsupported("паника ожидает 1 аргумент");
+
+    const message = try lowerExpr(ctx, call.arguments[0]);
+    if (message.flow == .terminates) return terminated;
+    ctx.builder.terminate(.{ .unreachable_term = .{ .reason = "паника" } });
+    return terminated;
 }
 
 fn lowerProcessBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {

@@ -45,6 +45,8 @@ fn unsupported(comptime what: []const u8) error{StringExpandUnsupported} {
 const StringRuntime = struct {
     concat: mir.FunctionId,
     equal: mir.FunctionId,
+    byte_length: mir.FunctionId,
+    starts_with: mir.FunctionId,
 };
 
 const ExpandCtx = struct {
@@ -66,6 +68,8 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     const runtime = StringRuntime{
         .concat = try buildConcat(allocator, module, type_store, layout),
         .equal = try buildEqual(allocator, module, type_store, layout),
+        .byte_length = try buildByteLength(allocator, module, type_store, layout),
+        .starts_with = try buildStartsWith(allocator, module, type_store, layout),
     };
     const ctx = ExpandCtx{ .layout = layout, .type_store = type_store, .runtime = runtime };
 
@@ -138,6 +142,18 @@ fn expandInstruction(builder: *mir_builder.Builder, instruction: mir.Instruction
                     try builder.emit(.{ .call = .{ .dst = eq, .callee = ctx.runtime.equal, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ v.lhs, v.rhs }) } });
                     try builder.emit(.{ .unary = .{ .dst = v.dst, .op = .negate_bool, .src = eq } });
                 }
+                return;
+            }
+            try builder.emit(instruction);
+        },
+        .call_builtin => |v| {
+            const callee: ?mir.FunctionId = blk: {
+                if (std.mem.eql(u8, v.name, "строки::длина_байт")) break :blk ctx.runtime.byte_length;
+                if (std.mem.eql(u8, v.name, "строки::начинается_с")) break :blk ctx.runtime.starts_with;
+                break :blk null;
+            };
+            if (callee) |fn_id| {
+                try builder.emit(.{ .call = .{ .dst = v.dst, .callee = fn_id, .args = v.args } });
                 return;
             }
             try builder.emit(instruction);
@@ -340,6 +356,121 @@ fn buildEqual(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
 
     const byte_a_reload = try wasm_heap.loadLocal(&builder, byte_a_local, layout.idx_type);
     const bytes_equal = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, byte_a_reload, byte_b);
+    const mismatch_block = try builder.newBlock();
+    const continue_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = bytes_equal, .then_block = continue_block, .else_block = mismatch_block } });
+
+    builder.setCurrentBlock(mismatch_block);
+    const false_val2 = try wasm_heap.boolConst(&builder, layout.bool_type, false);
+    builder.terminate(.{ .return_value = .{ .value = false_val2 } });
+
+    builder.setCurrentBlock(continue_block);
+    const i_next_src = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const one = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const i_next = try wasm_heap.binOp(&builder, layout.idx_type, .add, i_next_src, one);
+    try builder.emit(.{ .store_local = .{ .local = i_local, .src = i_next } });
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_exit);
+    const true_val = try wasm_heap.boolConst(&builder, layout.bool_type, true);
+    builder.terminate(.{ .return_value = .{ .value = true_val } });
+
+    return id;
+}
+
+// `@string_byte_length(s) -> Число`: trivial, the length header IS the
+// byte length. Matches `строки.длина_байт`'s native semantics exactly
+// (`vm.zig`'s `strLenBytes` — plain `string.len`).
+fn buildByteLength(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, "@string_byte_length", wasm_heap.dummy_symbol, type_store.builtins.number, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const s_local = try builder.newLocal(wasm_heap.dummy_symbol, "s", layout.ptr_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{s_local});
+    builder.currentFunction().type_store = type_store;
+
+    const s1 = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const len_i32 = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load = .{ .dst = len_i32, .addr = s1 } });
+    const len_f64 = try builder.newValue(type_store.builtins.number);
+    try builder.emit(.{ .unary = .{ .dst = len_f64, .op = .from_i32, .src = len_i32 } });
+    builder.terminate(.{ .return_value = .{ .value = len_f64 } });
+    return id;
+}
+
+// `@string_starts_with(s, prefix) -> Булево`: byte-level, case-sensitive
+// (`vm.zig`'s `strStartsWith` — `std.mem.startsWith(u8, string, prefix)`).
+// If prefix is longer than s, false (never reads out of bounds).
+fn buildStartsWith(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, "@string_starts_with", wasm_heap.dummy_symbol, layout.bool_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const s_local = try builder.newLocal(wasm_heap.dummy_symbol, "s", layout.ptr_type);
+    const prefix_local = try builder.newLocal(wasm_heap.dummy_symbol, "prefix", layout.ptr_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{ s_local, prefix_local });
+    builder.currentFunction().type_store = type_store;
+
+    const s1 = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const len_s = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load = .{ .dst = len_s, .addr = s1 } });
+    const len_s_local = try wasm_heap.storeLocal(&builder, "len_s", layout.idx_type, len_s);
+
+    const p1 = try wasm_heap.loadLocal(&builder, prefix_local, layout.ptr_type);
+    const len_p = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load = .{ .dst = len_p, .addr = p1 } });
+    const len_p_local = try wasm_heap.storeLocal(&builder, "len_p", layout.idx_type, len_p);
+
+    const len_p_for_cmp = try wasm_heap.loadLocal(&builder, len_p_local, layout.idx_type);
+    const len_s_for_cmp = try wasm_heap.loadLocal(&builder, len_s_local, layout.idx_type);
+    const fits = try wasm_heap.cmpOp(&builder, layout.bool_type, .less_equal, len_p_for_cmp, len_s_for_cmp);
+
+    const compare_block = try builder.newBlock();
+    const too_long_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = fits, .then_block = compare_block, .else_block = too_long_block } });
+
+    builder.setCurrentBlock(too_long_block);
+    const false_val = try wasm_heap.boolConst(&builder, layout.bool_type, false);
+    builder.terminate(.{ .return_value = .{ .value = false_val } });
+
+    builder.setCurrentBlock(compare_block);
+    const four = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const s_for_base = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const s_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, s_for_base, four);
+    const s_base_local = try wasm_heap.storeLocal(&builder, "s_base", layout.idx_type, s_base);
+    const four2 = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const p_for_base = try wasm_heap.loadLocal(&builder, prefix_local, layout.ptr_type);
+    const p_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, p_for_base, four2);
+    const p_base_local = try wasm_heap.storeLocal(&builder, "p_base", layout.idx_type, p_base);
+
+    const i_local = try builder.newLocal(wasm_heap.dummy_symbol, "@i", layout.idx_type);
+    const zero = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    try builder.emit(.{ .store_local = .{ .local = i_local, .src = zero } });
+
+    const loop_header = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_header);
+    const i_for_cmp = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const len_p_for_loop = try wasm_heap.loadLocal(&builder, len_p_local, layout.idx_type);
+    const keep_going = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, i_for_cmp, len_p_for_loop);
+    const loop_body = try builder.newBlock();
+    const loop_exit = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = keep_going, .then_block = loop_body, .else_block = loop_exit } });
+
+    builder.setCurrentBlock(loop_body);
+    const i_for_s = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const s_base_r = try wasm_heap.loadLocal(&builder, s_base_local, layout.idx_type);
+    const s_addr = try wasm_heap.binOp(&builder, layout.idx_type, .add, s_base_r, i_for_s);
+    const byte_s = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load8 = .{ .dst = byte_s, .addr = s_addr } });
+    const byte_s_local = try wasm_heap.storeLocal(&builder, "@byte_s", layout.idx_type, byte_s);
+
+    const i_for_p = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const p_base_r = try wasm_heap.loadLocal(&builder, p_base_local, layout.idx_type);
+    const p_addr = try wasm_heap.binOp(&builder, layout.idx_type, .add, p_base_r, i_for_p);
+    const byte_p = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load8 = .{ .dst = byte_p, .addr = p_addr } });
+
+    const byte_s_reload = try wasm_heap.loadLocal(&builder, byte_s_local, layout.idx_type);
+    const bytes_equal = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, byte_s_reload, byte_p);
     const mismatch_block = try builder.newBlock();
     const continue_block = try builder.newBlock();
     builder.terminate(.{ .branch = .{ .cond = bytes_equal, .then_block = continue_block, .else_block = mismatch_block } });

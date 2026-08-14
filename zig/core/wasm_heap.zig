@@ -113,6 +113,10 @@ pub fn dupeOne(module: *mir.Module, value: mir.ValueId) ![]const mir.ValueId {
 
 pub const alloc_function_name = "@runtime_alloc";
 
+// 64 KiB — the fixed WASM page size (`memory.size`/`memory.grow` always
+// operate in units of this, never bytes directly).
+const wasm_page_bytes: u32 = 65536;
+
 fn buildAlloc(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, alloc_function_name, dummy_symbol, layout.ptr_type, dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -136,7 +140,80 @@ fn buildAlloc(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     // `global_set` only cares about the underlying WASM primitive (i32,
     // same for both `idx_type`/`ptr_type` here), so no conversion needed.
     const new_ptr = try binOp(&builder, layout.idx_type, .add, ptr_for_add, size);
-    try builder.emit(.{ .global_set = .{ .global = 0, .src = new_ptr } });
+    const new_ptr_local = try storeLocal(&builder, "new_ptr", layout.idx_type, new_ptr);
+
+    // Real bug found running a synthetic serialize/parse benchmark: this
+    // bump pointer never checked against the module's ACTUAL memory size
+    // at all — any allocation past the initial page count (fixed at
+    // compile time, `wasm_emit.zig`'s `actor_heap_base` computation)
+    // trapped with a raw "memory access out of bounds" on the very next
+    // read/write through the returned pointer, the first time a program
+    // allocated enough (a few thousand small strings — no GC exists here
+    // to reclaim any of them either) to walk past it. Grow the memory
+    // FIRST, only when actually needed, before ever handing out a
+    // pointer past the current boundary.
+    // A MIR `compare`/`binary` instruction doesn't re-push its operands —
+    // it consumes whatever's already on the WASM stack, in the order
+    // those operands were EMITTED (program order), regardless of which
+    // one is written as `lhs`/`rhs` in this Zig code. Real bug found
+    // running this against a real allocation-heavy program: emitting
+    // `current_bytes`'s computation before reloading `new_ptr_for_cmp`
+    // put `current_bytes` UNDER `new_ptr` on the stack, so `i32.gt_s`
+    // (which pops top-as-c2, next-as-c1) actually computed
+    // `current_bytes > new_ptr` — the exact opposite of the intended
+    // check — so growth was silently never triggered and the module
+    // still trapped at the old boundary. `new_ptr_for_cmp` MUST be
+    // loaded first here to land at the bottom of the two-operand stack
+    // window matching `cmpOp`'s `lhs` argument.
+    const new_ptr_for_cmp = try loadLocal(&builder, new_ptr_local, layout.idx_type);
+    const pages = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .memory_size = .{ .dst = pages } });
+    const page_bytes_const = try addressConst(&builder, layout.idx_type, wasm_page_bytes);
+    const current_bytes = try binOp(&builder, layout.idx_type, .multiply, pages, page_bytes_const);
+    const needs_growth = try cmpOp(&builder, layout.bool_type, .greater, new_ptr_for_cmp, current_bytes);
+
+    // Single branch level only — `wasm_stackify.zig`'s merge-point
+    // detection (`findMerge`) relies on the CFG staying REDUCIBLE the way
+    // `mir_lowering.zig`'s own если/иначе lowering always produces it
+    // (each branch's merge is a block dominated ONLY by that branch).
+    // A second, nested branch inside `grow_block` sharing the SAME
+    // `ok_block` merge as the outer branch breaks that (`ok_block`'s
+    // dominator becomes the outer branch, not `grow_block`) — confirmed
+    // as a real bug: it compiled but wasmtime rejected the module
+    // ("invalid var_i32: integer too large", a corrupted LEB128 from the
+    // stackifier misplacing block boundaries). Fixed by not branching a
+    // second time on `memory.grow`'s result at all — an actual growth
+    // failure (host memory limit hit) just falls through to the same
+    // "memory access out of bounds" trap this bug fixes the COMMON case
+    // of, on the very next read/write past the boundary; genuinely
+    // running out of host memory is not something this allocator can
+    // recover from either way.
+    const grow_block = try builder.newBlock();
+    const ok_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = needs_growth, .then_block = grow_block, .else_block = ok_block } });
+
+    builder.setCurrentBlock(grow_block);
+    const new_ptr_for_grow = try loadLocal(&builder, new_ptr_local, layout.idx_type);
+    // `pages`/`page_bytes_const` (used above, in the branch condition)
+    // are stack values already consumed by that one use — re-derive
+    // fresh copies here rather than reusing them (single-use invariant,
+    // see the file-level comment on `ValueId`).
+    const pages_fresh = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .memory_size = .{ .dst = pages_fresh } });
+    const page_bytes_const2 = try addressConst(&builder, layout.idx_type, wasm_page_bytes);
+    const current_bytes_for_grow = try binOp(&builder, layout.idx_type, .multiply, pages_fresh, page_bytes_const2);
+    const additional_bytes = try binOp(&builder, layout.idx_type, .subtract, new_ptr_for_grow, current_bytes_for_grow);
+    const round_up_const = try addressConst(&builder, layout.idx_type, wasm_page_bytes - 1);
+    const rounded_bytes = try binOp(&builder, layout.idx_type, .add, additional_bytes, round_up_const);
+    const page_bytes_const3 = try addressConst(&builder, layout.idx_type, wasm_page_bytes);
+    const additional_pages = try binOp(&builder, layout.idx_type, .int_divide, rounded_bytes, page_bytes_const3);
+    const grow_result = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .memory_grow = .{ .dst = grow_result, .pages = additional_pages } });
+    builder.terminate(.{ .jump = .{ .target = ok_block } });
+
+    builder.setCurrentBlock(ok_block);
+    const new_ptr_for_set = try loadLocal(&builder, new_ptr_local, layout.idx_type);
+    try builder.emit(.{ .global_set = .{ .global = 0, .src = new_ptr_for_set } });
     const ptr_for_return = try loadLocal(&builder, ptr_local, layout.ptr_type);
     builder.terminate(.{ .return_value = .{ .value = ptr_for_return } });
     return id;

@@ -174,6 +174,23 @@ pub const Instruction = union(enum) {
     // with no actor instructions.
     global_get: struct { dst: ValueId, global: u32 },
     global_set: struct { global: u32, src: ValueId },
+    // WASM `memory.size`/`memory.grow` (opcodes 0x3F/0x40, both followed
+    // by a fixed `0x00` memory-index byte — this backend only ever has
+    // one memory) — WASM-only, produced exclusively by `wasm_heap.zig`'s
+    // `buildAlloc` to grow linear memory before the bump pointer would
+    // walk past the end of it. `memory.size` returns the current size in
+    // 64 KiB PAGES (not bytes); `memory.grow` takes a page DELTA and
+    // returns the previous page count, or `-1` on failure (host memory
+    // limit reached). Real bug found running a synthetic serialize/parse
+    // benchmark: `buildAlloc`'s bump pointer never checked against the
+    // actual memory size at all — any allocation past the module's
+    // initial page count (computed once at compile time from string
+    // constants + the actor heap, `wasm_emit.zig`'s `actor_heap_base`)
+    // trapped with a raw "memory access out of bounds", not a clean
+    // diagnostic, the first time a program allocated enough (a few
+    // thousand small strings) to walk past it.
+    memory_size: struct { dst: ValueId },
+    memory_grow: struct { dst: ValueId, pages: ValueId },
     // Like `frame_load`/`frame_store` but the address is a fully computed
     // RUNTIME i32 value, not `frame + compile-time slot*8` — needed for
     // `wasm_actors.zig`'s mailbox ring buffer (message index only known

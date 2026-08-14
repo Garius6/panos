@@ -301,6 +301,7 @@ fn computeUseCount(allocator: std.mem.Allocator, function: *const mir.Function) 
                 },
                 .call => |call| for (call.args) |arg| try countUse(&counts, arg),
                 .global_set => |set| try countUse(&counts, set.src),
+                .memory_grow => |v| try countUse(&counts, v.pages),
                 .mem_load => |load| try countUse(&counts, load.addr),
                 .mem_store => |store| {
                     try countUse(&counts, store.addr);
@@ -311,7 +312,7 @@ fn computeUseCount(allocator: std.mem.Allocator, function: *const mir.Function) 
                     try countUse(&counts, store.addr);
                     try countUse(&counts, store.src);
                 },
-                .const_value, .load_local, .function_ref, .global_get => {},
+                .const_value, .load_local, .function_ref, .global_get, .memory_size => {},
                 else => return unsupported("вид MIR-инструкции при подсчёте использований"),
             }
         }
@@ -872,6 +873,17 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try code.append(allocator, 0x24); // global.set
             try wasm_module.writeUleb128(code, allocator, set.global);
             return null;
+        },
+        .memory_size => |v| {
+            try code.append(allocator, 0x3F); // memory.size
+            try code.append(allocator, 0x00); // memory index (always 0)
+            return v.dst;
+        },
+        .memory_grow => |v| {
+            // `pages` already on the stack, produced by its own instruction.
+            try code.append(allocator, 0x40); // memory.grow
+            try code.append(allocator, 0x00); // memory index (always 0)
+            return v.dst;
         },
         // Single operand (`addr`), already fully computed and on the
         // stack by its own producer — no offset math needed here, unlike

@@ -162,6 +162,11 @@ fn instrRefs(allocator: std.mem.Allocator, instruction: mir.Instruction) !struct
         .frame_store => |v| try operands.appendSlice(allocator, &.{ v.frame, v.src }),
         .global_get => |v| dst = v.dst,
         .global_set => |v| try operands.append(allocator, v.src),
+        .memory_size => |v| dst = v.dst,
+        .memory_grow => |v| {
+            dst = v.dst;
+            try operands.append(allocator, v.pages);
+        },
         .mem_load => |v| {
             dst = v.dst;
             try operands.append(allocator, v.addr);

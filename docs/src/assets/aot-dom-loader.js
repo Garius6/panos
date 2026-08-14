@@ -3,10 +3,37 @@
 // see `zig/core/mir_lowering.zig`'s `lowerDomBuiltinCall` / `zig/core/
 // wasm_emit.zig`'s `hostImportNameForBuiltin`/`builtinSignature`).
 //
-// String values are opaque i32 handles held by this host. The compiler
-// turns each literal's static UTF-8 offset into a handle through
-// `pw_string_literal`; dynamic DOM values and string `+` use the same
-// table. Allocation and collection therefore stay outside the WASM core.
+// Строка/Опция(Строка) values are REAL addresses into the program's own
+// WASM linear memory now, not host-table handles — `zig/core/wasm_strings.
+// zig` (string builtins host-imports elimination) and `zig/core/
+// wasm_objects.zig` (struct/array/variant expansion) both replaced the
+// original DOM-object-table scheme with real in-memory representations
+// some time ago; this loader was never updated to match and silently
+// stayed correct only because nothing ever exercised a Строка/Опция(Строка)
+// value crossing the host boundary until `сеть.http_запрос_sync` was
+// actually run end-to-end for the first time (`panos build --target=wasm`
+// itself only started succeeding for real programs once WASM AOT interface
+// dispatch + first-class function values landed — see the WASM-AOT
+// initiative's own commit history). Confirmed via `wasm-objdump`: the
+// compiled module imports ZERO `pw_string_*`/`struct_new_*`/`variant_new_*`
+// functions any more — every one of those host imports below was already
+// dead code, never actually requested by the module.
+//
+// Layouts read/written directly here, matching the compiler's own codegen
+// exactly (not guessed):
+//   Строка:  `[u32 byte_length][raw UTF-8 bytes...]` — `wasm_strings.zig`'s
+//            own "LENGTH-PREFIXED UTF-8 byte buffer" doc comment.
+//   Опция(T): two 8-byte slots — `[i32 tag][padding][i32-or-f64 field0]...`
+//            (`wasm_objects.zig`'s `.build_variant`/`.match_tag` codegen —
+//            each slot is 8 bytes regardless of the value's own width, a
+//            narrow i32 write only touches the slot's low 4 bytes). Опция's
+//            own tag order is fixed by `prelude.zig`: `Нет = 0`, `Есть(T)
+//            = 1`.
+// Both are allocated via the module's own exported bump allocator,
+// `@runtime_alloc(size) -> ptr` (exported unconditionally like every other
+// function, `wasm_emit.zig`'s export section has no allow-list) — this
+// loader never needs its own memory management, just the same allocator
+// the WASM code itself uses.
 //
 // NOTE: `demo/todo-app/frontend/index.html` still calls
 // `loadAotDomProgram(programUrl, runtimeUrl)` with the OLD two-argument,
@@ -16,235 +43,134 @@
 // this loader and isn't something this rewrite attempts to fix.
 export async function loadAotDomProgram(programWasmUrl) {
 	const decoder = new TextDecoder()
+	const encoder = new TextEncoder()
 	let instance
-	const strings = [""]
-	const stringHandles = new Map([["", 0]])
-	const aggregates = [null]
-	const arrays = [null]
-	const variants = [null]
-	function newAggregate(fields) {
-		aggregates.push(fields)
-		return aggregates.length - 1
+
+	// Never cache a `DataView`/`Uint8Array` across calls — WASM memory can
+	// grow (`memory.grow`), which detaches any previously constructed view
+	// of the old backing `ArrayBuffer`.
+	function memoryView() {
+		return new DataView(instance.exports.memory.buffer)
 	}
-	function arrayAt(handle) {
-		return arrays[handle]
-	}
-	function newVariant(fields, tag) {
-		variants.push({ fields, tag })
-		return variants.length - 1
-	}
-	function internString(value) {
-		const text = String(value)
-		const existing = stringHandles.get(text)
-		if (existing !== undefined) return existing
-		const handle = strings.length
-		strings.push(text)
-		stringHandles.set(text, handle)
-		return handle
-	}
-	function stringValue(handle) {
-		return strings[handle] ?? ""
-	}
-	function runes(handle) {
-		return Array.from(stringValue(handle))
-	}
-	function asRuneIndex(value) {
-		return Math.trunc(value)
+	function memoryBytes() {
+		return new Uint8Array(instance.exports.memory.buffer)
 	}
 
-	function readCString(offset) {
-		const bytes = new Uint8Array(instance.exports.memory.buffer)
-		let end = offset
-		while (bytes[end] !== 0) end++
-		return decoder.decode(bytes.subarray(offset, end))
+	function readString(ptr) {
+		if (ptr === 0) return ""
+		const byteLength = memoryView().getUint32(ptr, true)
+		return decoder.decode(memoryBytes().subarray(ptr + 4, ptr + 4 + byteLength))
+	}
+
+	function writeString(text) {
+		const bytes = encoder.encode(text)
+		const ptr = instance.exports["@runtime_alloc"](4 + bytes.length)
+		memoryView().setUint32(ptr, bytes.length, true)
+		memoryBytes().set(bytes, ptr + 4)
+		return ptr
+	}
+
+	// Опция(Строка) — the only Опция(T) shape this host boundary ever
+	// needs to build or read (DOM.значение_поля's result, `сеть.
+	// http_запрос_sync`'s result). `null`/`undefined` builds `Нет`.
+	function buildStringOption(text) {
+		if (text === null || text === undefined) {
+			const ptr = instance.exports["@runtime_alloc"](8)
+			memoryView().setInt32(ptr, 0, true) // tag = Нет
+			return ptr
+		}
+		const strHandle = writeString(text)
+		const ptr = instance.exports["@runtime_alloc"](16)
+		memoryView().setInt32(ptr, 1, true) // tag = Есть
+		memoryView().setInt32(ptr + 8, strHandle, true) // field 0, slot 1
+		return ptr
 	}
 
 	const dom = {
-		struct_new_: () => newAggregate([]),
-		struct_new_f: (a) => newAggregate([a]),
-		struct_new_i: (a) => newAggregate([a]),
-		struct_new_ff: (a, b) => newAggregate([a, b]),
-		struct_new_if: (a, b) => newAggregate([a, b]),
-		struct_new_fi: (a, b) => newAggregate([a, b]),
-		struct_new_ii: (a, b) => newAggregate([a, b]),
-		struct_new_fff: (a, b, c) => newAggregate([a, b, c]),
-		struct_new_iff: (a, b, c) => newAggregate([a, b, c]),
-		struct_new_fif: (a, b, c) => newAggregate([a, b, c]),
-		struct_new_iif: (a, b, c) => newAggregate([a, b, c]),
-		struct_new_ffi: (a, b, c) => newAggregate([a, b, c]),
-		struct_new_ifi: (a, b, c) => newAggregate([a, b, c]),
-		struct_new_fii: (a, b, c) => newAggregate([a, b, c]),
-		struct_new_iii: (a, b, c) => newAggregate([a, b, c]),
-		struct_get_i32: (handle, field) => aggregates[handle]?.[field] ?? 0,
-		struct_get_f64: (handle, field) => aggregates[handle]?.[field] ?? 0,
-		struct_set_i32: (handle, value, field) => {
-			if (aggregates[handle]) aggregates[handle][field] = value
-		},
-		struct_set_f64: (handle, value, field) => {
-			if (aggregates[handle]) aggregates[handle][field] = value
-		},
-		array_new: () => {
-			arrays.push([])
-			return arrays.length - 1
-		},
-		array_length: (handle) => arrayAt(handle)?.length ?? 0,
-		array_append_i32: (handle, value) => {
-			arrayAt(handle)?.push(value)
-		},
-		array_append_f64: (handle, value) => {
-			arrayAt(handle)?.push(value)
-		},
-		array_set_i32: (handle, index, value) => {
-			const array = arrayAt(handle)
-			if (!array || !Number.isInteger(index) || index < 0 || index >= array.length) throw new RangeError("индекс массива вне границ")
-			array[index] = value
-		},
-		array_set_f64: (handle, index, value) => {
-			const array = arrayAt(handle)
-			if (!array || !Number.isInteger(index) || index < 0 || index >= array.length) throw new RangeError("индекс массива вне границ")
-			array[index] = value
-		},
-		array_get_i32: (handle, index) => {
-			const array = arrayAt(handle)
-			if (!array || !Number.isInteger(index) || index < 0 || index >= array.length) throw new RangeError("индекс массива вне границ")
-			return array[index]
-		},
-		array_get_f64: (handle, index) => {
-			const array = arrayAt(handle)
-			if (!array || !Number.isInteger(index) || index < 0 || index >= array.length) throw new RangeError("индекс массива вне границ")
-			return array[index]
-		},
-		array_get_or_i32: (handle, index, fallback) => {
-			const array = arrayAt(handle)
-			return array && Number.isInteger(index) && index >= 0 && index < array.length ? array[index] : fallback
-		},
-		array_get_or_f64: (handle, index, fallback) => {
-			const array = arrayAt(handle)
-			return array && Number.isInteger(index) && index >= 0 && index < array.length ? array[index] : fallback
-		},
-		variant_new_: (tag) => newVariant([], tag),
-		variant_new_i: (a, tag) => newVariant([a], tag),
-		variant_new_f: (a, tag) => newVariant([a], tag),
-		variant_new_ii: (a, b, tag) => newVariant([a, b], tag),
-		variant_new_if: (a, b, tag) => newVariant([a, b], tag),
-		variant_new_fi: (a, b, tag) => newVariant([a, b], tag),
-		variant_new_ff: (a, b, tag) => newVariant([a, b], tag),
-		variant_match: (handle, tag) => variants[handle]?.tag === tag ? 1 : 0,
-		variant_get_i32: (handle, field) => variants[handle]?.fields[field] ?? 0,
-		variant_get_f64: (handle, field) => variants[handle]?.fields[field] ?? 0,
-		pw_string_literal: (offset) => internString(readCString(offset)),
-		pw_string_concat: (left, right) => internString(stringValue(left) + stringValue(right)),
-		pw_string_length: (value) => runes(value).length,
-		pw_string_byte_length: (value) => new TextEncoder().encode(stringValue(value)).length,
-		pw_string_slice: (value, start, end) => internString(runes(value).slice(asRuneIndex(start), asRuneIndex(end)).join("")),
-		pw_string_find: (value, needle, start) => {
-			const subject = runes(value)
-			const target = runes(needle)
-			const from = Math.max(0, asRuneIndex(start))
-			if (target.length === 0) return Math.min(from, subject.length)
-			for (let index = from; index + target.length <= subject.length; index++) {
-				let matches = true
-				for (let offset = 0; offset < target.length; offset++) {
-					if (subject[index + offset] !== target[offset]) {
-						matches = false
-						break
-					}
-				}
-				if (matches) return index
-			}
-			return -1
-		},
-		pw_string_starts_with: (value, prefix) => stringValue(value).startsWith(stringValue(prefix)) ? 1 : 0,
-		pw_string_replace: (value, from, to) => internString(stringValue(value).replaceAll(stringValue(from), stringValue(to))),
-		pw_string_split: (value, separator) => {
-			arrays.push(stringValue(value).split(stringValue(separator)).map(internString))
-			return arrays.length - 1
-		},
-		pw_string_from_number: (value) => internString(String(value)),
-		pw_string_to_number: (value) => {
-			const text = stringValue(value).trim()
-			const number = Number(text)
-			if (text !== "" && Number.isFinite(number)) return newVariant([number], 0)
-			return newVariant([newAggregate([internString("строки"), internString("некорректное число")])], 1)
-		},
-		// The AOT ABI cannot suspend a Panos frame, so this intentionally uses
-		// synchronous same-origin XHR. HTTP 2xx returns Опция.Есть(body);
-		// every non-2xx or transport failure is Опция.Нет().
-		pw_http_request_sync: (method, url, body) => {
-			try {
-				const request = new XMLHttpRequest()
-				request.open(stringValue(method), stringValue(url), false)
-				request.setRequestHeader("Content-Type", "application/json")
-				request.send(stringValue(body))
-				if (request.status >= 200 && request.status < 300) return newVariant([internString(request.responseText)], 1)
-			} catch (_) {
-				// Network failures are represented by Опция.Нет().
-			}
-			return newVariant([], 0)
-		},
-		dom_get_text_num: (selector) => {
-			const el = document.querySelector(stringValue(selector))
+		dom_get_text_num: (selectorPtr) => {
+			const el = document.querySelector(readString(selectorPtr))
 			if (!el) return 0
 			const n = parseFloat(el.textContent)
 			return Number.isFinite(n) ? n : 0
 		},
-		dom_set_text_num: (selector, value) => {
-			const el = document.querySelector(stringValue(selector))
+		dom_set_text_num: (selectorPtr, value) => {
+			const el = document.querySelector(readString(selectorPtr))
 			if (el) el.textContent = String(value)
 		},
 		// Handler name MUST match an exported panos function taking zero
 		// arguments (`функ имя() -> Пусто`) — no captured "context" value,
 		// unlike the old Odin-era loader's `(context, __env)` convention
 		// (that needed a real closures ABI this backend doesn't have yet).
-		dom_on_click_num: (selector, handlerName) => {
-			const el = document.querySelector(stringValue(selector))
-			const name = stringValue(handlerName)
-			const handler = instance.exports[name]
+		dom_on_click_num: (selectorPtr, handlerNamePtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			const handler = instance.exports[readString(handlerNamePtr)]
 			if (el && typeof handler === "function") {
 				el.addEventListener("click", () => handler())
 			}
 		},
 		// The three-argument form `DOM.на_клик(selector, name, context)`
 		// is intentionally not a general closure ABI: `name` remains a
-		// static exported function and context is one explicit string value.
-		dom_on_click_context: (selector, handlerName, context) => {
-			const el = document.querySelector(stringValue(selector))
-			const handler = instance.exports[stringValue(handlerName)]
+		// static exported function and `context` is one explicit Строка
+		// value — `contextPtr` is already a real Строка handle from the
+		// WASM side, forwarded to the handler UNCHANGED (never decoded
+		// here; only WASM code ever needs to read it).
+		dom_on_click_context: (selectorPtr, handlerNamePtr, contextPtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			const handler = instance.exports[readString(handlerNamePtr)]
 			if (el && typeof handler === "function") {
-				el.addEventListener("click", () => handler(context))
+				el.addEventListener("click", () => handler(contextPtr))
 			}
 		},
-		dom_get_text_string: (selector) => {
-			const el = document.querySelector(stringValue(selector))
-			return internString(el?.textContent ?? "")
+		dom_get_text_string: (selectorPtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			return writeString(el?.textContent ?? "")
 		},
-		dom_set_text_string: (selector, value) => {
-			const el = document.querySelector(stringValue(selector))
-			if (el) el.textContent = stringValue(value)
+		dom_set_text_string: (selectorPtr, valuePtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			if (el) el.textContent = readString(valuePtr)
 		},
-		dom_get_input_value: (selector) => {
-			const el = document.querySelector(stringValue(selector))
-			return internString(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : "")
+		dom_get_input_value: (selectorPtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			return writeString(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : "")
 		},
-		dom_set_input_value: (selector, value) => {
-			const el = document.querySelector(stringValue(selector))
-			if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) el.value = stringValue(value)
+		dom_set_input_value: (selectorPtr, valuePtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) el.value = readString(valuePtr)
 		},
-		dom_create_append: (parentSelector, tagName, id) => {
-			const parent = document.querySelector(stringValue(parentSelector))
+		dom_create_append: (parentSelectorPtr, tagNamePtr, idPtr) => {
+			const parent = document.querySelector(readString(parentSelectorPtr))
 			if (!parent) return
-			const child = document.createElement(stringValue(tagName))
-			child.id = stringValue(id)
+			const child = document.createElement(readString(tagNamePtr))
+			child.id = readString(idPtr)
 			parent.appendChild(child)
 		},
 		// Schedules a fresh exported Panos call. It deliberately does not
 		// suspend or resume the current Panos frame, so it is safe without a
 		// CPS transform or a general actor/closure runtime.
-		dom_after_frame: (handlerName, context) => {
-			const handler = instance.exports[stringValue(handlerName)]
+		dom_after_frame: (handlerNamePtr, contextPtr) => {
+			const handler = instance.exports[readString(handlerNamePtr)]
 			if (typeof handler === "function") {
-				requestAnimationFrame(() => handler(context))
+				requestAnimationFrame(() => handler(contextPtr))
 			}
+		},
+		// The AOT ABI cannot suspend a Panos frame, so this intentionally uses
+		// synchronous same-origin XHR. HTTP 2xx returns Опция.Есть(body);
+		// every non-2xx or transport failure is Опция.Нет() — both built as
+		// REAL Опция(Строка) values in WASM memory via `buildStringOption`,
+		// not a host-table handle (see this file's own header comment for
+		// why the old scheme silently traps `match_tag`/`get_variant_field`
+		// with "unreachable" — confirmed via `wasmtime`, not guessed).
+		pw_http_request_sync: (methodPtr, urlPtr, bodyPtr) => {
+			try {
+				const request = new XMLHttpRequest()
+				request.open(readString(methodPtr), readString(urlPtr), false)
+				request.setRequestHeader("Content-Type", "application/json")
+				request.send(readString(bodyPtr))
+				if (request.status >= 200 && request.status < 300) return buildStringOption(request.responseText)
+			} catch (_) {
+				// Network failures are represented by Опция.Нет().
+			}
+			return buildStringOption(null)
 		},
 	}
 

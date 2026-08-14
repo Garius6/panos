@@ -2,13 +2,172 @@
 <html lang="ru">
 <head>
 	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
 	<title>panos todo-демо</title>
+	<style>
+		:root {
+			color-scheme: light dark;
+			--accent: #6366f1;
+			--accent-dark: #4f46e5;
+			--danger: #ef4444;
+			--surface: #ffffff;
+			--surface-muted: #f8fafc;
+			--border: #e2e8f0;
+			--text: #0f172a;
+			--text-muted: #64748b;
+		}
+		@media (prefers-color-scheme: dark) {
+			:root {
+				--surface: #1e293b;
+				--surface-muted: #0f172a;
+				--border: #334155;
+				--text: #f1f5f9;
+				--text-muted: #94a3b8;
+			}
+		}
+		* {
+			box-sizing: border-box;
+		}
+		body {
+			margin: 0;
+			min-height: 100vh;
+			display: flex;
+			justify-content: center;
+			padding: 3rem 1rem;
+			background: var(--surface-muted);
+			color: var(--text);
+			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+		}
+		main {
+			width: 100%;
+			max-width: 32rem;
+		}
+		h1 {
+			font-size: 1.5rem;
+			font-weight: 700;
+			margin: 0 0 1.25rem;
+			text-align: center;
+		}
+		.панель {
+			background: var(--surface);
+			border: 1px solid var(--border);
+			border-radius: 1rem;
+			box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 8px 24px rgba(0, 0, 0, 0.06);
+			padding: 1rem;
+		}
+		.форма-добавления {
+			display: flex;
+			gap: 0.5rem;
+			margin-bottom: 0.75rem;
+		}
+		#новая-задача {
+			flex: 1;
+			padding: 0.65rem 0.85rem;
+			border: 1px solid var(--border);
+			border-radius: 0.6rem;
+			background: var(--surface-muted);
+			color: var(--text);
+			font-size: 0.95rem;
+			outline: none;
+			transition: border-color 0.15s ease;
+		}
+		#новая-задача:focus {
+			border-color: var(--accent);
+		}
+		#добавить {
+			padding: 0.65rem 1.1rem;
+			border: none;
+			border-radius: 0.6rem;
+			background: var(--accent);
+			color: white;
+			font-size: 0.95rem;
+			font-weight: 600;
+			cursor: pointer;
+			transition: background 0.15s ease;
+		}
+		#добавить:hover {
+			background: var(--accent-dark);
+		}
+		#список {
+			list-style: none;
+			margin: 0;
+			padding: 0;
+			display: flex;
+			flex-direction: column;
+			gap: 0.35rem;
+		}
+		.задача {
+			display: flex;
+			align-items: center;
+			gap: 0.65rem;
+			padding: 0.6rem 0.5rem;
+			border-radius: 0.6rem;
+			transition: background 0.15s ease;
+		}
+		.задача:hover {
+			background: var(--surface-muted);
+		}
+		.флажок {
+			flex-shrink: 0;
+			width: 1.4rem;
+			height: 1.4rem;
+			border-radius: 50%;
+			border: 2px solid var(--border);
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			font-size: 0.85rem;
+			color: white;
+			cursor: pointer;
+			user-select: none;
+			transition: background 0.15s ease, border-color 0.15s ease;
+		}
+		.задача-готово .флажок {
+			background: var(--accent);
+			border-color: var(--accent);
+		}
+		.задача-текст {
+			flex: 1;
+			font-size: 0.95rem;
+			word-break: break-word;
+		}
+		.задача-готово .задача-текст {
+			color: var(--text-muted);
+			text-decoration: line-through;
+		}
+		.кнопка-удалить {
+			flex-shrink: 0;
+			width: 1.8rem;
+			height: 1.8rem;
+			border: none;
+			border-radius: 0.5rem;
+			background: transparent;
+			color: var(--text-muted);
+			font-size: 0.9rem;
+			cursor: pointer;
+			opacity: 0;
+			transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+		}
+		.задача:hover .кнопка-удалить {
+			opacity: 1;
+		}
+		.кнопка-удалить:hover {
+			background: var(--danger);
+			color: white;
+		}
+	</style>
 </head>
 <body>
-	<h1>Список задач</h1>
-	<input id="новая-задача" type="text" placeholder="новая задача" />
-	<button id="добавить">добавить</button>
-	<ul id="список"></ul>
+	<main>
+		<h1>Список задач</h1>
+		<div class="панель">
+			<div class="форма-добавления">
+				<input id="новая-задача" type="text" placeholder="новая задача" />
+				<button id="добавить">добавить</button>
+			</div>
+			<ul id="список"></ul>
+		</div>
+	</main>
 
 	<script type="module">
 		import { loadAotDomProgram } from "/docs/src/assets/aot-dom-loader.js"

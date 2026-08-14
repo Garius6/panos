@@ -85,6 +85,15 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     // already established).
     var wrapper_of: std.AutoHashMap(mir.FunctionId, mir.FunctionId) = .init(allocator);
     defer wrapper_of.deinit();
+    // Same memoization shape as `wrapper_of` above, for `.build_closure`'s
+    // OWN wrapper need — see `closureWrapperFor`'s doc comment. Separate
+    // map (not shared with `wrapper_of`) since the two wrappers have
+    // different shapes (box-unwrap-receiver vs. trailing-ignored-env_ptr)
+    // and could, in principle, both be needed for the SAME target
+    // function (used both as an interface method AND passed around as a
+    // first-class value).
+    var closure_wrapper_of: std.AutoHashMap(mir.FunctionId, mir.FunctionId) = .init(allocator);
+    defer closure_wrapper_of.deinit();
 
     var index: usize = 0;
     while (index < module.functions.items.len) : (index += 1) {
@@ -114,11 +123,27 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
         const function_ctx = ExpandCtx{ .layout = function_layout, .type_store = function_store };
         var direct_call_callees = try directCallCallees(allocator, &module.functions.items[index]);
         defer direct_call_callees.deinit();
+        // Populated by the `.function_ref` case below, WHENEVER it hits
+        // the `direct_call_callees` exclusion (i.e. this function_ref's
+        // `dst` feeds a SAME-function `call_value`'s callee directly) —
+        // this is the correct "is this call_value's callee actually a
+        // known-static function" signal for `expandCallValue` to use.
+        // `direct_call_callees` ITSELF is the wrong thing to check there:
+        // it's populated by scanning `.call_value.callee` fields
+        // directly, so a call_value's OWN callee is trivially always a
+        // member of that set — checking it against itself is a tautology
+        // that made `expandCallValue` treat EVERY closure call as a
+        // static direct call, silently passing the raw (unboxed) box
+        // pointer straight to `call_indirect` as a table index. Real bug,
+        // found via `wasmtime`: "undefined element: out of bounds table
+        // access" on the very first closure invocation tested.
+        var static_callees: std.AutoHashMap(mir.ValueId, mir.FunctionId) = .init(allocator);
+        defer static_callees.deinit();
         const block_count = module.functions.items[index].blocks.items.len;
         var block_index: usize = 0;
         while (block_index < block_count) : (block_index += 1) {
             var builder = mir_builder.Builder{ .module = module, .allocator = allocator, .function_id = function_id };
-            try expandBlock(&builder, allocator, @enumFromInt(block_index), function_ctx, &table, &table_index_of, &wrapper_of, &direct_call_callees);
+            try expandBlock(&builder, allocator, @enumFromInt(block_index), function_ctx, &table, &table_index_of, &wrapper_of, &closure_wrapper_of, &direct_call_callees, &static_callees);
         }
     }
 
@@ -207,15 +232,209 @@ fn wrapperFor(module: *mir.Module, allocator: std.mem.Allocator, fallback_type_s
     return wrapper_id;
 }
 
+// A plain named function used as a first-class closure VALUE
+// (`.build_closure{already_env_aware: false}` — `mir_lowering.zig`'s
+// `lowerSymbolValueRef`) needs a thin WRAPPER placed in the table
+// instead of the original function itself: every closure is called
+// uniformly through `call_indirect` with a TRAILING `env_ptr` argument
+// (see `expandCallValue`), but the original function's own real
+// signature/direct-call sites must stay untouched — adding a param to
+// the function ITSELF would break every ordinary `f(x)` call to it
+// elsewhere. The wrapper forwards to the real function unchanged,
+// simply dropping the trailing `env_ptr` (a plain function-ref-turned-
+// value never has real captures). Memoized per ORIGINAL FunctionId in
+// `closure_wrapper_of`, same "build once, first time needed" shape as
+// `wrapperFor` above.
+fn closureWrapperFor(module: *mir.Module, allocator: std.mem.Allocator, fallback_type_store: *const types.TypeStore, closure_wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), target: mir.FunctionId) !mir.FunctionId {
+    if (closure_wrapper_of.get(target)) |existing| return existing;
+
+    // Same "copy everything BEFORE calling newFunction/beginFunction"
+    // discipline as `wrapperFor` — both APPEND to `module.functions`,
+    // which can reallocate and invalidate a raw `*mir.Function`.
+    const target_function = &module.functions.items[@intFromEnum(target)];
+    const target_type_store = target_function.type_store orelse fallback_type_store;
+    const target_layout = wasm_heap.PtrLayout{
+        .ptr_type = target_type_store.builtins.string,
+        .idx_type = target_type_store.builtins.boolean,
+        .bool_type = target_type_store.builtins.boolean,
+    };
+    const target_name = try module.arena.allocator().dupe(u8, target_function.name);
+    const target_result_type = target_function.result_type;
+    const target_param_types = try allocator.alloc(types.TypeId, target_function.parameters.len);
+    defer allocator.free(target_param_types);
+    for (target_function.parameters, target_param_types) |local, *out| {
+        out.* = target_function.locals.items[@intFromEnum(local)].type_id;
+    }
+
+    const wrapper_name = try std.fmt.allocPrint(module.arena.allocator(), "@closure_wrap_{s}", .{target_name});
+    const wrapper_id = try mir_builder.newFunction(module, allocator, wrapper_name, wasm_heap.dummy_symbol, target_result_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, wrapper_id);
+
+    var params: std.ArrayList(mir.LocalId) = .empty;
+    var real_locals: std.ArrayList(mir.LocalId) = .empty;
+    defer real_locals.deinit(allocator);
+    for (target_param_types) |t| {
+        const p = try builder.newLocal(wasm_heap.dummy_symbol, "a", t);
+        try params.append(allocator, p);
+        try real_locals.append(allocator, p);
+    }
+    const env_param = try builder.newLocal(wasm_heap.dummy_symbol, "@env", target_layout.idx_type);
+    try params.append(allocator, env_param);
+    builder.currentFunction().parameters = try params.toOwnedSlice(allocator);
+    builder.currentFunction().type_store = target_type_store;
+
+    const arena = module.arena.allocator();
+    var args: std.ArrayList(mir.ValueId) = .empty;
+    for (real_locals.items) |local| {
+        const t = builder.currentFunction().locals.items[@intFromEnum(local)].type_id;
+        try args.append(arena, try wasm_heap.loadLocal(&builder, local, t));
+    }
+
+    const is_void = target_type_store.eql(target_result_type, target_type_store.builtins.void);
+    const dst = if (is_void) null else try builder.newValue(target_result_type);
+    try builder.emit(.{ .call = .{ .dst = dst, .callee = target, .args = try args.toOwnedSlice(arena) } });
+    builder.terminate(.{ .return_value = .{ .value = dst } });
+
+    try closure_wrapper_of.put(target, wrapper_id);
+    return wrapper_id;
+}
+
+// Expands `.build_closure{dst, function, captured, already_env_aware}`
+// into: an ENVIRONMENT allocation (one 8-byte `frame_store` slot per
+// captured value, same plain-struct shape `wasm_objects.zig` already
+// uses — heterogeneous i32/f64 captures both fit uniformly, unlike a
+// byte-packed layout) — skipped entirely (env_ptr = constant 0) for the
+// common zero-capture case (a plain function reference used as a
+// value) — then a 2-FIELD BOX, `mem_load`/`mem_store` at byte offsets 0
+// and 4 (NOT frame slots — both box fields are always plain i32s, never
+// a captured f64 directly, matching `expandCastInterface`'s own
+// `{receiver, vtable_ptr}` box shape exactly): `table_index` at +0,
+// `env_ptr` at +4. `already_env_aware` decides whether `function` is
+// placed in the table directly (a lambda body, already synthesized
+// with its own trailing `env_ptr` parameter — `mir_lowering.zig`'s
+// `lowerLambda`) or via `closureWrapperFor` (a plain named function,
+// needs the ignored-`env_ptr` wrapper).
+fn expandBuildClosure(builder: *mir_builder.Builder, allocator: std.mem.Allocator, v: anytype, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), closure_wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId)) !void {
+    const layout = ctx.layout;
+    const module = builder.module;
+    const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
+
+    // `v.captured` are pre-existing values (produced earlier in the
+    // instruction stream by whatever computed each captured expression)
+    // — route through Locals IMMEDIATELY, same "buried value" discipline
+    // as `expandCastInterface`'s `v.src`/`expandInvokeInterface`'s
+    // `v.args` (this whole initiative's most load-bearing lesson).
+    const capture_locals = try module.arena.allocator().alloc(mir.LocalId, v.captured.len);
+    for (v.captured, capture_locals) |val, *local| {
+        local.* = try wasm_heap.storeLocal(builder, "@capture", builder.currentFunction().valueType(val), val);
+    }
+
+    const env_local: mir.LocalId = env_blk: {
+        if (v.captured.len == 0) {
+            const zero = try wasm_heap.addressConst(builder, layout.ptr_type, 0);
+            break :env_blk try wasm_heap.storeLocal(builder, "@env", layout.ptr_type, zero);
+        }
+        const env_size = try wasm_heap.addressConst(builder, layout.idx_type, @intCast(v.captured.len * 8));
+        const env = try builder.newValue(layout.ptr_type);
+        try builder.emit(.{ .call = .{ .dst = env, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, env_size) } });
+        const local = try wasm_heap.storeLocal(builder, "@env", layout.ptr_type, env);
+
+        // Reverse order — established stack-order convention (see
+        // `wasm_objects.zig`'s own plain-struct field-store loop, same
+        // reasoning repeated throughout this session's work).
+        var i = capture_locals.len;
+        while (i > 0) {
+            i -= 1;
+            const capture_type = builder.currentFunction().locals.items[@intFromEnum(capture_locals[i])].type_id;
+            const capture_val = try wasm_heap.loadLocal(builder, capture_locals[i], capture_type);
+            const env_for_store = try wasm_heap.loadLocal(builder, local, layout.ptr_type);
+            try builder.emit(.{ .frame_store = .{ .frame = env_for_store, .slot = @intCast(i), .src = capture_val } });
+        }
+        break :env_blk local;
+    };
+
+    const callee = if (v.already_env_aware) v.function else try closureWrapperFor(module, allocator, ctx.type_store, closure_wrapper_of, v.function);
+    const table_index = try tableIndexFor(table, table_index_of, allocator, callee);
+
+    const box_size = try wasm_heap.addressConst(builder, layout.idx_type, 8);
+    const box = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = box, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, box_size) } });
+    const box_local = try wasm_heap.storeLocal(builder, "@closure_box", layout.ptr_type, box);
+
+    const table_index_const = try wasm_heap.addressConst(builder, layout.idx_type, table_index);
+    const box_for_table = try wasm_heap.loadLocal(builder, box_local, layout.ptr_type);
+    try builder.emit(.{ .mem_store = .{ .addr = box_for_table, .src = table_index_const } });
+
+    const env_for_box = try wasm_heap.loadLocal(builder, env_local, layout.ptr_type);
+    const four = try wasm_heap.addressConst(builder, layout.idx_type, 4);
+    const box_for_env_addr = try wasm_heap.loadLocal(builder, box_local, layout.ptr_type);
+    const env_field_addr = try wasm_heap.binOp(builder, layout.idx_type, .add, box_for_env_addr, four);
+    try builder.emit(.{ .mem_store = .{ .addr = env_field_addr, .src = env_for_box } });
+
+    try builder.emit(.{ .load_local = .{ .dst = v.dst, .local = box_local } });
+}
+
+// Expands a closure-typed `.call_value{callee, args, dst}` (a
+// `.build_closure`-produced box, or any local/parameter/field holding
+// one) into: unbox (`mem_load` table_index @+0, `mem_load` env_ptr
+// @+4), append `env_ptr` as a TRAILING argument, `.call_indirect` —
+// mirrors `expandInvokeInterface`'s own unbox-then-`call_indirect`
+// shape exactly, same stack-order discipline (`table_index` must be the
+// LAST-produced operand, per `call_indirect`'s own WASM semantics).
+// STATIC direct calls (`static_callees` — see its own doc comment at
+// the call site in `expand`) are left completely untouched —
+// `wasm_emit.zig`'s existing `value_to_function` fast path still
+// handles them as an ordinary `call`, zero closure overhead.
+fn expandCallValue(builder: *mir_builder.Builder, allocator: std.mem.Allocator, v: anytype, ctx: ExpandCtx, static_callees: *const std.AutoHashMap(mir.ValueId, mir.FunctionId)) !void {
+    if (static_callees.contains(v.callee)) {
+        try builder.emit(.{ .call_value = .{ .dst = v.dst, .callee = v.callee, .args = v.args } });
+        return;
+    }
+    _ = allocator;
+    const layout = ctx.layout;
+    const module = builder.module;
+
+    const box_local = try wasm_heap.storeLocal(builder, "@call_box", layout.ptr_type, v.callee);
+    const arg_locals = try module.arena.allocator().alloc(mir.LocalId, v.args.len);
+    for (v.args, arg_locals) |arg, *local| {
+        local.* = try wasm_heap.storeLocal(builder, "@call_arg", builder.currentFunction().valueType(arg), arg);
+    }
+
+    const box_for_table = try wasm_heap.loadLocal(builder, box_local, layout.ptr_type);
+    const table_index_val = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load = .{ .dst = table_index_val, .addr = box_for_table } });
+    const table_index_local = try wasm_heap.storeLocal(builder, "@table_index", layout.idx_type, table_index_val);
+
+    const box_for_env = try wasm_heap.loadLocal(builder, box_local, layout.ptr_type);
+    const four = try wasm_heap.addressConst(builder, layout.idx_type, 4);
+    const env_addr = try wasm_heap.binOp(builder, layout.idx_type, .add, box_for_env, four);
+    const env_ptr_val = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .mem_load = .{ .dst = env_ptr_val, .addr = env_addr } });
+    const env_ptr_local = try wasm_heap.storeLocal(builder, "@call_env", layout.ptr_type, env_ptr_val);
+
+    const arena = module.arena.allocator();
+    var args: std.ArrayList(mir.ValueId) = .empty;
+    for (arg_locals) |local| {
+        const t = builder.currentFunction().locals.items[@intFromEnum(local)].type_id;
+        try args.append(arena, try wasm_heap.loadLocal(builder, local, t));
+    }
+    try args.append(arena, try wasm_heap.loadLocal(builder, env_ptr_local, layout.ptr_type));
+
+    const table_index_for_call = try wasm_heap.loadLocal(builder, table_index_local, layout.idx_type);
+    try builder.emit(.{ .call_indirect = .{ .dst = v.dst, .table_index = table_index_for_call, .args = try args.toOwnedSlice(arena) } });
+}
+
 // Also gates first-class function VALUES (`.function_ref` used as
 // anything other than `.spawn`'s own statically-resolved callee — see
-// `directCallCallees`/`.function_ref`'s rewrite in `expandInstruction`) —
-// both features share this pass's alloc/table infrastructure, and a
-// program using ONE without the OTHER shouldn't pay for either's setup.
+// `directCallCallees`/`.function_ref`'s rewrite in `expandInstruction`)
+// AND closures (`.build_closure`, WASM AOT closure support Stage A —
+// `mir_lowering.zig`'s `lowerLambda`/`lowerSymbolValueRef`) — all three
+// features share this pass's alloc/table infrastructure, and a program
+// using none of them shouldn't pay for any of their setup.
 fn usesInterfaces(module: *const mir.Module) bool {
     for (module.functions.items) |function| for (function.blocks.items) |block|
         for (block.instructions.items) |instruction| switch (instruction) {
-            .cast_interface, .invoke_interface, .function_ref, .call_value => return true,
+            .cast_interface, .invoke_interface, .function_ref, .call_value, .build_closure => return true,
             else => {},
         };
     return false;
@@ -271,7 +490,7 @@ fn tableIndexFor(table: *std.ArrayList(mir.FunctionId), table_index_of: *std.Aut
     return index;
 }
 
-fn expandBlock(builder: *mir_builder.Builder, allocator: std.mem.Allocator, block_id: mir.BlockId, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), direct_call_callees: *const std.AutoHashMap(mir.ValueId, void)) !void {
+fn expandBlock(builder: *mir_builder.Builder, allocator: std.mem.Allocator, block_id: mir.BlockId, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), closure_wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), direct_call_callees: *const std.AutoHashMap(mir.ValueId, void), static_callees: *std.AutoHashMap(mir.ValueId, mir.FunctionId)) !void {
     const function = builder.currentFunction();
     var original = function.blockConst(block_id).*;
     function.block(block_id).instructions = .empty;
@@ -279,13 +498,13 @@ fn expandBlock(builder: *mir_builder.Builder, allocator: std.mem.Allocator, bloc
     builder.terminated = false;
 
     for (original.instructions.items) |instruction| {
-        try expandInstruction(builder, allocator, instruction, ctx, table, table_index_of, wrapper_of, direct_call_callees);
+        try expandInstruction(builder, allocator, instruction, ctx, table, table_index_of, wrapper_of, closure_wrapper_of, direct_call_callees, static_callees);
     }
     builder.terminate(original.terminator);
     original.instructions.deinit(allocator);
 }
 
-fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator, instruction: mir.Instruction, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), direct_call_callees: *const std.AutoHashMap(mir.ValueId, void)) !void {
+fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator, instruction: mir.Instruction, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), closure_wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), direct_call_callees: *const std.AutoHashMap(mir.ValueId, void), static_callees: *std.AutoHashMap(mir.ValueId, mir.FunctionId)) !void {
     switch (instruction) {
         .cast_interface => |v| {
             try expandCastInterface(builder, allocator, v, ctx, table, table_index_of, wrapper_of);
@@ -299,11 +518,25 @@ fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator
         // callee is deliberately excluded.
         .function_ref => |v| {
             if (direct_call_callees.contains(v.dst)) {
+                try static_callees.put(v.dst, v.function);
                 try builder.emit(instruction);
                 return;
             }
             const table_index = try tableIndexFor(table, table_index_of, allocator, v.function);
             try builder.emit(.{ .const_value = .{ .dst = v.dst, .value = .{ .address = table_index } } });
+        },
+        // WASM AOT closures, Stage A — see `expandBuildClosure`'s own
+        // doc comment.
+        .build_closure => |v| {
+            try expandBuildClosure(builder, allocator, v, ctx, table, table_index_of, closure_wrapper_of);
+        },
+        // A closure-typed callee (`.function`-typed value, produced by
+        // `.build_closure` or an ordinary local/parameter/field holding
+        // one) — see `expandCallValue`'s own doc comment. The STATIC
+        // direct-call fast path (`static_callees`) is untouched, exactly
+        // as `.function_ref`'s own rewrite above.
+        .call_value => |v| {
+            try expandCallValue(builder, allocator, v, ctx, static_callees);
         },
         else => try builder.emit(instruction),
     }

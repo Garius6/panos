@@ -54,6 +54,23 @@ const LoopTargets = struct {
     break_target: mir.BlockId,
 };
 
+// Populated ONLY while lowering a lambda BODY (`lowerLambda` below) — a
+// captured symbol resolves via `frame_load{env_local, slot}` instead of
+// the ordinary `symbol_to_local` map, since it lives in the closure's
+// environment allocation, not a real WASM local of the lambda body
+// itself. `env_local` is the lambda body's own trailing `env_ptr`
+// parameter (a `LocalId`, loaded fresh via `load_local` each time it's
+// needed — same "reload from a Local" discipline this whole file
+// already uses everywhere else).
+const CaptureEnv = struct {
+    env_local: mir.LocalId,
+    index_of: std.AutoHashMap(symbols.SymbolId, u32),
+
+    fn deinit(self: *CaptureEnv) void {
+        self.index_of.deinit();
+    }
+};
+
 const LoweringContext = struct {
     allocator: std.mem.Allocator,
     tree: *const ast.Ast,
@@ -63,10 +80,12 @@ const LoweringContext = struct {
     symbol_to_local: std.AutoHashMap(symbols.SymbolId, mir.LocalId),
     symbol_to_function: *const std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
     loops: std.ArrayList(LoopTargets) = .empty,
+    capture_env: ?CaptureEnv = null,
 
     fn deinit(self: *LoweringContext) void {
         self.loops.deinit(self.allocator);
         self.symbol_to_local.deinit();
+        if (self.capture_env) |*env| env.deinit();
         self.* = undefined;
     }
 };
@@ -1348,6 +1367,7 @@ fn lowerExprInner(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOu
             if (flow == .terminates) break :blk terminated;
             break :blk continuesWith(try emitConstNumber(ctx, 0));
         },
+        .lambda => |lambda| lowerLambda(ctx, expression, lambda),
         else => return unsupported("вид выражения"),
     };
 }
@@ -1546,16 +1566,136 @@ fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytyp
 }
 
 fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: source.Span) !mir.ValueId {
+    // Captured symbol, resolved INSIDE a lambda body — see `CaptureEnv`'s
+    // own doc comment. Checked BEFORE `symbol_to_local`: a capture and an
+    // ordinary lambda-body local can never collide (captures never get a
+    // `symbol_to_local` entry in the inner `LoweringContext` at all, see
+    // `lowerLambda`), but checking first keeps the precedence explicit
+    // rather than accidental.
+    if (ctx.capture_env) |*env| {
+        if (env.index_of.get(symbol)) |slot| {
+            const type_id = ctx.checked.symbol_types.get(symbol) orelse ctx.checked.types.builtins.void;
+            const env_ptr = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
+            try ctx.builder.emit(.{ .load_local = .{ .dst = env_ptr, .local = env.env_local } });
+            const dst = try ctx.builder.newValue(type_id);
+            try ctx.builder.emit(.{ .frame_load = .{ .dst = dst, .frame = env_ptr, .slot = slot } });
+            return dst;
+        }
+    }
     if (ctx.symbol_to_local.get(symbol)) |local| {
         const dst = try ctx.builder.newValue(ctx.builder.currentFunction().locals.items[@intFromEnum(local)].type_id);
         try ctx.builder.emit(.{ .load_local = .{ .dst = dst, .local = local } });
         return dst;
     }
     if (ctx.symbol_to_function.get(symbol)) |function_id| {
-        return emitFunctionRef(ctx, function_id);
+        // A plain named function used as an ordinary VALUE (not
+        // immediately called — `lowerCall`'s OWN ident-callee fast path
+        // never reaches this function at all, see this file's own
+        // closure design notes) — uniform closure representation, zero
+        // captures, `already_env_aware = false` since the ORIGINAL
+        // function's signature has no `env_ptr` param and must stay
+        // untouched for its own direct-call sites. `wasm_interfaces.zig`
+        // synthesizes a thin ignored-`env_ptr` wrapper for this case.
+        const dst = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
+        try ctx.builder.emit(.{ .build_closure = .{ .dst = dst, .function = function_id, .captured = &.{}, .already_env_aware = false } });
+        return dst;
     }
     _ = span;
     return unsupported("символ не является локалью или функцией");
+}
+
+fn lambdaReturnType(checked: *const type_checker.CheckResult, expression: ast.ExprId) types.TypeId {
+    const signature_id = checked.expression_types.get(expression) orelse return checked.types.builtins.void;
+    const entry = checked.types.get(signature_id) orelse return checked.types.builtins.void;
+    return switch (entry.*) {
+        .function => |value| value.return_type,
+        else => checked.types.builtins.void,
+    };
+}
+
+// WASM AOT closure support, Stage A (see the `project_panos_wasm_aot_closures`
+// design notes) — real `.lambda` lowering. Captures are BY VALUE, taken
+// at closure-CONSTRUCTION time (matches the bytecode VM's own
+// `.build_closure`/`compileLambda` semantics exactly, `compiler.zig`) —
+// each captured symbol is read via the OUTER `ctx`'s ordinary
+// `lowerSymbolValueRef` (so a capture can itself be a parameter, a
+// local, or — recursively — another OUTER capture, as long as that
+// outer scope isn't ITSELF a lambda body, see the nesting restriction
+// below) and stored into a fresh environment allocation; the lambda
+// BODY is lowered as a genuinely separate MIR function whose captured-
+// symbol lookups are redirected through `CaptureEnv` instead of
+// `symbol_to_local`.
+//
+// Explicit scoping restriction for this stage: NON-NESTED lambdas only.
+// A lambda body containing another `.lambda` that itself needs to reach
+// the OUTER lambda's own captures (not just the outer ORDINARY
+// function's locals) would need the inner closure's environment to
+// chain through the outer one — real, deferred gap, not silently wrong
+// codegen: `ctx.capture_env != null` at lowering time means we are
+// ALREADY inside a lambda body, so hitting a nested `.lambda` here
+// reports a clear diagnostic instead of miscompiling.
+fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) anyerror!ExprOutcome {
+    if (ctx.capture_env != null) return unsupported("вложенные замыкания (Stage A поддерживает только один уровень)");
+
+    const captures = ctx.resolution.lambda_captures.get(expression) orelse &.{};
+    if (captures.len > std.math.maxInt(u16)) return unsupported("лямбда захватывает слишком много значений");
+
+    const arena = ctx.builder.module.arena.allocator();
+    var captured_values: std.ArrayList(mir.ValueId) = .empty;
+    for (captures) |capture_symbol| {
+        const value = try lowerSymbolValueRef(ctx, capture_symbol, expressionSpan(ctx.tree, expression));
+        try captured_values.append(arena, value);
+    }
+    const captured_slice = try captured_values.toOwnedSlice(arena);
+
+    const lambda_result_type = lambdaReturnType(ctx.checked, expression);
+    const lambda_name = try std.fmt.allocPrint(arena, "@lambda_{d}", .{ctx.builder.module.functions.items.len});
+    const lambda_function_id = try mir_builder.newFunction(ctx.builder.module, ctx.allocator, lambda_name, dummy_symbol, lambda_result_type, expressionSpan(ctx.tree, expression));
+    ctx.builder.module.functions.items[@intFromEnum(lambda_function_id)].type_store = &ctx.checked.types;
+
+    var inner_ctx = LoweringContext{
+        .allocator = ctx.allocator,
+        .tree = ctx.tree,
+        .resolution = ctx.resolution,
+        .checked = ctx.checked,
+        .builder = try mir_builder.Builder.beginFunction(ctx.builder.module, ctx.allocator, lambda_function_id),
+        .symbol_to_local = .init(ctx.allocator),
+        .symbol_to_function = ctx.symbol_to_function,
+    };
+    defer inner_ctx.deinit();
+
+    const parameter_symbols = ctx.resolution.lambda_parameters.get(expression) orelse &.{};
+    var param_locals: std.ArrayList(mir.LocalId) = .empty;
+    for (parameter_symbols) |symbol| {
+        const type_id = ctx.checked.symbol_types.get(symbol) orelse ctx.checked.types.builtins.void;
+        const local = try inner_ctx.builder.newLocal(symbol, "", type_id);
+        try inner_ctx.symbol_to_local.put(symbol, local);
+        try param_locals.append(ctx.allocator, local);
+    }
+    // `env_ptr` is a TRAILING parameter, uniformly, matching the "append
+    // env_ptr as a trailing call_indirect argument" convention on the
+    // CALLING side (`wasm_interfaces.zig`'s `.call_value` expansion) —
+    // one calling convention everywhere a `.function`-typed value is
+    // invoked, no branching between "closure" and "plain function"
+    // shapes at the call site.
+    const env_param = try inner_ctx.builder.newLocal(dummy_symbol, "@env", ctx.checked.types.builtins.boolean);
+    try param_locals.append(ctx.allocator, env_param);
+    inner_ctx.builder.currentFunction().parameters = try param_locals.toOwnedSlice(ctx.allocator);
+    inner_ctx.builder.currentFunction().type_store = &ctx.checked.types;
+
+    var index_of: std.AutoHashMap(symbols.SymbolId, u32) = .init(ctx.allocator);
+    for (captures, 0..) |capture_symbol, i| try index_of.put(capture_symbol, @intCast(i));
+    inner_ctx.capture_env = .{ .env_local = env_param, .index_of = index_of };
+
+    const want_value = !ctx.checked.types.eql(lambda_result_type, ctx.checked.types.builtins.void);
+    const outcome = try lowerBlock(&inner_ctx, lambda.body, want_value);
+    if (outcome.flow == .continues) {
+        inner_ctx.builder.terminate(.{ .return_value = .{ .value = if (want_value) outcome.value else null } });
+    }
+
+    const dst = try ctx.builder.newValue(ctx.checked.expression_types.get(expression) orelse ctx.checked.types.builtins.boolean);
+    try ctx.builder.emit(.{ .build_closure = .{ .dst = dst, .function = lambda_function_id, .captured = captured_slice, .already_env_aware = true } });
+    return continuesWith(dst);
 }
 
 fn emitFunctionRef(ctx: *LoweringContext, function_id: mir.FunctionId) !mir.ValueId {

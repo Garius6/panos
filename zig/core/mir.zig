@@ -149,7 +149,21 @@ pub const Instruction = union(enum) {
     build_variant: struct { dst: ValueId, type_name: []const u8, variant_name: []const u8, tag: u32, fields: []const ValueId },
     match_tag: struct { dst: ValueId, subject: ValueId, tag: u32 },
     get_variant_field: struct { dst: ValueId, subject: ValueId, field_index: u32 },
-    build_closure: struct { dst: ValueId, function: FunctionId, captured: []const ValueId },
+    // WASM AOT closure support (Stage A) — `function` is EITHER a lambda
+    // body already synthesized with its own trailing `env_ptr` parameter
+    // (`already_env_aware = true`, `mir_lowering.zig`'s `lowerLambda`) OR
+    // a pre-existing named function used as a first-class VALUE
+    // (`already_env_aware = false`, `lowerSymbolValueRef`'s `.function`
+    // fallback) — the latter needs a thin trailing-`env_ptr`-ignoring
+    // WRAPPER synthesized at expansion time (`wasm_interfaces.zig`,
+    // reusing its established `wrapperFor`-shaped pattern) since the
+    // ORIGINAL function's signature/direct-call sites must stay
+    // untouched. `captured` empty is the common "plain function value,
+    // zero captures" case. Expanded by `wasm_interfaces.zig` (same pass
+    // that already rewrites `.function_ref`/`.cast_interface`) into a
+    // real env allocation (one slot per captured value) + a 2-slot
+    // `{table_index, env_ptr}` box — see that file's own doc comment.
+    build_closure: struct { dst: ValueId, function: FunctionId, captured: []const ValueId, already_env_aware: bool },
     function_ref: struct { dst: ValueId, function: FunctionId },
     spawn: struct { dst: ValueId, callee: ValueId, args: []const ValueId },
     send: struct { process: ValueId, message: ValueId },

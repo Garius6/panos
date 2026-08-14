@@ -56,8 +56,20 @@ export async function loadAotDomProgram(programWasmUrl) {
 		return new Uint8Array(instance.exports.memory.buffer)
 	}
 
+	// `ptr === 0` is NOT a null/missing-string sentinel here — the static
+	// string-literal data section is placed at the very START of linear
+	// memory (`wasm_emit.zig`'s own `actor_heap_base` computation adds
+	// the actor allocator's sentinel-avoidance AFTER `strings.data.len`,
+	// confirming the data section itself starts at absolute address 0),
+	// so a short/common literal (e.g. the very FIRST string constant
+	// emitted) can legitimately have a real address of exactly 0. Real
+	// bug found via a `DOM.создать_и_добавить("body", ...)` call reading
+	// back as an empty selector — silently broke `querySelector("")`
+	// instead of `querySelector("body")` — confirmed via `strings
+	// program.wasm` showing "body" genuinely present in the data section
+	// while every OTHER string literal in the same tiny test program
+	// happened to read back correctly (they didn't land at offset 0).
 	function readString(ptr) {
-		if (ptr === 0) return ""
 		const byteLength = memoryView().getUint32(ptr, true)
 		return decoder.decode(memoryBytes().subarray(ptr + 4, ptr + 4 + byteLength))
 	}
@@ -136,6 +148,22 @@ export async function loadAotDomProgram(programWasmUrl) {
 		dom_set_input_value: (selectorPtr, valuePtr) => {
 			const el = document.querySelector(readString(selectorPtr))
 			if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) el.value = readString(valuePtr)
+		},
+		// `DOM.атрибут`/`.установить_атрибут` — the general escape hatch
+		// for anything not covered by a dedicated call (CSS via
+		// `style`, CSS classes via `class`, ARIA attributes, etc.).
+		// Returns/accepts a plain Строка, no Опция wrapping (matches
+		// `dom_get_text_string`'s own "" fallback, not `сеть.
+		// http_запрос_sync`'s Опция convention — an attribute simply
+		// being absent is not an error case worth a match/`.получить()`
+		// at every call site).
+		dom_get_attribute: (selectorPtr, nameAttrPtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			return writeString(el?.getAttribute(readString(nameAttrPtr)) ?? "")
+		},
+		dom_set_attribute: (selectorPtr, nameAttrPtr, valuePtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			if (el) el.setAttribute(readString(nameAttrPtr), readString(valuePtr))
 		},
 		dom_create_append: (parentSelectorPtr, tagNamePtr, idPtr) => {
 			const parent = document.querySelector(readString(parentSelectorPtr))

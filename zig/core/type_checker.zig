@@ -3693,6 +3693,32 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.void;
             }
+            if (self.isBuiltinModule(symbol, "DOM", "атрибут")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: DOM.атрибут() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: DOM.атрибут() ожидает селектор и имя атрибута типа Строка", .{});
+                    }
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "DOM", "установить_атрибут")) {
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: DOM.установить_атрибут() ожидает 3 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: DOM.установить_атрибут() ожидает селектор, имя и значение атрибута типа Строка", .{});
+                    }
+                }
+                return self.result.types.builtins.void;
+            }
             if (self.isBuiltinModule(symbol, "DOM", "после_кадра")) {
                 if (call.arguments.len != 2) {
                     try self.report(call.span, "Type Error: DOM.после_кадра() ожидает имя обработчика и контекст", .{});

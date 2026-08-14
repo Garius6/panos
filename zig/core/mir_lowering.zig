@@ -2359,6 +2359,10 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
         "DOM::создать_и_добавить"
     else if (std.mem.eql(u8, property.property, "после_кадра"))
         "DOM::после_кадра"
+    else if (std.mem.eql(u8, property.property, "атрибут"))
+        "DOM::атрибут"
+    else if (std.mem.eql(u8, property.property, "установить_атрибут"))
+        "DOM::установить_атрибут"
     else
         return unsupported("DOM.свойство вызов (неподдерживаемый DOM-метод)");
 

@@ -1932,6 +1932,7 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
         if (try lowerNetworkBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerStringBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerDomBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
+        if (try lowerStateBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerArrayMethodCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerOptionMethodCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerResultMethodCall(ctx, call, result_type)) |outcome| return outcome;
@@ -2435,6 +2436,39 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
         args = new_args;
     }
 
+    const is_void = ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);
+    if (is_void) {
+        try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = name, .args = args } });
+        return continuesWith(mir.invalid_value);
+    }
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = name, .args = args } });
+    return continuesWith(dst);
+}
+
+// `состояние.прочитать`/`.записать` — the JS-loader-held Model
+// (`aot-dom-loader.js`'s `heldModel` closure variable), NOT a DOM
+// attribute — see `project_panos_elm_architecture_dom_storage_design`.
+// Unlike `на_клик_контекст`/`после_кадра`'s context argument, NOTHING
+// here needs `wasm_heap.findOrBuildPromoteToPermanent` — the value
+// always flows as a full byte COPY through `readString`/`writeString`
+// on the JS side (never a raw pointer JS holds onto across calls), so
+// it's automatically safe under `wasm_gc_arena.zig`'s per-call arena
+// reset with no special handling.
+fn lowerStateBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "состояние")) return null;
+
+    const property = ctx.tree.expr(call.callee).property;
+    const name = if (std.mem.eql(u8, property.property, "прочитать"))
+        "состояние::прочитать"
+    else if (std.mem.eql(u8, property.property, "записать"))
+        "состояние::записать"
+    else
+        return unsupported("состояние.свойство вызов (неподдерживаемый метод)");
+
+    const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     const is_void = ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);
     if (is_void) {
         try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = name, .args = args } });

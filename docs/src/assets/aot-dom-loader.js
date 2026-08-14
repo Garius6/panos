@@ -45,6 +45,11 @@ export async function loadAotDomProgram(programWasmUrl) {
 	const decoder = new TextDecoder()
 	const encoder = new TextEncoder()
 	let instance
+	// Elm-architecture Model, held here (not in the DOM) across separate
+	// `state_read`/`.записать` round-trips — see the `состояние.*` host
+	// functions below. Per-instance (one `loadAotDomProgram` call =
+	// one running program), never global.
+	let heldModel = ""
 
 	// Never cache a `DataView`/`Uint8Array` across calls — WASM memory can
 	// grow (`memory.grow`), which detaches any previously constructed view
@@ -98,6 +103,28 @@ export async function loadAotDomProgram(programWasmUrl) {
 		return ptr
 	}
 
+	// `на_клик`/`.на_клик_контекст` re-registering on the SAME element
+	// across repeated calls (e.g. a re-render loop re-running the same
+	// `DOM.на_клик(...)` call every frame/update) used to just keep
+	// STACKING listeners forever — every click fired every past
+	// registration, including ones captured with now-stale context
+	// pointers (memory-safe since Phase 1 GC's promotion fix, but still
+	// semantically wrong: a click would re-run OLD handlers with OLD
+	// data). `WeakMap<Element, listener>` — keyed by the actual element
+	// (not the selector string), so a genuinely RECREATED element for
+	// the same selector (`DOM.создать_и_добавить` rebuilding a subtree)
+	// gets its own fresh entry with no explicit cleanup needed (the old,
+	// now-detached element and its map entry become unreachable
+	// together); re-registering on the SAME still-attached element
+	// replaces the listener instead of adding a second one.
+	const clickListeners = new WeakMap()
+	function registerClick(el, listener) {
+		const previous = clickListeners.get(el)
+		if (previous) el.removeEventListener("click", previous)
+		el.addEventListener("click", listener)
+		clickListeners.set(el, listener)
+	}
+
 	const dom = {
 		dom_get_text_num: (selectorPtr) => {
 			const el = document.querySelector(readString(selectorPtr))
@@ -117,7 +144,7 @@ export async function loadAotDomProgram(programWasmUrl) {
 			const el = document.querySelector(readString(selectorPtr))
 			const handler = instance.exports[readString(handlerNamePtr)]
 			if (el && typeof handler === "function") {
-				el.addEventListener("click", () => handler())
+				registerClick(el, () => handler())
 			}
 		},
 		// The three-argument form `DOM.на_клик(selector, name, context)`
@@ -130,7 +157,7 @@ export async function loadAotDomProgram(programWasmUrl) {
 			const el = document.querySelector(readString(selectorPtr))
 			const handler = instance.exports[readString(handlerNamePtr)]
 			if (el && typeof handler === "function") {
-				el.addEventListener("click", () => handler(contextPtr))
+				registerClick(el, () => handler(contextPtr))
 			}
 		},
 		dom_get_text_string: (selectorPtr) => {
@@ -164,6 +191,18 @@ export async function loadAotDomProgram(programWasmUrl) {
 		dom_set_attribute: (selectorPtr, nameAttrPtr, valuePtr) => {
 			const el = document.querySelector(readString(selectorPtr))
 			if (el) el.setAttribute(readString(nameAttrPtr), readString(valuePtr))
+		},
+		// `состояние.прочитать`/`.записать` — an Elm-architecture Model
+		// held as a plain JS variable in THIS closure (`heldModel`,
+		// declared below), not a DOM attribute — see
+		// `project_panos_elm_architecture_dom_storage_design`. Always a
+		// full byte copy in both directions (`writeString`/`readString`),
+		// same as every other Строка crossing this boundary — no raw
+		// pointer is ever held onto here, so it needs no special handling
+		// under the WASM side's per-call arena reset.
+		state_read: () => writeString(heldModel),
+		state_write: (valuePtr) => {
+			heldModel = readString(valuePtr)
 		},
 		dom_create_append: (parentSelectorPtr, tagNamePtr, idPtr) => {
 			const parent = document.querySelector(readString(parentSelectorPtr))

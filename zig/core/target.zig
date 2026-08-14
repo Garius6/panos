@@ -34,6 +34,7 @@ pub const RuntimeAvailabilityError = error{
 
 pub fn builtinAvailability(name: []const u8) BuiltinAvailability {
     if (std.mem.startsWith(u8, name, "DOM::") or
+        std.mem.startsWith(u8, name, "состояние::") or
         std.mem.eql(u8, name, "сеть::http_запрос_sync"))
     {
         return .aot_wasm_only;

@@ -88,6 +88,31 @@
 		#добавить:hover {
 			background: var(--accent-dark);
 		}
+		.фильтры {
+			display: flex;
+			gap: 0.4rem;
+			margin-bottom: 0.75rem;
+		}
+		.фильтр {
+			padding: 0.35rem 0.75rem;
+			border: 1px solid var(--border);
+			border-radius: 0.5rem;
+			background: transparent;
+			color: var(--text-muted);
+			font-size: 0.85rem;
+			cursor: pointer;
+			transition: background 0.15s ease, color 0.15s ease;
+		}
+		.фильтр:hover {
+			background: var(--surface-muted);
+			color: var(--text);
+		}
+		.фильтр-активен,
+		.фильтр-активен:hover {
+			background: var(--accent);
+			color: white;
+			border-color: var(--accent);
+		}
 		#список {
 			list-style: none;
 			margin: 0;
@@ -164,6 +189,11 @@
 			<div class="форма-добавления">
 				<input id="новая-задача" type="text" placeholder="новая задача" />
 				<button id="добавить">добавить</button>
+			</div>
+			<div class="фильтры">
+				<button class="фильтр" id="фильтр-все">Все</button>
+				<button class="фильтр" id="фильтр-активные">Активные</button>
+				<button class="фильтр" id="фильтр-готово">Готово</button>
 			</div>
 			<ul id="список"></ul>
 		</div>

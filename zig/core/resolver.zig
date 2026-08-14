@@ -22,6 +22,7 @@ pub const native_builtin_modules = [_][]const u8{
     "ввод_вывод",
     "строки",
     "DOM",
+    "состояние",
     "сжатие",
     "синтаксис",
     "сеть",
@@ -71,6 +72,7 @@ pub fn nativeModuleExports(name: []const u8) ?[]const []const u8 {
             "кодовая_точка",
         } },
         .{ .name = "DOM", .exports = &.{ "текст", "установить_текст", "на_клик", "текст_строка", "установить_текст_строка", "значение_поля", "установить_значение_поля", "создать_и_добавить", "после_кадра", "атрибут", "установить_атрибут" } },
+        .{ .name = "состояние", .exports = &.{ "прочитать", "записать" } },
         .{ .name = "сжатие", .exports = &.{"разжать_gzip"} },
         .{ .name = "синтаксис", .exports = &.{ "структуры", "поля", "импорты", "аннотации", "аргумент_аннотации", "аннотации_поля", "аргумент_аннотации_поля" } },
         .{ .name = "сеть", .exports = &.{ "подключиться", "кодировать_url", "декодировать_url", "http_запрос", "http_запрос_sync", "http_сервер_слушать" } },
@@ -500,6 +502,10 @@ const Resolver = struct {
         // Numeric methods stay compatible with the first AOT DOM slice;
         // the string methods use opaque handles supplied by its JS runtime.
         try self.installBuiltinModule("DOM", &.{ "текст", "установить_текст", "на_клик", "текст_строка", "установить_текст_строка", "значение_поля", "установить_значение_поля", "создать_и_добавить", "после_кадра", "атрибут", "установить_атрибут" });
+        // `состояние` — the JS-loader-held Model, AOT WASM only (same
+        // `target.zig` restriction as `DOM`, same reasoning: backed by a
+        // JS closure variable that only exists in `aot-dom-loader.js`).
+        try self.installBuiltinModule("состояние", &.{ "прочитать", "записать" });
         try self.installBuiltinModule("сжатие", &.{"разжать_gzip"});
         try self.installBuiltinModule("синтаксис", &.{ "структуры", "поля", "импорты", "аннотации", "аргумент_аннотации", "аннотации_поля", "аргумент_аннотации_поля" });
         try self.installBuiltinModule("сеть", &.{ "подключиться", "кодировать_url", "декодировать_url", "http_запрос", "http_запрос_sync", "http_сервер_слушать" });

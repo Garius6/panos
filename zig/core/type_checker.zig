@@ -3732,6 +3732,33 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.void;
             }
+            // `состояние.прочитать`/`.записать` — the JS-loader-held Model
+            // (aot-dom-loader.js's own `heldModel` closure variable), NOT
+            // a DOM attribute: unlike `DOM.атрибут`, the value never
+            // touches an actual element — the host just hands back
+            // whatever string the previous `.записать` call stored,
+            // across separate export calls. Deliberately zero-arg read /
+            // one-arg write, same shape family as `DOM.атрибут`/
+            // `установить_атрибут` (added earlier this session), backed
+            // by a different host mechanism.
+            if (self.isBuiltinModule(symbol, "состояние", "прочитать")) {
+                if (call.arguments.len != 0) {
+                    try self.report(call.span, "Type Error: состояние.прочитать() не принимает аргументов", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "состояние", "записать")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: состояние.записать() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: состояние.записать() ожидает значение типа Строка", .{});
+                }
+                return self.result.types.builtins.void;
+            }
             if (self.isBuiltinModule(symbol, "ввод_вывод", "печать") or self.isBuiltinModule(symbol, "ввод_вывод", "строка")) {
                 const name = if (self.isBuiltinModule(symbol, "ввод_вывод", "печать")) "печать" else "строка";
                 if (call.arguments.len != 1) {

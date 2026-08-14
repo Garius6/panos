@@ -587,6 +587,7 @@ const FunctionCompiler = struct {
         if (try self.compileOsBuiltin(call)) return;
         if (try self.compileTimeBuiltin(call)) return;
         if (try self.compileDomBuiltin(call)) return;
+        if (try self.compileStateBuiltin(call)) return;
         if (try self.compileIoBuiltin(call)) return;
         if (try self.compileStringBuiltin(call)) return;
         if (try self.compileCompressBuiltin(call)) return;
@@ -879,6 +880,22 @@ const FunctionCompiler = struct {
         const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
         if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "DOM")) return false;
         const message = try self.compiler.program().copyString("DOM доступен только через panos build --target=wasm, не в этом runtime-таргете");
+        try self.emitConstant(.{ .string = message });
+        try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
+        return true;
+    }
+
+    // `состояние.*` is `aot_wasm_only`, same reasoning as `compileDomBuiltin`
+    // right above — a genuine RUNTIME panic, not a compile error, since
+    // this same bytecode compiler runs unconditionally as part of
+    // `panos build --target=wasm`'s own full analysis
+    // (`module_compiler.compileGraphForTarget`) even though the result
+    // is never executed for that command.
+    fn compileStateBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "состояние")) return false;
+        const message = try self.compiler.program().copyString("состояние доступен только через panos build --target=wasm, не в этом runtime-таргете");
         try self.emitConstant(.{ .string = message });
         try self.function.emit(self.compiler.result.allocator, .{ .panic = {} });
         return true;

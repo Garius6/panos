@@ -26,6 +26,17 @@ pub fn wasmValTypeForStore(store: *const types.TypeStore, type_id: types.TypeId)
         // (see `wasm_interfaces.zig`'s `.function_ref` rewrite) — same
         // "opaque i32 handle" category as nominal/array/process values.
         .nominal, .array, .process, .function => return wasm_i32,
+        // A bare, unresolved generic type parameter (`T` with no
+        // concrete substitution reaching this point) — panos generics
+        // are deliberately never monomorphized (see `type_checker.zig`'s
+        // own doc comments), so a value typed this way is only ever
+        // sound to touch through an interface bound (dispatched via the
+        // SAME boxed-i32 vtable mechanism as any other interface value —
+        // `registerGenericInterfaceCasts`/`inferGenericBoundInterfaceCall`
+        // cast the argument to that bound interface at the call site,
+        // not here) — same "safe default" reasoning as the
+        // `.poison`/`.unconstrained` case below.
+        .generic_parameter => return wasm_i32,
         // `поison`/`unconstrained` reaching codegen at ALL means one
         // specific thing in practice, not "type checking gave up
         // generically": `type_checker.zig`'s `получить()` handling

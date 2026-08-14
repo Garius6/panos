@@ -121,7 +121,28 @@ pub fn lowerModule(
             .function => |value| value,
             else => continue,
         };
-        if (function.type_parameters.len > 0) continue; // generics — Phase 2
+        // Generic free functions are no longer skipped (were, "Phase 2")
+        // — panos generics are never monomorphized (see `type_checker.
+        // zig`'s own doc comments), so a generic body compiles exactly
+        // once, unspecialized, the SAME reasoning already applied to
+        // `.interface_decl` default methods this session (see
+        // `reserveMethods`'s own doc comment on that arm). Safe under
+        // the same condition: `T` must only ever be touched through an
+        // interface bound (ordinary `checked.interface_calls`/
+        // `interface_casts` dispatch, ALREADY handled by `lowerCall`/
+        // `applyInterfaceCast` — ordinary interface dispatch doesn't
+        // care whether the interface-typed value came from a generic
+        // bound-cast or an explicit non-generic interface parameter) or
+        // as an opaque `.nominal`/`.function`/struct-field pass-through
+        // (`wasm_objects.zig`'s `frame_store`/`frame_load` type each
+        // value from its OWN concrete producing expression at that call
+        // site, never from the generic declared type) — NOT as a bare
+        // returned/stored `T` value whose OWN WASM representation
+        // (i32 vs f64) could legitimately differ across different
+        // instantiations reachable from the same compiled body (that
+        // narrower case would need real per-instantiation specialization,
+        // not attempted here — no such function exists in the prelude or
+        // any current fixture).
         const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
         const result_type = functionReturnType(checked, symbol);
         const function_id = try mir_builder.newFunction(&module, allocator, function.name, symbol, result_type, function.span);
@@ -135,7 +156,6 @@ pub fn lowerModule(
             .function => |value| value,
             else => continue,
         };
-        if (function.type_parameters.len > 0) continue;
         const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
         const function_id = symbol_to_function.get(symbol) orelse continue;
         try lowerFunctionBody(allocator, tree, resolution, checked, &module, function_id, decl_id, function.body, &symbol_to_function);

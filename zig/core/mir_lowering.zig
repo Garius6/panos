@@ -2536,15 +2536,35 @@ fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types
 //                       which the current one-level implementation in
 //                       `promoteSimpleStructToPermanent` doesn't do
 //                       yet).
+//   `.function_ref`   — a `.function`-typed capture. Real, common case
+//                       found only by RUNNING this, not by reading the
+//                       type system: `symbols.zig`'s `lookupTrackingCaptures`
+//                       registers ANY `.function`-kind symbol referenced
+//                       across a lambda boundary as a capture —
+//                       including a plain top-level function called
+//                       DIRECTLY inside the handler body (e.g.
+//                       `обработать_переключить(id)`), even though
+//                       `mir_lowering.zig`'s own direct-call fast path
+//                       means that reference never actually needs a
+//                       boxed closure value at the CALL site at all.
+//                       `lowerLambda`'s env-building step doesn't know
+//                       this either — it captures every symbol the
+//                       resolver listed, unconditionally. Promoted via
+//                       a RUNTIME check (`promoteFunctionRefCapture`):
+//                       a plain function reference's box always has
+//                       `env_ptr == 0` (nothing captured BY it), safe
+//                       to copy as-is; a genuine closure-with-captures
+//                       value (`env_ptr != 0`) traps instead of
+//                       silently producing a dangling pointer — telling
+//                       the two apart statically isn't possible (both
+//                       share the same `.function` type).
 //   `.unsupported`    — Массив (needs a RUNTIME loop over a dynamic
 //                       element count — not a compile-time-unrolled
 //                       shape like a struct's fixed field list, real
 //                       deferred gap), `Процесс` (actors+closures
-//                       interaction unexplored), another closure
-//                       (`.function` — capturing a closure inside a
-//                       closure has its own env-chaining question, out
-//                       of scope), or a struct with a non-simple field.
-const CaptureKind = enum { scalar, string, struct_simple, unsupported };
+//                       interaction unexplored), or a struct with a
+//                       non-simple field.
+const CaptureKind = enum { scalar, string, struct_simple, function_ref, unsupported };
 
 fn classifyCapture(checked: *const type_checker.CheckResult, type_id: types.TypeId) CaptureKind {
     if (checked.types.eql(type_id, checked.types.builtins.string)) return .string;
@@ -2558,7 +2578,8 @@ fn classifyCapture(checked: *const type_checker.CheckResult, type_id: types.Type
             }
             break :blk .struct_simple;
         },
-        .array, .process, .function => .unsupported,
+        .function => .function_ref,
+        .array, .process => .unsupported,
         else => .scalar,
     };
 }
@@ -2606,8 +2627,68 @@ fn promoteCaptureValue(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, value
             break :blk promoted;
         },
         .struct_simple => try promoteSimpleStructToPermanent(ctx, layout, value_type, old_value),
+        .function_ref => try promoteFunctionRefCapture(ctx, layout, old_value),
         .unsupported => unreachable,
     };
+}
+
+// A captured `.function`-typed value's box, copied into the permanent
+// region — see `CaptureKind.function_ref`'s own doc comment for WHY
+// this case exists at all (the resolver captures every function
+// reference crossing a lambda boundary, even ones the lowering-time
+// direct-call fast path never actually boxes). Only SAFE, in general,
+// when the captured box's `env_ptr` is exactly 0 (a plain named
+// function reference — the overwhelmingly common case, e.g. calling
+// another top-level function from inside a DOM handler) — a non-zero
+// `env_ptr` means the captured value is a genuine closure WITH ITS OWN
+// captures, which would need recursive promotion of THAT environment
+// too (closures-capturing-closures, out of scope here). Can't tell the
+// two apart statically (both share the same `.function` type) — a
+// RUNTIME check decides, trapping with a clear diagnostic instead of
+// silently producing a dangling pointer if it's the unsupported case.
+fn promoteFunctionRefCapture(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, old_box: mir.ValueId) anyerror!mir.ValueId {
+    const module = ctx.builder.module;
+    const old_box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_fn_box", layout.ptr_type, old_box);
+
+    const old_box_for_table = try wasm_heap.loadLocal(&ctx.builder, old_box_local, layout.ptr_type);
+    const table_index = try ctx.builder.newValue(layout.idx_type);
+    try ctx.builder.emit(.{ .mem_load = .{ .dst = table_index, .addr = old_box_for_table } });
+    const table_index_local = try wasm_heap.storeLocal(&ctx.builder, "@click_fn_table_index", layout.idx_type, table_index);
+
+    const old_box_for_env = try wasm_heap.loadLocal(&ctx.builder, old_box_local, layout.ptr_type);
+    const four = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 4);
+    const env_addr = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .add, old_box_for_env, four);
+    const env_ptr = try ctx.builder.newValue(layout.ptr_type);
+    try ctx.builder.emit(.{ .mem_load = .{ .dst = env_ptr, .addr = env_addr } });
+
+    const zero_check = try wasm_heap.addressConst(&ctx.builder, layout.ptr_type, 0);
+    const is_plain = try wasm_heap.cmpOp(&ctx.builder, layout.bool_type, .equal, env_ptr, zero_check);
+
+    const ok_block = try ctx.builder.newBlock();
+    const trap_block = try ctx.builder.newBlock();
+    ctx.builder.terminate(.{ .branch = .{ .cond = is_plain, .then_block = ok_block, .else_block = trap_block } });
+
+    ctx.builder.setCurrentBlock(trap_block);
+    ctx.builder.terminate(.{ .unreachable_term = .{ .reason = "DOM.на_клик_замыкание(): захват замыкания с собственными захватами пока не поддержан (Stage C ограничение)" } });
+
+    ctx.builder.setCurrentBlock(ok_block);
+    const alloc_permanent_id = try wasm_heap.findOrBuildAllocPermanent(ctx.allocator, module, &ctx.checked.types, layout);
+    const box_size = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 8);
+    const new_box = try ctx.builder.newValue(layout.ptr_type);
+    try ctx.builder.emit(.{ .call = .{ .dst = new_box, .callee = alloc_permanent_id, .args = try wasm_heap.dupeOne(module, box_size) } });
+    const new_box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_new_fn_box", layout.ptr_type, new_box);
+
+    const table_index_for_store = try wasm_heap.loadLocal(&ctx.builder, table_index_local, layout.idx_type);
+    const new_box_for_table = try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
+    try ctx.builder.emit(.{ .mem_store = .{ .addr = new_box_for_table, .src = table_index_for_store } });
+
+    const zero_store = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 0);
+    const four2 = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 4);
+    const new_box_for_env_addr = try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
+    const new_env_addr = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .add, new_box_for_env_addr, four2);
+    try ctx.builder.emit(.{ .mem_store = .{ .addr = new_env_addr, .src = zero_store } });
+
+    return try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
 }
 
 // A "simple" struct (per `classifyCapture` — every field is
@@ -2742,23 +2823,52 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
         }
     }
 
-    const selector = try lowerExpr(ctx, call.arguments[0]);
-    if (selector.flow == .terminates) return terminated;
-    const handler_outcome = try lowerExpr(ctx, handler_expr);
-    if (handler_outcome.flow == .terminates) return terminated;
-
     const layout = wasm_heap.PtrLayout{
         .ptr_type = ctx.checked.types.builtins.string,
         .idx_type = ctx.checked.types.builtins.boolean,
         .bool_type = ctx.checked.types.builtins.boolean,
     };
+
+    // Lowered in a DELIBERATELY non-source order: the handler/promotion
+    // side first (which can open a WASM `if/else` block internally —
+    // `promoteFunctionRefCapture`'s runtime env_ptr check, for a
+    // captured plain-function reference), its result stashed in a
+    // Local IMMEDIATELY; `selector` — always a trivial, non-branching
+    // expression in practice (Stage B/C already require the handler to
+    // be a literal lambda; a `DOM.на_клик_замыкание` call's selector is
+    // realistically always a string literal) — computed LAST, right
+    // before the call, so it never needs to survive anything.
+    //
+    // Real bug found via wasmtime, took several attempts to pin down:
+    // a bare, un-Local-routed value computed BEFORE
+    // `promoteClosureBoxToPermanent` does NOT reliably survive its
+    // internal branch — but neither does naively wrapping it in a
+    // Local and reloading it in EITHER position relative to
+    // `promoteClosureBoxToPermanent`'s own call (both orderings tried,
+    // both corrupted `promoted_box`'s own construction instead —
+    // `call_builtin`'s codegen assumes args are pushed in ARRAY order
+    // with NOTHING else interleaved, and squeezing an extra Local
+    // reload of a value computed EARLIER into the middle of
+    // `promoteClosureBoxToPermanent`'s own instruction stream broke
+    // that invariant even when semantically "correct"). Restructuring
+    // so NEITHER value's own danger window (branching, or being
+    // computed early and reloaded late) overlaps the OTHER's
+    // construction sidesteps the whole problem instead of fighting it.
+    const handler_outcome = try lowerExpr(ctx, handler_expr);
+    if (handler_outcome.flow == .terminates) return terminated;
+
     _ = try findOrBuildInvokeClosureClickTrampoline(ctx.allocator, ctx.builder.module, &ctx.checked.types, layout);
     const promoted_box = try promoteClosureBoxToPermanent(ctx, layout, handler_outcome.value, captures);
+    const promoted_box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_promoted_box", layout.ptr_type, promoted_box);
+
+    const selector = try lowerExpr(ctx, call.arguments[0]);
+    if (selector.flow == .terminates) return terminated;
+    const promoted_box_for_call = try wasm_heap.loadLocal(&ctx.builder, promoted_box_local, layout.ptr_type);
 
     const arena = ctx.builder.module.arena.allocator();
     var args: std.ArrayList(mir.ValueId) = .empty;
     try args.append(arena, selector.value);
-    try args.append(arena, promoted_box);
+    try args.append(arena, promoted_box_for_call);
     try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = "DOM::на_клик_замыкание", .args = try args.toOwnedSlice(arena) } });
     return continuesWith(mir.invalid_value);
 }

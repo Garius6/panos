@@ -320,13 +320,26 @@ fn expandBuildClosure(builder: *mir_builder.Builder, allocator: std.mem.Allocato
     const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
 
     // `v.captured` are pre-existing values (produced earlier in the
-    // instruction stream by whatever computed each captured expression)
-    // — route through Locals IMMEDIATELY, same "buried value" discipline
-    // as `expandCastInterface`'s `v.src`/`expandInvokeInterface`'s
-    // `v.args` (this whole initiative's most load-bearing lesson).
+    // instruction stream by whatever computed each captured expression,
+    // IN ARRAY ORDER — `mir_lowering.zig`'s `lowerLambda` emits each
+    // one's producer right when it iterates `captures`) — route through
+    // Locals IMMEDIATELY, same "buried value" discipline as
+    // `expandCastInterface`'s `v.src` (this whole initiative's most
+    // load-bearing lesson) — but REVERSE order specifically: with N>1
+    // captures, `v.captured[N-1]`'s producer was the LAST one replayed,
+    // so it's the value actually sitting on TOP of the real WASM stack
+    // at this point — processing `storeLocal` in ARRAY order (index 0
+    // first) tried to pop it into the WRONG local. Real bug, found only
+    // by running a genuine 2-capture closure under wasmtime/V8 (every
+    // earlier fixture this session had exactly one capture, which
+    // can't expose an ordering bug at all) — `wasm2wat`/`wasm-objdump`
+    // traced it to a `local.set` receiving an f64 where an i32 local
+    // was declared, two captures' values swapped.
     const capture_locals = try module.arena.allocator().alloc(mir.LocalId, v.captured.len);
-    for (v.captured, capture_locals) |val, *local| {
-        local.* = try wasm_heap.storeLocal(builder, "@capture", builder.currentFunction().valueType(val), val);
+    var capture_index = v.captured.len;
+    while (capture_index > 0) {
+        capture_index -= 1;
+        capture_locals[capture_index] = try wasm_heap.storeLocal(builder, "@capture", builder.currentFunction().valueType(v.captured[capture_index]), v.captured[capture_index]);
     }
 
     const env_local: mir.LocalId = env_blk: {

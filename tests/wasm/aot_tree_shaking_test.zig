@@ -150,3 +150,58 @@ test "a function reachable only via DOM.на_клик's string-literal handler n
     defer allocator.free(wasm_bytes);
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "обработчик") != null);
 }
+
+test "a generic function returning bare T, called with both a Число and a struct argument, is flagged as a conflicting instantiation" {
+    const allocator = std.testing.allocator;
+
+    // `первый[T](x: T) -> T` — the ONE residual risk the "no
+    // monomorphization" design (see `5cced87`'s own commit message and
+    // `project_panos_wasm_no_monomorphization_needed` memory) explicitly
+    // left open: a bare, unwrapped `T` as a function's OWN return type,
+    // compiled exactly once, called here with BOTH a Число (f64) and a
+    // Коробка (i32 nominal handle) — the SAME compiled body can't
+    // represent both.
+    //
+    // Checks `computeReachableSymbols`'s own `.conflicts` list directly
+    // rather than running the full `buildGraphToWasmBytes`/`lowerGraph`
+    // pipeline and expecting `error.AotUnsupported` — `lowerGraph`'s
+    // `unsupported(...)` reports via `std.debug.print`, a raw syscall
+    // write that bypasses Zig's `Io` abstraction; triggering it from
+    // CODE UNDER TEST while `zig build`'s own test runner is using the
+    // `--listen=-` stdin/stdout protocol corrupts that protocol (a real
+    // Zig 0.16 std-library interaction, not a bug in this diagnostic —
+    // confirmed by running the exact same test binary directly with
+    // plain `zig test`, outside the protocol, where it passes cleanly).
+    // No other `unsupported(...)` call site in this file was ever
+    // exercised by an in-process test before this one — every other AOT
+    // test invokes `wasmtime`/`panos` as a separate subprocess instead.
+    const source =
+        \\функ первый[T](x: T) -> T
+        \\x
+        \\конец
+        \\
+        \\тип Коробка = структура
+        \\значение: Число
+        \\конец
+        \\
+        \\функ старт() -> Число
+        \\пер a = первый(1.0)
+        \\пер b = первый(Коробка(2.0))
+        \\a
+        \\конец
+    ;
+    const reader = MemoryReader{ .files = &.{.{ .path = "программа.ps", .bytes = source }} };
+    var graph = panos.module_loader.Graph.init(allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "программа");
+    _ = try graph.appendPreludeModule(panos.prelude.SOURCE);
+    try std.testing.expectEqual(@as(usize, 0), graph.diagnostics.items.items.len);
+
+    var compiled = try panos.module_compiler.compileGraphForTarget(allocator, &graph, .aot_js_wasm);
+    defer compiled.deinit();
+    try std.testing.expect(!compiled.hasErrors());
+
+    var reachability = try panos.mir_lowering.computeReachableSymbols(allocator, &graph, &compiled);
+    defer reachability.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), reachability.conflicts.items.len);
+}

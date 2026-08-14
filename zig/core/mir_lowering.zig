@@ -294,6 +294,94 @@ const ReachKey = struct {
 };
 pub const ReachableSet = std.AutoHashMap(ReachKey, void);
 
+// A generic function/method's parameter or return type that stays a
+// BARE, unwrapped `.generic_parameter` (not `.nominal`/`.function` — see
+// `5cced87`'s own doc comment on why those ARE safe unspecialized) needs
+// ONE consistent WASM representation across every call site reachable in
+// the compiled program. `Category` classifies a concrete instantiation's
+// WASM value shape the same way `wasm_module.wasmValTypeForStore` does;
+// `MixedMap` records, per generic symbol, which categories were actually
+// seen — more than one means a single unspecialized compiled body would
+// need to treat the SAME local/return slot as both an i32 handle and an
+// f64 number depending on the caller, which is not representable without
+// real per-instantiation specialization (deliberately not implemented —
+// see `project_panos_wasm_no_monomorphization_needed` memory).
+const Category = enum { i32_like, f64_like };
+const MixedMap = std.AutoHashMap(ReachKey, std.EnumSet(Category));
+
+fn categoryOf(store: *const types.TypeStore, type_id: types.TypeId) Category {
+    return if (wasm_module.wasmValTypeForStore(store, type_id) == wasm_module.wasm_i32) .i32_like else .f64_like;
+}
+
+fn isBareGenericParameter(store: *const types.TypeStore, type_id: types.TypeId) bool {
+    const entry = store.get(type_id) orelse return false;
+    return entry.* == .generic_parameter;
+}
+
+// Resolves `symbol`'s own function/method SIGNATURE type directly from
+// `checked.symbol_types` (a `.function{parameters, return_type}` —
+// panos generic signatures are stored as ordinary function types, T's
+// substitution status included, same lookup `functionReturnType` already
+// uses for the return half). Returns `null` for anything that isn't a
+// "risky" generic signature (no bare `.generic_parameter` anywhere in
+// it) — the common, safe case, skipped without further work.
+const RiskySignature = struct { parameters: []const types.TypeId, return_type: types.TypeId };
+
+fn riskyGenericSignature(checked: *const type_checker.CheckResult, symbol: symbols.SymbolId) ?RiskySignature {
+    const signature_id = checked.symbol_types.get(symbol) orelse return null;
+    const entry = checked.types.get(signature_id) orelse return null;
+    const function_type = switch (entry.*) {
+        .function => |value| value,
+        else => return null,
+    };
+    var risky = isBareGenericParameter(&checked.types, function_type.return_type);
+    if (!risky) for (function_type.parameters) |parameter| {
+        if (isBareGenericParameter(&checked.types, parameter)) {
+            risky = true;
+            break;
+        }
+    };
+    if (!risky) return null;
+    return RiskySignature{ .parameters = function_type.parameters, .return_type = function_type.return_type };
+}
+
+// Records, for a CALL to a "risky" generic symbol, which WASM
+// representation category each risky-typed argument's ACTUAL concrete
+// type maps to — called from `walkExpr`'s own `.call` case, reusing the
+// SAME import-redirect logic `recordReference` already applies (a
+// generic function called across a module boundary must be tracked
+// under the EXPORTING module's own symbol, not the importing alias).
+fn recordGenericInstantiation(
+    compiled: anytype,
+    resolution: *const resolver.Resolution,
+    checked: *const type_checker.CheckResult,
+    mixed: *MixedMap,
+    module_index: usize,
+    callee_symbol: symbols.SymbolId,
+    call: anytype,
+) !void {
+    var target_module_index = module_index;
+    var target_symbol = callee_symbol;
+    if (resolution.imported_symbols.get(callee_symbol)) |origin| {
+        const target_resolution = if (compiled.modules[origin.module].resolution) |*value| value else return;
+        target_symbol = target_resolution.decl_symbols.get(origin.declaration) orelse return;
+        target_module_index = origin.module;
+    }
+    const target_checked = if (compiled.modules[target_module_index].checked) |*value| value else return;
+    const signature = riskyGenericSignature(target_checked, target_symbol) orelse return;
+
+    const key = ReachKey{ .module_index = target_module_index, .symbol = target_symbol };
+    const shared = @min(call.arguments.len, signature.parameters.len);
+    for (call.arguments[0..shared], signature.parameters[0..shared]) |argument, parameter_type| {
+        if (!isBareGenericParameter(&target_checked.types, parameter_type)) continue;
+        const argument_type = checked.expression_types.get(argument) orelse continue;
+        const category = categoryOf(&checked.types, argument_type);
+        const entry = try mixed.getOrPut(key);
+        if (!entry.found_existing) entry.value_ptr.* = .initEmpty();
+        entry.value_ptr.insert(category);
+    }
+}
+
 fn isReachable(reachable: ?*const ReachableSet, module_index: usize, symbol: symbols.SymbolId) bool {
     // `null` — no filtering at all (the single-file `lowerModule` path
     // used by unit tests, which has no real module graph / entry point
@@ -395,6 +483,7 @@ fn walkExpr(
     checked: *const type_checker.CheckResult,
     set: *ReachableSet,
     worklist: *std.ArrayList(ReachKey),
+    mixed: *MixedMap,
     module_index: usize,
     expression: ast.ExprId,
 ) anyerror!void {
@@ -408,45 +497,51 @@ fn walkExpr(
 
     switch (tree.expr(expression).*) {
         .number, .boolean, .string, .ident, .error_node => {},
-        .unary => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.operand),
-        .cast => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.operand),
+        .unary => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.operand),
+        .cast => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.operand),
         .binary => |v| {
-            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.left);
-            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.right);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.left);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.right);
         },
         .call => |v| {
-            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.callee);
-            for (v.arguments) |argument| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, argument);
+            if (resolution.expr_symbols.get(v.callee)) |callee_symbol| {
+                try recordGenericInstantiation(compiled, resolution, checked, mixed, module_index, callee_symbol, v);
+            }
+            if (checked.method_calls.get(expression)) |method_symbol| {
+                try recordGenericInstantiation(compiled, resolution, checked, mixed, module_index, method_symbol, v);
+            }
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.callee);
+            for (v.arguments) |argument| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, argument);
         },
-        .spawn => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.call),
-        .select_wait => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.source),
-        .property => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.object),
+        .spawn => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.call),
+        .select_wait => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.source),
+        .property => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.object),
         .if_expr => |v| {
-            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.condition);
-            try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.then_branch);
-            try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.else_branch);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.condition);
+            try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.then_branch);
+            try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.else_branch);
         },
         .while_expr => |v| {
-            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.condition);
-            try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.body);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.condition);
+            try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.body);
         },
-        .tuple => |v| for (v.elements) |element| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, element),
-        .lambda => |v| try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.body),
-        .array => |v| for (v.elements) |element| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, element),
+        .tuple => |v| for (v.elements) |element| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, element),
+        .lambda => |v| try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.body),
+        .array => |v| for (v.elements) |element| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, element),
         .map => |v| for (v.entries) |entry| {
-            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, entry.key);
-            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, entry.value);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, entry.key);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, entry.value);
         },
         .index => |v| {
-            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.object);
-            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.index);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.object);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.index);
         },
-        .try_expr => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.value),
+        .try_expr => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.value),
         .match_expr => |v| {
-            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.subject);
+            try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.subject);
             for (v.arms) |arm| {
-                if (tree.pattern(arm.pattern).* == .literal) try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, tree.pattern(arm.pattern).literal.value);
-                try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, arm.body);
+                if (tree.pattern(arm.pattern).* == .literal) try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, tree.pattern(arm.pattern).literal.value);
+                try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, arm.body);
             }
         },
     }
@@ -460,22 +555,23 @@ fn walkStmts(
     checked: *const type_checker.CheckResult,
     set: *ReachableSet,
     worklist: *std.ArrayList(ReachKey),
+    mixed: *MixedMap,
     module_index: usize,
     statements: []const ast.StmtId,
 ) anyerror!void {
     for (statements) |statement| {
         switch (tree.stmt(statement).*) {
-            .return_stmt => |v| if (v.value) |value| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, value),
-            .let => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.value),
-            .expr => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.value),
+            .return_stmt => |v| if (v.value) |value| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, value),
+            .let => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.value),
+            .expr => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.value),
             .for_in => |v| {
-                try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.iterable);
-                try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.body);
+                try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.iterable);
+                try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.body);
             },
             .for_range => |v| {
-                try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.start);
-                try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.end);
-                try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, module_index, v.body);
+                try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.start);
+                try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.end);
+                try walkStmts(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.body);
             },
             .continue_stmt, .break_stmt, .error_node => {},
         }
@@ -658,11 +754,52 @@ fn addRootByName(allocator: std.mem.Allocator, graph: anytype, compiled: anytype
     }
 }
 
-pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, compiled: anytype) !ReachableSet {
+pub const ReachabilityResult = struct {
+    reachable: ReachableSet,
+    // Generic symbols with a bare `.generic_parameter` return/parameter
+    // type, called with BOTH i32-category and f64-category concrete
+    // arguments somewhere in reachable code — see `MixedMap`'s own doc
+    // comment. Empty in the overwhelmingly common case; `lowerGraph`
+    // reports these as a clear diagnostic instead of silently
+    // miscompiling one of the two instantiations.
+    conflicts: std.ArrayList(ReachKey),
+
+    pub fn deinit(self: *ReachabilityResult, allocator: std.mem.Allocator) void {
+        self.reachable.deinit();
+        self.conflicts.deinit(allocator);
+    }
+};
+
+// A symbol's own top-level function/method NAME (for the mixed-generic-
+// instantiation diagnostic message) — same linear-scan shape as
+// `findSymbolBody`, kept separate rather than combined since most
+// callers (the reachability walk itself) only ever need the body.
+fn findSymbolName(tree: *const ast.Ast, resolution: *const resolver.Resolution, symbol: symbols.SymbolId) ?[]const u8 {
+    const program = tree.program orelse return null;
+    for (program.declarations) |decl_id| {
+        switch (tree.decl(decl_id).*) {
+            .function => |function| {
+                if ((resolution.decl_symbols.get(decl_id) orelse continue) == symbol) return function.name;
+            },
+            .impl => |implementation| for (implementation.methods) |method_decl_id| {
+                if ((resolution.decl_symbols.get(method_decl_id) orelse continue) == symbol) return tree.decl(method_decl_id).function.name;
+            },
+            .interface_decl => |interface| for (interface.default_methods) |method_decl_id| {
+                if ((resolution.decl_symbols.get(method_decl_id) orelse continue) == symbol) return tree.decl(method_decl_id).function.name;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, compiled: anytype) !ReachabilityResult {
     var set: ReachableSet = .init(allocator);
     errdefer set.deinit();
     var worklist: std.ArrayList(ReachKey) = .empty;
     defer worklist.deinit(allocator);
+    var mixed: MixedMap = .init(allocator);
+    defer mixed.deinit();
 
     // Module index 0 is ALWAYS the entry module — `graph.load(...)` (the
     // very first call, before `appendPreludeModule`/any import) assigns
@@ -672,11 +809,11 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
     // separately, no explicit import edges pointing AT it — actually
     // sorts FIRST, not last; confirmed by `module_loader.zig`'s own test
     // `expectEqual(prelude_index, graph.order.items[0])`).
-    if (graph.modules.items.len == 0) return set;
+    if (graph.modules.items.len == 0) return .{ .reachable = set, .conflicts = .empty };
     const entry_module_index: usize = 0;
-    const entry_resolution = if (compiled.modules[entry_module_index].resolution) |*value| value else return set;
+    const entry_resolution = if (compiled.modules[entry_module_index].resolution) |*value| value else return .{ .reachable = set, .conflicts = .empty };
     const entry_tree = &graph.modules.items[entry_module_index].tree;
-    const entry_program = entry_tree.program orelse return set;
+    const entry_program = entry_tree.program orelse return .{ .reachable = set, .conflicts = .empty };
     for (entry_program.declarations) |decl_id| {
         const function = switch (entry_tree.decl(decl_id).*) {
             .function => |value| value,
@@ -693,7 +830,7 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
         const checked = if (compiled.modules[item.module_index].checked) |*value| value else continue;
         const tree = &graph.modules.items[item.module_index].tree;
         const body = findSymbolBody(tree, resolution, item.symbol) orelse continue;
-        try walkStmts(allocator, compiled, tree, resolution, checked, &set, &worklist, item.module_index, body);
+        try walkStmts(allocator, compiled, tree, resolution, checked, &set, &worklist, &mixed, item.module_index, body);
     }
 
     try addDomHandlerRoots(allocator, graph, compiled, &set, &worklist);
@@ -702,10 +839,17 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
         const checked = if (compiled.modules[item.module_index].checked) |*value| value else continue;
         const tree = &graph.modules.items[item.module_index].tree;
         const body = findSymbolBody(tree, resolution, item.symbol) orelse continue;
-        try walkStmts(allocator, compiled, tree, resolution, checked, &set, &worklist, item.module_index, body);
+        try walkStmts(allocator, compiled, tree, resolution, checked, &set, &worklist, &mixed, item.module_index, body);
     }
 
-    return set;
+    var conflicts: std.ArrayList(ReachKey) = .empty;
+    errdefer conflicts.deinit(allocator);
+    var mixed_iter = mixed.iterator();
+    while (mixed_iter.next()) |entry| {
+        if (entry.value_ptr.count() > 1) try conflicts.append(allocator, entry.key_ptr.*);
+    }
+
+    return .{ .reachable = set, .conflicts = conflicts };
 }
 
 // Link the already resolved/type-checked module graph into one AOT MIR
@@ -724,8 +868,18 @@ pub fn lowerGraph(
     // Tree-shaking — see `computeReachableSymbols`'s own doc comment for
     // why this MUST run before any lowering happens, not as a dead-code-
     // eliminate pass afterward.
-    var reachable = try computeReachableSymbols(allocator, graph, compiled);
-    defer reachable.deinit();
+    var reachability = try computeReachableSymbols(allocator, graph, compiled);
+    defer reachability.deinit(allocator);
+    if (reachability.conflicts.items.len > 0) {
+        const first = reachability.conflicts.items[0];
+        const tree = &graph.modules.items[first.module_index].tree;
+        if (compiled.modules[first.module_index].resolution) |*resolution| {
+            const name = findSymbolName(tree, resolution, first.symbol) orelse "<аноним>";
+            std.debug.print("panos build: generic-функция/метод '{s}' вызвана и с числовым, и со структурным/массивным T без специализации\n", .{name});
+        }
+        return unsupported("generic-функция/метод с несовместимыми инстанциациями T (число и структура/массив в одном скомпилированном теле — не монoморфизировано, см. project_panos_wasm_no_monomorphization_needed)");
+    }
+    const reachable = &reachability.reachable;
 
     var function_maps: std.ArrayList(std.AutoHashMap(symbols.SymbolId, mir.FunctionId)) = .empty;
     defer {
@@ -749,13 +903,13 @@ pub fn lowerGraph(
                 else => continue,
             };
             const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
-            if (!isReachable(&reachable, module_index, symbol)) continue;
+            if (!isReachable(reachable, module_index, symbol)) continue;
             const result_type = functionReturnType(checked, symbol);
             const function_id = try mir_builder.newFunction(&module, allocator, function.name, symbol, result_type, function.span);
             module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
             try function_maps.items[module_index].put(symbol, function_id);
         }
-        try reserveMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index], &reachable, module_index);
+        try reserveMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index], reachable, module_index);
     }
 
     // Imported symbols are freshly minted in the importing Resolution. Map

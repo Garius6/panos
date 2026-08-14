@@ -216,3 +216,40 @@ test "из_числа formats integers, decimals, negatives — practical digit 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("1\n", result.stdout);
 }
+
+test "в_число parses integers/decimals/negatives via Успех, rejects garbage via Неудача" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\функ разобрать(s: Строка, ожидаемое: Число) -> Булево
+        \\    выбор строки.в_число(s)
+        \\    Успех(x) -> x == ожидаемое
+        \\    Неудача(_) -> ложь
+        \\    конец
+        \\конец
+        \\функ отклонить(s: Строка) -> Булево
+        \\    выбор строки.в_число(s)
+        \\    Успех(_) -> ложь
+        \\    Неудача(_) -> истина
+        \\    конец
+        \\конец
+        \\функ старт() -> Булево
+        \\    разобрать("42", 42.0)
+        \\        и разобрать("-5", 0.0 - 5.0)
+        \\        и разобрать("3.14", 3.14)
+        \\        и отклонить("")
+        \\        и отклонить("abc")
+        \\        и отклонить("12x")
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_str9.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRun(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1\n", result.stdout);
+}

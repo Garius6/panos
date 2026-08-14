@@ -562,7 +562,77 @@ fn lowerForIn(ctx: *LoweringContext, statement: ast.StmtId, loop: anytype) anyer
     return .continues;
 }
 
+// Wraps every expression lowering with the SAME "was this expression's
+// value just cast to an interface type?" check the native bytecode
+// compiler applies universally (`compiler.zig`'s `compileExpression`/
+// `emitInterfaceCast` — called after EVERY expression, not just
+// call-shaped ones, since a cast can happen at a let-binding, return,
+// array/map element, or plain function argument just as easily as at a
+// call). `lowerExprInner` is the real per-kind dispatch; this wrapper
+// is the one thing every recursive `lowerExpr` call site already goes
+// through, so hooking here reaches every cast site for free.
 fn lowerExpr(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOutcome {
+    const outcome = try lowerExprInner(ctx, expression);
+    if (outcome.flow == .terminates) return outcome;
+    return try applyInterfaceCast(ctx, expression, outcome);
+}
+
+// Mirrors `compiler.zig`'s `emitInterfaceCast` exactly (same resolution
+// call, same error conditions) — reuses `type_checker.
+// findInterfaceImplementation` (compile-time exact-match-then-generic-
+// pattern-fallback resolution, already proven correct by the native
+// backend) rather than re-deriving vtable-matching logic here. Builds
+// `mir.InterfaceMethodBinding{method_name, function}` pairs by zipping
+// the interface's OWN declared method order (`InterfaceDefinition.
+// methods[i].name`) with the implementation's method symbols (`entry.
+// methods[i]`, SAME index — `defineInterfaceImplementation` guarantees
+// this pairing) — `wasm_interfaces.zig` (the WASM-specific expansion of
+// `.cast_interface`) is what turns FunctionIds into WASM table indices;
+// this stays target-agnostic.
+fn applyInterfaceCast(ctx: *LoweringContext, expression: ast.ExprId, outcome: ExprOutcome) anyerror!ExprOutcome {
+    const cast = ctx.checked.interface_casts.get(expression) orelse return outcome;
+    // `mir.Instruction.cast_interface`'s `vtable` is ONE flat list (no
+    // `vtable_index`-style nesting the way the bytecode backend's
+    // `interface_vtables` constant supports multiple simultaneous
+    // interfaces per cast) — `checked.interface_calls`'s own
+    // `vtable_index` field is unused below as a result. A value cast to
+    // MULTIPLE interfaces at once (e.g. satisfying two bounds
+    // simultaneously) would need `method_index` reinterpreted per-entry,
+    // which this flat scheme can't represent; explicitly rejected rather
+    // than silently invoking the wrong method. Not hit by anything this
+    // plan's own verification cases (prelude iterators) exercise — a
+    // real, scoped Phase-2 gap, not a silent correctness risk.
+    if (cast.entries.len > 1) return unsupported("значение приведено сразу к нескольким интерфейсам (Phase 2)");
+    var vtable: std.ArrayList(mir.InterfaceMethodBinding) = .empty;
+    for (cast.entries) |entry| {
+        var ambiguous = false;
+        const implementation = type_checker.findInterfaceImplementation(
+            ctx.checked,
+            entry.interface,
+            entry.arguments,
+            entry.target,
+            entry.target_arguments,
+            &ambiguous,
+        ) orelse return unsupported("не удалось найти реализацию интерфейса");
+        if (ambiguous) return unsupported("неоднозначная реализация интерфейса — несколько подходящих 'реализация' блоков");
+        const definition = ctx.checked.interface_definitions.get(entry.interface) orelse return unsupported("интерфейс без определения");
+        if (definition.methods.len != implementation.methods.len) return unsupported("несоответствие количества методов интерфейса");
+        for (definition.methods, implementation.methods) |method, method_symbol| {
+            const function_id = ctx.symbol_to_function.get(method_symbol) orelse return unsupported("не удалось найти метод интерфейса");
+            try vtable.append(ctx.builder.module.arena.allocator(), .{ .method_name = method.name, .function = function_id });
+        }
+    }
+    // Same WASM representation (opaque i32 handle) either way — the
+    // source expression's own type is reused rather than the (not
+    // separately tracked at this stage — see `type_checker.zig`'s own
+    // "NO implicit wrapping at type-checker level" design note)
+    // interface type itself.
+    const dst = try ctx.builder.newValue(ctx.builder.currentFunction().valueType(outcome.value));
+    try ctx.builder.emit(.{ .cast_interface = .{ .dst = dst, .src = outcome.value, .vtable = try vtable.toOwnedSlice(ctx.builder.module.arena.allocator()) } });
+    return continuesWith(dst);
+}
+
+fn lowerExprInner(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOutcome {
     return switch (ctx.tree.expr(expression).*) {
         .number => |number| continuesWith(try emitConstNumber(ctx, number.value)),
         .boolean => |boolean| blk: {
@@ -1082,18 +1152,38 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
     }
 
     if (ctx.tree.expr(call.callee).* == .property) {
+        // `значение.метод(...)` where `значение`'s static type is an
+        // INTERFACE (not a concrete struct — that's `checked.
+        // method_calls` below, resolved to a fixed `Symbol_Id`).
+        // `checked.interface_calls` gives `method_index` (the interface's
+        // OWN declared method order — matches `applyInterfaceCast`'s
+        // `vtable` construction, same order, same source:
+        // `InterfaceDefinition.methods`) — the concrete function is only
+        // known at RUNTIME (read from whichever cast produced this
+        // particular receiver value), hence `.invoke_interface`, not an
+        // ordinary `.call`/`.call_value`. `wasm_interfaces.zig` (WASM-
+        // specific expansion, mirrors `wasm_objects.zig`'s own generic-
+        // MIR → target-specific-codegen split) turns this into the
+        // box-unwrap + `call_indirect` chain.
+        if (ctx.checked.interface_calls.get(expression)) |interface_call| {
+            const property = ctx.tree.expr(call.callee).property;
+            const receiver = try lowerExpr(ctx, property.object);
+            if (receiver.flow == .terminates) return terminated;
+            const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+            const dst = if (ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void)) null else try ctx.builder.newValue(result_type);
+            try ctx.builder.emit(.{ .invoke_interface = .{ .dst = dst, .receiver = receiver.value, .method_name = "", .method_index = interface_call.method_index, .args = args } });
+            return .{ .value = dst orelse mir.invalid_value, .flow = .continues };
+        }
         // `значение.метод(...)` where `значение`'s static type is a
-        // concrete struct (not an interface — that's a SEPARATE map,
-        // `checked.interface_calls`, needing real indirect dispatch this
-        // backend doesn't have yet, deliberately left unsupported) —
-        // the type checker already resolved this to the method's own
-        // `Symbol_Id` in `method_calls` (`type_checker.zig:4437`), the
-        // exact same map the native bytecode compiler reads
-        // (`compiler.zig`'s `Method_Struct` case) instead of re-deriving
-        // struct-field lookup here. `это` is just `parameters[0]` on the
-        // method's own side (see `reserveMethods`/`lowerMethods`) — the
-        // receiver (`property.object`) is lowered as an ordinary
-        // argument and placed FIRST, matching that.
+        // concrete struct — the type checker already resolved this to
+        // the method's own `Symbol_Id` in `method_calls` (`type_checker.
+        // zig:4437`), the exact same map the native bytecode compiler
+        // reads (`compiler.zig`'s `Method_Struct` case) instead of
+        // re-deriving struct-field lookup here. `это` is just
+        // `parameters[0]` on the method's own side (see
+        // `reserveMethods`/`lowerMethods`) — the receiver (`property.
+        // object`) is lowered as an ordinary argument and placed FIRST,
+        // matching that.
         if (ctx.checked.method_calls.get(expression)) |method_symbol| {
             if (ctx.symbol_to_function.get(method_symbol)) |function_id| {
                 const function_ref = try emitFunctionRef(ctx, function_id);

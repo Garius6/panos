@@ -103,3 +103,94 @@ test "call_indirect through a hand-built WASM function table dispatches to the c
         try std.testing.expectEqualStrings(case.expected, result.stdout);
     }
 }
+
+fn buildAndRunSource(allocator: std.mem.Allocator, io: std.Io, source: []const u8, wasm_path: []const u8) !std.process.RunResult {
+    var lexed = try panos.lexer.tokenize(allocator, source, 0);
+    defer lexed.deinit();
+    var parsed = try panos.parser.parse(allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try panos.resolver.resolve(allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try panos.type_checker.check(allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+    if (checked.diagnostics.items.items.len > 0) {
+        for (checked.diagnostics.items.items) |d| std.debug.print("DIAG: {s}\n", .{d.message});
+        return error.TypeCheckFailed;
+    }
+
+    var module = try panos.mir_lowering.lowerModule(allocator, &parsed.ast, &resolved, &checked);
+    defer module.deinit(allocator);
+
+    try panos.wasm_objects.expand(allocator, &module, &checked.types);
+    try panos.wasm_strings.expand(allocator, &module, &checked.types);
+    const iface_result = try panos.wasm_interfaces.expand(allocator, &module, &checked.types);
+    defer allocator.free(iface_result.table);
+    var frame_info = try panos.mir_cps.prepare(allocator, &module);
+    defer frame_info.deinit();
+
+    const wasm_bytes = try panos.wasm_emit.emitModule(allocator, &checked, &module, iface_result.table);
+    defer allocator.free(wasm_bytes);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = wasm_path, .data = wasm_bytes });
+    return wasmtimeInvoke(allocator, io, wasm_path, "старт");
+}
+
+// End-to-end through the REAL pipeline (mir_lowering.zig's
+// applyInterfaceCast/interface_calls handling, not hand-built MIR) —
+// two structs implementing the same interface method, invoked
+// polymorphically through a shared parameter type. Real bug found and
+// fixed here: `wasm_interfaces.zig`'s box construction stored the
+// vtable-array pointer into the box's own field with `addr`/`src`
+// produced in the wrong order (addr computed via multi-step arithmetic
+// FIRST, src loaded LAST) — backwards from `mem_store`'s established
+// convention — which silently corrupted the vtable array itself rather
+// than writing the box's own vtable-pointer field, so runtime dispatch
+// always picked the FIRST-ever-cast implementation regardless of which
+// concrete value was actually passed.
+test "interface dispatch: two struct implementations of one interface method, called polymorphically" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\тип Форма = интерфейс
+        \\функ площадь() -> Число
+        \\конец
+        \\
+        \\тип Круг = структура
+        \\радиус: Число
+        \\конец
+        \\
+        \\реализация Форма для Круг
+        \\функ площадь(это: Круг) -> Число
+        \\это.радиус * это.радиус * 3.0
+        \\конец
+        \\конец
+        \\
+        \\тип Квадрат = структура
+        \\сторона: Число
+        \\конец
+        \\
+        \\реализация Форма для Квадрат
+        \\функ площадь(это: Квадрат) -> Число
+        \\это.сторона * это.сторона
+        \\конец
+        \\конец
+        \\
+        \\функ вычислить(ф: Форма) -> Число
+        \\ф.площадь()
+        \\конец
+        \\
+        \\функ старт() -> Число
+        \\вычислить(Круг(2.0)) + вычислить(Квадрат(3.0))
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_iface_dispatch.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRunSource(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("21\n", result.stdout);
+}

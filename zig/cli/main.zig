@@ -321,6 +321,12 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         try stderr.flush();
         std.process.exit(1);
     };
+    const iface_result = panos_core.wasm_interfaces.expand(init.gpa, &module, &entry_checked.types) catch |err| {
+        try stderr.print("panos build: интерфейсы: {t}\n", .{err});
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    defer init.gpa.free(iface_result.table);
     var frame_info = try panos_core.mir_cps.prepare(init.gpa, &module);
     defer frame_info.deinit();
     panos_core.wasm_actors.expand(init.gpa, &module, &entry_checked.types, &frame_info) catch |err| {
@@ -329,7 +335,7 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         std.process.exit(1);
     };
 
-    const wasm_bytes = panos_core.wasm_emit.emitModule(init.gpa, entry_checked, &module, &.{}) catch |err| {
+    const wasm_bytes = panos_core.wasm_emit.emitModule(init.gpa, entry_checked, &module, iface_result.table) catch |err| {
         try stderr.print("panos build: не удалось эмитировать WASM для {s}: {t}\n", .{ input, err });
         try stderr.flush();
         std.process.exit(1);

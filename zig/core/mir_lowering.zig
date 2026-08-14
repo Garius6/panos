@@ -748,6 +748,26 @@ fn lowerIndex(ctx: *LoweringContext, expression: ast.ExprId, index: anytype) any
     return continuesWith(dst);
 }
 
+// `nominal_fields` only has entries for CONCRETE (non-generic) struct
+// declarations — a generic one (`тип X[T] = структура ...`, e.g. the
+// prelude's own `МассивИтератор[T]`, hit by every plain `для x в
+// массив` loop) only has an entry in `generic_nominal_fields`, keyed the
+// same way. Field LOOKUP here only needs each field's NAME and ordinal
+// POSITION (`field_index`, used by `.get_property`/`.set_property` at
+// the MIR level) — never its type-parameter-substituted type (the
+// result type instead comes from `ctx.checked.expression_types`,
+// already resolved earlier by the type checker) — so the generic
+// declaration's own unsubstituted `.fields` list is exactly as usable
+// as a concrete struct's, no substitution needed at this stage. Mirrors
+// `type_checker.zig`'s own `fieldsForNominal` fallback (that one DOES
+// substitute, because it needs to type-check field access expressions;
+// this one only needs positions).
+fn fieldsForNominalSymbol(ctx: *LoweringContext, symbol: symbols.SymbolId) ?[]const type_checker.NominalField {
+    if (ctx.checked.nominal_fields.get(symbol)) |fields| return fields;
+    if (ctx.checked.generic_nominal_fields.get(symbol)) |generic_nominal| return generic_nominal.fields;
+    return null;
+}
+
 fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytype) anyerror!ExprOutcome {
     // Module members and enum variants are resolved symbols and are handled
     // by their callers. A remaining property expression is a struct field.
@@ -760,7 +780,7 @@ fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytyp
         .nominal => |value| value,
         else => return unsupported("свойство не-структуры"),
     };
-    const fields = ctx.checked.nominal_fields.get(nominal.symbol) orelse return unsupported("поле generic-структуры");
+    const fields = fieldsForNominalSymbol(ctx, nominal.symbol) orelse return unsupported("поле generic-структуры");
     for (fields, 0..) |field, index| {
         if (!std.mem.eql(u8, field.name, property.property)) continue;
         const result_type = ctx.checked.expression_types.get(expression) orelse field.typ;
@@ -857,7 +877,7 @@ fn lowerAssign(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcome {
                 .nominal => |value| value,
                 else => return unsupported("присваивание свойства не-структуры"),
             };
-            const fields = ctx.checked.nominal_fields.get(nominal.symbol) orelse return unsupported("присваивание поля generic-структуры");
+            const fields = fieldsForNominalSymbol(ctx, nominal.symbol) orelse return unsupported("присваивание поля generic-структуры");
             var field_index: ?u32 = null;
             for (fields, 0..) |field, index| {
                 if (std.mem.eql(u8, field.name, property.property)) {

@@ -1142,11 +1142,37 @@ fn submitHttpAccept(vm: *Vm, listener: *value.Listener, target_id: u64) void {
                     .value = std.heap.page_allocator.dupe(u8, header.value) catch @panic("OOM"),
                 }) catch @panic("OOM");
             }
-            var body_buffer: [8192]u8 = undefined;
-            const body_reader = request.readerExpectNone(&body_buffer);
-            const body = body_reader.allocRemaining(std.heap.page_allocator, .limited(1024 * 1024)) catch |err| {
-                stream.close(io.io());
-                return job.fail(std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"));
+            // Real hang found running demo/todo-app for real (2026-08-14,
+            // see project_panos_http_post_empty_body_hang memory): a
+            // POST/PUT/PATCH request with NEITHER `Content-Length` NOR
+            // `Transfer-Encoding: chunked` (an empty-body POST sent
+            // without an explicit `Content-Length: 0` — e.g. a bare
+            // `curl -X POST` with no `-d`) is exactly the one case
+            // `std.http.Server.Request.Reader.bodyReader` (std/http.zig
+            // ~444-461) does NOT hand back an already-terminated/bounded
+            // reader — it hands back the RAW, UNBOUNDED connection
+            // socket reader instead (`reader.in`), on the theory that
+            // the caller knows what it's doing with a length-less body.
+            // `allocRemaining` on that raw reader waits for EOF or the
+            // 1 MiB limit, but this is a keep-alive HTTP/1.1 connection
+            // — neither ever arrives for a legitimate empty body, so the
+            // worker hangs forever. `DELETE`/`GET`/`HEAD` never hit this
+            // at all (`Method.requestHasBody()` is false for them,
+            // `readerExpectNone` returns `.ending` immediately) — only
+            // body-bearing methods sent WITHOUT a length declaration.
+            // Detect the exact same condition `bodyReader` itself checks
+            // (`transfer_encoding == .none and content_length == null`)
+            // and treat it as an empty body directly, without ever
+            // touching the raw connection reader.
+            const body: []u8 = if (request.head.transfer_encoding == .none and request.head.content_length == null)
+                &.{}
+            else blk: {
+                var body_buffer: [8192]u8 = undefined;
+                const body_reader = request.readerExpectNone(&body_buffer);
+                break :blk body_reader.allocRemaining(std.heap.page_allocator, .limited(1024 * 1024)) catch |err| {
+                    stream.close(io.io());
+                    return job.fail(std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(err)}) catch @panic("OOM"));
+                };
             };
             job.queue.push(.{ .target_id = job.target_id, .payload = .{ .http_accept = .{
                 .listener = job.listener,

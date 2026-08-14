@@ -52,7 +52,7 @@ const capacity_slot: u32 = 1;
 const data_ptr_slot: u32 = 2;
 const array_header_slots: u32 = 3;
 
-const ArrayRuntime = struct {
+pub const ArrayRuntime = struct {
     new: mir.FunctionId,
     ensure_capacity: mir.FunctionId,
     append_i32: mir.FunctionId,
@@ -364,6 +364,37 @@ fn emitReorderedStore(builder: *mir_builder.Builder, layout: wasm_heap.PtrLayout
 }
 
 // --- Array runtime -------------------------------------------------------
+
+// Public + idempotent (unlike `wasm_heap.findOrBuildAlloc`'s own
+// no-caching rationale, an `ArrayRuntime` has 11 functions to re-find by
+// name — worth a real name-lookup short-circuit instead of re-deriving
+// each field individually): callable from `wasm_strings.zig` too
+// (`разбить` returns `Массив(Строка)`, needs `@array_new`/
+// `@array_append_i32`), for a module that has NO other array usage of
+// its own — `wasm_objects.expand`'s own `usesArrays` gate only scans
+// for `.new_array`/`.get_index`/`.set_index`/`@runtime::array_*`, which
+// a still-unexpanded `строки::разбить` call doesn't match yet (it only
+// becomes an array-returning call AFTER `wasm_strings.expand` rewrites
+// it) — so `wasm_objects.expand` may have skipped building the array
+// runtime entirely by the time `wasm_strings.expand` runs.
+pub fn findOrBuildArrayRuntime(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !ArrayRuntime {
+    if (wasm_heap.findFunctionByName(module, "@array_new")) |new_id| {
+        return .{
+            .new = new_id,
+            .ensure_capacity = wasm_heap.findFunctionByName(module, "@array_ensure_capacity").?,
+            .append_i32 = wasm_heap.findFunctionByName(module, "@array_append_i32").?,
+            .append_f64 = wasm_heap.findFunctionByName(module, "@array_append_f64").?,
+            .get_i32 = wasm_heap.findFunctionByName(module, "@array_get_i32").?,
+            .get_f64 = wasm_heap.findFunctionByName(module, "@array_get_f64").?,
+            .get_or_i32 = wasm_heap.findFunctionByName(module, "@array_get_or_i32").?,
+            .get_or_f64 = wasm_heap.findFunctionByName(module, "@array_get_or_f64").?,
+            .set_i32 = wasm_heap.findFunctionByName(module, "@array_set_i32").?,
+            .set_f64 = wasm_heap.findFunctionByName(module, "@array_set_f64").?,
+            .length = wasm_heap.findFunctionByName(module, "@array_length").?,
+        };
+    }
+    return buildArrayRuntime(allocator, module, type_store, layout);
+}
 
 fn buildArrayRuntime(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !ArrayRuntime {
     _ = try wasm_heap.findOrBuildAlloc(allocator, module, type_store, layout);

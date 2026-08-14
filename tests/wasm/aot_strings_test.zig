@@ -161,3 +161,30 @@ test "заменить replaces all occurrences, byte-level, empty target is a n
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("1\n", result.stdout);
 }
+
+test "разбить splits into Массив(Строка), empty separator returns a single element" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\функ старт() -> Булево
+        \\    пер parts = строки.разбить("a,b,c", ",")
+        \\    пер unsplit = строки.разбить("привет", "")
+        \\    (parts.длина() == 3)
+        \\        и (parts.получить(0.0, "?") == "a")
+        \\        и (parts.получить(1.0, "?") == "b")
+        \\        и (parts.получить(2.0, "?") == "c")
+        \\        и (unsplit.длина() == 1)
+        \\        и (unsplit.получить(0.0, "?") == "привет")
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_str7.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRun(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1\n", result.stdout);
+}

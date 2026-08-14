@@ -188,3 +188,31 @@ test "разбить splits into Массив(Строка), empty separator ret
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("1\n", result.stdout);
 }
+
+test "из_числа formats integers, decimals, negatives — practical digit extraction, not bit-exact Zig {d}" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\функ старт() -> Булево
+        \\    (строки.из_числа(0.0) == "0")
+        \\        и (строки.из_числа(42.0) == "42")
+        \\        и (строки.из_числа(0.0 - 42.0) == "-42")
+        \\        и (строки.из_числа(100.0) == "100")
+        \\        и (строки.из_числа(0.5) == "0.5")
+        \\        и (строки.из_числа(123.25) == "123.25")
+        \\        и (строки.из_числа(0.0 - 2.5) == "-2.5")
+        \\        и (строки.из_числа(0.1) == "0.1")
+        \\        и (строки.из_числа(1.25 + 1.25) == "2.5")
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_str8.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRun(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1\n", result.stdout);
+}

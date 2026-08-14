@@ -57,6 +57,8 @@ const StringRuntime = struct {
     find: mir.FunctionId,
     replace: mir.FunctionId,
     split: ?mir.FunctionId,
+    from_int: mir.FunctionId,
+    from_number: mir.FunctionId,
 };
 
 const ExpandCtx = struct {
@@ -91,6 +93,9 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
         const slice_bytes = try buildSliceBytes(allocator, module, type_store, layout);
         break :blk try buildSplit(allocator, module, type_store, layout, index_of, slice_bytes, array_runtime);
     } else null;
+    const format_digits = try buildFormatUnsignedDigits(allocator, module, type_store, layout);
+    const from_int = try buildFromInt(allocator, module, type_store, layout, format_digits, concat);
+    const from_number = try buildFromNumber(allocator, module, type_store, layout, format_digits, concat);
     const runtime = StringRuntime{
         .concat = concat,
         .equal = try buildEqual(allocator, module, type_store, layout),
@@ -105,6 +110,8 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
         .find = find,
         .replace = try buildReplace(allocator, module, type_store, layout, length, slice, find, concat),
         .split = split,
+        .from_int = from_int,
+        .from_number = from_number,
     };
     const ctx = ExpandCtx{ .layout = layout, .type_store = type_store, .runtime = runtime };
 
@@ -199,6 +206,7 @@ fn expandInstruction(builder: *mir_builder.Builder, instruction: mir.Instruction
                 if (std.mem.eql(u8, v.name, "строки::найти")) break :blk ctx.runtime.find;
                 if (std.mem.eql(u8, v.name, "строки::заменить")) break :blk ctx.runtime.replace;
                 if (std.mem.eql(u8, v.name, "строки::разбить")) break :blk ctx.runtime.split.?;
+                if (std.mem.eql(u8, v.name, "строки::из_числа")) break :blk ctx.runtime.from_number;
                 break :blk null;
             };
             if (callee) |fn_id| {
@@ -217,6 +225,28 @@ fn expandInstruction(builder: *mir_builder.Builder, instruction: mir.Instruction
 // calling. Same loop shape as `wasm_objects.zig`'s `buildEnsureCapacity`
 // copy loop (real WASM `loop`, ordinary single-header/single-exit,
 // no suspend involved — hits `wasm_stackify.zig`'s existing fast path).
+// Builds a fresh 1-byte `Строка` (`[len=1][byte_value]`) at runtime —
+// used for the "-" sign and the "0" digit-string special case, neither
+// of which come from user source (so there's no data-section literal
+// to point at; they must be constructed the same way any other
+// heap string is).
+fn emitOneByteString(builder: *mir_builder.Builder, module: *mir.Module, layout: wasm_heap.PtrLayout, byte_value: u32) !mir.ValueId {
+    const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
+    const five = try wasm_heap.addressConst(builder, layout.idx_type, 5);
+    const handle = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = handle, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, five) } });
+    const handle_local = try wasm_heap.storeLocal(builder, "@h", layout.ptr_type, handle);
+    const one_len = try wasm_heap.addressConst(builder, layout.idx_type, 1);
+    const handle_for_hdr = try wasm_heap.loadLocal(builder, handle_local, layout.ptr_type);
+    try builder.emit(.{ .mem_store = .{ .addr = handle_for_hdr, .src = one_len } });
+    const the_byte = try wasm_heap.addressConst(builder, layout.idx_type, byte_value);
+    const four = try wasm_heap.addressConst(builder, layout.idx_type, 4);
+    const handle_for_byte = try wasm_heap.loadLocal(builder, handle_local, layout.ptr_type);
+    const byte_addr = try wasm_heap.binOp(builder, layout.idx_type, .add, handle_for_byte, four);
+    try builder.emit(.{ .mem_store8 = .{ .addr = byte_addr, .src = the_byte } });
+    return try wasm_heap.loadLocal(builder, handle_local, layout.ptr_type);
+}
+
 fn emitByteCopyLoop(builder: *mir_builder.Builder, layout: wasm_heap.PtrLayout, src_base_local: mir.LocalId, dst_base_local: mir.LocalId, count_local: mir.LocalId) !void {
     const i_local = try builder.newLocal(wasm_heap.dummy_symbol, "@i", layout.idx_type);
     const zero = try wasm_heap.addressConst(builder, layout.idx_type, 0);
@@ -1475,6 +1505,466 @@ fn buildSplit(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
         const arr_final = try wasm_heap.loadLocal(&builder, arr2_local, array_type);
         builder.terminate(.{ .return_value = .{ .value = arr_final } });
     }
+
+    return id;
+}
+
+// `@string_format_unsigned_digits(n) -> Строка`: `n` is a NONNEGATIVE
+// whole-number `Число` (caller already applied `int_trunc` + sign
+// handling) — writes its decimal digits into a small scratch buffer
+// from the END backward (least-significant digit first is what the
+// `% 10` loop naturally produces), then copies just the written range
+// out into a real length-prefixed string. `n == 0` is a special case
+// (the loop below produces zero digits for it, not "0").
+fn buildFormatUnsignedDigits(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
+    const number_type = type_store.builtins.number;
+    const id = try mir_builder.newFunction(module, allocator, "@string_format_unsigned_digits", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const n_local = try builder.newLocal(wasm_heap.dummy_symbol, "n", number_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{n_local});
+    builder.currentFunction().type_store = type_store;
+    const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
+
+    const n_for_zero_cmp = try wasm_heap.loadLocal(&builder, n_local, number_type);
+    const zero_n = try wasm_heap.numberConst(&builder, number_type, 0);
+    const is_zero = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, n_for_zero_cmp, zero_n);
+    const zero_block = try builder.newBlock();
+    const nonzero_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = is_zero, .then_block = zero_block, .else_block = nonzero_block } });
+
+    builder.setCurrentBlock(zero_block);
+    {
+        const handle_final = try emitOneByteString(&builder, module, layout, '0');
+        builder.terminate(.{ .return_value = .{ .value = handle_final } });
+    }
+
+    builder.setCurrentBlock(nonzero_block);
+    // i64 range easily covers every whole `Число` this ever sees (up to
+    // 2^53 exactly, per `Целое`'s own documented range) — 24 scratch
+    // bytes is comfortably more than an i64's 19-digit max.
+    const scratch_size = try wasm_heap.addressConst(&builder, layout.idx_type, 24);
+    const scratch = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = scratch, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, scratch_size) } });
+    const scratch_local = try wasm_heap.storeLocal(&builder, "@scratch", layout.ptr_type, scratch);
+
+    const pos_local = try builder.newLocal(wasm_heap.dummy_symbol, "@pos", layout.idx_type);
+    const twentyfour = try wasm_heap.addressConst(&builder, layout.idx_type, 24);
+    try builder.emit(.{ .store_local = .{ .local = pos_local, .src = twentyfour } });
+
+    const cur_local = try builder.newLocal(wasm_heap.dummy_symbol, "@cur", number_type);
+    const n_reload = try wasm_heap.loadLocal(&builder, n_local, number_type);
+    try builder.emit(.{ .store_local = .{ .local = cur_local, .src = n_reload } });
+
+    const loop_header = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_header);
+    const cur_for_cmp = try wasm_heap.loadLocal(&builder, cur_local, number_type);
+    const zero_cur = try wasm_heap.numberConst(&builder, number_type, 0);
+    const keep_going = try wasm_heap.cmpOp(&builder, layout.bool_type, .greater, cur_for_cmp, zero_cur);
+    const loop_body = try builder.newBlock();
+    const loop_exit = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = keep_going, .then_block = loop_body, .else_block = loop_exit } });
+
+    builder.setCurrentBlock(loop_body);
+    // `digit = cur - trunc(cur/10)*10` instead of `.modulo` — `.modulo`
+    // on f64 operands (`wasm_emit.zig`) routes through a shared i64
+    // scratch-local trick (`reserveScratchLocal`, hardcoded `wasm_f64`)
+    // that collides with `mem_store`/`mem_store8`'s OWN scratch-local
+    // reservation (`reserveFrameScratch`/`reserveFrameStoreScratch`) when
+    // both appear in the same function — confirmed via wasmtime
+    // ("type mismatch: expected f64, found i32" on a `local.set` whose
+    // declared type didn't match the value being stored). A real,
+    // pre-existing bug in the scratch-local allocator, not this file's
+    // to fix; this loop (the first place in `wasm_strings.zig` combining
+    // integer memory writes with `.modulo`) is what surfaced it.
+    // Sidestepped here rather than touching `wasm_emit.zig`'s shared
+    // scratch machinery.
+    const cur_for_div = try wasm_heap.loadLocal(&builder, cur_local, number_type);
+    const ten_div = try wasm_heap.numberConst(&builder, number_type, 10);
+    const q = try wasm_heap.binOp(&builder, number_type, .int_divide, cur_for_div, ten_div);
+    const q_local = try wasm_heap.storeLocal(&builder, "@q", number_type, q);
+    // `cur_for_digit` (lhs) loaded BEFORE `q_times_10` (rhs) is computed
+    // — `.binary`'s codegen assumes operands are produced in
+    // lhs-then-rhs order, rhs freshest immediately before the op.
+    const cur_for_digit = try wasm_heap.loadLocal(&builder, cur_local, number_type);
+    const q_for_mul = try wasm_heap.loadLocal(&builder, q_local, number_type);
+    const ten_mul = try wasm_heap.numberConst(&builder, number_type, 10);
+    const q_times_10 = try wasm_heap.binOp(&builder, number_type, .multiply, q_for_mul, ten_mul);
+    const digit_f = try wasm_heap.binOp(&builder, number_type, .subtract, cur_for_digit, q_times_10);
+    const digit_i32 = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .unary = .{ .dst = digit_i32, .op = .to_i32, .src = digit_f } });
+    const zero_char2 = try wasm_heap.addressConst(&builder, layout.idx_type, '0');
+    const digit_byte = try wasm_heap.binOp(&builder, layout.idx_type, .add, zero_char2, digit_i32);
+    const digit_byte_local = try wasm_heap.storeLocal(&builder, "@digit_byte", layout.idx_type, digit_byte);
+
+    const pos_for_dec = try wasm_heap.loadLocal(&builder, pos_local, layout.idx_type);
+    const one_p = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const new_pos = try wasm_heap.binOp(&builder, layout.idx_type, .subtract, pos_for_dec, one_p);
+    try builder.emit(.{ .store_local = .{ .local = pos_local, .src = new_pos } });
+
+    const digit_byte_reload = try wasm_heap.loadLocal(&builder, digit_byte_local, layout.idx_type);
+    const scratch_for_addr = try wasm_heap.loadLocal(&builder, scratch_local, layout.ptr_type);
+    const new_pos_for_addr = try wasm_heap.loadLocal(&builder, pos_local, layout.idx_type);
+    const byte_addr2 = try wasm_heap.binOp(&builder, layout.idx_type, .add, scratch_for_addr, new_pos_for_addr);
+    try builder.emit(.{ .mem_store8 = .{ .addr = byte_addr2, .src = digit_byte_reload } });
+
+    const q_for_next = try wasm_heap.loadLocal(&builder, q_local, number_type);
+    try builder.emit(.{ .store_local = .{ .local = cur_local, .src = q_for_next } });
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_exit);
+    // `twentyfour2` (lhs) produced BEFORE `pos_for_len` (rhs) — an
+    // earlier version loaded `pos` first, silently computing `pos - 24`
+    // (small negative, then reinterpreted as a huge unsigned length)
+    // instead of `24 - pos`, since `.binary`'s codegen just emits the
+    // subtract opcode against whatever's already on the stack in
+    // production order, it doesn't reorder to match `lhs`/`rhs`.
+    const twentyfour2 = try wasm_heap.addressConst(&builder, layout.idx_type, 24);
+    const pos_for_len = try wasm_heap.loadLocal(&builder, pos_local, layout.idx_type);
+    const digit_count = try wasm_heap.binOp(&builder, layout.idx_type, .subtract, twentyfour2, pos_for_len);
+    const digit_count_local = try wasm_heap.storeLocal(&builder, "@count", layout.idx_type, digit_count);
+
+    const four_a = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const digit_count_for_size = try wasm_heap.loadLocal(&builder, digit_count_local, layout.idx_type);
+    const alloc_size = try wasm_heap.binOp(&builder, layout.idx_type, .add, four_a, digit_count_for_size);
+    const result = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = result, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, alloc_size) } });
+    const result_local = try wasm_heap.storeLocal(&builder, "@result", layout.ptr_type, result);
+
+    const digit_count_for_hdr = try wasm_heap.loadLocal(&builder, digit_count_local, layout.idx_type);
+    const result_for_hdr = try wasm_heap.loadLocal(&builder, result_local, layout.ptr_type);
+    try builder.emit(.{ .mem_store = .{ .addr = result_for_hdr, .src = digit_count_for_hdr } });
+
+    // No `+4` header offset here (unlike every other src_base in this
+    // file) — `scratch` is a raw scratch buffer, not a `[len][bytes]`
+    // string.
+    const scratch_for_src = try wasm_heap.loadLocal(&builder, scratch_local, layout.ptr_type);
+    const pos_for_src = try wasm_heap.loadLocal(&builder, pos_local, layout.idx_type);
+    const src_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, scratch_for_src, pos_for_src);
+    const src_base_local = try wasm_heap.storeLocal(&builder, "@src_base", layout.idx_type, src_base);
+
+    const four_c = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const result_for_dst = try wasm_heap.loadLocal(&builder, result_local, layout.ptr_type);
+    const dst_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, result_for_dst, four_c);
+    const dst_base_local = try wasm_heap.storeLocal(&builder, "@dst_base", layout.idx_type, dst_base);
+
+    try emitByteCopyLoop(&builder, layout, src_base_local, dst_base_local, digit_count_local);
+
+    const result_final = try wasm_heap.loadLocal(&builder, result_local, layout.ptr_type);
+    builder.terminate(.{ .return_value = .{ .value = result_final } });
+    return id;
+}
+
+// `@string_from_int(x) -> Строка`: `x` (`Целое`, already a whole
+// number) formatted as a plain decimal integer — matches `vm.zig`'s
+// `strIntToStr` (`{d}` on `@intFromFloat(x)`) for every value in
+// `Целое`'s documented exact range (up to 2^53).
+fn buildFromInt(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, format_digits: mir.FunctionId, concat: mir.FunctionId) !mir.FunctionId {
+    const number_type = type_store.builtins.number;
+    const id = try mir_builder.newFunction(module, allocator, "@string_from_int", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const x_local = try builder.newLocal(wasm_heap.dummy_symbol, "x", number_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{x_local});
+    builder.currentFunction().type_store = type_store;
+
+    const x_for_cmp = try wasm_heap.loadLocal(&builder, x_local, number_type);
+    const zero_x = try wasm_heap.numberConst(&builder, number_type, 0);
+    const is_neg = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, x_for_cmp, zero_x);
+    const neg_block = try builder.newBlock();
+    const pos_block = try builder.newBlock();
+    const abs_local = try builder.newLocal(wasm_heap.dummy_symbol, "@abs", number_type);
+    builder.terminate(.{ .branch = .{ .cond = is_neg, .then_block = neg_block, .else_block = pos_block } });
+
+    builder.setCurrentBlock(neg_block);
+    // `zero_neg` (lhs) produced BEFORE `x_for_neg` (rhs) — a previous
+    // version loaded `x` first, silently computing `x - 0` (unchanged,
+    // still negative) instead of `0 - x`, same arg-order bug class as
+    // elsewhere in this file.
+    const zero_neg = try wasm_heap.numberConst(&builder, number_type, 0);
+    const x_for_neg = try wasm_heap.loadLocal(&builder, x_local, number_type);
+    const negated = try wasm_heap.binOp(&builder, number_type, .subtract, zero_neg, x_for_neg);
+    try builder.emit(.{ .store_local = .{ .local = abs_local, .src = negated } });
+    const after_block = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = after_block } });
+
+    builder.setCurrentBlock(pos_block);
+    const x_for_pos = try wasm_heap.loadLocal(&builder, x_local, number_type);
+    try builder.emit(.{ .store_local = .{ .local = abs_local, .src = x_for_pos } });
+    builder.terminate(.{ .jump = .{ .target = after_block } });
+
+    builder.setCurrentBlock(after_block);
+    const abs_for_digits = try wasm_heap.loadLocal(&builder, abs_local, number_type);
+    const digits_str = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = digits_str, .callee = format_digits, .args = try wasm_heap.dupeOne(module, abs_for_digits) } });
+
+    const is_neg_for_sign = try wasm_heap.loadLocal(&builder, x_local, number_type); // reload x (fresh) — reused below for the sign check again
+    const zero_sign = try wasm_heap.numberConst(&builder, number_type, 0);
+    const is_neg2 = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, is_neg_for_sign, zero_sign);
+    const sign_block = try builder.newBlock();
+    const no_sign_block = try builder.newBlock();
+    const digits_str_local = try wasm_heap.storeLocal(&builder, "@digits", layout.ptr_type, digits_str);
+    builder.terminate(.{ .branch = .{ .cond = is_neg2, .then_block = sign_block, .else_block = no_sign_block } });
+
+    builder.setCurrentBlock(sign_block);
+    {
+        const minus = try emitOneByteString(&builder, module, layout, '-');
+        const digits_reload = try wasm_heap.loadLocal(&builder, digits_str_local, layout.ptr_type);
+        const with_sign = try builder.newValue(layout.ptr_type);
+        try builder.emit(.{ .call = .{ .dst = with_sign, .callee = concat, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ minus, digits_reload }) } });
+        builder.terminate(.{ .return_value = .{ .value = with_sign } });
+    }
+
+    builder.setCurrentBlock(no_sign_block);
+    const digits_final = try wasm_heap.loadLocal(&builder, digits_str_local, layout.ptr_type);
+    builder.terminate(.{ .return_value = .{ .value = digits_final } });
+
+    return id;
+}
+
+// `@string_from_number(x) -> Строка`: practical digit-extraction
+// formatter, NOT a bit-exact port of Zig's `{d}` (which uses a
+// shortest-round-trip decimal algorithm — Ryu-class — genuinely hard to
+// replicate in raw WASM arithmetic without arbitrary precision). This
+// extracts up to 15 fractional digits via repeated `frac *= 10;
+// digit = trunc(frac); frac -= digit`, then trims trailing zeros —
+// correct for exact/short decimals (the overwhelming majority of real
+// panos program output: loop counters, simple arithmetic results,
+// currency-shaped values) and for the whole-number part in `Целое`'s
+// exact range (matches `@string_from_int` exactly there). Known,
+// accepted divergence from native (documented, not silently shipped):
+// values needing MORE than 15 significant fractional digits to
+// round-trip may show extra trailing noise digits or a rounding
+// difference in the last kept digit; extreme magnitudes (~1e17+) lose
+// integer-part precision the same way `Число`'s own f64 representation
+// already does; NaN/Infinity are NOT special-cased (a divide-by-zero
+// producing either will format via the same digit-extraction path,
+// which does not match native's `"nan"`/`"inf"` output) — none of these
+// come from ordinary panos arithmetic, and this file's own established
+// practice (see `docs`'s historical Odin `{d}`-vs-`%v` note) is to
+// document a gap like this rather than block on a full Ryu port.
+fn buildFromNumber(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, format_digits: mir.FunctionId, concat: mir.FunctionId) !mir.FunctionId {
+    const number_type = type_store.builtins.number;
+    const id = try mir_builder.newFunction(module, allocator, "@string_from_number", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const x_local = try builder.newLocal(wasm_heap.dummy_symbol, "x", number_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{x_local});
+    builder.currentFunction().type_store = type_store;
+    const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
+
+    const x_for_cmp = try wasm_heap.loadLocal(&builder, x_local, number_type);
+    const zero_x = try wasm_heap.numberConst(&builder, number_type, 0);
+    const is_neg = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, x_for_cmp, zero_x);
+    const neg_block = try builder.newBlock();
+    const pos_block = try builder.newBlock();
+    const abs_local = try builder.newLocal(wasm_heap.dummy_symbol, "@abs", number_type);
+    builder.terminate(.{ .branch = .{ .cond = is_neg, .then_block = neg_block, .else_block = pos_block } });
+
+    builder.setCurrentBlock(neg_block);
+    // `zero_neg` (lhs) produced BEFORE `x_for_neg` (rhs) — a previous
+    // version loaded `x` first, silently computing `x - 0` (unchanged,
+    // still negative) instead of `0 - x`, same arg-order bug class as
+    // elsewhere in this file.
+    const zero_neg = try wasm_heap.numberConst(&builder, number_type, 0);
+    const x_for_neg = try wasm_heap.loadLocal(&builder, x_local, number_type);
+    const negated = try wasm_heap.binOp(&builder, number_type, .subtract, zero_neg, x_for_neg);
+    try builder.emit(.{ .store_local = .{ .local = abs_local, .src = negated } });
+    const after_abs = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = after_abs } });
+
+    builder.setCurrentBlock(pos_block);
+    const x_for_pos = try wasm_heap.loadLocal(&builder, x_local, number_type);
+    try builder.emit(.{ .store_local = .{ .local = abs_local, .src = x_for_pos } });
+    builder.terminate(.{ .jump = .{ .target = after_abs } });
+
+    builder.setCurrentBlock(after_abs);
+    const abs_for_trunc = try wasm_heap.loadLocal(&builder, abs_local, number_type);
+    const int_part = try builder.newValue(number_type);
+    try builder.emit(.{ .unary = .{ .dst = int_part, .op = .int_trunc, .src = abs_for_trunc } });
+    const int_part_local = try wasm_heap.storeLocal(&builder, "@int_part", number_type, int_part);
+
+    const abs_for_frac = try wasm_heap.loadLocal(&builder, abs_local, number_type);
+    const int_part_for_frac = try wasm_heap.loadLocal(&builder, int_part_local, number_type);
+    const frac0 = try wasm_heap.binOp(&builder, number_type, .subtract, abs_for_frac, int_part_for_frac);
+    const frac_local = try builder.newLocal(wasm_heap.dummy_symbol, "@frac", number_type);
+    try builder.emit(.{ .store_local = .{ .local = frac_local, .src = frac0 } });
+
+    const int_part_for_digits = try wasm_heap.loadLocal(&builder, int_part_local, number_type);
+    const int_digits = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = int_digits, .callee = format_digits, .args = try wasm_heap.dupeOne(module, int_part_for_digits) } });
+    const int_digits_local = try wasm_heap.storeLocal(&builder, "@int_digits", layout.ptr_type, int_digits);
+
+    // Extract up to 15 fractional digits into a raw scratch buffer.
+    const max_frac_digits = 15;
+    const scratch_size = try wasm_heap.addressConst(&builder, layout.idx_type, max_frac_digits);
+    const scratch = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = scratch, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, scratch_size) } });
+    const scratch_local = try wasm_heap.storeLocal(&builder, "@fscratch", layout.ptr_type, scratch);
+
+    const i_local = try builder.newLocal(wasm_heap.dummy_symbol, "@fi", layout.idx_type);
+    const zero_i = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    try builder.emit(.{ .store_local = .{ .local = i_local, .src = zero_i } });
+
+    const frac_loop_header = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = frac_loop_header } });
+
+    builder.setCurrentBlock(frac_loop_header);
+    const i_for_cmp = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const max_c = try wasm_heap.addressConst(&builder, layout.idx_type, max_frac_digits);
+    const frac_keep_going = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, i_for_cmp, max_c);
+    const frac_loop_body = try builder.newBlock();
+    const frac_loop_exit = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = frac_keep_going, .then_block = frac_loop_body, .else_block = frac_loop_exit } });
+
+    builder.setCurrentBlock(frac_loop_body);
+    const frac_for_mul = try wasm_heap.loadLocal(&builder, frac_local, number_type);
+    const ten_f = try wasm_heap.numberConst(&builder, number_type, 10);
+    const frac_x10 = try wasm_heap.binOp(&builder, number_type, .multiply, frac_for_mul, ten_f);
+    try builder.emit(.{ .store_local = .{ .local = frac_local, .src = frac_x10 } });
+
+    const frac_for_trunc = try wasm_heap.loadLocal(&builder, frac_local, number_type);
+    const digit_f = try builder.newValue(number_type);
+    try builder.emit(.{ .unary = .{ .dst = digit_f, .op = .int_trunc, .src = frac_for_trunc } });
+    const digit_f_local = try wasm_heap.storeLocal(&builder, "@fdigit", number_type, digit_f);
+
+    const frac_for_sub = try wasm_heap.loadLocal(&builder, frac_local, number_type);
+    const digit_for_sub = try wasm_heap.loadLocal(&builder, digit_f_local, number_type);
+    const frac_next = try wasm_heap.binOp(&builder, number_type, .subtract, frac_for_sub, digit_for_sub);
+    try builder.emit(.{ .store_local = .{ .local = frac_local, .src = frac_next } });
+
+    const digit_for_i32 = try wasm_heap.loadLocal(&builder, digit_f_local, number_type);
+    const digit_i32 = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .unary = .{ .dst = digit_i32, .op = .to_i32, .src = digit_for_i32 } });
+    const zero_char = try wasm_heap.addressConst(&builder, layout.idx_type, '0');
+    const digit_byte = try wasm_heap.binOp(&builder, layout.idx_type, .add, zero_char, digit_i32);
+    const digit_byte_local = try wasm_heap.storeLocal(&builder, "@fdigit_byte", layout.idx_type, digit_byte);
+
+    const digit_byte_reload = try wasm_heap.loadLocal(&builder, digit_byte_local, layout.idx_type);
+    const scratch_for_addr = try wasm_heap.loadLocal(&builder, scratch_local, layout.ptr_type);
+    const i_for_addr = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const byte_addr = try wasm_heap.binOp(&builder, layout.idx_type, .add, scratch_for_addr, i_for_addr);
+    try builder.emit(.{ .mem_store8 = .{ .addr = byte_addr, .src = digit_byte_reload } });
+
+    const i_for_next = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const one_i = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const i_next = try wasm_heap.binOp(&builder, layout.idx_type, .add, i_for_next, one_i);
+    try builder.emit(.{ .store_local = .{ .local = i_local, .src = i_next } });
+    builder.terminate(.{ .jump = .{ .target = frac_loop_header } });
+
+    builder.setCurrentBlock(frac_loop_exit);
+    // Trim trailing '0' digits: count starts at max_frac_digits, walks
+    // backward while the byte just before `count` is '0'.
+    const count_local = try builder.newLocal(wasm_heap.dummy_symbol, "@fcount", layout.idx_type);
+    const max_c2 = try wasm_heap.addressConst(&builder, layout.idx_type, max_frac_digits);
+    try builder.emit(.{ .store_local = .{ .local = count_local, .src = max_c2 } });
+
+    const trim_header = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = trim_header } });
+
+    builder.setCurrentBlock(trim_header);
+    const count_for_zero_cmp = try wasm_heap.loadLocal(&builder, count_local, layout.idx_type);
+    const zero_tc = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    const count_nonzero = try wasm_heap.cmpOp(&builder, layout.bool_type, .greater, count_for_zero_cmp, zero_tc);
+    const trim_check_last_block = try builder.newBlock();
+    const trim_exit_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = count_nonzero, .then_block = trim_check_last_block, .else_block = trim_exit_block } });
+
+    builder.setCurrentBlock(trim_check_last_block);
+    const scratch_for_last = try wasm_heap.loadLocal(&builder, scratch_local, layout.ptr_type);
+    const count_for_last = try wasm_heap.loadLocal(&builder, count_local, layout.idx_type);
+    const one_tl = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const last_offset = try wasm_heap.binOp(&builder, layout.idx_type, .subtract, count_for_last, one_tl);
+    const last_addr = try wasm_heap.binOp(&builder, layout.idx_type, .add, scratch_for_last, last_offset);
+    const last_byte = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load8 = .{ .dst = last_byte, .addr = last_addr } });
+    const zero_char2 = try wasm_heap.addressConst(&builder, layout.idx_type, '0');
+    const last_is_zero = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, last_byte, zero_char2);
+    const trim_continue_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = last_is_zero, .then_block = trim_continue_block, .else_block = trim_exit_block } });
+
+    builder.setCurrentBlock(trim_continue_block);
+    const count_for_dec = try wasm_heap.loadLocal(&builder, count_local, layout.idx_type);
+    const one_td = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const count_dec = try wasm_heap.binOp(&builder, layout.idx_type, .subtract, count_for_dec, one_td);
+    try builder.emit(.{ .store_local = .{ .local = count_local, .src = count_dec } });
+    builder.terminate(.{ .jump = .{ .target = trim_header } });
+
+    builder.setCurrentBlock(trim_exit_block);
+    const count_for_final_cmp = try wasm_heap.loadLocal(&builder, count_local, layout.idx_type);
+    const zero_fc = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    const no_frac_digits = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, count_for_final_cmp, zero_fc);
+    const int_only_block = try builder.newBlock();
+    const with_frac_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = no_frac_digits, .then_block = int_only_block, .else_block = with_frac_block } });
+
+    const sign_join_local = try builder.newLocal(wasm_heap.dummy_symbol, "@unsigned_result", layout.ptr_type);
+
+    builder.setCurrentBlock(int_only_block);
+    const int_digits_for_only = try wasm_heap.loadLocal(&builder, int_digits_local, layout.ptr_type);
+    try builder.emit(.{ .store_local = .{ .local = sign_join_local, .src = int_digits_for_only } });
+    const after_frac_block = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = after_frac_block } });
+
+    builder.setCurrentBlock(with_frac_block);
+    {
+        const four_a = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+        const count_for_size = try wasm_heap.loadLocal(&builder, count_local, layout.idx_type);
+        const frac_alloc_size = try wasm_heap.binOp(&builder, layout.idx_type, .add, four_a, count_for_size);
+        const frac_str = try builder.newValue(layout.ptr_type);
+        try builder.emit(.{ .call = .{ .dst = frac_str, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, frac_alloc_size) } });
+        const frac_str_local = try wasm_heap.storeLocal(&builder, "@frac_str", layout.ptr_type, frac_str);
+
+        const count_for_hdr = try wasm_heap.loadLocal(&builder, count_local, layout.idx_type);
+        const frac_str_for_hdr = try wasm_heap.loadLocal(&builder, frac_str_local, layout.ptr_type);
+        try builder.emit(.{ .mem_store = .{ .addr = frac_str_for_hdr, .src = count_for_hdr } });
+
+        const scratch_for_copy_src = try wasm_heap.loadLocal(&builder, scratch_local, layout.ptr_type);
+        const src_base_local = try wasm_heap.storeLocal(&builder, "@fsrc_base", layout.idx_type, scratch_for_copy_src);
+
+        const four_b = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+        const frac_str_for_dst = try wasm_heap.loadLocal(&builder, frac_str_local, layout.ptr_type);
+        const dst_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, frac_str_for_dst, four_b);
+        const dst_base_local = try wasm_heap.storeLocal(&builder, "@fdst_base", layout.idx_type, dst_base);
+
+        try emitByteCopyLoop(&builder, layout, src_base_local, dst_base_local, count_local);
+
+        // `int_digits_for_cat` (arg0) must be produced BEFORE `dot`
+        // (arg1) — same arg-order convention as everywhere else in this
+        // file; an earlier version built `dot` first, silently
+        // concatenating "." + digits instead of digits + "." (both i32
+        // handles, no validator error to catch it).
+        const int_digits_for_cat = try wasm_heap.loadLocal(&builder, int_digits_local, layout.ptr_type);
+        const dot = try emitOneByteString(&builder, module, layout, '.');
+        const with_dot = try builder.newValue(layout.ptr_type);
+        try builder.emit(.{ .call = .{ .dst = with_dot, .callee = concat, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ int_digits_for_cat, dot }) } });
+        const with_dot_local = try wasm_heap.storeLocal(&builder, "@with_dot", layout.ptr_type, with_dot);
+
+        const with_dot_reload = try wasm_heap.loadLocal(&builder, with_dot_local, layout.ptr_type);
+        const frac_str_reload = try wasm_heap.loadLocal(&builder, frac_str_local, layout.ptr_type);
+        const full = try builder.newValue(layout.ptr_type);
+        try builder.emit(.{ .call = .{ .dst = full, .callee = concat, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ with_dot_reload, frac_str_reload }) } });
+        try builder.emit(.{ .store_local = .{ .local = sign_join_local, .src = full } });
+        builder.terminate(.{ .jump = .{ .target = after_frac_block } });
+    }
+
+    builder.setCurrentBlock(after_frac_block);
+    const x_for_sign = try wasm_heap.loadLocal(&builder, x_local, number_type);
+    const zero_sign = try wasm_heap.numberConst(&builder, number_type, 0);
+    const is_neg_final = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, x_for_sign, zero_sign);
+    const sign_block = try builder.newBlock();
+    const no_sign_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = is_neg_final, .then_block = sign_block, .else_block = no_sign_block } });
+
+    builder.setCurrentBlock(sign_block);
+    const minus = try emitOneByteString(&builder, module, layout, '-');
+    const unsigned_reload = try wasm_heap.loadLocal(&builder, sign_join_local, layout.ptr_type);
+    const signed_result = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = signed_result, .callee = concat, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ minus, unsigned_reload }) } });
+    builder.terminate(.{ .return_value = .{ .value = signed_result } });
+
+    builder.setCurrentBlock(no_sign_block);
+    const unsigned_final = try wasm_heap.loadLocal(&builder, sign_join_local, layout.ptr_type);
+    builder.terminate(.{ .return_value = .{ .value = unsigned_final } });
 
     return id;
 }

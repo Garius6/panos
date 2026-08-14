@@ -506,12 +506,16 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
                     try wasm_module.writeSleb128(code, allocator, if (b) 1 else 0);
                 },
                 .string => |s| {
+                    // A literal's handle IS its data-section offset,
+                    // directly — the length-prefixed `[len][bytes]` layout
+                    // `wasm_strings.zig` establishes needs no runtime
+                    // construction at all for literals (see that file's
+                    // doc comment). No host call, unlike the old
+                    // `@runtime::строка_литерал` host-import path this
+                    // replaces.
                     const offset = ctx.string_offsets.get(s) orelse return unsupported("строковая константа без выделенного смещения (баг сборки data-секции)");
                     try code.append(allocator, 0x41); // i32.const
                     try wasm_module.writeSleb128(code, allocator, @intCast(offset));
-                    const import_index = ctx.builtin_index.get("@runtime::строка_литерал") orelse return unsupported("строковая константа без runtime-импорта");
-                    try code.append(allocator, 0x10); // call
-                    try wasm_module.writeUleb128(code, allocator, import_index);
                 },
                 .address => |a| {
                     try code.append(allocator, 0x41); // i32.const
@@ -531,12 +535,16 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             return null;
         },
         .binary => |binary| {
+            // `wasm_strings.zig`'s `expand()` rewrites every string-typed
+            // `.binary{.add}` into a real `.call(@string_concat, ...)`
+            // BEFORE this codegen ever runs (same "must be expanded
+            // before codegen" invariant `wasm_objects.zig`'s struct/
+            // array/variant instructions already established) — reaching
+            // this point with a string-typed `.binary` means that
+            // expansion was skipped somewhere, a real bug, not a case to
+            // silently handle here.
             if (ctx.type_store.eql(ctx.function.valueType(binary.dst), ctx.type_store.builtins.string)) {
-                if (binary.op != .add) return unsupported("строки поддерживают только оператор +");
-                const import_index = ctx.builtin_index.get("@runtime::строка_сложить") orelse return unsupported("конкатенация строк без runtime-импорта");
-                try code.append(allocator, 0x10); // call
-                try wasm_module.writeUleb128(code, allocator, import_index);
-                return binary.dst;
+                return unsupported("строковая конкатенация должна быть развёрнута wasm_strings.zig до кодогенерации");
             }
             // Phase-1a user-facing numbers (`Целое`/`Число`) are always
             // f64 (see the modulo/bitwise comment below) — a
@@ -1026,10 +1034,16 @@ fn builtinSignature(name: []const u8) !BuiltinSignature {
     return unsupported("call_builtin с именем без известной сигнатуры импорта");
 }
 
-// Every DISTINCT string literal any function in `module` uses, concatenated
-// null-terminated into one blob — `pw_string_literal` reads the literal
-// from this data section and converts its offset into a JS string handle.
-// Empty for a module with no string literals at all.
+// Every DISTINCT string literal any function in `module` uses,
+// concatenated into one blob — each entry LENGTH-PREFIXED (`u32`
+// little-endian byte count, then the raw bytes, no null terminator;
+// `wasm_strings.zig`'s own doc comment explains why this exact layout
+// is what every string operation, literal or heap-allocated, expects).
+// `offsets.get(s)` points at the START of the length prefix, so
+// `.const_value{.string}`'s codegen can turn a literal directly into a
+// bare `i32.const <offset>` — a fully-formed string handle needing ZERO
+// runtime work, not even a host call. Empty for a module with no string
+// literals at all.
 fn collectStringConstants(allocator: std.mem.Allocator, module: *const mir.Module) !struct {
     data: []u8,
     offsets: std.StringHashMap(u32),
@@ -1046,8 +1060,10 @@ fn collectStringConstants(allocator: std.mem.Allocator, module: *const mir.Modul
                         .string => |s| {
                             if (!offsets.contains(s)) {
                                 try offsets.put(s, @intCast(data.items.len));
+                                var len_bytes: [4]u8 = undefined;
+                                std.mem.writeInt(u32, &len_bytes, @intCast(s.len), .little);
+                                try data.appendSlice(allocator, &len_bytes);
                                 try data.appendSlice(allocator, s);
-                                try data.append(allocator, 0); // null terminator
                             }
                         },
                         else => {},
@@ -1077,16 +1093,15 @@ fn collectBuiltinNames(allocator: std.mem.Allocator, module: *const mir.Module) 
                     .call_builtin => |call| {
                         try appendBuiltinName(allocator, &seen, &names, call.name);
                     },
-                    .const_value => |constant| switch (constant.value) {
-                        .string => try appendBuiltinName(allocator, &seen, &names, "@runtime::строка_литерал"),
-                        else => {},
-                    },
-                    .binary => |binary| {
-                        const store = function.type_store orelse continue;
-                        if (store.eql(function.valueType(binary.dst), store.builtins.string)) {
-                            try appendBuiltinName(allocator, &seen, &names, "@runtime::строка_сложить");
-                        }
-                    },
+                    // String literals/concatenation need NO host import
+                    // any more — `wasm_strings.zig` handles both entirely
+                    // in-module (see its own doc comment). Registering
+                    // `@runtime::строка_литерал`/`строка_сложить` here
+                    // would declare an import nothing under plain
+                    // wasmtime provides, failing instantiation even
+                    // though it's never actually called.
+                    .const_value => {},
+                    .binary => {},
                     .new_aggregate => |aggregate| {
                         try appendBuiltinName(allocator, &seen, &names, try structNewBuiltinName(&function, aggregate.elements));
                     },

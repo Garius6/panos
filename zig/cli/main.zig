@@ -316,6 +316,11 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         try stderr.flush();
         std.process.exit(1);
     };
+    panos_core.wasm_strings.expand(init.gpa, &module, &entry_checked.types) catch |err| {
+        try stderr.print("panos build: строки: {t}\n", .{err});
+        try stderr.flush();
+        std.process.exit(1);
+    };
     var frame_info = try panos_core.mir_cps.prepare(init.gpa, &module);
     defer frame_info.deinit();
     panos_core.wasm_actors.expand(init.gpa, &module, &entry_checked.types, &frame_info) catch |err| {

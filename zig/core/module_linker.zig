@@ -61,7 +61,7 @@ pub const ImportScope = struct {
                 for (export_names) |export_name| {
                     try exports.append(allocator, .{
                         .name = export_name,
-                        .kind = .builtin,
+                        .kind = resolver.nativeModuleExportKind(native_name, export_name),
                         .span = import.span,
                         .builtin_module_path = native_name,
                     });

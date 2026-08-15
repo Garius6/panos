@@ -121,28 +121,21 @@ test "an unreachable declaration that would fail to lower is skipped, not compil
     try std.testing.expectEqualStrings("42\n", result.stdout);
 }
 
-test "a function reachable only via DOM.на_клик's string-literal handler name is kept" {
+test "a function reachable only from a DOM.на_клик closure is kept" {
     const allocator = std.testing.allocator;
 
-    // `обработчик` is never called by name anywhere in ordinary MIR
-    // (only referenced as a STRING LITERAL argument to `DOM.на_клик`'s
-    // 3-argument form, resolved by `instance.exports[name]` at runtime
-    // in the browser loader) — the DOM-handler-root heuristic must find
-    // it via that string literal and keep it reachable, or this build
-    // would succeed but the compiled `обработчик` export would be
-    // silently missing (a real regression the browser loader can't
-    // detect until a user actually clicks the button). Can't invoke
-    // this one through `wasmtime run` directly (no host providing
-    // `env::dom_on_click_context` outside a real browser/JS loader) —
-    // just verify the build succeeds and the export survives.
+    // The click handler is a real closure, so the ordinary reachability
+    // walk must traverse its body and keep the directly-called helper.
     const source =
         \\импорт DOM
         \\
-        \\экспорт функ обработчик(контекст: Строка) -> Пусто
+        \\функ обработчик(_: DOM.СобытиеКлика) -> Пусто
         \\конец
         \\
         \\функ старт() -> Число
-        \\    DOM.на_клик("#кнопка", "обработчик", "контекст")
+        \\    DOM.на_клик("#кнопка", функ(событие: DOM.СобытиеКлика) -> Пусто
+        \\        обработчик(событие)
+        \\    конец)
         \\    1.0
         \\конец
     ;

@@ -243,14 +243,14 @@ pub const permanent_reserved_bytes: u32 = 65536;
 
 // Phase 1 GC (arena reset at every JS-invoked entry-point call,
 // `wasm_gc_arena.zig`) needs SOMETHING to survive the reset — a DOM
-// handler's context argument (`DOM.на_клик_контекст`/`.после_кадра`),
+// delayed callback context (`DOM.после_кадра`) or a click closure,
 // which JS captures RAW across two SEPARATE future export calls (see
 // `project_panos_elm_architecture_dom_storage_design`/this session's
 // research — confirmed live in `demo/todo-app/frontend/main.pns`'s
 // `обработать_переключить`). An unconditional arena reset would free
 // that string out from under JS on the very next click. This second,
 // non-resettable bump region is where such values get PROMOTED (copied)
-// at the exact `на_клик_контекст`/`после_кадра` lowering site
+// at the exact delayed-callback/closure lowering site
 // (`mir_lowering.zig`) — everything else keeps going through the
 // ordinary arena (`buildAlloc`/global 0).
 //
@@ -400,12 +400,12 @@ pub const promote_bytes_to_permanent_function_name = "@promote_bytes_to_permanen
 // `@promote_to_permanent` above, but `size` is an explicit RUNTIME
 // argument instead of read from a length-prefix header — for copying a
 // fixed-size raw block with no such header, e.g. a WASM AOT closure's
-// environment allocation (`mir_lowering.zig`'s `на_клик_замыкание`
+// environment allocation (`mir_lowering.zig`'s closure-based `на_клик`
 // lowering, Stage B — the closure's ENV/BOX must live in the permanent
 // region too, not just its (currently scalar-only) captured VALUES, or
 // the box pointer itself would dangle across the next arena reset —
 // same class of problem `@promote_to_permanent` already solves for
-// `на_клик_контекст`'s context string, one level up the pointer chain).
+// a delayed callback's context string, one level up the pointer chain).
 fn buildPromoteBytesToPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, promote_bytes_to_permanent_function_name, dummy_symbol, layout.ptr_type, dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);

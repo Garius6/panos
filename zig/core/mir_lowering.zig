@@ -627,18 +627,13 @@ fn walkStmts(
     }
 }
 
-// `DOM.на_клик` (2-arg form, no context, OR 3-arg form — SAME source-
-// level property name either way, `lowerDomBuiltinCall` disambiguates
-// by argument COUNT into `DOM::на_клик`/`DOM::на_клик_контекст`
-// internally) and `DOM.после_кадра` take a handler function's NAME as a
-// STRING LITERAL argument (`aot-dom-loader.js`'s `instance.exports[name]`
-// — resolved by STRING at runtime, invisible to the ordinary call-graph
-// walk above). Scans every string-literal argument to one of these
-// calls anywhere in ALREADY-reachable code (a second pass, after the
-// main worklist settles once) and, for each one that exactly matches
-// some top-level function's own name, adds that function as an extra
-// root. Caller re-drains the worklist to a fixpoint afterward — a
-// newly-added handler can itself reference more calls/casts/handlers.
+// `DOM.после_кадра` still takes a handler function's NAME as a STRING
+// LITERAL (`aot-dom-loader.js`'s `instance.exports[name]` — resolved by
+// STRING at runtime, invisible to the ordinary call-graph walk above).
+// `DOM.на_клик` uses a real closure and therefore needs no string root.
+// Scan reachable code for the remaining name-based callback, add the
+// matching function as an extra root, then let the caller re-drain the
+// worklist to a fixpoint.
 fn addDomHandlerRoots(
     allocator: std.mem.Allocator,
     graph: anytype,
@@ -730,8 +725,7 @@ fn scanDomHandlerRootsInExpr(
         .call => |call| {
             if (tree.expr(call.callee).* == .property) {
                 const property = tree.expr(call.callee).property;
-                const is_handler_call = std.mem.eql(u8, property.property, "на_клик") or
-                    std.mem.eql(u8, property.property, "после_кадра");
+                const is_handler_call = std.mem.eql(u8, property.property, "после_кадра");
                 if (is_handler_call) {
                     for (call.arguments) |argument| {
                         if (tree.expr(argument).* != .string) continue;
@@ -783,7 +777,7 @@ fn scanDomHandlerRootsInExpr(
 }
 
 // A DOM-handler name is always a plain top-level `функ`, never a method
-// (see `dom_on_click_context`'s own doc comment in `aot-dom-loader.js`:
+// (see the delayed-callback doc comment in `aot-dom-loader.js`:
 // "name remains a static exported function") — search every module's
 // top-level function declarations for a name match, add the FIRST one
 // found (handler names are meant to be unambiguous top-level entry
@@ -817,8 +811,8 @@ pub const ReachabilityResult = struct {
     // reports these as a clear diagnostic instead of silently
     // miscompiling one of the two instantiations.
     conflicts: std.ArrayList(ReachKey),
-    // Every function name found registered as a `на_клик`/
-    // `.после_кадра` handler during `addDomHandlerRoots` — see
+    // Every function name found registered as a `.после_кадра` handler
+    // during `addDomHandlerRoots` — see
     // `mir.Module.dom_handler_names`'s own doc comment for why
     // `wasm_gc_arena.zig` needs this. Borrowed slices into AST memory
     // (`graph`/`compiled`'s lifetime) — `lowerGraph` dupes them into
@@ -1034,14 +1028,11 @@ pub fn lowerGraphWithDiagnostic(
         try seen_handler_names.put(name, {});
         try handler_names_owned.append(module_arena, try module_arena.dupe(u8, name));
     }
-    // `DOM.на_клик_замыкание`'s trampoline (Stage B) isn't found by the
-    // string-literal-name scan above at all — closures have no literal
-    // name — but it's still a genuine JS-invoked entry point (on every
-    // click) needing `wasm_gc_arena.zig`'s checkpoint/restore wrap, same
-    // as any name-based handler. A presence check is enough (fixed name,
-    // built at most once per module by `findOrBuildInvokeClosureClickTrampoline`).
-    if (wasm_heap.findFunctionByName(&module, invoke_closure_click_trampoline_name) != null) {
-        try handler_names_owned.append(module_arena, invoke_closure_click_trampoline_name);
+    // Click closures have no literal export name, but the one fixed
+    // trampoline is still a JS-invoked entry point and must receive the
+    // same arena checkpoint/restore wrapper as name-based callbacks.
+    if (wasm_heap.findFunctionByName(&module, invoke_click_trampoline_name) != null) {
+        try handler_names_owned.append(module_arena, invoke_click_trampoline_name);
     }
     module.dom_handler_names = try handler_names_owned.toOwnedSlice(module_arena);
 
@@ -2630,27 +2621,44 @@ fn isProcessCapture(checked: *const type_checker.CheckResult, type_id: types.Typ
     return entry.* == .process;
 }
 
-pub const invoke_closure_click_trampoline_name = "@invoke_closure_click";
+pub const invoke_click_trampoline_name = "@invoke_click";
 
-// One FIXED trampoline, shared by every `DOM.на_клик_замыкание`
-// registration in the module — Stage B's handler shape is always
-// `функ() -> Пусто` (captures carry all the state a handler needs, no
-// event-argument passing yet), so exactly ONE shape is ever needed.
-// Body is just `.call_value{callee: box_param, args: &.{}}` — deliberately
-// NOT hand-unboxed here: `wasm_interfaces.zig`'s existing `expandCallValue`
-// already does the unbox-then-`call_indirect` rewrite for ANY closure-typed
-// `.call_value`, generically, later in the pipeline — reusing it here
-// avoids duplicating that logic for a second time.
-fn findOrBuildInvokeClosureClickTrampoline(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
-    if (wasm_heap.findFunctionByName(module, invoke_closure_click_trampoline_name)) |id| return id;
-    const id = try mir_builder.newFunction(module, allocator, invoke_closure_click_trampoline_name, dummy_symbol, type_store.builtins.void, wasm_heap.dummy_span);
+// One fixed browser entry point for every click closure. JS passes the
+// permanent closure box plus flattened MouseEvent scalars. The trampoline
+// builds the public nominal `DOM.СобытиеКлика` value in the resettable
+// per-call arena, then delegates closure unboxing and `call_indirect` to
+// `wasm_interfaces.expandCallValue`.
+fn findOrBuildInvokeClickTrampoline(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, event_type: types.TypeId) !mir.FunctionId {
+    if (wasm_heap.findFunctionByName(module, invoke_click_trampoline_name)) |id| return id;
+    const id = try mir_builder.newFunction(module, allocator, invoke_click_trampoline_name, dummy_symbol, type_store.builtins.void, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
     const box_local = try builder.newLocal(dummy_symbol, "box", layout.ptr_type);
-    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{box_local});
+    const client_x_local = try builder.newLocal(dummy_symbol, "клиент_x", type_store.builtins.number);
+    const client_y_local = try builder.newLocal(dummy_symbol, "клиент_y", type_store.builtins.number);
+    const button_local = try builder.newLocal(dummy_symbol, "кнопка", type_store.builtins.integer);
+    const ctrl_local = try builder.newLocal(dummy_symbol, "ctrl", type_store.builtins.boolean);
+    const shift_local = try builder.newLocal(dummy_symbol, "shift", type_store.builtins.boolean);
+    const alt_local = try builder.newLocal(dummy_symbol, "alt", type_store.builtins.boolean);
+    const meta_local = try builder.newLocal(dummy_symbol, "meta", type_store.builtins.boolean);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{ box_local, client_x_local, client_y_local, button_local, ctrl_local, shift_local, alt_local, meta_local });
     builder.currentFunction().type_store = type_store;
 
+    const arena = module.arena.allocator();
+    var fields: std.ArrayList(mir.ValueId) = .empty;
+    try fields.append(arena, try wasm_heap.loadLocal(&builder, client_x_local, type_store.builtins.number));
+    try fields.append(arena, try wasm_heap.loadLocal(&builder, client_y_local, type_store.builtins.number));
+    try fields.append(arena, try wasm_heap.loadLocal(&builder, button_local, type_store.builtins.integer));
+    try fields.append(arena, try wasm_heap.loadLocal(&builder, ctrl_local, type_store.builtins.boolean));
+    try fields.append(arena, try wasm_heap.loadLocal(&builder, shift_local, type_store.builtins.boolean));
+    try fields.append(arena, try wasm_heap.loadLocal(&builder, alt_local, type_store.builtins.boolean));
+    try fields.append(arena, try wasm_heap.loadLocal(&builder, meta_local, type_store.builtins.boolean));
+    const event = try builder.newValue(event_type);
+    try builder.emit(.{ .new_aggregate = .{ .dst = event, .type_name = "DOM.СобытиеКлика", .elements = try fields.toOwnedSlice(arena) } });
+    // `.call_value` expansion consumes the callee before its arguments.
+    // Produce the reloaded box LAST so it is on top of the WASM stack;
+    // the already-produced event remains directly underneath it.
     const box_val = try wasm_heap.loadLocal(&builder, box_local, layout.ptr_type);
-    try builder.emit(.{ .call_value = .{ .dst = null, .callee = box_val, .args = &.{} } });
+    try builder.emit(.{ .call_value = .{ .dst = null, .callee = box_val, .args = try module.arena.allocator().dupe(mir.ValueId, &.{event}) } });
     builder.terminate(.{ .return_value = .{ .value = null } });
     return id;
 }
@@ -2722,7 +2730,7 @@ fn promoteFunctionRefCapture(ctx: *LoweringContext, layout: wasm_heap.PtrLayout,
     ctx.builder.terminate(.{ .branch = .{ .cond = is_plain, .then_block = ok_block, .else_block = trap_block } });
 
     ctx.builder.setCurrentBlock(trap_block);
-    ctx.builder.terminate(.{ .unreachable_term = .{ .reason = "DOM.на_клик_замыкание(): нельзя безопасно продвинуть замыкание неизвестного происхождения с собственным окружением" } });
+    ctx.builder.terminate(.{ .unreachable_term = .{ .reason = "DOM.на_клик(): нельзя безопасно продвинуть замыкание неизвестного происхождения с собственным окружением" } });
 
     ctx.builder.setCurrentBlock(ok_block);
     const alloc_permanent_id = try wasm_heap.findOrBuildAllocPermanent(ctx.allocator, module, &ctx.checked.types, layout);
@@ -2880,7 +2888,7 @@ fn promoteArrayToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, a
 // too (`promoteCaptureValue`), not just its raw pointer bit-pattern
 // (which would otherwise dangle after the next arena reset — the exact
 // bug this whole function exists to avoid, one level up the pointer
-// chain from `на_клик_контекст`'s own context-string promotion).
+// chain from the old click-context string promotion).
 fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, box_value: mir.ValueId, captures: []const symbols.SymbolId, closure_depth: u8) anyerror!mir.ValueId {
     const module = ctx.builder.module;
     const box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_box", layout.ptr_type, box_value);
@@ -2943,27 +2951,34 @@ fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayo
     return try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
 }
 
-// `DOM.на_клик_замыкание(selector, замыкание)` — WASM AOT closures,
-// Stage B. Deliberately requires the handler argument to be a literal
+// `DOM.на_клик(selector, обработчик)` deliberately requires the handler
+// argument to be a literal
 // `.lambda` expression AT THE CALL SITE (not an arbitrary closure-typed
 // value from elsewhere) — this is what makes the capture list
 // statically inspectable here via `lambda_captures`, needed for the
 // scalar-only restriction below. See `project_panos_wasm_aot_closures`.
 fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutcome {
-    if (call.arguments.len != 2) return ctx.unsupported("DOM.на_клик_замыкание() ожидает 2 аргумента");
+    if (call.arguments.len != 2) return ctx.unsupported("DOM.на_клик() ожидает 2 аргумента");
     const handler_expr = call.arguments[1];
     switch (ctx.tree.expr(handler_expr).*) {
         .lambda => {},
-        else => return ctx.unsupported("DOM.на_клик_замыкание() ожидает лямбда-выражение непосредственно на месте вызова (Stage B)"),
+        else => return ctx.unsupported("DOM.на_клик() ожидает лямбда-выражение непосредственно на месте вызова"),
     }
+    const handler_type = ctx.checked.expression_types.get(handler_expr) orelse return ctx.unsupported("DOM.на_клик(): не удалось определить тип обработчика");
+    const handler_signature = switch ((ctx.checked.types.get(handler_type) orelse return ctx.unsupported("DOM.на_клик(): неизвестный тип обработчика")).*) {
+        .function => |function| function,
+        else => return ctx.unsupported("DOM.на_клик(): обработчик не является функцией"),
+    };
+    if (handler_signature.parameters.len != 1) return ctx.unsupported("DOM.на_клик(): обработчик должен принимать DOM.СобытиеКлика");
+    const event_type = handler_signature.parameters[0];
     const captures = ctx.resolution.lambda_captures.get(handler_expr) orelse &.{};
     for (captures) |capture_symbol| {
         const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
         if (classifyCapture(ctx.checked, capture_type) == .unsupported) {
             if (isProcessCapture(ctx.checked, capture_type)) {
-                return ctx.unsupported("DOM.на_клик_замыкание(): захват процесса небезопасен — AOT handle указывает на actor frame в сбрасываемой арене, а Phase 1 scheduler не сохраняет актор между DOM-вызовами");
+                return ctx.unsupported("DOM.на_клик(): захват процесса небезопасен — AOT handle указывает на actor frame в сбрасываемой арене, а Phase 1 scheduler не сохраняет актор между DOM-вызовами");
             }
-            return ctx.unsupported("DOM.на_клик_замыкание(): захват процесса, рекурсивного/обобщённого агрегата или иного неподдержанного типа (Stage C ограничение, project_panos_wasm_aot_closures)");
+            return ctx.unsupported("DOM.на_клик(): захват процесса, рекурсивного/обобщённого агрегата или иного неподдержанного типа (Stage C ограничение, project_panos_wasm_aot_closures)");
         }
     }
 
@@ -2985,7 +3000,7 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     const handler_outcome = try lowerExpr(ctx, handler_expr);
     if (handler_outcome.flow == .terminates) return terminated;
 
-    _ = try findOrBuildInvokeClosureClickTrampoline(ctx.allocator, ctx.builder.module, &ctx.checked.types, layout);
+    _ = try findOrBuildInvokeClickTrampoline(ctx.allocator, ctx.builder.module, &ctx.checked.types, layout, event_type);
     const promoted_box = try promoteClosureBoxToPermanent(ctx, layout, handler_outcome.value, captures, 0);
     const promoted_box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_promoted_box", layout.ptr_type, promoted_box);
 
@@ -2996,7 +3011,7 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     var args: std.ArrayList(mir.ValueId) = .empty;
     try args.append(arena, selector_for_call);
     try args.append(arena, promoted_box_for_call);
-    try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = "DOM::на_клик_замыкание", .args = try args.toOwnedSlice(arena) } });
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = "DOM::на_клик", .args = try args.toOwnedSlice(arena) } });
     return continuesWith(mir.invalid_value);
 }
 
@@ -3006,15 +3021,13 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
     if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "DOM")) return null;
 
     const property = ctx.tree.expr(call.callee).property;
-    if (std.mem.eql(u8, property.property, "на_клик_замыкание")) {
+    if (std.mem.eql(u8, property.property, "на_клик")) {
         return try lowerDomClickClosure(ctx, call);
     }
     const name = if (std.mem.eql(u8, property.property, "текст"))
         "DOM::текст"
     else if (std.mem.eql(u8, property.property, "установить_текст"))
         "DOM::установить_текст"
-    else if (std.mem.eql(u8, property.property, "на_клик"))
-        if (call.arguments.len == 3) "DOM::на_клик_контекст" else "DOM::на_клик"
     else if (std.mem.eql(u8, property.property, "текст_строка"))
         "DOM::текст_строка"
     else if (std.mem.eql(u8, property.property, "установить_текст_строка"))
@@ -3036,9 +3049,9 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
 
     var args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
 
-    // `на_клик_контекст`/`после_кадра`'s context argument is captured
-    // RAW by the JS loader (`aot-dom-loader.js`'s `dom_on_click_context`/
-    // `dom_after_frame`) and handed back UNCHANGED to a handler invoked
+    // `после_кадра`'s context argument is captured RAW by the JS loader
+    // (`aot-dom-loader.js`'s `dom_after_frame`) and handed back UNCHANGED
+    // to a handler invoked
     // in a wholly SEPARATE, later export call — see
     // `project_panos_elm_architecture_dom_storage_design`/
     // `project_panos_wasm_aot_memory_growth_fix` for the full research.
@@ -3049,9 +3062,7 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
     // to the host import — everything else keeps going through the
     // ordinary arena, no call-graph analysis needed (see
     // `wasm_heap.findOrBuildPromoteToPermanent`'s own doc comment).
-    const context_arg_index: ?usize = if (std.mem.eql(u8, name, "DOM::на_клик_контекст"))
-        2
-    else if (std.mem.eql(u8, name, "DOM::после_кадра"))
+    const context_arg_index: ?usize = if (std.mem.eql(u8, name, "DOM::после_кадра"))
         1
     else
         null;
@@ -3083,7 +3094,7 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
 // `состояние.прочитать`/`.записать` — the JS-loader-held Model
 // (`aot-dom-loader.js`'s `heldModel` closure variable), NOT a DOM
 // attribute — see `project_panos_elm_architecture_dom_storage_design`.
-// Unlike `на_клик_контекст`/`после_кадра`'s context argument, NOTHING
+// Unlike `после_кадра`'s context argument, NOTHING
 // here needs `wasm_heap.findOrBuildPromoteToPermanent` — the value
 // always flows as a full byte COPY through `readString`/`writeString`
 // on the JS side (never a raw pointer JS holds onto across calls), so
@@ -3277,7 +3288,7 @@ test "DOM click closure lowers selector before handler construction" {
         \\конец
         \\функ старт() -> Пусто
         \\    пер id: Число = 1.0
-        \\    DOM.на_клик_замыкание(селектор(), функ() -> Пусто
+        \\    DOM.на_клик(селектор(), функ(_: DOM.СобытиеКлика) -> Пусто
         \\        обработать(id)
         \\    конец)
         \\конец

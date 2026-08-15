@@ -103,14 +103,13 @@ export async function loadAotDomProgram(programWasmUrl) {
 		return ptr
 	}
 
-	// `на_клик`/`.на_клик_контекст` re-registering on the SAME element
+	// `на_клик` re-registering on the SAME element
 	// across repeated calls (e.g. a re-render loop re-running the same
 	// `DOM.на_клик(...)` call every frame/update) used to just keep
 	// STACKING listeners forever — every click fired every past
-	// registration, including ones captured with now-stale context
-	// pointers (memory-safe since Phase 1 GC's promotion fix, but still
-	// semantically wrong: a click would re-run OLD handlers with OLD
-	// data). `WeakMap<Element, listener>` — keyed by the actual element
+	// registration, including ones with stale captured data. This is
+	// semantically wrong even though permanent closure promotion keeps the
+	// old pointers memory-safe. `WeakMap<Element, listener>` — keyed by the actual element
 	// (not the selector string), so a genuinely RECREATED element for
 	// the same selector (`DOM.создать_и_добавить` rebuilding a subtree)
 	// gets its own fresh entry with no explicit cleanup needed (the old,
@@ -136,46 +135,25 @@ export async function loadAotDomProgram(programWasmUrl) {
 			const el = document.querySelector(readString(selectorPtr))
 			if (el) el.textContent = String(value)
 		},
-		// Handler name MUST match an exported panos function taking zero
-		// arguments (`функ имя() -> Пусто`) — no captured "context" value,
-		// unlike the old Odin-era loader's `(context, __env)` convention
-		// (that needed a real closures ABI this backend doesn't have yet).
-		dom_on_click_num: (selectorPtr, handlerNamePtr) => {
+		// `DOM.на_клик(selector, обработчик)` stores a real closure box in
+		// permanent WASM memory. On every MouseEvent the host forwards the
+		// scalar event fields to one fixed trampoline; WASM constructs the
+		// public `DOM.СобытиеКлика` value in its per-call arena and invokes
+		// the closure through `call_indirect`.
+		dom_on_click: (selectorPtr, boxPtr) => {
 			const el = document.querySelector(readString(selectorPtr))
-			const handler = instance.exports[readString(handlerNamePtr)]
-			if (el && typeof handler === "function") {
-				registerClick(el, () => handler())
-			}
-		},
-		// The three-argument form `DOM.на_клик(selector, name, context)`
-		// is intentionally not a general closure ABI: `name` remains a
-		// static exported function and `context` is one explicit Строка
-		// value — `contextPtr` is already a real Строка handle from the
-		// WASM side, forwarded to the handler UNCHANGED (never decoded
-		// here; only WASM code ever needs to read it).
-		dom_on_click_context: (selectorPtr, handlerNamePtr, contextPtr) => {
-			const el = document.querySelector(readString(selectorPtr))
-			const handler = instance.exports[readString(handlerNamePtr)]
-			if (el && typeof handler === "function") {
-				registerClick(el, () => handler(contextPtr))
-			}
-		},
-		// `DOM.на_клик_замыкание(selector, замыкание)` — a REAL closure
-		// (WASM AOT closures Stage B), not a static name lookup. A
-		// closure has no export name at all — `boxPtr` is already a
-		// pointer into the PERMANENT (non-arena-reset) region on the
-		// WASM side (`mir_lowering.zig`'s `promoteClosureBoxToPermanent`)
-		// — it's held here raw and handed, unchanged, to the ONE fixed
-		// trampoline export (`@invoke_closure_click`, Stage B's single
-		// handler shape — `функ() -> Пусто`, captures carry all state)
-		// on every click. `@invoke_closure_click` internally does the
-		// unbox+`call_indirect` dance (WASM-side, `wasm_interfaces.zig`'s
-		// `expandCallValue`) — this loader just forwards the pointer.
-		dom_on_click_closure: (selectorPtr, boxPtr) => {
-			const el = document.querySelector(readString(selectorPtr))
-			const trampoline = instance.exports["@invoke_closure_click"]
+			const trampoline = instance.exports["@invoke_click"]
 			if (el && typeof trampoline === "function") {
-				registerClick(el, () => trampoline(boxPtr))
+				registerClick(el, (event) => trampoline(
+					boxPtr,
+					event.clientX,
+					event.clientY,
+					event.button,
+					event.ctrlKey ? 1 : 0,
+					event.shiftKey ? 1 : 0,
+					event.altKey ? 1 : 0,
+					event.metaKey ? 1 : 0,
+				))
 			}
 		},
 		dom_get_text_string: (selectorPtr) => {

@@ -5,15 +5,15 @@ const panos = @import("panos_core");
 // `project_panos_wasm_aot_memory_growth_fix`/
 // `project_panos_elm_architecture_dom_storage_design`. The deep
 // end-to-end proof (memory usage staying bounded across 500 repeated
-// `старт()` calls, a DOM-context pointer surviving a SEPARATE later
+// `старт()` calls, a promoted closure surviving a SEPARATE later
 // export call) was done via a Node/wasmtime harness during development
 // — not reproducible here the same way `aot_tree_shaking_test.zig`'s own
-// DOM test explains why (`env::dom_on_click_context` has no host outside
+// DOM test explains why (`env::dom_on_click` has no host outside
 // a real browser/JS loader). These tests verify the STRUCTURAL
 // properties that make that behavior possible: the wrapper exists under
 // the right export name, the original body survives under a renamed
 // internal name, and the permanent region (globals 1/2) is reserved
-// exactly when — and only when — a DOM handler context argument needs it.
+// exactly when — and only when — delayed data needs it.
 
 const MemoryReader = struct {
     files: []const struct { path: []const u8, bytes: []const u8 },
@@ -132,24 +132,23 @@ test "старт invoked twice in a row still produces the correct result (arena
     try std.testing.expectEqualStrings(first.stdout, second.stdout);
 }
 
-test "DOM.на_клик_контекст reserves the permanent region and keeps both старт and the handler reachable" {
+test "DOM.на_клик reserves the permanent region and wraps the event trampoline" {
     const allocator = std.testing.allocator;
 
-    // Structural-only, matching `aot_tree_shaking_test.zig`'s own DOM
-    // test's precedent: no host provides `env::dom_on_click_context`
-    // outside a real browser/JS loader, so this can't be invoked through
-    // bare `wasmtime run`. The actual "does the context pointer survive
-    // a later, separate call" behavior was verified via a Node/wasmtime
-    // harness with a stub host import during development (see
-    // `project_panos_elm_architecture_dom_storage_design`).
+    // The captured string and closure box must survive after `старт`
+    // returns; the fixed JS-invoked trampoline, not an internal helper,
+    // must receive the arena checkpoint/restore wrapper.
     const source =
         \\импорт DOM
         \\
-        \\экспорт функ обработчик(контекст: Строка) -> Пусто
+        \\функ обработчик(контекст: Строка) -> Пусто
         \\конец
         \\
         \\функ старт() -> Число
-        \\    DOM.на_клик("#кнопка", "обработчик", "контекст-строка")
+        \\    пер контекст = "контекст-строка"
+        \\    DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
+        \\        обработчик(контекст)
+        \\    конец)
         \\    1.0
         \\конец
     ;
@@ -160,7 +159,7 @@ test "DOM.на_клик_контекст reserves the permanent region and keeps
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@runtime_alloc_permanent") != null);
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_старт") != null);
-    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_обработчик") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_@invoke_click") != null);
 }
 
 test "a program with no heap usage at all compiles with no arena wrapper (nothing to reset)" {

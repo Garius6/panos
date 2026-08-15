@@ -1089,6 +1089,26 @@ const Checker = struct {
         }
     }
 
+    // Native modules have no AST declaration from which `nominalPass`
+    // could read fields. Materialize the public click-event layout here;
+    // declaration order is also the WASM trampoline's in-memory order.
+    fn nativeNominalPass(self: *Checker) !void {
+        for (self.resolution.symbols.symbols.items[1..], 1..) |entry, index| {
+            if (entry.kind != .type or entry.module_path == null) continue;
+            if (!std.mem.eql(u8, entry.module_path.?, "DOM") or !std.mem.eql(u8, entry.name, "СобытиеКлика")) continue;
+            const symbol: symbols.SymbolId = @enumFromInt(index);
+            const fields = try self.result.arena.allocator().alloc(NominalField, 7);
+            fields[0] = .{ .name = "клиент_x", .typ = self.result.types.builtins.number };
+            fields[1] = .{ .name = "клиент_y", .typ = self.result.types.builtins.number };
+            fields[2] = .{ .name = "кнопка", .typ = self.result.types.builtins.integer };
+            fields[3] = .{ .name = "ctrl", .typ = self.result.types.builtins.boolean };
+            fields[4] = .{ .name = "shift", .typ = self.result.types.builtins.boolean };
+            fields[5] = .{ .name = "alt", .typ = self.result.types.builtins.boolean };
+            fields[6] = .{ .name = "meta", .typ = self.result.types.builtins.boolean };
+            try self.result.nominal_fields.put(symbol, fields);
+        }
+    }
+
     fn enumPass(self: *Checker) !void {
         for (self.tree.program.?.declarations) |declaration| {
             const enumeration = switch (self.tree.decl(declaration).*) {
@@ -3642,45 +3662,20 @@ const Checker = struct {
                 return self.result.types.builtins.void;
             }
             if (self.isBuiltinModule(symbol, "DOM", "на_клик")) {
-                if (call.arguments.len != 2 and call.arguments.len != 3) {
-                    try self.report(call.span, "Type Error: DOM.на_клик() ожидает 2 или 3 аргумента", .{});
-                    for (call.arguments) |argument| _ = try self.infer(argument);
-                    return self.result.types.builtins.void;
-                }
-                for (call.arguments) |argument| {
-                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
-                        try self.report(call.span, "Type Error: DOM.на_клик() ожидает селектор, имя обработчика и необязательный контекст типа Строка", .{});
-                    }
-                }
-                return self.result.types.builtins.void;
-            }
-            // WASM AOT closures, Stage B — a REAL closure value instead
-            // of a static exported handler NAME + one Строка context
-            // (`DOM.на_клик`'s existing 2/3-arg forms above). The
-            // handler is a genuine `функ() -> Пусто` value — captures do
-            // the job the old "context" string argument used to.
-            // Deliberately a SEPARATE method name (not an overload of
-            // `на_клик`) — hand-rolled per-builtin type-checking here has
-            // no shared union-type-argument machinery, and reusing the
-            // same name would need one; a new name is additive and keeps
-            // `на_клик`'s existing contract/callers untouched. Only a
-            // The runtime trampoline invokes the handler with no
-            // arguments and expects no result, so accepting any other
-            // function shape here would compile successfully and then
-            // produce an invalid `call_indirect` signature in WASM.
-            if (self.isBuiltinModule(symbol, "DOM", "на_клик_замыкание")) {
                 if (call.arguments.len != 2) {
-                    try self.report(call.span, "Type Error: DOM.на_клик_замыкание() ожидает 2 аргумента", .{});
+                    try self.report(call.span, "Type Error: DOM.на_клик() ожидает 2 аргумента", .{});
                     for (call.arguments) |argument| _ = try self.infer(argument);
                     return self.result.types.builtins.void;
                 }
                 if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
-                    try self.report(call.span, "Type Error: DOM.на_клик_замыкание() ожидает CSS-селектор типа Строка первым аргументом", .{});
+                    try self.report(call.span, "Type Error: DOM.на_клик() ожидает CSS-селектор типа Строка первым аргументом", .{});
                 }
-                const expected_handler = try self.result.types.function(&.{}, self.result.types.builtins.void);
+                const event_symbol = self.findQualifiedTypeSymbol("DOM", "СобытиеКлика") orelse return self.result.types.poison();
+                const event_type = try self.nominalType(event_symbol, &.{});
+                const expected_handler = try self.result.types.function(&.{event_type}, self.result.types.builtins.void);
                 const handler_type = try self.inferExpected(call.arguments[1], expected_handler);
                 if (!self.assignable(handler_type, expected_handler)) {
-                    try self.report(call.span, "Type Error: DOM.на_клик_замыкание() ожидает замыкание (функ() -> Пусто) вторым аргументом", .{});
+                    try self.report(call.span, "Type Error: DOM.на_клик() ожидает обработчик (функ(DOM.СобытиеКлика) -> Пусто) вторым аргументом", .{});
                 }
                 return self.result.types.builtins.void;
             }
@@ -6126,6 +6121,7 @@ pub fn checkWithImportContextForTarget(
     // were declared with the exact same annotation.
     try checker.importIdentityPass(imports, &owner_remaps, &owner_parameters_by_symbol);
     try checker.nominalPass();
+    try checker.nativeNominalPass();
     // Must run BEFORE `signaturePass` — a `реализация Интерфейс для
     // Модуль.Тип` (qualified impl TARGET) is processed by `signaturePass`
     // and needs `nominal_fields`/`generic_nominal_fields` for the
@@ -6287,20 +6283,22 @@ test "type checker infers lambda parameters from a function annotation" {
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
-test "type checker requires an exact DOM click closure signature" {
+test "type checker exposes all DOM click event fields" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
     var lexed = try lexer.tokenize(
         std.testing.allocator,
         "импорт DOM\n" ++
-            "функ с_аргументом(x: Число) -> Пусто\n" ++
-            "конец\n" ++
-            "функ с_результатом() -> Число\n" ++
-            "1.0\n" ++
-            "конец\n" ++
             "функ старт() -> Пусто\n" ++
-            "DOM.на_клик_замыкание(\"#a\", с_аргументом)\n" ++
-            "DOM.на_клик_замыкание(\"#b\", с_результатом)\n" ++
+            "DOM.на_клик(\"#кнопка\", функ(событие: DOM.СобытиеКлика) -> Пусто\n" ++
+            "DOM.установить_текст(\"#x\", событие.клиент_x)\n" ++
+            "DOM.установить_текст(\"#y\", событие.клиент_y)\n" ++
+            "событие.кнопка == 0\n" ++
+            "событие.ctrl\n" ++
+            "событие.shift\n" ++
+            "событие.alt\n" ++
+            "событие.meta\n" ++
+            "конец)\n" ++
             "конец",
         0,
     );
@@ -6312,9 +6310,42 @@ test "type checker requires an exact DOM click closure signature" {
     var checked = try checkWithImportsForTarget(std.testing.allocator, &parsed.ast, &resolved, &.{}, .aot_js_wasm);
     defer checked.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), checked.diagnostics.items.items.len);
-    try std.testing.expectEqualStrings("Type Error: DOM.на_клик_замыкание() ожидает замыкание (функ() -> Пусто) вторым аргументом", checked.diagnostics.items.items[0].message);
-    try std.testing.expectEqualStrings("Type Error: DOM.на_клик_замыкание() ожидает замыкание (функ() -> Пусто) вторым аргументом", checked.diagnostics.items.items[1].message);
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "type checker requires an exact DOM click event handler signature" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "импорт DOM\n" ++
+            "функ без_аргумента() -> Пусто\n" ++
+            "конец\n" ++
+            "функ неверный_аргумент(x: Число) -> Пусто\n" ++
+            "конец\n" ++
+            "функ с_результатом(_: DOM.СобытиеКлика) -> Число\n" ++
+            "1.0\n" ++
+            "конец\n" ++
+            "функ старт() -> Пусто\n" ++
+            "DOM.на_клик(\"#a\", без_аргумента)\n" ++
+            "DOM.на_клик(\"#b\", неверный_аргумент)\n" ++
+            "DOM.на_клик(\"#c\", с_результатом)\n" ++
+            "конец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try checkWithImportsForTarget(std.testing.allocator, &parsed.ast, &resolved, &.{}, .aot_js_wasm);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), checked.diagnostics.items.items.len);
+    for (checked.diagnostics.items.items) |item| {
+        try std.testing.expectEqualStrings("Type Error: DOM.на_клик() ожидает обработчик (функ(DOM.СобытиеКлика) -> Пусто) вторым аргументом", item.message);
+    }
 }
 
 test "type checker preserves nominal user types in function signatures" {

@@ -229,7 +229,7 @@ test "a lambda capturing two local values in order returns the correct (order-se
     try std.testing.expectEqualStrings("7\n", result.stdout);
 }
 
-test "DOM.на_клик_замыкание capturing a scalar plus calling a plain function directly compiles (function_ref capture)" {
+test "DOM.на_клик capturing a scalar plus calling a plain function directly compiles (function_ref capture)" {
     // Regression for the two hardest follow-up bugs found converting the
     // real todo-app: (1) the resolver captures ANY `.function`-kind symbol
     // referenced inside a lambda, even one called DIRECTLY — so a plain
@@ -253,7 +253,7 @@ test "DOM.на_клик_замыкание capturing a scalar plus calling a pla
         \\
         \\функ старт() -> Пусто
         \\пер id: Число = 5.0
-        \\DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
         \\    обработать(id)
         \\конец)
         \\конец
@@ -261,19 +261,19 @@ test "DOM.на_клик_замыкание capturing a scalar plus calling a pla
     const wasm_bytes = try buildGraphBytes(allocator, source);
     defer allocator.free(wasm_bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "dom_on_click_closure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "dom_on_click") != null);
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@runtime_alloc_permanent") != null);
 }
 
-// Stage B (`DOM.на_клик_замыкание`) — structural-only, matching
+// `DOM.на_клик` closure registration — structural-only, matching
 // `aot_tree_shaking_test.zig`'s/`aot_gc_arena_test.zig`'s own DOM test
-// precedent: no host provides `env::dom_on_click_closure` outside a
+// precedent: no host provides `env::dom_on_click` outside a
 // real browser/JS loader, so this can't be invoked through bare
 // `wasmtime run`. The deep end-to-end proof (a captured Число surviving
 // across two SEPARATE simulated clicks, after an intervening arena
 // reset) was done via a Node/wasmtime harness with a stub host import
 // during development — see `project_panos_wasm_aot_closures`.
-test "DOM.на_клик_замыкание compiles and registers the fixed invoke_closure_click trampoline" {
+test "DOM.на_клик compiles and registers the fixed invoke_click trampoline" {
     const allocator = std.testing.allocator;
 
     const source =
@@ -282,7 +282,7 @@ test "DOM.на_клик_замыкание compiles and registers the fixed invo
         \\
         \\функ старт() -> Пусто
         \\пер счётчик: Число = 42.0
-        \\DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
         \\    DOM.установить_текст_строка("#результат", строки.из_числа(счётчик))
         \\конец)
         \\конец
@@ -290,8 +290,8 @@ test "DOM.на_клик_замыкание compiles and registers the fixed invo
     const wasm_bytes = try buildGraphBytes(allocator, source);
     defer allocator.free(wasm_bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "dom_on_click_closure") != null);
-    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@invoke_closure_click") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "dom_on_click") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@invoke_click") != null);
     // Scalar-only captures (this fixture) go through Stage C's raw-copy
     // path (`classifyCapture` → `.scalar`, no promotion CALL needed at
     // all) — `@runtime_alloc_permanent` is still required (the box+env
@@ -301,10 +301,10 @@ test "DOM.на_клик_замыкание compiles and registers the fixed invo
     // `wasm_gc_arena.zig` must have wrapped the trampoline too (Task 45's
     // `module.dom_handler_names` addition) — the ORIGINAL trampoline
     // function survives renamed under the arena-wrapper convention.
-    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_@invoke_closure_click") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_@invoke_click") != null);
 }
 
-test "DOM.на_клик_замыкание promotes a captured local closure and its environment" {
+test "DOM.на_клик promotes a captured local closure and its environment" {
     const allocator = std.testing.allocator;
     var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
     defer io.deinit();
@@ -315,7 +315,7 @@ test "DOM.на_клик_замыкание promotes a captured local closure and
         \\функ старт() -> Пусто
         \\    пер основа: Число = 41.0
         \\    пер вычислить = функ() -> Число основа + 1.0 конец
-        \\    DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\    DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
         \\        DOM.установить_текст("#результат", вычислить())
         \\    конец)
         \\конец
@@ -334,12 +334,12 @@ test "DOM.на_клик_замыкание promotes a captured local closure and
         \\  let observed = 0;
         \\  const bytes = fs.readFileSync(process.argv[1]);
         \\  const imports = { env: {
-        \\    dom_on_click_closure: (_selector, box) => { handler = box; },
+        \\    dom_on_click: (_selector, box) => { handler = box; },
         \\    dom_set_text_num: (_selector, value) => { observed = value; },
         \\  } };
         \\  const { instance } = await WebAssembly.instantiate(bytes, imports);
         \\  instance.exports["старт"]();
-        \\  instance.exports["@invoke_closure_click"](handler);
+        \\  instance.exports["@invoke_click"](handler, 0, 0, 0, 0, 0, 0, 0);
         \\  if (observed !== 42) throw new Error(`expected 42, got ${observed}`);
         \\  process.stdout.write(String(observed));
         \\})().catch((error) => { console.error(error); process.exit(1); });
@@ -355,7 +355,71 @@ test "DOM.на_клик_замыкание promotes a captured local closure and
     try std.testing.expectEqualStrings("42", result.stdout);
 }
 
-test "DOM.на_клик_замыкание capturing a Строка directly promotes it via @promote_to_permanent (Stage C)" {
+test "DOM.на_клик forwards MouseEvent fields through DOM.СобытиеКлика across arena resets" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\импорт DOM
+        \\
+        \\функ старт() -> Пусто
+        \\    DOM.на_клик("#кнопка", функ(событие: DOM.СобытиеКлика) -> Пусто
+        \\        пер сумма: Число = событие.клиент_x + событие.клиент_y + (событие.кнопка как Число)
+        \\        если событие.ctrl тогда
+        \\            сумма = сумма + 1.0
+        \\        конец
+        \\        если событие.shift тогда
+        \\            сумма = сумма + 1.0
+        \\        конец
+        \\        если событие.alt тогда
+        \\            сумма = сумма + 1.0
+        \\        конец
+        \\        если событие.meta тогда
+        \\            сумма = сумма + 1.0
+        \\        конец
+        \\        DOM.установить_текст("#результат", сумма)
+        \\    конец)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_click_event_fields.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const script =
+        \\const fs = require("fs");
+        \\(async () => {
+        \\  let handler = 0;
+        \\  let observed = 0;
+        \\  const bytes = fs.readFileSync(process.argv[1]);
+        \\  const imports = { env: {
+        \\    dom_on_click: (_selector, box) => { handler = box; },
+        \\    dom_set_text_num: (_selector, value) => { observed = value; },
+        \\  } };
+        \\  const { instance } = await WebAssembly.instantiate(bytes, imports);
+        \\  instance.exports["старт"]();
+        \\  instance.exports["@invoke_click"](handler, 10.5, 20.25, 2, 1, 0, 1, 1);
+        \\  if (observed !== 35.75) throw new Error(`expected 35.75, got ${observed}`);
+        \\  instance.exports["@invoke_click"](handler, 1, 2, 0, 0, 1, 0, 0);
+        \\  if (observed !== 4) throw new Error(`expected 4, got ${observed}`);
+        \\  process.stdout.write(String(observed));
+        \\})().catch((error) => { console.error(error); process.exit(1); });
+    ;
+    const result = try std.process.run(allocator, io.io(), .{
+        .argv = &.{ "node", "-e", script, wasm_path },
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("4", result.stdout);
+}
+
+test "DOM.на_клик capturing a Строка directly promotes it via @promote_to_permanent (Stage C)" {
     const allocator = std.testing.allocator;
 
     const source =
@@ -363,7 +427,7 @@ test "DOM.на_клик_замыкание capturing a Строка directly pro
         \\
         \\функ старт() -> Пусто
         \\пер текст: Строка = "привет"
-        \\DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
         \\    DOM.установить_текст_строка("#результат", текст)
         \\конец)
         \\конец
@@ -374,7 +438,7 @@ test "DOM.на_клик_замыкание capturing a Строка directly pro
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
 }
 
-test "DOM.на_клик_замыкание capturing a struct with a Строка field promotes the field too (Stage C)" {
+test "DOM.на_клик capturing a struct with a Строка field promotes the field too (Stage C)" {
     const allocator = std.testing.allocator;
 
     const source =
@@ -387,7 +451,7 @@ test "DOM.на_клик_замыкание capturing a struct with a Строк�
         \\
         \\функ старт() -> Пусто
         \\пер задача: Задача = Задача(7.0, "купить хлеб")
-        \\DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
         \\    DOM.установить_текст_строка("#результат", задача.текст)
         \\конец)
         \\конец
@@ -399,7 +463,7 @@ test "DOM.на_клик_замыкание capturing a struct with a Строк�
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
 }
 
-test "DOM.на_клик_замыкание recursively promotes a nested struct capture" {
+test "DOM.на_клик recursively promotes a nested struct capture" {
     const allocator = std.testing.allocator;
 
     const source =
@@ -414,7 +478,7 @@ test "DOM.на_клик_замыкание recursively promotes a nested struct 
         \\
         \\функ старт() -> Пусто
         \\    пер задача = Задача(Подробности("купить хлеб"))
-        \\    DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\    DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
         \\        DOM.установить_текст_строка("#результат", задача.подробности.текст)
         \\    конец)
         \\конец
@@ -426,7 +490,7 @@ test "DOM.на_клик_замыкание recursively promotes a nested struct 
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
 }
 
-test "DOM.на_клик_замыкание recursively promotes an array capture" {
+test "DOM.на_клик recursively promotes an array capture" {
     const allocator = std.testing.allocator;
 
     const source =
@@ -434,7 +498,7 @@ test "DOM.на_клик_замыкание recursively promotes an array capture
         \\
         \\функ старт() -> Пусто
         \\    пер задачи: Массив(Строка) = массив("первая", "вторая")
-        \\    DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\    DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
         \\        DOM.установить_текст_строка("#результат", задачи[1.0])
         \\    конец)
         \\конец
@@ -446,14 +510,14 @@ test "DOM.на_клик_замыкание recursively promotes an array capture
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
 }
 
-test "DOM.на_клик_замыкание reports an unsupported process capture without writing to stderr" {
+test "DOM.на_клик reports an unsupported process capture without writing to stderr" {
     const allocator = std.testing.allocator;
 
     const source =
         \\импорт DOM
         \\
         \\функ зарегистрировать(proc: Процесс(Число)) -> Пусто
-        \\    DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\    DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
         \\        отправить(proc, 1.0)
         \\    конец)
         \\конец

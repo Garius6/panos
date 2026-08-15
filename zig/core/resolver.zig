@@ -29,10 +29,8 @@ pub const native_builtin_modules = [_][]const u8{
     "бд",
 };
 
-// Export list per native module — the SAME data `installBuiltins` below
-// passes to `installBuiltinModule` inline (kept separate rather than
-// refactoring those call sites to read from this table, to avoid
-// touching already-tested code for a second consumer). Used by
+// Export names per native module. Values are builtins unless
+// `nativeModuleExportKind` marks a name as a public native type. Used by
 // `module_linker.zig` to bind an ALIASED native import (`импорт
 // "ввод_вывод" как ио`) — `module_loader.zig`'s `native_module` field on
 // `Import` says a name resolved natively, but the alias itself still
@@ -71,7 +69,7 @@ pub fn nativeModuleExports(name: []const u8) ?[]const []const u8 {
             "из_рун",
             "кодовая_точка",
         } },
-        .{ .name = "DOM", .exports = &.{ "текст", "установить_текст", "на_клик", "на_клик_замыкание", "текст_строка", "установить_текст_строка", "значение_поля", "установить_значение_поля", "создать_и_добавить", "после_кадра", "атрибут", "установить_атрибут" } },
+        .{ .name = "DOM", .exports = &.{ "текст", "установить_текст", "на_клик", "СобытиеКлика", "текст_строка", "установить_текст_строка", "значение_поля", "установить_значение_поля", "создать_и_добавить", "после_кадра", "атрибут", "установить_атрибут" } },
         .{ .name = "состояние", .exports = &.{ "прочитать", "записать" } },
         .{ .name = "сжатие", .exports = &.{"разжать_gzip"} },
         .{ .name = "синтаксис", .exports = &.{ "структуры", "поля", "импорты", "аннотации", "аргумент_аннотации", "аннотации_поля", "аргумент_аннотации_поля" } },
@@ -82,6 +80,11 @@ pub fn nativeModuleExports(name: []const u8) ?[]const []const u8 {
         if (std.mem.eql(u8, entry.name, name)) return entry.exports;
     }
     return null;
+}
+
+pub fn nativeModuleExportKind(module_name: []const u8, export_name: []const u8) symbols.SymbolKind {
+    if (std.mem.eql(u8, module_name, "DOM") and std.mem.eql(u8, export_name, "СобытиеКлика")) return .type;
+    return .builtin;
 }
 
 const EnumVariants = struct {
@@ -501,7 +504,8 @@ const Resolver = struct {
         // `DOM` — AOT WASM only (`target.zig`'s `builtinAvailability`), a
         // Numeric methods stay compatible with the first AOT DOM slice;
         // the string methods use opaque handles supplied by its JS runtime.
-        try self.installBuiltinModule("DOM", &.{ "текст", "установить_текст", "на_клик", "на_клик_замыкание", "текст_строка", "установить_текст_строка", "значение_поля", "установить_значение_поля", "создать_и_добавить", "после_кадра", "атрибут", "установить_атрибут" });
+        try self.installBuiltinModule("DOM", &.{ "текст", "установить_текст", "на_клик", "текст_строка", "установить_текст_строка", "значение_поля", "установить_значение_поля", "создать_и_добавить", "после_кадра", "атрибут", "установить_атрибут" });
+        try self.installBuiltinModuleType("DOM", "СобытиеКлика");
         // `состояние` — the JS-loader-held Model, AOT WASM only (same
         // `target.zig` restriction as `DOM`, same reasoning: backed by a
         // JS closure variable that only exists in `aot-dom-loader.js`).
@@ -621,6 +625,22 @@ const Resolver = struct {
             .span = .{ .file_id = 0, .start = 0, .end = 0 },
         });
         try self.scopes.declare(&self.result.symbols, symbol);
+    }
+
+    fn installBuiltinModuleType(self: *Resolver, module_name: []const u8, name: []const u8) !void {
+        const module = self.scopes.lookup(module_name) orelse return error.InvalidSymbol;
+        const symbol = try self.result.symbols.add(.{
+            .name = name,
+            .kind = .type,
+            .module_path = module_name,
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+        });
+        for (self.module_members.items) |*members| {
+            if (members.module != module) continue;
+            try members.values.put(name, symbol);
+            return;
+        }
+        return error.InvalidSymbol;
     }
 
     fn predeclareImports(self: *Resolver, imports: []const ImportedModule) !void {

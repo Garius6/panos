@@ -917,7 +917,9 @@ const Resolver = struct {
             try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
         } else if (self.target_profile != .native) {
             try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
-        } else if ((comptime builtin.target.os.tag != .windows and builtin.link_libc) and std.mem.eql(u8, foreign.library, "libc")) {
+        } else if ((comptime builtin.target.os.tag != .windows and builtin.link_libc) and
+            (std.mem.eql(u8, foreign.library, "libc") or std.mem.eql(u8, foreign.library, "хост")))
+        {
             // Real bug found via CI (not local — this machine always
             // links libc for every build): `std.c.dlopen` referenced
             // UNCONDITIONALLY (no `builtin.link_libc` guard) forces
@@ -936,6 +938,11 @@ const Resolver = struct {
             // `внешний "libc"` doesn't need to find and load a SEPARATE
             // shared object file at all — libc is ALREADY linked into
             // this very process (every native panos binary links libc).
+            // `внешний "хост"` uses the same POSIX mechanism for a Zig
+            // executable embedding Panos: its `pub export fn` C-ABI entry
+            // points live in the main process image, not in a fake dynamic
+            // library next to a map. The host must enable `rdynamic` so
+            // those exports reach the dynamic symbol table.
             // `dlopen(NULL, ...)` is POSIX for exactly this: "give me a
             // handle to the running program's own already-loaded image"
             // (main executable + every shared library already mapped
@@ -952,15 +959,15 @@ const Resolver = struct {
             // mistake the .so-vs-.so.6 fix was itself catching. dlopen
             // (NULL) needs no filename, no libc-flavor knowledge, and
             // is exactly as valid on macOS as it is on any POSIX system
-            // — used unconditionally for "libc" on every non-Windows
-            // target, not just Linux.
+            // — used unconditionally for both process-image libraries on
+            // every non-Windows target, not just Linux.
             const handle = std.c.dlopen(null, .{ .LAZY = true }) orelse {
-                try self.report(foreign.span, "Resolve Error: библиотека 'libc' не найдена (dlopen(NULL) в этом процессе)", .{});
+                try self.report(foreign.span, "Resolve Error: библиотека '{s}' не найдена (dlopen(NULL) в этом процессе)", .{foreign.library});
                 return;
             };
             const name_z = try self.result.arena.allocator().dupeZ(u8, foreign.name);
             const fn_ptr = std.c.dlsym(handle, name_z) orelse {
-                try self.report(foreign.span, "Resolve Error: библиотека 'libc' не экспортирует символ '{s}'", .{foreign.name});
+                try self.report(foreign.span, "Resolve Error: библиотека '{s}' не экспортирует символ '{s}'", .{ foreign.library, foreign.name });
                 return;
             };
             try self.result.foreign_functions.put(symbol, @intFromPtr(fn_ptr));

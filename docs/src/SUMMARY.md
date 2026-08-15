@@ -40,6 +40,7 @@
 - [Память и сборщик мусора](./architecture/memory-and-gc.md)
 - [Модульная система](./architecture/module-system.md)
 - [Platform-split (native/wasm)](./architecture/platform-split.md)
+- [Встраивание Panos в Zig](./architecture/embedding.md)
 - [LSP-сервер](./architecture/lsp.md)
 - [Известные грабли](./architecture/known-pitfalls.md)
 - [Тулчейн и тестирование](./architecture/toolchain-and-testing.md)

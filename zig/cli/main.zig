@@ -1,5 +1,6 @@
 const std = @import("std");
 const panos_core = @import("panos_core");
+const panos_embed = @import("panos_embed");
 
 pub const DiagnosticFormatError = error{
     FileMismatch,
@@ -495,57 +496,56 @@ fn runGraph(
     verbose: bool,
     profile_ffi: bool,
 ) !void {
-    var graph = panos_core.module_loader.Graph.init(init.gpa);
-    defer graph.deinit();
-    graph.global_search_roots = global_search_roots;
-    try graph.load(&reader, entry_path);
+    var runtime = panos_embed.Runtime.init(init.gpa, .{
+        .global_search_roots = global_search_roots,
+        .program_args = program_args,
+        .foreign_profile_enabled = profile_ffi,
+    });
+    defer runtime.deinit();
+    try runtime.load(&reader, entry_path);
     // Real prelude module (same as runner.zig's single-file pipeline and
     // the LSP already do) instead of the type-checker's hardcoded
     // Опция/Результат/interface stand-ins — `module_compiler.zig`'s
     // `ImportContext.collect` bridges its real definitions into every
     // other module, `preludePass` (`type_checker.zig`) skips its own
     // hardcode once it detects this.
-    _ = try graph.appendPreludeModule(panos_core.prelude.SOURCE);
-    if (graph.diagnostics.items.items.len != 0) {
-        try writeModuleDiagnostics(stderr, &graph);
-        if (hasErrors(&graph.diagnostics)) {
+    if (runtime.graphDiagnostics().items.items.len != 0) {
+        try writeModuleDiagnostics(stderr, runtime.graph());
+        if (runtime.hasGraphErrors()) {
             try stderr.flush();
             std.process.exit(1);
         }
     }
 
-    var compiled = try panos_core.module_compiler.compileGraph(init.gpa, &graph);
-    defer compiled.deinit();
-    try writeGraphDiagnostics(stderr, &graph, &compiled.diagnostics);
-    if (compiled.hasErrors()) {
+    try runtime.compile();
+    const compiled = runtime.compiledGraph() orelse unreachable;
+    const compilation_diagnostics = runtime.compilationDiagnostics() orelse unreachable;
+    try writeGraphDiagnostics(stderr, runtime.graph(), compilation_diagnostics);
+    if (runtime.hasCompilationErrors()) {
         try stderr.flush();
         std.process.exit(1);
     }
 
-    const start = compiled.start orelse {
+    if (compiled.start == null) {
         try stderr.print("Compiler Error: не определена функция 'старт'\n", .{});
         try stderr.flush();
         std.process.exit(1);
-    };
+    }
     if (verbose) {
         const entry = &compiled.modules[0];
         const resolution = if (entry.resolution) |*value| value else unreachable;
         const checked = if (entry.checked) |*value| value else unreachable;
         try writeVerboseInfo(stdout, .{
-            .declarations = graph.modules.items[0].tree.program.?.declarations.len,
+            .declarations = runtime.graph().modules.items[0].tree.program.?.declarations.len,
             .symbols = resolution.symbols.symbols.items.len - 1,
             .types = checked.types.types.items.len - 1,
             .functions = compiled.program.functions.items.len,
         });
     }
 
-    var machine = panos_core.vm.Vm.init(init.gpa, &compiled.program);
-    machine.program_args = program_args;
-    machine.foreign_profile_enabled = profile_ffi;
-    defer machine.deinit();
-    const execution = try machine.run(start, &.{});
+    const execution = try runtime.runStart();
     if (profile_ffi) {
-        try machine.writeForeignProfile(stderr);
+        try runtime.writeForeignProfile(stderr);
         try stderr.flush();
     }
     switch (execution) {
@@ -557,7 +557,7 @@ fn runGraph(
             // calls made DURING execution — printed first, same order a
             // real stdout write during the program's own run would have
             // appeared in.
-            try stdout.print("{s}{s}\n", .{ machine.output.items, output });
+            try stdout.print("{s}{s}\n", .{ runtime.output(), output });
             try stdout.flush();
             // `stderr` is buffered (`stderr_buffer` above) and otherwise
             // only ever flushed on the error-exit paths — a WARNING-only
@@ -573,8 +573,8 @@ fn runGraph(
             try stderr.flush();
         },
         .runtime_error => |message| {
-            if (machine.output.items.len != 0) {
-                try stdout.print("{s}", .{machine.output.items});
+            if (runtime.output().len != 0) {
+                try stdout.print("{s}", .{runtime.output()});
                 try stdout.flush();
             }
             try stderr.print("{s}\n", .{message});

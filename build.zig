@@ -9,7 +9,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
     // `бд.*` (`zig/core/sqlite3_bindings.zig`, referenced from `vm.zig`)
     // needs `external/sqlite3/sqlite3.c` linked in — built into its own
     // small static library rather than added directly to `core_module`,
@@ -34,6 +33,22 @@ pub fn build(b: *std.Build) void {
     // never attached to `core_module`/`browser`.
     const libffi_archive = libffiArchivePath(b, target);
 
+    // Native embedding API. It is deliberately a separate module: the core
+    // module is also shared by the freestanding browser target and must stay
+    // free of the native VM's SQLite/FFI linker requirements. Keeping those
+    // requirements on this module makes `dependency.module("panos_embed")`
+    // sufficient for a Zig host; it does not need to discover vendored
+    // sqlite/libffi paths itself.
+    const embed_module = b.addModule("panos_embed", .{
+        .root_source_file = b.path("zig/embed.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "panos_core", .module = core_module }},
+    });
+    embed_module.linkLibrary(sqlite_lib);
+    embed_module.addObjectFile(libffi_archive);
+
     const panos = b.addExecutable(.{
         .name = "panos",
         .root_module = b.createModule(.{
@@ -41,7 +56,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+            .imports = &.{
+                .{ .name = "panos_core", .module = core_module },
+                .{ .name = "panos_embed", .module = embed_module },
+            },
         }),
     });
     panos.root_module.linkLibrary(sqlite_lib);
@@ -298,6 +316,27 @@ pub fn build(b: *std.Build) void {
     });
     runner_unit_tests.root_module.linkLibrary(sqlite_lib);
     runner_unit_tests.root_module.addObjectFile(libffi_archive);
+    const embed_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/embed.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "panos_core", .module = core_module }},
+        }),
+    });
+    embed_tests.root_module.linkLibrary(sqlite_lib);
+    embed_tests.root_module.addObjectFile(libffi_archive);
+    const embed_host_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/embed_host_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "panos_embed", .module = embed_module }},
+        }),
+    });
+    // `внешний "хост"` resolves symbols from the test executable itself.
+    embed_host_tests.rdynamic = true;
     const cli_tests = b.addTest(.{ .root_module = panos.root_module });
     const lsp_tests = b.addTest(.{ .root_module = lsp.root_module });
     const browser_tests = b.addTest(.{
@@ -498,6 +537,8 @@ pub fn build(b: *std.Build) void {
     const run_module_compiler_unit_tests = b.addRunArtifact(module_compiler_unit_tests);
     const run_lsp_graph_unit_tests = b.addRunArtifact(lsp_graph_unit_tests);
     const run_runner_unit_tests = b.addRunArtifact(runner_unit_tests);
+    const run_embed_tests = b.addRunArtifact(embed_tests);
+    const run_embed_host_tests = b.addRunArtifact(embed_host_tests);
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const run_lsp_tests = b.addRunArtifact(lsp_tests);
     const run_browser_tests = b.addRunArtifact(browser_tests);
@@ -653,6 +694,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_module_compiler_unit_tests.step);
     test_step.dependOn(&run_lsp_graph_unit_tests.step);
     test_step.dependOn(&run_runner_unit_tests.step);
+    test_step.dependOn(&run_embed_tests.step);
+    test_step.dependOn(&run_embed_host_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_lsp_tests.step);
     test_step.dependOn(&run_browser_tests.step);

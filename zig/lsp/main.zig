@@ -916,6 +916,29 @@ pub const Server = struct {
         try output.appendSlice("]}");
     }
 
+    fn graphDocumentDiagnostics(self: *const Server, uri: []const u8) !?core_lsp.DocumentDiagnostics {
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        var analysis = lsp_graph.analyze(self.allocator, io.io(), &self.documents, uri, self.global_search_roots) catch return null;
+        defer analysis.deinit();
+
+        const file = analysis.moduleSourceFile(0);
+        var result = core_lsp.DocumentDiagnostics.init(self.allocator);
+        errdefer result.deinit();
+        for (analysis.compiled.diagnostics.items.items) |item| {
+            if (item.span.file_id != file.id or !item.span.isValidFor(file)) continue;
+            try result.items.append(self.allocator, .{
+                .range = .{
+                    .start = file.byteOffsetToUtf16Position(item.span.start),
+                    .end = file.byteOffsetToUtf16Position(item.span.end),
+                },
+                .severity = item.severity,
+                .message = try result.arena.allocator().dupe(u8, item.message),
+            });
+        }
+        return result;
+    }
+
     fn documentPosition(self: *const Server, params: ?std.json.Value) ?DocumentPosition {
         const params_object = objectValue(params orelse return null) orelse return null;
         const document = objectValue(params_object.get("textDocument") orelse return null) orelse return null;
@@ -932,6 +955,12 @@ pub const Server = struct {
     }
 
     fn writePublishDiagnostics(self: *const Server, output: *ResponseBuffer, uri: []const u8) !void {
+        var graph_diagnostics = try self.graphDocumentDiagnostics(uri);
+        if (graph_diagnostics) |*diagnostics| {
+            defer diagnostics.deinit();
+            try writePublish(output, uri, diagnostics);
+            return;
+        }
         var diagnostics = (try self.documents.diagnose(uri)) orelse return;
         defer diagnostics.deinit();
         try writePublish(output, uri, &diagnostics);
@@ -1780,6 +1809,7 @@ test "LSP definition and references cross a real импорт between two open d
     // main.ps: line 2 (0-indexed) is `мат.сложить(мат.ОТВЕТ, 2)` —
     // "мат." is 4 characters, "сложить" starts at character 4.
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/main.ps\",\"text\":\"импорт \\\"./математика\\\" как мат\\nэкспорт функ старт() -> Число\\nмат.сложить(мат.ОТВЕТ, 2)\\nконец\"}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "выполнение импортов ещё не поддержано Zig-версией") == null);
     // математика.ps: line 1 is `экспорт функ сложить(a: Число, b: Число) -> Число` —
     // "экспорт функ " is 13 characters, "сложить" starts at character 13.
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/математика.ps\",\"text\":\"экспорт конст ОТВЕТ = 40\\nэкспорт функ сложить(a: Число, b: Число) -> Число\\na + b\\nконец\"}}}", &output));

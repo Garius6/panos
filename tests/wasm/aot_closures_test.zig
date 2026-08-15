@@ -480,4 +480,5 @@ test "DOM.на_клик_замыкание reports an unsupported process captur
     );
     try std.testing.expect(diagnostic.reason != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic.reason.?, "захват процесса") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.reason.?, "actor frame в сбрасываемой арене") != null);
 }

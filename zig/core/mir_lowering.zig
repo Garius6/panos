@@ -2594,9 +2594,12 @@ fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types
 //                       plain function box (`env_ptr == 0`) and traps on
 //                       an opaque non-zero env rather than guessing its
 //                       layout and producing a dangling pointer.
-//   `.unsupported`    — `Процесс`, a generic struct whose concrete
-//                       fields are unavailable here, or a recursive type
-//                       graph (cycle preservation needs an identity map).
+//   `.unsupported`    — `Процесс` (its AOT handle is an actor-frame
+//                       pointer allocated in the resettable arena, not a
+//                       permanent scalar ID), a generic struct whose
+//                       concrete fields are unavailable here, or a
+//                       recursive type graph (cycle preservation needs an
+//                       identity map).
 const CaptureKind = enum { scalar, string, structure, array, function_ref, unsupported };
 
 fn classifyCapture(checked: *const type_checker.CheckResult, type_id: types.TypeId) CaptureKind {
@@ -2620,6 +2623,11 @@ fn classifyCaptureDepth(checked: *const type_checker.CheckResult, type_id: types
         .process => .unsupported,
         else => .scalar,
     };
+}
+
+fn isProcessCapture(checked: *const type_checker.CheckResult, type_id: types.TypeId) bool {
+    const entry = checked.types.get(type_id) orelse return false;
+    return entry.* == .process;
 }
 
 pub const invoke_closure_click_trampoline_name = "@invoke_closure_click";
@@ -2952,6 +2960,9 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     for (captures) |capture_symbol| {
         const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
         if (classifyCapture(ctx.checked, capture_type) == .unsupported) {
+            if (isProcessCapture(ctx.checked, capture_type)) {
+                return ctx.unsupported("DOM.на_клик_замыкание(): захват процесса небезопасен — AOT handle указывает на actor frame в сбрасываемой арене, а Phase 1 scheduler не сохраняет актор между DOM-вызовами");
+            }
             return ctx.unsupported("DOM.на_клик_замыкание(): захват процесса, рекурсивного/обобщённого агрегата или иного неподдержанного типа (Stage C ограничение, project_panos_wasm_aot_closures)");
         }
     }

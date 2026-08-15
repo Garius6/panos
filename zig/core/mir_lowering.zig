@@ -97,6 +97,11 @@ const LoweringContext = struct {
     builder: mir_builder.Builder,
     symbol_to_local: std.AutoHashMap(symbols.SymbolId, mir.LocalId),
     symbol_to_function: *const std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
+    // Known only while a local still holds the literal lambda assigned by
+    // `пер f = функ ... конец`. This gives DOM promotion the exact nested
+    // environment layout without changing the runtime closure-box ABI.
+    // Any later assignment invalidates the entry conservatively.
+    closure_origins: std.AutoHashMap(symbols.SymbolId, ast.ExprId),
     diagnostic: *AotDiagnostic,
     loops: std.ArrayList(LoopTargets) = .empty,
     capture_env: ?CaptureEnv = null,
@@ -108,6 +113,7 @@ const LoweringContext = struct {
 
     fn deinit(self: *LoweringContext) void {
         self.loops.deinit(self.allocator);
+        self.closure_origins.deinit();
         self.symbol_to_local.deinit();
         if (self.capture_env) |*env| env.deinit();
         self.* = undefined;
@@ -1062,6 +1068,7 @@ fn lowerFunctionBody(
         .builder = try mir_builder.Builder.beginFunction(module, allocator, function_id),
         .symbol_to_local = .init(allocator),
         .symbol_to_function = symbol_to_function,
+        .closure_origins = .init(allocator),
         .diagnostic = diagnostic,
     };
     defer ctx.deinit();
@@ -1134,6 +1141,10 @@ fn lowerStmt(ctx: *LoweringContext, statement: ast.StmtId) anyerror!FlowResult {
             const local_type = ctx.checked.expression_types.get(let.value) orelse ctx.checked.types.builtins.void;
             const local = try ctx.builder.newLocal(symbol, let.name orelse "", local_type);
             try ctx.symbol_to_local.put(symbol, local);
+            switch (ctx.tree.expr(let.value).*) {
+                .lambda => try ctx.closure_origins.put(symbol, let.value),
+                else => {},
+            }
             try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = outcome.value } });
             return .continues;
         },
@@ -1697,6 +1708,7 @@ fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) a
         .builder = try mir_builder.Builder.beginFunction(ctx.builder.module, ctx.allocator, lambda_function_id),
         .symbol_to_local = .init(ctx.allocator),
         .symbol_to_function = ctx.symbol_to_function,
+        .closure_origins = .init(ctx.allocator),
         .diagnostic = ctx.diagnostic,
     };
     defer inner_ctx.deinit();
@@ -1829,6 +1841,7 @@ fn lowerAssign(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcome {
             const target = ctx.symbol_to_local.get(symbol) orelse return ctx.unsupported("присваивание не-локали (Фаза 3+)");
             const rhs = try lowerExpr(ctx, binary.right);
             if (rhs.flow == .terminates) return terminated;
+            _ = ctx.closure_origins.remove(symbol);
             try ctx.builder.emit(.{ .store_local = .{ .local = target, .src = rhs.value } });
         },
         .property => |property| {
@@ -2572,15 +2585,15 @@ fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types
 //                       boxed closure value at the CALL site at all.
 //                       `lowerLambda`'s env-building step doesn't know
 //                       this either — it captures every symbol the
-//                       resolver listed, unconditionally. Promoted via
-//                       a RUNTIME check (`promoteFunctionRefCapture`):
-//                       a plain function reference's box always has
-//                       `env_ptr == 0` (nothing captured BY it), safe
-//                       to copy as-is; a genuine closure-with-captures
-//                       value (`env_ptr != 0`) traps instead of
-//                       silently producing a dangling pointer — telling
-//                       the two apart statically isn't possible (both
-//                       share the same `.function` type).
+//                       resolver listed, unconditionally. A local whose
+//                       current origin is a literal lambda carries its
+//                       exact resolver capture list in `closure_origins`,
+//                       so its box+env are promoted recursively. For an
+//                       unknown-origin function value, a RUNTIME check
+//                       (`promoteFunctionRefCapture`) still permits a
+//                       plain function box (`env_ptr == 0`) and traps on
+//                       an opaque non-zero env rather than guessing its
+//                       layout and producing a dangling pointer.
 //   `.unsupported`    — `Процесс`, a generic struct whose concrete
 //                       fields are unavailable here, or a recursive type
 //                       graph (cycle preservation needs an identity map).
@@ -2642,7 +2655,7 @@ fn findOrBuildInvokeClosureClickTrampoline(allocator: std.mem.Allocator, module:
 // safe — it carries no pointer at all). `.unsupported` never reaches
 // here — rejected earlier, before any lowering happens, by
 // `lowerDomClickClosure`'s own pre-check.
-fn promoteCaptureValue(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, value_type: types.TypeId, old_value: mir.ValueId) !mir.ValueId {
+fn promoteCaptureValue(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, value_type: types.TypeId, old_value: mir.ValueId, capture_symbol: ?symbols.SymbolId, closure_depth: u8) anyerror!mir.ValueId {
     return switch (classifyCapture(ctx.checked, value_type)) {
         .scalar => old_value,
         .string => blk: {
@@ -2651,9 +2664,18 @@ fn promoteCaptureValue(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, value
             try ctx.builder.emit(.{ .call = .{ .dst = promoted, .callee = promote_id, .args = try wasm_heap.dupeOne(ctx.builder.module, old_value) } });
             break :blk promoted;
         },
-        .structure => try promoteStructToPermanent(ctx, layout, value_type, old_value),
-        .array => try promoteArrayToPermanent(ctx, layout, value_type, old_value),
-        .function_ref => try promoteFunctionRefCapture(ctx, layout, old_value),
+        .structure => try promoteStructToPermanent(ctx, layout, value_type, old_value, closure_depth),
+        .array => try promoteArrayToPermanent(ctx, layout, value_type, old_value, closure_depth),
+        .function_ref => blk: {
+            if (capture_symbol) |symbol| {
+                if (ctx.closure_origins.get(symbol)) |closure_expression| {
+                    if (closure_depth == 64) return ctx.unsupported("слишком глубокая или рекурсивная цепочка захваченных замыканий");
+                    const captures = ctx.resolution.lambda_captures.get(closure_expression) orelse &.{};
+                    break :blk try promoteClosureBoxToPermanent(ctx, layout, old_value, captures, closure_depth + 1);
+                }
+            }
+            break :blk try promoteFunctionRefCapture(ctx, layout, old_value);
+        },
         .unsupported => unreachable,
     };
 }
@@ -2662,16 +2684,13 @@ fn promoteCaptureValue(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, value
 // region — see `CaptureKind.function_ref`'s own doc comment for WHY
 // this case exists at all (the resolver captures every function
 // reference crossing a lambda boundary, even ones the lowering-time
-// direct-call fast path never actually boxes). Only SAFE, in general,
-// when the captured box's `env_ptr` is exactly 0 (a plain named
-// function reference — the overwhelmingly common case, e.g. calling
-// another top-level function from inside a DOM handler) — a non-zero
-// `env_ptr` means the captured value is a genuine closure WITH ITS OWN
-// captures, which would need recursive promotion of THAT environment
-// too (closures-capturing-closures, out of scope here). Can't tell the
-// two apart statically (both share the same `.function` type) — a
-// RUNTIME check decides, trapping with a clear diagnostic instead of
-// silently producing a dangling pointer if it's the unsupported case.
+// direct-call fast path never actually boxes). This is the fallback for
+// an UNKNOWN origin: a plain named function has `env_ptr == 0` and can
+// be copied safely, while a non-zero env has no available slot layout.
+// Known local literal lambdas take the recursive
+// `promoteClosureBoxToPermanent` path in `promoteCaptureValue` instead.
+// The runtime check here traps rather than silently retaining a dangling
+// pointer for an opaque closure from a parameter/field/reassignment.
 fn promoteFunctionRefCapture(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, old_box: mir.ValueId) anyerror!mir.ValueId {
     const module = ctx.builder.module;
     const old_box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_fn_box", layout.ptr_type, old_box);
@@ -2695,7 +2714,7 @@ fn promoteFunctionRefCapture(ctx: *LoweringContext, layout: wasm_heap.PtrLayout,
     ctx.builder.terminate(.{ .branch = .{ .cond = is_plain, .then_block = ok_block, .else_block = trap_block } });
 
     ctx.builder.setCurrentBlock(trap_block);
-    ctx.builder.terminate(.{ .unreachable_term = .{ .reason = "DOM.на_клик_замыкание(): захват замыкания с собственными захватами пока не поддержан (Stage C ограничение)" } });
+    ctx.builder.terminate(.{ .unreachable_term = .{ .reason = "DOM.на_клик_замыкание(): нельзя безопасно продвинуть замыкание неизвестного происхождения с собственным окружением" } });
 
     ctx.builder.setCurrentBlock(ok_block);
     const alloc_permanent_id = try wasm_heap.findOrBuildAllocPermanent(ctx.allocator, module, &ctx.checked.types, layout);
@@ -2721,7 +2740,7 @@ fn promoteFunctionRefCapture(ctx: *LoweringContext, layout: wasm_heap.PtrLayout,
 // recursively promote every field. Same 8-byte-slot `frame_load`/
 // `frame_store` layout `wasm_objects.zig` already established for
 // plain structs (no tag slot — that's a variant-only convention).
-fn promoteStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, struct_type: types.TypeId, old_struct_ptr: mir.ValueId) anyerror!mir.ValueId {
+fn promoteStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, struct_type: types.TypeId, old_struct_ptr: mir.ValueId, closure_depth: u8) anyerror!mir.ValueId {
     const module = ctx.builder.module;
     const type_entry = ctx.checked.types.get(struct_type) orelse return ctx.unsupported("захват структуры неизвестного типа (Stage C)");
     const nominal = switch (type_entry.*) {
@@ -2743,7 +2762,7 @@ fn promoteStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, 
         const old_field_val = try ctx.builder.newValue(field.typ);
         try ctx.builder.emit(.{ .frame_load = .{ .dst = old_field_val, .frame = old_struct_for_load, .slot = @intCast(j) } });
 
-        const promoted_field = try promoteCaptureValue(ctx, layout, field.typ, old_field_val);
+        const promoted_field = try promoteCaptureValue(ctx, layout, field.typ, old_field_val, null, closure_depth);
 
         const new_struct_for_store = try wasm_heap.loadLocal(&ctx.builder, new_struct_local, layout.ptr_type);
         try ctx.builder.emit(.{ .frame_store = .{ .frame = new_struct_for_store, .slot = @intCast(j), .src = promoted_field } });
@@ -2752,7 +2771,7 @@ fn promoteStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, 
     return try wasm_heap.loadLocal(&ctx.builder, new_struct_local, layout.ptr_type);
 }
 
-fn promoteArrayToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, array_type: types.TypeId, old_array_ptr: mir.ValueId) anyerror!mir.ValueId {
+fn promoteArrayToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, array_type: types.TypeId, old_array_ptr: mir.ValueId, closure_depth: u8) anyerror!mir.ValueId {
     const type_entry = ctx.checked.types.get(array_type) orelse return ctx.unsupported("захват массива неизвестного типа (Stage C)");
     const element_type = switch (type_entry.*) {
         .array => |element| element,
@@ -2817,7 +2836,7 @@ fn promoteArrayToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, a
     const old_element_addr = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .add, old_data_for_addr, old_offset_for_addr);
     const old_element = try ctx.builder.newValue(element_type);
     try ctx.builder.emit(.{ .mem_load = .{ .dst = old_element, .addr = old_element_addr } });
-    const promoted_element = try promoteCaptureValue(ctx, layout, element_type, old_element);
+    const promoted_element = try promoteCaptureValue(ctx, layout, element_type, old_element, null, closure_depth);
     const promoted_element_local = try wasm_heap.storeLocal(&ctx.builder, "@click_promoted_array_element", element_type, promoted_element);
 
     const index_for_new_offset = try wasm_heap.loadLocal(&ctx.builder, index_local, layout.idx_type);
@@ -2854,7 +2873,7 @@ fn promoteArrayToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, a
 // (which would otherwise dangle after the next arena reset — the exact
 // bug this whole function exists to avoid, one level up the pointer
 // chain from `на_клик_контекст`'s own context-string promotion).
-fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, box_value: mir.ValueId, captures: []const symbols.SymbolId) !mir.ValueId {
+fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, box_value: mir.ValueId, captures: []const symbols.SymbolId, closure_depth: u8) anyerror!mir.ValueId {
     const module = ctx.builder.module;
     const box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_box", layout.ptr_type, box_value);
 
@@ -2888,7 +2907,7 @@ fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayo
             const old_slot_val = try ctx.builder.newValue(capture_type);
             try ctx.builder.emit(.{ .frame_load = .{ .dst = old_slot_val, .frame = old_env_for_load, .slot = @intCast(i) } });
 
-            const promoted_val = try promoteCaptureValue(ctx, layout, capture_type, old_slot_val);
+            const promoted_val = try promoteCaptureValue(ctx, layout, capture_type, old_slot_val, capture_symbol, closure_depth);
 
             const new_env_for_store = try wasm_heap.loadLocal(&ctx.builder, new_env_local, layout.ptr_type);
             try ctx.builder.emit(.{ .frame_store = .{ .frame = new_env_for_store, .slot = @intCast(i), .src = promoted_val } });
@@ -2956,7 +2975,7 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     if (handler_outcome.flow == .terminates) return terminated;
 
     _ = try findOrBuildInvokeClosureClickTrampoline(ctx.allocator, ctx.builder.module, &ctx.checked.types, layout);
-    const promoted_box = try promoteClosureBoxToPermanent(ctx, layout, handler_outcome.value, captures);
+    const promoted_box = try promoteClosureBoxToPermanent(ctx, layout, handler_outcome.value, captures, 0);
     const promoted_box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_promoted_box", layout.ptr_type, promoted_box);
 
     const selector_for_call = try wasm_heap.loadLocal(&ctx.builder, selector_local, ctx.checked.types.builtins.string);

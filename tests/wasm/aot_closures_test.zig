@@ -304,6 +304,57 @@ test "DOM.на_клик_замыкание compiles and registers the fixed invo
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_@invoke_closure_click") != null);
 }
 
+test "DOM.на_клик_замыкание promotes a captured local closure and its environment" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\импорт DOM
+        \\
+        \\функ старт() -> Пусто
+        \\    пер основа: Число = 41.0
+        \\    пер вычислить = функ() -> Число основа + 1.0 конец
+        \\    DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\        DOM.установить_текст("#результат", вычислить())
+        \\    конец)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_closure_captures_closure.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const script =
+        \\const fs = require("fs");
+        \\(async () => {
+        \\  let handler = 0;
+        \\  let observed = 0;
+        \\  const bytes = fs.readFileSync(process.argv[1]);
+        \\  const imports = { env: {
+        \\    dom_on_click_closure: (_selector, box) => { handler = box; },
+        \\    dom_set_text_num: (_selector, value) => { observed = value; },
+        \\  } };
+        \\  const { instance } = await WebAssembly.instantiate(bytes, imports);
+        \\  instance.exports["старт"]();
+        \\  instance.exports["@invoke_closure_click"](handler);
+        \\  if (observed !== 42) throw new Error(`expected 42, got ${observed}`);
+        \\  process.stdout.write(String(observed));
+        \\})().catch((error) => { console.error(error); process.exit(1); });
+    ;
+    const result = try std.process.run(allocator, io.io(), .{
+        .argv = &.{ "node", "-e", script, wasm_path },
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("42", result.stdout);
+}
+
 test "DOM.на_клик_замыкание capturing a Строка directly promotes it via @promote_to_permanent (Stage C)" {
     const allocator = std.testing.allocator;
 

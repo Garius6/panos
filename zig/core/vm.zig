@@ -130,6 +130,7 @@ const HttpRequestResult = struct {
 
 const AsyncPayload = union(enum) {
     file_read: struct { content: ?[]u8, err_message: ?[]u8 },
+    gzip_decompress: struct { content: ?[]u8, err_message: ?[]u8 },
     file_write: struct { bytes_written: usize, err_message: ?[]u8 },
     net_connect: struct { stream: ?std.Io.net.Stream, err_message: ?[]u8 },
     http_request: struct { result: ?HttpRequestResult, err_message: ?[]u8 },
@@ -168,6 +169,10 @@ const AsyncCompletion = struct {
 fn freeAsyncPayload(payload: AsyncPayload) void {
     switch (payload) {
         .file_read => |data| {
+            if (data.content) |bytes| std.heap.page_allocator.free(bytes);
+            if (data.err_message) |message| std.heap.page_allocator.free(message);
+        },
+        .gzip_decompress => |data| {
             if (data.content) |bytes| std.heap.page_allocator.free(bytes);
             if (data.err_message) |message| std.heap.page_allocator.free(message);
         },
@@ -383,6 +388,40 @@ fn submitFileRead(vm: *Vm, path: []const u8, target_id: u64) void {
         }
     };
     const thread = std.Thread.spawn(.{}, Job.run, .{Job{ .queue = &vm.async_queue, .target_id = target_id, .path = owned_path }}) catch @panic("не удалось запустить фоновый поток фс.прочитать");
+    thread.detach();
+}
+
+fn submitGzipDecompress(vm: *Vm, data: []const u8, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const owned_data = std.heap.page_allocator.dupe(u8, data) catch @panic("OOM: данные для async сжатие.разжать_gzip");
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        data: []u8,
+
+        fn run(job: @This()) void {
+            var input: std.Io.Reader = .fixed(job.data);
+            var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &.{});
+            var allocating: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+            defer allocating.deinit();
+            const payload: AsyncPayload = blk: {
+                _ = decompress.reader.streamRemaining(&allocating.writer) catch {
+                    const message = decompress.err orelse error.ReadFailed;
+                    break :blk .{ .gzip_decompress = .{
+                        .content = null,
+                        .err_message = std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{@errorName(message)}) catch @panic("OOM"),
+                    } };
+                };
+                break :blk .{ .gzip_decompress = .{
+                    .content = allocating.toOwnedSlice() catch @panic("OOM: результат async сжатие.разжать_gzip"),
+                    .err_message = null,
+                } };
+            };
+            std.heap.page_allocator.free(job.data);
+            job.queue.push(.{ .target_id = job.target_id, .payload = payload });
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{ .queue = &vm.async_queue, .target_id = target_id, .data = owned_data }}) catch @panic("не удалось запустить фоновый поток сжатие.разжать_gzip");
     thread.detach();
 }
 
@@ -1636,7 +1675,7 @@ pub const Vm = struct {
             .str_is_digit => try self.strIsDigit(),
             .int_cast => try self.intCast(),
             .to_display_string => try self.toDisplayString(),
-            .gzip_decompress => try self.gzipDecompress(),
+            .gzip_decompress_submit => try self.gzipDecompressSubmit(),
             .syntax_structs => try self.syntaxStructs(),
             .syntax_fields => try self.syntaxFields(),
             .syntax_imports => try self.syntaxImports(),
@@ -3082,7 +3121,7 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .heap_string = result });
     }
 
-    fn gzipDecompress(self: *Vm) anyerror!void {
+    fn gzipDecompressSubmit(self: *Vm) anyerror!void {
         target_policy.ensureRuntimeBuiltinAvailable("сжатие::разжать_gzip", self.target_profile) catch {
             const message = try target_policy.runtimeErrorMessage(self.allocator, "сжатие::разжать_gzip", self.target_profile);
             defer self.allocator.free(message);
@@ -3093,22 +3132,15 @@ pub const Vm = struct {
             try self.fault("Runtime Error: сжатие.разжать_gzip() ожидает Строку", .{});
             return;
         };
-        // Pure in-memory codec (no OS/threading dependency at all, unlike
-        // фс.*/ос.*) — no `std.Io.Threaded`/comptime-freestanding branch
-        // needed; `target_policy` above is the only gate, matching Odin's
-        // restriction (see `builtin_availability.odin`), not a real Zig
-        // compilation limitation.
-        var input: std.Io.Reader = .fixed(data);
-        var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &.{});
-        var allocating: std.Io.Writer.Allocating = .init(self.allocator);
-        defer allocating.deinit();
-        _ = decompress.reader.streamRemaining(&allocating.writer) catch {
-            const message = decompress.err orelse error.ReadFailed;
-            try self.pushErrorResultForModule("сжатие", @errorName(message));
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: сжатие.разжать_gzip() вызвано вне процесса", .{});
             return;
         };
-        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, allocating.written()));
-        try self.pushSuccessResult(.{ .heap_string = heap_string });
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'сжатие::разжать_gzip' недоступно в этом runtime-таргете", .{});
+        } else {
+            submitGzipDecompress(self, data, process.id);
+        }
     }
 
     // `Результат.Успех(payload)` — matches the tagged-aggregate shape every
@@ -5706,6 +5738,11 @@ pub const Vm = struct {
         switch (payload) {
             .file_read => |data| {
                 if (data.err_message) |message| return self.buildErrorResultValue("фс", message);
+                const heap_string = try self.heap.createString(try self.allocator.dupe(u8, data.content.?));
+                return self.buildSuccessResultValue(.{ .heap_string = heap_string });
+            },
+            .gzip_decompress => |data| {
+                if (data.err_message) |message| return self.buildErrorResultValue("сжатие", message);
                 const heap_string = try self.heap.createString(try self.allocator.dupe(u8, data.content.?));
                 return self.buildSuccessResultValue(.{ .heap_string = heap_string });
             },

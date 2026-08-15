@@ -3664,9 +3664,10 @@ const Checker = struct {
             // no shared union-type-argument machinery, and reusing the
             // same name would need one; a new name is additive and keeps
             // `на_клик`'s existing contract/callers untouched. Only a
-            // STRUCTURAL "is this a function-typed value" check — a
-            // real signature match (zero params, void return) is not
-            // enforced yet, see `project_panos_wasm_aot_closures`.
+            // The runtime trampoline invokes the handler with no
+            // arguments and expects no result, so accepting any other
+            // function shape here would compile successfully and then
+            // produce an invalid `call_indirect` signature in WASM.
             if (self.isBuiltinModule(symbol, "DOM", "на_клик_замыкание")) {
                 if (call.arguments.len != 2) {
                     try self.report(call.span, "Type Error: DOM.на_клик_замыкание() ожидает 2 аргумента", .{});
@@ -3676,10 +3677,9 @@ const Checker = struct {
                 if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
                     try self.report(call.span, "Type Error: DOM.на_клик_замыкание() ожидает CSS-селектор типа Строка первым аргументом", .{});
                 }
-                const handler_type = try self.infer(call.arguments[1]);
-                const handler_entry = self.result.types.get(handler_type);
-                const is_function = handler_entry != null and handler_entry.?.* == .function;
-                if (!is_function) {
+                const expected_handler = try self.result.types.function(&.{}, self.result.types.builtins.void);
+                const handler_type = try self.inferExpected(call.arguments[1], expected_handler);
+                if (!self.assignable(handler_type, expected_handler)) {
                     try self.report(call.span, "Type Error: DOM.на_клик_замыкание() ожидает замыкание (функ() -> Пусто) вторым аргументом", .{});
                 }
                 return self.result.types.builtins.void;
@@ -6285,6 +6285,36 @@ test "type checker infers lambda parameters from a function annotation" {
     defer checked.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "type checker requires an exact DOM click closure signature" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "импорт DOM\n" ++
+            "функ с_аргументом(x: Число) -> Пусто\n" ++
+            "конец\n" ++
+            "функ с_результатом() -> Число\n" ++
+            "1.0\n" ++
+            "конец\n" ++
+            "функ старт() -> Пусто\n" ++
+            "DOM.на_клик_замыкание(\"#a\", с_аргументом)\n" ++
+            "DOM.на_клик_замыкание(\"#b\", с_результатом)\n" ++
+            "конец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try checkWithImportsForTarget(std.testing.allocator, &parsed.ast, &resolved, &.{}, .aot_js_wasm);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: DOM.на_клик_замыкание() ожидает замыкание (функ() -> Пусто) вторым аргументом", checked.diagnostics.items.items[0].message);
+    try std.testing.expectEqualStrings("Type Error: DOM.на_клик_замыкание() ожидает замыкание (функ() -> Пусто) вторым аргументом", checked.diagnostics.items.items[1].message);
 }
 
 test "type checker preserves nominal user types in function signatures" {

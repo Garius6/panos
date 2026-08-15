@@ -982,7 +982,8 @@ const FunctionCompiler = struct {
         if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "сжатие")) return false;
         if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "разжать_gzip")) {
             try self.compileExpression(call.arguments[0]);
-            try self.function.emit(self.compiler.result.allocator, .{ .gzip_decompress = {} });
+            try self.function.emit(self.compiler.result.allocator, .{ .gzip_decompress_submit = {} });
+            try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
             return true;
         }
         return false;

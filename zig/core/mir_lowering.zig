@@ -14,7 +14,6 @@ const wasm_heap = @import("wasm_heap.zig");
 // `wasm_heap.zig` already established for compiler-synthesized locals.
 const dummy_symbol: symbols.SymbolId = @enumFromInt(0);
 
-
 // AST (post resolve+typecheck) → MIR. Ported from `core/mir_lowering.odin`
 // (~2000 lines there) — works at the SAME pipeline point `compiler.zig`
 // already does: reads the already-computed resolver/type-checker side
@@ -1628,24 +1627,14 @@ fn lambdaReturnType(checked: *const type_checker.CheckResult, expression: ast.Ex
 // `.build_closure`/`compileLambda` semantics exactly, `compiler.zig`) —
 // each captured symbol is read via the OUTER `ctx`'s ordinary
 // `lowerSymbolValueRef` (so a capture can itself be a parameter, a
-// local, or — recursively — another OUTER capture, as long as that
-// outer scope isn't ITSELF a lambda body, see the nesting restriction
-// below) and stored into a fresh environment allocation; the lambda
+// local, or — recursively — another OUTER capture) and stored into a
+// fresh environment allocation; the resolver propagates a grandparent
+// capture into every intervening lambda, so each environment stays flat
+// and no runtime parent pointer is needed. The lambda
 // BODY is lowered as a genuinely separate MIR function whose captured-
 // symbol lookups are redirected through `CaptureEnv` instead of
 // `symbol_to_local`.
-//
-// Explicit scoping restriction for this stage: NON-NESTED lambdas only.
-// A lambda body containing another `.lambda` that itself needs to reach
-// the OUTER lambda's own captures (not just the outer ORDINARY
-// function's locals) would need the inner closure's environment to
-// chain through the outer one — real, deferred gap, not silently wrong
-// codegen: `ctx.capture_env != null` at lowering time means we are
-// ALREADY inside a lambda body, so hitting a nested `.lambda` here
-// reports a clear diagnostic instead of miscompiling.
 fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) anyerror!ExprOutcome {
-    if (ctx.capture_env != null) return unsupported("вложенные замыкания (Stage A поддерживает только один уровень)");
-
     const captures = ctx.resolution.lambda_captures.get(expression) orelse &.{};
     if (captures.len > std.math.maxInt(u16)) return unsupported("лямбда захватывает слишком много значений");
 
@@ -2527,15 +2516,10 @@ fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types
 //                       pointer-chasing needed at all.
 //   `.string`        — Строка: promote via the existing
 //                       `wasm_heap.findOrBuildPromoteToPermanent`.
-//   `.struct_simple`  — a nominal struct whose OWN fields are ALL
-//                       `.scalar`/`.string` (one level only — a field
-//                       that's itself a struct/array is `.unsupported`
-//                       for now, a real deferred gap, not silently
-//                       wrong: nested promotion would need genuine
-//                       recursion through THIS SAME classification,
-//                       which the current one-level implementation in
-//                       `promoteSimpleStructToPermanent` doesn't do
-//                       yet).
+//   `.structure`      — a nominal struct whose complete field graph can
+//                       be promoted recursively.
+//   `.array`          — an array whose element graph can be promoted
+//                       recursively with a runtime loop.
 //   `.function_ref`   — a `.function`-typed capture. Real, common case
 //                       found only by RUNNING this, not by reading the
 //                       type system: `symbols.zig`'s `lookupTrackingCaptures`
@@ -2558,28 +2542,30 @@ fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types
 //                       silently producing a dangling pointer — telling
 //                       the two apart statically isn't possible (both
 //                       share the same `.function` type).
-//   `.unsupported`    — Массив (needs a RUNTIME loop over a dynamic
-//                       element count — not a compile-time-unrolled
-//                       shape like a struct's fixed field list, real
-//                       deferred gap), `Процесс` (actors+closures
-//                       interaction unexplored), or a struct with a
-//                       non-simple field.
-const CaptureKind = enum { scalar, string, struct_simple, function_ref, unsupported };
+//   `.unsupported`    — `Процесс`, a generic struct whose concrete
+//                       fields are unavailable here, or a recursive type
+//                       graph (cycle preservation needs an identity map).
+const CaptureKind = enum { scalar, string, structure, array, function_ref, unsupported };
 
 fn classifyCapture(checked: *const type_checker.CheckResult, type_id: types.TypeId) CaptureKind {
+    return classifyCaptureDepth(checked, type_id, 0);
+}
+
+fn classifyCaptureDepth(checked: *const type_checker.CheckResult, type_id: types.TypeId, depth: u8) CaptureKind {
+    if (depth == 64) return .unsupported;
     if (checked.types.eql(type_id, checked.types.builtins.string)) return .string;
     const entry = checked.types.get(type_id) orelse return .scalar;
     return switch (entry.*) {
         .nominal => |nominal| blk: {
             const fields = checked.nominal_fields.get(nominal.symbol) orelse break :blk .unsupported;
             for (fields) |field| {
-                const field_kind = classifyCapture(checked, field.typ);
-                if (field_kind != .scalar and field_kind != .string) break :blk .unsupported;
+                if (classifyCaptureDepth(checked, field.typ, depth + 1) == .unsupported) break :blk .unsupported;
             }
-            break :blk .struct_simple;
+            break :blk .structure;
         },
         .function => .function_ref,
-        .array, .process => .unsupported,
+        .array => |element| if (classifyCaptureDepth(checked, element, depth + 1) == .unsupported) .unsupported else .array,
+        .process => .unsupported,
         else => .scalar,
     };
 }
@@ -2612,7 +2598,7 @@ fn findOrBuildInvokeClosureClickTrampoline(allocator: std.mem.Allocator, module:
 // Promotes ONE already-loaded value (`old_value`, typed `value_type`)
 // into the permanent region, per `classifyCapture`'s classification —
 // the shared leaf operation both `promoteClosureBoxToPermanent` (env
-// slots) and `promoteSimpleStructToPermanent` (struct fields) reduce
+// slots) and recursive aggregate promotion reduce
 // to. `.scalar` is a no-op (the raw value IS already permanent-region-
 // safe — it carries no pointer at all). `.unsupported` never reaches
 // here — rejected earlier, before any lowering happens, by
@@ -2626,7 +2612,8 @@ fn promoteCaptureValue(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, value
             try ctx.builder.emit(.{ .call = .{ .dst = promoted, .callee = promote_id, .args = try wasm_heap.dupeOne(ctx.builder.module, old_value) } });
             break :blk promoted;
         },
-        .struct_simple => try promoteSimpleStructToPermanent(ctx, layout, value_type, old_value),
+        .structure => try promoteStructToPermanent(ctx, layout, value_type, old_value),
+        .array => try promoteArrayToPermanent(ctx, layout, value_type, old_value),
         .function_ref => try promoteFunctionRefCapture(ctx, layout, old_value),
         .unsupported => unreachable,
     };
@@ -2691,13 +2678,11 @@ fn promoteFunctionRefCapture(ctx: *LoweringContext, layout: wasm_heap.PtrLayout,
     return try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
 }
 
-// A "simple" struct (per `classifyCapture` — every field is
-// `.scalar`/`.string`, exactly one level, no further nesting):
-// allocate a same-field-count copy in the permanent region, promote or
-// raw-copy each field individually. Same 8-byte-slot `frame_load`/
+// Allocate a same-field-count struct copy in the permanent region and
+// recursively promote every field. Same 8-byte-slot `frame_load`/
 // `frame_store` layout `wasm_objects.zig` already established for
 // plain structs (no tag slot — that's a variant-only convention).
-fn promoteSimpleStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, struct_type: types.TypeId, old_struct_ptr: mir.ValueId) anyerror!mir.ValueId {
+fn promoteStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, struct_type: types.TypeId, old_struct_ptr: mir.ValueId) anyerror!mir.ValueId {
     const module = ctx.builder.module;
     const type_entry = ctx.checked.types.get(struct_type) orelse return unsupported("захват структуры неизвестного типа (Stage C)");
     const nominal = switch (type_entry.*) {
@@ -2728,6 +2713,96 @@ fn promoteSimpleStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLa
     return try wasm_heap.loadLocal(&ctx.builder, new_struct_local, layout.ptr_type);
 }
 
+fn promoteArrayToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, array_type: types.TypeId, old_array_ptr: mir.ValueId) anyerror!mir.ValueId {
+    const type_entry = ctx.checked.types.get(array_type) orelse return unsupported("захват массива неизвестного типа (Stage C)");
+    const element_type = switch (type_entry.*) {
+        .array => |element| element,
+        else => return unsupported("захват не-массива как массива (Stage C)"),
+    };
+    const module = ctx.builder.module;
+    const old_array_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_array", layout.ptr_type, old_array_ptr);
+
+    const old_for_length = try wasm_heap.loadLocal(&ctx.builder, old_array_local, layout.ptr_type);
+    const length = try ctx.builder.newValue(layout.idx_type);
+    try ctx.builder.emit(.{ .frame_load = .{ .dst = length, .frame = old_for_length, .slot = 0 } });
+    const length_local = try wasm_heap.storeLocal(&ctx.builder, "@click_array_length", layout.idx_type, length);
+
+    const old_for_data = try wasm_heap.loadLocal(&ctx.builder, old_array_local, layout.ptr_type);
+    const old_data = try ctx.builder.newValue(layout.ptr_type);
+    try ctx.builder.emit(.{ .frame_load = .{ .dst = old_data, .frame = old_for_data, .slot = 2 } });
+    const old_data_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_array_data", layout.ptr_type, old_data);
+
+    const alloc_permanent_id = try wasm_heap.findOrBuildAllocPermanent(ctx.allocator, module, &ctx.checked.types, layout);
+    const header_size = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 3 * 8);
+    const new_header = try ctx.builder.newValue(layout.ptr_type);
+    try ctx.builder.emit(.{ .call = .{ .dst = new_header, .callee = alloc_permanent_id, .args = try wasm_heap.dupeOne(module, header_size) } });
+    const new_header_local = try wasm_heap.storeLocal(&ctx.builder, "@click_new_array", layout.ptr_type, new_header);
+
+    const length_for_size = try wasm_heap.loadLocal(&ctx.builder, length_local, layout.idx_type);
+    const eight_for_size = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 8);
+    const data_size = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .multiply, length_for_size, eight_for_size);
+    const new_data = try ctx.builder.newValue(layout.ptr_type);
+    try ctx.builder.emit(.{ .call = .{ .dst = new_data, .callee = alloc_permanent_id, .args = try wasm_heap.dupeOne(module, data_size) } });
+    const new_data_local = try wasm_heap.storeLocal(&ctx.builder, "@click_new_array_data", layout.ptr_type, new_data);
+
+    inline for (.{ @as(u32, 0), @as(u32, 1) }) |slot| {
+        const header_value = try wasm_heap.loadLocal(&ctx.builder, length_local, layout.idx_type);
+        const header = try wasm_heap.loadLocal(&ctx.builder, new_header_local, layout.ptr_type);
+        try ctx.builder.emit(.{ .frame_store = .{ .frame = header, .slot = slot, .src = header_value } });
+    }
+    const data_pointer = try wasm_heap.loadLocal(&ctx.builder, new_data_local, layout.ptr_type);
+    const header_for_data = try wasm_heap.loadLocal(&ctx.builder, new_header_local, layout.ptr_type);
+    try ctx.builder.emit(.{ .frame_store = .{ .frame = header_for_data, .slot = 2, .src = data_pointer } });
+
+    const index_local = try ctx.builder.newLocal(dummy_symbol, "@click_array_index", layout.idx_type);
+    const zero = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 0);
+    try ctx.builder.emit(.{ .store_local = .{ .local = index_local, .src = zero } });
+
+    const loop_header = try ctx.builder.newBlock();
+    ctx.builder.terminate(.{ .jump = .{ .target = loop_header } });
+    ctx.builder.setCurrentBlock(loop_header);
+    const index_for_cmp = try wasm_heap.loadLocal(&ctx.builder, index_local, layout.idx_type);
+    const length_for_cmp = try wasm_heap.loadLocal(&ctx.builder, length_local, layout.idx_type);
+    const keep_going = try wasm_heap.cmpOp(&ctx.builder, layout.bool_type, .less, index_for_cmp, length_for_cmp);
+    const loop_body = try ctx.builder.newBlock();
+    const loop_exit = try ctx.builder.newBlock();
+    ctx.builder.terminate(.{ .branch = .{ .cond = keep_going, .then_block = loop_body, .else_block = loop_exit } });
+
+    ctx.builder.setCurrentBlock(loop_body);
+    const index_for_old_offset = try wasm_heap.loadLocal(&ctx.builder, index_local, layout.idx_type);
+    const eight_for_old_offset = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 8);
+    const old_offset = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .multiply, index_for_old_offset, eight_for_old_offset);
+    const old_offset_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_array_offset", layout.idx_type, old_offset);
+    const old_data_for_addr = try wasm_heap.loadLocal(&ctx.builder, old_data_local, layout.ptr_type);
+    const old_offset_for_addr = try wasm_heap.loadLocal(&ctx.builder, old_offset_local, layout.idx_type);
+    const old_element_addr = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .add, old_data_for_addr, old_offset_for_addr);
+    const old_element = try ctx.builder.newValue(element_type);
+    try ctx.builder.emit(.{ .mem_load = .{ .dst = old_element, .addr = old_element_addr } });
+    const promoted_element = try promoteCaptureValue(ctx, layout, element_type, old_element);
+    const promoted_element_local = try wasm_heap.storeLocal(&ctx.builder, "@click_promoted_array_element", element_type, promoted_element);
+
+    const index_for_new_offset = try wasm_heap.loadLocal(&ctx.builder, index_local, layout.idx_type);
+    const eight_for_new_offset = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 8);
+    const new_offset = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .multiply, index_for_new_offset, eight_for_new_offset);
+    const new_offset_local = try wasm_heap.storeLocal(&ctx.builder, "@click_new_array_offset", layout.idx_type, new_offset);
+    const new_data_for_addr = try wasm_heap.loadLocal(&ctx.builder, new_data_local, layout.ptr_type);
+    const new_offset_for_addr = try wasm_heap.loadLocal(&ctx.builder, new_offset_local, layout.idx_type);
+    const new_element_addr = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .add, new_data_for_addr, new_offset_for_addr);
+    const new_element_addr_local = try wasm_heap.storeLocal(&ctx.builder, "@click_new_array_element_addr", layout.ptr_type, new_element_addr);
+    const promoted_element_for_store = try wasm_heap.loadLocal(&ctx.builder, promoted_element_local, element_type);
+    const new_element_addr_for_store = try wasm_heap.loadLocal(&ctx.builder, new_element_addr_local, layout.ptr_type);
+    try ctx.builder.emit(.{ .mem_store = .{ .addr = new_element_addr_for_store, .src = promoted_element_for_store } });
+
+    const index_for_next = try wasm_heap.loadLocal(&ctx.builder, index_local, layout.idx_type);
+    const one = try wasm_heap.addressConst(&ctx.builder, layout.idx_type, 1);
+    const next_index = try wasm_heap.binOp(&ctx.builder, layout.idx_type, .add, index_for_next, one);
+    try ctx.builder.emit(.{ .store_local = .{ .local = index_local, .src = next_index } });
+    ctx.builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    ctx.builder.setCurrentBlock(loop_exit);
+    return wasm_heap.loadLocal(&ctx.builder, new_header_local, layout.ptr_type);
+}
+
 // Rebuilds a `.build_closure`-produced box (table_index + env_ptr,
 // currently in the ordinary RESETTABLE arena) directly in the
 // PERMANENT region — needed even for SCALAR-only captures (Stage B):
@@ -2735,7 +2810,7 @@ fn promoteSimpleStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLa
 // raw across a separate later export call (the click), regardless of
 // what's inside them. Stage C extends this from a flat byte copy (only
 // correct when every slot is scalar) to a per-slot, TYPE-DIRECTED copy
-// — a `Строка`/simple-struct slot gets its OWN pointed-to data promoted
+// — a `Строка`/aggregate slot gets its OWN pointed-to data promoted
 // too (`promoteCaptureValue`), not just its raw pointer bit-pattern
 // (which would otherwise dangle after the next arena reset — the exact
 // bug this whole function exists to avoid, one level up the pointer
@@ -2819,7 +2894,7 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     for (captures) |capture_symbol| {
         const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
         if (classifyCapture(ctx.checked, capture_type) == .unsupported) {
-            return unsupported("DOM.на_клик_замыкание(): захват массива/процесса/замыкания/структуры со вложенным указателем пока не поддержан (Stage C ограничение, project_panos_wasm_aot_closures)");
+            return unsupported("DOM.на_клик_замыкание(): захват процесса, рекурсивного/обобщённого агрегата или иного неподдержанного типа (Stage C ограничение, project_panos_wasm_aot_closures)");
         }
     }
 
@@ -2829,31 +2904,15 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
         .bool_type = ctx.checked.types.builtins.boolean,
     };
 
-    // Lowered in a DELIBERATELY non-source order: the handler/promotion
-    // side first (which can open a WASM `if/else` block internally —
-    // `promoteFunctionRefCapture`'s runtime env_ptr check, for a
-    // captured plain-function reference), its result stashed in a
-    // Local IMMEDIATELY; `selector` — always a trivial, non-branching
-    // expression in practice (Stage B/C already require the handler to
-    // be a literal lambda; a `DOM.на_клик_замыкание` call's selector is
-    // realistically always a string literal) — computed LAST, right
-    // before the call, so it never needs to survive anything.
-    //
-    // Real bug found via wasmtime, took several attempts to pin down:
-    // a bare, un-Local-routed value computed BEFORE
-    // `promoteClosureBoxToPermanent` does NOT reliably survive its
-    // internal branch — but neither does naively wrapping it in a
-    // Local and reloading it in EITHER position relative to
-    // `promoteClosureBoxToPermanent`'s own call (both orderings tried,
-    // both corrupted `promoted_box`'s own construction instead —
-    // `call_builtin`'s codegen assumes args are pushed in ARRAY order
-    // with NOTHING else interleaved, and squeezing an extra Local
-    // reload of a value computed EARLIER into the middle of
-    // `promoteClosureBoxToPermanent`'s own instruction stream broke
-    // that invariant even when semantically "correct"). Restructuring
-    // so NEITHER value's own danger window (branching, or being
-    // computed early and reloaded late) overlaps the OTHER's
-    // construction sidesteps the whole problem instead of fighting it.
+    // Preserve source-order evaluation: selector first, handler second.
+    // Both results cross promotion's possible `if/else`, so keep them in
+    // real MIR locals and reload them contiguously immediately before the
+    // builtin call. A bare ValueId is a one-use stack value and cannot
+    // safely survive that branch.
+    const selector_outcome = try lowerExpr(ctx, call.arguments[0]);
+    if (selector_outcome.flow == .terminates) return terminated;
+    const selector_local = try wasm_heap.storeLocal(&ctx.builder, "@click_selector", ctx.checked.types.builtins.string, selector_outcome.value);
+
     const handler_outcome = try lowerExpr(ctx, handler_expr);
     if (handler_outcome.flow == .terminates) return terminated;
 
@@ -2861,13 +2920,12 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     const promoted_box = try promoteClosureBoxToPermanent(ctx, layout, handler_outcome.value, captures);
     const promoted_box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_promoted_box", layout.ptr_type, promoted_box);
 
-    const selector = try lowerExpr(ctx, call.arguments[0]);
-    if (selector.flow == .terminates) return terminated;
+    const selector_for_call = try wasm_heap.loadLocal(&ctx.builder, selector_local, ctx.checked.types.builtins.string);
     const promoted_box_for_call = try wasm_heap.loadLocal(&ctx.builder, promoted_box_local, layout.ptr_type);
 
     const arena = ctx.builder.module.arena.allocator();
     var args: std.ArrayList(mir.ValueId) = .empty;
-    try args.append(arena, selector.value);
+    try args.append(arena, selector_for_call);
     try args.append(arena, promoted_box_for_call);
     try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = "DOM::на_клик_замыкание", .args = try args.toOwnedSlice(arena) } });
     return continuesWith(mir.invalid_value);
@@ -3134,4 +3192,56 @@ test "lowerModule lowers an accumulator пока loop with assignment, back-edge
     const body = function.blockConst(@enumFromInt(2));
     try std.testing.expect(body.terminator == .jump);
     try std.testing.expectEqual(@as(mir.BlockId, @enumFromInt(1)), body.terminator.jump.target);
+}
+
+test "DOM click closure lowers selector before handler construction" {
+    const allocator = std.testing.allocator;
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const type_checker_mod = @import("type_checker.zig");
+    const source_text =
+        \\импорт DOM
+        \\функ селектор() -> Строка
+        \\    "#кнопка"
+        \\конец
+        \\функ обработать(id: Число) -> Пусто
+        \\конец
+        \\функ старт() -> Пусто
+        \\    пер id: Число = 1.0
+        \\    DOM.на_клик_замыкание(селектор(), функ() -> Пусто
+        \\        обработать(id)
+        \\    конец)
+        \\конец
+    ;
+    var lexed = try lexer.tokenize(allocator, source_text, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics.items.items.len);
+    var resolved = try resolver.resolve(allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try type_checker_mod.checkWithImportsForTarget(allocator, &parsed.ast, &resolved, &.{}, .aot_js_wasm);
+    defer checked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+
+    var module = try lowerModule(allocator, &parsed.ast, &resolved, &checked);
+    defer module.deinit(allocator);
+    const selector_id = wasm_heap.findFunctionByName(&module, "селектор") orelse return error.TestExpectedEqual;
+    const start_id = wasm_heap.findFunctionByName(&module, "старт") orelse return error.TestExpectedEqual;
+    const entry = module.functions.items[@intFromEnum(start_id)].blockConst(@enumFromInt(0));
+
+    var selector_evaluation_index: ?usize = null;
+    var closure_index: ?usize = null;
+    for (entry.instructions.items, 0..) |instruction, index| {
+        switch (instruction) {
+            .function_ref => |function_ref| if (function_ref.function == selector_id) {
+                selector_evaluation_index = index;
+            },
+            .build_closure => closure_index = index,
+            else => {},
+        }
+    }
+    try std.testing.expect(selector_evaluation_index != null);
+    try std.testing.expect(closure_index != null);
+    try std.testing.expect(selector_evaluation_index.? < closure_index.?);
 }

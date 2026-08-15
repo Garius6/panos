@@ -895,6 +895,88 @@ test "runner reports a Result failure for invalid gzip input" {
     }
 }
 
+fn makeStoredGzip(allocator: std.mem.Allocator, plain_len: usize) ![]u8 {
+    const plain = try allocator.alloc(u8, plain_len);
+    defer allocator.free(plain);
+    @memset(plain, 0);
+
+    const block_count = (plain_len + 65534) / 65535;
+    const result = try allocator.alloc(u8, 10 + block_count * 5 + plain_len + 8);
+    errdefer allocator.free(result);
+    @memcpy(result[0..10], &[_]u8{ 0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03 });
+
+    var source_offset: usize = 0;
+    var output_offset: usize = 10;
+    while (source_offset < plain.len) {
+        const block_len = @min(plain.len - source_offset, 65535);
+        result[output_offset] = if (source_offset + block_len == plain.len) 1 else 0;
+        output_offset += 1;
+        var len_bytes: [2]u8 = undefined;
+        var inverse_len_bytes: [2]u8 = undefined;
+        const len: u16 = @intCast(block_len);
+        std.mem.writeInt(u16, &len_bytes, len, .little);
+        std.mem.writeInt(u16, &inverse_len_bytes, ~len, .little);
+        @memcpy(result[output_offset .. output_offset + 2], &len_bytes);
+        @memcpy(result[output_offset + 2 .. output_offset + 4], &inverse_len_bytes);
+        output_offset += 4;
+        @memcpy(result[output_offset .. output_offset + block_len], plain[source_offset .. source_offset + block_len]);
+        output_offset += block_len;
+        source_offset += block_len;
+    }
+
+    var crc = std.hash.Crc32.init();
+    crc.update(plain);
+    var crc_bytes: [4]u8 = undefined;
+    var size_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_bytes, crc.final(), .little);
+    std.mem.writeInt(u32, &size_bytes, @truncate(plain.len), .little);
+    @memcpy(result[output_offset .. output_offset + 4], &crc_bytes);
+    @memcpy(result[output_offset + 4 .. output_offset + 8], &size_bytes);
+    return result;
+}
+
+test "runner schedules another process while gzip decompression is in flight" {
+    const path = "zzz_runner_async_gzip_probe.tmp";
+    const gzip_bytes = try makeStoredGzip(std.testing.allocator, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(gzip_bytes);
+    var io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io.deinit();
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = path, .data = gzip_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), path) catch {};
+
+    var result = try runSource(std.testing.allocator, "пример.ps",
+        \\функ распаковщик(родитель: Процесс(Строка), данные: Строка) -> Пусто
+        \\    выбор сжатие.разжать_gzip(данные)
+        \\        Успех(_) -> отправить(родитель, "распаковка")
+        \\        Неудача(_) -> отправить(родитель, "ошибка")
+        \\    конец
+        \\конец
+        \\функ быстрый(родитель: Процесс(Строка)) -> Пусто
+        \\    отправить(родитель, "быстрый")
+        \\конец
+        \\экспорт функ старт() -> Строка
+        \\    пер данные = выбор фс.прочитать("
+    ++ path ++
+        \\")
+        \\        Успех(содержимое) -> содержимое
+        \\        Неудача(_) -> ""
+        \\    конец
+        \\    запусти распаковщик(себя(), данные)
+        \\    запусти быстрый(себя())
+        \\    пер первое: Строка = получить()
+        \\    пер второе: Строка = получить()
+        \\    первое + "," + второе
+        \\конец
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
+    switch (result.execution orelse return error.TestUnexpectedResult) {
+        .success => |output| try std.testing.expectEqualStrings("быстрый,распаковка", output),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
 test "browser target rejects сжатие.разжать_gzip before compilation" {
     var result = try checkSourceForTarget(std.testing.allocator, "плейграунд.ps", "экспорт функ старт() -> Число\nсжатие.разжать_gzip(\"x\").успех()\n1\nконец", .browser_interpreter);
     defer result.deinit();

@@ -176,6 +176,95 @@ test "a closure returned from a function and passed to a higher-order function w
     try std.testing.expectEqualStrings("21\n", result.stdout);
 }
 
+test "a lambda nested inside a capturing lambda can capture both outer values" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\функ старт() -> Число
+        \\    пер x: Число = 10.0
+        \\    пер внешняя = функ(y: Число) -> функ() -> Число
+        \\        функ() -> Число x + y конец
+        \\    конец
+        \\    пер внутренняя = внешняя(5.0)
+        \\    внутренняя()
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_closures_nested.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRun(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("15\n", result.stdout);
+}
+
+test "a lambda capturing two local values in order returns the correct (order-sensitive) result" {
+    // Regression for the multi-capture reverse-order bug (`expandBuildClosure`
+    // in `wasm_interfaces.zig` processed `v.captured` in array order, but the
+    // values were PUSHED in array order too — with 2+ captures the LAST one
+    // sits on top of the real stack, not the first). Every fixture before
+    // this had exactly one capture and couldn't expose it. Subtraction (not
+    // addition) deliberately makes a swapped-order bug produce a WRONG
+    // answer instead of silently matching by coincidence.
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\функ старт() -> Число
+        \\пер x: Число = 10.0
+        \\пер y: Число = 3.0
+        \\пер разница = функ() -> Число x - y конец
+        \\разница()
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_closures_multicapture_order.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRun(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("7\n", result.stdout);
+}
+
+test "DOM.на_клик_замыкание capturing a scalar plus calling a plain function directly compiles (function_ref capture)" {
+    // Regression for the two hardest follow-up bugs found converting the
+    // real todo-app: (1) the resolver captures ANY `.function`-kind symbol
+    // referenced inside a lambda, even one called DIRECTLY — so a plain
+    // top-level function call inside the handler body makes `classifyCapture`
+    // see a `.function_ref` capture needing `promoteFunctionRefCapture`'s
+    // runtime env_ptr==0 check; (2) that check's OWN internal if/else branch
+    // previously corrupted the `selector` value computed before it. This
+    // fixture combines BOTH triggers at once (multi-capture including a
+    // function_ref, alongside the selector argument) — the exact shape that
+    // broke before `lowerDomClickClosure` was reordered (handler/promotion
+    // fully resolved and stashed in a Local before `selector` is lowered).
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\импорт строки
+        \\
+        \\функ обработать(id: Число) -> Пусто
+        \\    DOM.установить_текст_строка("#результат", строки.из_числа(id))
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\пер id: Число = 5.0
+        \\DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\    обработать(id)
+        \\конец)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "dom_on_click_closure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@runtime_alloc_permanent") != null);
+}
+
 // Stage B (`DOM.на_клик_замыкание`) — structural-only, matching
 // `aot_tree_shaking_test.zig`'s/`aot_gc_arena_test.zig`'s own DOM test
 // precedent: no host provides `env::dom_on_click_closure` outside a
@@ -259,8 +348,56 @@ test "DOM.на_клик_замыкание capturing a struct with a Строк�
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
 }
 
-// The remaining-unsupported-cases restriction (a `Массив`/`Процесс`
-// capture in a `DOM.на_клик_замыкание` handler must be rejected, not
+test "DOM.на_клик_замыкание recursively promotes a nested struct capture" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\тип Подробности = структура
+        \\    текст: Строка
+        \\конец
+        \\тип Задача = структура
+        \\    подробности: Подробности
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    пер задача = Задача(Подробности("купить хлеб"))
+        \\    DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\        DOM.установить_текст_строка("#результат", задача.подробности.текст)
+        \\    конец)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@runtime_alloc_permanent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
+}
+
+test "DOM.на_клик_замыкание recursively promotes an array capture" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\функ старт() -> Пусто
+        \\    пер задачи: Массив(Строка) = массив("первая", "вторая")
+        \\    DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\        DOM.установить_текст_строка("#результат", задачи[1.0])
+        \\    конец)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@runtime_alloc_permanent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
+}
+
+// The remaining-unsupported-cases restriction (`Процесс`, a captured
+// closure with its own environment, or a recursive/generic aggregate)
+// in a `DOM.на_клик_замыкание` handler must be rejected, not
 // silently miscompiled) is deliberately NOT an automated test here —
 // the diagnostic fires via `unsupported()`'s own `std.debug.print`,
 // which corrupts `zig test`'s `--listen=-` protocol when triggered from

@@ -162,19 +162,10 @@ test "a generic function returning bare T, called with both a Число and a s
     // Коробка (i32 nominal handle) — the SAME compiled body can't
     // represent both.
     //
-    // Checks `computeReachableSymbols`'s own `.conflicts` list directly
-    // rather than running the full `buildGraphToWasmBytes`/`lowerGraph`
-    // pipeline and expecting `error.AotUnsupported` — `lowerGraph`'s
-    // `unsupported(...)` reports via `std.debug.print`, a raw syscall
-    // write that bypasses Zig's `Io` abstraction; triggering it from
-    // CODE UNDER TEST while `zig build`'s own test runner is using the
-    // `--listen=-` stdin/stdout protocol corrupts that protocol (a real
-    // Zig 0.16 std-library interaction, not a bug in this diagnostic —
-    // confirmed by running the exact same test binary directly with
-    // plain `zig test`, outside the protocol, where it passes cleanly).
-    // No other `unsupported(...)` call site in this file was ever
-    // exercised by an in-process test before this one — every other AOT
-    // test invokes `wasmtime`/`panos` as a separate subprocess instead.
+    // Exercise the real lowering failure rather than only inspecting the
+    // reachability helper. The reason must be returned as data: a direct
+    // stderr write from code under test corrupts Zig's `--listen=-` test
+    // protocol before the assertion can observe the failure.
     const source =
         \\функ первый[T](x: T) -> T
         \\x
@@ -201,7 +192,12 @@ test "a generic function returning bare T, called with both a Число and a s
     defer compiled.deinit();
     try std.testing.expect(!compiled.hasErrors());
 
-    var reachability = try panos.mir_lowering.computeReachableSymbols(allocator, &graph, &compiled);
-    defer reachability.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 1), reachability.conflicts.items.len);
+    var diagnostic: panos.mir_lowering.AotDiagnostic = .{};
+    try std.testing.expectError(
+        error.AotUnsupported,
+        panos.mir_lowering.lowerGraphWithDiagnostic(allocator, &graph, &compiled, &diagnostic),
+    );
+    try std.testing.expect(diagnostic.reason != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.reason.?, "несовместимыми инстанциациями T") != null);
+    try std.testing.expectEqualStrings("первый", diagnostic.subject.?);
 }

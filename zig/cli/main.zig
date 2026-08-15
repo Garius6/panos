@@ -301,13 +301,22 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         std.process.exit(1);
     };
 
-    // `mir_lowering.zig` deliberately rejects language features outside
-    // the current AOT runtime (ADTs, closures, actors, async I/O, ...) —
-    // it already printed the SPECIFIC reason to stderr before returning
-    // `error.AotUnsupported`; this catch only needs to turn that into a
-    // clean exit instead of an unhandled-error trace.
-    var module = panos_core.mir_lowering.lowerGraph(init.gpa, &graph, &compiled) catch |err| {
+    // `mir_lowering.zig` returns an AOT-specific reason as data instead of
+    // writing behind the caller's `std.Io.Writer`. This keeps the CLI in
+    // charge of output and lets in-process tests observe failures without
+    // corrupting Zig's test-runner protocol.
+    var aot_diagnostic: panos_core.mir_lowering.AotDiagnostic = .{};
+    var module = panos_core.mir_lowering.lowerGraphWithDiagnostic(init.gpa, &graph, &compiled, &aot_diagnostic) catch |err| {
         if (err != error.AotUnsupported) return err;
+        if (aot_diagnostic.reason) |reason| {
+            if (aot_diagnostic.subject) |subject| {
+                try stderr.print("panos build: AOT (wasm) не поддерживает — {s} (символ: {s})\n", .{ reason, subject });
+            } else {
+                try stderr.print("panos build: AOT (wasm) не поддерживает — {s}\n", .{reason});
+            }
+        } else {
+            try stderr.print("panos build: AOT (wasm) не поддерживает используемую конструкцию\n", .{});
+        }
         try stderr.flush();
         std.process.exit(1);
     };

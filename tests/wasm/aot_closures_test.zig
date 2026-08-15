@@ -395,12 +395,38 @@ test "DOM.на_клик_замыкание recursively promotes an array capture
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
 }
 
-// The remaining-unsupported-cases restriction (`Процесс`, a captured
-// closure with its own environment, or a recursive/generic aggregate)
-// in a `DOM.на_клик_замыкание` handler must be rejected, not
-// silently miscompiled) is deliberately NOT an automated test here —
-// the diagnostic fires via `unsupported()`'s own `std.debug.print`,
-// which corrupts `zig test`'s `--listen=-` protocol when triggered from
-// code under test (documented gotcha, see `aot_tree_shaking_test.zig`'s
-// own mixed-generic test). Verified manually via the CLI instead
-// (`panos build --target=wasm`), see `project_panos_wasm_aot_closures`.
+test "DOM.на_клик_замыкание reports an unsupported process capture without writing to stderr" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\функ зарегистрировать(proc: Процесс(Число)) -> Пусто
+        \\    DOM.на_клик_замыкание("#кнопка", функ() -> Пусто
+        \\        отправить(proc, 1.0)
+        \\    конец)
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    зарегистрировать(себя())
+        \\конец
+    ;
+    const reader = MemoryReader{ .files = &.{.{ .path = "программа.ps", .bytes = source }} };
+    var graph = panos.module_loader.Graph.init(allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "программа");
+    _ = try graph.appendPreludeModule(panos.prelude.SOURCE);
+    try std.testing.expectEqual(@as(usize, 0), graph.diagnostics.items.items.len);
+
+    var compiled = try panos.module_compiler.compileGraphForTarget(allocator, &graph, .aot_js_wasm);
+    defer compiled.deinit();
+    try std.testing.expect(!compiled.hasErrors());
+
+    var diagnostic: panos.mir_lowering.AotDiagnostic = .{};
+    try std.testing.expectError(
+        error.AotUnsupported,
+        panos.mir_lowering.lowerGraphWithDiagnostic(allocator, &graph, &compiled, &diagnostic),
+    );
+    try std.testing.expect(diagnostic.reason != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.reason.?, "захват процесса") != null);
+}

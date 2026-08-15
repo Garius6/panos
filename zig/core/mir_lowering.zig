@@ -27,9 +27,8 @@ const dummy_symbol: symbols.SymbolId = @enumFromInt(0);
 // short-circuit `и`/`или`), `если`/`иначе`, `пока` (+ `прервать`/
 // `продолжить`), plain function calls (by identifier OR by an arbitrary
 // value — the generic `Call_Value_Instr` fallback), `возврат`. NOT covered
-// (reported via `unsupported`, matching Odin's `lower_unsupported` —
-// panics with a clear message rather than silently producing incorrect
-// MIR, since this pipeline isn't reachable from normal compilation yet):
+// (reported via `AotDiagnostic` + `error.AotUnsupported`, rather than
+// silently producing incorrect MIR):
 // `выбор`/ADTs, closures, interfaces, actors, async I/O, generics,
 // operator-overload sugar (Сравниваемое/Арифметика), `для`/`для..in`,
 // destructuring, builtins, methods, `внешний`. Each of these is a REAL
@@ -51,6 +50,26 @@ const terminated: ExprOutcome = .{ .value = mir.invalid_value, .flow = .terminat
 const LoopTargets = struct {
     continue_target: mir.BlockId,
     break_target: mir.BlockId,
+};
+
+// One lowering attempt stops at the first unsupported AOT construct, so a
+// single structured diagnostic is sufficient. All slices are borrowed from
+// static strings or the source AST and therefore remain valid for the whole
+// lowering call (and while the caller reports the failure immediately after
+// it returns).
+pub const AotDiagnostic = struct {
+    reason: ?[]const u8 = null,
+    subject: ?[]const u8 = null,
+
+    fn reset(self: *AotDiagnostic) void {
+        self.* = .{};
+    }
+
+    fn report(self: *AotDiagnostic, reason: []const u8, subject: ?[]const u8) void {
+        if (self.reason != null) return;
+        self.reason = reason;
+        self.subject = subject;
+    }
 };
 
 // Populated ONLY while lowering a lambda BODY (`lowerLambda` below) — a
@@ -78,8 +97,14 @@ const LoweringContext = struct {
     builder: mir_builder.Builder,
     symbol_to_local: std.AutoHashMap(symbols.SymbolId, mir.LocalId),
     symbol_to_function: *const std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
+    diagnostic: *AotDiagnostic,
     loops: std.ArrayList(LoopTargets) = .empty,
     capture_env: ?CaptureEnv = null,
+
+    fn unsupported(self: *LoweringContext, comptime what: []const u8) error{AotUnsupported} {
+        self.diagnostic.report(what, null);
+        return error.AotUnsupported;
+    }
 
     fn deinit(self: *LoweringContext) void {
         self.loops.deinit(self.allocator);
@@ -88,20 +113,6 @@ const LoweringContext = struct {
         self.* = undefined;
     }
 };
-
-// Was `@panic(...)` — crashed the whole `panos build --target=wasm`
-// process with a Zig stack trace on ANY unsupported-for-wasm construct
-// (real Phase-1 scope gaps: `для..в`, struct methods, ADTs beyond
-// simple match, ...). Prints the specific reason immediately (the only
-// place that context exists — by the time an `anyerror!` unwinds to
-// `cli/main.zig`'s catch, the "what" string is long gone) and returns a
-// plain error instead, so `lowerModule`/`lowerGraph`'s caller can report
-// a clean compile failure (exit code, no trace) like every other AOT
-// failure mode already does (`emitModule`/`writeFile` in `main.zig`).
-fn unsupported(comptime what: []const u8) error{AotUnsupported} {
-    std.debug.print("panos build: AOT (wasm) не поддерживает — " ++ what ++ "\n", .{});
-    return error.AotUnsupported;
-}
 
 fn expressionSpan(tree: *const ast.Ast, expression: ast.ExprId) source.Span {
     return switch (tree.expr(expression).*) {
@@ -125,6 +136,18 @@ pub fn lowerModule(
     resolution: *const resolver.Resolution,
     checked: *const type_checker.CheckResult,
 ) !mir.Module {
+    var diagnostic: AotDiagnostic = .{};
+    return lowerModuleWithDiagnostic(allocator, tree, resolution, checked, &diagnostic);
+}
+
+pub fn lowerModuleWithDiagnostic(
+    allocator: std.mem.Allocator,
+    tree: *const ast.Ast,
+    resolution: *const resolver.Resolution,
+    checked: *const type_checker.CheckResult,
+    diagnostic: *AotDiagnostic,
+) !mir.Module {
+    diagnostic.reset();
     var module = mir.Module.init(allocator);
     errdefer module.deinit(allocator);
 
@@ -178,9 +201,9 @@ pub fn lowerModule(
         };
         const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
         const function_id = symbol_to_function.get(symbol) orelse continue;
-        try lowerFunctionBody(allocator, tree, resolution, checked, &module, function_id, decl_id, function.body, &symbol_to_function);
+        try lowerFunctionBody(allocator, tree, resolution, checked, &module, function_id, decl_id, function.body, &symbol_to_function, diagnostic);
     }
-    try lowerMethods(&module, allocator, tree, resolution, checked, program, &symbol_to_function);
+    try lowerMethods(&module, allocator, tree, resolution, checked, program, &symbol_to_function, diagnostic);
 
     return module;
 }
@@ -266,6 +289,7 @@ fn lowerMethods(
     checked: *const type_checker.CheckResult,
     program: anytype,
     symbol_to_function: *const std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
+    diagnostic: *AotDiagnostic,
 ) !void {
     for (program.declarations) |decl_id| {
         switch (tree.decl(decl_id).*) {
@@ -273,13 +297,13 @@ fn lowerMethods(
                 const function = tree.decl(method_decl_id).function;
                 const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
                 const function_id = symbol_to_function.get(symbol) orelse continue;
-                try lowerFunctionBody(allocator, tree, resolution, checked, module, function_id, method_decl_id, function.body, symbol_to_function);
+                try lowerFunctionBody(allocator, tree, resolution, checked, module, function_id, method_decl_id, function.body, symbol_to_function, diagnostic);
             },
             .interface_decl => |interface| for (interface.default_methods) |method_decl_id| {
                 const function = tree.decl(method_decl_id).function;
                 const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
                 const function_id = symbol_to_function.get(symbol) orelse continue;
-                try lowerFunctionBody(allocator, tree, resolution, checked, module, function_id, method_decl_id, function.body, symbol_to_function);
+                try lowerFunctionBody(allocator, tree, resolution, checked, module, function_id, method_decl_id, function.body, symbol_to_function, diagnostic);
             },
             else => {},
         }
@@ -896,6 +920,17 @@ pub fn lowerGraph(
     graph: anytype,
     compiled: anytype,
 ) !mir.Module {
+    var diagnostic: AotDiagnostic = .{};
+    return lowerGraphWithDiagnostic(allocator, graph, compiled, &diagnostic);
+}
+
+pub fn lowerGraphWithDiagnostic(
+    allocator: std.mem.Allocator,
+    graph: anytype,
+    compiled: anytype,
+    diagnostic: *AotDiagnostic,
+) !mir.Module {
+    diagnostic.reset();
     var module = mir.Module.init(allocator);
     errdefer module.deinit(allocator);
 
@@ -907,11 +942,12 @@ pub fn lowerGraph(
     if (reachability.conflicts.items.len > 0) {
         const first = reachability.conflicts.items[0];
         const tree = &graph.modules.items[first.module_index].tree;
+        var subject: ?[]const u8 = null;
         if (compiled.modules[first.module_index].resolution) |*resolution| {
-            const name = findSymbolName(tree, resolution, first.symbol) orelse "<аноним>";
-            std.debug.print("panos build: generic-функция/метод '{s}' вызвана и с числовым, и со структурным/массивным T без специализации\n", .{name});
+            subject = findSymbolName(tree, resolution, first.symbol) orelse "<аноним>";
         }
-        return unsupported("generic-функция/метод с несовместимыми инстанциациями T (число и структура/массив в одном скомпилированном теле — не монoморфизировано, см. project_panos_wasm_no_monomorphization_needed)");
+        diagnostic.report("generic-функция/метод с несовместимыми инстанциациями T (число и структура/массив в одном скомпилированном теле — не монoморфизировано, см. project_panos_wasm_no_monomorphization_needed)", subject);
+        return error.AotUnsupported;
     }
     const reachable = &reachability.reachable;
 
@@ -972,9 +1008,9 @@ pub fn lowerGraph(
             };
             const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
             const function_id = function_maps.items[module_index].get(symbol) orelse continue;
-            try lowerFunctionBody(allocator, tree, resolution, checked, &module, function_id, decl_id, function.body, &function_maps.items[module_index]);
+            try lowerFunctionBody(allocator, tree, resolution, checked, &module, function_id, decl_id, function.body, &function_maps.items[module_index], diagnostic);
         }
-        try lowerMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index]);
+        try lowerMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index], diagnostic);
     }
 
     // `reachability.dom_handler_names` holds borrowed slices into AST
@@ -1016,6 +1052,7 @@ fn lowerFunctionBody(
     decl_id: ast.DeclId,
     body: []const ast.StmtId,
     symbol_to_function: *const std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
+    diagnostic: *AotDiagnostic,
 ) !void {
     var ctx = LoweringContext{
         .allocator = allocator,
@@ -1025,6 +1062,7 @@ fn lowerFunctionBody(
         .builder = try mir_builder.Builder.beginFunction(module, allocator, function_id),
         .symbol_to_local = .init(allocator),
         .symbol_to_function = symbol_to_function,
+        .diagnostic = diagnostic,
     };
     defer ctx.deinit();
 
@@ -1087,11 +1125,11 @@ fn emitConstNumber(ctx: *LoweringContext, value: f64) !mir.ValueId {
 fn lowerStmt(ctx: *LoweringContext, statement: ast.StmtId) anyerror!FlowResult {
     switch (ctx.tree.stmt(statement).*) {
         .let => |let| {
-            if (let.destructure_type != null) return unsupported("деструктурирующее объявление");
+            if (let.destructure_type != null) return ctx.unsupported("деструктурирующее объявление");
             const outcome = try lowerExpr(ctx, let.value);
             if (outcome.flow == .terminates) return .terminates;
             const bindings = ctx.resolution.stmt_bindings.get(statement) orelse &.{};
-            if (bindings.len != 1) return unsupported("деструктурирующее объявление");
+            if (bindings.len != 1) return ctx.unsupported("деструктурирующее объявление");
             const symbol = bindings[0];
             const local_type = ctx.checked.expression_types.get(let.value) orelse ctx.checked.types.builtins.void;
             const local = try ctx.builder.newLocal(symbol, let.name orelse "", local_type);
@@ -1131,18 +1169,18 @@ fn lowerStmt(ctx: *LoweringContext, statement: ast.StmtId) anyerror!FlowResult {
         .for_range => |range| return lowerForRange(ctx, statement, range),
         .for_in => |loop| return lowerForIn(ctx, statement, loop),
         .continue_stmt => {
-            if (ctx.loops.items.len == 0) return unsupported("продолжить вне цикла");
+            if (ctx.loops.items.len == 0) return ctx.unsupported("продолжить вне цикла");
             const target = ctx.loops.items[ctx.loops.items.len - 1].continue_target;
             ctx.builder.terminate(.{ .jump = .{ .target = target } });
             return .terminates;
         },
         .break_stmt => {
-            if (ctx.loops.items.len == 0) return unsupported("прервать вне цикла");
+            if (ctx.loops.items.len == 0) return ctx.unsupported("прервать вне цикла");
             const target = ctx.loops.items[ctx.loops.items.len - 1].break_target;
             ctx.builder.terminate(.{ .jump = .{ .target = target } });
             return .terminates;
         },
-        else => return unsupported("вид statement"),
+        else => return ctx.unsupported("вид statement"),
     }
 }
 
@@ -1151,8 +1189,8 @@ fn lowerForRange(ctx: *LoweringContext, statement: ast.StmtId, range: anytype) a
     if (start.flow == .terminates) return .terminates;
     const end = try lowerExpr(ctx, range.end);
     if (end.flow == .terminates) return .terminates;
-    const bindings = ctx.resolution.stmt_bindings.get(statement) orelse return unsupported("для без символа переменной");
-    if (bindings.len != 1) return unsupported("для с несколькими переменными");
+    const bindings = ctx.resolution.stmt_bindings.get(statement) orelse return ctx.unsupported("для без символа переменной");
+    if (bindings.len != 1) return ctx.unsupported("для с несколькими переменными");
     const index_type = ctx.checked.expression_types.get(range.start) orelse ctx.checked.types.builtins.number;
     const index_local = try ctx.builder.newLocal(bindings[0], range.name, index_type);
     try ctx.symbol_to_local.put(bindings[0], index_local);
@@ -1199,20 +1237,20 @@ fn lowerForRange(ctx: *LoweringContext, statement: ast.StmtId, range: anytype) a
 // for Phase 1) — stays `unsupported`, a genuinely separate, larger
 // follow-up, not a small gap.
 fn lowerForIn(ctx: *LoweringContext, statement: ast.StmtId, loop: anytype) anyerror!FlowResult {
-    const info = ctx.checked.for_in_infos.get(statement) orelse return unsupported("для..в без определённой формы цикла");
-    if (info.kind != .array) return unsupported("для..в по итератору (Фаза 2)");
+    const info = ctx.checked.for_in_infos.get(statement) orelse return ctx.unsupported("для..в без определённой формы цикла");
+    if (info.kind != .array) return ctx.unsupported("для..в по итератору (Фаза 2)");
 
-    const bindings = ctx.resolution.stmt_bindings.get(statement) orelse return unsupported("для..в без символа переменной");
-    if (bindings.len != 1) return unsupported("для..в с несколькими переменными");
+    const bindings = ctx.resolution.stmt_bindings.get(statement) orelse return ctx.unsupported("для..в без символа переменной");
+    if (bindings.len != 1) return ctx.unsupported("для..в с несколькими переменными");
 
     const iterable = try lowerExpr(ctx, loop.iterable);
     if (iterable.flow == .terminates) return .terminates;
 
-    const array_type = ctx.checked.expression_types.get(loop.iterable) orelse return unsupported("для..в: массив без типа");
-    const array_entry = ctx.checked.types.get(array_type) orelse return unsupported("для..в: массив с неизвестным типом");
+    const array_type = ctx.checked.expression_types.get(loop.iterable) orelse return ctx.unsupported("для..в: массив без типа");
+    const array_entry = ctx.checked.types.get(array_type) orelse return ctx.unsupported("для..в: массив с неизвестным типом");
     const element_type = switch (array_entry.*) {
         .array => |value| value,
-        else => return unsupported("для..в: не массив"),
+        else => return ctx.unsupported("для..в: не массив"),
     };
 
     const array_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$for_in_array", array_type);
@@ -1312,7 +1350,7 @@ fn applyInterfaceCast(ctx: *LoweringContext, expression: ast.ExprId, outcome: Ex
     // than silently invoking the wrong method. Not hit by anything this
     // plan's own verification cases (prelude iterators) exercise — a
     // real, scoped Phase-2 gap, not a silent correctness risk.
-    if (cast.entries.len > 1) return unsupported("значение приведено сразу к нескольким интерфейсам (Phase 2)");
+    if (cast.entries.len > 1) return ctx.unsupported("значение приведено сразу к нескольким интерфейсам (Phase 2)");
     var vtable: std.ArrayList(mir.InterfaceMethodBinding) = .empty;
     for (cast.entries) |entry| {
         var ambiguous = false;
@@ -1323,12 +1361,12 @@ fn applyInterfaceCast(ctx: *LoweringContext, expression: ast.ExprId, outcome: Ex
             entry.target,
             entry.target_arguments,
             &ambiguous,
-        ) orelse return unsupported("не удалось найти реализацию интерфейса");
-        if (ambiguous) return unsupported("неоднозначная реализация интерфейса — несколько подходящих 'реализация' блоков");
-        const definition = ctx.checked.interface_definitions.get(entry.interface) orelse return unsupported("интерфейс без определения");
-        if (definition.methods.len != implementation.methods.len) return unsupported("несоответствие количества методов интерфейса");
+        ) orelse return ctx.unsupported("не удалось найти реализацию интерфейса");
+        if (ambiguous) return ctx.unsupported("неоднозначная реализация интерфейса — несколько подходящих 'реализация' блоков");
+        const definition = ctx.checked.interface_definitions.get(entry.interface) orelse return ctx.unsupported("интерфейс без определения");
+        if (definition.methods.len != implementation.methods.len) return ctx.unsupported("несоответствие количества методов интерфейса");
         for (definition.methods, implementation.methods) |method, method_symbol| {
-            const function_id = ctx.symbol_to_function.get(method_symbol) orelse return unsupported("не удалось найти метод интерфейса");
+            const function_id = ctx.symbol_to_function.get(method_symbol) orelse return ctx.unsupported("не удалось найти метод интерфейса");
             const is_default = method.default_symbol != null and method.default_symbol.? == method_symbol;
             try vtable.append(ctx.builder.module.arena.allocator(), .{ .method_name = method.name, .function = function_id, .is_default = is_default });
         }
@@ -1360,7 +1398,7 @@ fn lowerExprInner(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOu
         .spawn => |spawn| lowerSpawn(ctx, expression, spawn),
         .index => |index| lowerIndex(ctx, expression, index),
         .ident => blk: {
-            const symbol = ctx.resolution.expr_symbols.get(expression) orelse return unsupported("неразрешённый идентификатор");
+            const symbol = ctx.resolution.expr_symbols.get(expression) orelse return ctx.unsupported("неразрешённый идентификатор");
             break :blk continuesWith(try lowerSymbolValueRef(ctx, symbol, expressionSpan(ctx.tree, expression)));
         },
         .unary => |unary| lowerUnary(ctx, expression, unary),
@@ -1376,7 +1414,7 @@ fn lowerExprInner(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOu
             break :blk continuesWith(try emitConstNumber(ctx, 0));
         },
         .lambda => |lambda| lowerLambda(ctx, expression, lambda),
-        else => return unsupported("вид выражения"),
+        else => return ctx.unsupported("вид выражения"),
     };
 }
 
@@ -1386,13 +1424,13 @@ fn lowerExprInner(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOu
 fn lowerSpawn(ctx: *LoweringContext, expression: ast.ExprId, spawn: anytype) anyerror!ExprOutcome {
     const call = switch (ctx.tree.expr(spawn.call).*) {
         .call => |value| value,
-        else => return unsupported("запусти не-вызов"),
+        else => return ctx.unsupported("запусти не-вызов"),
     };
-    const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return unsupported("запусти неразрешённую функцию");
-    const function_id = ctx.symbol_to_function.get(symbol) orelse return unsupported("запусти не-статическую функцию");
+    const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return ctx.unsupported("запусти неразрешённую функцию");
+    const function_id = ctx.symbol_to_function.get(symbol) orelse return ctx.unsupported("запусти не-статическую функцию");
     const callee = try emitFunctionRef(ctx, function_id);
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
-    const result_type = ctx.checked.expression_types.get(expression) orelse return unsupported("запусти без типа");
+    const result_type = ctx.checked.expression_types.get(expression) orelse return ctx.unsupported("запусти без типа");
     const dst = try ctx.builder.newValue(result_type);
     try ctx.builder.emit(.{ .spawn = .{ .dst = dst, .callee = callee, .args = args } });
     return continuesWith(dst);
@@ -1401,7 +1439,7 @@ fn lowerSpawn(ctx: *LoweringContext, expression: ast.ExprId, spawn: anytype) any
 fn lowerMatchExpr(ctx: *LoweringContext, expression: ast.ExprId, match: anytype) anyerror!ExprOutcome {
     const subject = try lowerExpr(ctx, match.subject);
     if (subject.flow == .terminates) return terminated;
-    const subject_type = ctx.checked.expression_types.get(match.subject) orelse return unsupported("выбор без типа subject");
+    const subject_type = ctx.checked.expression_types.get(match.subject) orelse return ctx.unsupported("выбор без типа subject");
     const subject_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$match", subject_type);
     try ctx.builder.emit(.{ .store_local = .{ .local = subject_local, .src = subject.value } });
     const result_type = ctx.checked.expression_types.get(expression) orelse ctx.checked.types.builtins.void;
@@ -1413,7 +1451,7 @@ fn lowerMatchExpr(ctx: *LoweringContext, expression: ast.ExprId, match: anytype)
         const next = if (arm_index + 1 < match.arms.len) try ctx.builder.newBlock() else mir.invalid_block;
         const variant = ctx.checked.pattern_variants.get(arm.pattern);
         if (variant) |variant_symbol| {
-            const definition = ctx.checked.enum_definitions.get((ctx.resolution.symbols.get(variant_symbol) orelse unreachable).owner_type) orelse return unsupported("вариант без enum definition");
+            const definition = ctx.checked.enum_definitions.get((ctx.resolution.symbols.get(variant_symbol) orelse unreachable).owner_type) orelse return ctx.unsupported("вариант без enum definition");
             var tag: u32 = 0;
             for (definition.variants, 0..) |candidate, index| if (candidate.symbol == variant_symbol) {
                 tag = @intCast(index);
@@ -1469,15 +1507,15 @@ fn bindVariantPattern(ctx: *LoweringContext, pattern: ast.PatternId, subject_loc
             // `получить()` deliberately has poison as its static subject
             // type. The checker still resolved the constructor variant, so
             // recover its positional field type from that enum definition.
-            const variant_symbol = ctx.checked.pattern_variants.get(pattern) orelse return unsupported("payload pattern без типа");
-            const entry = ctx.resolution.symbols.get(variant_symbol) orelse return unsupported("payload variant без symbol");
-            const definition = ctx.checked.enum_definitions.get(entry.owner_type) orelse return unsupported("payload variant без enum definition");
+            const variant_symbol = ctx.checked.pattern_variants.get(pattern) orelse return ctx.unsupported("payload pattern без типа");
+            const entry = ctx.resolution.symbols.get(variant_symbol) orelse return ctx.unsupported("payload variant без symbol");
+            const definition = ctx.checked.enum_definitions.get(entry.owner_type) orelse return ctx.unsupported("payload variant без enum definition");
             for (definition.variants) |variant| {
                 if (variant.symbol != variant_symbol) continue;
-                if (index >= variant.fields.len) return unsupported("payload pattern вне variant fields");
+                if (index >= variant.fields.len) return ctx.unsupported("payload pattern вне variant fields");
                 break :blk variant.fields[index];
             }
-            return unsupported("payload variant не найден");
+            return ctx.unsupported("payload variant не найден");
         };
         const local = try ctx.builder.newLocal(binding, "$payload", field_type);
         try ctx.symbol_to_local.put(binding, local);
@@ -1496,11 +1534,11 @@ fn valuesInArena(ctx: *LoweringContext, values: []const mir.ValueId) ![]const mi
 }
 
 fn lowerArrayLiteral(ctx: *LoweringContext, expression: ast.ExprId, array: anytype) anyerror!ExprOutcome {
-    const array_type = ctx.checked.expression_types.get(expression) orelse return unsupported("массив без типа");
-    const entry = ctx.checked.types.get(array_type) orelse return unsupported("массив с неизвестным типом");
+    const array_type = ctx.checked.expression_types.get(expression) orelse return ctx.unsupported("массив без типа");
+    const entry = ctx.checked.types.get(array_type) orelse return ctx.unsupported("массив с неизвестным типом");
     const element_type = switch (entry.*) {
         .array => |value| value,
-        else => return unsupported("литерал не-массива"),
+        else => return ctx.unsupported("литерал не-массива"),
     };
     const array_value = try ctx.builder.newValue(array_type);
     try ctx.builder.emit(.{ .new_array = .{ .dst = array_value, .elements = &.{} } });
@@ -1524,7 +1562,7 @@ fn lowerIndex(ctx: *LoweringContext, expression: ast.ExprId, index: anytype) any
     if (object.flow == .terminates) return terminated;
     const subscript = try lowerExpr(ctx, index.index);
     if (subscript.flow == .terminates) return terminated;
-    const result_type = ctx.checked.expression_types.get(expression) orelse return unsupported("индексирование без типа результата");
+    const result_type = ctx.checked.expression_types.get(expression) orelse return ctx.unsupported("индексирование без типа результата");
     const dst = try ctx.builder.newValue(result_type);
     try ctx.builder.emit(.{ .get_index = .{ .dst = dst, .object = object.value, .index = subscript.value } });
     return continuesWith(dst);
@@ -1553,16 +1591,16 @@ fn fieldsForNominalSymbol(ctx: *LoweringContext, symbol: symbols.SymbolId) ?[]co
 fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytype) anyerror!ExprOutcome {
     // Module members and enum variants are resolved symbols and are handled
     // by their callers. A remaining property expression is a struct field.
-    if (ctx.resolution.expr_symbols.contains(expression)) return unsupported("свойство-модуль или вариант перечисления вне вызова");
+    if (ctx.resolution.expr_symbols.contains(expression)) return ctx.unsupported("свойство-модуль или вариант перечисления вне вызова");
     const object = try lowerExpr(ctx, property.object);
     if (object.flow == .terminates) return terminated;
-    const object_type = ctx.checked.expression_types.get(property.object) orelse return unsupported("свойство без типа объекта");
-    const type_entry = ctx.checked.types.get(object_type) orelse return unsupported("свойство с неизвестным типом объекта");
+    const object_type = ctx.checked.expression_types.get(property.object) orelse return ctx.unsupported("свойство без типа объекта");
+    const type_entry = ctx.checked.types.get(object_type) orelse return ctx.unsupported("свойство с неизвестным типом объекта");
     const nominal = switch (type_entry.*) {
         .nominal => |value| value,
-        else => return unsupported("свойство не-структуры"),
+        else => return ctx.unsupported("свойство не-структуры"),
     };
-    const fields = fieldsForNominalSymbol(ctx, nominal.symbol) orelse return unsupported("поле generic-структуры");
+    const fields = fieldsForNominalSymbol(ctx, nominal.symbol) orelse return ctx.unsupported("поле generic-структуры");
     for (fields, 0..) |field, index| {
         if (!std.mem.eql(u8, field.name, property.property)) continue;
         const result_type = ctx.checked.expression_types.get(expression) orelse field.typ;
@@ -1570,7 +1608,7 @@ fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytyp
         try ctx.builder.emit(.{ .get_property = .{ .dst = dst, .object = object.value, .field_index = @intCast(index) } });
         return continuesWith(dst);
     }
-    return unsupported("неизвестное поле структуры");
+    return ctx.unsupported("неизвестное поле структуры");
 }
 
 fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: source.Span) !mir.ValueId {
@@ -1609,7 +1647,7 @@ fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: so
         return dst;
     }
     _ = span;
-    return unsupported("символ не является локалью или функцией");
+    return ctx.unsupported("символ не является локалью или функцией");
 }
 
 fn lambdaReturnType(checked: *const type_checker.CheckResult, expression: ast.ExprId) types.TypeId {
@@ -1636,7 +1674,7 @@ fn lambdaReturnType(checked: *const type_checker.CheckResult, expression: ast.Ex
 // `symbol_to_local`.
 fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) anyerror!ExprOutcome {
     const captures = ctx.resolution.lambda_captures.get(expression) orelse &.{};
-    if (captures.len > std.math.maxInt(u16)) return unsupported("лямбда захватывает слишком много значений");
+    if (captures.len > std.math.maxInt(u16)) return ctx.unsupported("лямбда захватывает слишком много значений");
 
     const arena = ctx.builder.module.arena.allocator();
     var captured_values: std.ArrayList(mir.ValueId) = .empty;
@@ -1659,6 +1697,7 @@ fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) a
         .builder = try mir_builder.Builder.beginFunction(ctx.builder.module, ctx.allocator, lambda_function_id),
         .symbol_to_local = .init(ctx.allocator),
         .symbol_to_function = ctx.symbol_to_function,
+        .diagnostic = ctx.diagnostic,
     };
     defer inner_ctx.deinit();
 
@@ -1741,7 +1780,7 @@ fn lowerUnary(ctx: *LoweringContext, expression: ast.ExprId, unary: anytype) any
         .minus => .negate_number,
         .negate => .negate_bool,
         .tilde => .bit_not,
-        else => return unsupported("унарный оператор"),
+        else => return ctx.unsupported("унарный оператор"),
     };
     const result_type = ctx.checked.expression_types.get(expression) orelse ctx.checked.types.builtins.void;
     const dst = try ctx.builder.newValue(result_type);
@@ -1771,7 +1810,7 @@ fn lowerBinary(ctx: *LoweringContext, expression: ast.ExprId, binary: anytype) a
         .less_less => .shift_left,
         .greater_greater => .shift_right,
         .less, .less_equal, .greater, .greater_equal, .equal, .not_equal => return continuesWith(try emitCompare(ctx, binary.operator, lhs.value, rhs.value)),
-        else => return unsupported("бинарный оператор"),
+        else => return ctx.unsupported("бинарный оператор"),
     };
     const dst = try ctx.builder.newValue(result_type);
     try ctx.builder.emit(.{ .binary = .{ .dst = dst, .op = bin_op, .lhs = lhs.value, .rhs = rhs.value } });
@@ -1786,8 +1825,8 @@ fn lowerBinary(ctx: *LoweringContext, expression: ast.ExprId, binary: anytype) a
 fn lowerAssign(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcome {
     switch (ctx.tree.expr(binary.left).*) {
         .ident => {
-            const symbol = ctx.resolution.expr_symbols.get(binary.left) orelse return unsupported("неразрешённый идентификатор в присваивании");
-            const target = ctx.symbol_to_local.get(symbol) orelse return unsupported("присваивание не-локали (Фаза 3+)");
+            const symbol = ctx.resolution.expr_symbols.get(binary.left) orelse return ctx.unsupported("неразрешённый идентификатор в присваивании");
+            const target = ctx.symbol_to_local.get(symbol) orelse return ctx.unsupported("присваивание не-локали (Фаза 3+)");
             const rhs = try lowerExpr(ctx, binary.right);
             if (rhs.flow == .terminates) return terminated;
             try ctx.builder.emit(.{ .store_local = .{ .local = target, .src = rhs.value } });
@@ -1795,13 +1834,13 @@ fn lowerAssign(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcome {
         .property => |property| {
             const object = try lowerExpr(ctx, property.object);
             if (object.flow == .terminates) return terminated;
-            const object_type = ctx.checked.expression_types.get(property.object) orelse return unsupported("присваивание свойства без типа");
-            const entry = ctx.checked.types.get(object_type) orelse return unsupported("присваивание свойства с неизвестным типом");
+            const object_type = ctx.checked.expression_types.get(property.object) orelse return ctx.unsupported("присваивание свойства без типа");
+            const entry = ctx.checked.types.get(object_type) orelse return ctx.unsupported("присваивание свойства с неизвестным типом");
             const nominal = switch (entry.*) {
                 .nominal => |value| value,
-                else => return unsupported("присваивание свойства не-структуры"),
+                else => return ctx.unsupported("присваивание свойства не-структуры"),
             };
-            const fields = fieldsForNominalSymbol(ctx, nominal.symbol) orelse return unsupported("присваивание поля generic-структуры");
+            const fields = fieldsForNominalSymbol(ctx, nominal.symbol) orelse return ctx.unsupported("присваивание поля generic-структуры");
             var field_index: ?u32 = null;
             for (fields, 0..) |field, index| {
                 if (std.mem.eql(u8, field.name, property.property)) {
@@ -1809,7 +1848,7 @@ fn lowerAssign(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcome {
                     break;
                 }
             }
-            const index = field_index orelse return unsupported("присваивание неизвестному полю структуры");
+            const index = field_index orelse return ctx.unsupported("присваивание неизвестному полю структуры");
             const rhs = try lowerExpr(ctx, binary.right);
             if (rhs.flow == .terminates) return terminated;
             try ctx.builder.emit(.{ .set_property = .{ .object = object.value, .field_index = index, .value = rhs.value } });
@@ -1823,7 +1862,7 @@ fn lowerAssign(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcome {
             if (rhs.flow == .terminates) return terminated;
             try ctx.builder.emit(.{ .set_index = .{ .object = object.value, .index = subscript.value, .value = rhs.value } });
         },
-        else => return unsupported("цель присваивания (Фаза 3+)"),
+        else => return ctx.unsupported("цель присваивания (Фаза 3+)"),
     }
     return continuesWith(mir.invalid_value);
 }
@@ -2096,7 +2135,7 @@ fn lowerEnumConstructor(ctx: *LoweringContext, symbol: symbols.SymbolId, call: a
         }
     }
     const variant_tag = tag orelse return null;
-    if (call.arguments.len > 3) return unsupported("вариант с более чем 3 полями");
+    if (call.arguments.len > 3) return ctx.unsupported("вариант с более чем 3 полями");
     const fields = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     const dst = try ctx.builder.newValue(result_type);
     try ctx.builder.emit(.{ .build_variant = .{ .dst = dst, .type_name = "", .variant_name = entry.name, .tag = variant_tag, .fields = fields } });
@@ -2326,7 +2365,7 @@ fn lowerStructConstructor(ctx: *LoweringContext, expression: ast.ExprId, symbol:
     };
     if (nominal.symbol != symbol) return null;
     const fields = fieldsForNominalSymbol(ctx, symbol) orelse return null;
-    if (fields.len > 3) return unsupported("структура с более чем 3 полями");
+    if (fields.len > 3) return ctx.unsupported("структура с более чем 3 полями");
     const arguments = ctx.checked.call_arguments.get(expression) orelse call.arguments;
     const args = try lowerCallArgs(ctx, arguments) orelse return terminated;
     const dst = try ctx.builder.newValue(result_type);
@@ -2343,7 +2382,7 @@ fn lowerStructConstructor(ctx: *LoweringContext, expression: ast.ExprId, symbol:
 fn lowerCast(ctx: *LoweringContext, expression: ast.ExprId, cast: anytype) anyerror!ExprOutcome {
     const argument_outcome = try lowerExpr(ctx, cast.operand);
     if (argument_outcome.flow == .terminates) return terminated;
-    const cast_type = ctx.checked.expression_types.get(expression) orelse return unsupported("не удалось определить тип каста");
+    const cast_type = ctx.checked.expression_types.get(expression) orelse return ctx.unsupported("не удалось определить тип каста");
     if (!ctx.checked.types.eql(cast_type, ctx.checked.types.builtins.integer)) return continuesWith(argument_outcome.value);
 
     const dst = try ctx.builder.newValue(ctx.checked.types.builtins.integer);
@@ -2354,7 +2393,7 @@ fn lowerCast(ctx: *LoweringContext, expression: ast.ExprId, cast: anytype) anyer
 fn lowerLengthBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
     if (entry.kind != .builtin or entry.module_path != null or !std.mem.eql(u8, entry.name, "длина")) return null;
-    if (call.arguments.len != 1) return unsupported("длина с числом аргументов != 1");
+    if (call.arguments.len != 1) return ctx.unsupported("длина с числом аргументов != 1");
 
     const argument_type = ctx.checked.expression_types.get(call.arguments[0]) orelse return null;
     const type_entry = ctx.checked.types.get(argument_type) orelse return null;
@@ -2383,7 +2422,7 @@ fn lowerLengthBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call:
 fn lowerPanicBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype) anyerror!?ExprOutcome {
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
     if (entry.kind != .builtin or entry.module_path != null or !std.mem.eql(u8, entry.name, "паника")) return null;
-    if (call.arguments.len != 1) return unsupported("паника ожидает 1 аргумент");
+    if (call.arguments.len != 1) return ctx.unsupported("паника ожидает 1 аргумент");
 
     const message = try lowerExpr(ctx, call.arguments[0]);
     if (message.flow == .terminates) return terminated;
@@ -2445,7 +2484,7 @@ fn lowerStringBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: typ
     else if (std.mem.eql(u8, property.property, "в_число"))
         "строки::в_число"
     else
-        return unsupported("строки.свойство вызов (неподдерживаемая строковая операция в AOT WASM)");
+        return ctx.unsupported("строки.свойство вызов (неподдерживаемая строковая операция в AOT WASM)");
 
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     const dst = try ctx.builder.newValue(result_type);
@@ -2464,7 +2503,7 @@ fn lowerNetworkBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: ty
 
     const property = ctx.tree.expr(call.callee).property;
     if (!std.mem.eql(u8, property.property, "http_запрос_sync")) {
-        return unsupported("сеть.свойство вызов (неподдерживаемая сетевая операция в AOT WASM)");
+        return ctx.unsupported("сеть.свойство вызов (неподдерживаемая сетевая операция в AOT WASM)");
     }
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     const dst = try ctx.builder.newValue(result_type);
@@ -2489,14 +2528,14 @@ fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
     if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "время")) return null;
 
-    if (std.mem.eql(u8, property.property, "спать_мс")) return unsupported("время.спать_мс (native-only builtin, недоступен в AOT WASM)");
+    if (std.mem.eql(u8, property.property, "спать_мс")) return ctx.unsupported("время.спать_мс (native-only builtin, недоступен в AOT WASM)");
 
     const name = if (std.mem.eql(u8, property.property, "сейчас_мс"))
         "время::сейчас_мс"
     else if (std.mem.eql(u8, property.property, "монотонно_мс"))
         "время::монотонно_мс"
     else
-        return unsupported("модуль.свойство вызов (только время.сейчас_мс/монотонно_мс поддержаны в AOT WASM)");
+        return ctx.unsupported("модуль.свойство вызов (только время.сейчас_мс/монотонно_мс поддержаны в AOT WASM)");
 
     const dst = try ctx.builder.newValue(result_type);
     try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = name, .args = &.{} } });
@@ -2684,12 +2723,12 @@ fn promoteFunctionRefCapture(ctx: *LoweringContext, layout: wasm_heap.PtrLayout,
 // plain structs (no tag slot — that's a variant-only convention).
 fn promoteStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, struct_type: types.TypeId, old_struct_ptr: mir.ValueId) anyerror!mir.ValueId {
     const module = ctx.builder.module;
-    const type_entry = ctx.checked.types.get(struct_type) orelse return unsupported("захват структуры неизвестного типа (Stage C)");
+    const type_entry = ctx.checked.types.get(struct_type) orelse return ctx.unsupported("захват структуры неизвестного типа (Stage C)");
     const nominal = switch (type_entry.*) {
         .nominal => |value| value,
-        else => return unsupported("захват не-структуры как структуры (Stage C)"),
+        else => return ctx.unsupported("захват не-структуры как структуры (Stage C)"),
     };
-    const fields = ctx.checked.nominal_fields.get(nominal.symbol) orelse return unsupported("захват generic-структуры (Stage C)");
+    const fields = ctx.checked.nominal_fields.get(nominal.symbol) orelse return ctx.unsupported("захват generic-структуры (Stage C)");
 
     const old_struct_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_struct", layout.ptr_type, old_struct_ptr);
 
@@ -2714,10 +2753,10 @@ fn promoteStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, 
 }
 
 fn promoteArrayToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, array_type: types.TypeId, old_array_ptr: mir.ValueId) anyerror!mir.ValueId {
-    const type_entry = ctx.checked.types.get(array_type) orelse return unsupported("захват массива неизвестного типа (Stage C)");
+    const type_entry = ctx.checked.types.get(array_type) orelse return ctx.unsupported("захват массива неизвестного типа (Stage C)");
     const element_type = switch (type_entry.*) {
         .array => |element| element,
-        else => return unsupported("захват не-массива как массива (Stage C)"),
+        else => return ctx.unsupported("захват не-массива как массива (Stage C)"),
     };
     const module = ctx.builder.module;
     const old_array_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_array", layout.ptr_type, old_array_ptr);
@@ -2884,17 +2923,17 @@ fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayo
 // statically inspectable here via `lambda_captures`, needed for the
 // scalar-only restriction below. See `project_panos_wasm_aot_closures`.
 fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutcome {
-    if (call.arguments.len != 2) return unsupported("DOM.на_клик_замыкание() ожидает 2 аргумента");
+    if (call.arguments.len != 2) return ctx.unsupported("DOM.на_клик_замыкание() ожидает 2 аргумента");
     const handler_expr = call.arguments[1];
     switch (ctx.tree.expr(handler_expr).*) {
         .lambda => {},
-        else => return unsupported("DOM.на_клик_замыкание() ожидает лямбда-выражение непосредственно на месте вызова (Stage B)"),
+        else => return ctx.unsupported("DOM.на_клик_замыкание() ожидает лямбда-выражение непосредственно на месте вызова (Stage B)"),
     }
     const captures = ctx.resolution.lambda_captures.get(handler_expr) orelse &.{};
     for (captures) |capture_symbol| {
         const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
         if (classifyCapture(ctx.checked, capture_type) == .unsupported) {
-            return unsupported("DOM.на_клик_замыкание(): захват процесса, рекурсивного/обобщённого агрегата или иного неподдержанного типа (Stage C ограничение, project_panos_wasm_aot_closures)");
+            return ctx.unsupported("DOM.на_клик_замыкание(): захват процесса, рекурсивного/обобщённого агрегата или иного неподдержанного типа (Stage C ограничение, project_panos_wasm_aot_closures)");
         }
     }
 
@@ -2963,7 +3002,7 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
     else if (std.mem.eql(u8, property.property, "установить_атрибут"))
         "DOM::установить_атрибут"
     else
-        return unsupported("DOM.свойство вызов (неподдерживаемый DOM-метод)");
+        return ctx.unsupported("DOM.свойство вызов (неподдерживаемый DOM-метод)");
 
     var args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
 
@@ -3031,7 +3070,7 @@ fn lowerStateBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: type
     else if (std.mem.eql(u8, property.property, "записать"))
         "состояние::записать"
     else
-        return unsupported("состояние.свойство вызов (неподдерживаемый метод)");
+        return ctx.unsupported("состояние.свойство вызов (неподдерживаемый метод)");
 
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     const is_void = ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);

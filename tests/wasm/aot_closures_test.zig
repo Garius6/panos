@@ -533,6 +533,27 @@ test "DOM.на_клик recursively promotes an array capture" {
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
 }
 
+test "DOM.на_клик rejects a closure stored inside a captured aggregate" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\тип Коробка = структура
+        \\    действие: функ() -> Число
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    пер коробка = Коробка(функ() -> Число 7.0 конец)
+        \\    DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
+        \\        коробка.действие()
+        \\    конец)
+        \\конец
+    ;
+
+    try std.testing.expectError(error.AotUnsupported, buildGraphBytes(allocator, source));
+}
+
 test "DOM.на_клик reports an unsupported process capture without writing to stderr" {
     const allocator = std.testing.allocator;
 

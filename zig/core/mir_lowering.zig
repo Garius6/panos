@@ -2627,6 +2627,13 @@ fn classifyCaptureDepth(checked: *const type_checker.CheckResult, type_id: types
                 if (checked.generic_nominal_fields.get(nominal.symbol)) |generic| generic.fields else break :blk .unsupported;
             for (fields) |field| {
                 const concrete_type = concreteCaptureFieldType(checked, .{ .nominal = nominal }, field.typ) orelse break :blk .unsupported;
+                // A function stored inside an aggregate has no capture-symbol
+                // metadata at this boundary, so its environment layout cannot
+                // be promoted safely. Directly captured local function values
+                // remain supported through the symbol-aware path below.
+                if (checked.types.get(concrete_type)) |field_entry| {
+                    if (field_entry.* == .function) break :blk .unsupported;
+                }
                 if (classifyCaptureDepth(checked, concrete_type, depth + 1) == .unsupported) break :blk .unsupported;
             }
             break :blk .structure;

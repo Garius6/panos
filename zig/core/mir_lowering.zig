@@ -2597,15 +2597,37 @@ fn classifyCapture(checked: *const type_checker.CheckResult, type_id: types.Type
     return classifyCaptureDepth(checked, type_id, 0);
 }
 
+// Generic nominal declarations keep their field types in terms of the
+// declaration's parameter placeholders.  A concrete value crossing a DOM
+// closure boundary has the actual arguments on its nominal TypeId, so resolve
+// direct placeholders here without allocating a second type graph.  Nested
+// generic expressions are deliberately rejected until lowering can substitute
+// them recursively as well; treating an unresolved placeholder as a scalar
+// would otherwise retain a resettable-arena pointer unsafely.
+fn concreteCaptureFieldType(checked: *const type_checker.CheckResult, nominal: types.Type, field_type: types.TypeId) ?types.TypeId {
+    const entry = checked.types.get(field_type) orelse return field_type;
+    if (entry.* != .generic_parameter) return field_type;
+    const parameters = type_checker.nominalParametersOf(checked, nominal.nominal.symbol);
+    for (parameters, 0..) |parameter, index| {
+        if (checked.types.eql(field_type, parameter.typ)) {
+            if (index >= nominal.nominal.arguments.len) return null;
+            return nominal.nominal.arguments[index];
+        }
+    }
+    return null;
+}
+
 fn classifyCaptureDepth(checked: *const type_checker.CheckResult, type_id: types.TypeId, depth: u8) CaptureKind {
     if (depth == 64) return .unsupported;
     if (checked.types.eql(type_id, checked.types.builtins.string)) return .string;
     const entry = checked.types.get(type_id) orelse return .scalar;
     return switch (entry.*) {
         .nominal => |nominal| blk: {
-            const fields = checked.nominal_fields.get(nominal.symbol) orelse break :blk .unsupported;
+            const fields = checked.nominal_fields.get(nominal.symbol) orelse
+                if (checked.generic_nominal_fields.get(nominal.symbol)) |generic| generic.fields else break :blk .unsupported;
             for (fields) |field| {
-                if (classifyCaptureDepth(checked, field.typ, depth + 1) == .unsupported) break :blk .unsupported;
+                const concrete_type = concreteCaptureFieldType(checked, .{ .nominal = nominal }, field.typ) orelse break :blk .unsupported;
+                if (classifyCaptureDepth(checked, concrete_type, depth + 1) == .unsupported) break :blk .unsupported;
             }
             break :blk .structure;
         },
@@ -2763,7 +2785,8 @@ fn promoteStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, 
         .nominal => |value| value,
         else => return ctx.unsupported("захват не-структуры как структуры (Stage C)"),
     };
-    const fields = ctx.checked.nominal_fields.get(nominal.symbol) orelse return ctx.unsupported("захват generic-структуры (Stage C)");
+    const fields = ctx.checked.nominal_fields.get(nominal.symbol) orelse
+        if (ctx.checked.generic_nominal_fields.get(nominal.symbol)) |generic| generic.fields else return ctx.unsupported("захват структуры неизвестного типа (Stage C)");
 
     const old_struct_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_struct", layout.ptr_type, old_struct_ptr);
 
@@ -2775,10 +2798,11 @@ fn promoteStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, 
 
     for (fields, 0..) |field, j| {
         const old_struct_for_load = try wasm_heap.loadLocal(&ctx.builder, old_struct_local, layout.ptr_type);
-        const old_field_val = try ctx.builder.newValue(field.typ);
+        const concrete_type = concreteCaptureFieldType(ctx.checked, .{ .nominal = nominal }, field.typ) orelse return ctx.unsupported("вложенный generic-тип в захвате структуры (Stage C)");
+        const old_field_val = try ctx.builder.newValue(concrete_type);
         try ctx.builder.emit(.{ .frame_load = .{ .dst = old_field_val, .frame = old_struct_for_load, .slot = @intCast(j) } });
 
-        const promoted_field = try promoteCaptureValue(ctx, layout, field.typ, old_field_val, null, closure_depth);
+        const promoted_field = try promoteCaptureValue(ctx, layout, concrete_type, old_field_val, null, closure_depth);
 
         const new_struct_for_store = try wasm_heap.loadLocal(&ctx.builder, new_struct_local, layout.ptr_type);
         try ctx.builder.emit(.{ .frame_store = .{ .frame = new_struct_for_store, .slot = @intCast(j), .src = promoted_field } });

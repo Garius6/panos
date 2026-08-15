@@ -463,6 +463,29 @@ test "DOM.на_клик capturing a struct with a Строка field promotes th
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
 }
 
+test "DOM.на_клик promotes a concrete generic struct capture" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\тип Коробка[T] = структура
+        \\    значение: T
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    пер коробка: Коробка(Строка) = Коробка("купить хлеб")
+        \\    DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
+        \\        DOM.установить_текст_строка("#результат", коробка.значение)
+        \\    конец)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
+}
+
 test "DOM.на_клик recursively promotes a nested struct capture" {
     const allocator = std.testing.allocator;
 

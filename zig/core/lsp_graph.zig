@@ -41,6 +41,11 @@ const Reader = struct {
         const uri = try pathToUri(allocator, path);
         defer allocator.free(uri);
         if (self.documents.sourceText(uri)) |text| return allocator.dupe(u8, text);
+        // Accept the raw-Unicode form used by older clients/tests too; the
+        // canonical URI returned to the client remains percent-encoded.
+        const raw_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{path});
+        defer allocator.free(raw_uri);
+        if (self.documents.sourceText(raw_uri)) |text| return allocator.dupe(u8, text);
         return std.Io.Dir.cwd().readFileAlloc(self.io, path, allocator, .limited(4 * 1024 * 1024));
     }
 };
@@ -51,8 +56,34 @@ pub fn uriToPath(uri: []const u8) ?[]const u8 {
     return uri[prefix.len..];
 }
 
+// LSP clients normally percent-encode file URIs (`%20`, UTF-8 bytes, ...).
+// Keep `uriToPath` as the zero-allocation fast path for existing callers, and
+// use this owned variant whenever the path is passed to the filesystem or
+// compared with graph module paths.
+pub fn uriToPathAlloc(allocator: std.mem.Allocator, uri: []const u8) !?[]u8 {
+    const raw = uriToPath(uri) orelse return null;
+    const buffer = try allocator.dupe(u8, raw);
+    const decoded = std.Uri.percentDecodeInPlace(buffer);
+    const result = try allocator.alloc(u8, decoded.len);
+    @memcpy(result, decoded);
+    allocator.free(buffer);
+    return result;
+}
+
 pub fn pathToUri(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "file://{s}", .{path});
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(allocator);
+    try encoded.appendSlice(allocator, "file://");
+    for (path) |byte| {
+        const safe = std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '.' or byte == '_' or byte == '~' or byte == '/';
+        if (safe) {
+            try encoded.append(allocator, byte);
+        } else {
+            const hex = "0123456789ABCDEF";
+            try encoded.appendSlice(allocator, &.{ '%', hex[byte >> 4], hex[byte & 0x0f] });
+        }
+    }
+    return encoded.toOwnedSlice(allocator);
 }
 
 pub const GraphAnalysis = struct {
@@ -111,7 +142,8 @@ pub const GraphAnalysis = struct {
 };
 
 pub fn analyze(allocator: std.mem.Allocator, io: std.Io, documents: *const lsp.DocumentStore, entry_uri: []const u8, global_search_roots: []const []const u8) !GraphAnalysis {
-    const entry_path = uriToPath(entry_uri) orelse return error.NotAFileUri;
+    const entry_path = (try uriToPathAlloc(allocator, entry_uri)) orelse return error.NotAFileUri;
+    defer allocator.free(entry_path);
     var graph = module_loader.Graph.init(allocator);
     errdefer graph.deinit();
     // Without this, any import resolved via `$PANOS_STDLIB`/exe-relative
@@ -139,7 +171,17 @@ test "uriToPath/pathToUri round-trip a file:// URI" {
     try std.testing.expectEqualStrings("/пример.ps", path);
     const uri = try pathToUri(allocator, path);
     defer allocator.free(uri);
-    try std.testing.expectEqualStrings("file:///пример.ps", uri);
+    try std.testing.expectEqualStrings("file:///%D0%BF%D1%80%D0%B8%D0%BC%D0%B5%D1%80.ps", uri);
+    const decoded = (try uriToPathAlloc(allocator, uri)).?;
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("/пример.ps", decoded);
+}
+
+test "uriToPathAlloc decodes spaces and percent-encoded UTF-8" {
+    const allocator = std.testing.allocator;
+    const path = (try uriToPathAlloc(allocator, "file:///tmp/Panos%20%D1%82%D0%B5%D1%81%D1%82.ps")).?;
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("/tmp/Panos тест.ps", path);
 }
 
 test "uriToPath rejects a non-file URI" {

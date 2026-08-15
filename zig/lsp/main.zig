@@ -447,7 +447,8 @@ pub const Server = struct {
         // of it — both a same-file declaration and any OTHER open
         // document's own `импорт` of it are matched against this same
         // (path, span) pair below.
-        const entry_path = lsp_graph.uriToPath(context.uri).?; // already validated: `analyze` above only succeeds for file:// URIs
+        const entry_path = (try lsp_graph.uriToPathAlloc(self.allocator, context.uri)).?; // already validated: `analyze` above only succeeds for file:// URIs
+        defer self.allocator.free(entry_path);
         var target_path: []const u8 = entry_path;
         var target_span: panos_core.source.Span = undefined;
         if (resolved.imported_symbols.get(symbol)) |origin| {
@@ -1786,7 +1787,7 @@ test "LSP definition and references cross a real импорт between two open d
     // definition on the `сложить` CALL in main.ps must jump to
     // математика.ps, not stay within main.ps.
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/main.ps\"},\"position\":{\"line\":2,\"character\":5}}}", &output));
-    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"uri\":\"file:///проект/математика.ps\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"uri\":\"file:///%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82/%D0%BC%D0%B0%D1%82%D0%B5%D0%BC%D0%B0%D1%82%D0%B8%D0%BA%D0%B0.ps\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"line\":1") != null);
 
     // references from the `сложить` CALL SITE in main.ps (a declaration
@@ -1796,7 +1797,7 @@ test "LSP definition and references cross a real импорт between two open d
     // here) must find BOTH the declaration in математика.ps (via
     // `includeDeclaration`) AND this same use in main.ps.
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"textDocument/references\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/main.ps\"},\"position\":{\"line\":2,\"character\":5},\"context\":{\"includeDeclaration\":true}}}", &output));
-    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"uri\":\"file:///проект/математика.ps\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"uri\":\"file:///%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82/%D0%BC%D0%B0%D1%82%D0%B5%D0%BC%D0%B0%D1%82%D0%B8%D0%BA%D0%B0.ps\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"uri\":\"file:///проект/main.ps\"") != null);
 }
 

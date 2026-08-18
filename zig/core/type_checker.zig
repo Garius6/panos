@@ -7207,3 +7207,135 @@ test "indexing an array of functions and calling the result is unaffected by exp
 
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
+
+// specs/015-typechecker-metamorphic-tests — hardening-plan Phase C's
+// "metamorphic testing" item. Crash-oracle fuzzing (`zig build fuzz`)
+// only asks "did it panic" — the real bug class this project has
+// actually hit (false duplicate-variant, `Сравниваемое` outside
+// generic, wrong `получить()` type, ...) is a QUIETLY WRONG answer,
+// never a crash. The oracle here instead is: two source forms that are
+// semantically equivalent MUST produce the same diagnostic count and
+// severity multiset. No unparser/pretty-printer exists in this codebase
+// (`grep` confirmed, see hardening plan) — these are literal SOURCE-TEXT
+// pairs, not AST-mutate-and-reprint; each pair below is a direct,
+// deliberately minimal encoding of one of the plan's 5 documented
+// invariants (not a byte-mutated fuzzer — `zig build fuzz --fuzz`'s
+// continuous mode is broken on this Zig toolchain regardless, see
+// project_panos_zig_fuzz_continuous_broken memory).
+fn expectEquivalentDiagnostics(comptime label: []const u8, variant_a: []const u8, variant_b: []const u8) !void {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+
+    const Summary = struct { errors: usize, warnings: usize };
+    const summarize = struct {
+        fn run(allocator: std.mem.Allocator, source_text: []const u8) !Summary {
+            var lexed = try lexer.tokenize(allocator, source_text, 0);
+            defer lexed.deinit();
+            var parsed = try parser.parse(allocator, lexed.tokens.items);
+            defer parsed.deinit();
+            var resolved = try resolver.resolve(allocator, &parsed.ast);
+            defer resolved.deinit();
+            var checked = try check(allocator, &parsed.ast, &resolved);
+            defer checked.deinit();
+
+            var summary = Summary{ .errors = 0, .warnings = 0 };
+            for (resolved.diagnostics.items.items) |item| switch (item.severity) {
+                .err => summary.errors += 1,
+                .warning => summary.warnings += 1,
+            };
+            for (checked.diagnostics.items.items) |item| switch (item.severity) {
+                .err => summary.errors += 1,
+                .warning => summary.warnings += 1,
+            };
+            return summary;
+        }
+    }.run;
+
+    const a = try summarize(std.testing.allocator, variant_a);
+    const b = try summarize(std.testing.allocator, variant_b);
+    if (a.errors != b.errors or a.warnings != b.warnings) {
+        std.debug.print(
+            "metamorphic mismatch ({s}): variant A -> {d} error(s)/{d} warning(s), variant B -> {d} error(s)/{d} warning(s)\n",
+            .{ label, a.errors, a.warnings, b.errors, b.warnings },
+        );
+        return error.MetamorphicDiagnosticMismatch;
+    }
+}
+
+test "metamorphic: untyped пер vs explicitly typed пер infer identically" {
+    try expectEquivalentDiagnostics(
+        "untyped vs typed let binding",
+        "функ ф() -> Массив(Число)\n" ++
+            "выбор истина\n" ++
+            "истина -> массив()\n" ++
+            "ложь -> массив(1.0)\n" ++
+            "конец\n" ++
+            "конец",
+        "функ ф() -> Массив(Число)\n" ++
+            "пер x: Массив(Число) = выбор истина\n" ++
+            "истина -> массив()\n" ++
+            "ложь -> массив(1.0)\n" ++
+            "конец\n" ++
+            "x\n" ++
+            "конец",
+    );
+}
+
+test "metamorphic: named struct constructor argument order doesn't affect diagnostics" {
+    const decl =
+        "тип Точка = структура\n" ++
+        "x: Число\n" ++
+        "y: Число\n" ++
+        "конец\n";
+    try expectEquivalentDiagnostics(
+        "named constructor argument order",
+        decl ++ "функ старт() -> Точка\n" ++ "Точка(x = 1.0, y = 2.0)\n" ++ "конец",
+        decl ++ "функ старт() -> Точка\n" ++ "Точка(y = 2.0, x = 1.0)\n" ++ "конец",
+    );
+}
+
+test "metamorphic: reordering two independent top-level declarations doesn't affect diagnostics" {
+    try expectEquivalentDiagnostics(
+        "top-level declaration order",
+        "функ а() -> Число\n1.0\nконец\n" ++
+            "функ б() -> Число\n2.0\nконец\n" ++
+            "функ старт() -> Число\nа() + б()\nконец",
+        "функ б() -> Число\n2.0\nконец\n" ++
+            "функ а() -> Число\n1.0\nконец\n" ++
+            "функ старт() -> Число\nа() + б()\nконец",
+    );
+}
+
+test "metamorphic: method call through concrete type vs through interface-typed variable" {
+    const decl =
+        "тип Печатаемый = интерфейс\n" ++
+        "функ показать() -> Строка\n" ++
+        "конец\n" ++
+        "тип Точка = структура\n" ++
+        "x: Число\n" ++
+        "конец\n" ++
+        "реализация Печатаемый для Точка\n" ++
+        "функ показать(это: Точка) -> Строка\n" ++
+        "\"точка\"\n" ++
+        "конец\n" ++
+        "конец\n";
+    try expectEquivalentDiagnostics(
+        "concrete vs interface-typed receiver",
+        decl ++ "функ старт() -> Строка\n" ++ "пер t = Точка(1.0)\n" ++ "t.показать()\n" ++ "конец",
+        decl ++ "функ старт() -> Строка\n" ++ "пер t: Печатаемый = Точка(1.0)\n" ++ "t.показать()\n" ++ "конец",
+    );
+}
+
+test "metamorphic: reordering two non-conflicting match arms doesn't affect diagnostics" {
+    const decl =
+        "тип Ответ = перечисление\n" ++
+        "Да(Число)\n" ++
+        "Нет\n" ++
+        "конец\n" ++
+        "функ ф(о: Ответ) -> Число\n";
+    try expectEquivalentDiagnostics(
+        "match arm order",
+        decl ++ "выбор о\n" ++ "Ответ.Да(x) -> x\n" ++ "Ответ.Нет -> 0.0\n" ++ "конец\n" ++ "конец",
+        decl ++ "выбор о\n" ++ "Ответ.Нет -> 0.0\n" ++ "Ответ.Да(x) -> x\n" ++ "конец\n" ++ "конец",
+    );
+}

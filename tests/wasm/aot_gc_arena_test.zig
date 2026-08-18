@@ -103,7 +103,7 @@ test "старт invoked twice in a row still produces the correct result (arena
     const source =
         \\функ старт() -> Целое
         \\пер s: Строка = "число-" + строки.из_числа(7.0)
-        \\строки.длина_байт(s)
+        \\длина(s)
         \\конец
     ;
     const wasm_bytes = try buildGraphToWasmBytes(allocator, source);

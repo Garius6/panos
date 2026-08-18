@@ -963,9 +963,6 @@ const FunctionCompiler = struct {
         if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "строки")) return false;
         const Op = struct { name: []const u8, argc: usize, instr: bytecode.Instruction };
         const ops = [_]Op{
-            .{ .name = "байт", .argc = 2, .instr = .{ .str_byte = {} } },
-            .{ .name = "длина_байт", .argc = 1, .instr = .{ .str_len_bytes = {} } },
-            .{ .name = "срез_байт", .argc = 3, .instr = .{ .str_slice_bytes = {} } },
             .{ .name = "из_байтов", .argc = 1, .instr = .{ .str_from_bytes = {} } },
             .{ .name = "в_число", .argc = 1, .instr = .{ .str_to_number = {} } },
             .{ .name = "из_числа", .argc = 1, .instr = .{ .str_number_to_str = {} } },

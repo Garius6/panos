@@ -46,7 +46,6 @@ fn unsupported(comptime what: []const u8) error{StringExpandUnsupported} {
 const StringRuntime = struct {
     concat: mir.FunctionId,
     equal: mir.FunctionId,
-    byte_length: mir.FunctionId,
     starts_with: mir.FunctionId,
     utf8_width: mir.FunctionId,
     length: mir.FunctionId,
@@ -101,7 +100,6 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     const runtime = StringRuntime{
         .concat = concat,
         .equal = try buildEqual(allocator, module, type_store, layout),
-        .byte_length = try buildByteLength(allocator, module, type_store, layout),
         .starts_with = try buildStartsWith(allocator, module, type_store, layout),
         .utf8_width = utf8_width,
         .length = length,
@@ -215,7 +213,6 @@ fn expandInstruction(builder: *mir_builder.Builder, instruction: mir.Instruction
         },
         .call_builtin => |v| {
             const callee: ?mir.FunctionId = blk: {
-                if (std.mem.eql(u8, v.name, "строки::длина_байт")) break :blk ctx.runtime.byte_length;
                 if (std.mem.eql(u8, v.name, "строки::начинается_с")) break :blk ctx.runtime.starts_with;
                 if (std.mem.eql(u8, v.name, "строки::длина")) break :blk ctx.runtime.length;
                 if (std.mem.eql(u8, v.name, "строки::срез")) break :blk ctx.runtime.slice;
@@ -471,25 +468,6 @@ fn buildEqual(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     const true_val = try wasm_heap.boolConst(&builder, layout.bool_type, true);
     builder.terminate(.{ .return_value = .{ .value = true_val } });
 
-    return id;
-}
-
-// `@string_byte_length(s) -> Число`: trivial, the length header IS the
-// byte length. Matches `строки.длина_байт`'s native semantics exactly
-// (`vm.zig`'s `strLenBytes` — plain `string.len`).
-fn buildByteLength(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
-    const id = try mir_builder.newFunction(module, allocator, "@string_byte_length", wasm_heap.dummy_symbol, type_store.builtins.number, wasm_heap.dummy_span);
-    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
-    const s_local = try builder.newLocal(wasm_heap.dummy_symbol, "s", layout.ptr_type);
-    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{s_local});
-    builder.currentFunction().type_store = type_store;
-
-    const s1 = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
-    const len_i32 = try builder.newValue(layout.idx_type);
-    try builder.emit(.{ .mem_load = .{ .dst = len_i32, .addr = s1 } });
-    const len_f64 = try builder.newValue(type_store.builtins.number);
-    try builder.emit(.{ .unary = .{ .dst = len_f64, .op = .from_i32, .src = len_i32 } });
-    builder.terminate(.{ .return_value = .{ .value = len_f64 } });
     return id;
 }
 

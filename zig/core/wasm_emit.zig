@@ -1079,7 +1079,6 @@ fn hostImportNameForBuiltin(name: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "состояние::прочитать")) return "state_read";
     if (std.mem.eql(u8, name, "состояние::записать")) return "state_write";
     if (std.mem.eql(u8, name, "строки::длина")) return "pw_string_length";
-    if (std.mem.eql(u8, name, "строки::длина_байт")) return "pw_string_byte_length";
     if (std.mem.eql(u8, name, "строки::срез")) return "pw_string_slice";
     if (std.mem.eql(u8, name, "строки::найти")) return "pw_string_find";
     if (std.mem.eql(u8, name, "строки::начинается_с")) return "pw_string_starts_with";
@@ -1128,7 +1127,7 @@ fn builtinSignature(name: []const u8) !BuiltinSignature {
         return .{ .params = &.{wasm_module.wasm_i32}, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "@runtime::строка_сложить"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = wasm_module.wasm_i32 };
-    if (std.mem.eql(u8, name, "строки::длина") or std.mem.eql(u8, name, "строки::длина_байт"))
+    if (std.mem.eql(u8, name, "строки::длина"))
         return .{ .params = &.{wasm_module.wasm_i32}, .result = wasm_module.wasm_f64 };
     if (std.mem.eql(u8, name, "строки::срез"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_f64, wasm_module.wasm_f64 }, .result = wasm_module.wasm_i32 };

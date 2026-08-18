@@ -43,9 +43,6 @@ pub fn nativeModuleExports(name: []const u8) ?[]const []const u8 {
         .{ .name = "время", .exports = &.{ "сейчас_мс", "монотонно_мс", "спать_мс" } },
         .{ .name = "ввод_вывод", .exports = &.{ "печать", "строка", "прочитать_строку" } },
         .{ .name = "строки", .exports = &.{
-            "байт",
-            "длина_байт",
-            "срез_байт",
             "из_байтов",
             "в_число",
             "из_числа",
@@ -462,22 +459,19 @@ const Resolver = struct {
         // rather than an empty string, so callers can distinguish "user
         // pressed Enter on an empty line" from "stdin closed".
         try self.installBuiltinModule("ввод_вывод", &.{ "печать", "строка", "прочитать_строку" });
-        // `строки` — the other half of the panosiki audit's headline gap:
-        // completely absent (not native, no `std/строки.ps`), yet docs
-        // (`docs/src/language/basic-types.md` §"Байты") describe byte-level
-        // primitives (`срез_байт`/`из_байтов`/`байт`) that can ONLY be
-        // native (no way to build them out of other panos-level string
-        // ops) — this was always meant to be a native module like `фс`/
-        // `время`, not a `std/*.ps` library, and simply never got ported.
-        // Scoped to the 18 functions panosiki/std actually calls, plus
-        // the 4 mass-conversion primitives docs/src/language/basic-types.md
-        // §"Байты" also documents (`в_байты`/`в_руны`/`из_рун`/
-        // `кодовая_точка`) — real gap found via a docs-example sweep
-        // (those 4 doc examples never compiled at all before this).
+        // `строки` — native module (`std/*.ps` can't build these string
+        // primitives out of other panos-level ops). `байт`/`длина_байт`/
+        // `срез_байт` were REMOVED (not deprecated) — they exposed a
+        // BYTE index on `Строка` alongside `найти`/`срез`'s RUNE index,
+        // both typed as bare `Целое` with nothing preventing mixing the
+        // two (confirmed real data corruption on Cyrillic input, see
+        // `docs/src/language/standard-library.md` §"Байты"). Go-style
+        // fix: byte-level work now goes through `строки.в_байты(s) ->
+        // Массив(Целое)` + ordinary array methods (`.длина()`/
+        // `.получить()`/`.срез()`, already existing) — a rune index and
+        // a byte-array index are now different in-language index spaces
+        // (`Строка` vs `Массив`), not just a documentation warning.
         try self.installBuiltinModule("строки", &.{
-            "байт",
-            "длина_байт",
-            "срез_байт",
             "из_байтов",
             "в_число",
             "из_числа",

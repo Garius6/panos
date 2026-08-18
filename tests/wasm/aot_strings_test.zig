@@ -101,14 +101,20 @@ test "string inequality after concat" {
     try std.testing.expectEqualStrings("1\n", result.stdout);
 }
 
-test "длина is rune count, длина_байт is byte count, начинается_с" {
+test "длина is rune count, начинается_с" {
     const allocator = std.testing.allocator;
     var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
     defer io.deinit();
 
+    // `строки.в_байты` (byte-level work moved here off `Строка`, see
+    // specs/014-string-byte-index-safety/) isn't lowered in WASM AOT at
+    // all yet (`mir_lowering.zig`'s `lowerStringBuiltinCall` — pre-existing
+    // gap, unrelated to that migration) — this test keeps only the
+    // rune-count/`начинается_с` assertions AOT already supports; byte-count
+    // coverage lives in the native-only `type_checker.zig`/`vm.zig` tests.
     const source =
         \\функ старт() -> Булево
-        \\    (длина("привет") == 6.0) и (строки.длина_байт("привет") == 12.0)
+        \\    (длина("привет") == 6.0)
         \\        и строки.начинается_с("привет мир", "привет")
         \\        и (не строки.начинается_с("привет мир", "мир"))
         \\конец

@@ -1648,9 +1648,6 @@ pub const Vm = struct {
             .io_print => try self.ioPrint(false),
             .io_println => try self.ioPrint(true),
             .io_read_line => try self.ioReadLine(),
-            .str_byte => try self.strByte(),
-            .str_len_bytes => try self.strLenBytes(),
-            .str_slice_bytes => try self.strSliceBytes(),
             .str_from_bytes => try self.strFromBytes(),
             .str_to_bytes => try self.strToBytes(),
             .str_to_runes => try self.strToRunes(),
@@ -2556,71 +2553,6 @@ pub const Vm = struct {
             current += 1;
         }
         return offset;
-    }
-
-    fn strByte(self: *Vm) anyerror!void {
-        const index_value = try self.pop();
-        const string_value = try self.pop();
-        const string = string_value.stringBytes() orelse {
-            try self.fault("Runtime Error: строки.байт() ожидает строку", .{});
-            return;
-        };
-        const index = try self.arrayIndex(index_value);
-        if (index >= string.len) {
-            try self.fault("Runtime Error: строки.байт(): индекс вне границ", .{});
-            return;
-        }
-        try self.stack.append(self.allocator, .{ .number = @floatFromInt(string[index]) });
-    }
-
-    fn strLenBytes(self: *Vm) anyerror!void {
-        const string_value = try self.pop();
-        const string = string_value.stringBytes() orelse {
-            try self.fault("Runtime Error: строки.длина_байт() ожидает строку", .{});
-            return;
-        };
-        try self.stack.append(self.allocator, .{ .number = @floatFromInt(string.len) });
-    }
-
-    fn strSliceBytes(self: *Vm) anyerror!void {
-        const end_value = try self.pop();
-        const start_value = try self.pop();
-        const string_value = try self.pop();
-        const string = string_value.stringBytes() orelse {
-            try self.fault("Runtime Error: строки.срез_байт() ожидает строку", .{});
-            return;
-        };
-        const start = try self.arrayIndex(start_value);
-        const end = try self.arrayIndex(end_value);
-        if (start > end or end > string.len) {
-            try self.fault("Runtime Error: строки.срез_байт(): границы вне диапазона", .{});
-            return;
-        }
-        // `строки.найти` returns a RUNE index, `срез_байт` takes BYTE
-        // indices — mixing the two (a real, confirmed-by-running trap:
-        // `строки.срез_байт(текст, строки.найти(текст, "хлеб", 0), ...)`
-        // silently produced mangled output on Cyrillic input, since a
-        // rune offset landing mid-character is a perfectly valid byte
-        // offset арифметически, just not a valid UTF-8 boundary) is not
-        // fixable by guessing which index kind the caller meant — but a
-        // continuation byte (`10xxxxxx`) at either boundary means the
-        // slice cuts a multi-byte rune in half, which is NEVER correct
-        // regardless of which index kind was intended. Converts silent
-        // corruption into a loud, debuggable error at the exact call
-        // site that got it wrong, instead of mangled output surfacing
-        // however many operations later someone finally looks at the
-        // string.
-        const is_continuation_byte = struct {
-            fn check(bytes: []const u8, offset: usize) bool {
-                return offset < bytes.len and bytes[offset] & 0xC0 == 0x80;
-            }
-        }.check;
-        if (is_continuation_byte(string, start) or is_continuation_byte(string, end)) {
-            try self.fault("Runtime Error: строки.срез_байт(): граница внутри UTF-8-руны — вероятно, перепутаны rune- и byte-индексы", .{});
-            return;
-        }
-        const result = try self.heap.createString(try self.allocator.dupe(u8, string[start..end]));
-        try self.stack.append(self.allocator, .{ .heap_string = result });
     }
 
     fn strFromBytes(self: *Vm) anyerror!void {

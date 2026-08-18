@@ -3816,47 +3816,6 @@ const Checker = struct {
                 const result_symbol = self.findTypeSymbol("Результат") orelse return self.result.types.poison();
                 return self.nominalType(result_symbol, &.{ self.result.types.builtins.string, self.result.types.builtins.error_value });
             }
-            if (self.isBuiltinModule(symbol, "строки", "байт")) {
-                if (call.arguments.len != 2) {
-                    try self.report(call.span, "Type Error: строки.байт() ожидает 2 аргумента", .{});
-                    for (call.arguments) |argument| _ = try self.infer(argument);
-                    return self.result.types.builtins.integer;
-                }
-                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
-                    try self.report(call.span, "Type Error: строки.байт() ожидает строку первым аргументом", .{});
-                }
-                if (!self.isNumeric(try self.infer(call.arguments[1]))) {
-                    try self.report(call.span, "Type Error: строки.байт() ожидает индекс-число вторым аргументом", .{});
-                }
-                return self.result.types.builtins.integer;
-            }
-            if (self.isBuiltinModule(symbol, "строки", "длина_байт")) {
-                if (call.arguments.len != 1) {
-                    try self.report(call.span, "Type Error: строки.длина_байт() ожидает 1 аргумент", .{});
-                    for (call.arguments) |argument| _ = try self.infer(argument);
-                    return self.result.types.builtins.integer;
-                }
-                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
-                    try self.report(call.span, "Type Error: строки.длина_байт() ожидает строку", .{});
-                }
-                return self.result.types.builtins.integer;
-            }
-            if (self.isBuiltinModule(symbol, "строки", "срез_байт")) {
-                if (call.arguments.len != 3) {
-                    try self.report(call.span, "Type Error: строки.срез_байт() ожидает 3 аргумента", .{});
-                    for (call.arguments) |argument| _ = try self.infer(argument);
-                    return self.result.types.builtins.string;
-                }
-                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
-                    try self.report(call.span, "Type Error: строки.срез_байт() ожидает строку первым аргументом", .{});
-                }
-                for (call.arguments[1..3]) |argument| {
-                    if (!self.isNumeric(try self.infer(argument))) {
-                        try self.report(call.span, "Type Error: строки.срез_байт() ожидает границы-числа", .{});
-                    }
-                }
-                return self.result.types.builtins.string;
-            }
             if (self.isBuiltinModule(symbol, "строки", "из_байтов")) {
                 if (call.arguments.len != 1) {
                     try self.report(call.span, "Type Error: строки.из_байтов() ожидает 1 аргумент", .{});

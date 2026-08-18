@@ -2471,9 +2471,7 @@ fn lowerStringBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: typ
     if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "строки")) return null;
 
     const property = ctx.tree.expr(call.callee).property;
-    const name = if (std.mem.eql(u8, property.property, "длина_байт"))
-        "строки::длина_байт"
-    else if (std.mem.eql(u8, property.property, "срез"))
+    const name = if (std.mem.eql(u8, property.property, "срез"))
         "строки::срез"
     else if (std.mem.eql(u8, property.property, "найти"))
         "строки::найти"

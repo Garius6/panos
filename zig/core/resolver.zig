@@ -1247,7 +1247,32 @@ const Resolver = struct {
             },
             .index => |index| {
                 try self.resolveExpression(tree, index.object);
-                try self.resolveExpression(tree, index.index);
+                // `ф[Тип](...)` — explicit generic-argument call (see
+                // `specs/013-explicit-generic-args/`) parses as an
+                // ordinary `Index_Expr`. Indexing a plain FUNCTION
+                // symbol was never valid ordinary semantics (only
+                // arrays/maps are indexable) — when `index.object`
+                // resolves to one, `index.index` may be a TYPE name
+                // (a builtin primitive like `Число`/`Строка` has no
+                // resolvable value-symbol in this scope table at all,
+                // unlike a user struct's auto-registered constructor)
+                // rather than an ordinary value reference. The resolver
+                // has no notion of generics (that's computed later, by
+                // `type_checker.zig`), so it cannot tell explicit-generic
+                // calls apart from a genuinely broken index here — it
+                // simply skips resolving `index.index` as a value in
+                // this one narrow shape, deferring entirely to
+                // `resolveTypeFromExpr` (does its own independent
+                // lookup, doesn't need this pass's `expr_symbols`) to
+                // decide whether it is a real type argument. Every OTHER
+                // index target (arrays, maps, unresolved names) keeps
+                // today's exact behavior — an unresolved index there
+                // remains a hard Resolve Error.
+                const indexes_a_function = if (self.result.expr_symbols.get(index.object)) |object_symbol|
+                    if (self.result.symbols.get(object_symbol)) |entry| entry.kind == .function else false
+                else
+                    false;
+                if (!indexes_a_function) try self.resolveExpression(tree, index.index);
             },
             .try_expr => |try_expression| try self.resolveExpression(tree, try_expression.value),
             .match_expr => |match| {

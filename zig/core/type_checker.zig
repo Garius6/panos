@@ -4512,11 +4512,38 @@ const Checker = struct {
             },
             else => {},
         }
-        const callee_type = try self.infer(call.callee);
+        // `ф[Тип](...)` — explicit generic-argument call — parses
+        // TODAY, unchanged, as `Call_Expr{ callee: Index_Expr{ object,
+        // index } }` (the same shape as "index an array of functions,
+        // then call the result", e.g. `функции[0](args)` — see
+        // `specs/013-explicit-generic-args/`). The ambiguity is resolved
+        // HERE, semantically, not by the parser (which has no
+        // backtracking and cannot know at parse time whether `ф` is
+        // generic): if `index.object` resolves to a symbol with generic
+        // parameters, `ф[Тип](...)` is reinterpreted as an explicit call
+        // — `effective_callee` becomes `index.object` and
+        // `explicit_type_arguments` is seeded from `Тип`. When
+        // `index.object` is NOT a generic function (an ordinary
+        // indexable value), NEITHER changes — the existing
+        // index-then-call path below runs exactly as it always has
+        // (zero regression, see spec.md FR-006).
+        var effective_callee = call.callee;
+        var explicit_type_arguments: ?[]const types.TypeId = null;
+        if (self.tree.expr(call.callee).* == .index) {
+            const index = self.tree.expr(call.callee).index;
+            if (self.resolution.expr_symbols.get(index.object)) |object_symbol| {
+                const generic_parameters = self.result.generic_function_parameters.get(object_symbol) orelse &.{};
+                if (generic_parameters.len != 0) {
+                    effective_callee = index.object;
+                    explicit_type_arguments = try self.resolveExplicitGenericArguments(index.index, generic_parameters, call.span);
+                }
+            }
+        }
+        const callee_type = try self.infer(effective_callee);
         const entry = self.result.types.get(callee_type) orelse return self.result.types.poison();
         switch (entry.*) {
             .function => |function| {
-                const callee_symbol = self.resolution.expr_symbols.get(call.callee);
+                const callee_symbol = self.resolution.expr_symbols.get(effective_callee);
                 const arguments = if (call.argument_names) |_| blk: {
                     const symbol = callee_symbol orelse {
                         try self.report(call.span, "Type Error: именованные аргументы не поддержаны для этого вызова", .{});
@@ -4537,6 +4564,21 @@ const Checker = struct {
                 if (generic_parameters.len != 0) {
                     var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
                     defer substitutions.deinit();
+                    // Explicit generic arguments (`ф[Тип](...)`, detected
+                    // above) are seeded FIRST, before anything inferred
+                    // from context — a disagreeing inferred argument
+                    // below (`inferGenericSubstitution`'s own
+                    // already-present-entry check) then reports the
+                    // conflict as ordinary substitution ambiguity, with
+                    // no separate mechanism needed (see
+                    // `specs/013-explicit-generic-args/research.md`
+                    // "Decision: конфликт explicit-vs-inferred ловится
+                    // БЕСПЛАТНО").
+                    if (explicit_type_arguments) |explicit_types| {
+                        for (generic_parameters, explicit_types) |parameter, resolved| {
+                            try substitutions.put(parameter.typ, resolved);
+                        }
+                    }
                     // Seed from the caller's KNOWN expected type FIRST
                     // (bidirectional half) — see `inferCallExpected`'s doc
                     // comment. Structural unification against
@@ -4889,6 +4931,113 @@ const Checker = struct {
             },
             else => try self.result.types.poison(),
         };
+    }
+
+    // Parallel to `resolveType` (`ast.TypeId -> types.TypeId`), but
+    // starting from an ORDINARY EXPRESSION instead of a real `TypeNode`.
+    // Needed for `ф[Тип](...)` explicit generic-argument calls: `Тип`
+    // parses as `Index_Expr`'s `index` field — an `Expr`, not a
+    // `TypeNode` — there is no real AST type-node to hand `resolveType`,
+    // and synthesizing one would mean mutating `self.tree`, which is
+    // `*const Ast` here (see `specs/013-explicit-generic-args/research.md`
+    // "Decision: Expr → TypeId напрямую"). Reuses the SAME symbol-lookup
+    // helpers `resolveType` already calls (`findGenericParameter`,
+    // `builtinType`, `findTypeSymbol`, `findQualifiedTypeSymbol`,
+    // `nominalType`) — only the entry shape differs.
+    //
+    // Returns `null` when `expr`'s shape cannot denote a type AT ALL
+    // (arithmetic, arbitrary calls, string/number literals, ...) — the
+    // caller (`inferCallExpected`'s explicit-generic-call detection)
+    // reports THAT case itself, with a message distinct from "this looks
+    // like a type but the name is unknown" (which this function reports
+    // directly, mirroring `resolveType`'s own diagnostics).
+    fn resolveTypeFromExpr(self: *Checker, expr: ast.ExprId) anyerror!?types.TypeId {
+        return switch (self.tree.expr(expr).*) {
+            .ident => |ident| self.findGenericParameter(ident.name) orelse builtinType(&self.result.types, ident.name) orelse blk: {
+                if (self.findTypeSymbol(ident.name)) |symbol| {
+                    if (self.result.alias_type_nodes.contains(symbol)) break :blk try self.resolveAlias(symbol, ident.span);
+                    break :blk try self.nominalType(symbol, &.{});
+                }
+                try self.report(ident.span, "Type Error: неизвестный тип '{s}'", .{ident.name});
+                break :blk try self.result.types.poison();
+            },
+            // `модуль.Тип` — qualified type name. Only a bare `.ident`
+            // object is type-like (`а.б.Тип`-style deeper chains don't
+            // exist for panos modules, which never nest); anything else
+            // means this `.property` is an ordinary value expression, not
+            // a type reference.
+            .property => |property| blk: {
+                if (self.tree.expr(property.object).* != .ident) break :blk null;
+                const module_name = self.tree.expr(property.object).ident.name;
+                const symbol = self.findQualifiedTypeSymbol(module_name, property.property) orelse {
+                    try self.report(property.span, "Type Error: неизвестный тип '{s}.{s}'", .{ module_name, property.property });
+                    break :blk try self.result.types.poison();
+                };
+                if (self.result.type_aliases.get(symbol)) |aliased| break :blk aliased;
+                break :blk try self.nominalType(symbol, &.{});
+            },
+            // `Тип(Аргумент, ...)` — generic instantiation written at a
+            // call site, same shape a constructor call would have.
+            // `callee` must itself be type-like (`.ident`/`.property` as
+            // above); every argument is resolved recursively through this
+            // SAME function, so nested instantiations
+            // (`Список(Коробка(Число))`) work without extra cases.
+            .call => |call| blk: {
+                const callee_expr = self.tree.expr(call.callee).*;
+                const symbol = switch (callee_expr) {
+                    .ident => |ident| self.findTypeSymbol(ident.name) orelse break :blk null,
+                    .property => |property| prop_blk: {
+                        if (self.tree.expr(property.object).* != .ident) break :blk null;
+                        const module_name = self.tree.expr(property.object).ident.name;
+                        break :prop_blk self.findQualifiedTypeSymbol(module_name, property.property) orelse break :blk null;
+                    },
+                    else => break :blk null,
+                };
+                var arguments: std.ArrayList(types.TypeId) = .empty;
+                defer arguments.deinit(self.result.allocator);
+                for (call.arguments) |argument_expr| {
+                    const argument_type = (try self.resolveTypeFromExpr(argument_expr)) orelse break :blk null;
+                    try arguments.append(self.result.allocator, argument_type);
+                }
+                break :blk try self.nominalType(symbol, arguments.items);
+            },
+            else => null,
+        };
+    }
+
+    // Extracts the explicit type-argument list from an `Index_Expr`'s
+    // `index` field for a confirmed explicit-generic-call site (see
+    // `inferCallExpected`). A single argument is the bare expression
+    // itself (`ф[Тип](...)`); several are an existing `Tuple_Expr`
+    // reused as a container (`ф[(Т1, Т2)](...)`, see
+    // `specs/013-explicit-generic-args/research.md` "Decision: несколько
+    // type-аргументов"). Always returns exactly
+    // `generic_parameters.len` entries (poison-filled on arity mismatch
+    // or an unresolved shape) so the caller's substitution-seeding loop
+    // never has to special-case a short list.
+    fn resolveExplicitGenericArguments(
+        self: *Checker,
+        index_value: ast.ExprId,
+        generic_parameters: []const GenericParameter,
+        span: source.Span,
+    ) anyerror![]const types.TypeId {
+        const type_exprs: []const ast.ExprId = switch (self.tree.expr(index_value).*) {
+            .tuple => |tuple| tuple.elements,
+            else => &[_]ast.ExprId{index_value},
+        };
+        const resolved = try self.result.arena.allocator().alloc(types.TypeId, generic_parameters.len);
+        if (type_exprs.len != generic_parameters.len) {
+            try self.report(span, "Type Error: неверное количество явных type-аргументов", .{});
+            for (resolved) |*slot| slot.* = try self.result.types.poison();
+            return resolved;
+        }
+        for (type_exprs, resolved) |type_expr, *slot| {
+            slot.* = (try self.resolveTypeFromExpr(type_expr)) orelse blk: {
+                try self.report(ast.exprSpan(self.tree.expr(type_expr).*), "Type Error: явный generic-аргумент должен быть именем типа", .{});
+                break :blk try self.result.types.poison();
+            };
+        }
+        return resolved;
     }
 
     // Returns the FIRST interface bound of `parameter`, if `parameter`
@@ -6856,6 +7005,239 @@ test "type checker does not warn when an if has no else (false path falls throug
     // exact shape hits with `возврат` in a lone then-branch (separate
     // from what this test is checking).
     var lexed = try lexer.tokenize(std.testing.allocator, "функ f(x: Булево) -> Число\nесли x тогда\nпаника(\"boom\")\nконец\n2.0\nконец", 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+// specs/013-explicit-generic-args — `ф[Тип](...)` explicit generic-argument
+// calls. `Никогда`-returning `паника(...)` bodies keep these fixtures
+// minimal (directionally assignable to any declared return type) — the
+// call SITE's explicit-argument handling is what's under test, not the
+// generic function's own body.
+
+test "explicit generic argument resolves a type parameter absent from any inferrable context" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator,
+        \\тип Коробка[T] = структура
+        \\    значение: T
+        \\конец
+        \\функ ф[T](x: Строка) -> Коробка(T)
+        \\    паника("не реализовано")
+        \\конец
+        \\функ вызов() -> Пусто
+        \\    ф[Число]("42")
+        \\конец
+    , 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "without an explicit generic argument, an unconstrained type parameter still degrades silently (no regression)" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator,
+        \\тип Коробка[T] = структура
+        \\    значение: T
+        \\конец
+        \\функ ф[T](x: Строка) -> Коробка(T)
+        \\    паника("не реализовано")
+        \\конец
+        \\функ вызов() -> Пусто
+        \\    ф("42")
+        \\конец
+    , 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+// A real cross-module (`module_loader`/`module_compiler`) test for
+// `либ.ф[Тип](...)` was deliberately dropped here: pulling
+// `module_compiler.zig` into `type_checker_unit_tests` transitively
+// drags in `vm.zig`'s native SQL/FFI code, which THIS test binary (see
+// `build.zig`'s `type_checker_unit_tests`) is not linked against
+// (unlike `vm_unit_tests`) — a real, reproducible link failure, not a
+// flake (confirmed by isolating on a clean `.zig-cache` against
+// unmodified `HEAD` first). Not worth wiring a new link dependency into
+// this binary for one test: the qualified-call detection path
+// (`self.resolution.expr_symbols.get(index.object)` where
+// `index.object` is a `Property_Expr`) is the EXACT SAME lookup the
+// pre-existing, already-proven-working ORDINARY qualified generic call
+// path uses (`callee_symbol = self.resolution.expr_symbols.get(call.callee)`
+// for `модуль.ф(...)`, unchanged by this feature) — qualified explicit
+// calls are structurally covered by that existing behavior, not
+// separately re-verified end-to-end here.
+
+test "explicit generic argument conflicting with the actual argument type is a Type Error" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator,
+        \\функ ф[T](x: T) -> T
+        \\    x
+        \\конец
+        \\функ вызов() -> Пусто
+        \\    ф[Число]("текст")
+        \\конец
+    , 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expect(checked.diagnostics.items.items.len >= 1);
+}
+
+test "explicit generic argument matching what would have been inferred anyway compiles cleanly" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator,
+        \\функ ф[T](x: T) -> T
+        \\    x
+        \\конец
+        \\функ вызов() -> Пусто
+        \\    ф[Число](1.0)
+        \\конец
+    , 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "explicit generic argument violating an interface bound is a Type Error" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator,
+        \\тип Точка = структура
+        \\    x: Число
+        \\конец
+        \\функ макс[T: Сравниваемое](a: T) -> T
+        \\    a
+        \\конец
+        \\функ вызов() -> Пусто
+        \\    макс[Точка](Точка(1.0))
+        \\конец
+    , 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: тип аргумента не реализует ограничение 'Сравниваемое'", checked.diagnostics.items.items[0].message);
+}
+
+test "explicit generic argument on a non-type-shaped expression is a clear diagnostic, not silent indexing" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator,
+        \\функ ф[T](x: T) -> T
+        \\    x
+        \\конец
+        \\функ вызов() -> Пусто
+        \\    ф[1.0 + 2.0]("x")
+        \\конец
+    , 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expect(checked.diagnostics.items.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, checked.diagnostics.items.items[0].message, "явный generic-аргумент должен быть именем типа") != null);
+}
+
+test "explicit generic argument on an unknown type name is a clear diagnostic" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator,
+        \\функ ф[T](x: T) -> T
+        \\    x
+        \\конец
+        \\функ вызов() -> Пусто
+        \\    ф[НесуществующийТип]("x")
+        \\конец
+    , 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expect(checked.diagnostics.items.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, checked.diagnostics.items.items[0].message, "неизвестный тип") != null);
+}
+
+test "multiple explicit generic arguments via an existing tuple literal" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator,
+        \\функ пара[T, U](a: T, b: U) -> T
+        \\    a
+        \\конец
+        \\функ вызов() -> Пусто
+        \\    пара[(Число, Строка)](1.0, "x")
+        \\конец
+    , 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "indexing an array of functions and calling the result is unaffected by explicit generic-call detection" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(std.testing.allocator,
+        \\функ удвоить(x: Число) -> Число
+        \\    x * 2.0
+        \\конец
+        \\функ вызов() -> Число
+        \\    пер функции: Массив(функ(Число) -> Число) = массив(удвоить)
+        \\    функции[0.0](21.0)
+        \\конец
+    , 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
     defer parsed.deinit();

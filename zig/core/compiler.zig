@@ -668,10 +668,37 @@ const FunctionCompiler = struct {
             } });
             return;
         }
-        try self.compileExpression(call.callee);
+        try self.compileExpression(self.explicitGenericCallCallee(call.callee));
         for (arguments) |argument| try self.compileExpression(argument);
         if (arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
         try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(arguments.len) });
+    }
+
+    // `ф[Тип](...)` — explicit generic-argument call (see
+    // `specs/013-explicit-generic-args/`) — parses as `Call_Expr{
+    // callee: Index_Expr{ object, index } }`, the SAME shape as
+    // "index an array of functions, then call the result". The
+    // typechecker reinterprets this at `inferCallExpected` time when
+    // `index.object` resolves to a generic-function symbol, but codegen
+    // walks the SAME raw AST independently and would otherwise try to
+    // compile `index.index` (a compile-time-only type name, e.g.
+    // `Число`) as an ordinary runtime index operand — panos generics are
+    // never monomorphized (no per-call-site specialization exists), so
+    // the explicit type argument carries no runtime information at all;
+    // codegen only needs to skip straight to `index.object`, exactly
+    // mirroring the typechecker's `effective_callee` detection. Returns
+    // `callee` unchanged for every other shape (ordinary calls, and
+    // genuine index-then-call on a non-generic value) — zero behavior
+    // change there.
+    fn explicitGenericCallCallee(self: *FunctionCompiler, callee: ast.ExprId) ast.ExprId {
+        const index = switch (self.compiler.tree.expr(callee).*) {
+            .index => |value| value,
+            else => return callee,
+        };
+        const object_symbol = self.compiler.resolution.expr_symbols.get(index.object) orelse return callee;
+        const generic_parameters = self.compiler.checked.generic_function_parameters.get(object_symbol) orelse &.{};
+        if (generic_parameters.len == 0) return callee;
+        return index.object;
     }
 
     fn compileErrorConstructor(self: *FunctionCompiler, call: anytype) !bool {

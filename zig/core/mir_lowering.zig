@@ -2600,21 +2600,43 @@ fn classifyCapture(checked: *const type_checker.CheckResult, type_id: types.Type
 // Generic nominal declarations keep their field types in terms of the
 // declaration's parameter placeholders.  A concrete value crossing a DOM
 // closure boundary has the actual arguments on its nominal TypeId, so resolve
-// direct placeholders here without allocating a second type graph.  Nested
-// generic expressions are deliberately rejected until lowering can substitute
-// them recursively as well; treating an unresolved placeholder as a scalar
-// would otherwise retain a resettable-arena pointer unsafely.
+// direct placeholders here without allocating a second type graph.  A field
+// whose OWN type is itself a generic nominal (`Коробка(T)` inside
+// `Коробка(Коробка(T))`) still carries the OUTER nominal's bare placeholders
+// in its argument list — recurse into those arguments through the same
+// substitution before returning, so nested generic captures resolve to a
+// fully concrete type, not a partially-substituted one. Materializing the
+// substituted nominal mutates `checked.types` (append-only TypeStore —
+// existing TypeIds stay valid); `@constCast` is safe here because this pass
+// runs strictly after typechecking has finished reading the store.
 fn concreteCaptureFieldType(checked: *const type_checker.CheckResult, nominal: types.Type, field_type: types.TypeId) ?types.TypeId {
     const entry = checked.types.get(field_type) orelse return field_type;
-    if (entry.* != .generic_parameter) return field_type;
-    const parameters = type_checker.nominalParametersOf(checked, nominal.nominal.symbol);
-    for (parameters, 0..) |parameter, index| {
-        if (checked.types.eql(field_type, parameter.typ)) {
-            if (index >= nominal.nominal.arguments.len) return null;
-            return nominal.nominal.arguments[index];
-        }
+    switch (entry.*) {
+        .generic_parameter => {
+            const parameters = type_checker.nominalParametersOf(checked, nominal.nominal.symbol);
+            for (parameters, 0..) |parameter, index| {
+                if (checked.types.eql(field_type, parameter.typ)) {
+                    if (index >= nominal.nominal.arguments.len) return null;
+                    return nominal.nominal.arguments[index];
+                }
+            }
+            return null;
+        },
+        .nominal => |inner| {
+            var substituted_any = false;
+            var arguments: std.ArrayList(types.TypeId) = .empty;
+            defer arguments.deinit(checked.allocator);
+            for (inner.arguments) |argument| {
+                const resolved = concreteCaptureFieldType(checked, nominal, argument) orelse return null;
+                if (!checked.types.eql(resolved, argument)) substituted_any = true;
+                arguments.append(checked.allocator, resolved) catch return null;
+            }
+            if (!substituted_any) return field_type;
+            const mutable_types: *types.TypeStore = @constCast(&checked.types);
+            return mutable_types.nominalWithIdentity(inner.symbol, inner.identity, arguments.items) catch null;
+        },
+        else => return field_type,
     }
-    return null;
 }
 
 fn classifyCaptureDepth(checked: *const type_checker.CheckResult, type_id: types.TypeId, depth: u8) CaptureKind {

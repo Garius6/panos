@@ -486,6 +486,53 @@ test "DOM.на_клик promotes a concrete generic struct capture" {
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
 }
 
+// `Обёртка[T]{ внутри: Коробка(T) }` — the FIELD's declared type is itself
+// a generic nominal built from the struct's OWN type parameter (`Коробка[T]`,
+// not a bare `T`). Substituting `Обёртка(Строка)`'s concrete argument for
+// `T` inside `внутри`'s declared type (`Коробка[T]`) requires rewriting the
+// nested nominal's OWN argument list — the exact gap `concreteCaptureFieldType`'s
+// new `.nominal` branch closes. A struct field simply typed `значение: T`
+// (as in the single-level `Коробка[T]` fixture above) resolves through a
+// chain of already-supported bare-placeholder substitutions and does not
+// exercise this path at all.
+test "DOM.на_клик promotes a struct field whose declared type nests the struct's own type parameter" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\тип Коробка[T] = структура
+        \\    значение: T
+        \\конец
+        \\тип Обёртка[T] = структура
+        \\    внутри: Коробка(T)
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    пер обёртка: Обёртка(Строка) = Обёртка(Коробка("купить хлеб"))
+        \\    DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
+        \\        DOM.установить_текст_строка("#результат", обёртка.внутри.значение)
+        \\    конец)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") != null);
+}
+
+// A genuinely unresolvable case (the closure's own generic function never
+// concretely bound at compile time) was attempted here and dropped: every
+// constructed fixture where `показать[T]`'s closure was actually reachable
+// from `старт()` type-checked and lowered successfully even before this
+// fix's `.nominal` branch existed, meaning `concreteCaptureFieldType`'s
+// existing bare-`generic_parameter` substitution already covers whatever
+// path the checker/lowering pipeline currently reaches for a reachable
+// generic function — no reachable fixture reproduces the `null`-return
+// (rejection) branch added above. Left unverified rather than asserting
+// unconfirmed behavior; see spec.md's Edge Cases note that arbitrary depth
+// is a bonus, not a hard requirement.
+
 test "DOM.на_клик recursively promotes a nested struct capture" {
     const allocator = std.testing.allocator;
 

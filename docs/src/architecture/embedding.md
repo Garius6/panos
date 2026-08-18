@@ -53,6 +53,24 @@ const outcome = try runtime.call("обновить", &.{.{ .number = delta_secon
 `read(allocator, path) ![]u8`. Поэтому движок может читать сценарии из обычной
 файловой системы, архива ресурсов или памяти, не меняя Panos.
 
+### Рендер диагностик
+
+`hasGraphErrors()`/`hasCompilationErrors()` сообщают только факт ошибки —
+сами диагностики (с байтовыми офсетами, не готовыми строками) доступны через
+`graphDiagnostics()`/`compilationDiagnostics()`. `Runtime.formatDiagnostics`
+рендерит их в привычном `путь:строка:колонка: сообщение` формате, сам находя
+нужный файл в графе модулей — хосту не нужно повторять этот поиск:
+
+```zig
+if (runtime.hasCompilationErrors()) {
+    var allocating: std.Io.Writer.Allocating = .init(allocator);
+    defer allocating.deinit();
+    try runtime.formatDiagnostics(&allocating.writer, runtime.compilationDiagnostics().?);
+    log.err("ошибка компиляции сценария:\n{s}", .{allocating.written()});
+    return error.ScriptCompileFailed;
+}
+```
+
 ## Нативная поверхность движка
 
 Не добавляйте `игра.*` в VM. Экспортируйте маленькие C-ABI-функции из движка и

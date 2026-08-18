@@ -135,6 +135,18 @@ pub const Runtime = struct {
         try machine.writeForeignProfile(writer);
     }
 
+    /// Renders `diagnostics` as one line per entry, resolving each one's
+    /// source file from the runtime's own module graph — the host does not
+    /// need to look up `SourceFile`s itself. Typically called with
+    /// `graphDiagnostics()` or `compilationDiagnostics().?`.
+    pub fn formatDiagnostics(
+        self: *const Runtime,
+        writer: *std.Io.Writer,
+        diagnostics: *const panos_core.diagnostic.DiagnosticList,
+    ) !void {
+        try panos_core.diagnostic.writeGraph(writer, self.graph(), diagnostics);
+    }
+
     fn run(self: *Runtime, function: panos_core.bytecode.FunctionId, arguments: []const panos_core.value.Value) !panos_core.vm.Execution {
         const machine = if (self.machine) |*value| value else return error.NotRunnable;
         // Output is reported per host invocation, rather than leaking a
@@ -163,6 +175,11 @@ pub fn renderValue(allocator: std.mem.Allocator, runtime_value: Value) ![]const 
     return panos_core.runner.renderValue(allocator, runtime_value);
 }
 
+/// Low-level single-diagnostic render against an already-known
+/// `SourceFile`. Most hosts want `Runtime.formatDiagnostics` instead, which
+/// resolves the right file per diagnostic from the graph itself.
+pub const formatDiagnostic = panos_core.diagnostic.format;
+
 fn hasErrors(diagnostics: *const panos_core.diagnostic.DiagnosticList) bool {
     for (diagnostics.items.items) |item| {
         if (item.severity == .err) return true;
@@ -185,6 +202,31 @@ const MemoryReader = struct {
         return error.FileNotFound;
     }
 };
+
+test "embedded runtime renders compilation diagnostics with source locations" {
+    const reader = MemoryReader{ .files = &.{
+        .{
+            .path = "карта/main.pns",
+            .bytes = "экспорт функ сломано() -> Число\n" ++
+                "\"не число\"\n" ++
+                "конец",
+        },
+    } };
+
+    var runtime = Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    try runtime.load(&reader, "карта/main.pns");
+    try std.testing.expect(!runtime.hasGraphErrors());
+    try runtime.compile();
+    try std.testing.expect(runtime.hasCompilationErrors());
+
+    var allocating: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating.deinit();
+    try runtime.formatDiagnostics(&allocating.writer, runtime.compilationDiagnostics().?);
+
+    const rendered = allocating.written();
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "карта/main.pns:"));
+}
 
 test "embedded runtime executes root exports across a file graph" {
     const reader = MemoryReader{ .files = &.{
@@ -237,4 +279,76 @@ test "embedded runtime executes root exports across a file graph" {
         },
         .runtime_error => return error.TestUnexpectedResult,
     }
+}
+
+test "a broken script never surfaces as a Zig error, only as diagnostics" {
+    const reader = MemoryReader{ .files = &.{
+        .{
+            .path = "карта/main.pns",
+            .bytes = "экспорт функ сломано(",
+        },
+    } };
+
+    var runtime = Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    try runtime.load(&reader, "карта/main.pns");
+    try std.testing.expect(runtime.hasGraphErrors());
+
+    try std.testing.expectError(error.GraphHasErrors, runtime.compile());
+    // No `compiled_graph` exists yet (`compile()` returns before building
+    // one), so a lookup by export name fails the same way a genuinely
+    // unknown name would — there is no export table to consult at all.
+    try std.testing.expectError(error.ExportNotFound, runtime.call("сломано", &.{}));
+    try std.testing.expectError(error.NotCompiled, runtime.runStart());
+}
+
+test "call after a runtime panic leaves the runtime able to run other exports" {
+    const reader = MemoryReader{ .files = &.{
+        .{
+            .path = "карта/main.pns",
+            .bytes = "экспорт функ упасть() -> Число\n" ++
+                "паника(\"специально для теста\")\n" ++
+                "конец\n" ++
+                "экспорт функ уцелеть() -> Число\n" ++
+                "1.0\n" ++
+                "конец",
+        },
+    } };
+
+    var runtime = Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    try runtime.load(&reader, "карта/main.pns");
+    try runtime.compile();
+    try std.testing.expect(!runtime.hasCompilationErrors());
+
+    switch (try runtime.call("упасть", &.{})) {
+        .success => return error.TestUnexpectedResult,
+        .runtime_error => {},
+    }
+    switch (try runtime.call("уцелеть", &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 1.0), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "calling an export name that does not exist returns ExportNotFound" {
+    const reader = MemoryReader{ .files = &.{
+        .{
+            .path = "карта/main.pns",
+            .bytes = "экспорт функ существует() -> Число\n" ++
+                "1.0\n" ++
+                "конец",
+        },
+    } };
+
+    var runtime = Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    try runtime.load(&reader, "карта/main.pns");
+    try runtime.compile();
+    try std.testing.expect(!runtime.hasCompilationErrors());
+
+    try std.testing.expectError(error.ExportNotFound, runtime.call("не_существует", &.{}));
 }

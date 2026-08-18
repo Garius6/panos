@@ -2,34 +2,13 @@ const std = @import("std");
 const panos_core = @import("panos_core");
 const panos_embed = @import("panos_embed");
 
-pub const DiagnosticFormatError = error{
-    FileMismatch,
-    InvalidSpan,
-};
+pub const DiagnosticFormatError = panos_core.diagnostic.FormatError;
 
 pub const Execution = panos_core.runner.Execution;
 pub const VerboseInfo = panos_core.runner.VerboseInfo;
 pub const SourceRun = panos_core.runner.SourceRun;
 
-pub fn formatDiagnostic(
-    allocator: std.mem.Allocator,
-    file: panos_core.source.SourceFile,
-    value: panos_core.diagnostic.Diagnostic,
-) (DiagnosticFormatError || std.mem.Allocator.Error)![]u8 {
-    if (value.span.file_id != file.id) return error.FileMismatch;
-    if (!value.span.isValidFor(file)) return error.InvalidSpan;
-
-    const position = file.lineColumn(value.span.start);
-    const warning_prefix: []const u8 = switch (value.severity) {
-        .err => "",
-        .warning => "warning: ",
-    };
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}:{d}:{d}: {s}{s}",
-        .{ file.path, position.line, position.column, warning_prefix, value.message },
-    );
-}
+pub const formatDiagnostic = panos_core.diagnostic.format;
 
 pub fn runSource(allocator: std.mem.Allocator, path: []const u8, input: []const u8) !SourceRun {
     return panos_core.runner.runSource(allocator, path, input);
@@ -67,21 +46,7 @@ const FileReader = struct {
     }
 };
 
-fn writeGraphDiagnostics(
-    writer: *std.Io.Writer,
-    graph: *const panos_core.module_loader.Graph,
-    diagnostics: *const panos_core.diagnostic.DiagnosticList,
-) !void {
-    for (diagnostics.items.items) |value| {
-        const module = graph.moduleForFile(value.span.file_id) orelse {
-            try writer.print("{s}\n", .{value.message});
-            continue;
-        };
-        const rendered = try formatDiagnostic(std.heap.page_allocator, module.file, value);
-        defer std.heap.page_allocator.free(rendered);
-        try writer.print("{s}\n", .{rendered});
-    }
-}
+const writeGraphDiagnostics = panos_core.diagnostic.writeGraph;
 
 fn writeModuleDiagnostics(writer: *std.Io.Writer, graph: *const panos_core.module_loader.Graph) !void {
     return writeGraphDiagnostics(writer, graph, &graph.diagnostics);

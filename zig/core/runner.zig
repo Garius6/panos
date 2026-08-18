@@ -100,6 +100,33 @@ pub const SourceAnalysis = struct {
         return @as(?[]const u8, try formatTypeName(self.arena.allocator(), &checked.types, &resolved.symbols, type_id));
     }
 
+    /// Returns the `///`-doc-comment text attached to the declaration a use
+    /// resolves to, if any. `Resolution` only exposes the forward
+    /// `DeclId -> SymbolId` direction (`decl_symbols`), so this inverts it
+    /// on the spot — cheap enough for one file's worth of declarations per
+    /// hover request, not worth a permanent index.
+    pub fn expressionDoc(self: *SourceAnalysis, expression: ast.ExprId) ?[]const u8 {
+        const resolved = self.resolution() orelse return null;
+        const symbol = resolved.expr_symbols.get(expression) orelse return null;
+        const tree_ = self.tree() orelse return null;
+
+        var declarations = resolved.decl_symbols.iterator();
+        const decl_id = while (declarations.next()) |entry| {
+            if (entry.value_ptr.* == symbol) break entry.key_ptr.*;
+        } else return null;
+
+        const doc = switch (tree_.decl(decl_id).*) {
+            .function => |value_| value_.doc,
+            .struct_decl => |value_| value_.doc,
+            .interface_decl => |value_| value_.doc,
+            .enum_decl => |value_| value_.doc,
+            .constant => |value_| value_.doc,
+            .type_alias => |value_| value_.doc,
+            .import, .impl, .foreign, .error_node => return null,
+        };
+        return if (doc.len == 0) null else doc;
+    }
+
     fn appendDiagnostics(self: *SourceAnalysis, items: *const diagnostic.DiagnosticList) !void {
         for (items.items.items) |item| {
             const message = try self.arena.allocator().dupe(u8, item.message);

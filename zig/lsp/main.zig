@@ -226,8 +226,9 @@ pub const Server = struct {
             try writeResponse(output, request_id, "null");
             return;
         };
+        const doc = analysis.expressionDoc(expression);
         const span = panos_core.ast.exprSpan(tree.expr(expression).*);
-        try writeHoverResponse(output, request_id, type_name, .{
+        try writeHoverResponse(output, request_id, doc, type_name, .{
             .start = file.byteOffsetToUtf16Position(span.start),
             .end = file.byteOffsetToUtf16Position(span.end),
         });
@@ -1073,12 +1074,16 @@ fn writeError(output: *ResponseBuffer, id: std.json.Value, code: i32, message: [
     try output.appendSlice("}}");
 }
 
-fn writeHoverResponse(output: *ResponseBuffer, id: std.json.Value, type_name: []const u8, range: core_lsp.Range) !void {
+fn writeHoverResponse(output: *ResponseBuffer, id: std.json.Value, doc: ?[]const u8, type_name: []const u8, range: core_lsp.Range) !void {
     try output.appendSlice("{\"jsonrpc\":\"2.0\",\"id\":");
     try appendJsonValue(output, id);
-    try output.appendSlice(",\"result\":{\"contents\":{\"kind\":\"plaintext\",\"value\":");
-    try appendJsonString(output, type_name);
-    try output.appendSlice("},\"range\":");
+    try output.appendSlice(",\"result\":{\"contents\":{\"kind\":\"plaintext\",\"value\":\"");
+    if (doc) |value_| {
+        try appendJsonStringBody(output, value_);
+        try output.appendSlice("\\n\\n");
+    }
+    try appendJsonStringBody(output, type_name);
+    try output.appendSlice("\"},\"range\":");
     try appendRange(output, range);
     try output.appendSlice("}}");
 }
@@ -1586,6 +1591,11 @@ fn appendNumber(output: *ResponseBuffer, number: anytype) !void {
 
 fn appendJsonString(output: *ResponseBuffer, text: []const u8) !void {
     try output.append('"');
+    try appendJsonStringBody(output, text);
+    try output.append('"');
+}
+
+fn appendJsonStringBody(output: *ResponseBuffer, text: []const u8) !void {
     for (text) |byte| switch (byte) {
         '"' => try output.appendSlice("\\\""),
         '\\' => try output.appendSlice("\\\\"),
@@ -1595,7 +1605,6 @@ fn appendJsonString(output: *ResponseBuffer, text: []const u8) !void {
         0...8, 11...12, 14...0x1f => try appendControlByte(output, byte),
         else => try output.append(byte),
     };
-    try output.append('"');
 }
 
 fn appendControlByte(output: *ResponseBuffer, byte: u8) !void {
@@ -1798,6 +1807,26 @@ test "LSP server publishes diagnostics for opened and changed documents" {
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"data\":[]}") == null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), ",5,0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), ",3,0") != null);
+}
+
+test "LSP hover includes a contiguous doc-comment ahead of the type name" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var output = ResponseBuffer.init(std.testing.allocator);
+    defer output.deinit();
+
+    // `сложить` line 0 has a doc-comment; `старт` line 3 has none.
+    // "сложить(20, 22)" on line 4 — "сложить" starts at character 0.
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///доки.ps\",\"text\":\"/// Складывает два числа.\\nэкспорт функ сложить(a: Число, b: Число) -> Число\\na + b\\nконец\\nэкспорт функ старт() -> Число\\nсложить(20.0, 22.0)\\nконец\"}}}", &output));
+
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///доки.ps\"},\"position\":{\"line\":5,\"character\":1}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"value\":\"Складывает два числа.\\n\\nфунк(Число, Число) -> Число\"") != null);
+
+    // `a` (a parameter use inside `a + b`, line 2) has no doc-comment of
+    // its own — hover falls back to only the type, same as before
+    // doc-comments were read at all (no regression).
+    try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///доки.ps\"},\"position\":{\"line\":2,\"character\":0}}}", &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"value\":\"Число\"") != null);
 }
 
 test "LSP definition and references cross a real импорт between two open documents" {

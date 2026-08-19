@@ -370,14 +370,90 @@ fn expandSpawn(
     original.instructions.deinit(allocator);
 }
 
+// specs/016-actor-dom-persistence — `отправить` from ANYWHERE OTHER than
+// `старт()`'s own (CPS-rewritten, scheduler-driven) body has no outer
+// loop driving the target actor's step function afterward — `старт()`
+// gets that for free from `buildScheduler`'s unrolled round-trip, but a
+// DOM handler calling `отправить` after `старт()` has already returned
+// is on its own. Mirrors `emitSchedulerRound`'s "process 1" half (same
+// `scheduler_rounds` bound, same "staying not-done forever is normal"
+// contract, see this file's own `emitSendRoundDriving` doc comment
+// below) — deliberately NOT a real WASM `loop`, matching this whole
+// backend's existing "unrolled, hand-verifiable rounds" choice over a
+// genuine dynamic loop.
+// `actor_step`'s `Булево` return means "the function itself genuinely
+// RETURNED" (`mir_cps.zig`'s own doc comment: "true = really finished
+// ..., false = suspended, call again once the mailbox/signal is
+// ready") — NOT "the message that was just sent got processed". A
+// persistent server actor like a typical `счётчик`-shaped
+// `выбор получить() ... конец` loop (every branch tail-recurses back
+// into another `получить()`) NEVER returns `true` — it suspends again
+// the instant its mailbox goes empty, by design, forever. Confirmed via
+// wasmtime: an earlier version of this function looped until `true` and
+// trapped ("превышен лимит раундов") if it never came, which meant ANY
+// persistent actor receiving a message through this path trapped
+// EVERY time, 100% reproducible, not an edge case — `buildScheduler`'s
+// own `emitSchedulerRound` already established the right precedent
+// (process 1, the spawned background actor, is driven every round but
+// its `done1` staying `false` forever is normal, untested at the end).
+// Mirrors that: drive up to `scheduler_rounds` calls (stopping early
+// only if the step function genuinely finishes), no trap either way —
+// each call that finds a non-empty mailbox pops and processes AT LEAST
+// the message just sent (`mir_cps.zig`'s dispatch loops back to the
+// mailbox check in place after each `получить()`, not via a fresh WASM
+// call), so a single round already guarantees the send is handled
+// before this function returns; the remaining rounds are pure
+// defensive slack, not a correctness requirement.
+fn emitSendRoundDriving(builder: *mir_builder.Builder, layout: wasm_heap.PtrLayout, process_local: mir.LocalId, actor_step: mir.FunctionId) !void {
+    const done_local = try builder.newLocal(wasm_heap.dummy_symbol, "@send_done", layout.bool_type);
+    const false_init = try wasm_heap.boolConst(builder, layout.bool_type, false);
+    try builder.emit(.{ .store_local = .{ .local = done_local, .src = false_init } });
+
+    var round: u32 = 0;
+    while (round < scheduler_rounds) : (round += 1) {
+        const d = try builder.newValue(layout.bool_type);
+        try builder.emit(.{ .load_local = .{ .dst = d, .local = done_local } });
+        const not_done = try wasm_heap.notOp(builder, layout.bool_type, d);
+
+        const call_block = try builder.newBlock();
+        // `skip_block` MUST be a distinct block from `after_block` — see
+        // `emitSchedulerRound`'s own comment on the exact same pitfall
+        // (`wasm_stackify.findMerge` exponential blowup if the branch's
+        // own else-target IS the merge point).
+        const skip_block = try builder.newBlock();
+        const after_block = try builder.newBlock();
+        builder.terminate(.{ .branch = .{ .cond = not_done, .then_block = call_block, .else_block = skip_block } });
+
+        builder.setCurrentBlock(call_block);
+        const process_for_step = try wasm_heap.loadLocal(builder, process_local, layout.ptr_type);
+        const r = try builder.newValue(layout.bool_type);
+        try builder.emit(.{ .call = .{ .dst = r, .callee = actor_step, .args = try wasm_heap.dupeOne(builder.module, process_for_step) } });
+        try builder.emit(.{ .store_local = .{ .local = done_local, .src = r } });
+        builder.terminate(.{ .jump = .{ .target = after_block } });
+
+        builder.setCurrentBlock(skip_block);
+        builder.terminate(.{ .jump = .{ .target = after_block } });
+
+        builder.setCurrentBlock(after_block);
+    }
+    // No trap on `done_local` staying `false` — see this function's own
+    // doc comment above. Caller continues emitting the ORIGINAL tail
+    // instructions/terminator in whatever block is now current.
+}
+
 // Rewrites the SINGLE `.send` in place: pushes `message` into `process`'s
-// mailbox ring buffer.
+// mailbox ring buffer, then — UNLESS this send lives in `старт()`'s own
+// body (which already gets rounds driven by `buildScheduler`'s outer
+// loop) — drives the target actor's step function via
+// `emitSendRoundDriving` so the message is genuinely PROCESSED before
+// this function returns, not merely enqueued.
 fn expandSend(
     allocator: std.mem.Allocator,
     builder: *mir_builder.Builder,
     block_id: mir.BlockId,
     send_index: usize,
     layout: wasm_heap.PtrLayout,
+    round_driving: ?mir.FunctionId,
 ) !void {
     const function = builder.currentFunction();
     var original = function.blockConst(block_id).*;
@@ -450,7 +526,13 @@ fn expandSend(
     const process_for_store = try wasm_heap.loadLocal(builder, process_local, layout.ptr_type);
     try builder.emit(.{ .frame_store = .{ .frame = process_for_store, .slot = mir_cps.mailbox_count_slot, .src = count_new } });
 
-    try builder.currentFunction().block(block_id).instructions.appendSlice(allocator, original.instructions.items[send_index + 1 ..]);
+    // Tail instructions/terminator land in whichever block is CURRENT
+    // after this point — `emitSendRoundDriving` (when applicable) leaves
+    // the builder positioned in its own `finish_block`, not `block_id`.
+    if (round_driving) |actor_step| {
+        try emitSendRoundDriving(builder, layout, process_local, actor_step);
+    }
+    try builder.currentBlock().instructions.appendSlice(allocator, original.instructions.items[send_index + 1 ..]);
     builder.terminate(original.terminator);
     // `.deinit`, not `allocator.free(.items)` — see `mir_cps.zig`'s
     // identical comment on its own equivalent free.
@@ -712,7 +794,19 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
             }
             const target = found orelse break;
             var builder = mir_builder.Builder{ .module = module, .allocator = allocator, .function_id = function.id };
-            try expandSend(allocator, &builder, target.block, target.index, layout);
+            // Only inject round-driving for a `отправить` OUTSIDE both
+            // `старт()` (already covered by `buildScheduler`'s outer
+            // loop) AND the actor's OWN body (`actor_id` — a real bug
+            // found running the existing actor tests: `счётчик` replying
+            // to its caller via `отправить(отвечающему, ...)` is a send
+            // TARGETING `старт()`, not the actor itself — driving
+            // `actor_id`'s OWN step function again there ran it against
+            // the WRONG frame, corrupting state and trapping. Only a DOM
+            // handler (neither `старт()` nor the actor) has no OTHER
+            // mechanism to process what it just sent — see
+            // `specs/016-actor-dom-persistence/`.
+            const round_driving: ?mir.FunctionId = if (function.id == start_id or function.id == actor_id) null else actor_id;
+            try expandSend(allocator, &builder, target.block, target.index, layout, round_driving);
             index += 1;
             if (index > 1000) return unsupported("слишком много отправить (возможный баг развёртки)");
         }

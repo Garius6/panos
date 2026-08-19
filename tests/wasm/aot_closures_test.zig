@@ -690,8 +690,90 @@ test "DOM.на_клик promotes a запусти-spawned actor, старт() it
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@invoke_click") != null);
 }
 
-// specs/016-actor-dom-persistence — User Story 2 (actually driving
-// scheduler rounds from a DOM handler after re-entry, so a
-// fire-and-forget `отправить` like the one above is genuinely PROCESSED
-// before the handler returns, not just safely queued) is NOT implemented
-// yet — the test above only proves the combination compiles.
+// specs/016-actor-dom-persistence — User Story 2: `отправить` called
+// from INSIDE a DOM handler (after `старт()` has already returned) now
+// actually drives the target actor's step function
+// (`emitSendRoundDriving`), so the message is genuinely PROCESSED
+// before the handler returns, instead of just sitting enqueued. Observed
+// here through a REAL side effect the actor produces upon receiving the
+// message (`DOM.установить_текст`) — not through the handler awaiting a
+// reply itself (the handler is not a suspending actor; only `старт()`/
+// the spawned actor are, per Phase-1's own constraint).
+test "DOM.на_клик's отправить() actually drives the actor to process the message, not just enqueue it" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\импорт DOM
+        \\
+        \\тип Ответ = перечисление
+        \\    Значение(Число)
+        \\конец
+        \\
+        \\тип Сообщение = перечисление
+        \\    Увеличить(Число, Процесс(Ответ))
+        \\    УвеличитьИПоказать(Число)
+        \\конец
+        \\
+        \\функ счётчик(состояние: Число) -> Пусто
+        \\    выбор получить()
+        \\        Сообщение.Увеличить(шаг, отвечающему) тогда
+        \\            пер новое = состояние + шаг
+        \\            отправить(отвечающему, Ответ.Значение(новое))
+        \\            счётчик(новое)
+        \\        конец
+        \\        Сообщение.УвеличитьИПоказать(шаг) тогда
+        \\            пер новое = состояние + шаг
+        \\            DOM.установить_текст("#результат", новое)
+        \\            счётчик(новое)
+        \\        конец
+        \\    конец
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    пер proc: Процесс(Сообщение) = запусти счётчик(0.0)
+        \\    отправить(proc, Сообщение.Увеличить(1.0, себя()))
+        \\    выбор получить()
+        \\        Ответ.Значение(x) -> DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
+        \\            отправить(proc, Сообщение.УвеличитьИПоказать(1.0))
+        \\        конец)
+        \\    конец
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_actor_dom_send_drives_rounds.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const script =
+        \\const fs = require("fs");
+        \\(async () => {
+        \\  let handler = 0;
+        \\  let observed = null;
+        \\  const bytes = fs.readFileSync(process.argv[1]);
+        \\  const imports = { env: {
+        \\    dom_on_click: (_selector, box) => { handler = box; },
+        \\    dom_set_text_num: (_selector, value) => { observed = value; },
+        \\  } };
+        \\  const { instance } = await WebAssembly.instantiate(bytes, imports);
+        \\  instance.exports["старт"]();
+        \\  if (handler === 0) throw new Error("handler was never registered");
+        \\  if (observed !== null) throw new Error(`observed set before any click: ${observed}`);
+        \\  instance.exports["@invoke_click"](handler, 0, 0, 0, 0, 0, 0, 0);
+        \\  if (observed !== 2) throw new Error(`expected 2 after one click, got ${observed}`);
+        \\  process.stdout.write(String(observed));
+        \\})().catch((error) => { console.error(error); process.exit(1); });
+    ;
+    const result = try std.process.run(allocator, io.io(), .{
+        .argv = &.{ "node", "-e", script, wasm_path },
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("2", result.stdout);
+}

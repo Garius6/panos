@@ -245,9 +245,21 @@ fn expandSpawn(
     builder.terminated = false;
 
     const size_const = try wasm_heap.addressConst(builder, layout.idx_type, target_total_slots * 8);
-    // Guaranteed already built — `expand()` calls `buildRuntime` (which
-    // creates it) before `expandSpawn` ever runs.
-    const alloc_id = wasm_heap.findFunctionByName(builder.module, wasm_heap.alloc_function_name).?;
+    // A `Процесс` captured by a DOM closure (see
+    // `specs/016-actor-dom-persistence/`) must survive the arena reset
+    // between separate JS-invoked calls — allocate its frame (mailbox
+    // included, it lives inline in the same block) in the PERMANENT
+    // region from the start instead of the ordinary resettable arena.
+    // `mir_lowering.zig`'s `lowerDomClickClosure` sets this flag; at
+    // most one `.spawn` exists per module (Phase-1 constraint), so a
+    // single module-wide flag is unambiguous — there is no OTHER spawn
+    // this could apply to instead.
+    const alloc_id = if (builder.module.actor_captured_by_dom_closure)
+        try wasm_heap.findOrBuildAllocPermanent(allocator, builder.module, builder.currentFunction().type_store.?, layout)
+    else
+        // Guaranteed already built — `expand()` calls `buildRuntime`
+        // (which creates it) before `expandSpawn` ever runs.
+        wasm_heap.findFunctionByName(builder.module, wasm_heap.alloc_function_name).?;
     try builder.emit(.{ .call = .{ .dst = dst, .callee = alloc_id, .args = try wasm_heap.dupeOne(builder.module, size_const) } });
     // `dst` is used below for EVERY arg's `frame_store`, the child-slot
     // stash, AND possibly further downstream (the user's own `пер proc =
@@ -444,7 +456,21 @@ fn buildScheduler(
 
     const size0 = try wasm_heap.addressConst(&builder, layout.idx_type, old_start_total_slots * 8);
     const frame0 = try builder.newValue(layout.ptr_type);
-    const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
+    // `старт`'s OWN frame (process 0) — reachable from a DOM closure not
+    // just through a spawned CHILD actor, but directly via `себя()`
+    // (self-reference to the currently-running process's own frame). If
+    // ANY DOM closure in this module captures ANY `Процесс` value, EITHER
+    // origin could be what got captured — Phase-1's "at most one
+    // `.spawn`, reachable from `старт`" constraint means there are only
+    // ever at most two frames in the whole module (this one, and the one
+    // `expandSpawn` allocates for the spawned child, which applies the
+    // SAME condition) — promoting both unconditionally is simpler and
+    // safer than tracing which specific captured symbol resolves to
+    // which origin. See `specs/016-actor-dom-persistence/`.
+    const alloc_id = if (module.actor_captured_by_dom_closure)
+        try wasm_heap.findOrBuildAllocPermanent(allocator, module, type_store, layout)
+    else
+        wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
     try builder.emit(.{ .call = .{ .dst = frame0, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, size0) } });
     // `frame0` used more than once below — store once, reload fresh per use.
     const frame0_local = try wasm_heap.storeLocal(&builder, "frame0", layout.ptr_type, frame0);

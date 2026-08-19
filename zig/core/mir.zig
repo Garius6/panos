@@ -350,6 +350,19 @@ pub const Module = struct {
     // pointer checkpoint/restore wrapper. Allocated in `arena` above,
     // so no separate lifetime to manage.
     dom_handler_names: [][]const u8 = &.{},
+    // Set during `mir_lowering.zig`'s DOM-closure capture lowering
+    // (`lowerDomClickClosure`) when a `Процесс` value is captured by a
+    // DOM closure. Read by `wasm_actors.zig`'s `expandSpawn` — at MOST
+    // one `.spawn` exists per module (Phase-1 constraint), so a single
+    // flag is enough to decide whether ITS frame must be allocated in
+    // the permanent (non-resettable) region from the start instead of
+    // the ordinary bump arena. `mir_lowering.zig` runs BEFORE
+    // `mir_cps.prepare`/`wasm_actors.expand` in the pipeline — at
+    // capture-lowering time `.spawn` is still an unexpanded MIR
+    // instruction with no concrete frame yet, so the ACTUAL allocation
+    // choice can only be made later, by whichever pass expands it; this
+    // flag is how that decision crosses the pass boundary.
+    actor_captured_by_dom_closure: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Module {
         return .{

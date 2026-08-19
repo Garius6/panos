@@ -2660,7 +2660,17 @@ fn classifyCaptureDepth(checked: *const type_checker.CheckResult, type_id: types
         },
         .function => .function_ref,
         .array => |element| if (classifyCaptureDepth(checked, element, depth + 1) == .unsupported) .unsupported else .array,
-        .process => .unsupported,
+        // A `Процесс` value is a plain frame pointer (`i32`, same shape
+        // as any other pointer capture) — copying it into a closure box
+        // needs no special promotion logic (`.scalar`'s identity copy
+        // already suffices). Safe ONLY because the caller
+        // (`lowerDomClickClosure`) marks `module.actor_captured_by_dom_closure`
+        // whenever this case is reached, so `wasm_actors.zig`'s
+        // `expandSpawn` allocates the underlying frame in PERMANENT
+        // memory from the start — by the time this captured value is
+        // actually read, it already points into memory that survives
+        // the arena reset between calls. See `specs/016-actor-dom-persistence/`.
+        .process => .scalar,
         else => .scalar,
     };
 }
@@ -3025,11 +3035,17 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     const captures = ctx.resolution.lambda_captures.get(handler_expr) orelse &.{};
     for (captures) |capture_symbol| {
         const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
+        // A captured `Процесс` needs its underlying frame allocated in
+        // PERMANENT memory (see `specs/016-actor-dom-persistence/`) —
+        // flag it for `wasm_actors.zig`'s `expandSpawn` to read later;
+        // `classifyCaptureDepth`'s `.process => .scalar` already treats
+        // the capture itself as an ordinary pointer copy, safe once this
+        // flag makes the underlying allocation permanent.
+        if (isProcessCapture(ctx.checked, capture_type)) {
+            ctx.builder.module.actor_captured_by_dom_closure = true;
+        }
         if (classifyCapture(ctx.checked, capture_type) == .unsupported) {
-            if (isProcessCapture(ctx.checked, capture_type)) {
-                return ctx.unsupported("DOM.на_клик(): захват процесса небезопасен — AOT handle указывает на actor frame в сбрасываемой арене, а Phase 1 scheduler не сохраняет актор между DOM-вызовами");
-            }
-            return ctx.unsupported("DOM.на_клик(): захват процесса, рекурсивного/обобщённого агрегата или иного неподдержанного типа (Stage C ограничение, project_panos_wasm_aot_closures)");
+            return ctx.unsupported("DOM.на_клик(): захват рекурсивного/обобщённого агрегата или иного неподдержанного типа (Stage C ограничение, project_panos_wasm_aot_closures)");
         }
     }
 

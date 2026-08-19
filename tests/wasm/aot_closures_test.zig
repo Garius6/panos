@@ -636,20 +636,62 @@ test "DOM.на_клик with a себя() capture outside any suspending ста�
     try std.testing.expectError(error.WasmEmitUnsupported, buildGraphBytes(allocator, source));
 }
 
-// specs/016-actor-dom-persistence — a real, NEW crash found attempting a
-// fuller end-to-end test here (a `запусти`-spawned actor, старт() awaits
-// its first reply THEN registers a DOM handler that sends it a further
-// fire-and-forget message): `wasm_actors.zig`'s `rewireSuspendCalls`
-// null-derefs `function.type_store.?` (line ~183) for some function
-// reached while rewiring `@runtime::mailbox_pop`/`signal_pop` — a
-// genuinely new DOM-closure × actor-CPS interaction, not exercised by
-// any existing fixture (every prior actor test sends only from `старт()`
-// itself; every prior DOM-closure test never touches `.send`/`получить()`).
-// Deliberately NOT added as a test here (Zig has no way to assert a
-// specific `--release-safe` panic cleanly) — logged instead as a
-// concrete follow-up in `specs/016-actor-dom-persistence/research.md`.
-// User Story 1 (frame promotion via `.process => .scalar` +
-// `actor_captured_by_dom_closure`-gated permanent allocation) is covered
-// by the passing tests above it; User Story 2 (actually driving rounds
-// from a DOM handler after re-entry) is NOT implemented — this crash is
-// exactly the kind of bug that work would need to navigate.
+// specs/016-actor-dom-persistence — real, standalone bug found and fixed
+// while building this feature (`wasm_actors.zig`'s `rewireSuspendCalls`):
+// `is_i32`/`call.dst.?` used to be computed UNCONDITIONALLY for every
+// `.call_builtin` inside a CPS-suspending function, before checking
+// whether the callee name was even one of the 4 relevant suspend
+// builtins — a guaranteed null-deref for any OTHER void call_builtin
+// (like `DOM.на_клик(...)`) sharing a suspending function's body. No
+// prior fixture combined "CPS-suspending function" with "an unrelated
+// void call_builtin in the same body" — this is the first one that does
+// (`старт()` awaits its own spawn reply, THEN registers a DOM handler).
+test "DOM.на_клик promotes a запусти-spawned actor, старт() itself already suspended once via получить()" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\тип Ответ = перечисление
+        \\    Значение(Число)
+        \\конец
+        \\
+        \\тип Сообщение = перечисление
+        \\    Увеличить(Число, Процесс(Ответ))
+        \\    УвеличитьТихо(Число)
+        \\конец
+        \\
+        \\функ счётчик(состояние: Число) -> Пусто
+        \\    выбор получить()
+        \\        Сообщение.Увеличить(шаг, отвечающему) тогда
+        \\            пер новое = состояние + шаг
+        \\            отправить(отвечающему, Ответ.Значение(новое))
+        \\            счётчик(новое)
+        \\        конец
+        \\        Сообщение.УвеличитьТихо(шаг) тогда
+        \\            счётчик(состояние + шаг)
+        \\        конец
+        \\    конец
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    пер proc: Процесс(Сообщение) = запусти счётчик(0.0)
+        \\    отправить(proc, Сообщение.Увеличить(1.0, себя()))
+        \\    выбор получить()
+        \\        Ответ.Значение(x) -> DOM.на_клик("#кнопка", функ(_: DOM.СобытиеКлика) -> Пусто
+        \\            отправить(proc, Сообщение.УвеличитьТихо(x))
+        \\        конец)
+        \\    конец
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@invoke_click") != null);
+}
+
+// specs/016-actor-dom-persistence — User Story 2 (actually driving
+// scheduler rounds from a DOM handler after re-entry, so a
+// fire-and-forget `отправить` like the one above is genuinely PROCESSED
+// before the handler returns, not just safely queued) is NOT implemented
+// yet — the test above only proves the combination compiles.

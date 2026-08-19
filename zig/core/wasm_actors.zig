@@ -172,20 +172,41 @@ fn rewireSuspendCalls(module: *mir.Module, runtime: Runtime) void {
                     continue;
                 }
                 // Real bug found running actual code, not just reading:
-                // checking equality against ONLY `builtins.string`/
-                // `.boolean` misses every nominal (struct/enum), array,
-                // and process type — ALL of which ALSO map to i32 per
-                // `wasm_module.wasmValTypeForStore` (which also now
-                // special-cases `поison`/`unconstrained` as i32 — see
-                // its own doc comment — covering `получить()`'s
-                // otherwise-unresolved type for the common `-> Пусто`
-                // actor idiom).
-                const is_i32 = wasm_module.wasmValTypeForStore(function.type_store.?, function.valueType(call.dst.?)) == wasm_module.wasm_i32;
+                // this loop matches EVERY `.call_builtin` in the function,
+                // not just the 4 suspend-related ones below — a function
+                // that's CPS-suspending (calls `получить()`) can ALSO
+                // contain a completely unrelated VOID `call_builtin` (e.g.
+                // `DOM.на_клик(...)`, registered from inside `старт()`
+                // AFTER it has already suspended once — see
+                // `specs/016-actor-dom-persistence/`) with `call.dst ==
+                // null`. `is_i32`/`call.dst.?` used to be computed
+                // UNCONDITIONALLY for every match, before checking whether
+                // `call.name` was even one of the 4 relevant names — a
+                // guaranteed null-deref for any OTHER void call_builtin
+                // sharing a suspending function's body. No prior fixture
+                // combined "CPS-suspending function" with "an unrelated
+                // void call_builtin in the same body", so this was never
+                // exercised before. Fixed: match the name FIRST, only
+                // compute `is_i32` for the two variants that actually use
+                // it (`mailbox_has`/`signal_has` return a fixed `Булево`,
+                // never need the payload-type check at all).
+                //
+                // The `is_i32` check itself checks equality against ONLY
+                // `builtins.string`/`.boolean` misses every nominal
+                // (struct/enum), array, and process type — ALL of which
+                // ALSO map to i32 per `wasm_module.wasmValTypeForStore`
+                // (which also now special-cases `поison`/`unconstrained`
+                // as i32 — see its own doc comment — covering
+                // `получить()`'s otherwise-unresolved type for the common
+                // `-> Пусто` actor idiom).
                 const callee: ?mir.FunctionId = blk: {
                     if (std.mem.eql(u8, call.name, "@runtime::mailbox_has")) break :blk runtime.mailbox_has;
                     if (std.mem.eql(u8, call.name, "@runtime::signal_has")) break :blk runtime.signal_has;
-                    if (std.mem.eql(u8, call.name, "@runtime::mailbox_pop")) break :blk if (is_i32) runtime.mailbox_pop_i32 else runtime.mailbox_pop_f64;
-                    if (std.mem.eql(u8, call.name, "@runtime::signal_pop")) break :blk if (is_i32) runtime.signal_pop_i32 else runtime.signal_pop_f64;
+                    if (std.mem.eql(u8, call.name, "@runtime::mailbox_pop") or std.mem.eql(u8, call.name, "@runtime::signal_pop")) {
+                        const is_i32 = wasm_module.wasmValTypeForStore(function.type_store.?, function.valueType(call.dst.?)) == wasm_module.wasm_i32;
+                        if (std.mem.eql(u8, call.name, "@runtime::mailbox_pop")) break :blk if (is_i32) runtime.mailbox_pop_i32 else runtime.mailbox_pop_f64;
+                        break :blk if (is_i32) runtime.signal_pop_i32 else runtime.signal_pop_f64;
+                    }
                     break :blk null;
                 };
                 if (callee) |fn_id| {

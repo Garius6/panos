@@ -1276,14 +1276,24 @@ test "browser target rejects сеть.http_запрос before compilation" {
 }
 
 test "runner performs a full CRUD round-trip through бд.открыть/выполнить/запрос, omitting NULL columns" {
-    const db_path = "zzz_runner_sql_probe.sqlite";
+    // Unique per test RUN (not just per test name) — this exact test
+    // block gets compiled into more than one `zig build test` root
+    // (`runner.zig` itself, plus anything that imports it, e.g.
+    // `lsp_graph.zig`), and those binaries run concurrently on CI. A
+    // fixed filename let two separate processes race on the SAME sqlite
+    // file — confirmed on real CI (linux-amd64, 2026-08-18): one process
+    // saw "database is locked", the other read the OTHER process's
+    // in-progress rows. Not a flaky assertion — a genuine missing
+    // per-process isolation bug.
     var io = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io.deinit();
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "zzz_runner_sql_probe_{x}.sqlite", .{std.Io.Timestamp.now(io.io(), .real).nanoseconds});
+    defer std.testing.allocator.free(db_path);
     defer std.Io.Dir.cwd().deleteFile(io.io(), db_path) catch {};
 
-    var result = try runSource(std.testing.allocator, "пример.ps",
+    const program_source = try std.fmt.allocPrint(std.testing.allocator,
         \\экспорт функ старт() -> Строка
-        \\выбор бд.открыть("zzz_runner_sql_probe.sqlite")
+        \\выбор бд.открыть("{s}")
         \\Успех(соединение) тогда
         \\    соединение.выполнить("CREATE TABLE товары (имя TEXT, цена TEXT)", массив())
         \\    соединение.выполнить("INSERT INTO товары (имя, цена) VALUES (?, ?)", массив("яблоко", "10"))
@@ -1302,7 +1312,10 @@ test "runner performs a full CRUD round-trip through бд.открыть/вып�
         \\Неудача(о) -> о.сообщение
         \\конец
         \\конец
-    );
+    , .{db_path});
+    defer std.testing.allocator.free(program_source);
+
+    var result = try runSource(std.testing.allocator, "пример.ps", program_source);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
@@ -1317,12 +1330,18 @@ test "runner performs a full CRUD round-trip through бд.открыть/вып�
 }
 
 test "runner reports a Result failure for bad SQL and for a closed connection" {
-    const db_path = "zzz_runner_sql_errors.sqlite";
+    // Unique per test RUN, same reason as the CRUD round-trip test just
+    // above — this exact test also gets compiled into multiple `zig
+    // build test` roots that run concurrently on CI.
     var io = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io.deinit();
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "zzz_runner_sql_errors_{x}.sqlite", .{std.Io.Timestamp.now(io.io(), .real).nanoseconds});
+    defer std.testing.allocator.free(db_path);
     defer std.Io.Dir.cwd().deleteFile(io.io(), db_path) catch {};
 
-    var bad_sql = try runSource(std.testing.allocator, "пример.ps", "экспорт функ старт() -> Булево\nвыбор бд.открыть(\"zzz_runner_sql_errors.sqlite\")\nУспех(с) -> с.выполнить(\"НЕ SQL СОВСЕМ\", массив()).успех()\nНеудача(о) -> ложь\nконец\nконец");
+    const bad_sql_source = try std.fmt.allocPrint(std.testing.allocator, "экспорт функ старт() -> Булево\nвыбор бд.открыть(\"{s}\")\nУспех(с) -> с.выполнить(\"НЕ SQL СОВСЕМ\", массив()).успех()\nНеудача(о) -> ложь\nконец\nконец", .{db_path});
+    defer std.testing.allocator.free(bad_sql_source);
+    var bad_sql = try runSource(std.testing.allocator, "пример.ps", bad_sql_source);
     defer bad_sql.deinit();
     try std.testing.expectEqual(@as(usize, 0), bad_sql.diagnostics.items.items.len);
     switch (bad_sql.execution orelse return error.TestUnexpectedResult) {
@@ -1330,7 +1349,9 @@ test "runner reports a Result failure for bad SQL and for a closed connection" {
         .runtime_error => return error.TestUnexpectedResult,
     }
 
-    var closed = try runSource(std.testing.allocator, "пример.ps", "экспорт функ старт() -> Булево\nвыбор бд.открыть(\"zzz_runner_sql_errors.sqlite\")\nУспех(с) тогда\n    с.закрыть()\n    с.выполнить(\"SELECT 1\", массив()).успех()\nконец\nНеудача(о) -> ложь\nконец\nконец");
+    const closed_source = try std.fmt.allocPrint(std.testing.allocator, "экспорт функ старт() -> Булево\nвыбор бд.открыть(\"{s}\")\nУспех(с) тогда\n    с.закрыть()\n    с.выполнить(\"SELECT 1\", массив()).успех()\nконец\nНеудача(о) -> ложь\nконец\nконец", .{db_path});
+    defer std.testing.allocator.free(closed_source);
+    var closed = try runSource(std.testing.allocator, "пример.ps", closed_source);
     defer closed.deinit();
     try std.testing.expectEqual(@as(usize, 0), closed.diagnostics.items.items.len);
     switch (closed.execution orelse return error.TestUnexpectedResult) {

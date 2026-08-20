@@ -4213,6 +4213,57 @@ const Checker = struct {
                 }
                 return result_type;
             }
+            if (self.isBuiltinModule(symbol, "крипто", "hmac_sha256_base64url")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: крипто.hmac_sha256_base64url() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: крипто.hmac_sha256_base64url() ожидает ключ типа Строка первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: крипто.hmac_sha256_base64url() ожидает сообщение типа Строка вторым аргументом", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "крипто", "base64url_кодировать")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: крипто.base64url_кодировать() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: крипто.base64url_кодировать() ожидает Строку", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "крипто", "base64url_декодировать")) {
+                const result_type = self.resultOfString(self.result.types.builtins.string) orelse return self.result.types.poison();
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: крипто.base64url_декодировать() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: крипто.base64url_декодировать() ожидает Строку", .{});
+                }
+                return result_type;
+            }
+            if (self.isBuiltinModule(symbol, "крипто", "сравнить_константное_время")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: крипто.сравнить_константное_время() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.boolean;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: крипто.сравнить_константное_время() ожидает Строку первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: крипто.сравнить_константное_время() ожидает Строку вторым аргументом", .{});
+                }
+                return self.result.types.builtins.boolean;
+            }
             if (self.isBuiltin(symbol, "получить")) {
                 if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить() не принимает аргументы", .{});
                 for (call.arguments) |argument| _ = try self.infer(argument);

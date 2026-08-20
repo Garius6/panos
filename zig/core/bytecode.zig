@@ -180,6 +180,10 @@ pub const Opcode = enum {
     sql_query_submit,
     sql_close,
     call_foreign,
+    crypto_hmac_sha256_b64url,
+    crypto_base64url_encode,
+    crypto_base64url_decode,
+    crypto_timing_safe_eq,
     // Неблокирующий I/O: submit-опкоды кладут задачу в воркер-пул и
     // возвращают управление сразу (не блокируют) — компилятор ВСЕГДА
     // эмитит await_async сразу после (compiler.zig, compileFilesystemBuiltin).
@@ -368,6 +372,10 @@ pub const Instruction = union(Opcode) {
         constant_index: u16,
         argument_count: u16,
     },
+    crypto_hmac_sha256_b64url: void,
+    crypto_base64url_encode: void,
+    crypto_base64url_decode: void,
+    crypto_timing_safe_eq: void,
     file_read_submit: void,
     file_write_submit: void,
     net_connect_submit: void,

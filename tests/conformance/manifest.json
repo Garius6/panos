@@ -511,6 +511,30 @@
       }
     },
     {
+      "id": "graph-crypto",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/crypto_fixture_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
+      "id": "graph-transitive-nominal-diamond",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/transitive_nominal_diamond_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
       "id": "graph-json",
       "tier": "graph",
       "profile": "native",

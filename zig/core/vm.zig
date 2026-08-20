@@ -1732,6 +1732,10 @@ pub const Vm = struct {
             .sql_exec_submit => try self.sqlExecSubmit(),
             .sql_query_submit => try self.sqlQuerySubmit(),
             .sql_close => try self.sqlClose(),
+            .crypto_hmac_sha256_b64url => try self.cryptoHmacSha256Base64Url(),
+            .crypto_base64url_encode => try self.cryptoBase64UrlEncode(),
+            .crypto_base64url_decode => try self.cryptoBase64UrlDecode(),
+            .crypto_timing_safe_eq => try self.cryptoTimingSafeEq(),
             .http_listen => try self.httpListen(),
             .http_accept_submit => try self.httpAcceptSubmit(),
             .http_request_method => try self.httpRequestMethod(),
@@ -3990,6 +3994,137 @@ pub const Vm = struct {
             connection.is_open = false;
             try self.stack.append(self.allocator, .{ .void = {} });
         }
+    }
+
+    // HMAC-SHA256 + base64url — чистые функции над `std.crypto` (Zig
+    // stdlib, ничего не вендорится), но `native_only` (`target.zig`): у
+    // AOT WASM-кодогенерации (`wasm_emit.zig`) нет своего пути для этих
+    // опкодов, а `быстряга`/JWT всё равно только server-side. Подпись
+    // отдаётся СРАЗУ в base64url-текст (не сырыми байтами) — `Строка` в
+    // этой VM обязана быть валидным UTF-8 (см. `фс.прочитать`), а
+    // произвольный 32-байтный HMAC-дайджест им почти никогда не
+    // является — то же решение, что `бд`'s "BLOB не поддержан", просто
+    // здесь обойдено кодировкой, а не отказом.
+    fn cryptoHmacSha256Base64Url(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("крипто::hmac_sha256_base64url", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "крипто::hmac_sha256_base64url", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const message_text = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: крипто.hmac_sha256_base64url() ожидает сообщение типа Строка вторым аргументом", .{});
+            return;
+        };
+        const key = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: крипто.hmac_sha256_base64url() ожидает ключ типа Строка первым аргументом", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'крипто::hmac_sha256_base64url' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var digest: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&digest, message_text, key);
+        const encoder = std.base64.url_safe_no_pad.Encoder;
+        const encoded = try self.allocator.alloc(u8, encoder.calcSize(digest.len));
+        defer self.allocator.free(encoded);
+        _ = encoder.encode(encoded, &digest);
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, encoded));
+        try self.stack.append(self.allocator, .{ .heap_string = heap_string });
+    }
+
+    fn cryptoBase64UrlEncode(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("крипто::base64url_кодировать", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "крипто::base64url_кодировать", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const text = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: крипто.base64url_кодировать() ожидает Строку", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'крипто::base64url_кодировать' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const encoder = std.base64.url_safe_no_pad.Encoder;
+        const encoded = try self.allocator.alloc(u8, encoder.calcSize(text.len));
+        defer self.allocator.free(encoded);
+        _ = encoder.encode(encoded, text);
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, encoded));
+        try self.stack.append(self.allocator, .{ .heap_string = heap_string });
+    }
+
+    // Декодированные байты обязаны быть валидным UTF-8, чтобы стать
+    // panos `Строка` — JWT-заголовок/payload-сегменты ВСЕГДА сериализованы
+    // из JSON (валидный UTF-8 по построению), так что для честного JWT
+    // эта ветка не срабатывает; для мусорного/подделанного токена — это
+    // `Результат.Неудача`, а не паника, тот же принцип, что у остальных
+    // декодеров в проекте (`json.разобрать`, `сеть.декодировать_url`).
+    fn cryptoBase64UrlDecode(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("крипто::base64url_декодировать", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "крипто::base64url_декодировать", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const text = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: крипто.base64url_декодировать() ожидает Строку", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'крипто::base64url_декодировать' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(text) catch {
+            try self.pushErrorResultForModule("крипто", "некорректная base64url-строка");
+            return;
+        };
+        const decoded = try self.allocator.alloc(u8, decoded_len);
+        defer self.allocator.free(decoded);
+        decoder.decode(decoded, text) catch {
+            try self.pushErrorResultForModule("крипто", "некорректная base64url-строка");
+            return;
+        };
+        if (!std.unicode.utf8ValidateSlice(decoded)) {
+            try self.pushErrorResultForModule("крипто", "декодированные байты не валидный UTF-8");
+            return;
+        }
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, decoded));
+        try self.pushSuccessResult(.{ .heap_string = heap_string });
+    }
+
+    // Сравнение сигнатуры JWT в постоянное время — обычное `==` на
+    // байтах рано выходит на первом несовпадении, что теоретически даёт
+    // атакующему таймингом byte-by-byte оракул для подбора подписи;
+    // XOR-аккумулятор без early-return всегда проходит по всей длине
+    // более короткой строки, не завершаясь на первом расхождении.
+    fn cryptoTimingSafeEq(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("крипто::сравнить_константное_время", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "крипто::сравнить_константное_время", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const right = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: крипто.сравнить_константное_время() ожидает Строку вторым аргументом", .{});
+            return;
+        };
+        const left = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: крипто.сравнить_константное_время() ожидает Строку первым аргументом", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'крипто::сравнить_константное_время' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var diff: u8 = @intFromBool(left.len != right.len);
+        const shorter = @min(left.len, right.len);
+        for (left[0..shorter], right[0..shorter]) |left_byte, right_byte| diff |= left_byte ^ right_byte;
+        try self.stack.append(self.allocator, .{ .boolean = diff == 0 });
     }
 
     fn callForeign(self: *Vm, compiled: *const bytecode.Function, constant_index: u16, argument_count: u16) anyerror!void {

@@ -621,6 +621,7 @@ const FunctionCompiler = struct {
         if (try self.compileSyntaxBuiltin(call)) return;
         if (try self.compileNetBuiltin(call)) return;
         if (try self.compileSqlBuiltin(call)) return;
+        if (try self.compileCryptoBuiltin(call)) return;
         if (try self.compileForeignCall(call)) return;
         if (try self.compileProcessBuiltin(call)) return;
         if (try self.compileLengthBuiltin(call)) return;
@@ -1128,6 +1129,37 @@ const FunctionCompiler = struct {
         if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "http_сервер_слушать")) {
             try self.compileExpression(call.arguments[0]);
             try self.function.emit(self.compiler.result.allocator, .{ .http_listen = {} });
+            return true;
+        }
+        return false;
+    }
+
+    fn compileCryptoBuiltin(self: *FunctionCompiler, call: anytype) !bool {
+        const property = switch (self.compiler.tree.expr(call.callee).*) {
+            .property => |value| value,
+            else => return false,
+        };
+        const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "крипто")) return false;
+        if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "hmac_sha256_base64url")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_hmac_sha256_b64url = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "base64url_кодировать")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_base64url_encode = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "base64url_декодировать")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_base64url_decode = {} });
+            return true;
+        }
+        if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "сравнить_константное_время")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_timing_safe_eq = {} });
             return true;
         }
         return false;

@@ -24,6 +24,7 @@ pub const native_builtin_modules = [_][]const u8{
     "синтаксис",
     "сеть",
     "бд",
+    "крипто",
 };
 
 // Экспортируемые имена по каждому нативному модулю. Значения — builtin'ы,
@@ -69,6 +70,7 @@ pub fn nativeModuleExports(name: []const u8) ?[]const []const u8 {
         .{ .name = "синтаксис", .exports = &.{ "структуры", "поля", "импорты", "аннотации", "аргумент_аннотации", "аннотации_поля", "аргумент_аннотации_поля" } },
         .{ .name = "сеть", .exports = &.{ "подключиться", "кодировать_url", "декодировать_url", "http_запрос", "http_запрос_sync", "http_сервер_слушать" } },
         .{ .name = "бд", .exports = &.{"открыть"} },
+        .{ .name = "крипто", .exports = &.{ "hmac_sha256_base64url", "base64url_кодировать", "base64url_декодировать", "сравнить_константное_время" } },
     };
     for (table) |entry| {
         if (std.mem.eql(u8, entry.name, name)) return entry.exports;
@@ -519,6 +521,15 @@ const Resolver = struct {
         // и `Соединение`, хранит живой ресурс (открытый `sqlite3*`), не
         // "путь для переоткрытия".
         try self.installBuiltinType("Соединение_БД");
+        // `крипто` — HMAC-SHA256/base64url/константное-время-сравнение,
+        // достаточное подмножество для подписи/проверки JWT (`std/
+        // кодирование/jwt.pns`) — чистые функции над `std.crypto`
+        // (Zig stdlib, ничего не вендорится, в отличие от `бд`/libffi),
+        // но всё равно `native_only` (`target.zig`): выполняются только
+        // через байткод-VM, у AOT WASM-кодогенерации (`wasm_emit.zig`)
+        // нет своего пути для них — тот же практический предел, что и у
+        // `сеть`/`бд` (быстряга/HTTP-сервер всё равно недоступны в WASM).
+        try self.installBuiltinModule("крипто", &.{ "hmac_sha256_base64url", "base64url_кодировать", "base64url_декодировать", "сравнить_константное_время" });
         if (skip_prelude_hardcode) return;
         try self.installPreludeEnum("Опция", &.{ "Нет", "Есть" });
         try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });

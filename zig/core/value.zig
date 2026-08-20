@@ -38,83 +38,82 @@ pub const GcHeader = struct {
     marked: bool = false,
 };
 
-// Open filesystem handle (`фс.открыть`). Mirrors Odin's `File_Value`
-// (`core/file_value_native.odin`) minus the live OS descriptor and the
-// async in_flight/close_requested pair — see `vm.zig`'s `fileOpen`/
-// `fileHandleRead*`/`fileHandleWrite` for why: keeping a real `std.Io.File`
-// alive across calls pulls in `std.Io.Threaded`'s positional
-// `File.Reader`/`File.Writer`, which fail to compile for the
-// `wasm32-freestanding` browser target (`RandomFile`'s `getrandom` probe
-// has no freestanding stub). Every method instead reopens the file by
-// `path` per call through the same whole-file `readFileAlloc`/`writeFile`
-// helpers `фс.прочитать`/`фс.записать` already use (proven to compile for
-// every target) — `offset` is OUR OWN logical read/write cursor into that
-// path's content, not an OS seek position.
+// Открытый файловый дескриптор (`фс.открыть`). Держать живой `std.Io.File`
+// между вызовами нельзя: это тянет за собой позиционные
+// `File.Reader`/`File.Writer` из `std.Io.Threaded`, которые не собираются
+// для `wasm32-freestanding` (у `getrandom`-проверки `RandomFile` нет
+// freestanding-заглушки). Поэтому каждый метод переоткрывает файл по
+// `path` на каждый вызов через те же цельнофайловые
+// `readFileAlloc`/`writeFile`, которыми уже пользуются `фс.прочитать`/
+// `фс.записать` (компилируются под любую цель) — `offset` это НАШ
+// собственный логический курсор чтения/записи внутри содержимого файла,
+// а не позиция seek в ОС.
 pub const FileHandle = struct {
     header: GcHeader = .{},
     path: []u8,
     is_open: bool = true,
     offset: usize = 0,
-    // Gates a concurrent second read/write on the SAME handle — without
-    // this, two overlapping async calls could both snapshot `offset`
-    // before either writes it back, corrupting the sequential-read
-    // contract (same race `Connection.in_flight` guards against).
+    // Блокирует одновременное второе чтение/запись на ТОМ ЖЕ дескрипторе —
+    // без этого два параллельных async-вызова могли бы оба прочитать
+    // `offset` до того, как любой из них его обновит, ломая
+    // последовательное чтение (та же гонка, от которой защищает
+    // `Connection.in_flight`).
     in_flight: bool = false,
 };
 
-// Open TCP connection (`сеть.подключиться`). Unlike `FileHandle` above,
-// this DOES hold a live OS socket — a connection can't be "reopened by
-// address" between calls the way a file can be reopened by path (once
-// bytes are read off the wire they're gone; a fresh `connect()` would be a
-// different, empty conversation, not a resumption).
+// Открытое TCP-соединение (`сеть.подключиться`). В отличие от `FileHandle`
+// выше, здесь держится живой OS-сокет — соединение нельзя "переоткрыть по
+// адресу" между вызовами, как файл переоткрывается по пути (once bytes
+// are read off the wire они потеряны; новый `connect()` — это другой,
+// пустой разговор, а не продолжение).
 //
-// `pending` is OUR OWN byte buffer for `.получить_строку()`'s partial-line
-// carry-over — deliberately NOT a persisted `std.Io.net.Stream.Reader`
-// (which owns its own lookahead buffer): `vm.zig`'s connection methods
-// only ever construct a `Stream.Reader` locally, per call, with a
-// zero-length buffer (`&.{}`), which forces it to read exactly as many
-// bytes as requested with no opportunistic readahead — so nothing is ever
-// silently lost when that transient `Reader` goes out of scope at the end
-// of the call. `pending`/`stream` are both plain data (safe struct
-// fields); the actual `Stream.Reader`/`.Writer` construction happens
-// inside a real `if`/`else` on `builtin.target.os.tag == .freestanding`
-// (proper Sema branch elimination — see the progress report's note on
-// `ос.*` for why the early-return-then-fallthrough shape `Файл`'s methods
-// use wouldn't be safe to reuse here).
+// `pending` — НАШ СОБСТВЕННЫЙ буфер байт для переноса недочитанной
+// строки между вызовами `.получить_строку()` — умышленно не persisted
+// `std.Io.net.Stream.Reader` (у которого свой буфер readahead): методы
+// соединения в `vm.zig` всегда создают `Stream.Reader` локально, на
+// каждый вызов, с нулевым буфером (`&.{}`), что заставляет его читать
+// ровно столько байт, сколько запрошено, без опережающего чтения — так
+// ничего не теряется, когда этот временный `Reader` выходит из области
+// видимости в конце вызова. `pending`/`stream` — обычные данные
+// (безопасные поля структуры); реальное создание
+// `Stream.Reader`/`.Writer` происходит внутри настоящего `if`/`else` по
+// `builtin.target.os.tag == .freestanding` (нормальное устранение ветки
+// компилятором).
 pub const Connection = struct {
     header: GcHeader = .{},
     stream: std.Io.net.Stream,
     is_open: bool = true,
     pending: std.ArrayList(u8) = .empty,
-    // Set while a background read/write for THIS connection is in flight
-    // (submitted, not yet delivered) — gates a concurrent second read/write
-    // (busy error, same as Odin) and defers the actual OS-level close if
-    // .закрыть() is called mid-flight (close_requested, applied at
-    // delivery time instead of racing the worker thread touching the fd).
+    // Установлен, пока для ЭТОГО соединения выполняется фоновое
+    // чтение/запись (отправлено, но ещё не доставлено) — блокирует
+    // одновременное второе чтение/запись (ошибка занятости) и откладывает
+    // реальное закрытие на уровне ОС, если .закрыть() вызван в процессе
+    // (close_requested применяется при доставке результата, а не гонится
+    // с рабочим потоком за дескриптором).
     in_flight: bool = false,
     close_requested: bool = false,
 };
 
-// TCP listening socket (`сеть.http_сервер_слушать`) — `.socket` inside
-// `std.Io.net.Server` is just a handle (plain integer/struct), copyable and
-// safe to call `.accept()` on concurrently from multiple worker threads at
-// once (unlike `Connection`, MULTIPLE `.принять_запрос()` calls in flight
-// at the same time is the whole point of a server — no `in_flight` gate
-// here, `Heap.pin`/`unpin` already support multiple concurrent pins of the
-// same value via its by-value, not by-position, bookkeeping).
+// TCP-слушающий сокет (`сеть.http_сервер_слушать`) — `.socket` внутри
+// `std.Io.net.Server` это просто хендл (обычное целое/структура),
+// копируемый и безопасный для одновременного вызова `.accept()` из
+// нескольких рабочих потоков сразу (в отличие от `Connection`, здесь
+// НЕСКОЛЬКО одновременных `.принять_запрос()` — это и есть смысл
+// сервера, поэтому блокировки `in_flight` нет: `Heap.pin`/`unpin` уже
+// поддерживают несколько одновременных pin одного значения).
 pub const Listener = struct {
     header: GcHeader = .{},
     server: std.Io.net.Server,
     is_open: bool = true,
 };
 
-// One accepted HTTP request (`Слушатель.принять_запрос()`) — `method`/
-// `path` are already-parsed, GC-owned copies (built at delivery time from
-// the worker's plain-data result); `stream` stays live so `.ответить()`
-// can write the response later, on the main thread, entirely synchronously
-// (formatting+writing a response is fast — no need to route it through the
-// async worker pool). One request per connection (no keep-alive) — the
-// stream is closed right after `.ответить()`.
+// Один принятый HTTP-запрос (`Слушатель.принять_запрос()`) — `method`/
+// `path` уже разобранные, GC-владеемые копии (построены на момент
+// доставки из данных воркера); `stream` остаётся живым, чтобы
+// `.ответить()` мог написать ответ позже, в основном потоке, полностью
+// синхронно (форматирование+запись ответа быстрые — нет нужды гонять их
+// через пул воркеров). Один запрос на соединение (без keep-alive) —
+// поток закрывается сразу после `.ответить()`.
 pub const HttpHeaderEntry = struct { name: []u8, value: []u8 };
 
 pub const HttpRequestHandle = struct {
@@ -127,17 +126,18 @@ pub const HttpRequestHandle = struct {
     responded: bool = false,
 };
 
-// Open SQLite connection (`бд.открыть`) — a live resource like
-// `Connection` above, not a "reopen by path" handle like `FileHandle`
-// (re-opening a SQLite file mid-transaction would lose uncommitted state,
-// same reasoning as TCP).
+// Открытое SQLite-соединение (`бд.открыть`) — живой ресурс, как
+// `Connection` выше, а не хендл "переоткрыть по пути", как `FileHandle`
+// (переоткрытие файла SQLite посреди транзакции потеряло бы
+// незакоммиченное состояние — та же причина, что и у TCP).
 pub const SqlConnection = struct {
     header: GcHeader = .{},
     db: ?*sqlite3.sqlite3,
     is_open: bool = true,
-    // Same purpose as `Connection.in_flight`/`FileHandle.in_flight` — one
-    // async `.выполнить()`/`.запрос()` at a time per connection, serialized
-    // by us rather than relying on SQLite's own internal threading mode.
+    // Та же роль, что у `Connection.in_flight`/`FileHandle.in_flight` —
+    // один async `.выполнить()`/`.запрос()` за раз на соединение,
+    // сериализуется нами, а не собственным режимом потокобезопасности
+    // SQLite.
     in_flight: bool = false,
 };
 
@@ -158,12 +158,12 @@ pub const ProcessStatus = enum {
     failed,
 };
 
-// A call frame belonging to a suspended-or-running Process. Lives here (not
-// vm.zig) so Process can hold its OWN persistent frames/stack — the
-// scheduler swaps `Vm.stack`/`Vm.frames` with a process's `stack`/`frames`
-// for the duration of one scheduling slice, instead of the old model where a
-// process's whole execution ran-to-completion recursively on the Zig call
-// stack with no way to pause mid-frame.
+// Кадр вызова, принадлежащий приостановленному или выполняющемуся
+// Process. Живёт здесь (не в vm.zig), чтобы Process мог держать
+// СОБСТВЕННЫЕ постоянные frames/stack — планировщик подменяет
+// `Vm.stack`/`Vm.frames` на `stack`/`frames` процесса на время одного
+// кванта планирования, что позволяет приостанавливать выполнение
+// посреди кадра.
 pub const Frame = struct {
     function_id: bytecode.FunctionId,
     ip: usize = 0,
@@ -180,61 +180,63 @@ pub const Process = struct {
     watchers: std.ArrayList(*Process) = .empty,
     links: std.ArrayList(*Process) = .empty,
     status: ProcessStatus = .ready,
-    // Persistent continuation state — empty while this process is not the
-    // one currently swapped into the VM (either it never started, or the
-    // scheduler is running a different process right now).
+    // Постоянное состояние продолжения — пусто, пока этот процесс не тот,
+    // что сейчас подставлен в VM (либо ещё не запускался, либо
+    // планировщик сейчас выполняет другой процесс).
     frames: std.ArrayList(Frame) = .empty,
     stack: std.ArrayList(Value) = .empty,
-    // A freshly spawned process must get at least one scheduling slice even
-    // with an empty mailbox (its body need not start with получить()) —
-    // afterwards an empty mailbox/signals/async_results genuinely means
-    // "nothing to do", not "hasn't started yet".
+    // Новорождённый процесс должен получить минимум один квант
+    // планирования даже с пустым почтовым ящиком (его тело не обязано
+    // начинаться с получить()) — после этого пустые
+    // mailbox/signals/async_results уже действительно значат "нечего
+    // делать", а не "ещё не стартовал".
     has_run: bool = false,
-    // Results of async builtin calls (Await_Async) — a queue SEPARATE from
-    // mailbox/signals so a background I/O result can never be mistaken for
-    // an ordinary message or a monitor signal that arrived while waiting.
+    // Результаты async-вызовов встроенных функций (Await_Async) —
+    // очередь ОТДЕЛЬНАЯ от mailbox/signals, чтобы результат фонового I/O
+    // нельзя было спутать с обычным сообщением или сигналом монитора,
+    // пришедшим во время ожидания.
     async_results: std.ArrayList(Value) = .empty,
-    // Set when the LAST scheduling slice ended because this process burned
-    // through its instruction budget without blocking or completing (a
-    // CPU-bound busy loop with no получить()/получить_сигнал()/async call
-    // inside) — see `Vm.runProcessSlice`. The scheduler's runnability check
-    // must treat this the same as "has a pending message": a
-    // budget-exhausted process is NOT actually blocked on anything and
-    // must always be eligible for its next slice, regardless of whether
-    // mailbox/signals/async_results are empty (unlike a genuinely
-    // MESSAGE-blocked process, for which "nothing pending" really does
-    // mean "no work to do yet").
+    // Устанавливается, когда ПОСЛЕДНИЙ квант планирования закончился из-за
+    // исчерпания бюджета инструкций без блокировки или завершения
+    // (CPU-bound цикл без получить()/получить_сигнал()/async-вызова
+    // внутри) — см. `Vm.runProcessSlice`. Проверка планировщиком
+    // готовности процесса должна считать это как "есть ожидающее
+    // сообщение": процесс с исчерпанным бюджетом НЕ заблокирован ни на
+    // чём и должен оставаться допустимым для следующего кванта независимо
+    // от пустоты mailbox/signals/async_results (в отличие от процесса,
+    // реально заблокированного на СООБЩЕНИИ, для которого "ничего
+    // ожидающего" действительно значит "пока нет работы").
     budget_exhausted: bool = false,
-    // `ждать(процесс)` support — `result` is populated exactly
-    // once, whenever this process transitions out of `.ready` (completed
-    // OR failed), regardless of whether anything is actually waiting on
-    // it — cheap to always record (one optional field), and means `ждать`
-    // never races the completion: if it's already there when `ждать`
-    // checks, no suspend/wakeup dance is needed at all.
+    // Поддержка `ждать(процесс)` — `result` заполняется ровно один раз,
+    // когда процесс выходит из `.ready` (завершился или упал), независимо
+    // от того, ждёт ли его кто-то в этот момент — дёшево записывать
+    // всегда (одно опциональное поле), и это значит, что `ждать` никогда
+    // не гонится с завершением: если результат уже там на момент
+    // проверки, никакого suspend/wakeup не требуется.
     result: ?TaskResult = null,
-    // Processes currently blocked in `ждать(это)` — separate from
-    // `.watchers` (which feeds `получить_сигнал()`, a user-observable
-    // channel) so an internal task-completion wakeup can never be
-    // mistaken for a real monitor signal by code that happens to also
-    // call `получить_сигнал()`.
+    // Процессы, сейчас заблокированные в `ждать(это)` — отдельно от
+    // `.watchers` (который питает `получить_сигнал()`, пользовательский
+    // канал), чтобы внутреннее пробуждение по завершению задачи нельзя
+    // было спутать с настоящим сигналом монитора в коде, который заодно
+    // вызывает `получить_сигнал()`.
     task_waiters: std.ArrayList(*Process) = .empty,
-    // Mirrors `budget_exhausted`'s role in the scheduler's runnability
-    // gate: set on a WAITING process (not on the completed task) when
-    // something it's `ждать`-ing on just finished — this process is not
-    // actually blocked on its own mailbox/signals/async_results, so it
-    // must stay eligible for its next slice regardless of those being
-    // empty.
+    // Отражает роль `budget_exhausted` в проверке готовности
+    // планировщиком: устанавливается на ОЖИДАЮЩЕМ процессе (не на
+    // завершившейся задаче), когда то, что он ждёт через `ждать`, только
+    // что завершилось — этот процесс не заблокирован на собственных
+    // mailbox/signals/async_results, поэтому должен оставаться допустимым
+    // для следующего кванта независимо от их пустоты.
     task_wakeup_pending: bool = false,
-    // Bounded mailbox (Phase F, item 6) — `null` (default) means
-    // unbounded, matching every process's behavior before this feature.
-    // Set only via `ограничить_почту(N)`, called by the process on
-    // itself; only `отправить_или` (not plain `отправить`) consults it.
+    // Ограниченный почтовый ящик — `null` (по умолчанию) значит
+    // неограниченный. Устанавливается только через `ограничить_почту(N)`,
+    // вызываемый процессом на самом себе; учитывается только
+    // `отправить_или` (не обычным `отправить`).
     mailbox_capacity: ?u32 = null,
-    // Cooperative cancellation (Phase F, item 7) — purely advisory, set
-    // by `отмена(proc)` on the TARGET, read by `отменено()` on the
-    // CURRENT process. No VM code besides these two builtins ever
-    // touches this; a process that never calls `отменено()` behaves as
-    // if cancellation doesn't exist.
+    // Кооперативная отмена — чисто рекомендательная, устанавливается
+    // `отмена(proc)` на ЦЕЛЕВОМ процессе, читается `отменено()` на
+    // ТЕКУЩЕМ процессе. Никакой другой код VM это поле не трогает;
+    // процесс, никогда не вызывающий `отменено()`, ведёт себя так, как
+    // будто отмены не существует.
     cancel_requested: bool = false,
 
     pub fn deinit(self: *Process, allocator: std.mem.Allocator) void {
@@ -253,8 +255,8 @@ pub const Process = struct {
     }
 };
 
-// The outcome of a `запусти`-spawned process, delivered by `ждать` as
-// `Результат.Успех(значение)`/`Результат.Неудача(Ошибка(...))`.
+// Результат процесса, запущенного через `запусти`, доставляется `ждать`
+// как `Результат.Успех(значение)`/`Результат.Неудача(Ошибка(...))`.
 pub const TaskResult = union(enum) {
     completed: Value,
     failed: *HeapString,

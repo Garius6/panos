@@ -1,17 +1,17 @@
 const std = @import("std");
 const panos_core = @import("panos_core");
 
-/// Первый публичный API для встраивания Panos в нативный Zig-процесс.
+/// Публичный API для встраивания панос в нативный Zig-процесс.
 ///
 /// `Runtime` владеет графом модулей, скомпилированной программой и VM. Один
 /// экземпляр загружает один корневой скрипт; вызывать экспортированные функции
 /// можно многократно. `Value`, возвращённый из `call`/`runStart`, принадлежит
 /// VM и действителен до следующего вызова или `deinit`.
 ///
-/// Нативные возможности хоста описываются в Panos как
+/// Нативные возможности хоста описываются в панос как
 /// `внешний "хост" функ ...`. Встраивающее приложение экспортирует
 /// соответствующие C-ABI `pub export fn` и включает `rdynamic` в своей
-/// Zig-сборке; это намеренно не требует вносить игровой API в Panos VM.
+/// Zig-сборке; это намеренно не требует вносить игровой API в VM панос.
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     graph_state: panos_core.module_loader.Graph,
@@ -28,10 +28,10 @@ pub const Runtime = struct {
     };
 
     pub const Config = struct {
-        /// Additional roots used for bare module imports. The caller keeps
-        /// these slices alive until `Runtime.deinit`.
+        /// Дополнительные корни для разрешения "голых" импортов модулей.
+        /// Вызывающий код обязан держать эти слайсы живыми до `Runtime.deinit`.
         global_search_roots: []const []const u8 = &.{},
-        /// Values exposed to `ос.аргументы()` while a script is executing.
+        /// Значения, доступные скрипту через `ос.аргументы()` во время выполнения.
         program_args: []const []const u8 = &.{},
         foreign_profile_enabled: bool = false,
     };
@@ -54,8 +54,8 @@ pub const Runtime = struct {
         self.* = undefined;
     }
 
-    /// Loads the entry module and every reachable import. `reader` must
-    /// provide `read(allocator, path)`, just like `module_loader.Graph.load`.
+    /// Загружает корневой модуль и все достижимые импорты. `reader` должен
+    /// предоставлять `read(allocator, path)`, как и `module_loader.Graph.load`.
     pub fn load(self: *Runtime, reader: anytype, entry_path: []const u8) !void {
         if (self.stage != .empty) return error.AlreadyLoaded;
         try self.graph_state.load(reader, entry_path);
@@ -63,9 +63,10 @@ pub const Runtime = struct {
         self.stage = .loaded;
     }
 
-    /// Compiles a successfully loaded graph. Frontend errors remain available
-    /// through `compilationDiagnostics`; they are not converted into a Zig
-    /// error so an embedding host can render them with source locations.
+    /// Компилирует успешно загруженный граф. Ошибки фронтенда остаются
+    /// доступны через `compilationDiagnostics` — они не превращаются в
+    /// Zig-ошибку, чтобы встраивающий хост мог отрисовать их вместе с
+    /// местоположением в исходнике.
     pub fn compile(self: *Runtime) !void {
         if (self.stage == .empty) return error.NotLoaded;
         if (self.stage == .compiled) return error.AlreadyCompiled;
@@ -109,16 +110,16 @@ pub const Runtime = struct {
         return false;
     }
 
-    /// Calls an exported function declared in the root module. Names from
-    /// imports are intentionally not exposed here: the host controls its
-    /// script-facing surface with ordinary Panos `экспорт` declarations.
+    /// Вызывает экспортированную функцию, объявленную в корневом модуле.
+    /// Имена из импортов сюда намеренно не выведены: хост управляет
+    /// видимой скрипту поверхностью обычными объявлениями `экспорт` в панос.
     pub fn call(self: *Runtime, name: []const u8, arguments: []const panos_core.value.Value) !panos_core.vm.Execution {
         const function = self.rootExportFunction(name) orelse return error.ExportNotFound;
         return self.run(function, arguments);
     }
 
-    /// Runs the conventional `старт` function. Unlike `call`, `старт` keeps
-    /// the CLI's historic behavior and does not have to be exported.
+    /// Запускает обычную функцию `старт`. В отличие от `call`, `старт`
+    /// повторяет поведение CLI и не обязана быть экспортированной.
     pub fn runStart(self: *Runtime) !panos_core.vm.Execution {
         const compile_result = self.compiledGraph() orelse return error.NotCompiled;
         const start = compile_result.start orelse return error.StartNotFound;
@@ -135,10 +136,10 @@ pub const Runtime = struct {
         try machine.writeForeignProfile(writer);
     }
 
-    /// Renders `diagnostics` as one line per entry, resolving each one's
-    /// source file from the runtime's own module graph — the host does not
-    /// need to look up `SourceFile`s itself. Typically called with
-    /// `graphDiagnostics()` or `compilationDiagnostics().?`.
+    /// Отрисовывает `diagnostics` по одной строке на запись, разрешая
+    /// исходный файл каждой записи через собственный граф модулей рантайма —
+    /// хосту не нужно самому искать `SourceFile`. Обычно вызывается с
+    /// `graphDiagnostics()` или `compilationDiagnostics().?`.
     pub fn formatDiagnostics(
         self: *const Runtime,
         writer: *std.Io.Writer,
@@ -149,8 +150,8 @@ pub const Runtime = struct {
 
     fn run(self: *Runtime, function: panos_core.bytecode.FunctionId, arguments: []const panos_core.value.Value) !panos_core.vm.Execution {
         const machine = if (self.machine) |*value| value else return error.NotRunnable;
-        // Output is reported per host invocation, rather than leaking a
-        // previous frame/event's `ввод_вывод.печать` into the next one.
+        // Вывод отслеживается отдельно на каждый вызов хоста, чтобы вывод
+        // `ввод_вывод.печать` из предыдущего кадра/события не просачивался в следующий.
         machine.output.clearRetainingCapacity();
         return machine.run(function, arguments);
     }
@@ -175,9 +176,9 @@ pub fn renderValue(allocator: std.mem.Allocator, runtime_value: Value) ![]const 
     return panos_core.runner.renderValue(allocator, runtime_value);
 }
 
-/// Low-level single-diagnostic render against an already-known
-/// `SourceFile`. Most hosts want `Runtime.formatDiagnostics` instead, which
-/// resolves the right file per diagnostic from the graph itself.
+/// Низкоуровневая отрисовка одной диагностики относительно уже известного
+/// `SourceFile`. Большинству хостов нужен `Runtime.formatDiagnostics`,
+/// который сам разрешает нужный файл для каждой диагностики из графа.
 pub const formatDiagnostic = panos_core.diagnostic.format;
 
 fn hasErrors(diagnostics: *const panos_core.diagnostic.DiagnosticList) bool {
@@ -295,9 +296,10 @@ test "a broken script never surfaces as a Zig error, only as diagnostics" {
     try std.testing.expect(runtime.hasGraphErrors());
 
     try std.testing.expectError(error.GraphHasErrors, runtime.compile());
-    // No `compiled_graph` exists yet (`compile()` returns before building
-    // one), so a lookup by export name fails the same way a genuinely
-    // unknown name would — there is no export table to consult at all.
+    // `compiled_graph` ещё не существует (`compile()` возвращает ошибку до
+    // его построения), поэтому поиск по имени экспорта завершается так же,
+    // как и для действительно неизвестного имени — таблицы экспортов
+    // просто нет.
     try std.testing.expectError(error.ExportNotFound, runtime.call("сломано", &.{}));
     try std.testing.expectError(error.NotCompiled, runtime.runStart());
 }

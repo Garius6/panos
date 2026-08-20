@@ -20,17 +20,15 @@ const Object = union(enum) {
 pub const Heap = struct {
     allocator: std.mem.Allocator,
     objects: std.ArrayList(Object) = .empty,
-    // Long-lived, order-independent GC protection for an object a
-    // background async-I/O worker is touching (an already-open `Файл`/
-    // `Соединение`/`Соединение_БД` handle) — outlives many step() calls,
-    // unlike a LIFO protect/unprotect pair that's only safe within a single
-    // call with no foreign code running in between. Unpinned by VALUE
-    // (search+swapRemove), not by stack position, so arbitrarily
-    // interleaved pins from OTHER unrelated calls never interfere: each
-    // adds and removes only its OWN entry, regardless of how long some
-    // other entry has already been sitting here. Mirrors Odin's
-    // gc_pin/gc_unpin (core/gc.odin), which reuses `vm.gc.protect_stack`
-    // for the same reason.
+    // Долгоживущая, независимая от порядка защита GC для объекта, который
+    // трогает фоновый async-I/O воркер (уже открытый хэндл `Файл`/
+    // `Соединение`/`Соединение_БД`) — переживает много вызовов step(),
+    // в отличие от LIFO-пары protect/unprotect, безопасной только внутри
+    // одного вызова без стороннего кода между ними. Снимается с защиты по
+    // ЗНАЧЕНИЮ (поиск+swapRemove), а не по позиции в стеке — поэтому
+    // произвольно переплетённые pin от ДРУГИХ несвязанных вызовов никогда
+    // не мешают друг другу: каждый добавляет и удаляет только свою запись,
+    // независимо от того, сколько уже висит чужих.
     pinned: std.ArrayList(value.Value) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Heap {
@@ -88,8 +86,9 @@ pub const Heap = struct {
         return array;
     }
 
-    // Called only from `фс.открыть` (`vm.zig`'s `fileOpen`) — `path` is
-    // duped so it outlives whatever local buffer the caller read it from.
+    // Вызывается только из `фс.открыть` (`fileOpen` в `vm.zig`) — `path`
+    // копируется, чтобы пережить любой локальный буфер, из которого его
+    // прочитал вызывающий код.
     pub fn createFile(self: *Heap, path: []const u8) !*value.FileHandle {
         const handle = try self.allocator.create(value.FileHandle);
         errdefer self.allocator.destroy(handle);
@@ -123,8 +122,8 @@ pub const Heap = struct {
         return listener;
     }
 
-    // `method`/`path` are duped by the caller (delivery time, `vm.zig`) so
-    // they outlive whatever worker-owned buffer they were parsed from.
+    // `method`/`path` копируются вызывающей стороной (в момент доставки,
+    // `vm.zig`), чтобы пережить буфер воркера, из которого их разобрали.
     pub fn createHttpRequest(self: *Heap, stream: std.Io.net.Stream, method: []u8, path: []u8, body: []u8, headers: []value.HttpHeaderEntry) !*value.HttpRequestHandle {
         const request = try self.allocator.create(value.HttpRequestHandle);
         errdefer self.allocator.destroy(request);
@@ -262,20 +261,19 @@ pub const Heap = struct {
                 map.deinit(self.allocator);
                 self.allocator.destroy(map);
             },
-            // No live OS descriptor to release (see `value.zig`'s
-            // `FileHandle` doc comment) — just the owned path buffer.
+            // Нет живого дескриптора ОС для освобождения (см. doc-комментарий
+            // `FileHandle` в `value.zig`) — только собственный буфер пути.
             .file => |file_handle| {
                 self.allocator.free(file_handle.path);
                 self.allocator.destroy(file_handle);
             },
-            // Symmetric to Odin's `close_socket_value` finalizer
-            // (`core/vm_io_native.odin`) — unlike `FileHandle`, this one
-            // DOES hold a live descriptor that must be released here if
-            // the user never called `.закрыть()` explicitly. Real `if`/
-            // `else` on the freestanding check (not early-return) so the
-            // `std.Io.Threaded`-backed close is Sema-eliminated entirely
-            // for the browser target, matching `ос.*`'s pattern — see
-            // `value.zig`'s `Connection` doc comment.
+            // В отличие от `FileHandle`, здесь ЕСТЬ живой дескриптор,
+            // который нужно освободить, если пользователь ни разу не
+            // вызвал `.закрыть()` явно. Настоящий `if`/`else` вокруг
+            // проверки freestanding (не ранний return), чтобы закрытие
+            // через `std.Io.Threaded` полностью выпиливалось Sema для
+            // браузерной цели — см. doc-комментарий `Connection` в
+            // `value.zig`.
             .connection => |connection| {
                 if (connection.is_open) {
                     if (comptime @import("builtin").target.os.tag != .freestanding) {
@@ -287,10 +285,8 @@ pub const Heap = struct {
                 connection.pending.deinit(self.allocator);
                 self.allocator.destroy(connection);
             },
-            // Symmetric to Odin's `close_sql_connection` finalizer
-            // (`core/vm_sql_native.odin`) and to `.connection` above —
-            // same real-descriptor / same `if`/`else`-elimination
-            // reasoning.
+            // Та же логика живого дескриптора и `if`/`else`-выпиливания,
+            // что и у `.connection` выше.
             .sql_connection => |connection| {
                 if (connection.is_open) {
                     if (comptime @import("builtin").target.os.tag != .freestanding) {
@@ -299,8 +295,8 @@ pub const Heap = struct {
                 }
                 self.allocator.destroy(connection);
             },
-            // Symmetric to `.connection` above — same real-descriptor /
-            // same `if`/`else`-elimination reasoning.
+            // Та же логика живого дескриптора и `if`/`else`-выпиливания,
+            // что и у `.connection` выше.
             .listener => |listener| {
                 if (listener.is_open) {
                     if (comptime @import("builtin").target.os.tag != .freestanding) {

@@ -45,14 +45,14 @@ pub const ResponseBuffer = struct {
 pub const Server = struct {
     allocator: std.mem.Allocator,
     documents: core_lsp.DocumentStore,
-    // `$PANOS_STDLIB`/exe-relative `std/` search roots for `lsp_graph.
-    // analyze`'s `module_loader.Graph` — empty by default (every existing
-    // test constructs a `Server` via bare `init`, exercising only same-
-    // directory relative imports, which need no search roots at all).
-    // Populated once, for the real binary's whole lifetime, by `main`
-    // below (mirrors `cli/main.zig`'s own one-time setup) — computing it
-    // per-request would be wasteful and `$PANOS_STDLIB`/the exe path
-    // never change while the server process is running.
+    // Корни поиска `$PANOS_STDLIB`/относительно исполняемого файла `std/`
+    // для `lsp_graph.analyze`'s `module_loader.Graph` — по умолчанию пусто
+    // (тесты создают `Server` через голый `init`, используя только
+    // относительные импорты внутри одной директории, для которых корни
+    // поиска не нужны). Заполняется один раз, на весь срок жизни процесса,
+    // функцией `main` ниже — вычислять на каждый запрос было бы
+    // расточительно, а `$PANOS_STDLIB`/путь до исполняемого файла не
+    // меняются, пока сервер работает.
     global_search_roots: []const []const u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator) Server {
@@ -336,15 +336,13 @@ pub const Server = struct {
         try writeDocumentSymbolsResponse(output, request_id, file, symbols.items);
     }
 
-    // Cross-document (specs/010-zig-migration T047): backed by
-    // `lsp_graph.analyze` (a REAL `module_loader.Graph`, not the single-
-    // file `runner.analyzeSource`) — a symbol resolving to a real
-    // `импорт` jumps to the DECLARING module's own file/span via
-    // `resolved.imported_symbols`, not just within the current document.
-    // Falls back to `analyzeSource` only when the URI isn't a `file://`
-    // one (`lsp_graph.analyze` needs a real filesystem path to resolve
-    // relative `импорт`s against) — matches the exact previous behavior
-    // for that edge case.
+    // Межфайловый переход: опирается на `lsp_graph.analyze` (настоящий
+    // `module_loader.Graph`, а не однофайловый `runner.analyzeSource`) —
+    // символ, разрешающийся в реальный `импорт`, переходит к файлу/span
+    // ОБЪЯВЛЯЮЩЕГО модуля через `resolved.imported_symbols`, а не только
+    // внутри текущего документа. Откатывается на `analyzeSource` только
+    // когда URI не `file://` (`lsp_graph.analyze` требует реальный путь в
+    // файловой системе для разрешения относительных `импорт`ов).
     fn definition(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
         const context = self.documentPosition(params) orelse {
             try writeResponse(output, request_id, "null");
@@ -403,14 +401,13 @@ pub const Server = struct {
         try writeDefinitionResponse(output, request_id, context.uri, rangeForSpan(file, target_span));
     }
 
-    // Cross-document (specs/010-zig-migration T047): the contract's own
-    // documented limit still applies — "current graph plus currently open
-    // documents; closed reverse dependents on disk are not required".
-    // Identifies the target declaration by (declaring file path, decl
-    // span) rather than a raw `SymbolId`/`DeclId` — those are only
-    // meaningful WITHIN one `lsp_graph.analyze` call, and each currently
-    // open document gets its OWN independent graph built here, each with
-    // its own numbering.
+    // Межфайловый поиск ссылок ограничен: текущий граф плюс открытые в
+    // редакторе документы; закрытые обратные зависимости на диске не
+    // учитываются. Целевая декларация идентифицируется парой (путь файла
+    // декларации, span декларации), а не сырым `SymbolId`/`DeclId` — они
+    // имеют смысл только ВНУТРИ одного вызова `lsp_graph.analyze`, а
+    // каждый открытый документ здесь получает СВОЙ независимый граф со
+    // своей нумерацией.
     fn references(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
         const context = self.documentPosition(params) orelse {
             try writeResponse(output, request_id, "null");
@@ -443,12 +440,12 @@ pub const Server = struct {
             return;
         };
 
-        // Target identity: where the symbol is DECLARED, regardless of
-        // whether the cursor was on the declaration or on an imported use
-        // of it — both a same-file declaration and any OTHER open
-        // document's own `импорт` of it are matched against this same
-        // (path, span) pair below.
-        const entry_path = (try lsp_graph.uriToPathAlloc(self.allocator, context.uri)).?; // already validated: `analyze` above only succeeds for file:// URIs
+        // Идентичность цели определяется местом ОБЪЯВЛЕНИЯ символа,
+        // независимо от того, стоял ли курсор на самой декларации или на
+        // её использовании через импорт — и декларация в этом же файле, и
+        // `импорт` в любом ДРУГОМ открытом документе сверяются ниже с
+        // одной и той же парой (путь, span).
+        const entry_path = (try lsp_graph.uriToPathAlloc(self.allocator, context.uri)).?; // уже проверено: `analyze` выше успешен только для file:// URI
         defer self.allocator.free(entry_path);
         var target_path: []const u8 = entry_path;
         var target_span: panos_core.source.Span = undefined;
@@ -683,12 +680,12 @@ pub const Server = struct {
         try writeResponse(output, request_id, "null");
     }
 
-    // Coarse but real: innermost tier is the exact expression at the
-    // cursor (`findExpressionAt`'s own span), next tier is the smallest
-    // top-level declaration containing it, outermost is the whole file —
-    // not full AST-statement-level granularity (this AST has no parent
-    // pointers to walk block/statement nesting), but a genuine 2-3-level
-    // chain, not a single flat range.
+    // Грубая, но настоящая иерархия: внутренний уровень — точное выражение
+    // под курсором (собственный span `findExpressionAt`), следующий —
+    // наименьшая содержащая его декларация верхнего уровня, внешний — весь
+    // файл. Не полная гранулярность на уровне AST-стейтментов (у этого AST
+    // нет указателей на родителя для обхода вложенности блоков/стейтментов),
+    // но настоящая цепочка из 2-3 уровней, а не единственный плоский диапазон.
     fn selectionRange(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
         const params_value = params orelse {
             try writeResponse(output, request_id, "null");
@@ -813,11 +810,10 @@ pub const Server = struct {
         try output.appendSlice("]}");
     }
 
-    // `textDocument/semanticTokens/full` — relative encoding per the LSP
-    // spec: each token is `(deltaLine, deltaChar, length, tokenType,
-    // tokenModifiers)`, `deltaChar` measured from the PREVIOUS token's
-    // start ONLY when both are on the same line, otherwise from column 0.
-    // Ported from `lsp/lsp_server.odin`'s `handle_semantic_tokens`.
+    // `textDocument/semanticTokens/full` — относительное кодирование по
+    // спецификации LSP: каждый токен — это `(deltaLine, deltaChar, length,
+    // tokenType, tokenModifiers)`, `deltaChar` отсчитывается от начала
+    // ПРЕДЫДУЩЕГО токена ТОЛЬКО если оба на одной строке, иначе от колонки 0.
     fn semanticTokensFull(self: *Server, params: ?std.json.Value, request_id: std.json.Value, output: *ResponseBuffer) !void {
         const uri = documentUri(params) orelse {
             try writeResponse(output, request_id, "{\"data\":[]}");
@@ -854,10 +850,11 @@ pub const Server = struct {
         for (raw) |token| {
             const start = file.byteOffsetToUtf16Position(token.span.start);
             const end = file.byteOffsetToUtf16Position(token.span.end);
-            // panos identifiers are always single-line — this guards
-            // against ever emitting a token that violates the spec's
-            // "a semantic token cannot span more than one line" invariant,
-            // rather than assuming the source data always agrees.
+            // Идентификаторы panos всегда однострочные — эта проверка
+            // защищает от отправки токена, нарушающего инвариант
+            // спецификации "семантический токен не может занимать больше
+            // одной строки", вместо того чтобы полагаться на то, что
+            // исходные данные всегда ему соответствуют.
             if (end.line != start.line or end.character <= start.character) continue;
             try items.append(self.allocator, .{
                 .line = start.line,
@@ -1106,11 +1103,11 @@ fn writeDefinitionResponse(output: *ResponseBuffer, id: std.json.Value, uri: []c
     try output.append('}');
 }
 
-// Appends every `.ident`-use of `symbol` WITHIN one document's own
-// `resolved`/`tree` as a JSON location (comma-separated, tracking `first`
-// across possibly-multiple documents) — shared by `references`' own
-// document and every other currently open document that imports the same
-// target.
+// Добавляет каждое использование `symbol` (`.ident`) ВНУТРИ собственных
+// `resolved`/`tree` одного документа как JSON location (через запятую,
+// `first` отслеживается через возможно несколько документов) — используется
+// как собственным документом `references`, так и каждым другим открытым
+// документом, импортирующим ту же цель.
 fn appendSymbolReferenceLocations(output: *ResponseBuffer, first: *bool, uri: []const u8, file: panos_core.source.SourceFile, tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId) !void {
     var iterator = resolved.expr_symbols.iterator();
     while (iterator.next()) |entry| {
@@ -1155,14 +1152,14 @@ fn writeRenameResponse(output: *ResponseBuffer, id: std.json.Value, uri: []const
     try appendJsonString(output, uri);
     try output.appendSlice(":[");
     var first = true;
-    // Only include the declaration site itself when we have a PRECISE
-    // name-only span for it (`decl_symbols`, function/constant) — a local
-    // `пер`/`конст` binding's recorded span covers the WHOLE statement
-    // (`ast.zig`'s `Stmt.let` has no separate name sub-span), so including
-    // it here would replace `пер a: Число = 1` with just the new name,
-    // corrupting the statement. Local declarations are therefore
-    // deliberately left out of the edit set for now — only their actual
-    // uses (via `expr_symbols` below) get renamed.
+    // Место самой декларации включается только когда для неё есть ТОЧНЫЙ
+    // span, покрывающий только имя (`decl_symbols`, функция/константа) —
+    // записанный span локальной привязки `пер`/`конст` покрывает ВЕСЬ
+    // стейтмент (у `Stmt.let` в `ast.zig` нет отдельного под-span для
+    // имени), так что включение сюда заменило бы `пер a: Число = 1` просто
+    // новым именем, повредив стейтмент. Поэтому локальные декларации
+    // намеренно не входят в набор правок — переименовываются только их
+    // реальные использования (через `expr_symbols` ниже).
     if (preciseDeclarationSpan(tree, resolved, symbol)) |span| {
         if (span.isValidFor(file)) {
             try appendTextEdit(output, rangeForSpan(file, span), new_name);
@@ -1205,8 +1202,9 @@ fn countReferences(resolved: *const panos_core.resolver.Resolution, symbol: pano
     return count;
 }
 
-// Deepest `DocumentSymbol` (by nesting) whose `range` contains `offset` —
-// `null` if none does (cursor sits in top-level whitespace/outside any decl).
+// Самый глубоко вложенный `DocumentSymbol`, чей `range` содержит `offset` —
+// `null`, если такого нет (курсор в пробельных символах верхнего уровня/вне
+// любой декларации).
 fn smallestSymbolContaining(symbols: []const core_lsp.DocumentSymbol, offset: u32) ?core_lsp.DocumentSymbol {
     for (symbols) |symbol| {
         if (offset < symbol.range.start or offset > symbol.range.end) continue;
@@ -1215,8 +1213,8 @@ fn smallestSymbolContaining(symbols: []const core_lsp.DocumentSymbol, offset: u3
     return null;
 }
 
-// See `selectionRange`'s doc comment for why this is a 2-3-tier chain, not
-// full statement-level AST nesting.
+// См. комментарий к `selectionRange` — почему это цепочка из 2-3 уровней, а
+// не полная вложенность AST на уровне стейтментов.
 fn appendSelectionRangeChain(
     output: *ResponseBuffer,
     file: panos_core.source.SourceFile,
@@ -1289,10 +1287,10 @@ fn appendMatchingSymbols(
     }
 }
 
-// Like `definitionSpan` below, but for a DIRECTLY known `DeclId` (no
-// `decl_symbols` reverse-lookup needed) — used for cross-document jumps
-// (`resolver.ImportedSymbolOrigin.declaration` already names the exact
-// declaration in the OTHER module's tree).
+// Аналог `definitionSpan` ниже, но для НАПРЯМУЮ известного `DeclId` (без
+// обратного поиска через `decl_symbols`) — используется для межфайловых
+// переходов (`resolver.ImportedSymbolOrigin.declaration` уже указывает
+// точную декларацию в дереве ДРУГОГО модуля).
 fn declNameOrFullSpan(tree: *const panos_core.ast.Ast, id: panos_core.ast.DeclId) panos_core.source.Span {
     return switch (tree.decl(id).*) {
         .function => |value| value.name_span,
@@ -1315,9 +1313,10 @@ fn definitionSpan(tree: *const panos_core.ast.Ast, resolved: *const panos_core.r
     return fallback;
 }
 
-// Same `decl_symbols` walk as `definitionSpan`, but returns `null` instead
-// of a whole-statement fallback span when no precise name-only span
-// exists (see the comment at its call site in `writeRenameResponse`).
+// Тот же обход `decl_symbols`, что и в `definitionSpan`, но возвращает
+// `null` вместо запасного span на весь стейтмент, если точного span только
+// для имени не существует (см. комментарий в месте вызова в
+// `writeRenameResponse`).
 fn preciseDeclarationSpan(tree: *const panos_core.ast.Ast, resolved: *const panos_core.resolver.Resolution, symbol: panos_core.symbols.SymbolId) ?panos_core.source.Span {
     var declarations = resolved.decl_symbols.iterator();
     while (declarations.next()) |entry| {
@@ -1670,25 +1669,22 @@ pub fn main(init: std.process.Init) !void {
     if (std.process.executableDirPath(init.io, &exe_dir_buffer)) |len| {
         try global_search_roots.append(init.gpa, try std.fmt.allocPrint(init.gpa, "{s}/std", .{exe_dir_buffer[0..len]}));
     } else |_| {
-        // No real executable path (e.g. some sandboxed/embedded launch
-        // context) — tier 4 is simply unavailable then, not a fatal
-        // error; `$PANOS_STDLIB` still works.
+        // Нет реального пути к исполняемому файлу (например, в песочнице
+        // или встроенном контексте запуска) — этот уровень поиска просто
+        // недоступен, это не фатальная ошибка; `$PANOS_STDLIB` всё ещё
+        // работает.
     }
     server.global_search_roots = global_search_roots.items;
 
     while (true) {
-        // A transport-framing error (missing/invalid `Content-Length`, a
-        // message past `max_message_size`, an unexpected EOF mid-header)
-        // used to propagate straight through this `while`'s `try` into
-        // `main`'s own `!void` return, crashing the ENTIRE server process
-        // on a single malformed frame — found via `specs/010-zig-migration`
-        // T055's contract validation (`contracts/lsp.md`: "[invalid input]
-        // ... never terminate the server"). A real LSP client always sends
-        // well-formed frames, so this is unlikely to trigger in practice —
-        // but "the whole editor's language server dies" on any transport
-        // hiccup is a strictly worse failure mode than a clean shutdown, so
-        // this now logs to stderr and exits the loop (ending the process
-        // with a normal, successful exit) instead of an uncaught error.
+        // Ошибка транспортного фрейминга (отсутствующий/невалидный
+        // `Content-Length`, сообщение больше `max_message_size`,
+        // неожиданный EOF в середине заголовка) не должна приводить к
+        // падению ВСЕГО процесса сервера на одном некорректном фрейме —
+        // "весь языковой сервер редактора падает" при любом сбое
+        // транспорта строго хуже, чем чистое завершение, поэтому здесь
+        // ошибка логируется в stderr и цикл завершается (обычным успешным
+        // выходом из процесса) вместо необработанной ошибки.
         const message = readMessage(init.gpa, stdin) catch |err| {
             var stderr_buffer: [256]u8 = undefined;
             var stderr_file_writer: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &stderr_buffer);
@@ -1768,12 +1764,12 @@ test "LSP server publishes diagnostics for opened and changed documents" {
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"contentChanges\":[{\"text\":\"экспорт функ старт() -> Число\\nпер a: Число = 1\\nесли истина тогда\\nпер a: Число = 2\\na\\nконец\\na\\nконец\"}]}}", &output));
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"textDocument/rename\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"},\"position\":{\"line\":6,\"character\":0},\"newName\":\"внешняя\"}}", &output));
-    // The `пер a: Число = 1` declaration itself is deliberately NOT in the
-    // edit set — a local binding's recorded span covers the whole
-    // statement, not just the name, so there is no safe sub-span to emit
-    // (see `writeRenameResponse`'s comment). Only its actual USES get
-    // renamed: line 6 (outer scope) but not line 4 (shadowed by the inner
-    // `пер a: Число = 2`, a different symbol).
+    // Сама декларация `пер a: Число = 1` намеренно НЕ входит в набор правок
+    // — записанный span локальной привязки покрывает весь стейтмент, а не
+    // только имя, поэтому нет безопасного под-span для отправки (см.
+    // комментарий `writeRenameResponse`). Переименовываются только реальные
+    // ИСПОЛЬЗОВАНИЯ: строка 6 (внешняя область видимости), но не строка 4
+    // (затенена внутренней `пер a: Число = 2` — другим символом).
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"start\":{\"line\":1,\"character\":4}") == null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"start\":{\"line\":6,\"character\":0},\"end\":{\"line\":6,\"character\":1}},\"newText\":\"внешняя\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"start\":{\"line\":4,\"character\":0},\"end\":{\"line\":4,\"character\":1}},\"newText\":\"внешняя\"") == null);
@@ -1796,12 +1792,12 @@ test "LSP server publishes diagnostics for opened and changed documents" {
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"location\":{\"uri\":\"file:///пример.ps\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"name\":\"старт\"") == null);
 
-    // Document is `сложить(a, b) -> a + b` / `старт() -> сложить(20, 22)`.
-    // `сложить`/`старт` themselves are DECLARATION names (not `.ident`
-    // expressions, so not classified — see `semantic_tokens.zig`'s doc
-    // comment); only USES land in `expr_symbols`: `a`/`b` inside `a + b`
-    // (parameter, token type 5) and the `сложить` call inside `старт`
-    // (function, token type 3).
+    // Документ: `сложить(a, b) -> a + b` / `старт() -> сложить(20, 22)`.
+    // `сложить`/`старт` сами по себе — имена ДЕКЛАРАЦИЙ (не выражения
+    // `.ident`, поэтому не классифицируются — см. doc-комментарий
+    // `semantic_tokens.zig`); в `expr_symbols` попадают только
+    // ИСПОЛЬЗОВАНИЯ: `a`/`b` внутри `a + b` (параметр, тип токена 5) и вызов
+    // `сложить` внутри `старт` (функция, тип токена 3).
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"textDocument/semanticTokens/full\",\"params\":{\"textDocument\":{\"uri\":\"file:///пример.ps\"}}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"result\":{\"data\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"data\":[]}") == null);
@@ -1815,16 +1811,15 @@ test "LSP hover includes a contiguous doc-comment ahead of the type name" {
     var output = ResponseBuffer.init(std.testing.allocator);
     defer output.deinit();
 
-    // `сложить` line 0 has a doc-comment; `старт` line 3 has none.
-    // "сложить(20, 22)" on line 4 — "сложить" starts at character 0.
+    // У `сложить` (строка 0) есть doc-комментарий; у `старт` (строка 3) нет.
+    // "сложить(20, 22)" на строке 4 — "сложить" начинается с символа 0.
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///доки.ps\",\"text\":\"/// Складывает два числа.\\nэкспорт функ сложить(a: Число, b: Число) -> Число\\na + b\\nконец\\nэкспорт функ старт() -> Число\\nсложить(20.0, 22.0)\\nконец\"}}}", &output));
 
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///доки.ps\"},\"position\":{\"line\":5,\"character\":1}}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"value\":\"Складывает два числа.\\n\\nфунк(Число, Число) -> Число\"") != null);
 
-    // `a` (a parameter use inside `a + b`, line 2) has no doc-comment of
-    // its own — hover falls back to only the type, same as before
-    // doc-comments were read at all (no regression).
+    // У `a` (использование параметра внутри `a + b`, строка 2) нет
+    // собственного doc-комментария — hover показывает только тип.
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///доки.ps\"},\"position\":{\"line\":2,\"character\":0}}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"value\":\"Число\"") != null);
 }
@@ -1835,16 +1830,16 @@ test "LSP definition and references cross a real импорт between two open d
     var output = ResponseBuffer.init(std.testing.allocator);
     defer output.deinit();
 
-    // main.ps: line 2 (0-indexed) is `мат.сложить(мат.ОТВЕТ, 2)` —
-    // "мат." is 4 characters, "сложить" starts at character 4.
+    // main.ps: строка 2 (с 0) — `мат.сложить(мат.ОТВЕТ, 2)` —
+    // "мат." это 4 символа, "сложить" начинается с символа 4.
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/main.ps\",\"text\":\"импорт \\\"./математика\\\" как мат\\nэкспорт функ старт() -> Число\\nмат.сложить(мат.ОТВЕТ, 2)\\nконец\"}}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "выполнение импортов ещё не поддержано Zig-версией") == null);
     // математика.ps: line 1 is `экспорт функ сложить(a: Число, b: Число) -> Число` —
     // "экспорт функ " is 13 characters, "сложить" starts at character 13.
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/математика.ps\",\"text\":\"экспорт конст ОТВЕТ = 40\\nэкспорт функ сложить(a: Число, b: Число) -> Число\\na + b\\nконец\"}}}", &output));
 
-    // definition on the `сложить` CALL in main.ps must jump to
-    // математика.ps, not stay within main.ps.
+    // переход к определению по ВЫЗОВУ `сложить` в main.ps должен вести в
+    // математика.ps, а не оставаться внутри main.ps.
     try std.testing.expect(try server.handle("{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///проект/main.ps\"},\"position\":{\"line\":2,\"character\":5}}}", &output));
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"uri\":\"file:///%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82/%D0%BC%D0%B0%D1%82%D0%B5%D0%BC%D0%B0%D1%82%D0%B8%D0%BA%D0%B0.ps\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "\"line\":1") != null);

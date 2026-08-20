@@ -1,20 +1,20 @@
 const std = @import("std");
 const symbols = @import("symbols.zig");
 
-/// A type-store-scoped handle.
+/// Хэндл, привязанный к конкретному TypeStore.
 ///
-/// The index is intentionally not sufficient to identify a type: every
-/// module owns a separate TypeStore, so index 1 means a different type in
-/// every store.  The owner token makes accidental cross-store use fail at
-/// the TypeStore boundary instead of silently reading a local type at the
-/// same index.
+/// Индекса намеренно недостаточно для идентификации типа: у каждого
+/// модуля свой TypeStore, поэтому индекс 1 означает разные типы в разных
+/// хранилищах. Токен owner превращает случайное использование хэндла из
+/// чужого хранилища в ошибку на границе TypeStore, а не в молчаливое
+/// чтение локального типа с тем же индексом.
 pub const TypeId = struct {
     owner: u32,
     index: u32,
 
-    /// Synthetic IDs are only for MIR/unit-test fixtures that do not have a
-    /// TypeStore. They must never be passed to TypeStore.get or a composite
-    /// type constructor.
+    /// Синтетические ID нужны только для фикстур MIR/юнит-тестов без
+    /// собственного TypeStore. Их нельзя передавать в TypeStore.get или
+    /// в конструктор составного типа.
     pub fn raw(index: u32) TypeId {
         return .{ .owner = 0, .index = index };
     }
@@ -63,43 +63,39 @@ pub const Type = union(enum) {
         key: TypeId,
         value: TypeId,
     },
-    // `Процесс(T)` — T is the spawned function's return type (delivered by
-    // `ждать`), not the message type accepted via `получить()` inside the
-    // process's own body — `Процесс(T)` has no way to type-check the latter
-    // today (would need analyzing `получить()` call sites in the callee),
-    // so `запусти`/`ждать` treat T as "the eventual result", matching what
-    // was previously a separate `Задача(R)` type before it was folded in.
+    // `Процесс(T)` — T это тип возврата запущенной функции (доставляется
+    // через `ждать`), а НЕ тип сообщений, принимаемых через `получить()`
+    // внутри тела процесса — проверить последнее сегодня нечем (пришлось
+    // бы анализировать места вызова `получить()` в теле callee), поэтому
+    // `запусти`/`ждать` трактуют T как «итоговый результат».
     process: TypeId,
-    // `Сообщение(T)` — a marker return-type for a `-> Пусто`-shaped actor
-    // function DECLARING (not letting the checker infer) the message type
-    // its `получить()`/`выбор получить() ... конец` body accepts. Exists
-    // ONLY in return-type-annotation position (`resolveType`'s `.generic`
-    // case is the sole place that constructs it) — a value of this type
-    // is never actually produced or held anywhere, matching how the
-    // function's body never needs to return a real value for it (see
-    // `checkFunction`'s void-like exhaustiveness exemption). `запусти`
-    // reads T straight off it (`inferSpawn`) to type the resulting
-    // `Процесс(T)` handle from the callee's SIGNATURE alone — no
-    // analysis of the callee's body needed, unlike the general case this
-    // replaces for actor-shaped spawns (see `process`'s own doc comment
-    // above).
+    // `Сообщение(T)` — маркерный тип возврата для функции-актора вида
+    // `-> Пусто`, ОБЪЯВЛЯЮЩИЙ (а не выводимый чекером) тип сообщений,
+    // которые принимает её тело через `получить()`/`выбор получить() ...
+    // конец`. Существует ТОЛЬКО в позиции аннотации типа возврата (единственное
+    // место конструирования — ветка `.generic` в `resolveType`) — значение
+    // этого типа никогда не создаётся и нигде не хранится, поэтому тело
+    // функции не обязано реально что-то возвращать (см. освобождение от
+    // void-подобной исчерпываемости в `checkFunction`). `запусти` читает T
+    // прямо из него (`inferSpawn`), чтобы получить тип итогового хэндла
+    // `Процесс(T)` только по СИГНАТУРЕ callee — без анализа тела функции.
     message: TypeId,
     pointer: TypeId,
     generic_parameter: u32,
     poison: void,
-    // Structurally identical to `poison` everywhere it's checked
-    // (`TypeStore.eql`, `Checker.assignable`'s short-circuit) — the
-    // distinction is purely for future diagnostics/tooling to tell
-    // apart WHY a value ended up universally-assignable: `poison` means
-    // "a real type error was already reported here, don't cascade more
-    // diagnostics from this value". `unconstrained` means "no error at
-    // all — a generic type parameter genuinely couldn't be inferred
-    // from any available context (no cross-statement inference, no
-    // explicit generic-argument call syntax), and staying permissive
-    // here is a deliberate, documented backward-compat fallback real
-    // code depends on (see `inferCallExpected`'s `expected_return`
-    // handling)". No behavioral difference introduced by this variant
-    // existing — see [[project_panos_sound_core_typesystem_direction]].
+    // Структурно идентичен `poison` везде, где проверяется
+    // (`TypeStore.eql`, короткое замыкание в `Checker.assignable`) —
+    // различие нужно только диагностике/инструментам, чтобы отличать
+    // ПРИЧИНУ универсальной совместимости значения: `poison` значит «здесь
+    // уже сообщена настоящая ошибка типов, не каскадировать новые
+    // диагностики от этого значения». `unconstrained` значит «ошибки нет
+    // вовсе — параметр generic-типа реально не удалось вывести из
+    // доступного контекста (нет межстейтментного вывода, нет явного
+    // generic-аргумента в вызове), и снисходительность здесь —
+    // осознанный запасной вариант для обратной совместимости, на который
+    // опирается реальный код (см. обработку `expected_return` в
+    // `inferCallExpected`)». Наличие этого варианта само по себе не меняет
+    // поведение.
     unconstrained: void,
 };
 

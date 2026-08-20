@@ -116,7 +116,7 @@ pub fn runtimeErrorMessage(
     return std.fmt.allocPrint(allocator, "Runtime Panic: '{s}' {s}", .{ name, suffix });
 }
 
-test "builtin availability ports the Odin source of truth" {
+test "builtin availability matches the expected classification per builtin" {
     try std.testing.expectEqual(BuiltinAvailability.all, builtinAvailability("массив::длина"));
     try std.testing.expectEqual(BuiltinAvailability.native_only, builtinAvailability("фс::есть"));
     try std.testing.expectEqual(BuiltinAvailability.native_only, builtinAvailability("сеть::http_запрос"));

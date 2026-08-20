@@ -3,21 +3,19 @@ const mir = @import("mir.zig");
 const mir_cfg = @import("mir_cfg.zig");
 const types = @import("types.zig");
 
-// Ported from `core/mir_validate.odin`. Runs AFTER lowering a function —
-// never mutates MIR, only reads it. Not currently a hard blocker for
-// `mir_lowering.zig` itself (its own construction already guarantees the
-// invariants checked here), but a real robustness net against FUTURE
-// lowering bugs the way `mir_lowering.odin`'s own differential testing
-// found several (see `mir_lowering.zig`'s doc comments) — a malformed MIR
-// value/block reference should fail loudly here, not silently corrupt
-// `wasm_emit.zig`'s stack-machine replay or crash with an unrelated panic
-// deep inside emission.
+// Запускается ПОСЛЕ lowering функции — никогда не мутирует MIR, только
+// читает. Не является жёстким блокером для самого `mir_lowering.zig` (его
+// собственное построение уже гарантирует проверяемые здесь инварианты), но
+// служит реальной страховкой от БУДУЩИХ ошибок lowering — некорректная
+// ссылка на MIR value/block должна громко упасть здесь, а не молча
+// повредить replay стек-машины в `wasm_emit.zig` или упасть с несвязанной
+// паникой где-то глубоко внутри emission.
 
 pub const ValidationIssue = struct {
     message: []const u8,
-    // true = structural error (MIR is broken, nothing downstream can be
-    // trusted); false = a warning (e.g. an unreachable block — may be
-    // legitimate, doesn't necessarily reject the function).
+    // true = структурная ошибка (MIR сломан, ничему из последующего нельзя
+    // доверять); false = предупреждение (например, недостижимый блок —
+    // может быть легитимным, не обязательно отвергает функцию).
     is_error: bool,
 };
 
@@ -33,11 +31,9 @@ fn validValue(id: mir.ValueId, n: usize) bool {
     return @intFromEnum(id) < n and id != mir.invalid_value;
 }
 
-// (dst, operands) of a single instruction — EXHAUSTIVE switch (not
-// `#partial`/`else`) so a new `Instruction` variant fails to compile here
-// until it's given a case, same principle as `core/gc.odin`'s
-// get_header/mark_value (see docs/src/architecture/memory-and-gc.md).
-// `operands` is allocator-owned, caller frees.
+// (dst, operands) одной инструкции — ИСЧЕРПЫВАЮЩИЙ switch (без `else`), так
+// что новый вариант `Instruction` не скомпилируется здесь, пока для него не
+// добавлен case. `operands` во владении allocator, освобождает вызывающий.
 fn instrRefs(allocator: std.mem.Allocator, instruction: mir.Instruction) !struct { dst: ?mir.ValueId, operands: []mir.ValueId } {
     var operands: std.ArrayList(mir.ValueId) = .empty;
     var dst: ?mir.ValueId = null;
@@ -181,14 +177,14 @@ fn instrRefs(allocator: std.mem.Allocator, instruction: mir.Instruction) !struct
     return .{ .dst = dst, .operands = try operands.toOwnedSlice(allocator) };
 }
 
-// `void_type` — the checker's own `Builtins.void` TypeId, needed to decide
-// whether a bare `Return` (no value) is legal for this function. Passed in
-// rather than hardcoded: `mir.Module`/`mir.Function` never carry a
-// reference to the live `types.TypeStore` they were built against (MIR only
-// stores the already-resolved `TypeId`s themselves), and re-deriving "which
-// TypeId means void" any other way here would silently assume a specific
-// `TypeStore.init` allocation order that belongs to `types.zig`, not this
-// file.
+// `void_type` — TypeId `Builtins.void` из checker'а, нужен, чтобы решить,
+// допустим ли для этой функции голый `Return` без значения. Передаётся
+// параметром, а не захардкожен: `mir.Module`/`mir.Function` никогда не
+// хранят ссылку на живой `types.TypeStore`, с которым они были построены
+// (MIR хранит только уже разрешённые `TypeId`), и вывести "какой TypeId
+// означает void" любым другим способом здесь означало бы молча полагаться
+// на конкретный порядок аллокации в `TypeStore.init`, который относится к
+// `types.zig`, а не к этому файлу.
 pub fn validateFunction(allocator: std.mem.Allocator, module: *const mir.Module, function: *const mir.Function, void_type: types.TypeId) ![]ValidationIssue {
     var issues: std.ArrayList(ValidationIssue) = .empty;
 

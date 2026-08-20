@@ -2,11 +2,10 @@ const std = @import("std");
 const type_checker = @import("type_checker.zig");
 const types = @import("types.zig");
 
-// Ported from `core/wasm_module.odin` — binary encoding primitives (LEB128,
-// WASM value types) and section assembly. Phase 1 value-type convention,
-// same as Odin: Число/Целое → f64, Булево → i32 (Строка/структуры/etc.
-// would need an object-table runtime — out of `mir_lowering.zig`'s current
-// scope, so not needed here yet either).
+// Примитивы бинарного кодирования (LEB128, типы значений WASM) и сборка
+// секций. Соглашение о типах значений: Число/Целое → f64, Булево → i32
+// (Строка/структуры/т.п. требуют object-table рантайма — вне текущей
+// области `mir_lowering.zig`).
 
 pub const wasm_f64: u8 = 0x7C;
 pub const wasm_i32: u8 = 0x7F;
@@ -17,42 +16,41 @@ pub fn wasmValType(checked: *const type_checker.CheckResult, type_id: types.Type
 
 pub fn wasmValTypeForStore(store: *const types.TypeStore, type_id: types.TypeId) u8 {
     if (store.eql(type_id, store.builtins.boolean)) return wasm_i32;
-    // Strings and nominal aggregate values are opaque i32 handles owned by
-    // the JS AOT runtime. The first aggregate slice only lowers numeric
-    // struct fields, but all nominal values share this representation.
+    // Строки и именованные агрегатные значения — непрозрачные i32-хендлы,
+    // которыми владеет JS AOT-рантайм. Все именованные значения используют
+    // одно и то же представление.
     if (store.eql(type_id, store.builtins.string)) return wasm_i32;
     if (store.get(type_id)) |entry| switch (entry.*) {
-        // First-class function values are opaque i32 WASM table indices
-        // (see `wasm_interfaces.zig`'s `.function_ref` rewrite) — same
-        // "opaque i32 handle" category as nominal/array/process values.
+        // Функции первого класса — непрозрачные i32-индексы в WASM-таблице
+        // (см. `.function_ref` в `wasm_interfaces.zig`) — та же категория
+        // "непрозрачный i32-хендл", что и nominal/array/process.
         .nominal, .array, .process, .function => return wasm_i32,
-        // A bare, unresolved generic type parameter (`T` with no
-        // concrete substitution reaching this point) — panos generics
-        // are deliberately never monomorphized (see `type_checker.zig`'s
-        // own doc comments), so a value typed this way is only ever
-        // sound to touch through an interface bound (dispatched via the
-        // SAME boxed-i32 vtable mechanism as any other interface value —
-        // `registerGenericInterfaceCasts`/`inferGenericBoundInterfaceCall`
-        // cast the argument to that bound interface at the call site,
-        // not here) — same "safe default" reasoning as the
-        // `.poison`/`.unconstrained` case below.
+        // Голый неразрешённый параметр generic-типа (`T` без конкретной
+        // подстановки на этом этапе) — дженерики панос принципиально
+        // никогда не мономорфизируются (см. доккомментарии
+        // `type_checker.zig`), поэтому значение такого типа можно
+        // безопасно трогать только через interface-bound (диспетчеризуется
+        // через ТОТ ЖЕ boxed-i32 vtable-механизм, что и любое другое
+        // interface-значение — `registerGenericInterfaceCasts`/
+        // `inferGenericBoundInterfaceCall` приводят аргумент к этому
+        // bound-интерфейсу в точке вызова, не здесь) — та же логика
+        // "безопасного значения по умолчанию", что и в случае
+        // `.poison`/`.unconstrained` ниже.
         .generic_parameter => return wasm_i32,
-        // `поison`/`unconstrained` reaching codegen at ALL means one
-        // specific thing in practice, not "type checking gave up
-        // generically": `type_checker.zig`'s `получить()` handling
-        // (~line 4146) stays poison unless the enclosing function
-        // declares `-> Сообщение(T)` — a real, separate limitation that
-        // never infers from match-arm narrowing for the far more common
-        // `-> Пусто` actor idiom (`docs/processes.md`'s own `счётчик`
-        // example). Any OTHER poison value would mean a real type error
-        // was already reported, which stops compilation before this
-        // function ever runs — so this default is safe to specialize:
-        // a received message is consumed via `match_tag`/
-        // `get_variant_field` (always an i32 variant handle) far more
-        // often than as a raw `Число`. Found by actually running
-        // `wasm2wat`/`wasmtime` against real actor output and chasing a
-        // cascade of i32/f64 mismatches back to this single default,
-        // not by reading alone.
+        // Достижение кодогенерации значением `poison`/`unconstrained`
+        // означает одну конкретную вещь, а не "тайпчекер сдался в общем
+        // случае": обработка `получить()` в `type_checker.zig` (~строка
+        // 4146) остаётся poison, если охватывающая функция не объявляет
+        // `-> Сообщение(T)` — реальное отдельное ограничение, которое
+        // никогда не выводится из сужения match-веток для гораздо более
+        // распространённой идиомы actor `-> Пусто` (пример `счётчик` в
+        // `docs/processes.md`). Любое ДРУГОЕ poison-значение означало бы,
+        // что реальная ошибка типов уже была зафиксирована, что
+        // останавливает компиляцию раньше, чем эта функция вообще
+        // вызывается — поэтому такое значение по умолчанию безопасно
+        // специализировать: полученное сообщение чаще потребляется через
+        // `match_tag`/`get_variant_field` (всегда i32-хендл варианта), чем
+        // как сырое `Число`.
         .poison, .unconstrained => return wasm_i32,
         else => {},
     };
@@ -91,8 +89,8 @@ pub fn writeF64Le(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: 
     try out.appendSlice(allocator, &buffer);
 }
 
-// A section is `id byte, uleb128(content.len), content` — built by the
-// caller into a plain byte buffer, wrapped here.
+// Секция — это `id byte, uleb128(content.len), content`: вызывающая сторона
+// собирает содержимое в обычный байтовый буфер, здесь оно оборачивается.
 pub fn writeSection(out: *std.ArrayList(u8), allocator: std.mem.Allocator, section_id: u8, content: []const u8) !void {
     try out.append(allocator, section_id);
     try writeUleb128(out, allocator, @intCast(content.len));

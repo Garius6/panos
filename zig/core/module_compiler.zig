@@ -83,12 +83,12 @@ const ImportContext = struct {
     impls: std.ArrayList(type_checker.ImportedImpl) = .empty,
     functions: std.ArrayList(compiler.ImportedFunction) = .empty,
     constants: std.ArrayList(compiler.ImportedConstant) = .empty,
-    // Each `ImportedNominal.default_method_symbols` (when non-null) is a
-    // fresh allocation `bridgeDefaultMethodSymbols` makes with
-    // `self.allocator` (not arena-owned like most of what `nominals`
-    // otherwise just BORROWS) — tracked here so `deinit` actually frees
-    // them instead of leaking one array per cross-module interface with
-    // default methods.
+    // `ImportedNominal.default_method_symbols` (когда не null) — это
+    // свежая аллокация, которую делает `bridgeDefaultMethodSymbols` через
+    // `self.allocator` (в отличие от большинства того, что `nominals`
+    // просто ЗАИМСТВУЕТ из arena) — отслеживается здесь, чтобы `deinit`
+    // реально освобождал эти массивы, а не тёк по одному на каждый
+    // межмодульный интерфейс со стандартными методами.
     default_method_symbol_arrays: std.ArrayList([]const ?symbols.SymbolId) = .empty,
 
     fn init(allocator: std.mem.Allocator) ImportContext {
@@ -109,27 +109,28 @@ const ImportContext = struct {
         self.* = undefined;
     }
 
-    // Mints a LOCAL synthetic symbol standing in for each default
-    // method a SOURCE interface declares (parallel to `methods`,
-    // `null` where that method has no default) — the SAME "synthetic
-    // symbol + `imports.functions` entry" pattern already used for
-    // inherent methods elsewhere in this file, just for a default
-    // method's compiled function instead. Returns `null` (no array at
-    // all) when the interface has no default methods, matching
-    // `ImportedNominal.interface_methods` itself staying `null` for a
-    // non-interface nominal.
+    // Чеканит ЛОКАЛЬНЫЙ синтетический символ на замену каждому методу по
+    // умолчанию, объявленному ИСХОДНЫМ интерфейсом (параллельно `methods`,
+    // `null` там, где у метода нет реализации по умолчанию) — тот же
+    // паттерн "синтетический символ + запись в `imports.functions`", что
+    // уже используется в этом файле для собственных методов, только для
+    // скомпилированной функции метода по умолчанию. Возвращает `null`
+    // (вообще без массива), если у интерфейса нет методов по умолчанию —
+    // соответствует тому, что `ImportedNominal.interface_methods` тоже
+    // остаётся `null` для не-интерфейсного номинального типа.
     //
-    // WARNING for future callers: this mints a FRESH synthetic symbol on
-    // every call, with no dedup of its own — every existing caller
-    // (`collect`'s direct-import loop and `collectTransitiveNominals`)
-    // is only safe because BOTH append to the same `self.nominals` array
-    // and dedup against it BEFORE calling this (`collectTransitiveNominals`
-    // explicitly scans `self.nominals.items` for an already-known
-    // `(store, source_symbol)` pair and returns early). A third
-    // collection path that calls this without first checking
-    // `self.nominals` the same way would silently double-mint symbols
-    // for the same interface — not a crash, just duplicate/leaked
-    // synthetic bindings.
+    // ПРЕДУПРЕЖДЕНИЕ будущим вызывающим: при каждом вызове чеканится
+    // НОВЫЙ синтетический символ, без собственной дедупликации — оба
+    // существующих вызывающих (цикл прямого импорта в `collect` и
+    // `collectTransitiveNominals`) безопасны только потому, что ОБА
+    // добавляют в один и тот же массив `self.nominals` и дедуплицируют
+    // ПЕРЕД вызовом этой функции (`collectTransitiveNominals` явно
+    // сканирует `self.nominals.items` на уже известную пару `(store,
+    // source_symbol)` и возвращается раньше). Третий путь сбора данных,
+    // вызывающий эту функцию без такой же предварительной проверки
+    // `self.nominals`, молча начеканит дубликаты символов для одного и
+    // того же интерфейса — не крах, но дублирующиеся/утекающие
+    // синтетические привязки.
     fn bridgeDefaultMethodSymbols(self: *ImportContext, resolution: *resolver.Resolution, definition_compiled: *const compiler.CompileResult, methods: []const type_checker.InterfaceMethod) !?[]const ?symbols.SymbolId {
         var any_default = false;
         for (methods) |method| {
@@ -164,16 +165,16 @@ const ImportContext = struct {
         return result;
     }
 
-    // Does `target` (a symbol within `impl_resolution`, an interface
-    // implementation's `.target`) refer to the SAME struct/enum as
-    // `{origin_module, origin_declaration}`? Two cases: `target` is
-    // itself an import within `impl_resolution` (the common
-    // cross-module case, including a THIRD file — compare origins
-    // directly); or `target` has no import origin at all, meaning it's
-    // a LOCAL declaration in `impl_resolution`'s own module (the
-    // same-file impl case) — then it matches only if that module IS
-    // `origin_module` and `target` is exactly the symbol THAT module's
-    // own resolver minted for `origin_declaration`.
+    // Ссылается ли `target` (символ внутри `impl_resolution`, поле
+    // `.target` реализации интерфейса) на ТОТ ЖЕ struct/enum, что и
+    // `{origin_module, origin_declaration}`? Два случая: `target` сам
+    // является импортом внутри `impl_resolution` (обычный межмодульный
+    // случай, включая ТРЕТИЙ файл — сравниваем origin напрямую); либо у
+    // `target` вообще нет origin импорта, значит это ЛОКАЛЬНОЕ
+    // объявление в собственном модуле `impl_resolution` (случай реализации
+    // в том же файле) — тогда совпадение только если этот модуль И ЕСТЬ
+    // `origin_module`, а `target` — именно тот символ, который для
+    // `origin_declaration` начеканил резолвер этого модуля.
     fn implementationTargetMatches(impl_resolution: *const resolver.Resolution, target: symbols.SymbolId, impl_own_module: usize, origin_module: usize, origin_declaration: ast.DeclId) bool {
         if (impl_resolution.imported_symbols.get(target)) |origin| {
             return origin.module == origin_module and origin.declaration == origin_declaration;
@@ -182,14 +183,15 @@ const ImportContext = struct {
         return (impl_resolution.decl_symbols.get(origin_declaration) orelse return false) == target;
     }
 
-    // Reverse lookup — does `resolution` (some OTHER module, not
-    // necessarily the impl's own) have a local symbol standing in for
-    // `{module, declaration}`? Used to resolve a qualified INTERFACE
-    // (codegen's `json.ВJSON`) to a symbol the CONSUMING module can
-    // actually use — a bare-name lookup can't find it there (only in
-    // scope as `модуль.Интерфейс`). `resolution.imported_symbols` is
-    // small (one entry per named cross-module reference in a single
-    // file), a linear scan here is not a hot path.
+    // Обратный поиск — есть ли в `resolution` (какой-то ДРУГОЙ модуль, не
+    // обязательно модуль реализации) локальный символ на замену
+    // `{module, declaration}`? Используется, чтобы привести
+    // квалифицированный ИНТЕРФЕЙС (например `json.ВJSON` из codegen) к
+    // символу, которым может пользоваться ПОТРЕБЛЯЮЩИЙ модуль — поиск по
+    // голому имени там ничего не найдёт (он виден только как
+    // `модуль.Интерфейс`). `resolution.imported_symbols` небольшой (одна
+    // запись на именованную межмодульную ссылку в файле), линейный
+    // перебор здесь не является узким местом.
     fn findLocalSymbolForOrigin(resolution: *const resolver.Resolution, module: usize, declaration: ast.DeclId) ?symbols.SymbolId {
         var it = resolution.imported_symbols.iterator();
         while (it.next()) |entry| {
@@ -198,26 +200,25 @@ const ImportContext = struct {
         return null;
     }
 
-    // Shared by the direct-import (`collect`) and transitive-import
-    // (`collectTransitiveNominals`) paths — both re-host a nominal's
-    // interface implementations the same way, differing only in which
-    // module/resolution/target symbol the source data comes from.
+    // Общая для пути прямого импорта (`collect`) и транзитивного импорта
+    // (`collectTransitiveNominals`) — оба одинаково пересаживают
+    // реализации интерфейса для номинального типа, различаясь лишь тем,
+    // из какого модуля/резолюции/целевого символа берутся исходные данные.
     //
-    // `impl_export.module` (where the `реализация` block is physically
-    // written) may DIFFER from `origin_module` (where the target struct
-    // is declared) — a qualified impl target in a THIRD file (codegen's
-    // `_gen.ps` shape: `реализация json.ВJSON для json_fixture.Заказ`,
-    // written in neither json_fixture.ps nor the consumer). So this
-    // fetches `interface_implementations` from the IMPL's OWN module's
-    // checked results (`modules[impl_export.module]`), not the target's
-    // — and matches `implementation.target` against `{origin_module,
-    // origin_declaration}` by ORIGIN, not raw `SymbolId` equality
-    // (`implementation.target` lives in the impl module's OWN symbol
-    // table, a DIFFERENT space than `origin_declaration`'s target
-    // module OR the consuming module calling this function — comparing
-    // them directly only ever coincidentally worked for the two
-    // previously-supported shapes, where impl/target/consumer symbol
-    // spaces happened to overlap).
+    // `impl_export.module` (где физически написан блок `реализация`)
+    // может ОТЛИЧАТЬСЯ от `origin_module` (где объявлена целевая
+    // структура) — квалифицированная цель реализации в ТРЕТЬЕМ файле
+    // (паттерн `_gen.ps` codegen: `реализация json.ВJSON для
+    // json_fixture.Заказ`, написано не в json_fixture.ps и не в
+    // потребителе). Поэтому здесь `interface_implementations` берутся из
+    // результатов проверки типов СОБСТВЕННОГО модуля реализации
+    // (`modules[impl_export.module]`), а не модуля цели — и
+    // `implementation.target` сравнивается с `{origin_module,
+    // origin_declaration}` по ORIGIN, а не по равенству `SymbolId`
+    // (`implementation.target` живёт в СОБСТВЕННОЙ таблице символов
+    // модуля реализации — это ДРУГОЕ пространство, чем целевой модуль
+    // `origin_declaration` или вызывающий эту функцию потребляющий
+    // модуль).
     fn appendMatchingImpls(
         self: *ImportContext,
         graph: *const module_loader.Graph,
@@ -230,17 +231,15 @@ const ImportContext = struct {
     ) !void {
         for (graph.impls.items) |impl_export| {
             if (impl_export.owner_module != origin_module or impl_export.owner_declaration != origin_declaration) continue;
-            // A `реализация` block declared IN THIS SAME module (`own_module`
-            // — e.g. a consumer file that imports a struct and also
-            // implements a qualified interface for it locally) is already
-            // registered directly by that module's own `signaturePass`
-            // (`defineInterfaceImplementation`) — bridging it here too would
-            // read `modules[own_module].checked`, which doesn't exist yet
-            // (we're INSIDE collecting for `own_module` right now, its
-            // `checked` is only set after `collect()` returns) —
-            // `error.ImportNotChecked`, a real crash found via this exact
-            // shape (both the "impl in consumer" and "impl in a third file
-            // that's ALSO imported directly for other exports" tests).
+            // Блок `реализация`, объявленный В ЭТОМ ЖЕ модуле (`own_module`
+            // — например, файл-потребитель, который импортирует структуру
+            // и тут же локально реализует для неё квалифицированный
+            // интерфейс), уже зарегистрирован напрямую собственным
+            // `signaturePass` этого модуля (`defineInterfaceImplementation`)
+            // — пересадка его ещё и здесь потребовала бы чтения
+            // `modules[own_module].checked`, которого пока не существует
+            // (мы СЕЙЧАС ВНУТРИ сбора для `own_module`, его `checked`
+            // устанавливается только после возврата из `collect()`).
             if (impl_export.module == own_module) continue;
             const impl_module = &modules[impl_export.module];
             const impl_resolution = if (impl_module.resolution) |*value| value else return error.ImportNotCompiled;
@@ -249,17 +248,18 @@ const ImportContext = struct {
                 if (!implementationTargetMatches(impl_resolution, implementation.target, impl_export.module, origin_module, origin_declaration)) continue;
                 const interface_symbol = impl_resolution.symbols.get(implementation.interface) orelse continue;
                 if (!std.mem.eql(u8, interface_symbol.name, impl_export.interface_name)) continue;
-                // A qualified interface (codegen's `json.ВJSON`) needs a
-                // LOCAL symbol in the CONSUMING module's own resolution
-                // to be usable by `type_checker.zig` (a bare-name lookup
-                // there can't find it — it's only in scope as
-                // `модуль.Интерфейс`, never unqualified). Resolved by
-                // ORIGIN, same principle as the target match above; a
-                // consumer that never itself imports the interface's
-                // module gets `null` here and this impl is skipped for
-                // it (degrades to "not found", not a crash — matches
-                // the existing skip-on-unresolvable pattern throughout
-                // this function).
+                // Квалифицированному интерфейсу (например, `json.ВJSON` из
+                // codegen) нужен ЛОКАЛЬНЫЙ символ в собственной резолюции
+                // ПОТРЕБЛЯЮЩЕГО модуля, чтобы им мог пользоваться
+                // `type_checker.zig` (поиск по голому имени там его не
+                // найдёт — он в области видимости только как
+                // `модуль.Интерфейс`, никогда без квалификации). Ищем по
+                // ORIGIN, тот же принцип, что и при сравнении цели выше;
+                // если потребитель сам никогда не импортирует модуль
+                // интерфейса, здесь получаем `null`, и эта реализация для
+                // него пропускается (деградация до "не найдено", не крах —
+                // тот же паттерн пропуска-при-неразрешимости, что и по
+                // всей этой функции).
                 const interface_local_symbol = if (impl_export.interface_module) |interface_module|
                     findLocalSymbolForOrigin(resolution, interface_module, impl_export.interface_declaration.?) orelse continue
                 else
@@ -277,34 +277,23 @@ const ImportContext = struct {
         }
     }
 
-    // Bridges CONCRETE (non-interface) methods for `owner_symbol` — the
-    // `graph.methods` counterpart of `appendMatchingImpls` above (same
-    // "scan the WHOLE graph by owner_module/owner_declaration, not just
-    // `own_module`'s own imports" shape, since `реализация X для
-    // Модуль.Тип` can live in a THIRD file relative to both the type's
-    // own module and any given consumer — codegen's `_gen.ps` pattern).
+    // Пересаживает КОНКРЕТНЫЕ (не интерфейсные) методы для `owner_symbol`
+    // — аналог `appendMatchingImpls` выше для `graph.methods` (та же
+    // схема "сканировать ВЕСЬ граф по owner_module/owner_declaration, а
+    // не только собственные импорты `own_module`", поскольку `реализация
+    // X для Модуль.Тип` может находиться в ТРЕТЬЕМ файле относительно и
+    // собственного модуля типа, и любого потребителя — паттерн `_gen.ps`
+    // codegen).
     //
-    // Needed alongside `appendMatchingImpls` (not instead of it) because a
-    // nominal reached ONLY TRANSITIVELY — through another module's field/
-    // return type, never named/imported directly by `own_module` — used
-    // to get its methods bridged ONLY from `definition_checked.methods`
-    // (the type's OWN declaring module's typecheck results), which can
-    // only ever contain SAME-FILE `реализация` blocks: the declaring
-    // module never imports its own `_gen.ps` counterpart, so a
-    // third-file method attach was invisible to it. Real gap found via
-    // codegen's cross-file nested-struct JSON support: `Фигура.центр:
-    // а.Точка` (a.Точка's `.в_json()` implemented in `a_gen.ps`) — `это.
-    // центр.в_json()` inside `b_gen.ps` (itself reached via `Фигура`'s
-    // field, not a direct import of `a`) failed "у типа нет поля
-    // 'в_json'" even though the exact same method resolves fine on a
-    // DIRECTLY-imported `a.Точка` value in the same file (`b_gen.ps`
-    // reaches `а.Точка` via TWO separate paths — its own `импорт "./a"
-    // как а` AND transitively through `Фигура.центр` — each path mints
-    // its OWN local symbol, `TypeStore.eql`'s identity check unifies them
-    // for type-compatibility purposes, but method lookup is keyed by
-    // symbol, and only the directly-imported one got bridged, via
-    // `module_linker.zig`'s `buildExportsForTarget`, which does the same
-    // `graph.methods` scan this mirrors).
+    // Нужна вместе с `appendMatchingImpls` (а не вместо неё), потому что
+    // номинальный тип, достигнутый ТОЛЬКО ТРАНЗИТИВНО — через поле или
+    // тип возврата другого модуля, никогда не названный/импортированный
+    // напрямую `own_module` — раньше получал пересадку методов ТОЛЬКО из
+    // `definition_checked.methods` (результатов проверки типов
+    // СОБСТВЕННОГО объявляющего модуля типа), где могут быть только блоки
+    // `реализация` В ТОМ ЖЕ ФАЙЛЕ: объявляющий модуль никогда не
+    // импортирует свой собственный аналог `_gen.ps`, поэтому присоединение
+    // метода из третьего файла было для него невидимо.
     fn appendMatchingMethods(
         self: *ImportContext,
         graph: *const module_loader.Graph,
@@ -317,11 +306,12 @@ const ImportContext = struct {
     ) !void {
         for (graph.methods.items) |method_export| {
             if (method_export.owner_module != origin_module or method_export.owner_declaration != origin_declaration) continue;
-            // Same rationale as `appendMatchingImpls`'s identical check —
-            // a method declared IN `own_module` itself is already a plain
-            // local declaration there, not something to bridge (and
-            // `modules[own_module].checked`/`.compiled` don't exist yet
-            // while `own_module` is still being collected).
+            // То же основание, что и у идентичной проверки в
+            // `appendMatchingImpls` — метод, объявленный В САМОМ
+            // `own_module`, уже является обычным локальным объявлением
+            // там, пересаживать нечего (а `modules[own_module].checked`/
+            // `.compiled` ещё не существуют, пока `own_module` всё ещё
+            // собирается).
             if (method_export.module == own_module) continue;
             const method_module = &modules[method_export.module];
             const method_resolution = if (method_module.resolution) |*value| value else return error.ImportNotCompiled;
@@ -365,27 +355,23 @@ const ImportContext = struct {
         graph: *const module_loader.Graph,
         own_module: usize,
     ) !void {
-        // `Результат`/`Опция` are prelude types — EVERY module gets its
-        // OWN freshly-minted symbol for them (the embedded prelude source
-        // is merged unqualified into each file's own resolution, see
-        // `resolver.zig`'s `predeclareUnqualifiedImport`), so an exported
-        // function/field type referencing "the source module's Результат"
-        // was structurally unrelated to "this module's Результат" as far
-        // as `copyImportedType`'s `.nominal` case was concerned — it's
-        // not a REAL cross-module import (`resolution.imported_symbols`
-        // never contains it), so nothing ever bridged the two. Real gap
-        // found auditing panosiki: ANY imported function returning
-        // `Результат(T, Ошибка)` (i.e. basically every function that can
-        // fail) silently became `poison` on the calling side once
-        // `copyImportedType` failed to find it — `.значение()`/`.ошибка()`
-        // then failed "у типа нет поля" instead of working normally.
-        // Fixed by bridging, ONCE per distinct target module this file
-        // actually imports from: that module's own `Результат`/`Опция`
-        // symbol → THIS module's own `Результат`/`Опция` symbol, with
-        // `identity = 0` so `TypeStore.eql`'s nominal comparison falls
-        // back to comparing symbols directly — exactly the same shape a
-        // purely LOCAL (never-imported) usage of `Результат` already
-        // produces in this same file.
+        // `Результат`/`Опция` — типы прелюдии: КАЖДЫЙ модуль получает
+        // СВОЙ собственный свежечеканенный символ для них (встроенный
+        // исходник прелюдии подмешивается без квалификации в резолюцию
+        // каждого файла, см. `predeclareUnqualifiedImport` в
+        // `resolver.zig`), поэтому тип экспортируемой функции/поля,
+        // ссылающийся на "Результат исходного модуля", структурно не
+        // связан с "Результат этого модуля" с точки зрения ветки
+        // `.nominal` в `copyImportedType` — это не НАСТОЯЩИЙ межмодульный
+        // импорт (`resolution.imported_symbols` его не содержит), так что
+        // ничего их не связывает. Мостик строится ОДИН РАЗ на каждый
+        // отдельный целевой модуль, из которого этот файл реально что-то
+        // импортирует: собственный символ `Результат`/`Опция` того
+        // модуля → собственный символ `Результат`/`Опция` ЭТОГО модуля, с
+        // `identity = 0`, чтобы сравнение номинальных типов в
+        // `TypeStore.eql` откатилось к прямому сравнению символов — точно
+        // так же, как уже происходит при чисто ЛОКАЛЬНОМ (никогда не
+        // импортированном) использовании `Результат` в этом же файле.
         var bridged_modules: std.AutoHashMap(usize, void) = .init(self.allocator);
         defer bridged_modules.deinit();
 
@@ -403,21 +389,20 @@ const ImportContext = struct {
 
             switch (exported.kind) {
                 .type => {
-                    // A TYPE ALIAS (`тип Обработчик = функ(Число) -> Число`)
-                    // is not a nominal at all — no fields/enum variants/
-                    // interface methods, `target_checked.enum_definitions`
-                    // /`generic_nominal_fields`/`interface_definitions`
-                    // are all correctly null for it, so the nominal-
-                    // bridging block below would mint an EMPTY opaque
-                    // nominal with no usable shape. Bridge it as an alias
-                    // instead — `target_checked.type_aliases` is always
-                    // populated for every declared alias by now (`type_
-                    // checker.zig`'s `eagerAliasResolutionPass`, forced
-                    // regardless of whether the DEFINING module ever
-                    // references its own alias locally — this exact case:
-                    // a `_lib.pns` that declares an alias purely for other
-                    // modules to import never triggers lazy resolution on
-                    // its own).
+                    // ПСЕВДОНИМ ТИПА (`тип Обработчик = функ(Число) ->
+                    // Число`) — это вообще не номинальный тип: нет полей/
+                    // вариантов перечисления/методов интерфейса,
+                    // `target_checked.enum_definitions`/
+                    // `generic_nominal_fields`/`interface_definitions` для
+                    // него корректно равны null, поэтому блок пересадки
+                    // номинального типа ниже начеканил бы ПУСТОЙ непрозрачный
+                    // номинальный тип без пригодной формы. Вместо этого
+                    // пересаживаем его как псевдоним — `target_checked.
+                    // type_aliases` к этому моменту всегда заполнен для
+                    // каждого объявленного псевдонима (`eagerAliasResolutionPass`
+                    // в `type_checker.zig`, выполняется принудительно
+                    // независимо от того, ссылается ли ОБЪЯВЛЯЮЩИЙ модуль
+                    // на свой псевдоним локально).
                     if (target_checked.type_aliases.get(target_symbol)) |aliased_type| {
                         try self.type_aliases.append(self.allocator, .{
                             .symbol = imported_symbol,
@@ -515,11 +500,12 @@ const ImportContext = struct {
             });
         }
 
-        // Every module has separately resolved prelude symbols. Re-host all
-        // prelude types that can occur in an exported signature or generic
-        // bound; otherwise an imported `[T: Сравниваемое]`, for example,
-        // silently loses its bound because its source SymbolId cannot be
-        // compared with the importer's local SymbolId.
+        // У каждого модуля отдельно разрешённые символы прелюдии.
+        // Пересаживаем все типы прелюдии, которые могут встретиться в
+        // экспортируемой сигнатуре или generic-ограничении; иначе
+        // импортированный, например, `[T: Сравниваемое]` молча теряет своё
+        // ограничение, потому что исходный SymbolId нельзя сравнить с
+        // локальным SymbolId импортёра.
         var touched = bridged_modules.keyIterator();
         while (touched.next()) |module_index_ptr| {
             const target = &modules[module_index_ptr.*];
@@ -528,21 +514,20 @@ const ImportContext = struct {
             for (prelude_type_names) |name| {
                 const source_symbol = findLocalTypeSymbol(target_resolution, name) orelse continue;
                 const local_symbol = findLocalTypeSymbol(resolution, name) orelse continue;
-                // Identity-only, deliberately — a full-data entry (like
-                // the ordinary cross-module `.type` case above) would
-                // DUPLICATE registration: once a real prelude module is
-                // in the graph, THIS module's own copy of `Опция`/
-                // `Сравниваемое`/... already flows in fully populated
-                // through the ordinary `resolution.imported_symbols`
-                // loop above (they're unqualified-imported from the
-                // prelude module, same as any real `импорт`) — a SECOND
-                // full entry for the same `local_symbol` here would
-                // `owner_remaps.put` over the first one and leak it
-                // (confirmed via a real leak-checked test before this
-                // comment was written). This loop exists ONLY to align
-                // a THIRD module's (`target`'s) own separate copy with
-                // this one for signature/bound comparisons — pure
-                // identity, no data.
+                // Намеренно только identity — запись с полными данными
+                // (как в обычном межмодульном случае `.type` выше) была
+                // бы ДУБЛИРУЮЩЕЙ регистрацией: раз в графе есть настоящий
+                // модуль прелюдии, собственная копия `Опция`/
+                // `Сравниваемое`/... этого модуля уже полностью
+                // заполняется через обычный цикл
+                // `resolution.imported_symbols` выше (они импортированы
+                // без квалификации из модуля прелюдии, как любой
+                // настоящий `импорт`) — вторая полная запись для того же
+                // `local_symbol` здесь перезаписала бы первую в
+                // `owner_remaps` и привела бы к утечке. Этот цикл
+                // существует ТОЛЬКО чтобы выровнять собственную отдельную
+                // копию ТРЕТЬЕГО модуля (`target`) с этой для сравнения
+                // сигнатур/ограничений — чистая identity, без данных.
                 try self.nominals.append(self.allocator, .{
                     .store = &target_checked.types,
                     .definition_store = &target_checked.types,
@@ -553,12 +538,13 @@ const ImportContext = struct {
             }
         }
 
-        // A public signature may contain a nominal from a dependency of the
-        // directly imported module.  It has no name in this module's source,
-        // but it still needs a LOCAL representative: fields and methods are
-        // keyed by SymbolId in the checker, whereas TypeId must never escape
-        // its owning TypeStore.  Re-host the complete reachable nominal
-        // closure before importSignaturePass copies any signature.
+        // Публичная сигнатура может содержать номинальный тип из
+        // зависимости напрямую импортированного модуля. У него нет имени
+        // в исходнике этого модуля, но всё равно нужен ЛОКАЛЬНЫЙ
+        // представитель: поля и методы в checker'е ключуются по SymbolId,
+        // а TypeId никогда не должен покидать свой владеющий TypeStore.
+        // Пересаживаем полное достижимое замыкание номинальных типов
+        // прежде, чем importSignaturePass скопирует хоть одну сигнатуру.
         var nominal_index: usize = 0;
         while (nominal_index < self.nominals.items.len) : (nominal_index += 1) {
             const imported = self.nominals.items[nominal_index];
@@ -588,18 +574,14 @@ const ImportContext = struct {
             const imported = self.imported_types.items[imported_type_index];
             try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, imported.store, imported.type_id);
         }
-        // Index-based, re-reading `self.methods.items` fresh each
-        // iteration — NOT `for (self.methods.items) |method|`, which
-        // captures a fixed slice. A transitively-discovered nominal with
-        // its OWN methods (below, the `.nominal` case) appends MORE
-        // entries to this exact list from inside this same loop — a
-        // captured slice keeps iterating over the OLD backing array after
-        // `ArrayList.append` reallocates it, walking freed memory (real,
-        // reproducible segfault: any imported function whose signature
-        // combines a transitively-imported nominal with a LOCAL struct
-        // that has a `реализация` block, e.g. `std/сеть/http.ps`'s
-        // `отправить_json(значение: json.Значение) -> Результат(Ответ,
-        // Ошибка)` — `Ответ` has methods).
+        // По индексу, перечитывая `self.methods.items` заново на каждой
+        // итерации — НЕ `for (self.methods.items) |method|`, который
+        // захватывает фиксированный срез. Транзитивно обнаруженный
+        // номинальный тип с СОБСТВЕННЫМИ методами (ниже, ветка
+        // `.nominal`) добавляет ЕЩЁ записи в этот же список изнутри этого
+        // же цикла — захваченный срез продолжил бы обход СТАРОГО
+        // массива после того, как `ArrayList.append` его переаллоцирует,
+        // то есть обход освобождённой памяти.
         var method_index: usize = 0;
         while (method_index < self.methods.items.len) : (method_index += 1) {
             const method = self.methods.items[method_index];
@@ -636,10 +618,11 @@ const ImportContext = struct {
                 const origin: resolver.ImportedSymbolOrigin = target_resolution.imported_symbols.get(nominal.symbol) orelse blk: {
                     const declaration = declarationForSymbol(target_resolution, nominal.symbol);
                     if (declaration) |value| break :blk .{ .module = reference_module, .declaration = value };
-                    // Resolver-installed builtin types have no AST
-                    // declaration and exist independently in every module.
-                    // Re-host them by name, just like prelude types; their
-                    // operations are recognised by the local checker.
+                    // Встроенные типы, устанавливаемые резолвером, не
+                    // имеют AST-объявления и существуют независимо в
+                    // каждом модуле. Пересаживаем их по имени, как и типы
+                    // прелюдии; их операции распознаются локальным
+                    // checker'ом.
                     const source_symbol = target_resolution.symbols.get(nominal.symbol) orelse return error.UnsupportedImportedType;
                     const local_symbol = findLocalTypeSymbol(resolution, source_symbol.name) orelse return error.UnsupportedImportedType;
                     try self.nominals.append(self.allocator, .{
@@ -690,28 +673,22 @@ const ImportContext = struct {
                     .interface_methods = transitive_interface_methods,
                     .default_method_symbols = transitive_default_method_symbols,
                 });
-                // Same bridging the direct-import loop above does for a
-                // symbol reached via `resolution.imported_symbols` — a
-                // nominal reached ONLY transitively (through another
-                // function's signature, never named/imported directly)
-                // previously got its STRUCTURAL shape re-hosted (fields/
-                // methods, just above) but never its INTERFACE
-                // IMPLEMENTATIONS, since this whole `.nominal` case never
-                // consulted `graph.impls` at all. Real gap found via
-                // `коллекции.итератор(x)` (a prelude function returning
-                // `МассивИтератор(T)`, itself only prelude-declared,
-                // reachable ONLY through that return type from a
-                // consuming module that never names `МассивИтератор`
-                // anywhere) — its interface DEFAULT METHOD dispatch
-                // (`inferDefaultInterfaceMethodCall`) had nothing to find
-                // in the consuming module's OWN `interface_implementations`.
+                // Тот же мостик, что и цикл прямого импорта выше строит
+                // для символа, достигнутого через
+                // `resolution.imported_symbols` — номинальный тип,
+                // достигнутый ТОЛЬКО транзитивно (через сигнатуру другой
+                // функции, никогда не названный/импортированный напрямую),
+                // без этого получал бы пересадку только СТРУКТУРНОЙ формы
+                // (поля/методы, чуть выше), но никогда — РЕАЛИЗАЦИЙ
+                // ИНТЕРФЕЙСА, поскольку вся эта ветка `.nominal` вообще
+                // не обращалась к `graph.impls`.
                 try self.appendMatchingImpls(graph, modules, resolution, own_module, origin.module, origin.declaration, local_symbol);
-                // `graph.methods`-wide scan (not just `definition_checked.
-                // methods`, which only ever sees SAME-FILE `реализация`
-                // blocks — the type's own declaring module never imports
-                // its own third-file `_gen.ps` counterpart) — see
-                // `appendMatchingMethods`'s doc comment for the real gap
-                // this closes.
+                // Сканирование всего `graph.methods` (а не только
+                // `definition_checked.methods`, где видны только блоки
+                // `реализация` В ТОМ ЖЕ ФАЙЛЕ — собственный объявляющий
+                // модуль типа никогда не импортирует свой аналог
+                // `_gen.ps` в третьем файле) — см. doc-комментарий
+                // `appendMatchingMethods`.
                 try self.appendMatchingMethods(graph, modules, resolution, own_module, origin.module, origin.declaration, local_symbol);
             },
             .array => |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, element),
@@ -752,23 +729,17 @@ fn findLocalTypeSymbol(resolution: *const resolver.Resolution, name: []const u8)
     return null;
 }
 
-// `Опция`/`Результат`/6 interfaces — there is only ever ONE real
-// declaration (`prelude.zig`), unqualified-merged into every module, so
-// unlike an ordinary cross-module struct/enum (where two SEPARATELY
-// declared same-named types must NOT be conflated), any two
-// reconstructions of one of these must always compare equal. Used at
-// TWO sites: (1) `nominalIdentity`'s call site below — forces identity
-// 0 (matching how a module's own DIRECT, local use of e.g. `Опция
-// (Число)` already gets identity 0, never touching `nominalIdentity`
-// at all) instead of minting a fresh nonzero cross-module identity;
-// (2) the prelude-bridge loop, aligning a THIRD module's own copy.
-// Real gap found only once a real prelude module was actually
-// exercised for the first time: `реализация Итерируемое для X`, where
-// `следующий() -> Опция(T)` gets reconstructed via `copyImportedType`
-// (needs `Опция`'s bridge identity) while `Опция(Число)` used directly
-// in the SAME file never goes through that path at all (identity 0,
-// default) — a mismatched identity made `TypeStore.eql` treat them as
-// different types even though the symbol matched.
+// `Опция`/`Результат`/6 интерфейсов — существует лишь ОДНО настоящее
+// объявление (`prelude.zig`), подмешиваемое без квалификации в каждый
+// модуль, поэтому в отличие от обычной межмодульной структуры/перечисления
+// (где два ОТДЕЛЬНО объявленных одноимённых типа НЕ должны смешиваться),
+// любые две реконструкции одного из этих типов должны всегда сравниваться
+// как равные. Используется в ДВУХ местах: (1) в месте вызова
+// `nominalIdentity` ниже — принудительно даёт identity 0 (так же, как
+// уже получает identity 0 прямое локальное использование модулем,
+// например, `Опция(Число)`, никогда не затрагивая `nominalIdentity`)
+// вместо чеканки новой ненулевой межмодульной identity; (2) цикл
+// мостика прелюдии, выравнивающий собственную копию ТРЕТЬЕГО модуля.
 const prelude_type_names = [_][]const u8{
     "Результат",
     "Опция",
@@ -811,82 +782,79 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
     try result.appendDiagnostics(&graph.diagnostics);
     if (result.hasErrors()) return result;
 
-    // Detected by reserved path, not a parameter — a graph built without
-    // calling `appendPreludeModule` (every existing test, and any caller not
-    // yet updated) compiles exactly as before, no prelude merged anywhere.
+    // Определяется по зарезервированному пути, а не параметром — граф,
+    // построенный без вызова `appendPreludeModule` (любой ранее написанный
+    // тест, любой не обновлённый вызывающий код), компилируется точно как
+    // раньше, без слияния прелюдии где-либо.
     const prelude_module = graph.module_indices.get("@prelude");
 
     result.modules = try allocator.alloc(ModuleCompilation, graph.modules.items.len);
     @memset(result.modules, .{});
-    // Phase 1: resolve EVERY module first, in any order — `ImportScope`
-    // is built purely from `graph.exports`/`graph.imports` (computed once
-    // at load time by `collectExports`/`registerModule`, see
-    // `module_linker.zig`'s `buildExportsForTarget`), never from another
-    // module's OWN resolve/check/compile results — so resolution has no
-    // real inter-module ordering dependency at all, unlike Phase 2 below.
+    // Фаза 1: сначала резолвим КАЖДЫЙ модуль, в любом порядке — `ImportScope`
+    // строится исключительно из `graph.exports`/`graph.imports` (вычислены
+    // один раз при загрузке `collectExports`/`registerModule`, см.
+    // `buildExportsForTarget` в `module_linker.zig`), никогда — из
+    // результатов резолва/проверки/компиляции ДРУГОГО модуля, поэтому у
+    // резолва вообще нет реальной межмодульной зависимости по порядку, в
+    // отличие от Фазы 2 ниже.
     for (graph.order.items) |module_index| {
         const module = &graph.modules.items[module_index];
         var scope = try module_linker.ImportScope.initWithPrelude(allocator, graph, module_index, prelude_module);
         defer scope.deinit();
 
-        // Skipped for EVERY module once a prelude module exists in the
-        // graph — the prelude module itself gets its own real declarations
-        // instead, and every OTHER module receives them via the implicit
-        // unqualified import above, so the hand-installed duplicates would
-        // collide with either path, not just the prelude module's own.
+        // Пропускается для КАЖДОГО модуля, если в графе уже есть модуль
+        // прелюдии — сама прелюдия получает свои настоящие объявления, а
+        // каждый ДРУГОЙ модуль получает их через неявный неквалифицированный
+        // импорт выше, так что вручную установленные дубликаты
+        // конфликтовали бы с любым из путей, не только с самой прелюдией.
         result.modules[module_index].resolution = try resolver.resolveModuleForTarget(allocator, &module.tree, scope.modules, prelude_module != null, target_profile, module.file.path);
         const resolution = &result.modules[module_index].resolution.?;
         try result.appendDiagnostics(&resolution.diagnostics);
         if (result.hasErrors()) return result;
     }
 
-    // Phase 2: typecheck + compile. `graph.order` (plain import-edge
-    // topological order) is used as the INITIAL queue, but is not
-    // actually sufficient by itself: `ImportContext.appendMatchingImpls`
-    // scans `graph.impls` for ANY `реализация` matching an imported
-    // type's origin, REGARDLESS of whether the impl-declaring module is
-    // itself imported by the module being processed — the qualified
-    // "third-file impl" shape (codegen's `_gen.ps` pattern: `реализация
-    // json.ВJSON для json_fixture.Заказ`, written in neither
-    // `json_fixture.ps` nor the consumer) means a module can depend on
-    // another module's `.checked`/`.compiled` state WITHOUT there being
-    // any import edge between them at all — an ordering constraint
-    // `graph.order`'s plain DFS over import edges cannot see or encode.
-    // Real, previously-unknown bug found via a genuine diamond import
-    // (`main` imports both `A` and `B`, `B` also imports `A`, and a
-    // THIRD file `A_gen` — imported only by `main`, not by `B` —
-    // implements an interface for `A`'s type): `B` is processed before
-    // `A_gen` in plain topological order (nothing requires otherwise —
-    // `B` never imports `A_gen`), but `B`'s own `collect()` still touches
-    // `A_gen`'s impl while scanning `A`'s import, `A_gen.checked` isn't
-    // populated yet → `error.ImportNotChecked`/`ImportNotCompiled`, a
-    // hard crash for a perfectly valid program.
+    // Фаза 2: проверка типов + компиляция. `graph.order` (обычный
+    // топологический порядок по рёбрам импорта) используется как
+    // НАЧАЛЬНАЯ очередь, но сам по себе недостаточен:
+    // `ImportContext.appendMatchingImpls` сканирует `graph.impls` на ЛЮБУЮ
+    // `реализация`, соответствующую origin импортированного типа, ВНЕ
+    // ЗАВИСИМОСТИ от того, импортирован ли модуль-объявитель реализации
+    // самим обрабатываемым модулем — форма "реализация в третьем файле"
+    // (паттерн codegen `_gen.ps`: `реализация json.ВJSON для
+    // json_fixture.Заказ`, написанная ни в `json_fixture.ps`, ни в
+    // потребителе) означает, что модуль может зависеть от состояния
+    // `.checked`/`.compiled` ДРУГОГО модуля БЕЗ какого-либо ребра импорта
+    // между ними вообще — ограничение порядка, которое обычный DFS
+    // `graph.order` по рёбрам импорта не может увидеть или закодировать.
     //
-    // Fixed with a worklist instead of a single topological pass: a
-    // module whose `collect()` hits a not-yet-ready dependency (this
-    // hidden impl-driven edge is the ONLY thing that can trigger it —
-    // every OTHER `ImportNotCompiled`/`ImportNotChecked` site in
-    // `ImportContext` looks up a module `own_module` ACTUALLY imports,
-    // already guaranteed ready by `graph.order`) is pushed to the back
-    // of the queue and retried later, instead of hard-failing. `stalled`
-    // counts consecutive requeues with zero forward progress — reaching
-    // the current queue length means every remaining module failed on a
-    // full pass, a genuine unresolvable case (not seen in practice; would
-    // need a real cycle between qualified impl targets across files) —
-    // propagate the underlying error rather than looping forever.
+    // Поэтому вместо одного топологического прохода используется рабочая
+    // очередь: модуль, чей `collect()` натыкается на ещё не готовую
+    // зависимость (это скрытое ребро, порождённое реализацией — ЕДИНСТВЕННОЕ,
+    // что может это вызвать: любое ДРУГОЕ место `ImportNotCompiled`/
+    // `ImportNotChecked` в `ImportContext` обращается к модулю, который
+    // `own_module` РЕАЛЬНО импортирует, и уже гарантированно готов по
+    // `graph.order`), откладывается в конец очереди и повторяется позже,
+    // вместо немедленного отказа. `stalled` считает подряд идущие
+    // переоткладывания без единого продвижения вперёд — если счётчик
+    // достигает текущей длины очереди, значит каждый оставшийся модуль
+    // провалился за полный проход — это по-настоящему неразрешимый случай
+    // (на практике не встречался; потребовал бы настоящего цикла между
+    // квалифицированными целями реализации через файлы) — тогда исходная
+    // ошибка пробрасывается наружу вместо бесконечного цикла.
     var queue: std.ArrayList(usize) = .empty;
     defer queue.deinit(allocator);
     try queue.appendSlice(allocator, graph.order.items);
     var stalled: usize = 0;
     while (queue.items.len != 0) {
         if (stalled >= queue.items.len) {
-            // Nothing in the queue made progress across a full pass — the
-            // graph state is otherwise unchanged since the last attempt at
-            // this exact module, so re-running `collect` is expected to
-            // fail identically and `try` propagates that error out of
-            // `compileGraphForTarget`. Only reachable for a genuine cycle
-            // between qualified impl targets across files (see the doc
-            // comment above) — not by any currently-existing panos code.
+            // Ни один элемент очереди не продвинулся за полный проход —
+            // состояние графа не изменилось с прошлой попытки для этого же
+            // модуля, поэтому повторный `collect` должен провалиться
+            // идентично, и `try` пробрасывает эту ошибку из
+            // `compileGraphForTarget`. Достижимо только при настоящем цикле
+            // между квалифицированными целями реализации через файлы (см.
+            // doc-комментарий выше) — не встречается ни в каком существующем
+            // коде панос.
             const module_index = queue.items[0];
             const resolution = &result.modules[module_index].resolution.?;
             var imports = ImportContext.init(allocator);
@@ -1349,34 +1317,30 @@ test "module compiler dispatches an interface-impl method as an ordinary cross-m
     }
 }
 
-// Both the interface AND the target are qualified (`реализация
-// интерфейсы.МойИнтерфейс для точки.Точка`), and the impl block itself
-// is written in the CONSUMING file (main.ps) — this is the shape that
-// exposed two real bugs, both now fixed:
-// (1) pass ordering — `signaturePass` (processes `реализация` blocks,
-//     including the `isImplementableNominal` check) used to run BEFORE
-//     `importSignaturePass` (populates `nominal_fields` for imported
-//     nominals), so a qualified target's `nominal_fields` entry didn't
-//     exist yet when checked, and every such `реализация` was rejected
-//     with "интерфейс может реализовать только структура или
-//     перечисление" even for a real struct;
-// (2) `interfaceMethodMatches`'s receiver type was built via a raw
-//     `types.nominal(owner, ...)` (identity=0) instead of `nominalType`
-//     (real bridged identity) — `TypeStore.eql`'s nominal case switches
-//     to strict identity comparison the moment either side is non-zero,
-//     so the receiver never matched the method's `это: точки.Точка`
-//     parameter type (which WAS resolved with the real identity via
-//     `resolveType`'s own `.qualified` case), rejected as "первый
-//     аргумент метода должен иметь тип реализующего типа".
+// И интерфейс, И цель квалифицированы (`реализация
+// интерфейсы.МойИнтерфейс для точки.Точка`), причём сам блок реализации
+// написан в ПОТРЕБЛЯЮЩЕМ файле (main.ps). `signaturePass` (обрабатывает
+// блоки `реализация`, включая проверку `isImplementableNominal`) должен
+// выполняться ПОСЛЕ `importSignaturePass` (заполняет `nominal_fields` для
+// импортированных номинальных типов) — иначе запись `nominal_fields` для
+// квалифицированной цели ещё не существует на момент проверки.
+// `interfaceMethodMatches` сравнивает тип получателя через `nominalType`
+// (реальную мостовую identity), а не через сырой `types.nominal(owner,
+// ...)` (identity=0) — `TypeStore.eql` для номинальных типов переключается
+// на строгое сравнение identity, как только хотя бы одна сторона не равна
+// нулю, поэтому получатель должен совпадать с типом параметра метода
+// `это: точки.Точка`, разрешённым через собственную ветку `.qualified`
+// `resolveType`.
 //
-// NOT covered here (a separate, larger gap, still open): an impl block
-// written in a THIRD file — neither the struct's own file nor the
-// consumer's — is invisible to any OTHER file that imports only the
-// struct's module (module_loader.zig's `collectMethods` skips qualified
-// targets entirely, `target_module != null => continue`, so such impls
-// never enter `graph.methods`/`graph.impls` at all) — exactly the shape
-// a codegen-generated `_gen.ps` file needs (separate from both the
-// source struct's file and whatever imports the generated file).
+// НЕ покрыто здесь (отдельный, более крупный пробел, всё ещё открыт): блок
+// реализации, написанный в ТРЕТЬЕМ файле — не в файле самой структуры и не
+// в файле потребителя — невидим для любого ДРУГОГО файла, импортирующего
+// только модуль структуры (`collectMethods` в module_loader.zig пропускает
+// квалифицированные цели целиком, `target_module != null => continue`, так
+// что такие реализации вообще никогда не попадают в
+// `graph.methods`/`graph.impls`) — именно такая форма нужна файлу
+// `_gen.ps`, сгенерированному codegen (отдельному и от файла исходной
+// структуры, и от того, что импортирует сгенерированный файл).
 test "module compiler resolves both qualified interface and qualified target declared in the consumer" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "импорт \"./интерфейсы\" как интерфейсы\nимпорт \"./точки\" как точки\nреализация интерфейсы.МойИнтерфейс для точки.Точка\nфунк значение(это: точки.Точка) -> Число\nэто.x\nконец\nконец\nэкспорт функ старт() -> Число\nточки.Точка(40.0).значение()\nконец" },
@@ -1402,17 +1366,13 @@ test "module compiler resolves both qualified interface and qualified target dec
     }
 }
 
-// Impl declared in a THIRD file — neither the struct's own file
-// (точки.ps) nor the file that actually calls the method (main.ps) —
-// mirrors a codegen-generated `_gen.ps`: separate from both the source
-// struct's file and whatever imports the generated file. main.ps
-// imports точки.ps directly (for the constructor) AND связка.ps (for
-// the side effect of registering the impl — exactly what a generated
-// `импорт "./<файл>_gen"` does). Was rejected with "у типа нет поля
-// 'значение'" before the module_loader/module_linker/resolver fix —
-// `collectMethods` (module_loader.zig) skipped any qualified impl
-// target entirely, so `graph.methods`/`graph.impls` never got an entry
-// for this shape at all.
+// Реализация объявлена в ТРЕТЬЕМ файле — не в собственном файле структуры
+// (точки.ps) и не в файле, который реально вызывает метод (main.ps) — это
+// повторяет форму сгенерированного codegen `_gen.ps`: отдельно и от файла
+// исходной структуры, и от того, что импортирует сгенерированный файл.
+// main.ps импортирует точки.ps напрямую (ради конструктора) И связка.ps
+// (ради побочного эффекта регистрации реализации — именно это делает
+// сгенерированный `импорт "./<файл>_gen"`).
 test "module compiler resolves an impl declared in a third file, separate from both the struct and the consumer" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nимпорт \"./связка\" как связка\nэкспорт функ старт() -> Число\nточки.Точка(40.0).значение()\nконец" },
@@ -1576,14 +1536,15 @@ test "module compiler dispatches through a direct interface-typed cast on an imp
     }
 }
 
-// Regression: `inferInterfaceCall`/`inferGenericBoundInterfaceCall` are
-// tried speculatively for EVERY `.property(...)` call and fall through
-// to the next candidate (here: a qualified struct constructor) on a
-// non-match, but used to report "именованные аргументы не поддержаны
-// для интерфейсного вызова" as a side effect BEFORE confirming the call
-// was actually theirs to handle — wrongly rejecting a plain cross-module
-// named-argument constructor call (`модуль.Тип(поле = x, ...)`) that has
-// nothing to do with interfaces at all.
+// `inferInterfaceCall`/`inferGenericBoundInterfaceCall` пробуются
+// спекулятивно для КАЖДОГО вызова `.property(...)` и при несовпадении
+// откатываются к следующему кандидату (здесь — квалифицированный
+// конструктор структуры); важно, чтобы диагностика "именованные аргументы
+// не поддержаны для интерфейсного вызова" не всплывала раньше, чем
+// подтверждено, что вызов действительно относится к интерфейсу — иначе
+// обычный межмодульный вызов конструктора с именованными аргументами
+// (`модуль.Тип(поле = x, ...)`), не имеющий отношения к интерфейсам,
+// был бы ошибочно отклонён.
 test "module compiler accepts a qualified struct constructor with named arguments" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "импорт \"./основа\" как основа\nэкспорт функ старт() -> Строка\nпер s = основа.Спавн(имя = \"рабочий\", приоритет = 1)\ns.имя\nконец" },
@@ -1719,23 +1680,21 @@ test "module compiler accepts an imported nominal in an imported generic callbac
     }
 }
 
-// Real, reproducible segfault found via std/сеть/http.ps's
-// `отправить_json(значение: json.Значение) -> Результат(Ответ, Ошибка)`:
-// importing a function whose signature combines a TRANSITIVELY-imported
-// nominal (`модель.Элемент` here, imported only via `сервис.ps`, never
-// directly by `main.ps`) with a LOCALLY-declared struct that has its OWN
-// `реализация` methods (`Обёртка.развернуть` here) crashed inside
-// `ImportContext.collect`'s `for (self.methods.items) |method|` loop —
-// `collectTransitiveNominals` (called from inside that exact loop, for
-// the `Обёртка` case) appends MORE entries to `self.methods` itself
-// (`.nominal`'s "definition has its own methods" branch), which can
-// reallocate the backing array out from under the `for` loop's already-
-// captured slice — the classic "mutate a collection while iterating a
-// captured slice of it" use-after-free. `модель.Элемент` alone (no local
-// struct with methods) never triggered it; `Обёртка` alone (no
-// transitive import) never triggered it either — needs both at once,
-// exactly like `отправить_json` (`json.Значение` transitive + local
-// `Ответ` with a `реализация` block).
+// Импорт функции, чья сигнатура сочетает ТРАНЗИТИВНО импортированный
+// номинальный тип (здесь `модель.Элемент`, импортированный только через
+// `сервис.ps`, никогда напрямую `main.ps`) с ЛОКАЛЬНО объявленной
+// структурой, у которой есть СОБСТВЕННЫЕ методы `реализация` (здесь
+// `Обёртка.развернуть`), затрагивает цикл `ImportContext.collect`'а `for
+// (self.methods.items) |method|`: `collectTransitiveNominals` (вызывается
+// изнутри именно этого цикла, для случая `Обёртка`) сам добавляет ЕЩЁ
+// записи в `self.methods` (ветка `.nominal` "у определения есть свои
+// методы"), что может переаллоцировать резервный массив прямо под уже
+// захваченным срезом цикла `for` — классический use-after-free "мутация
+// коллекции во время итерации по её захваченному срезу". Нужны ОБА
+// условия одновременно (только `модель.Элемент` без локальной структуры с
+// методами не задействует эту ветку; только `Обёртка` без транзитивного
+// импорта — тоже), как в `отправить_json` (`json.Значение` транзитивно +
+// локальный `Ответ` с блоком `реализация`).
 test "module compiler imports a function combining a transitive nominal with a local struct that has methods" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "импорт \"./сервис\" как сервис\nимпорт \"./модель\" как модель\nэкспорт функ старт() -> Число\nвыбор сервис.обернуть(модель.Элемент(42.0))\nРезультат.Успех(о) -> о.развернуть()\nРезультат.Неудача(_) -> -1.0\nконец\nконец" },
@@ -1761,17 +1720,16 @@ test "module compiler imports a function combining a transitive nominal with a l
     }
 }
 
-// Real `panos run` (`cli/main.zig`'s `main`) now loads the REAL prelude
-// module (`graph.appendPreludeModule(prelude.SOURCE)`) instead of relying
-// on `type_checker.zig`'s hardcoded Опция/Результат/interface stand-ins
-// — this is the graph-pipeline equivalent of what `runner.zig`'s single-
-// file pipeline already did. Covers: `Опция` methods (`.получить`) work
-// through the real prelude module, AND a cross-module `импорт` + `<`
-// through `Сравниваемое` still works with the real prelude module in the
-// graph (this exact path leaked — a duplicate `ImportedNominal` entry
-// for the prelude's own generic types orphaned an owner_remap — before
-// the prelude-bridge loop in `ImportContext.collect` was fixed back to
-// identity-only).
+// `panos run` (`main` в `cli/main.zig`) загружает НАСТОЯЩИЙ модуль
+// прелюдии (`graph.appendPreludeModule(prelude.SOURCE)`) вместо того,
+// чтобы полагаться на захардкоженные Опция/Результат/интерфейсные
+// заглушки `type_checker.zig` — это графовый эквивалент того, что уже
+// делает однофайловый пайплайн `runner.zig`. Проверяет: методы `Опция`
+// (`.получить`) работают через настоящий модуль прелюдии, и межмодульный
+// `импорт` + `<` через `Сравниваемое` тоже работает с настоящим модулем
+// прелюдии в графе — этот путь требует, чтобы мостовой цикл прелюдии в
+// `ImportContext.collect` оставался чисто identity-based (без дублирования
+// записей `ImportedNominal` для собственных generic-типов прелюдии).
 test "module compiler works end to end with a real prelude module in the graph" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "импорт \"./точки\" как точки\nэкспорт функ старт() -> Число\nпер o: Опция(Число) = Опция.Есть(42.0)\nпер cmp = точки.Точка(1.0) < точки.Точка(2.0)\nвыбор cmp\nистина -> o.получить(0.0)\nложь -> -1.0\nконец\nконец" },
@@ -1798,19 +1756,18 @@ test "module compiler works end to end with a real prelude module in the graph" 
     }
 }
 
-// Regression: a default method on `Итерируемое` (prelude) dispatched
-// from a DIFFERENT module than where the concrete implementing type is
-// declared, reached ONLY transitively (through a function's return
-// type, never named/imported directly) — real gap found via
+// Метод по умолчанию у `Итерируемое` (прелюдия), вызываемый из ДРУГОГО
+// модуля, чем тот, где объявлен конкретный реализующий тип, и достигнутый
+// ТОЛЬКО транзитивно (через тип возврата функции, никогда не
+// именованный/импортированный напрямую) — например,
 // `итератор(массив).отфильтровать(...).отобразить(...).взять(...)
-// .собрать()`: `собрать`'s `default_symbol` (a symbol in the PRELUDE
-// module's own symbol space) was meaningless in the consuming module,
-// and `collectTransitiveNominals` never bridged interface
-// IMPLEMENTATIONS for a transitively-reached nominal at all (only its
-// structural shape) — `ImportedNominal.default_method_symbols` +
-// `bridgeDefaultMethodSymbols` (mint a local synthetic symbol per
-// default method, same pattern already used for inherent methods) fix
-// both halves.
+// .собрать()`. `default_symbol` метода `собрать` (символ в собственном
+// пространстве символов модуля ПРЕЛЮДИИ) не имеет смысла в потребляющем
+// модуле сам по себе — `ImportedNominal.default_method_symbols` +
+// `bridgeDefaultMethodSymbols` (чеканят локальный синтетический символ на
+// каждый метод по умолчанию, тот же паттерн, что уже используется для
+// собственных методов) мостят и структурную форму, и РЕАЛИЗАЦИИ интерфейса
+// для транзитивно достигнутого номинального типа.
 test "module compiler dispatches a chain of interface default methods across a module boundary" {
     const reader = MemoryReader{ .files = &.{
         .{ .path = "проект/main.ps", .bytes = "экспорт функ старт() -> Массив(Число)\nпер числа = массив(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)\nитератор(числа).отфильтровать(функ(x: Число) -> Булево\nx > 2.0\nконец).отобразить(функ(x: Число) -> Число\nx * 10.0\nконец).взять(3).собрать()\nконец" },

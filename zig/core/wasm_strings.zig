@@ -6,37 +6,32 @@ const wasm_heap = @import("wasm_heap.zig");
 const wasm_module = @import("wasm_module.zig");
 const wasm_objects = @import("wasm_objects.zig");
 
-// Eliminates string JS-host imports (`@runtime::строка_литерал`/
-// `строка_сложить`, `строки::*`) — replaces string `.binary{.add}`/
-// `.compare{.equal,.not_equal}`/`.call_builtin{"строки::..."}` with real
-// in-module linear-memory code, reusing `wasm_heap.zig`'s bump allocator
-// (shared with `wasm_objects.zig`/`wasm_actors.zig`). Runs in the SAME
-// pass slot as `wasm_objects.expand` (before `mir_cps.prepare`).
+// Убирает JS-host импорты для строк (`@runtime::строка_литерал`/
+// `строка_сложить`, `строки::*`) — заменяет `.binary{.add}`/
+// `.compare{.equal,.not_equal}`/`.call_builtin{"строки::..."}` над
+// строками на настоящий внутримодульный код над линейной памятью,
+// переиспользуя bump-аллокатор `wasm_heap.zig` (общий с
+// `wasm_objects.zig`/`wasm_actors.zig`). Выполняется в ТОМ ЖЕ слоте
+// прохода, что и `wasm_objects.expand` (до `mir_cps.prepare`).
 //
-// Representation: a `Строка` handle is an i32 pointer to a
-// LENGTH-PREFIXED UTF-8 byte buffer — `[u32 byte_length][raw bytes...]`,
-// no null terminator (the explicit length makes one unnecessary, and
-// panos strings can contain embedded NUL bytes like any other byte).
-// String LITERALS need ZERO runtime work under this layout: their
-// length-prefixed bytes are written directly into the WASM data section
-// at COMPILE TIME (`wasm_emit.zig`'s `collectStringConstants`/
-// `.const_value{.string}` case), so a literal's handle is just a bare
-// `i32.const <data_offset>` — no host call, no allocation. Every string
-// OPERATION (concat, equality, length, slice, ...) only ever needs a
-// valid pointer to this `[len][bytes]` shape, never caring whether it
-// points into the read-only data section or the writable bump heap —
-// one uniform representation for both origins.
+// Представление: хэндл `Строка` — это i32-указатель на UTF-8 буфер
+// байт С ДЛИНОЙ В ПРЕФИКСЕ — `[u32 byte_length][raw bytes...]`, без
+// нуль-терминатора (явная длина делает его ненужным, а строки панос
+// могут содержать вложенные NUL-байты как любые другие байты). Строковые
+// ЛИТЕРАЛЫ не требуют вообще никакой работы в рантайме при такой
+// раскладке: их байты с префиксом длины записываются прямо в секцию
+// данных WASM ВО ВРЕМЯ КОМПИЛЯЦИИ (`wasm_emit.zig`, `collectStringConstants`/
+// случай `.const_value{.string}`), так что хэндл литерала — это просто
+// голый `i32.const <data_offset>` — без host-вызова, без аллокации.
+// Любой строковой ОПЕРАЦИИ (конкатенация, сравнение на равенство, длина,
+// срез, ...) нужен лишь валидный указатель на форму `[len][bytes]` — ей
+// неважно, указывает ли он в read-only секцию данных или в записываемую
+// bump-кучу — одно единообразное представление для обоих источников.
 //
-// Byte-level access (UTF-8 decoding, byte-copy loops) uses the new
-// `mem_load8`/`mem_store8` MIR instructions (`mir.zig`) — `mem_load`/
-// `mem_store` are word-granular (4/8 bytes), too coarse for this.
-//
-// Landing incrementally (see the plan this session is following):
-// concat + equality first (the smallest slice that makes any string
-// program correct under wasmtime), then the read-only builtins
-// (длина/длина_байт/начинается_с/etc), then слice/find, then the
-// numeric-formatting builtins last (из_числа's exact-decimal-parity
-// risk is isolated so it doesn't block everything else).
+// Побайтовый доступ (UTF-8-декодирование, циклы копирования байт)
+// использует новые MIR-инструкции `mem_load8`/`mem_store8` (`mir.zig`) —
+// `mem_load`/`mem_store` работают пословно (4/8 байт), это слишком грубо
+// для такой задачи.
 
 fn unsupported(comptime what: []const u8) error{StringExpandUnsupported} {
     std.debug.print("panos build: AOT (wasm) строки — " ++ what ++ "\n", .{});
@@ -85,9 +80,9 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     const length = try buildLength(allocator, module, type_store, layout, utf8_width);
     const slice = try buildSlice(allocator, module, type_store, layout, rune_byte_offset);
     const find = try buildFind(allocator, module, type_store, layout, rune_byte_offset, index_of, byte_to_rune_count);
-    // `разбить` returns `Массив(Строка)` — only pull in the (heavier)
-    // array runtime when the source actually uses it, same "build only
-    // what's needed" discipline as the rest of this file.
+    // `разбить` возвращает `Массив(Строка)` — подключаем (более тяжёлый)
+    // рантайм массивов только если исходник реально его использует, та
+    // же дисциплина «строить только нужное», что и во всём этом файле.
     const split: ?mir.FunctionId = if (usesSplit(module)) blk: {
         const array_runtime = try wasm_objects.findOrBuildArrayRuntime(allocator, module, type_store, layout);
         const slice_bytes = try buildSliceBytes(allocator, module, type_store, layout);
@@ -114,21 +109,22 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
         .from_number = from_number,
         .to_number = to_number,
     };
-    // Same "re-scan module.functions.items fresh each time" reasoning as
-    // wasm_objects.zig: buildConcat/buildEqual above already appended
-    // new functions, but neither's OWN body contains string ops itself
-    // (hand-built, not user code), so no frozen snapshot is needed.
+    // То же рассуждение «пересканировать module.functions.items заново
+    // каждый раз», что и в wasm_objects.zig: buildConcat/buildEqual выше
+    // уже добавили новые функции, но тело САМИХ этих функций строковых
+    // операций не содержит (они написаны руками, не пользовательский
+    // код), поэтому замороженный снимок не нужен.
     var index: usize = 0;
     while (index < module.functions.items.len) : (index += 1) {
         const function_id: mir.FunctionId = @enumFromInt(index);
-        // Per-function store/layout — same cross-module `TypeId` bug
-        // class already found and fixed in `wasm_objects.zig`/
-        // `wasm_interfaces.zig` (see either's own doc comment): a
-        // string op inside a NON-entry-module function must type any
-        // new local it creates against THAT function's own store.
-        // `runtime`'s own helper functions stay on the global entry
-        // store (compiler-synthesized, self-consistent, callers type
-        // their own `dst` independently).
+        // Store/layout на каждую функцию отдельно: строковая операция
+        // внутри функции НЕ из входного модуля должна типизировать любой
+        // создаваемый ею локал против СВОЕГО store (см. `wasm_objects.zig`/
+        // `wasm_interfaces.zig` — то же ограничение кросс-модульного
+        // `TypeId`). Собственные вспомогательные функции `runtime`
+        // остаются на глобальном store входного модуля
+        // (сгенерированы компилятором, самосогласованы, вызывающие
+        // типизируют свой `dst` независимо).
         const function_store = module.functions.items[index].type_store orelse type_store;
         const function_layout = wasm_heap.PtrLayout{
             .ptr_type = function_store.builtins.string,
@@ -196,11 +192,11 @@ fn expandInstruction(builder: *mir_builder.Builder, instruction: mir.Instruction
         .compare => |v| {
             if ((v.op == .equal or v.op == .not_equal) and isStringType(ctx.type_store, function.valueType(v.lhs))) {
                 if (v.op == .equal) {
-                    // `dst` becomes the call's own result directly — it's
-                    // exactly the ONE value the original instruction's
-                    // surrounding code already expects, no reordering
-                    // concern (a `.call`'s result is simply produced by
-                    // the call itself, nothing to interleave).
+                    // `dst` становится напрямую результатом вызова — это
+                    // ровно ТО ОДНО значение, которое уже ожидает
+                    // окружающий код исходной инструкции, без риска
+                    // переупорядочивания (результат `.call` просто
+                    // производится самим вызовом, перемежать нечего).
                     try builder.emit(.{ .call = .{ .dst = v.dst, .callee = ctx.runtime.equal, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ v.lhs, v.rhs }) } });
                 } else {
                     const eq = try builder.newValue(ctx.layout.bool_type);
@@ -233,17 +229,19 @@ fn expandInstruction(builder: *mir_builder.Builder, instruction: mir.Instruction
     }
 }
 
-// Copies `count` bytes from `src_base_local[0..count)` to
-// `dst_base_local[0..count)` — callers pre-add any fixed header offset
-// (e.g. `+4` to skip the length prefix) into the base pointers before
-// calling. Same loop shape as `wasm_objects.zig`'s `buildEnsureCapacity`
-// copy loop (real WASM `loop`, ordinary single-header/single-exit,
-// no suspend involved — hits `wasm_stackify.zig`'s existing fast path).
-// Builds a fresh 1-byte `Строка` (`[len=1][byte_value]`) at runtime —
-// used for the "-" sign and the "0" digit-string special case, neither
-// of which come from user source (so there's no data-section literal
-// to point at; they must be constructed the same way any other
-// heap string is).
+// Копирует `count` байт из `src_base_local[0..count)` в
+// `dst_base_local[0..count)` — вызывающие сами прибавляют любой
+// фиксированный offset заголовка (например, `+4`, чтобы пропустить
+// префикс длины) к базовым указателям перед вызовом. Та же форма цикла,
+// что и копирующий цикл `buildEnsureCapacity` в `wasm_objects.zig`
+// (настоящий WASM `loop`, обычный один-заголовок/один-выход, без
+// suspend — попадает в уже существующий быстрый путь
+// `wasm_stackify.zig`).
+// Строит свежую 1-байтовую `Строка` (`[len=1][byte_value]`) в рантайме —
+// используется для знака "-" и особого случая строки-цифры "0", ни один
+// из которых не приходит из пользовательского исходника (поэтому нет
+// литерала в секции данных, на который можно было бы указать; их нужно
+// строить так же, как и любую другую строку в куче).
 fn emitOneByteString(builder: *mir_builder.Builder, module: *mir.Module, layout: wasm_heap.PtrLayout, byte_value: u32) !mir.ValueId {
     const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
     const five = try wasm_heap.addressConst(builder, layout.idx_type, 5);
@@ -283,10 +281,10 @@ fn emitByteCopyLoop(builder: *mir_builder.Builder, layout: wasm_heap.PtrLayout, 
     const src_addr = try wasm_heap.binOp(builder, layout.idx_type, .add, src_base_r, i_for_src);
     const byte = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .mem_load8 = .{ .dst = byte, .addr = src_addr } });
-    // `byte` reloaded BEFORE `dst_addr` is computed — `mem_store8` needs
-    // stack order `[src, addr]` (addr freshest), same convention
-    // `mem_store` established (`wasm_emit.zig`'s
-    // `EmitContext.frame_store_scratch_frame` doc comment).
+    // `byte` перезагружается ДО вычисления `dst_addr` — `mem_store8`
+    // требует порядок на стеке `[src, addr]` (addr — самое свежее),
+    // та же конвенция, что установил `mem_store` (см. doc-комментарий
+    // `EmitContext.frame_store_scratch_frame` в `wasm_emit.zig`).
     const byte_local = try wasm_heap.storeLocal(builder, "@byte", layout.idx_type, byte);
     const byte_reload = try wasm_heap.loadLocal(builder, byte_local, layout.idx_type);
 
@@ -304,8 +302,8 @@ fn emitByteCopyLoop(builder: *mir_builder.Builder, layout: wasm_heap.PtrLayout, 
     builder.setCurrentBlock(loop_exit);
 }
 
-// `@string_concat(a, b) -> handle`: alloc `4 + len_a + len_b` bytes,
-// write the combined length header, byte-copy A then B.
+// `@string_concat(a, b) -> handle`: аллоцирует `4 + len_a + len_b` байт,
+// пишет объединённый заголовок длины, копирует байты A, затем B.
 fn buildConcat(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_concat", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -337,13 +335,13 @@ fn buildConcat(allocator: std.mem.Allocator, module: *mir.Module, type_store: *c
     try builder.emit(.{ .call = .{ .dst = handle, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, alloc_size) } });
     const handle_local = try wasm_heap.storeLocal(&builder, "handle", layout.ptr_type, handle);
 
-    // Write the length header: src (total) produced BEFORE addr (handle
-    // reload) — `mem_store` needs `[src, addr]` with addr freshest.
+    // Пишем заголовок длины: src (total) вычисляется ДО addr (перезагрузки
+    // handle) — `mem_store` требует `[src, addr]` с самым свежим addr.
     const total_r2 = try wasm_heap.loadLocal(&builder, total_local, layout.idx_type);
     const handle_for_header = try wasm_heap.loadLocal(&builder, handle_local, layout.ptr_type);
     try builder.emit(.{ .mem_store = .{ .addr = handle_for_header, .src = total_r2 } });
 
-    // Copy A into handle+4.
+    // Копируем A в handle+4.
     const four_for_src_a = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
     const a_for_copy = try wasm_heap.loadLocal(&builder, a_local, layout.ptr_type);
     const a_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, a_for_copy, four_for_src_a);
@@ -354,7 +352,7 @@ fn buildConcat(allocator: std.mem.Allocator, module: *mir.Module, type_store: *c
     const dst_base_a_local = try wasm_heap.storeLocal(&builder, "dst_base_a", layout.idx_type, dst_base_a);
     try emitByteCopyLoop(&builder, layout, a_base_local, dst_base_a_local, len_a_local);
 
-    // Copy B into handle+4+len_a.
+    // Копируем B в handle+4+len_a.
     const b_for_copy = try wasm_heap.loadLocal(&builder, b_local, layout.ptr_type);
     const four_for_src_b = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
     const b_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, b_for_copy, four_for_src_b);
@@ -372,12 +370,10 @@ fn buildConcat(allocator: std.mem.Allocator, module: *mir.Module, type_store: *c
     return id;
 }
 
-// `@string_equal(a, b) -> bool`: length check first, then byte-compare
-// loop with early exit on first mismatch. Fixes a real, standing
-// correctness bug — the old codegen path did raw `i32.eq` on the
-// HANDLE (pointer equality), silently wrong for any two independently
-// built equal strings (only literal-vs-identical-literal happened to
-// work, and only by accident of how the old host model interned them).
+// `@string_equal(a, b) -> bool`: сначала проверка длины, затем цикл
+// побайтового сравнения с ранним выходом при первом несовпадении —
+// сравнивает СОДЕРЖИМОЕ строки, а не хэндл (сравнение указателей было бы
+// неверным для любых двух независимо построенных равных строк).
 fn buildEqual(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_equal", wasm_heap.dummy_symbol, layout.bool_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -471,9 +467,10 @@ fn buildEqual(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     return id;
 }
 
-// `@string_starts_with(s, prefix) -> Булево`: byte-level, case-sensitive
-// (`vm.zig`'s `strStartsWith` — `std.mem.startsWith(u8, string, prefix)`).
-// If prefix is longer than s, false (never reads out of bounds).
+// `@string_starts_with(s, prefix) -> Булево`: побайтово, с учётом
+// регистра (как `strStartsWith` в `vm.zig` — `std.mem.startsWith(u8,
+// string, prefix)`). Если prefix длиннее s — false (никогда не читает за
+// границы).
 fn buildStartsWith(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_starts_with", wasm_heap.dummy_symbol, layout.bool_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -567,11 +564,12 @@ fn buildStartsWith(allocator: std.mem.Allocator, module: *mir.Module, type_store
     return id;
 }
 
-// `@string_utf8_width(byte) -> i32`: classifies a UTF-8 leading byte's
-// sequence length (1-4), matching `std.unicode.utf8ByteSequenceLength`'s
-// own classification. Panics (matching native's "строка содержит
-// некорректный UTF-8" fault) on a byte that can't start a sequence
-// (a stray continuation byte 0x80-0xBF, or 0xF8+).
+// `@string_utf8_width(byte) -> i32`: определяет длину UTF-8
+// последовательности (1-4) по стартовому байту, совпадает с
+// классификацией `std.unicode.utf8ByteSequenceLength`. Паникует (как и
+// нативная ошибка "строка содержит некорректный UTF-8") на байте,
+// который не может начинать последовательность (одинокий
+// continuation-байт 0x80-0xBF, либо 0xF8+).
 fn buildUtf8Width(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_utf8_width", wasm_heap.dummy_symbol, layout.idx_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -579,7 +577,7 @@ fn buildUtf8Width(allocator: std.mem.Allocator, module: *mir.Module, type_store:
     builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{byte_local});
     builder.currentFunction().type_store = type_store;
 
-    // byte & 0x80 == 0 -> ASCII, width 1.
+    // byte & 0x80 == 0 -> ASCII, ширина 1.
     const mask1 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x80);
     const byte1 = try wasm_heap.loadLocal(&builder, byte_local, layout.idx_type);
     const anded1 = try wasm_heap.binOp(&builder, layout.idx_type, .bit_and, byte1, mask1);
@@ -641,10 +639,10 @@ fn buildUtf8Width(allocator: std.mem.Allocator, module: *mir.Module, type_store:
     return id;
 }
 
-// `@string_length(s) -> Число`: rune count via a full UTF-8 walk from
-// byte 0 to the length header's byte count (`vm.zig`'s `stringLength`
-// via `std.unicode.utf8CountCodepoints` — same panic-on-invalid-UTF-8
-// contract, delegated to `@string_utf8_width`).
+// `@string_length(s) -> Число`: счётчик рун через полный обход UTF-8 от
+// байта 0 до количества байт из заголовка длины (как `stringLength` в
+// `vm.zig` через `std.unicode.utf8CountCodepoints` — тот же контракт
+// «паника на невалидном UTF-8», делегированный `@string_utf8_width`).
 fn buildLength(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, utf8_width: mir.FunctionId) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_length", wasm_heap.dummy_symbol, type_store.builtins.number, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -709,14 +707,14 @@ fn buildLength(allocator: std.mem.Allocator, module: *mir.Module, type_store: *c
     return id;
 }
 
-// `@string_rune_byte_offset(s, target_rune) -> byte_offset`: walks
-// runes from the start, converting a rune index to a byte offset
-// (RELATIVE to the string's own data, 0-based — callers add `+4` for
-// an absolute address). Matches `vm.zig`'s `runeByteOffset` exactly,
-// including its bounds check INSIDE the loop (panics the moment more
-// runes are needed than remain, not just at the very end) — this is
-// what makes an out-of-range rune index a clean panic rather than an
-// out-of-bounds read.
+// `@string_rune_byte_offset(s, target_rune) -> byte_offset`: обходит
+// руны с начала, переводя индекс руны в байтовый offset (ОТНОСИТЕЛЬНО
+// собственных данных строки, с нуля — вызывающие сами прибавляют `+4`
+// для абсолютного адреса). Точно соответствует `runeByteOffset` из
+// `vm.zig`, включая проверку границ ВНУТРИ цикла (паникует в момент,
+// когда нужна ещё одна руна, а их больше не осталось, а не только в
+// самом конце) — именно это превращает индекс руны вне диапазона в
+// чистую панику, а не в чтение за границами.
 fn buildRuneByteOffset(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, utf8_width: mir.FunctionId) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_rune_byte_offset", wasm_heap.dummy_symbol, layout.idx_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -791,12 +789,13 @@ fn buildRuneByteOffset(allocator: std.mem.Allocator, module: *mir.Module, type_s
     return id;
 }
 
-// `@string_byte_to_rune_count(s, byte_limit) -> rune_count`: counts
-// complete UTF-8 sequences in `s[0..byte_limit)` — the inverse
-// direction of `@string_rune_byte_offset`, needed by `найти` to convert
-// a found BYTE offset back into the rune index it must return
-// (`vm.zig`'s `strFind` — `std.unicode.utf8CountCodepoints(string[0 ..
-// start_byte + relative_offset])`).
+// `@string_byte_to_rune_count(s, byte_limit) -> rune_count`: считает
+// полные UTF-8-последовательности в `s[0..byte_limit)` — обратное
+// направление к `@string_rune_byte_offset`, нужно `найти`, чтобы
+// перевести найденный БАЙТОВЫЙ offset обратно в индекс руны, который
+// она должна вернуть (`strFind` в `vm.zig` —
+// `std.unicode.utf8CountCodepoints(string[0 .. start_byte +
+// relative_offset])`).
 fn buildByteToRuneCount(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, utf8_width: mir.FunctionId) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_byte_to_rune_count", wasm_heap.dummy_symbol, layout.idx_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -855,13 +854,13 @@ fn buildByteToRuneCount(allocator: std.mem.Allocator, module: *mir.Module, type_
     return id;
 }
 
-// `@string_index_of(s, needle, start_byte) -> i32`: byte offset of the
-// first occurrence of `needle` in `s` at or after `start_byte`, or -1.
-// Empty needle matches immediately at `start_byte` (matches
-// `std.mem.indexOf`'s own behavior — `vm.zig`'s `strReplace`/`strSplit`
-// both special-case empty separately at their OWN call sites, but the
-// underlying search primitive agreeing with `std.mem.indexOf` here
-// keeps this one function correct for both).
+// `@string_index_of(s, needle, start_byte) -> i32`: байтовый offset
+// первого вхождения `needle` в `s` начиная с `start_byte` включительно,
+// либо -1. Пустой needle сразу совпадает на `start_byte` (совпадает с
+// поведением `std.mem.indexOf` — `strReplace`/`strSplit` в `vm.zig` оба
+// отдельно обрабатывают пустой needle на СВОИХ местах вызова, но то, что
+// базовый примитив поиска здесь согласован с `std.mem.indexOf`, делает
+// эту одну функцию корректной для обоих случаев).
 fn buildIndexOf(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_index_of", wasm_heap.dummy_symbol, layout.idx_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -881,7 +880,7 @@ fn buildIndexOf(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     try builder.emit(.{ .mem_load = .{ .dst = needle_len, .addr = n1 } });
     const needle_len_local = try wasm_heap.storeLocal(&builder, "needle_len", layout.idx_type, needle_len);
 
-    // Empty needle: return start immediately.
+    // Пустой needle: сразу вернуть start.
     const needle_len_for_cmp = try wasm_heap.loadLocal(&builder, needle_len_local, layout.idx_type);
     const zero_c = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
     const needle_empty = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, needle_len_for_cmp, zero_c);
@@ -910,7 +909,7 @@ fn buildIndexOf(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     const outer_header = try builder.newBlock();
     builder.terminate(.{ .jump = .{ .target = outer_header } });
 
-    // Outer loop condition: i + needle_len <= s_len.
+    // Условие внешнего цикла: i + needle_len <= s_len.
     builder.setCurrentBlock(outer_header);
     const i_for_bound = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
     const needle_len_for_bound = try wasm_heap.loadLocal(&builder, needle_len_local, layout.idx_type);
@@ -922,18 +921,20 @@ fn buildIndexOf(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     builder.terminate(.{ .branch = .{ .cond = outer_keep_going, .then_block = outer_body, .else_block = not_found_block } });
 
     builder.setCurrentBlock(not_found_block);
-    // -1 computed as 0-1 (wrapping i32 subtraction), NOT a raw constant
-    // — `wasm_heap.addressConst` takes a `u32` and value-preserving-casts
-    // it to i64 for SLEB128 encoding, which does NOT reinterpret a large
-    // u32 bit pattern as the intended negative i32; runtime subtraction
-    // sidesteps the whole question (guaranteed correct two's-complement
-    // wraparound, well-defined by the WASM spec).
+    // -1 вычисляется как 0-1 (wrapping i32-вычитание), НЕ сырой
+    // константой — `wasm_heap.addressConst` принимает `u32` и
+    // value-preserving-приводит его к i64 для SLEB128-кодирования, что
+    // НЕ переинтерпретирует битовый паттерн большого u32 как задуманный
+    // отрицательный i32; вычитание в рантайме обходит весь этот вопрос
+    // (гарантированно корректный переполняющий two's-complement,
+    // определённый спецификацией WASM).
     const zero_nf = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
     const one_nf = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
     const neg_one = try wasm_heap.binOp(&builder, layout.idx_type, .subtract, zero_nf, one_nf);
     builder.terminate(.{ .return_value = .{ .value = neg_one } });
 
-    // Inner loop: compare needle_len bytes at s_base+i vs n_base.
+    // Внутренний цикл: сравнить needle_len байт по адресу s_base+i с
+    // n_base.
     builder.setCurrentBlock(outer_body);
     const j_local = try builder.newLocal(wasm_heap.dummy_symbol, "@j", layout.idx_type);
     const zero_j = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
@@ -993,11 +994,11 @@ fn buildIndexOf(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     return id;
 }
 
-// `@string_slice(s, start, end) -> Строка`: RUNE-indexed (not byte),
-// half-open `[start, end)`. `start`/`end` arrive as `Число` (f64) —
-// converted to i32 once via `.to_i32`. Panics (matching native's own
-// fault, no clamping) if `start > end` or the resulting end byte
-// offset runs past the string.
+// `@string_slice(s, start, end) -> Строка`: индексация по РУНАМ (не по
+// байтам), полуоткрытый интервал `[start, end)`. `start`/`end` приходят
+// как `Число` (f64) — приводятся к i32 один раз через `.to_i32`.
+// Паникует (как и нативная реализация, без клэмпинга), если `start >
+// end` или итоговый байтовый offset конца выходит за пределы строки.
 fn buildSlice(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, rune_byte_offset: mir.FunctionId) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_slice", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -1092,9 +1093,10 @@ fn buildSlice(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     return id;
 }
 
-// `@string_find(s, needle, start_rune) -> Число`: rune-indexed (both
-// `start` and the return value), returns -1 on not-found (matching
-// `vm.zig`'s `strFind` exactly — a plain `Число`, not `Опция`).
+// `@string_find(s, needle, start_rune) -> Число`: индексация по рунам
+// (и `start`, и возвращаемое значение), при отсутствии совпадения
+// возвращает -1 (точно как `strFind` в `vm.zig` — обычное `Число`, не
+// `Опция`).
 fn buildFind(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, rune_byte_offset: mir.FunctionId, index_of: mir.FunctionId, byte_to_rune_count: mir.FunctionId) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_find", wasm_heap.dummy_symbol, type_store.builtins.number, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -1150,17 +1152,15 @@ fn buildFind(allocator: std.mem.Allocator, module: *mir.Module, type_store: *con
     return id;
 }
 
-// `@string_replace(s, target, replacement) -> Строка`: replaces ALL
-// occurrences of `target` with `replacement`. Empty `target` returns a
-// copy of `s` unchanged (matches `vm.zig`'s `strReplace` exactly).
-// Deliberately built on TOP of the already-verified @string_find/
-// @string_slice/@string_concat/@string_length rather than a second
-// hand-rolled byte-manipulation pass — an earlier from-scratch
-// two-pass byte-copy version had a real, hard-to-isolate bug (silently
-// undercounting matches for one input, genuinely infinite-looping for
-// another) that this reuse-based version avoids by construction: all
-// the byte-level arithmetic risk is already covered by those other
-// functions' own tests.
+// `@string_replace(s, target, replacement) -> Строка`: заменяет ВСЕ
+// вхождения `target` на `replacement`. Пустой `target` возвращает копию
+// `s` без изменений (точно как `strReplace` в `vm.zig`). Намеренно
+// построена ПОВЕРХ уже проверенных @string_find/@string_slice/
+// @string_concat/@string_length, а не как второй самописный проход
+// побайтовой обработки — такой подход через переиспользование оставляет
+// весь риск побайтовой арифметики покрытым тестами тех других функций,
+// вместо второй с нуля написанной двухпроходной реализации копирования
+// байт.
 fn buildReplace(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, length: mir.FunctionId, slice: mir.FunctionId, find: mir.FunctionId, concat: mir.FunctionId) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_replace", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -1222,7 +1222,7 @@ fn buildReplace(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     try builder.emit(.{ .call = .{ .dst = target_rune_len, .callee = length, .args = try wasm_heap.dupeOne(module, target_for_len) } });
     const target_rune_len_local = try wasm_heap.storeLocal(&builder, "target_rune_len", number_type, target_rune_len);
 
-    // result starts as a fresh empty string (alloc(4), header=0).
+    // result начинается как свежая пустая строка (alloc(4), header=0).
     const four_r = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
     const result_init = try builder.newValue(layout.ptr_type);
     try builder.emit(.{ .call = .{ .dst = result_init, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, four_r) } });
@@ -1251,21 +1251,16 @@ fn buildReplace(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
 
     const found_rune_for_cmp = try wasm_heap.loadLocal(&builder, found_rune_local, number_type);
     const neg_one_number = try wasm_heap.numberConst(&builder, number_type, -1);
-    // `cond` must be the KEEP-GOING condition with `then_block` as the
-    // loop body (matching every other loop in this file, e.g. line 213
-    // above) — an earlier version used `not_found` (the STOP condition)
-    // with `then=tail(exit)`/`else=match(continue)`, backwards from that
-    // convention. `wasm_stackify`'s loop-header detection picks body/exit
-    // by which target can reach back to the header (`canReach`), NOT by
-    // trusting the then/else labels at face value — with the polarity
-    // inverted, it reassigned body/exit to match reachability but left
-    // the branch CONDITION itself untouched, so the emitted `if` tested
-    // "not found" while running the loop-continuing code, and the
-    // exit/tail code fell through unconditionally after the loop instead
-    // of only running on non-match. Found via wasm-objdump: the `if`
-    // (cond=not_found) body contained the match/concat/br-back logic, and
-    // the `else` was empty with tail code unconditionally following the
-    // loop.
+    // `cond` обязан быть условием ПРОДОЛЖЕНИЯ цикла, где `then_block` —
+    // тело цикла (как и в любом другом цикле в этом файле, см. выше).
+    // Определение loop-заголовка в `wasm_stackify` выбирает тело/выход
+    // по тому, какая цель может вернуться обратно к заголовку
+    // (`canReach`), а НЕ по буквальному доверию меткам then/else —
+    // инвертирование полярности условия оставит branch переназначенным
+    // под достижимость, но само УСЛОВИЕ будет по-прежнему проверять не
+    // то, так что итоговый `if` будет выполнять продолжающий цикл код
+    // при "не найдено" и безусловно проваливаться в код выхода/хвоста
+    // вместо того, чтобы делать это только при отсутствии совпадения.
     const found = try wasm_heap.cmpOp(&builder, layout.bool_type, .not_equal, found_rune_for_cmp, neg_one_number);
     const tail_block = try builder.newBlock();
     const match_block = try builder.newBlock();
@@ -1273,24 +1268,23 @@ fn buildReplace(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
 
     builder.setCurrentBlock(tail_block);
     {
-        // `s_rune_len` (the 3rd `@string_slice` arg) must be produced
-        // LAST, immediately before the call — `.call`'s args are
-        // replayed in the order listed, assuming each is genuinely
-        // fresh/adjacent (same convention this whole file follows);
-        // producing it FIRST left it buried under the other two args,
-        // a real bug caught by wasmtime's own validator ("type mismatch:
-        // expected f64, found i32" — the args ended up shifted by one).
+        // `s_rune_len` (3-й аргумент `@string_slice`) обязан
+        // производиться ПОСЛЕДНИМ, непосредственно перед вызовом —
+        // аргументы `.call` воспроизводятся в перечисленном порядке в
+        // предположении, что каждый по-настоящему свежий/смежный (та же
+        // конвенция, которой следует весь этот файл).
         //
-        // `result_for_final` must be produced BEFORE `remaining` — the
-        // final concat's args are `[result_for_final, remaining]`, so
-        // `result_for_final` needs to be earliest-produced/bottom and
-        // `remaining` freshest/top. An earlier version computed
-        // `remaining` first (to keep it adjacent to its own 3-arg slice
-        // call) then loaded `result_for_final` last — which put it on
-        // TOP of `remaining` instead of underneath, silently producing a
-        // rotated result ("bbxbbx" instead of "xbbxbb") rather than a
-        // validator error, since both operands are the same i32 handle
-        // type (no type mismatch to catch it).
+        // `result_for_final` обязан производиться ДО `remaining` —
+        // аргументы финального concat — это `[result_for_final,
+        // remaining]`, поэтому `result_for_final` должен быть
+        // произведён раньше всех/лежать снизу, а `remaining` — самым
+        // свежим/сверху. Если вычислить `remaining` первым (чтобы
+        // держать его рядом с его же 3-аргументным вызовом slice), он
+        // окажется ПОВЕРХ `result_for_final` вместо того, чтобы быть
+        // под ним, что молча даёт развёрнутый результат ("bbxbbx"
+        // вместо "xbbxbb"), а не ошибку валидатора — оба операнда имеют
+        // один и тот же тип i32-хэндла, несовпадения типов, которое бы
+        // это поймало, не возникает.
         const result_for_final = try wasm_heap.loadLocal(&builder, result_local, layout.ptr_type);
         const s_for_remaining = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
         const search_start_for_remaining = try wasm_heap.loadLocal(&builder, search_start_local, number_type);
@@ -1305,13 +1299,13 @@ fn buildReplace(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     }
 
     builder.setCurrentBlock(match_block);
-    // `result_for_partial1` loaded BEFORE `segment` is computed — the
-    // concat call below needs args `[result, segment]` in that
-    // PRODUCTION order (result first/bottom, segment last/freshest);
-    // computing segment first (as an earlier version of this code did)
-    // left it buried under the later-loaded result, backwards from
-    // what `.call`'s "args replayed in listed order" codegen assumes
-    // (caught by wasmtime's validator — a type mismatch one arg over).
+    // `result_for_partial1` загружается ДО вычисления `segment` —
+    // вызову concat ниже нужны аргументы `[result, segment]` именно в
+    // этом порядке ПРОИЗВОДСТВА (result первым/снизу, segment
+    // последним/сверху); вычисление segment первым оставило бы его
+    // погребённым под позже загруженным result — наоборот тому, что
+    // предполагает кодогенерация «.call воспроизводит аргументы в
+    // перечисленном порядке».
     const result_for_partial1 = try wasm_heap.loadLocal(&builder, result_local, layout.ptr_type);
     const s_for_segment = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
     const search_start_for_segment = try wasm_heap.loadLocal(&builder, search_start_local, number_type);
@@ -1337,13 +1331,14 @@ fn buildReplace(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     return id;
 }
 
-// `@string_slice_bytes(s, start_byte, end_byte) -> Строка`: raw
-// BYTE-indexed substring, no bounds checking — private to this file
-// (never exposed as `строки.*`, that's `срез`'s job and it's
-// rune-indexed). Callers must guarantee `0 <= start_byte <= end_byte <=
-// длина_байт(s)` themselves; `@string_split` (its only caller) always
-// derives its ranges from a real `@string_index_of` match or the
-// string's own byte length, so this invariant holds by construction.
+// `@string_slice_bytes(s, start_byte, end_byte) -> Строка`: сырая
+// подстрока с индексацией по БАЙТАМ, без проверки границ — приватна для
+// этого файла (никогда не экспонируется как `строки.*`, за это отвечает
+// `срез`, работающий по рунам). Вызывающие сами обязаны гарантировать
+// `0 <= start_byte <= end_byte <= длина_байт(s)`; `@string_split`
+// (единственный вызывающий) всегда выводит свои диапазоны из настоящего
+// совпадения `@string_index_of` либо из собственной байтовой длины
+// строки, так что этот инвариант выполняется по построению.
 fn buildSliceBytes(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, "@string_slice_bytes", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -1389,12 +1384,12 @@ fn buildSliceBytes(allocator: std.mem.Allocator, module: *mir.Module, type_store
     return id;
 }
 
-// `@string_split(s, separator) -> Массив(Строка)`: literal byte-substring
-// separator matching, matching `vm.zig`'s `strSplit` exactly — empty
-// separator returns a single-element array containing the whole
-// original string unchanged (NOT an array of individual bytes/runes).
+// `@string_split(s, separator) -> Массив(Строка)`: сопоставление
+// разделителя как буквальной байтовой подстроки, точно как `strSplit` в
+// `vm.zig` — пустой разделитель возвращает одноэлементный массив со
+// всей исходной строкой без изменений (НЕ массив отдельных байт/рун).
 fn buildSplit(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, index_of: mir.FunctionId, slice_bytes: mir.FunctionId, array_runtime: wasm_objects.ArrayRuntime) !mir.FunctionId {
-    const array_type = type_store.builtins.string; // opaque i32 handle, same as every other reference type this file deals in
+    const array_type = type_store.builtins.string; // непрозрачный i32-хэндл, как и любой другой ссылочный тип в этом файле
     const id = try mir_builder.newFunction(module, allocator, "@string_split", wasm_heap.dummy_symbol, array_type, wasm_heap.dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
     const s_local = try builder.newLocal(wasm_heap.dummy_symbol, "s", layout.ptr_type);
@@ -1462,16 +1457,17 @@ fn buildSplit(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
 
     builder.setCurrentBlock(match_block);
     {
-        // `arr_for_append` must be produced BEFORE `segment` — the
-        // append call's args are `[arr_for_append, segment]`, so
-        // `arr_for_append` needs to be earliest-produced/bottom. An
-        // earlier version computed `segment` first (to keep it adjacent
-        // to its own 3-arg slice_bytes call) then loaded the array
-        // handle last — putting it on TOP of `segment` instead of
-        // underneath, so `@array_append_i32` silently received
-        // (handle=segment, value=arr) swapped (both operands are i32,
-        // no validator error) — found via wasm-objdump, same bug class
-        // as `@string_replace`'s `result_for_final`/`remaining` fix.
+        // `arr_for_append` обязан производиться ДО `segment` — аргументы
+        // вызова append — это `[arr_for_append, segment]`, поэтому
+        // `arr_for_append` должен быть произведён раньше всех/лежать
+        // снизу. Если вычислить `segment` первым (чтобы держать его
+        // рядом с его же 3-аргументным вызовом slice_bytes), он окажется
+        // ПОВЕРХ `arr_for_append` вместо того, чтобы быть под ним, так
+        // что `@array_append_i32` молча получит (handle=segment,
+        // value=arr) переставленными местами (оба операнда i32, ошибки
+        // валидатора, которая бы это поймала, нет) — тот же риск
+        // порядка, что и с `result_for_final`/`remaining` в
+        // `@string_replace`.
         const arr_for_append = try wasm_heap.loadLocal(&builder, arr2_local, array_type);
         const s_for_seg = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
         const cursor_for_seg = try wasm_heap.loadLocal(&builder, cursor_local, layout.idx_type);
@@ -1489,7 +1485,8 @@ fn buildSplit(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
 
     builder.setCurrentBlock(tail_block);
     {
-        // Same fix as `match_block` above: array handle produced first.
+        // То же исправление, что и выше в `match_block`: хэндл массива
+        // производится первым.
         const arr_for_final_append = try wasm_heap.loadLocal(&builder, arr2_local, array_type);
         const s_for_tail = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
         const cursor_for_tail = try wasm_heap.loadLocal(&builder, cursor_local, layout.idx_type);
@@ -1504,13 +1501,13 @@ fn buildSplit(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     return id;
 }
 
-// `@string_format_unsigned_digits(n) -> Строка`: `n` is a NONNEGATIVE
-// whole-number `Число` (caller already applied `int_trunc` + sign
-// handling) — writes its decimal digits into a small scratch buffer
-// from the END backward (least-significant digit first is what the
-// `% 10` loop naturally produces), then copies just the written range
-// out into a real length-prefixed string. `n == 0` is a special case
-// (the loop below produces zero digits for it, not "0").
+// `@string_format_unsigned_digits(n) -> Строка`: `n` — НЕОТРИЦАТЕЛЬНОЕ
+// целочисленное `Число` (вызывающий уже применил `int_trunc` и обработку
+// знака) — пишет его десятичные цифры в маленький scratch-буфер с КОНЦА
+// в обратном направлении (младшая значащая цифра первой — то, что
+// естественно даёт цикл `% 10`), затем копирует ровно записанный
+// диапазон в настоящую строку с префиксом длины. `n == 0` — особый
+// случай (цикл ниже для него не даёт ни одной цифры, а не "0").
 fn buildFormatUnsignedDigits(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
     const number_type = type_store.builtins.number;
     const id = try mir_builder.newFunction(module, allocator, "@string_format_unsigned_digits", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
@@ -1534,9 +1531,10 @@ fn buildFormatUnsignedDigits(allocator: std.mem.Allocator, module: *mir.Module, 
     }
 
     builder.setCurrentBlock(nonzero_block);
-    // i64 range easily covers every whole `Число` this ever sees (up to
-    // 2^53 exactly, per `Целое`'s own documented range) — 24 scratch
-    // bytes is comfortably more than an i64's 19-digit max.
+    // Диапазон i64 с запасом покрывает любое целочисленное `Число`,
+    // которое сюда попадает (вплоть до ровно 2^53, согласно
+    // задокументированному диапазону `Целое`) — 24 scratch-байта заметно
+    // больше, чем максимум i64 в 19 цифр.
     const scratch_size = try wasm_heap.addressConst(&builder, layout.idx_type, 24);
     const scratch = try builder.newValue(layout.ptr_type);
     try builder.emit(.{ .call = .{ .dst = scratch, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, scratch_size) } });
@@ -1562,26 +1560,22 @@ fn buildFormatUnsignedDigits(allocator: std.mem.Allocator, module: *mir.Module, 
     builder.terminate(.{ .branch = .{ .cond = keep_going, .then_block = loop_body, .else_block = loop_exit } });
 
     builder.setCurrentBlock(loop_body);
-    // `digit = cur - trunc(cur/10)*10` instead of `.modulo` — `.modulo`
-    // on f64 operands (`wasm_emit.zig`) routes through a shared i64
-    // scratch-local trick (`reserveScratchLocal`, hardcoded `wasm_f64`)
-    // that collides with `mem_store`/`mem_store8`'s OWN scratch-local
-    // reservation (`reserveFrameScratch`/`reserveFrameStoreScratch`) when
-    // both appear in the same function — confirmed via wasmtime
-    // ("type mismatch: expected f64, found i32" on a `local.set` whose
-    // declared type didn't match the value being stored). A real,
-    // pre-existing bug in the scratch-local allocator, not this file's
-    // to fix; this loop (the first place in `wasm_strings.zig` combining
-    // integer memory writes with `.modulo`) is what surfaced it.
-    // Sidestepped here rather than touching `wasm_emit.zig`'s shared
-    // scratch machinery.
+    // `digit = cur - trunc(cur/10)*10` вместо `.modulo` — `.modulo` над
+    // операндами f64 (`wasm_emit.zig`) идёт через общий трюк со
+    // scratch-локалом i64 (`reserveScratchLocal`, жёстко привязанный к
+    // `wasm_f64`), который конфликтует с СОБСТВЕННЫМ резервированием
+    // scratch-локала у `mem_store`/`mem_store8`
+    // (`reserveFrameScratch`/`reserveFrameStoreScratch`), когда оба
+    // встречаются в одной функции. Здесь этого просто избегаем, вместо
+    // того чтобы трогать общий механизм scratch в `wasm_emit.zig`.
     const cur_for_div = try wasm_heap.loadLocal(&builder, cur_local, number_type);
     const ten_div = try wasm_heap.numberConst(&builder, number_type, 10);
     const q = try wasm_heap.binOp(&builder, number_type, .int_divide, cur_for_div, ten_div);
     const q_local = try wasm_heap.storeLocal(&builder, "@q", number_type, q);
-    // `cur_for_digit` (lhs) loaded BEFORE `q_times_10` (rhs) is computed
-    // — `.binary`'s codegen assumes operands are produced in
-    // lhs-then-rhs order, rhs freshest immediately before the op.
+    // `cur_for_digit` (lhs) загружается ДО вычисления `q_times_10` (rhs)
+    // — кодогенерация `.binary` предполагает, что операнды производятся
+    // в порядке lhs-затем-rhs, rhs — самый свежий непосредственно перед
+    // операцией.
     const cur_for_digit = try wasm_heap.loadLocal(&builder, cur_local, number_type);
     const q_for_mul = try wasm_heap.loadLocal(&builder, q_local, number_type);
     const ten_mul = try wasm_heap.numberConst(&builder, number_type, 10);
@@ -1609,12 +1603,12 @@ fn buildFormatUnsignedDigits(allocator: std.mem.Allocator, module: *mir.Module, 
     builder.terminate(.{ .jump = .{ .target = loop_header } });
 
     builder.setCurrentBlock(loop_exit);
-    // `twentyfour2` (lhs) produced BEFORE `pos_for_len` (rhs) — an
-    // earlier version loaded `pos` first, silently computing `pos - 24`
-    // (small negative, then reinterpreted as a huge unsigned length)
-    // instead of `24 - pos`, since `.binary`'s codegen just emits the
-    // subtract opcode against whatever's already on the stack in
-    // production order, it doesn't reorder to match `lhs`/`rhs`.
+    // `twentyfour2` (lhs) обязан производиться ДО `pos_for_len` (rhs) —
+    // кодогенерация `.binary` просто выдаёт опкод вычитания над тем, что
+    // уже лежит на стеке, в порядке производства, она не переупорядочивает
+    // под `lhs`/`rhs`; если сначала загрузить `pos`, молча вычислится
+    // `pos - 24` (маленькое отрицательное, затем переинтерпретированное
+    // как огромная беззнаковая длина) вместо `24 - pos`.
     const twentyfour2 = try wasm_heap.addressConst(&builder, layout.idx_type, 24);
     const pos_for_len = try wasm_heap.loadLocal(&builder, pos_local, layout.idx_type);
     const digit_count = try wasm_heap.binOp(&builder, layout.idx_type, .subtract, twentyfour2, pos_for_len);
@@ -1631,9 +1625,9 @@ fn buildFormatUnsignedDigits(allocator: std.mem.Allocator, module: *mir.Module, 
     const result_for_hdr = try wasm_heap.loadLocal(&builder, result_local, layout.ptr_type);
     try builder.emit(.{ .mem_store = .{ .addr = result_for_hdr, .src = digit_count_for_hdr } });
 
-    // No `+4` header offset here (unlike every other src_base in this
-    // file) — `scratch` is a raw scratch buffer, not a `[len][bytes]`
-    // string.
+    // Здесь нет offset `+4` для заголовка (в отличие от любого другого
+    // src_base в этом файле) — `scratch` — это сырой scratch-буфер, а не
+    // строка формы `[len][bytes]`.
     const scratch_for_src = try wasm_heap.loadLocal(&builder, scratch_local, layout.ptr_type);
     const pos_for_src = try wasm_heap.loadLocal(&builder, pos_local, layout.idx_type);
     const src_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, scratch_for_src, pos_for_src);
@@ -1651,10 +1645,11 @@ fn buildFormatUnsignedDigits(allocator: std.mem.Allocator, module: *mir.Module, 
     return id;
 }
 
-// `@string_from_int(x) -> Строка`: `x` (`Целое`, already a whole
-// number) formatted as a plain decimal integer — matches `vm.zig`'s
-// `strIntToStr` (`{d}` on `@intFromFloat(x)`) for every value in
-// `Целое`'s documented exact range (up to 2^53).
+// `@string_from_int(x) -> Строка`: `x` (`Целое`, уже целое число)
+// форматируется как обычное десятичное целое — совпадает с
+// `strIntToStr` в `vm.zig` (`{d}` над `@intFromFloat(x)`) для любого
+// значения в задокументированном точном диапазоне `Целое` (вплоть до
+// 2^53).
 fn buildFromInt(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, format_digits: mir.FunctionId, concat: mir.FunctionId) !mir.FunctionId {
     const number_type = type_store.builtins.number;
     const id = try mir_builder.newFunction(module, allocator, "@string_from_int", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
@@ -1672,10 +1667,10 @@ fn buildFromInt(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     builder.terminate(.{ .branch = .{ .cond = is_neg, .then_block = neg_block, .else_block = pos_block } });
 
     builder.setCurrentBlock(neg_block);
-    // `zero_neg` (lhs) produced BEFORE `x_for_neg` (rhs) — a previous
-    // version loaded `x` first, silently computing `x - 0` (unchanged,
-    // still negative) instead of `0 - x`, same arg-order bug class as
-    // elsewhere in this file.
+    // `zero_neg` (lhs) обязан производиться ДО `x_for_neg` (rhs) — если
+    // сначала загрузить `x`, молча вычислится `x - 0` (без изменений,
+    // всё ещё отрицательное) вместо `0 - x`, то же ограничение порядка
+    // производства, что и в других местах этого файла.
     const zero_neg = try wasm_heap.numberConst(&builder, number_type, 0);
     const x_for_neg = try wasm_heap.loadLocal(&builder, x_local, number_type);
     const negated = try wasm_heap.binOp(&builder, number_type, .subtract, zero_neg, x_for_neg);
@@ -1693,7 +1688,7 @@ fn buildFromInt(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     const digits_str = try builder.newValue(layout.ptr_type);
     try builder.emit(.{ .call = .{ .dst = digits_str, .callee = format_digits, .args = try wasm_heap.dupeOne(module, abs_for_digits) } });
 
-    const is_neg_for_sign = try wasm_heap.loadLocal(&builder, x_local, number_type); // reload x (fresh) — reused below for the sign check again
+    const is_neg_for_sign = try wasm_heap.loadLocal(&builder, x_local, number_type); // перезагрузка x (свежая) — снова используется ниже для проверки знака
     const zero_sign = try wasm_heap.numberConst(&builder, number_type, 0);
     const is_neg2 = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, is_neg_for_sign, zero_sign);
     const sign_block = try builder.newBlock();
@@ -1717,27 +1712,28 @@ fn buildFromInt(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     return id;
 }
 
-// `@string_from_number(x) -> Строка`: practical digit-extraction
-// formatter, NOT a bit-exact port of Zig's `{d}` (which uses a
-// shortest-round-trip decimal algorithm — Ryu-class — genuinely hard to
-// replicate in raw WASM arithmetic without arbitrary precision). This
-// extracts up to 15 fractional digits via repeated `frac *= 10;
-// digit = trunc(frac); frac -= digit`, then trims trailing zeros —
-// correct for exact/short decimals (the overwhelming majority of real
-// panos program output: loop counters, simple arithmetic results,
-// currency-shaped values) and for the whole-number part in `Целое`'s
-// exact range (matches `@string_from_int` exactly there). Known,
-// accepted divergence from native (documented, not silently shipped):
-// values needing MORE than 15 significant fractional digits to
-// round-trip may show extra trailing noise digits or a rounding
-// difference in the last kept digit; extreme magnitudes (~1e17+) lose
-// integer-part precision the same way `Число`'s own f64 representation
-// already does; NaN/Infinity are NOT special-cased (a divide-by-zero
-// producing either will format via the same digit-extraction path,
-// which does not match native's `"nan"`/`"inf"` output) — none of these
-// come from ordinary panos arithmetic, and this file's own established
-// practice (see `docs`'s historical Odin `{d}`-vs-`%v` note) is to
-// document a gap like this rather than block on a full Ryu port.
+// `@string_from_number(x) -> Строка`: практичный форматтер через
+// извлечение цифр, а НЕ побитово точный порт `{d}` из Zig (который
+// использует алгоритм кратчайшего round-trip-десятичного представления
+// класса Ryu — по-настоящему сложно воспроизвести в сырой WASM-арифметике
+// без произвольной точности). Извлекает до 15 дробных цифр через
+// повторяющееся `frac *= 10; digit = trunc(frac); frac -= digit`, затем
+// обрезает хвостовые нули — корректно для точных/коротких десятичных
+// значений (подавляющее большинство реального вывода программ панос:
+// счётчики циклов, простые результаты арифметики, денежные значения) и
+// для целой части в точном диапазоне `Целое` (там точно совпадает с
+// `@string_from_int`). Известное, осознанно принятое расхождение с
+// нативной реализацией (задокументировано, не тихо): значениям, которым
+// для round-trip нужно БОЛЬШЕ 15 значащих дробных цифр, может показать
+// лишние шумовые хвостовые цифры или расхождение в округлении последней
+// сохранённой цифры; экстремальные величины (~1e17+) теряют точность
+// целой части так же, как это уже делает собственное f64-представление
+// `Число`; NaN/Infinity НЕ обрабатываются особым образом (деление на
+// ноль, дающее любое из них, отформатируется тем же путём извлечения
+// цифр, что не совпадает с нативным выводом `"nan"`/`"inf"`) — ни один
+// из этих случаев не встречается в обычной арифметике панос, и
+// устоявшаяся практика этого файла — документировать такой пробел, а не
+// блокироваться на полном порте Ryu.
 fn buildFromNumber(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, format_digits: mir.FunctionId, concat: mir.FunctionId) !mir.FunctionId {
     const number_type = type_store.builtins.number;
     const id = try mir_builder.newFunction(module, allocator, "@string_from_number", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
@@ -1756,10 +1752,10 @@ fn buildFromNumber(allocator: std.mem.Allocator, module: *mir.Module, type_store
     builder.terminate(.{ .branch = .{ .cond = is_neg, .then_block = neg_block, .else_block = pos_block } });
 
     builder.setCurrentBlock(neg_block);
-    // `zero_neg` (lhs) produced BEFORE `x_for_neg` (rhs) — a previous
-    // version loaded `x` first, silently computing `x - 0` (unchanged,
-    // still negative) instead of `0 - x`, same arg-order bug class as
-    // elsewhere in this file.
+    // `zero_neg` (lhs) обязан производиться ДО `x_for_neg` (rhs) — если
+    // сначала загрузить `x`, молча вычислится `x - 0` (без изменений,
+    // всё ещё отрицательное) вместо `0 - x`, то же ограничение порядка
+    // производства, что и в других местах этого файла.
     const zero_neg = try wasm_heap.numberConst(&builder, number_type, 0);
     const x_for_neg = try wasm_heap.loadLocal(&builder, x_local, number_type);
     const negated = try wasm_heap.binOp(&builder, number_type, .subtract, zero_neg, x_for_neg);
@@ -1789,7 +1785,7 @@ fn buildFromNumber(allocator: std.mem.Allocator, module: *mir.Module, type_store
     try builder.emit(.{ .call = .{ .dst = int_digits, .callee = format_digits, .args = try wasm_heap.dupeOne(module, int_part_for_digits) } });
     const int_digits_local = try wasm_heap.storeLocal(&builder, "@int_digits", layout.ptr_type, int_digits);
 
-    // Extract up to 15 fractional digits into a raw scratch buffer.
+    // Извлекаем до 15 дробных цифр в сырой scratch-буфер.
     const max_frac_digits = 15;
     const scratch_size = try wasm_heap.addressConst(&builder, layout.idx_type, max_frac_digits);
     const scratch = try builder.newValue(layout.ptr_type);
@@ -1847,8 +1843,8 @@ fn buildFromNumber(allocator: std.mem.Allocator, module: *mir.Module, type_store
     builder.terminate(.{ .jump = .{ .target = frac_loop_header } });
 
     builder.setCurrentBlock(frac_loop_exit);
-    // Trim trailing '0' digits: count starts at max_frac_digits, walks
-    // backward while the byte just before `count` is '0'.
+    // Обрезаем хвостовые нули: count начинается с max_frac_digits и идёт
+    // назад, пока байт непосредственно перед `count` равен '0'.
     const count_local = try builder.newLocal(wasm_heap.dummy_symbol, "@fcount", layout.idx_type);
     const max_c2 = try wasm_heap.addressConst(&builder, layout.idx_type, max_frac_digits);
     try builder.emit(.{ .store_local = .{ .local = count_local, .src = max_c2 } });
@@ -1923,11 +1919,11 @@ fn buildFromNumber(allocator: std.mem.Allocator, module: *mir.Module, type_store
 
         try emitByteCopyLoop(&builder, layout, src_base_local, dst_base_local, count_local);
 
-        // `int_digits_for_cat` (arg0) must be produced BEFORE `dot`
-        // (arg1) — same arg-order convention as everywhere else in this
-        // file; an earlier version built `dot` first, silently
-        // concatenating "." + digits instead of digits + "." (both i32
-        // handles, no validator error to catch it).
+        // `int_digits_for_cat` (arg0) обязан производиться ДО `dot`
+        // (arg1) — та же конвенция порядка аргументов, что и везде в
+        // этом файле; если построить `dot` первым, молча
+        // сконкатенируется "." + digits вместо digits + "." (оба —
+        // i32-хэндлы, ошибки валидатора, которая бы это поймала, нет).
         const int_digits_for_cat = try wasm_heap.loadLocal(&builder, int_digits_local, layout.ptr_type);
         const dot = try emitOneByteString(&builder, module, layout, '.');
         const with_dot = try builder.newValue(layout.ptr_type);
@@ -1964,36 +1960,40 @@ fn buildFromNumber(allocator: std.mem.Allocator, module: *mir.Module, type_store
     return id;
 }
 
-// `Ошибка` is a builtin 2-field struct (`module: Строка`, `message:
-// Строка`), untagged (`wasm_objects.zig`'s `.new_aggregate` shape — N
-// slots, no tag) — vm.zig's `pushErrorResultForModule` is the oracle
-// (`heap.createAggregate("Ошибка", [module, message])`). `Результат`
-// is the ordinary tagged-variant shape (`Успех`=tag 0, `Неудача`=tag 1,
-// `prelude.zig`'s own declaration order) with ONE payload field at
-// slot 1. Building both by hand here (raw alloc + `frame_store`,
-// `wasm_objects.zig`'s own primitives) rather than emitting `Ошибка(...)`
-// as ordinary panos source and letting `wasm_objects.expand` handle it
-// — `Ошибка` is a TypeStore PRIMITIVE (`types.zig`'s `.error_value`,
-// not an ordinary struct/enum symbol), and `mir_lowering.zig` has no
-// lowering path for a user-level `Ошибка(a, b)` CALL at all (confirmed:
-// `panos build: AOT (wasm) не поддерживает — символ не является
-// локалью или функцией` — a genuine, pre-existing, separate gap, not
-// something this file should silently work around by teaching
-// `mir_lowering.zig` a new construct). Hand-building the two aggregates
-// directly sidesteps that gap entirely: WASM AOT's own object
-// representation (alloc + `frame_store`) doesn't care how a value's
-// TYPE is spelled in panos source, only that the bytes match what
-// `Ошибка`/`Результат.Неудача`'s existing field-access code
-// (`.получить_ошибку`, `.код`, `.сообщение`, etc. — ordinary
-// `.get_property`/`.get_variant_field`/`.match_tag`, already handled by
-// `wasm_objects.zig`) expects to read back.
-// Builds BOTH the `Ошибка` struct and the `Результат.Неудача(...)`
-// variant wrapping it, entirely self-contained (both text arguments are
-// compile-time-known Zig strings, materialized here via
-// `emitConstString` — never a pre-existing `ValueId` handed in from a
-// caller, which would risk exactly the "value produced too early, other
-// instructions emitted in between" staleness this file's whole
-// single-use-adjacent-production convention exists to avoid).
+// `Ошибка` — встроенная структура из 2 полей (`module: Строка`,
+// `message: Строка`), без тега (форма `.new_aggregate` в
+// `wasm_objects.zig` — N слотов, без тега) — эталон
+// `pushErrorResultForModule` в vm.zig
+// (`heap.createAggregate("Ошибка", [module, message])`). `Результат` —
+// обычная форма с тегированным вариантом (`Успех`=tag 0, `Неудача`=tag
+// 1, порядок объявления из `prelude.zig`) с ОДНИМ полем полезной
+// нагрузки в слоте 1. Обе строятся вручную здесь (сырой alloc +
+// `frame_store`, собственные примитивы `wasm_objects.zig`), а не через
+// выпуск `Ошибка(...)` как обычного исходника панос с последующей
+// обработкой `wasm_objects.expand` — `Ошибка` это ПРИМИТИВ TypeStore
+// (`.error_value` в `types.zig`, не обычный символ struct/enum), и у
+// `mir_lowering.zig` вообще нет пути понижения для пользовательского
+// ВЫЗОВА `Ошибка(a, b)` (подтверждено: `panos build: AOT (wasm) не
+// поддерживает — символ не является локалью или функцией` — реальный,
+// отдельный, ранее существовавший пробел, который этому файлу не
+// следует молча обходить, обучая `mir_lowering.zig` новой конструкции).
+// Ручная сборка обоих агрегатов полностью обходит этот пробел:
+// собственное представление объектов WASM AOT (alloc + `frame_store`)
+// не заботится о том, как ТИП значения записан в исходнике панос, лишь
+// о том, чтобы байты совпадали с тем, что ожидает прочитать
+// существующий код доступа к полям `Ошибка`/`Результат.Неудача`
+// (`.получить_ошибку`, `.код`, `.сообщение` и т.д. — обычные
+// `.get_property`/`.get_variant_field`/`.match_tag`, уже обрабатываемые
+// `wasm_objects.zig`).
+// Строит ОБА — и структуру `Ошибка`, и оборачивающий её вариант
+// `Результат.Неудача(...)` — полностью самодостаточно (оба текстовых
+// аргумента — заранее известные во время компиляции Zig-строки,
+// материализуемые здесь через `emitConstString` — никогда не заранее
+// существующий `ValueId`, переданный вызывающим, что рисковало бы как
+// раз той устарелостью «значение произведено слишком рано, между ним и
+// использованием выпущены другие инструкции», которую вся конвенция
+// «производить смежно с единственным использованием» этого файла
+// призвана предотвратить).
 fn buildFailResultNamed(builder: *mir_builder.Builder, module: *mir.Module, layout: wasm_heap.PtrLayout, module_name_text: []const u8, message_text: []const u8) !mir.ValueId {
     const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
 
@@ -2002,8 +2002,8 @@ fn buildFailResultNamed(builder: *mir_builder.Builder, module: *mir.Module, layo
     try builder.emit(.{ .call = .{ .dst = err_frame, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, err_size) } });
     const err_frame_local = try wasm_heap.storeLocal(builder, "@err", layout.ptr_type, err_frame);
 
-    // `src` produced before `frame` (reloaded fresh) — `frame_store`'s
-    // own stack convention, see `wasm_emit.zig`.
+    // `src` производится раньше `frame` (перезагруженного заново) —
+    // собственная конвенция стека `frame_store`, см. `wasm_emit.zig`.
     const message_str = try emitConstString(builder, module, layout, message_text);
     const err_frame_for_msg = try wasm_heap.loadLocal(builder, err_frame_local, layout.ptr_type);
     try builder.emit(.{ .frame_store = .{ .frame = err_frame_for_msg, .slot = 1, .src = message_str } });
@@ -2028,12 +2028,13 @@ fn buildFailResultNamed(builder: *mir_builder.Builder, module: *mir.Module, layo
     return try wasm_heap.loadLocal(builder, result_frame_local, layout.ptr_type);
 }
 
-// Materializes a compile-time-known (Zig-side) string as a fresh
-// `[len][bytes]` heap string at runtime — for text that has no
-// data-section entry of its own (not a literal in the panos SOURCE
-// being compiled, e.g. `Ошибка`'s constant module name/message text).
-// Every byte store is unrolled (text is short and fixed-length at
-// BUILD time) rather than a real WASM loop.
+// Материализует известную во время компиляции (Zig-side) строку как
+// свежую строку в куче `[len][bytes]` в рантайме — для текста, у
+// которого нет собственной записи в секции данных (не литерал в
+// компилируемом ИСХОДНИКЕ панос, например, константный текст
+// имени-модуля/сообщения у `Ошибка`). Каждая запись байта развёрнута
+// (текст короткий и имеет фиксированную длину во время СБОРКИ), а не
+// настоящий WASM-цикл.
 fn emitConstString(builder: *mir_builder.Builder, module: *mir.Module, layout: wasm_heap.PtrLayout, text: []const u8) !mir.ValueId {
     const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
     const size = try wasm_heap.addressConst(builder, layout.idx_type, @intCast(4 + text.len));
@@ -2055,7 +2056,7 @@ fn emitConstString(builder: *mir_builder.Builder, module: *mir.Module, layout: w
     return try wasm_heap.loadLocal(builder, handle_local, layout.ptr_type);
 }
 
-// `'0' <= byte <= '9'`.
+// Проверка: `'0' <= byte <= '9'`.
 fn emitIsDigit(builder: *mir_builder.Builder, layout: wasm_heap.PtrLayout, byte_local: mir.LocalId) !mir.ValueId {
     const byte_for_lo = try wasm_heap.loadLocal(builder, byte_local, layout.idx_type);
     const zero_char = try wasm_heap.addressConst(builder, layout.idx_type, '0');
@@ -2084,17 +2085,18 @@ fn buildSuccessResult(builder: *mir_builder.Builder, module: *mir.Module, layout
     return try wasm_heap.loadLocal(builder, result_frame_local, layout.ptr_type);
 }
 
-// `@string_to_number(s) -> Результат(Число, Ошибка)`: PRACTICAL parser
-// (optional sign, digits, optional `.` + digits) — matches
-// `std.fmt.parseFloat` for the common shapes real panos programs
-// produce (plain integers/decimals, with or without a leading sign).
-// Known, documented gap (same spirit as `из_числа`'s own divergence
-// note): scientific notation (`1e10`), `"inf"`/`"nan"` literals, and
-// leading/trailing whitespace are NOT accepted — `std.fmt.parseFloat`
-// accepts all of these, this parser rejects them as a `Неудача`. Empty
-// input, a bare sign with no digits, or ANY unrecognized trailing byte
-// all fail cleanly (never a crash/trap) — matching native's own
-// never-panics contract for `в_число`.
+// `@string_to_number(s) -> Результат(Число, Ошибка)`: ПРАКТИЧНЫЙ парсер
+// (необязательный знак, цифры, необязательные `.` + цифры) — совпадает
+// с `std.fmt.parseFloat` для распространённых форм, которые
+// действительно выдают программы панос (простые целые/десятичные, со
+// знаком в начале или без него). Известный, задокументированный пробел
+// (в том же духе, что и заметка о расхождении у `из_числа`): научная
+// нотация (`1e10`), литералы `"inf"`/`"nan"` и ведущие/хвостовые пробелы
+// НЕ принимаются — `std.fmt.parseFloat` принимает всё это, этот парсер
+// отвергает их как `Неудача`. Пустой ввод, голый знак без цифр или
+// ЛЮБОЙ нераспознанный хвостовой байт — всё это аккуратно проваливается
+// (никогда не crash/trap) — совпадает с контрактом «никогда не
+// паникует» у нативной реализации `в_число`.
 fn buildToNumber(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
     const number_type = type_store.builtins.number;
     const id = try mir_builder.newFunction(module, allocator, "@string_to_number", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
@@ -2309,8 +2311,9 @@ fn buildToNumber(allocator: std.mem.Allocator, module: *mir.Module, type_store: 
     builder.terminate(.{ .jump = .{ .target = after_frac_parse_block } });
 
     builder.setCurrentBlock(after_frac_parse_block);
-    // Valid iff at least one digit was seen AND every byte was consumed
-    // (no unrecognized trailing content — exponent, garbage, etc).
+    // Валидно тогда и только тогда, когда была замечена хотя бы одна
+    // цифра И потреблены все байты (нет нераспознанного хвостового
+    // содержимого — экспоненты, мусора и т.п.).
     const saw_digit_final = try wasm_heap.loadLocal(&builder, saw_digit_local, layout.bool_type);
     const pos_final = try wasm_heap.loadLocal(&builder, pos_local, layout.idx_type);
     const len_final = try wasm_heap.loadLocal(&builder, len_local, layout.idx_type);

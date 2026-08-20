@@ -4,10 +4,9 @@ const bytecode = @import("bytecode.zig");
 const gc = @import("gc.zig");
 const target_policy = @import("target.zig");
 const value = @import("value.zig");
-// Renamed (not `ast`/`lexer`/`parser`) — many existing tests below already
-// locally shadow those three names with their own `@import(...)` (written
-// before any module-scope import of them existed here); a plain top-level
-// import under the obvious name would conflict with every one of them.
+// Названы не `ast`/`lexer`/`parser` — многие тесты ниже уже локально
+// затеняют эти три имени собственными `@import(...)`; обычный импорт под
+// очевидным именем на уровне модуля конфликтовал бы с каждым из них.
 const ast_types = @import("ast.zig");
 const syntax_lexer = @import("lexer.zig");
 const syntax_parser = @import("parser.zig");
@@ -19,18 +18,19 @@ pub const Execution = union(enum) {
     runtime_error: []const u8,
 };
 
-// Persistent per-process continuation state now lives on value.Process
-// itself (see value.zig) so a process can be suspended mid-frame and
-// resumed later by the round-robin scheduler — kept as a local alias since
-// most of this file already refers to it as plain `Frame`.
+// Состояние продолжения процесса живёт в value.Process (см. value.zig) —
+// процесс можно приостановить посреди кадра и возобновить позже
+// планировщиком round-robin; здесь просто локальный алиас, т.к. большая
+// часть файла уже ссылается на это как на просто `Frame`.
 const Frame = value.Frame;
 
-// Outcome of a single step() dispatch. `.suspended` means the current
-// instruction could not complete yet (empty mailbox/signals/async_results)
-// and must be re-dispatched from the SAME frame.ip on the next scheduling
-// slice — the handful of suspend-capable instructions (получить,
-// получить_сигнал, Await_Async) roll frame.ip back by one before returning
-// this, since step() unconditionally advances ip before dispatch.
+// Результат одного шага step(). `.suspended` значит, что текущая
+// инструкция не смогла завершиться (пустой mailbox/сигналы/async_results) и
+// должна быть передиспетчеризована с ТОГО ЖЕ frame.ip на следующем такте
+// планировщика — инструкции, способные приостанавливаться (получить,
+// получить_сигнал, Await_Async), откатывают frame.ip на единицу назад перед
+// возвратом этого значения, т.к. step() безусловно продвигает ip перед
+// диспетчеризацией.
 const StepOutcome = union(enum) {
     none,
     completed: value.Value,
@@ -54,9 +54,9 @@ const ForeignCallMetric = struct {
     cache_misses: u64 = 0,
 };
 
-// Zig 0.16 routes clocks through std.Io, but keeping an Io.Threaded object
-// in every VM would install process-wide signal handlers just for an
-// optional profiler. Use direct monotonic platform clocks instead.
+// Zig 0.16 маршрутизирует часы через std.Io, но держать объект Io.Threaded
+// в каждой VM установило бы общесистемные обработчики сигналов ради
+// опционального профайлера. Вместо этого — прямые монотонные часы платформы.
 fn foreignProfileNowNanoseconds() u64 {
     if (comptime builtin.target.os.tag == .freestanding) {
         return 0;
@@ -134,30 +134,30 @@ const AsyncPayload = union(enum) {
     file_write: struct { bytes_written: usize, err_message: ?[]u8 },
     net_connect: struct { stream: ?std.Io.net.Stream, err_message: ?[]u8 },
     http_request: struct { result: ?HttpRequestResult, err_message: ?[]u8 },
-    // `connection` — gc_pinned for the whole flight (see submitConnectionRead)
-    // so it's safe to identify by raw pointer here; the worker never
-    // dereferences its GC header, only the copied `stream` value it was
-    // handed.
+    // `connection` закреплён (gc_pinned) на всё время полёта (см.
+    // submitConnectionRead), поэтому его безопасно идентифицировать здесь по
+    // сырому указателю; воркер никогда не разыменовывает его GC-заголовок,
+    // только переданную ему копию значения `stream`.
     connection_read: struct { connection: *value.Connection, content: ?[]u8, err_message: ?[]u8 },
     connection_write: struct { connection: *value.Connection, bytes_written: usize, err_message: ?[]u8 },
-    // `new_pending` is ALWAYS set (even on error) — whatever the worker had
-    // accumulated but not yet consumed into a line must be written back to
-    // `connection.pending` at delivery, so a retried `.получить_строку()`
-    // after a transient error doesn't lose already-buffered bytes.
+    // `new_pending` заполнено ВСЕГДА (даже при ошибке) — всё, что воркер
+    // накопил, но ещё не превратил в строку, должно быть записано обратно в
+    // `connection.pending` при доставке, чтобы повтор `.получить_строку()`
+    // после временной ошибки не терял уже буферизованные байты.
     connection_read_line: struct { connection: *value.Connection, line: ?[]u8, new_pending: []const u8, err_message: ?[]u8 },
     file_handle_read: struct { handle: *value.FileHandle, content: ?[]u8, new_offset: usize, err_message: ?[]u8 },
     file_handle_write: struct { handle: *value.FileHandle, bytes_written: usize, new_offset: usize, err_message: ?[]u8 },
     sql_open: struct { db: ?*sqlite3.sqlite3, err_message: ?[]u8 },
     sql_exec: struct { connection: *value.SqlConnection, rows_affected: i64, err_message: ?[]u8 },
-    // `column_names`/`rows` — positional, not per-row named (same layout as
-    // Odin's `Sql_Query_Result_Data`). Each row is `?[]u8` per column: null
-    // = SQL NULL (omitted from the delivered `Соответствие` entirely, same
-    // convention as the old synchronous `sqlReadRow`).
+    // `column_names`/`rows` — позиционные, не именованные по каждой строке.
+    // Каждая строка — `?[]u8` на колонку: null = SQL NULL (вообще
+    // исключается из итогового `Соответствие`, как и в старом синхронном
+    // варианте).
     sql_query: struct { connection: *value.SqlConnection, column_names: [][]u8, rows: [][]?[]u8, err_message: ?[]u8 },
-    // `listener` — pinned ONCE per in-flight accept (see submitHttpAccept);
-    // `Heap.pin`/`unpin` already support multiple concurrent pins of the
-    // same value, unlike Connection/FileHandle/SqlConnection's single
-    // `in_flight` flag.
+    // `listener` закрепляется ОДИН РАЗ на каждый accept в полёте (см.
+    // submitHttpAccept); `Heap.pin`/`unpin` уже поддерживают несколько
+    // одновременных закреплений одного значения — в отличие от единственного
+    // флага `in_flight` у Connection/FileHandle/SqlConnection.
     http_accept: struct { listener: *value.Listener, stream: ?std.Io.net.Stream, method: ?[]u8, path: ?[]u8, body: ?[]u8, headers: []HttpHeaderPair, err_message: ?[]u8 },
 };
 
@@ -243,24 +243,23 @@ fn freeAsyncPayload(payload: AsyncPayload) void {
 }
 
 // Живёт ЦЕЛИКОМ на std.heap.page_allocator — не на Vm.allocator, который
-// может (и в панос-CLI является) не потокобезопасным bump/arena-
-// аллокатором. Та же причина, что у Odin's vm_heap_allocator()
-// (core/gc.odin) — воркер-потоки и главный поток никогда не должны делить
-// один неатомарный аллокатор. outstanding — число задач, отправленных в
-// пул, но ещё не доложивших результат push()'ом (аналог Odin's
-// thread.pool_num_outstanding), нужен для различения "никто не готов, но
-// I/O в полёте" (настоящий idle-wait) от "дедлок" в run_scheduler.
-// Zig 0.16 moved Mutex/Condition off `std.Thread` onto `std.Io` (`lock`/
-// `wait` now take an `Io` handle, routed through `io.futexWait`/
-// `futexWake`) — there is no longer a raw OS mutex usable without one.
-// Each method below builds a throwaway `std.Io.Threaded` purely to obtain
-// that handle; the futex itself is keyed by the shared atomic's ADDRESS,
-// not by which `Threaded` instance issued the call, so a fresh one per
-// call from either the main thread or a worker thread still correctly
-// synchronizes through the same underlying `Mutex`/`Condition` state. Same
-// throwaway-Io-per-call pattern already used everywhere else in this file
-// for real I/O. `lock`/`wait` return `Cancelable!void` but a throwaway,
-// never-cancelled `Threaded` can never actually report cancellation.
+// может быть (и в панос-CLI является) не потокобезопасным bump/arena-
+// аллокатором. Воркер-потоки и главный поток никогда не должны делить один
+// неатомарный аллокатор. outstanding — число задач, отправленных в пул, но
+// ещё не доложивших результат push()'ом, нужен для различения "никто не
+// готов, но I/O в полёте" (настоящий idle-wait) от "дедлок" в run_scheduler.
+// Zig 0.16 перенёс Mutex/Condition с `std.Thread` на `std.Io` (`lock`/
+// `wait` теперь принимают handle `Io`, маршрутизируется через
+// `io.futexWait`/`futexWake`) — голого OS-мьютекса без такого handle больше
+// не существует. Каждый метод ниже создаёт одноразовый `std.Io.Threaded`
+// только чтобы получить этот handle; сам futex ключуется АДРЕСОМ общего
+// атомика, а не тем, какой именно экземпляр `Threaded` сделал вызов —
+// поэтому свежий экземпляр на каждый вызов (хоть с главного потока, хоть с
+// воркера) всё равно корректно синхронизируется через одно и то же
+// состояние `Mutex`/`Condition`. Тот же паттерн одноразового `Io` на вызов
+// используется везде в этом файле для реального I/O. `lock`/`wait`
+// возвращают `Cancelable!void`, но одноразовый, никогда не отменяемый
+// `Threaded` не может фактически сообщить об отмене.
 const AsyncQueue = struct {
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
@@ -287,16 +286,15 @@ const AsyncQueue = struct {
         self.condition.signal(io);
     }
 
-    // These four are called UNCONDITIONALLY from run()/run_scheduler for
-    // every target (there is no per-call-site freestanding guard, unlike
-    // beginSubmit/push — those are only ever reached through
-    // submitFileRead/submitFileWrite, themselves behind fileReadSubmit's/
-    // fileWriteSubmit's own freestanding `if`/`else`). A real `if`/`else`
-    // here is therefore required so the wasm32-freestanding `browser`
-    // build never has to resolve `std.Io.Threaded` (its `RandomFile` pulls
-    // in `posix.system.getrandom`, missing on freestanding) — outstanding/
-    // items are always 0 there anyway, since no async job is ever
-    // submitted on that target.
+    // Эти четыре вызываются БЕЗУСЛОВНО из run()/run_scheduler для
+    // каждой цели (в отличие от beginSubmit/push, которые достижимы только
+    // через submitFileRead/submitFileWrite за собственными freestanding
+    // `if`/`else` в fileReadSubmit/fileWriteSubmit, здесь нет отдельной
+    // проверки на каждом месте вызова). Настоящий `if`/`else` здесь нужен,
+    // чтобы сборка `browser` под wasm32-freestanding никогда не резолвила
+    // `std.Io.Threaded` (его `RandomFile` тянет `posix.system.getrandom`,
+    // отсутствующий на freestanding) — outstanding/items там всегда 0, т.к.
+    // на этой цели ни одна async-задача никогда не отправляется.
     fn drain(self: *AsyncQueue, out: *std.ArrayList(AsyncCompletion)) void {
         if (comptime builtin.target.os.tag == .freestanding) {
             return;
@@ -491,10 +489,10 @@ fn submitNetConnect(vm: *Vm, host: []const u8, port: u16, target_id: u64) void {
     thread.detach();
 }
 
-// `owned_headers` — already cloned onto page_allocator by the caller
-// (httpRequestSubmit, on the main thread) — this function takes ownership
-// of it (frees it itself, worker-side) along with the method/url/body
-// clones it makes here.
+// `owned_headers` уже склонирован на page_allocator вызывающей стороной
+// (httpRequestSubmit, на главном потоке) — эта функция забирает владение им
+// (сама освобождает на стороне воркера) вместе с клонами method/url/body,
+// которые делает здесь же.
 fn submitHttpRequest(vm: *Vm, method_text: []const u8, url: []const u8, body: []const u8, owned_headers: []HttpHeaderPair, target_id: u64) void {
     vm.async_queue.beginSubmit();
     const Job = struct {
@@ -606,11 +604,12 @@ fn submitHttpRequest(vm: *Vm, method_text: []const u8, url: []const u8, body: []
     thread.detach();
 }
 
-// `connection` is gc_pinned by the CALLER (connectionReadSubmit) for the
-// whole flight — the worker only ever touches the copied `stream` VALUE
-// (a plain fd wrapper, safe to use from another thread while the fd stays
-// open), never `connection`'s GC header or any other field; `connection`
-// itself is carried only as an opaque identifier for delivery.
+// `connection` закреплён (gc_pinned) ВЫЗЫВАЮЩЕЙ стороной (connectionReadSubmit)
+// на всё время полёта — воркер трогает только скопированное ЗНАЧЕНИЕ
+// `stream` (обычная обёртка fd, безопасно использовать из другого потока,
+// пока fd открыт), никогда не GC-заголовок `connection` или другое его
+// поле; сам `connection` переносится только как непрозрачный идентификатор
+// для доставки.
 fn submitConnectionRead(vm: *Vm, connection: *value.Connection, stream: std.Io.net.Stream, drained_pending: []u8, target_id: u64) void {
     vm.async_queue.beginSubmit();
     const Job = struct {
@@ -660,7 +659,8 @@ fn submitConnectionRead(vm: *Vm, connection: *value.Connection, stream: std.Io.n
     thread.detach();
 }
 
-// Same gc_pin/opaque-identifier discipline as submitConnectionRead above.
+// Та же дисциплина gc_pin/непрозрачного идентификатора, что и у
+// submitConnectionRead выше.
 fn submitConnectionWrite(vm: *Vm, connection: *value.Connection, stream: std.Io.net.Stream, content: []const u8, target_id: u64) void {
     vm.async_queue.beginSubmit();
     const owned_content = std.heap.page_allocator.dupe(u8, content) catch @panic("OOM: содержимое для async Соединение.отправить");
@@ -702,9 +702,9 @@ fn submitConnectionWrite(vm: *Vm, connection: *value.Connection, stream: std.Io.
     thread.detach();
 }
 
-// `drained_pending` — whatever `.pending` already held before this call,
-// handed over as the worker's starting accumulation buffer (same drain-
-// then-transfer discipline as submitConnectionRead).
+// `drained_pending` — всё, что уже было в `.pending` до этого вызова,
+// передаётся как стартовый буфер накопления воркера (та же дисциплина
+// "слить-затем-передать", что у submitConnectionRead).
 fn submitConnectionReadLine(vm: *Vm, connection: *value.Connection, stream: std.Io.net.Stream, drained_pending: []const u8, target_id: u64) void {
     vm.async_queue.beginSubmit();
     var owned_pending: std.ArrayList(u8) = .empty;
@@ -773,10 +773,11 @@ fn submitConnectionReadLine(vm: *Vm, connection: *value.Connection, stream: std.
     thread.detach();
 }
 
-// `Файл.прочитать()`/`Файл.прочитать_строку()` share this — `want_line`
-// picks which slicing rule applies to the same reopen-by-path whole-file
-// read (see `value.zig`'s `FileHandle` doc comment for why there's no
-// persistent OS handle to seek through instead).
+// Общее для `Файл.прочитать()`/`Файл.прочитать_строку()` — `want_line`
+// выбирает правило нарезки для одного и того же чтения всего файла
+// (переоткрываемого по пути) — см. doc-комментарий `FileHandle` в
+// `value.zig` о том, почему нет постоянного OS-хендла для seek вместо
+// этого.
 fn submitFileHandleRead(vm: *Vm, handle: *value.FileHandle, path: []const u8, offset: usize, want_line: bool, target_id: u64) void {
     vm.async_queue.beginSubmit();
     const owned_path = std.heap.page_allocator.dupe(u8, path) catch @panic("OOM: путь для async Файл.прочитать");
@@ -918,9 +919,9 @@ fn submitSqlOpen(vm: *Vm, path: []const u8, target_id: u64) void {
             const rc = sqlite3.sqlite3_open_v2(job.path, &db, sqlite3.SQLITE_OPEN_READWRITE | sqlite3.SQLITE_OPEN_CREATE, null);
             std.heap.page_allocator.free(job.path);
             if (rc != sqlite3.SQLITE_OK) {
-                // See the old synchronous sqlOpen — sqlite3_open_v2 can
-                // allocate a barely-usable `db` even on failure, purely so
-                // sqlite3_errmsg has something to report; must still close it.
+                // sqlite3_open_v2 может выделить едва пригодный `db` даже при
+                // ошибке, чисто чтобы sqlite3_errmsg было что вернуть; его
+                // всё равно нужно закрыть.
                 const message = std.mem.span(sqlite3.sqlite3_errmsg(db) orelse "не удалось открыть базу данных");
                 const owned_message = std.heap.page_allocator.dupe(u8, message) catch @panic("OOM");
                 _ = sqlite3.sqlite3_close_v2(db);
@@ -939,10 +940,10 @@ const SqlPrepareWorkerOutcome = union(enum) {
     fail: []u8,
 };
 
-// Worker-side equivalent of `Vm.sqlPrepare` — no `Vm` access, everything on
-// `page_allocator`. `params` is already validated (all-Строка) and cloned
-// to plain `[]const u8` by the caller (submitSqlExec/submitSqlQuery, on the
-// main thread) before the worker ever starts.
+// Эквивалент `Vm.sqlPrepare` на стороне воркера — без доступа к `Vm`, всё на
+// `page_allocator`. `params` уже провалидирован (все — Строка) и склонирован
+// в обычный `[]const u8` вызывающей стороной (submitSqlExec/submitSqlQuery,
+// на главном потоке) до того, как воркер вообще стартует.
 fn sqlPrepareWorker(db: ?*sqlite3.sqlite3, sql_z: [:0]const u8, params: []const []const u8) SqlPrepareWorkerOutcome {
     var stmt: ?*sqlite3.sqlite3_stmt = null;
     const prepare_rc = sqlite3.sqlite3_prepare_v2(db, sql_z.ptr, -1, &stmt, null);
@@ -1128,12 +1129,12 @@ fn submitSqlQuery(vm: *Vm, connection: *value.SqlConnection, sql: []const u8, pa
     thread.detach();
 }
 
-// `listener.server` is copied by VALUE into the job — `Server.accept` only
-// reads its fields (socket handle + options) to issue the syscall, never
-// mutates them, so independent copies calling `.accept()` concurrently
-// (from however many `.принять_запрос()` calls are in flight at once) are
-// safe — the same shared listening socket, safe to accept() from multiple
-// threads simultaneously (ordinary POSIX behavior).
+// `listener.server` копируется в задачу ПО ЗНАЧЕНИЮ — `Server.accept`
+// только читает его поля (хендл сокета + опции) для системного вызова,
+// никогда их не меняет, поэтому независимые копии, вызывающие `.accept()`
+// параллельно (сколько бы ни было `.принять_запрос()` в полёте одновременно)
+// безопасны — один и тот же слушающий сокет безопасно принимать (accept) из
+// нескольких потоков одновременно (обычное поведение POSIX).
 fn submitHttpAccept(vm: *Vm, listener: *value.Listener, target_id: u64) void {
     vm.async_queue.beginSubmit();
     const Job = struct {
@@ -1181,28 +1182,26 @@ fn submitHttpAccept(vm: *Vm, listener: *value.Listener, target_id: u64) void {
                     .value = std.heap.page_allocator.dupe(u8, header.value) catch @panic("OOM"),
                 }) catch @panic("OOM");
             }
-            // Real hang found running demo/todo-app for real (2026-08-14,
-            // see project_panos_http_post_empty_body_hang memory): a
-            // POST/PUT/PATCH request with NEITHER `Content-Length` NOR
-            // `Transfer-Encoding: chunked` (an empty-body POST sent
-            // without an explicit `Content-Length: 0` — e.g. a bare
-            // `curl -X POST` with no `-d`) is exactly the one case
+            // POST/PUT/PATCH-запрос БЕЗ `Content-Length` И БЕЗ
+            // `Transfer-Encoding: chunked` (пустое тело без явного
+            // `Content-Length: 0`, например голый `curl -X POST` без `-d`) —
+            // именно тот случай, для которого
             // `std.http.Server.Request.Reader.bodyReader` (std/http.zig
-            // ~444-461) does NOT hand back an already-terminated/bounded
-            // reader — it hands back the RAW, UNBOUNDED connection
-            // socket reader instead (`reader.in`), on the theory that
-            // the caller knows what it's doing with a length-less body.
-            // `allocRemaining` on that raw reader waits for EOF or the
-            // 1 MiB limit, but this is a keep-alive HTTP/1.1 connection
-            // — neither ever arrives for a legitimate empty body, so the
-            // worker hangs forever. `DELETE`/`GET`/`HEAD` never hit this
-            // at all (`Method.requestHasBody()` is false for them,
-            // `readerExpectNone` returns `.ending` immediately) — only
-            // body-bearing methods sent WITHOUT a length declaration.
-            // Detect the exact same condition `bodyReader` itself checks
-            // (`transfer_encoding == .none and content_length == null`)
-            // and treat it as an empty body directly, without ever
-            // touching the raw connection reader.
+            // ~444-461) НЕ возвращает уже терминированный/ограниченный
+            // reader — вместо этого отдаёт СЫРОЙ, НЕОГРАНИЧЕННЫЙ reader
+            // сокета соединения (`reader.in`), полагая, что вызывающий сам
+            // разберётся с телом без длины. `allocRemaining` на таком сыром
+            // reader'е ждёт EOF или лимит 1 МиБ, но это keep-alive
+            // HTTP/1.1-соединение — ни то, ни другое никогда не наступает
+            // для легитимного пустого тела, так что воркер зависает
+            // навсегда. `DELETE`/`GET`/`HEAD` этого никогда не задевают
+            // (`Method.requestHasBody()` для них false, `readerExpectNone`
+            // сразу возвращает `.ending`) — только методы с телом,
+            // отправленные БЕЗ объявления длины. Обнаруживаем то же самое
+            // условие, что проверяет сам `bodyReader`
+            // (`transfer_encoding == .none and content_length == null`), и
+            // напрямую трактуем это как пустое тело, вообще не трогая сырой
+            // reader соединения.
             const body: []u8 = if (request.head.transfer_encoding == .none and request.head.content_length == null)
                 &.{}
             else blk: {
@@ -1233,38 +1232,39 @@ fn submitHttpAccept(vm: *Vm, listener: *value.Listener, target_id: u64) void {
     thread.detach();
 }
 
-// `std.c` only binds `getenv` — no `setenv`/`unsetenv` — so those two are
-// declared directly, same shape as libc's own prototypes. Only referenced
-// from `Vm.osEnvSet`/`osEnvUnset`'s non-freestanding `if`/`else` branch —
-// see the comment on `osEnvGet` for why that branch shape matters here.
+// `std.c` связывает только `getenv` — без `setenv`/`unsetenv` — поэтому эти
+// два объявлены напрямую, в той же форме, что и прототипы самой libc.
+// Используются только в неfreestanding-ветке `if`/`else` в
+// `Vm.osEnvSet`/`osEnvUnset` — почему форма этой ветки здесь важна, см.
+// комментарий у `osEnvGet`.
 const posix_env = struct {
     extern "c" fn setenv(name: [*:0]const u8, value_ptr: [*:0]const u8, overwrite: c_int) c_int;
     extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 };
 
-// MSVC's ucrt has no `setenv`/`unsetenv` symbols at all (it's `_putenv_s`
-// instead) — `posix_env`'s `extern "c"` declarations above would fail at
-// LINK time on Windows, not compile time, so this was never caught by a
-// plain compile-error scan. `SetEnvironmentVariableW` mutates the CURRENT
-// process's env block directly (no `std` binding for it in this Zig
-// version — same gap `resolver.zig`'s `WindowsDynLib` already worked
-// around for `LoadLibraryW`/`GetProcAddress`) — a spawned child inherits
-// that block automatically unless a caller overrides it, which is exactly
-// what `osExec`'s environ-hack needs on Windows too (see there).
+// MSVC-шный ucrt вообще не имеет символов `setenv`/`unsetenv` (вместо них
+// `_putenv_s`) — объявления `extern "c"` из `posix_env` выше упали бы на
+// этапе ЛИНКОВКИ на Windows, не компиляции, так что простым сканом ошибок
+// компиляции это не поймать. `SetEnvironmentVariableW` меняет блок
+// окружения ТЕКУЩЕГО процесса напрямую (для этой версии Zig нет `std`-
+// биндинга) — порождённый дочерний процесс автоматически наследует этот
+// блок, если вызывающий его не переопределит, а это именно то, что нужно
+// хаку с environ в `osExec` на Windows тоже (см. там).
 const windows_env = struct {
     extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) c_int;
     extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buffer: ?[*]u16, size: u32) callconv(.winapi) u32;
     extern "kernel32" fn GetEnvironmentStringsW() callconv(.winapi) ?[*:0]const u16;
     extern "kernel32" fn FreeEnvironmentStringsW(penv: [*:0]const u16) callconv(.winapi) c_int;
 
-    // `std.c.getenv` reads ucrt's OWN cached copy of the environment
-    // block (populated at process startup, only kept in sync by
-    // `_putenv`/`_wputenv`) — `SetEnvironmentVariableW` mutates the raw
-    // Win32 process environment block directly and does NOT update that
-    // ucrt cache, so a `ос.установить_окружение(...)` followed by
-    // `ос.окружение(...)` would silently see the OLD value through
-    // `std.c.getenv`. `GetEnvironmentVariableW` reads the live Win32
-    // block instead, matching what `SetEnvironmentVariableW` just wrote.
+    // `std.c.getenv` читает СОБСТВЕННУЮ кэшированную копию блока окружения
+    // ucrt (заполняется при старте процесса, синхронизируется только через
+    // `_putenv`/`_wputenv`) — `SetEnvironmentVariableW` меняет сырой блок
+    // окружения процесса Win32 напрямую и НЕ обновляет этот кэш ucrt,
+    // поэтому `ос.установить_окружение(...)`, за которым следует
+    // `ос.окружение(...)`, молча увидело бы СТАРОЕ значение через
+    // `std.c.getenv`. `GetEnvironmentVariableW` вместо этого читает живой
+    // блок Win32, соответствующий тому, что только что записал
+    // `SetEnvironmentVariableW`.
     fn getenv(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
         const name_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, name);
         defer allocator.free(name_w);
@@ -1288,14 +1288,15 @@ const windows_env = struct {
         return if (SetEnvironmentVariableW(name_w, null) != 0) 0 else 1;
     }
 
-    // `std.process.Environ.Block` resolves to `GlobalBlock` on Windows
-    // (only `.empty`/`.global`, see `Environ.zig`) — no way to hand it a
-    // custom block through the normal `createMap` entry point at all on
-    // this platform. Bypasses that by reading the live process
-    // environment block directly (same live-block idea as the POSIX
-    // `std.c.environ` read in `osExec` below) and feeding it through
-    // `Environ.Map.putWindowsBlock`, which only needs a raw UTF-16
-    // double-null-terminated pointer — no `Block`/`createMap` involved.
+    // `std.process.Environ.Block` на Windows резолвится в `GlobalBlock`
+    // (только `.empty`/`.global`, см. `Environ.zig`) — никакого способа
+    // передать ему кастомный блок через обычный вход `createMap` на этой
+    // платформе вообще нет. Обходим это, читая живой блок окружения
+    // процесса напрямую (та же идея живого блока, что и чтение POSIX
+    // `std.c.environ` в `osExec` ниже) и передавая его через
+    // `Environ.Map.putWindowsBlock`, которому нужен только сырой
+    // UTF-16-указатель с двойным нулевым терминатором — без
+    // `Block`/`createMap`.
     fn buildEnvironMap(allocator: std.mem.Allocator) !std.process.Environ.Map {
         var map = std.process.Environ.Map.init(allocator);
         errdefer map.deinit();
@@ -1306,26 +1307,27 @@ const windows_env = struct {
     }
 };
 
-// `ввод_вывод.печать`/`.строка`'s value-to-text conversion, also reused by
-// `runner.renderValue` for the CLI's final return-value line (same
-// contract, one implementation) — a structural dump (`Имя(поле1, поле2,
-// ...)`, positional, no field names — matches the display-string
-// convention already documented for compound values without a real
-// `Печатаемое` implementation). Dispatching to a value's OWN `.вСтроку()`
-// when it implements `Печатаемое` (the docs' PREFERRED path) is NOT done
-// here — that needs static-type-aware interface casting at each call
-// site (the same mechanism `Складываемое`-sugar uses for `+`), which
-// `ввод_вывод.печать(значение: любой тип)` can't get for free since its
-// parameter isn't a real generic; deliberately left for a follow-up
-// rather than silently only half-supporting it.
+// Преобразование значения в текст для `ввод_вывод.печать`/`.строка`, также
+// переиспользуется `runner.renderValue` для финальной строки возвращаемого
+// значения CLI (один и тот же контракт, одна реализация) — структурный
+// дамп (`Имя(поле1, поле2, ...)`, позиционный, без имён полей — совпадает с
+// уже задокументированной конвенцией отображения составных значений без
+// реальной реализации `Печатаемое`). Диспетчеризация к СОБСТВЕННОМУ
+// `.вСтроку()` значения, когда оно реализует `Печатаемое` (ПРЕДПОЧТИТЕЛЬНЫЙ
+// по документации путь), здесь НЕ делается — для этого нужно приведение к
+// интерфейсу с учётом статического типа в каждой точке вызова (тот же
+// механизм, что использует сахар `Складываемое` для `+`), которое
+// `ввод_вывод.печать(значение: любой тип)` не может получить бесплатно, т.к.
+// его параметр — не настоящий generic; сознательно оставлено на будущее,
+// а не тихо наполовину поддержано.
 pub fn renderRuntimeValue(allocator: std.mem.Allocator, runtime_value: value.Value) anyerror![]u8 {
     return switch (runtime_value) {
         .void => allocator.dupe(u8, ""),
         .number => |number| std.fmt.allocPrint(allocator, "{d}", .{number}),
-        // Kept as Zig's default `true`/`false` (NOT `истина`/`ложь`) —
-        // matches the CLI's existing final-return-value rendering, which
-        // 19+ existing tests already assert on; changing it is a separate
-        // decision, not a side effect of adding `ввод_вывод`.
+        // Оставлено как стандартные `true`/`false` Zig (НЕ `истина`/`ложь`) —
+        // совпадает с существующим отображением финального возвращаемого
+        // значения CLI, на которое опирается 19+ тестов; изменение этого —
+        // отдельное решение, не побочный эффект добавления `ввод_вывод`.
         .boolean => |boolean| std.fmt.allocPrint(allocator, "{}", .{boolean}),
         .string => |string| allocator.dupe(u8, string),
         .heap_string => |string| allocator.dupe(u8, string.bytes),
@@ -1388,34 +1390,33 @@ pub const Vm = struct {
     next_process_id: u64 = 0,
     failure: ?*value.HeapString = null,
     target_profile: target_policy.TargetProfile = .native,
-    // Everything on the command line after the script path — `ос.
-    // аргументы()`, symmetric to Odin's `vm.program_args` (`core/vm.odin`,
-    // set from `main.odin`'s `run_file`). Empty for every entry point that
-    // isn't the native CLI (LSP, browser) — there is no meaningful argv
-    // there, same as Odin.
+    // Всё, что в командной строке после пути к скрипту — `ос.аргументы()`.
+    // Пусто для любой точки входа, кроме нативного CLI (LSP, browser) — там
+    // нет осмысленного argv.
     program_args: []const []const u8 = &.{},
     async_queue: AsyncQueue = .{},
     foreign_call_cache: std.AutoHashMap(*const bytecode.ForeignFunctionConstant, *PreparedForeignCall),
-    // The profile is deliberately opt-in: a frame loop pays neither for
-    // timestamps nor hash-map writes unless the CLI enables --profile-ffi.
+    // Профиль сознательно opt-in: цикл кадра не платит ни за таймстемпы, ни
+    // за записи в hash-map, пока CLI не включит --profile-ffi.
     foreign_profile_enabled: bool = false,
     foreign_profile: std.AutoHashMap(*const bytecode.ForeignFunctionConstant, ForeignCallMetric),
-    // Set on the FIRST `время.монотонно_мс()` call (native only — the
-    // freestanding wasm32 side has no clock of its own at all, see
-    // `timeMonotonic`) — every subsequent call reports elapsed time since
-    // this baseline, matching the documented "миллисекунды с момента
-    // старта VM" contract without needing a real "VM start" hook.
+    // Устанавливается при ПЕРВОМ вызове `время.монотонно_мс()` (только
+    // native — у freestanding wasm32 вообще нет своих часов, см.
+    // `timeMonotonic`) — каждый следующий вызов сообщает время, прошедшее с
+    // этой точки отсчёта, что соответствует задокументированному контракту
+    // "миллисекунды с момента старта VM" без нужды в отдельном хуке "старт
+    // VM".
     monotonic_baseline_ns: ?i96 = null,
-    // `ввод_вывод.печать`/`.строка` accumulate here instead of writing
-    // directly to a real fd — there IS no real fd on the freestanding
-    // wasm32 browser interpreter (see `zig/browser/main.zig`'s batch
-    // "run to completion, then read the result buffer" model), so both
-    // targets share one mechanism: the CALLER (`zig/cli/main.zig`'s
-    // native run path, `runner.zig`'s `runSourceWithVerboseForTarget`,
-    // which `zig/browser/main.zig` goes through too) reads `output.items`
-    // once `run()` returns and emits/appends it before the final
-    // return-value line — ordering is still correct since nothing reads
-    // it mid-execution.
+    // `ввод_вывод.печать`/`.строка` накапливают здесь, а не пишут напрямую
+    // в реальный fd — на freestanding wasm32 browser-интерпретаторе
+    // РЕАЛЬНОГО fd вообще нет (см. пакетную модель "выполнить до конца,
+    // затем прочитать буфер результата" в `zig/browser/main.zig`), поэтому
+    // обе цели делят один механизм: ВЫЗЫВАЮЩАЯ сторона (нативный путь
+    // запуска `zig/cli/main.zig`, `runSourceWithVerboseForTarget` в
+    // `runner.zig`, через который тоже проходит `zig/browser/main.zig`)
+    // читает `output.items` после возврата из `run()` и выводит/добавляет
+    // его перед финальной строкой возвращаемого значения — порядок всё
+    // равно верен, т.к. ничто не читает это в процессе выполнения.
     output: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, program: *const bytecode.Program) Vm {
@@ -1483,10 +1484,11 @@ pub const Vm = struct {
         self.clearFrames();
         self.clearProcesses();
         self.next_process_id = 0;
-        // Defensive reset for a reused Vm instance — next_process_id restarts
-        // from 0 above, so any leftover completion from a PRIOR run() could
-        // otherwise be delivered to an unrelated process that happens to
-        // reuse the same id.
+        // Защитный сброс для переиспользуемого экземпляра Vm —
+        // next_process_id перезапускается с 0 выше, поэтому любое
+        // оставшееся завершение от ПРЕДЫДУЩЕГО run() иначе могло бы быть
+        // доставлено не тому процессу, который случайно переиспользовал тот
+        // же id.
         self.async_queue.joinAll();
         for (self.async_queue.items.items) |leftover| freeAsyncPayload(leftover.payload);
         self.async_queue.items.clearRetainingCapacity();
@@ -1505,9 +1507,10 @@ pub const Vm = struct {
             self.heap.markValues(process.mailbox.items);
             self.heap.markValues(process.signals.items);
             self.heap.markValues(process.async_results.items);
-            // Only the CURRENTLY swapped-in process's continuation lives in
-            // self.stack/self.frames (marked above) — every other process's
-            // own stack/frames fields hold its suspended state directly.
+            // Продолжение только ТЕКУЩЕГО подключённого процесса живёт в
+            // self.stack/self.frames (помечено выше) — у всех остальных
+            // процессов их приостановленное состояние хранится напрямую в
+            // собственных полях stack/frames.
             self.heap.markValues(process.stack.items);
             for (process.frames.items) |frame| self.heap.markValues(frame.locals);
         }
@@ -1953,12 +1956,11 @@ pub const Vm = struct {
         }
         var io = std.Io.Threaded.init(self.allocator, .{});
         defer io.deinit();
-        // Open-or-create without wiping existing content, matching Odin's
-        // `os.open(path, {.Read, .Write, .Create}, ...)` (`фс::открыть`,
-        // `core/vm_io_native.odin`) — but see `value.zig`'s `FileHandle`
-        // doc comment for why this doesn't keep a descriptor open: `access`
-        // just probes existence (creating an empty file if missing), then
-        // every subsequent method reopens the file by path.
+        // Открыть-или-создать без стирания существующего содержимого — но
+        // см. doc-комментарий `FileHandle` в `value.zig` о том, почему
+        // дескриптор не держится открытым: `access` лишь проверяет
+        // существование (создавая пустой файл, если его нет), а каждый
+        // последующий метод переоткрывает файл по пути.
         std.Io.Dir.cwd().access(io.io(), path, .{}) catch {
             std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = path, .data = "" }) catch |err| {
                 try self.pushErrorResult(@errorName(err));
@@ -2163,10 +2165,9 @@ pub const Vm = struct {
         }
         var io = std.Io.Threaded.init(self.allocator, .{});
         defer io.deinit();
-        // Odin's `удалить_директорию` tries a plain remove first (file or
-        // already-empty dir) then falls back to a recursive delete only if
-        // that fails (non-empty dir) — same two-step here, `deleteDir`
-        // before `deleteTree`.
+        // Сначала пробуем простое удаление (файл или уже пустая
+        // директория), и только если оно не удалось (непустая директория) —
+        // рекурсивное удаление: `deleteDir` перед `deleteTree`.
         std.Io.Dir.cwd().deleteDir(io.io(), path) catch {
             std.Io.Dir.cwd().deleteTree(io.io(), path) catch |err| {
                 try self.pushErrorResult(@errorName(err));
@@ -2204,11 +2205,12 @@ pub const Vm = struct {
             try self.fault("Runtime Error: ос.окружение() ожидает имя типа Строка", .{});
             return;
         };
-        // `if`/`else` (not the early-return-then-fallthrough shape used
-        // elsewhere in this file) — required here so the freestanding
-        // branch never gets semantically analyzed at all: `std.c.getenv`
-        // is a real libc extern with no freestanding stub, unlike the
-        // `std.Io.Dir`/`std.Io.Threaded` calls the `фс.*` builtins use.
+        // `if`/`else` (не форма "ранний возврат, затем сквозной проход",
+        // используемая в остальном файле) — нужна здесь, чтобы freestanding-
+        // ветка вообще никогда не подвергалась семантическому анализу:
+        // `std.c.getenv` — настоящий extern libc без freestanding-заглушки,
+        // в отличие от вызовов `std.Io.Dir`/`std.Io.Threaded`, которые
+        // используют билтины `фс.*`.
         if (comptime builtin.target.os.tag == .freestanding) {
             try self.fault("Runtime Panic: 'ос::окружение' недоступно в этом runtime-таргете", .{});
         } else if (comptime builtin.target.os.tag == .windows) {
@@ -2330,31 +2332,24 @@ pub const Vm = struct {
             }
             var io = std.Io.Threaded.init(self.allocator, .{});
             defer io.deinit();
-            // `std.Io.Threaded.init(allocator, .{})` (no `.environ`
-            // supplied) sets `environ_initialized = options.environ.
-            // block.isEmpty()` to TRUE (Zig 0.16's `Io/Threaded.zig`) —
-            // so the lazy `scanEnviron()` call inside `processSpawn*`
-            // sees "already initialized" and skips scanning the REAL OS
-            // environment entirely, spawning every child with a
-            // completely EMPTY environment. Real bug found auditing
-            // panosiki's `gitsync` (`ос.установить_окружение(...)`
-            // followed by `ос.выполнить(...)` — the fake-1cv8 test
-            // harness reads `$GITSYNC_TEST_MAX_VERSION` to know when to
-            // stop, so the version-probing loop in `sync.ps` never saw
-            // the variable and looped until the DEFAULT fallback of
-            // 999999, spawning a subprocess per iteration — indistinguishable
-            // from an infinite hang). Worked around entirely within this
-            // function (no VM-wide `Io` plumbing exists to fix at the
-            // source) by hand-building an `Environ.Map` from the live
-            // libc `environ` global (mutated in place by `ос.
-            // установить_окружение`'s `setenv`, see `osEnvSet`) and
-            // passing it explicitly via `RunOptions.environ_map` —
-            // bypassing `Io.Threaded`'s broken auto-scan path entirely.
-            // `std.process.Environ.Block` is `PosixBlock` (a `.slice` of
-            // `std.c.environ`-shaped entries) on POSIX, but `GlobalBlock`
-            // (no `.slice` field at all) on Windows — `windows_env.
-            // buildEnvironMap` reads the live block a different way there
-            // (`GetEnvironmentStringsW`, see its own comment).
+            // `std.Io.Threaded.init(allocator, .{})` (без `.environ`)
+            // выставляет `environ_initialized = options.environ.block.
+            // isEmpty()` в TRUE (Zig 0.16, `Io/Threaded.zig`) — поэтому
+            // ленивый вызов `scanEnviron()` внутри `processSpawn*` видит
+            // "уже инициализировано" и полностью пропускает сканирование
+            // РЕАЛЬНОГО окружения ОС, порождая каждый дочерний процесс с
+            // абсолютно ПУСТЫМ окружением. Обходится целиком внутри этой
+            // функции (VM-wide прокладки `Io` для исправления в источнике
+            // нет) вручную построенным `Environ.Map` из живой глобальной
+            // переменной libc `environ` (мутируется на месте через `setenv`
+            // из `ос.установить_окружение`, см. `osEnvSet`) и передачей его
+            // явно через `RunOptions.environ_map` — полностью обходя
+            // сломанный путь авто-сканирования `Io.Threaded`.
+            // `std.process.Environ.Block` — это `PosixBlock` (`.slice` из
+            // записей в форме `std.c.environ`) на POSIX, но `GlobalBlock`
+            // (вообще без поля `.slice`) на Windows — `windows_env.
+            // buildEnvironMap` там читает живой блок иначе
+            // (`GetEnvironmentStringsW`, см. её собственный комментарий).
             var environ_map = if (comptime builtin.target.os.tag == .windows)
                 try windows_env.buildEnvironMap(self.allocator)
             else blk: {
@@ -2364,16 +2359,14 @@ pub const Vm = struct {
                 break :blk try std.process.Environ.createMap(.{ .block = .{ .slice = raw_environ[0..environ_len :null] } }, self.allocator);
             };
             defer environ_map.deinit();
-            // An empty `working_dir` means "run in the current directory"
-            // (documented contract, matches every real panosiki caller —
-            // `configurator.ps`/`storage_manager.ps` both pass `""` when
-            // they have no specific directory to chdir into) — real bug
-            // found auditing `v8runner`: `.{ .path = "" }` was passed to
-            // `Child.Cwd` UNCONDITIONALLY, and Zig 0.16's `chdir("")`
-            // fails `error.FileNotFound` (POSIX `chdir` rejects an empty
-            // path outright) — so EVERY `ос.выполнить(..., "")` call
-            // failed before the child process even spawned, regardless
-            // of whether the program path itself was valid.
+            // Пустой `working_dir` значит "выполнить в текущей директории"
+            // (задокументированный контракт, соответствует каждому реальному
+            // вызывающему в panosiki — `configurator.ps`/`storage_manager.ps`
+            // оба передают `""`, когда нет конкретной директории для
+            // chdir). `.{ .path = "" }`, переданный в `Child.Cwd`
+            // безусловно, привёл бы к ошибке: `chdir("")` в Zig 0.16 всегда
+            // возвращает `error.FileNotFound` (POSIX `chdir` прямо отвергает
+            // пустой путь).
             const cwd: std.process.Child.Cwd = if (working_dir.len == 0) .inherit else .{ .path = working_dir };
             const result = std.process.run(self.allocator, io.io(), .{
                 .argv = argv.items,
@@ -2415,14 +2408,15 @@ pub const Vm = struct {
         }
     }
 
-    // Host-provided clock for the freestanding wasm32 browser interpreter —
-    // wasm32-freestanding has no syscalls of its own (no `std.time`), so
-    // `время.сейчас_мс`/`.монотонно_мс` need the embedding JS to supply
-    // real time the same way `docs/src/assets/interactive.js`'s `env`
-    // import object already does for this exact purpose. Declared only
-    // here (not exported from `zig/browser/main.zig`) — an unreferenced
-    // `extern` on a non-wasm32 build is simply dead, never actually
-    // imported by the linker.
+    // Часы, предоставляемые хостом, для freestanding wasm32 browser-
+    // интерпретатора — у wasm32-freestanding нет собственных системных
+    // вызовов (нет `std.time`), поэтому `время.сейчас_мс`/`.монотонно_мс`
+    // нужно, чтобы встраивающий JS сам предоставил реальное время (так же,
+    // как это уже делает объект импорта `env` в
+    // `docs/src/assets/interactive.js`). Объявлено только здесь (не
+    // экспортируется из `zig/browser/main.zig`) — недостижимый `extern` в
+    // сборке не под wasm32 просто мёртв, линкер его никогда не
+    // импортирует.
     extern "env" fn panos_host_time_now_ms() f64;
     extern "env" fn panos_host_tick_now_ms() f64;
 
@@ -2471,15 +2465,13 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .number = millis });
     }
 
-    // Blocking, line-buffered real-stdin read — real gap found auditing
-    // panosiki's `cli-selector` package (an interactive menu that reads
-    // stdin lines to drive prompts): `native_only` per `target.zig`
-    // (already anticipated this exact name before it was implemented) —
-    // a browser tab has no real stdin to block on, same rationale as
-    // `время.спать_мс`'s freestanding panic. Returns `Результат.Неудача`
-    // only on IMMEDIATE EOF (zero bytes ever read) — a final
-    // unterminated line before EOF still comes back as `Успех(...)`,
-    // matching normal `readline`/`fgets` behavior elsewhere.
+    // Блокирующее построчное чтение реального stdin — `native_only` по
+    // `target.zig`: у вкладки браузера нет реального stdin, на котором
+    // можно блокироваться, та же причина, что и у freestanding-паники
+    // `время.спать_мс`. Возвращает `Результат.Неудача` только при
+    // НЕМЕДЛЕННОМ EOF (ни одного байта не прочитано вообще) — последняя
+    // незавершённая строка перед EOF всё равно приходит как `Успех(...)`,
+    // как обычное поведение `readline`/`fgets` в других местах.
     fn ioReadLine(self: *Vm) anyerror!void {
         target_policy.ensureRuntimeBuiltinAvailable("ввод_вывод::прочитать_строку", self.target_profile) catch {
             const message = try target_policy.runtimeErrorMessage(self.allocator, "ввод_вывод::прочитать_строку", self.target_profile);
@@ -2495,11 +2487,12 @@ pub const Vm = struct {
         defer line.deinit(self.allocator);
         var got_any = false;
         var buf: [1]u8 = undefined;
-        // `std.posix.read(std.posix.STDIN_FILENO, ...)` doesn't exist on
-        // Windows (`fd_t` there is handle-based, not a POSIX integer fd —
-        // `STDIN_FILENO` is a POSIX-only concept) — `std.Io.File.stdin()`
-        // + `.readStreaming` abstracts over both uniformly (already the
-        // pattern `submitFileRead`/`submitFileWrite` use for `фс.*` above).
+        // `std.posix.read(std.posix.STDIN_FILENO, ...)` не существует на
+        // Windows (`fd_t` там основан на хендлах, не на POSIX-целых fd —
+        // `STDIN_FILENO` — чисто POSIX-концепция) — `std.Io.File.stdin()` +
+        // `.readStreaming` абстрагируют это единообразно для обеих платформ
+        // (тот же паттерн, что используют `submitFileRead`/`submitFileWrite`
+        // для `фс.*` выше).
         var io: std.Io.Threaded = .init(self.allocator, .{});
         defer io.deinit();
         while (true) {
@@ -2532,11 +2525,12 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .void = {} });
     }
 
-    // Byte offset of the Nth rune (codepoint) in `string` — `string.len`
-    // itself is a valid result (the position just past the last rune),
-    // used as the upper bound by `strSlice`/`strFind`'s rune-index-to-
-    // byte-offset conversion. Same UTF-8 walk `stringAt` (indexing, `s[i]`)
-    // already does, factored out since `строки.срез`/`.найти` need it too.
+    // Байтовое смещение N-й руны (кодпоинта) в `string` — само `string.len`
+    // тоже валидный результат (позиция сразу за последней руной),
+    // используется как верхняя граница в конвертации индекса руны в байтовое
+    // смещение у `strSlice`/`strFind`. Тот же обход UTF-8, что уже делает
+    // `stringAt` (индексация, `s[i]`), вынесен отдельно, т.к. он нужен и
+    // `строки.срез`/`.найти`.
     fn runeByteOffset(self: *Vm, string: []const u8, rune_index: usize) anyerror!usize {
         var offset: usize = 0;
         var current: usize = 0;
@@ -2578,9 +2572,9 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .heap_string = result });
     }
 
-    // Mass (whole-string) counterpart to `строки.байт`/`длина_байт` — same
-    // element type/shape as `из_байтов`'s input, just produced instead of
-    // consumed.
+    // Массовый (по всей строке) аналог `строки.байт`/`длина_байт` — тот же
+    // тип/форма элементов, что и на входе `из_байтов`, только производится,
+    // а не потребляется.
     fn strToBytes(self: *Vm) anyerror!void {
         const string_value = try self.pop();
         const string = string_value.stringBytes() orelse {
@@ -2594,8 +2588,9 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .array = array });
     }
 
-    // Mass (whole-string) rune decode — `Массив(Целое)` of codepoint
-    // values, same UTF-8 decoding as `строки.длина`/`срез` (`Utf8View`).
+    // Массовое (по всей строке) декодирование рун — `Массив(Целое)` значений
+    // кодпоинтов, то же UTF-8-декодирование, что у `строки.длина`/`срез`
+    // (`Utf8View`).
     fn strToRunes(self: *Vm) anyerror!void {
         const string_value = try self.pop();
         const string = string_value.stringBytes() orelse {
@@ -2616,9 +2611,9 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .array = array });
     }
 
-    // Inverse of `в_руны` — encodes each codepoint back to UTF-8, same
-    // validation shape as `из_байтов` (range-check every element before
-    // committing any output).
+    // Обратное к `в_руны` — кодирует каждый кодпоинт обратно в UTF-8, та же
+    // форма валидации, что у `из_байтов` (проверка диапазона каждого
+    // элемента до записи любого вывода).
     fn strFromRunes(self: *Vm) anyerror!void {
         const array_value = try self.pop();
         const array = switch (array_value) {
@@ -2648,10 +2643,11 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .heap_string = result });
     }
 
-    // First rune's codepoint value — same "decode just the FIRST
-    // codepoint, ignore the rest" contract as `strIsDigit`/`strIsLetter`
-    // above, for the common `строки.кодовая_точка(s[i])` (single-rune
-    // slice) call shape the docs example uses.
+    // Значение кодпоинта первой руны — тот же контракт "декодировать только
+    // ПЕРВЫЙ кодпоинт, остальное игнорировать", что у `strIsDigit`/
+    // `strIsLetter` выше, для частой формы вызова
+    // `строки.кодовая_точка(s[i])` (срез из одной руны), используемой в
+    // примере из документации.
     fn strCodePoint(self: *Vm) anyerror!void {
         const string_value = try self.pop();
         const string = string_value.stringBytes() orelse {
@@ -2699,9 +2695,10 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .heap_string = result });
     }
 
-    // ASCII + Cyrillic (а-я/ё → А-Я/Ё) — the two alphabets any real panos
-    // caller (Russian-keyword language, 1С-adjacent tooling) actually
-    // uses; full Unicode case-folding is out of scope for this slice.
+    // ASCII + кириллица (а-я/ё → А-Я/Ё) — два алфавита, которые реально
+    // использует любой вызывающий код панос (язык с русскими ключевыми
+    // словами, инструментарий вокруг 1С); полное unicode-приведение
+    // регистра вне области этого среза.
     fn strUpper(self: *Vm) anyerror!void {
         const string_value = try self.pop();
         const string = string_value.stringBytes() orelse {
@@ -2800,10 +2797,10 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .boolean = std.mem.indexOf(u8, string, needle) != null });
     }
 
-    // Returns the RUNE index (not byte offset) of the first match, per
-    // `docs/src/language/basic-types.md`'s explicit contract ("строки.
-    // найти возвращает рановый индекс") — converts the byte offset
-    // `std.mem.indexOf` finds by counting codepoints up to it.
+    // Возвращает индекс РУНЫ (не байтовое смещение) первого совпадения, по
+    // явному контракту `docs/src/language/basic-types.md` ("строки.найти
+    // возвращает рановый индекс") — конвертирует байтовое смещение,
+    // найденное `std.mem.indexOf`, подсчётом кодпоинтов до него.
     fn strFind(self: *Vm) anyerror!void {
         const start_value = try self.pop();
         const needle_value = try self.pop();
@@ -2932,9 +2929,9 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .heap_string = result });
     }
 
-    // Rune-based (NOT byte-based) — `строки.срез_байт` is the byte-offset
-    // equivalent, see `docs/src/language/basic-types.md` §"Байты" for why
-    // both exist separately.
+    // По рунам (НЕ по байтам) — `строки.срез_байт` байтовый эквивалент, см.
+    // `docs/src/language/basic-types.md` §"Байты" о том, почему существуют
+    // оба варианта раздельно.
     fn strSlice(self: *Vm) anyerror!void {
         const end_value = try self.pop();
         const start_value = try self.pop();
@@ -2959,9 +2956,10 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .heap_string = result });
     }
 
-    // ASCII + Cyrillic letters (matches `strUpper`'s scope) — single-rune
-    // input expected (typical caller passes a one-character index slice
-    // like `s[i]`), only the FIRST rune is inspected if given more.
+    // Буквы ASCII + кириллицы (совпадает с областью `strUpper`) — ожидается
+    // ввод из одной руны (типичный вызывающий код передаёт срез из одного
+    // символа вроде `s[i]`), если дано больше — проверяется только ПЕРВАЯ
+    // руна.
     fn strIsDigitOrLetter(self: *Vm) anyerror!void {
         const string_value = try self.pop();
         const string = string_value.stringBytes() orelse {
@@ -3038,9 +3036,9 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .boolean = codepoint >= '0' and codepoint <= '9' });
     }
 
-    // `Целое(x)` — truncates toward zero, a no-op if `x` is already an
-    // integer value (same `Value.number` f64 representation either way,
-    // see `bytecode.zig`'s `.int_cast` doc comment).
+    // `Целое(x)` — усечение к нулю, no-op если `x` уже целое значение (в
+    // обоих случаях одно и то же представление `Value.number` как f64, см.
+    // doc-комментарий `.int_cast` в `bytecode.zig`).
     fn intCast(self: *Vm) anyerror!void {
         const n = try self.number(try self.pop());
         try self.stack.append(self.allocator, .{ .number = std.math.trunc(n) });
@@ -3075,9 +3073,9 @@ pub const Vm = struct {
         }
     }
 
-    // `Результат.Успех(payload)` — matches the tagged-aggregate shape every
-    // other prelude enum variant construction already uses (see
-    // `queueSignal`'s `Опция.Есть`/`Опция.Нет`).
+    // `Результат.Успех(payload)` — та же форма tagged-aggregate, что уже
+    // используют все остальные конструкции вариантов enum из prelude (см.
+    // `Опция.Есть`/`Опция.Нет` в `queueSignal`).
     fn pushSuccessResult(self: *Vm, payload: value.Value) anyerror!void {
         const elements = try self.allocator.alloc(value.Value, 1);
         elements[0] = payload;
@@ -3085,11 +3083,11 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .aggregate = aggregate });
     }
 
-    // `Результат.Неудача(Ошибка("фс", message))` — the plain `Ошибка` struct
-    // matches its `Ошибка(код, сообщение)` constructor shape
-    // (`compiler.zig`'s `compileErrorConstructor`), so `.код`/`.сообщение`
-    // field access on the value this pushes works exactly like a
-    // user-constructed `Ошибка`.
+    // `Результат.Неудача(Ошибка("фс", message))` — обычная структура
+    // `Ошибка` соответствует форме её конструктора `Ошибка(код, сообщение)`
+    // (`compileErrorConstructor` в `compiler.zig`), поэтому доступ к полям
+    // `.код`/`.сообщение` на этом значении работает точно так же, как у
+    // `Ошибка`, сконструированной пользователем.
     fn pushErrorResult(self: *Vm, message: []const u8) anyerror!void {
         try self.pushErrorResultForModule("фс", message);
     }
@@ -3105,17 +3103,17 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .aggregate = aggregate });
     }
 
-    // `Опция.Есть(payload)`/`Опция.Нет()` — same tagged-aggregate shape as
-    // `pushSuccessResult`, for natives whose "not found" isn't an `Ошибка`
-    // (`ос.окружение`).
+    // `Опция.Есть(payload)`/`Опция.Нет()` — та же форма tagged-aggregate,
+    // что у `pushSuccessResult`, для нативных функций, у которых "не
+    // найдено" — не `Ошибка` (`ос.окружение`).
     fn pushOption(self: *Vm, payload: ?value.Value) anyerror!void {
         try self.stack.append(self.allocator, try self.makeOptionValue(payload));
     }
 
-    // Same `Опция.Есть`/`Опция.Нет` construction as `pushOption`, but
-    // returns the value instead of pushing it — needed when an `Опция`
-    // itself becomes the payload of a `Результат.Успех(...)` (`синтаксис.
-    // аргумент_аннотации`/`аргумент_аннотации_поля`).
+    // Та же конструкция `Опция.Есть`/`Опция.Нет`, что у `pushOption`, но
+    // возвращает значение вместо того, чтобы класть его на стек — нужно,
+    // когда сама `Опция` становится payload'ом `Результат.Успех(...)`
+    // (`синтаксис.аргумент_аннотации`/`аргумент_аннотации_поля`).
     fn makeOptionValue(self: *Vm, payload: ?value.Value) anyerror!value.Value {
         const elements = try self.allocator.alloc(value.Value, if (payload == null) 0 else 1);
         if (payload) |some| elements[0] = some;
@@ -3123,13 +3121,12 @@ pub const Vm = struct {
         return .{ .aggregate = aggregate };
     }
 
-    // `синтаксис.*` — compile-time AST introspection of ANOTHER .ps file
-    // (not the currently-running program), for codegen tooling written in
-    // panos itself (mirrors `core/vm_syntax_native.odin`). No persistent
-    // handle, unlike `Файл`/`Соединение` — every call re-reads and
-    // re-parses the path from scratch; acceptable for a build-time tool
-    // run once over a small file, not a hot path (same tradeoff Odin's
-    // version documents).
+    // `синтаксис.*` — compile-time интроспекция AST ДРУГОГО .ps-файла (не
+    // текущей выполняющейся программы), для codegen-инструментария,
+    // написанного на самом панос. Нет постоянного хендла, в отличие от
+    // `Файл`/`Соединение` — каждый вызов заново читает и парсит путь с
+    // нуля; приемлемо для build-time инструмента, запускаемого один раз над
+    // небольшим файлом, а не для горячего пути.
     const SyntaxParseOutcome = union(enum) {
         ok: syntax_parser.ParseResult,
         fail: []u8,
@@ -3157,12 +3154,12 @@ pub const Vm = struct {
     }
 
     const StructLookupOutcome = union(enum) {
-        // `parsed` must be `.deinit()`-ed by the caller once done reading
-        // `decl.struct_decl.fields`/`.annotations` (both are slices into
-        // `parsed.ast`'s arena).
+        // Вызывающая сторона обязана вызвать `.deinit()` на `parsed`, как
+        // только закончит читать `decl.struct_decl.fields`/`.annotations`
+        // (оба — срезы в арену `parsed.ast`).
         ok: struct { parsed: syntax_parser.ParseResult, decl: ast_types.Decl },
-        // An error `Результат.Неудача(...)` was already pushed onto the
-        // stack — caller just returns.
+        // Ошибка `Результат.Неудача(...)` уже положена на стек —
+        // вызывающая сторона просто возвращается.
         failed: void,
     };
 
@@ -3205,10 +3202,10 @@ pub const Vm = struct {
         return null;
     }
 
-    // First positional string argument of an annotation (`&Json("ключ")`),
-    // if any — `annotation == null` (annotation absent) is also a valid
-    // input, just returns `null`, so callers don't need a separate nil
-    // check (mirrors Odin's `annotation_string_arg`).
+    // Первый позиционный строковый аргумент аннотации (`&Json("ключ")`),
+    // если есть — `annotation == null` (аннотация отсутствует) тоже
+    // валидный вход, просто возвращает `null`, чтобы вызывающим не нужна
+    // была отдельная проверка на nil.
     fn annotationStringArg(annotation: ?ast_types.Annotation) ?[]const u8 {
         const found = annotation orelse return null;
         if (found.arguments.len == 0) return null;
@@ -3235,11 +3232,10 @@ pub const Vm = struct {
         return self.makeOptionValue(.{ .heap_string = heap_string });
     }
 
-    // Textual rendering of a `Type_Node` as written in the source — NOT
-    // the checker's canonical `^Type`/`TypeId` (there is no type-checked
-    // graph for this file at all, it's a throwaway parse) — just the raw
-    // syntax, for human/codegen consumption. Mirrors Odin's
-    // `type_node_to_string` (`core/syntax_parser.odin`).
+    // Текстовое отображение `Type_Node` в том виде, как он написан в
+    // исходнике — НЕ канонический `^Type`/`TypeId` тайпчекера (для этого
+    // файла вообще нет протипизированного графа, это одноразовый парсинг) —
+    // просто сырой синтаксис, для восприятия человеком/codegen.
     fn typeNodeText(allocator: std.mem.Allocator, tree: *const ast_types.Ast, id: ast_types.TypeId) anyerror![]u8 {
         return switch (tree.typeNode(id).*) {
             .ident => |node| allocator.dupe(u8, node.name),
@@ -3264,9 +3260,9 @@ pub const Vm = struct {
         };
     }
 
-    // Comma-joins the rendered text of each type in `ids` — shared by
-    // `.generic`/`.qualified`/`.tuple` above, each of which wraps a list
-    // of nested type arguments the same way.
+    // Соединяет через запятую текст каждого типа в `ids` — общее для
+    // `.generic`/`.qualified`/`.tuple` выше, каждый из которых оборачивает
+    // список вложенных аргументов типа одинаковым образом.
     fn typeNodeTextList(allocator: std.mem.Allocator, tree: *const ast_types.Ast, ids: []const ast_types.TypeId) anyerror![]u8 {
         var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
@@ -3568,11 +3564,10 @@ pub const Vm = struct {
             try self.fault("Runtime Error: сеть.кодировать_url() ожидает Строку", .{});
             return;
         };
-        // Percent-encoding by BYTE, not rune — RFC 3986 unreserved
-        // (A-Z a-z 0-9 - _ . ~) as-is, everything else (including every
-        // byte of a multi-byte UTF-8 rune individually) as `%XX`. Matches
-        // Odin's `сеть::кодировать_url` (`core/vm.odin`) exactly — no
-        // target restriction, pure byte manipulation.
+        // Percent-encoding ПОБАЙТНО, не по рунам — незарезервированные по
+        // RFC 3986 (A-Z a-z 0-9 - _ . ~) как есть, всё остальное (включая
+        // каждый байт многобайтовой UTF-8-руны по отдельности) как `%XX`.
+        // Без ограничений по таргету, чистая манипуляция байтами.
         var encoded: std.ArrayList(u8) = .empty;
         defer encoded.deinit(self.allocator);
         const hex_digits = "0123456789ABCDEF";
@@ -3590,17 +3585,14 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .heap_string = heap_string });
     }
 
-    // Real gap found this session running `std/сеть/http.pns`'s router
-    // against a real curl request: HTTP clients percent-encode non-ASCII
-    // path segments on the wire (confirmed via `curl -sv` sending
-    // `/api/%d0%b7...` for a route registered as `/api/задачи`), and the
-    // router compared the RAW (still-encoded) request path against route
-    // templates — a Cyrillic route could never match a real request. No
-    // decode counterpart to `urlEncode` existed anywhere (native, std/,
-    // nothing) before this. Byte-level, symmetric with `urlEncode` above
-    // — a malformed `%`-escape (not a hex pair, or `%` truncated at the
-    // end of the string) is a `Runtime Error`, not a silent drop, so a
-    // malformed path fails loudly instead of matching the wrong route.
+    // HTTP-клиенты percent-кодируют не-ASCII сегменты пути на проводе,
+    // поэтому роутер должен декодировать сырой (всё ещё закодированный)
+    // путь запроса перед сравнением с шаблонами маршрутов — иначе
+    // кириллический маршрут никогда бы не совпал с реальным запросом.
+    // Побайтово, симметрично `urlEncode` выше — некорректный `%`-escape (не
+    // hex-пара, или `%` обрезан в конце строки) — это `Runtime Error`, не
+    // тихое отбрасывание, так что некорректный путь падает громко, а не
+    // совпадает не с тем маршрутом.
     fn urlDecode(self: *Vm) anyerror!void {
         const text = (try self.pop()).stringBytes() orelse {
             try self.fault("Runtime Error: сеть.декодировать_url() ожидает Строку", .{});
@@ -3669,14 +3661,14 @@ pub const Vm = struct {
             try self.fault("Runtime Panic: 'сеть::http_запрос' недоступно в этом runtime-таргете", .{});
             return;
         }
-        // Everything the worker touches must be cloned onto page_allocator
-        // HERE, on the main thread, before spawning — the Value/Map bytes
-        // are self.allocator-owned and not safe for a background thread to
-        // read concurrently once this call returns. The array itself (not
-        // just each pair's strings) must ALSO be page_allocator-owned and
-        // NOT freed here — ownership transfers fully to the worker
-        // (submitHttpRequest/Job frees it), since the worker keeps reading
-        // it after this function returns.
+        // Всё, к чему прикоснётся воркер, должно быть склонировано на
+        // page_allocator ЗДЕСЬ, на главном потоке, до запуска — байты
+        // Value/Map принадлежат self.allocator и небезопасны для
+        // параллельного чтения фоновым потоком после возврата из этого
+        // вызова. Сам массив (не только строки каждой пары) ТОЖЕ должен
+        // принадлежать page_allocator и НЕ освобождаться здесь — владение
+        // полностью переходит воркеру (освобождает submitHttpRequest/Job),
+        // т.к. воркер продолжает читать его после возврата из этой функции.
         const owned_headers = std.heap.page_allocator.alloc(HttpHeaderPair, headers_map.entries.items.len) catch @panic("OOM");
         var header_count: usize = 0;
         for (headers_map.entries.items) |map_entry| {
@@ -3688,11 +3680,12 @@ pub const Vm = struct {
             };
             header_count += 1;
         }
-        // Shrink to the actual valid count (not just a sub-slice) — the
-        // worker frees this slice by the SAME allocator with the SAME
-        // length it was given; a shorter sub-slice of a longer allocation
-        // is not a valid `free()` input for `page_allocator`. Shrinking via
-        // `realloc` is guaranteed to succeed (never needs new memory).
+        // Уменьшаем до реального валидного количества (не просто под-срез)
+        // — воркер освобождает этот срез ТЕМ ЖЕ аллокатором с ТОЙ ЖЕ
+        // длиной, что ему дали; более короткий под-срез большей аллокации —
+        // невалидный вход для `free()` у `page_allocator`. Уменьшение через
+        // `realloc` гарантированно успешно (никогда не требует новой
+        // памяти).
         const shrunk_headers = std.heap.page_allocator.realloc(owned_headers, header_count) catch unreachable;
         submitHttpRequest(
             self,
@@ -3759,18 +3752,18 @@ pub const Vm = struct {
 
     const SqlPrepareOutcome = union(enum) {
         ok: ?*sqlite3.sqlite3_stmt,
-        // Borrowed from `sqlite3_errmsg`'s own buffer — valid only until
-        // the next call on the same `db`/until it's closed. Callers must
-        // consume it (e.g. `pushErrorResultForModule`, which copies it
-        // immediately) before making any further sqlite3 call.
+        // Заимствовано из собственного буфера `sqlite3_errmsg` — валидно
+        // только до следующего вызова на том же `db`/пока он не закрыт.
+        // Вызывающий обязан потребить его (например, `pushErrorResultForModule`,
+        // который копирует немедленно) до любого следующего вызова sqlite3.
         fail: []const u8,
     };
 
-    // Shared prepare+positionally-bind-`?`-placeholders step for
-    // `Соединение_БД.выполнить`/`.запрос` — `параметры` bind ONLY this
-    // way, there is no string-concatenation SQL path anywhere in this
-    // VM, so callers can't build an injectable query even if they wanted
-    // to.
+    // Общий шаг prepare+позиционная привязка `?`-плейсхолдеров для
+    // `Соединение_БД.выполнить`/`.запрос` — `параметры` привязываются
+    // ТОЛЬКО так, во всей VM нет пути SQL через конкатенацию строк, так что
+    // вызывающая сторона не может построить инъекционный запрос, даже если
+    // бы захотела.
     fn sqlPrepare(self: *Vm, connection: *value.SqlConnection, sql: []const u8, params: []const value.Value) anyerror!SqlPrepareOutcome {
         const sql_z = try self.allocator.dupeZ(u8, sql);
         defer self.allocator.free(sql_z);
@@ -3796,9 +3789,9 @@ pub const Vm = struct {
         return .{ .ok = stmt };
     }
 
-    // Validates that every element of `параметры` is a Строка and clones
-    // them onto page_allocator — shared by sqlExecSubmit/sqlQuerySubmit,
-    // both need this identical prep before handing off to a worker.
+    // Проверяет, что каждый элемент `параметры` — Строка, и клонирует их на
+    // page_allocator — общее для sqlExecSubmit/sqlQuerySubmit, обоим нужна
+    // эта одинаковая подготовка перед передачей воркеру.
     fn cloneSqlParams(self: *Vm, elements: []const value.Value) anyerror!?[][]u8 {
         const owned = try self.allocator.alloc([]u8, elements.len);
         errdefer self.allocator.free(owned);
@@ -3971,11 +3964,11 @@ pub const Vm = struct {
         }
     }
 
-    // Packs a numeric panos `Value` into `dest` per `kind` — shared by
-    // both a plain scalar argument/field and one FIELD of a struct-by-value
-    // argument (`ff_структура` fields are always one of these five kinds,
-    // never `.c_string`/`.pointer`/`.struct_value` — `parser.zig`'s
-    // `parseFfiStructDeclaration` enforces that at parse time).
+    // Упаковывает числовой `Value` панос в `dest` согласно `kind` — общее
+    // для обычного скалярного аргумента/поля и одного ПОЛЯ аргумента
+    // struct-by-value (поля `ff_структура` всегда один из этих пяти видов,
+    // никогда `.c_string`/`.pointer`/`.struct_value` — это гарантирует
+    // `parseFfiStructDeclaration` в `parser.zig` на этапе парсинга).
     fn packScalar(self: *Vm, dest: [*]u8, kind: ast_types.ForeignMarshalKind, source: value.Value) anyerror!void {
         const numeric = try self.number(source);
         switch (kind) {
@@ -3988,8 +3981,8 @@ pub const Vm = struct {
         }
     }
 
-    // Inverse of `packScalar` — reads one field back out of raw C ABI
-    // bytes into a panos `Value`.
+    // Обратное к `packScalar` — читает одно поле обратно из сырых байт C
+    // ABI в `Value` панос.
     fn unpackScalar(kind: ast_types.ForeignMarshalKind, source: [*]const u8) value.Value {
         return switch (kind) {
             .int8 => .{ .number = @floatFromInt(@as(*const u8, @ptrCast(@alignCast(source))).*) },
@@ -4001,13 +3994,13 @@ pub const Vm = struct {
         };
     }
 
-    // Packs a panos struct-by-value argument (`.aggregate`, one element per
-    // field, declaration order — matches `layout`) into `dest`, which must
-    // be at least `struct_type.size` bytes (populated by `ffi_prep_cif` —
-    // callers must call this only AFTER that, never before). Field byte
-    // offsets come from libffi itself (`ffi_get_struct_offsets`) — C ABI
-    // struct layout (padding for alignment) is NOT something to
-    // reimplement by hand here.
+    // Упаковывает аргумент struct-by-value панос (`.aggregate`, по одному
+    // элементу на поле, в порядке объявления — совпадает с `layout`) в
+    // `dest`, который должен быть не меньше `struct_type.size` байт
+    // (заполняется `ffi_prep_cif` — вызывающая сторона обязана вызывать это
+    // только ПОСЛЕ него, никогда раньше). Байтовые смещения полей приходят
+    // из самой libffi (`ffi_get_struct_offsets`) — layout структуры C ABI
+    // (выравнивающий padding) здесь НЕ переизобретается вручную.
     fn packStruct(self: *Vm, dest: [*]u8, layout: []const ast_types.ForeignMarshalKind, offsets: []const usize, source: value.Value) anyerror!void {
         const aggregate = switch (source) {
             .aggregate => |a| a,
@@ -4029,10 +4022,10 @@ pub const Vm = struct {
         }
     }
 
-    // Inverse of `packStruct` — builds a panos `.aggregate` (untagged —
-    // field access is purely positional, `vm.zig`'s `getProperty`/
-    // `setProperty` never consult `.name`, see `buildStruct`) from raw C
-    // ABI bytes.
+    // Обратное к `packStruct` — строит `.aggregate` панос (без тега —
+    // доступ к полям чисто позиционный, `getProperty`/`setProperty` в
+    // `vm.zig` никогда не смотрят на `.name`, см. `buildStruct`) из сырых
+    // байт C ABI.
     fn unpackStruct(self: *Vm, source: [*]const u8, layout: []const ast_types.ForeignMarshalKind, offsets: []const usize) anyerror!value.Value {
         if (offsets.len != layout.len) {
             try self.fault("Runtime Error: layout ff_структура не совпадает при 'внешний'-вызове", .{});
@@ -4156,9 +4149,9 @@ pub const Vm = struct {
         return prepared;
     }
 
-    // Marshals `arguments` and performs the actual FFI call. Signature
-    // preparation, layout calculation and storage allocation are cached by
-    // `prepareForeignCall`; only the values themselves are hot-path work.
+    // Маршалит `arguments` и выполняет сам FFI-вызов. Подготовка сигнатуры,
+    // расчёт layout и выделение хранилища кэшируются `prepareForeignCall`;
+    // только сами значения — работа на горячем пути.
     fn invokeForeign(self: *Vm, info: *const bytecode.ForeignFunctionConstant, arguments: []const value.Value) anyerror!value.Value {
         const prepared = (try self.cachedForeignCall(info)) orelse return .{ .void = {} };
         const nargs = info.param_kinds.len;
@@ -4169,9 +4162,9 @@ pub const Vm = struct {
         const argument_values = prepared.argument_values.?;
         const return_storage = prepared.return_storage.?;
 
-        // `КСтрока` arguments need a real null-terminated buffer that
-        // outlives the `ffi_call` below. This remains per-call because C
-        // receives the current panos string, unlike the ABI plan above.
+        // Аргументам `КСтрока` нужен настоящий null-терминированный буфер,
+        // переживающий вызов `ffi_call` ниже. Это остаётся на каждый вызов,
+        // т.к. C получает текущую строку панос, в отличие от ABI-плана выше.
         var cstring_storage: std.ArrayList([:0]u8) = .empty;
         defer {
             for (cstring_storage.items) |buffer| self.allocator.free(buffer);
@@ -4211,7 +4204,7 @@ pub const Vm = struct {
             .void => .{ .void = {} },
             .int8, .int32, .int64, .float32, .float64 => unpackScalar(info.return_kind, return_bytes),
             .c_string => blk: {
-                // Panos always copies C-owned returned strings into the GC.
+                // Панос всегда копирует возвращённые C строки в GC.
                 const raw: ?[*:0]const u8 = @as(*const ?[*:0]const u8, @ptrCast(@alignCast(return_bytes))).*;
                 const bytes = if (raw) |pointer| std.mem.span(pointer) else "";
                 const heap_string = try self.heap.createString(try self.allocator.dupe(u8, bytes));
@@ -4255,10 +4248,9 @@ pub const Vm = struct {
         submitNetConnect(self, host, port, process.id);
     }
 
-    // Bind+listen is a fast, local, one-shot syscall — unlike `.accept()`
-    // (which can block indefinitely waiting for a client), this stays
-    // synchronous, same reasoning as `сеть.подключиться`'s DNS resolve NOT
-    // needing to be split from its own connect.
+    // Bind+listen — быстрый, локальный, одноразовый системный вызов — в
+    // отличие от `.accept()` (который может блокироваться неопределённо
+    // долго в ожидании клиента), это остаётся синхронным.
     fn httpListen(self: *Vm) anyerror!void {
         target_policy.ensureRuntimeBuiltinAvailable("сеть::http_сервер_слушать", self.target_profile) catch {
             const message = try target_policy.runtimeErrorMessage(self.allocator, "сеть::http_сервер_слушать", self.target_profile);
@@ -4327,12 +4319,14 @@ pub const Vm = struct {
             try self.fault("Runtime Panic: 'Слушатель.принять_запрос' недоступно в этом runtime-таргете", .{});
             return;
         }
-        // No in_flight gate, no gc_pin — unlike Connection/FileHandle/
-        // SqlConnection, MULTIPLE concurrent accepts on the same listener
-        // are exactly the point of a server (worker pool draining the
-        // accept "queue" concurrently across however many processes are
-        // calling .принять_запрос()). accept() itself is safe to call from
-        // multiple threads on the same listening socket.
+        // Нет флага in_flight (в отличие от Connection/FileHandle/
+        // SqlConnection) — НЕСКОЛЬКО параллельных accept на одном
+        // слушателе — это и есть смысл сервера (пул воркеров вычерпывает
+        // "очередь" accept параллельно, сколько бы процессов ни вызывало
+        // .принять_запрос()); `Heap.pin` поддерживает несколько
+        // одновременных закреплений одного значения (см. комментарий у
+        // `http_accept` в `AsyncPayload`). Сам accept() безопасно вызывать
+        // из нескольких потоков на одном слушающем сокете.
         try self.heap.pin(.{ .listener = listener });
         submitHttpAccept(self, listener, process.id);
     }
@@ -4368,10 +4362,10 @@ pub const Vm = struct {
         try self.pushOption(null);
     }
 
-    // Synchronous, like `.закрыть()` — formatting+writing a response is a
-    // fast local operation on an already-connected socket, no need to
-    // route it through the async worker pool. One request per connection
-    // (no keep-alive) — the stream is closed right after responding.
+    // Синхронно, как `.закрыть()` — форматирование+запись ответа быстрая
+    // локальная операция на уже подключённом сокете, нет нужды направлять
+    // её через пул async-воркеров. Один запрос на соединение (без
+    // keep-alive) — поток закрывается сразу после ответа.
     fn httpRequestRespond(self: *Vm) anyerror!void {
         const body = (try self.pop()).stringBytes() orelse {
             try self.fault("Runtime Error: Запрос.ответить() ожидает тело типа Строка", .{});
@@ -4401,10 +4395,10 @@ pub const Vm = struct {
         );
         defer self.allocator.free(response_text);
         request.responded = true;
-        // Best-effort — `Запрос.ответить()` returns plain `Пусто`, not a
-        // `Результат`: a write failure here almost always just means the
-        // client already disconnected, and there is nothing a request
-        // handler could meaningfully do differently in that case.
+        // Best-effort — `Запрос.ответить()` возвращает обычное `Пусто`, не
+        // `Результат`: ошибка записи здесь почти всегда просто значит, что
+        // клиент уже отключился, и обработчик запроса ничего осмысленного
+        // с этим сделать не может.
         var writer = request.stream.writer(io.io(), &.{});
         writer.interface.writeAll(response_text) catch {};
         writer.interface.flush() catch {};
@@ -4443,11 +4437,11 @@ pub const Vm = struct {
             try self.fault("Runtime Panic: 'Соединение.получить' недоступно в этом runtime-таргете", .{});
             return;
         }
-        // Drain whatever a previous `.получить_строку()` already pulled off
-        // the wire but hadn't consumed yet — handed to the worker as its
-        // starting buffer, then it keeps reading raw chunks (zero-length
-        // internal buffer — see `value.zig`'s `Connection` doc comment)
-        // until the peer closes the connection.
+        // Сливаем всё, что предыдущий `.получить_строку()` уже вытянул с
+        // провода, но ещё не потребил — передаётся воркеру как стартовый
+        // буфер, дальше он читает сырые куски (внутренний буфер нулевой
+        // длины — см. doc-комментарий `Connection` в `value.zig`), пока
+        // собеседник не закроет соединение.
         const drained = try connection.pending.toOwnedSlice(self.allocator);
         defer self.allocator.free(drained);
         connection.in_flight = true;
@@ -4776,10 +4770,10 @@ pub const Vm = struct {
             switch (outcome) {
                 .none => {},
                 .completed => |result| return result,
-                // A Сравниваемое implementation calling получить()/
-                // получить_сигнал()/an async builtin has no process context
-                // to suspend into here — this is a synchronous nested call,
-                // not a scheduled slice.
+                // У реализации Сравниваемое, вызывающей получить()/
+                // получить_сигнал()/асинхронный билтин, здесь нет контекста
+                // процесса, в который можно приостановиться — это
+                // синхронный вложенный вызов, а не квант планировщика.
                 .suspended => {
                     self.fault("Runtime Error: реализация Сравниваемое не может приостанавливаться (получить/асинхронный вызов)", .{}) catch |err| {
                         nested_failure = self.failure;
@@ -4791,10 +4785,10 @@ pub const Vm = struct {
         return .{ .void = {} };
     }
 
-    // Same nested-call shape as `invokeComparable`, one argument instead
-    // of two (`клонировать(это)`) — synchronously runs a `реализация
-    // Копируемое` override to completion and returns its result. Used by
-    // `deepCopyForSend` below.
+    // Та же форма вложенного вызова, что у `invokeComparable`, один
+    // аргумент вместо двух (`клонировать(это)`) — синхронно выполняет
+    // переопределение `реализация Копируемое` до конца и возвращает его
+    // результат. Используется `deepCopyForSend` ниже.
     fn invokeCopyable(self: *Vm, function_id: bytecode.FunctionId, receiver: value.Value) anyerror!value.Value {
         const saved_stack = self.stack;
         const saved_frames = self.frames;
@@ -4830,9 +4824,10 @@ pub const Vm = struct {
             switch (outcome) {
                 .none => {},
                 .completed => |result| return result,
-                // Same rationale as `invokeComparable` — a Копируемое
-                // override calling получить()/получить_сигнал()/an async
-                // builtin has no process context to suspend into here.
+                // Та же причина, что у `invokeComparable` — у
+                // переопределения Копируемое, вызывающего
+                // получить()/получить_сигнал()/асинхронный билтин, здесь
+                // нет контекста процесса для приостановки.
                 .suspended => {
                     self.fault("Runtime Error: реализация Копируемое не может приостанавливаться (получить/асинхронный вызов)", .{}) catch |err| {
                         nested_failure = self.failure;
@@ -4844,29 +4839,29 @@ pub const Vm = struct {
         return .{ .void = {} };
     }
 
-    // Restores copy-on-send isolation (ROADMAP.md Стадия 24, silently
-    // dropped in the Zig migration — see `send`'s own comment). Two
-    // dispatch paths, mirroring `Сравниваемое`'s existing name-keyed
-    // lookup:
-    //   - the message's runtime struct name has a registered `реализация
-    //     Копируемое` override (`registerCopyableMethods`,
-    //     `compiler.zig`) — call it directly and trust its result AS-IS
-    //     (no further reflective walk — a custom override exists
-    //     precisely to control what gets copied, e.g. deliberately
-    //     sharing a cache field; re-walking afterward would defeat that).
-    //   - otherwise, reflectively walk the value's structure and build an
-    //     independent copy — cycle-safe via `seen` (old heap pointer →
-    //     already-built copy), same shape as the GC mark-walker's own
-    //     cycle protection, just building a copy instead of setting a
-    //     mark bit.
-    // Primitives (Число/Булево/Пусто/Никогда) and heap strings are NOT
-    // copied — panos strings are immutable, so sharing them is always
-    // safe (ROADMAP.md Стадия 24, decision 2). Native resource handles
-    // (Процесс/Файл/Соединение/Соединение_БД/Слушатель/Запрос) are also
-    // NOT copied — they identify a live resource, not data; copying one
-    // would be meaningless (a "cloned" file handle doesn't point at a
-    // second copy of the file) and sending a `Процесс(T)` handle must
-    // keep pointing at the SAME target process.
+    // Обеспечивает изоляцию copy-on-send при отправке сообщения между
+    // процессами. Два пути диспетчеризации, зеркалящие уже существующий
+    // поиск по имени у `Сравниваемое`:
+    //   - у имени рантайм-структуры сообщения есть зарегистрированное
+    //     переопределение `реализация Копируемое`
+    //     (`registerCopyableMethods`, `compiler.zig`) — вызываем его
+    //     напрямую и доверяем результату КАК ЕСТЬ (без дальнейшего
+    //     рефлективного обхода — кастомное переопределение существует
+    //     именно для контроля того, что копируется, например намеренного
+    //     разделения поля кэша; повторный обход после этого свёл бы это на
+    //     нет).
+    //   - иначе рефлективно обходим структуру значения и строим независимую
+    //     копию — безопасно к циклам через `seen` (старый указатель кучи →
+    //     уже построенная копия), та же форма, что и у собственной защиты
+    //     от циклов GC-маркировщика, только строит копию вместо установки
+    //     бита маркировки.
+    // Примитивы (Число/Булево/Пусто/Никогда) и heap-строки НЕ копируются —
+    // строки панос неизменяемы, поэтому делить их всегда безопасно.
+    // Хендлы нативных ресурсов (Процесс/Файл/Соединение/Соединение_БД/
+    // Слушатель/Запрос) тоже НЕ копируются — они идентифицируют живой
+    // ресурс, а не данные; копирование было бы бессмысленным ("клонированный"
+    // хендл файла не указывает на вторую копию файла), а отправка хендла
+    // `Процесс(T)` должна продолжать указывать на ТОТ ЖЕ целевой процесс.
     fn deepCopyForSend(self: *Vm, source: value.Value) anyerror!value.Value {
         var seen = std.AutoHashMap(usize, value.Value).init(self.allocator);
         defer seen.deinit();
@@ -5045,13 +5040,13 @@ pub const Vm = struct {
             return;
         }
         const target_function_id = methods[call_info.method_index];
-        // A default method's own `это.другой_метод()` needs to dispatch
-        // through the vtable again — its compiled `это` parameter is
-        // the ABSTRACT interface type, not a concrete struct, so it
-        // needs the BOXED `.interface` value, not the raw underlying
-        // one an ordinary impl method (real field access on a concrete
-        // struct) requires. See `bytecode.Function.
-        // is_default_interface_method`'s doc comment.
+        // Собственный `это.другой_метод()` метода по умолчанию должен
+        // снова диспетчеризоваться через vtable — его скомпилированный
+        // параметр `это` имеет АБСТРАКТНЫЙ тип интерфейса, не конкретную
+        // структуру, поэтому ему нужно ОБЁРНУТОЕ значение `.interface`, а
+        // не сырое базовое, которое требуется обычному impl-методу
+        // (реальный доступ к полю конкретной структуры). См.
+        // doc-комментарий `bytecode.Function.is_default_interface_method`.
         const is_default = if (self.program.functionConst(target_function_id)) |target| target.is_default_interface_method else false;
         const this_argument: value.Value = if (is_default) self.stack.items[interface_index] else interface.receiver;
         self.stack.items[interface_index] = .{ .function_ref = target_function_id };
@@ -5089,10 +5084,10 @@ pub const Vm = struct {
             },
         };
         if (target.status == .ready) {
-            // Deep-copy for actor isolation — see `deepCopyForSend`'s own
-            // comment. Only done when the target is actually alive (a
-            // dead target is a silent no-op either way, no point paying
-            // the copy cost).
+            // Глубокое копирование для изоляции акторов — см. собственный
+            // комментарий `deepCopyForSend`. Делается только когда цель
+            // реально жива (мёртвая цель в любом случае тихий no-op, нет
+            // смысла платить за копирование).
             try target.mailbox.append(self.allocator, try self.deepCopyForSend(message));
         }
         try self.stack.append(self.allocator, .{ .void = {} });
@@ -5141,14 +5136,15 @@ pub const Vm = struct {
         return false;
     }
 
-    // `ждать(процесс)` — unlike получить/получить_сигнал/await_async
-    // (parameterless, block on the CURRENT process's own queue),
-    // `ждать` takes an argument (the target `Процесс(T)` handle) already
-    // sitting on the stack from `compileExpression(call.arguments[0])`.
-    // A suspend here only rewinds `frame.ip` back to THIS instruction —
-    // the argument-computing instructions before it do NOT re-run — so
-    // the target must be PEEKED (not popped) while still pending, and
-    // only actually consumed once ready to push a real result.
+    // `ждать(процесс)` — в отличие от получить/получить_сигнал/await_async
+    // (без параметров, блокируются на собственной очереди ТЕКУЩЕГО
+    // процесса), `ждать` принимает аргумент (целевой хендл `Процесс(T)`),
+    // уже лежащий на стеке от `compileExpression(call.arguments[0])`.
+    // Приостановка здесь только откатывает `frame.ip` назад к ЭТОЙ
+    // инструкции — инструкции вычисления аргумента перед ней НЕ
+    // выполняются заново — поэтому цель нужно ПОДСМОТРЕТЬ (не снимать со
+    // стека), пока она ещё в ожидании, и реально потребить только когда
+    // готова положить настоящий результат.
     fn awaitTask(self: *Vm) anyerror!bool {
         const waiter = self.current_process orelse {
             _ = try self.pop();
@@ -5168,11 +5164,12 @@ pub const Vm = struct {
             },
         };
         const outcome = target.result orelse {
-            // A single process only ever executes one instruction at a
-            // time (cooperative, single-threaded) — it can't already be
-            // registered as a waiter for a DIFFERENT still-pending `ждать`
-            // when this one starts, so a plain append here can't produce
-            // a stale/duplicate registration in practice.
+            // Один процесс всегда выполняет только одну инструкцию за раз
+            // (кооперативно, однопоточно) — он не может уже быть
+            // зарегистрирован ожидающим для ДРУГОГО ещё не завершённого
+            // `ждать`, когда начинается этот, поэтому простой append здесь
+            // на практике не может дать устаревшую/дублирующуюся
+            // регистрацию.
             try target.task_waiters.append(self.allocator, waiter);
             return true;
         };
@@ -5184,15 +5181,15 @@ pub const Vm = struct {
         return false;
     }
 
-    // `выбор ожидание(источник) ... конец` — like `awaitTask`, the source
-    // array is peeked (not popped) while nothing is ready, since a
-    // suspend only rewinds `frame.ip` back to THIS instruction and the
-    // instructions that computed the array won't re-run. Priority order
-    // when multiple sources are ready simultaneously: mailbox, then
-    // signals, then a listed process's completion — matching
-    // получить/получить_сигнал/ждать's own relative ordering elsewhere in
-    // this file (получить/получить_сигнал are always checked before any
-    // task-completion path exists at all).
+    // `выбор ожидание(источник) ... конец` — как и `awaitTask`, массив
+    // источника подсматривается (не снимается со стека), пока ничего не
+    // готово, т.к. приостановка только откатывает `frame.ip` назад к ЭТОЙ
+    // инструкции, а инструкции вычисления массива заново не выполняются.
+    // Порядок приоритета, когда одновременно готово несколько источников:
+    // mailbox, затем signals, затем завершение процесса из списка —
+    // совпадает с относительным порядком получить/получить_сигнал/ждать в
+    // остальном файле (получить/получить_сигнал всегда проверяются раньше
+    // любого пути завершения задачи).
     fn selectWait(self: *Vm) anyerror!bool {
         const waiter = self.current_process orelse {
             _ = try self.pop();
@@ -5237,13 +5234,13 @@ pub const Vm = struct {
             try self.pushSelectSource("ИсточникОжидания.Готово", &.{ .{ .process = target }, result_value });
             return false;
         }
-        // Nothing ready yet — register as a waiter on every still-pending
-        // listed process, guarding against duplicate registration across
-        // retries of this same suspended opcode (unlike `awaitTask`,
-        // `selectWait` CAN legitimately retry multiple times before
-        // anything becomes ready, e.g. woken by an unrelated mailbox
-        // message that turns out not to be present anymore by the time
-        // this instruction re-runs).
+        // Пока ничего не готово — регистрируемся ожидающим на каждом ещё
+        // не завершённом процессе из списка, защищаясь от дублирующей
+        // регистрации при повторах этого же приостановленного опкода (в
+        // отличие от `awaitTask`, `selectWait` МОЖЕТ легитимно повторяться
+        // несколько раз до того, как что-то станет готово, например,
+        // разбужен не связанным сообщением в mailbox, которого к моменту
+        // повторного выполнения этой инструкции уже нет).
         for (source.elements) |element| {
             const target = switch (element) {
                 .process => |process| process,
@@ -5342,11 +5339,10 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .void = {} });
     }
 
-    // `ограничить_почту(N)` — sets a capacity on the CALLING process's OWN
-    // mailbox (no target argument, mirrors `себя()`'s "current process"
-    // shape). Only `отправить_или` below ever consults this — plain
-    // `отправить` stays capacity-blind, matching every process's behavior
-    // before this feature existed.
+    // `ограничить_почту(N)` — устанавливает ёмкость на СОБСТВЕННОМ почтовом
+    // ящике вызывающего процесса (без аргумента-цели, зеркалит форму
+    // "текущий процесс" у `себя()`). Только `отправить_или` ниже вообще
+    // смотрит на это — обычный `отправить` остаётся слеп к ёмкости.
     fn setMailboxCapacity(self: *Vm) anyerror!void {
         const raw = try self.pop();
         const process = self.current_process orelse {
@@ -5363,10 +5359,10 @@ pub const Vm = struct {
     }
 
     // `отправить_или(процесс, сообщение) -> Результат(Пусто, Ошибка)` —
-    // opt-in, backpressure-aware sibling of `отправить`. Rejects (without
-    // appending) only when the TARGET has an explicit `mailbox_capacity`
-    // AND is already at/over it; an unbounded target (the default) never
-    // rejects, same as plain `отправить`.
+    // opt-in вариант `отправить`, учитывающий backpressure. Отклоняет (без
+    // добавления) только когда у ЦЕЛИ есть явная `mailbox_capacity` И она
+    // уже достигнута/превышена; неограниченная цель (по умолчанию) никогда
+    // не отклоняет, как и обычный `отправить`.
     fn sendOr(self: *Vm) anyerror!void {
         const message = try self.pop();
         const target = switch (try self.pop()) {
@@ -5390,11 +5386,11 @@ pub const Vm = struct {
         try self.pushSuccessResult(.{ .void = {} });
     }
 
-    // `отмена(процесс)` — sets a flag on the TARGET; purely advisory,
-    // nothing forces the target to notice. Sibling to `убить()`
-    // (structurally: pops a `Процесс(T)`, no self-cancel/main-process
-    // restriction needed since this can never actually stop anything on
-    // its own).
+    // `отмена(процесс)` — устанавливает флаг у ЦЕЛИ; чисто рекомендательно,
+    // ничто не заставляет цель это заметить. Родственно `убить()`
+    // (структурно: снимает со стека `Процесс(T)`), но не нужны ограничения
+    // на самоотмену/главный процесс, т.к. это само по себе никогда ничего
+    // реально не останавливает.
     fn requestCancel(self: *Vm) anyerror!void {
         const target = switch (try self.pop()) {
             .process => |process| process,
@@ -5407,8 +5403,8 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .void = {} });
     }
 
-    // `отменено()` — polls the CURRENT process's own flag. A process that
-    // never calls this never observes cancellation at all.
+    // `отменено()` — опрашивает собственный флаг ТЕКУЩЕГО процесса.
+    // Процесс, который никогда его не вызывает, никогда не увидит отмену.
     fn isCancelled(self: *Vm) anyerror!void {
         const process = self.current_process orelse {
             try self.fault("Runtime Error: отменено() вызвано вне процесса", .{});
@@ -5438,51 +5434,51 @@ pub const Vm = struct {
     const SliceOutcome = union(enum) {
         completed: value.Value,
         suspended,
-        // A CPU-bound process (busy loop with no blocking call inside)
-        // burned through its instruction budget without reaching
-        // completion, failure, or a blocking op — distinct from
-        // `.suspended`, which means "blocked on an empty mailbox/signal/
-        // async queue, re-check the SAME instruction next slice." Budget
-        // exhaustion has no such rollback: the loop below only checks the
-        // budget BETWEEN completed `step()` calls, never mid-dispatch, so
-        // `frame.ip` is already sitting exactly where execution should
-        // resume — no new persisted state is needed beyond what
-        // suspend/resume already maintains.
+        // CPU-bound процесс (цикл без блокирующего вызова внутри) исчерпал
+        // бюджет инструкций, не дойдя до завершения, сбоя или блокирующей
+        // операции — отличается от `.suspended`, которое значит
+        // "заблокирован на пустом mailbox/signal/async-очереди, повторно
+        // проверить ТУ ЖЕ инструкцию на следующем такте." У исчерпания
+        // бюджета нет такого отката: цикл ниже проверяет бюджет только
+        // МЕЖДУ завершёнными вызовами `step()`, никогда посреди
+        // диспетчеризации, так что `frame.ip` уже стоит ровно там, откуда
+        // должно возобновиться выполнение — новое сохраняемое состояние не
+        // нужно сверх того, что уже поддерживает приостановка/возобновление.
         budget_exhausted,
         failed,
     };
 
-    // A process runs at most this many bytecode instructions per
-    // scheduling slice before voluntarily yielding back to the scheduler,
-    // even if it never calls получить()/получить_сигнал()/an async
-    // builtin. Without this, a CPU-bound `пока истина цикл ... конец` with
-    // no blocking call inside hangs the ENTIRE VM forever — round-robin in
-    // name only, since `runProcessSlice` used to run a process strictly
-    // until it blocked or finished. Value is a rough empirical balance:
-    // large enough that ordinary short-lived process bodies never hit it
-    // (avoiding needless round-trip overhead for the common case), small
-    // enough that a busy-looping process can't starve message-blocked
-    // siblings for more than a bounded number of scheduler rounds.
+    // Процесс выполняет не более стольких байткод-инструкций за такт
+    // планировщика, прежде чем добровольно уступить управление, даже если
+    // никогда не вызывает получить()/получить_сигнал()/асинхронный
+    // билтин. Без этого CPU-bound `пока истина цикл ... конец` без
+    // блокирующего вызова внутри повесил бы ВСЮ VM навсегда. Значение —
+    // приблизительный эмпирический баланс: достаточно большое, чтобы
+    // обычные короткоживущие тела процессов никогда его не достигали
+    // (избегая ненужных накладных расходов на переключение в общем
+    // случае), достаточно маленькое, чтобы процесс с активным циклом не
+    // мог морить голодом заблокированных на сообщениях соседей дольше
+    // ограниченного числа тактов планировщика.
     const process_instruction_budget: u32 = 100_000;
 
-    // Runs ONE process for one scheduling slice: swaps its persisted
-    // stack/frames into the shared vm.stack/vm.frames (cheap — an
-    // ArrayList header, not a data copy), steps until it either finishes,
-    // crashes, suspends (получить/получить_сигнал/Await_Async on an empty
-    // queue), or exhausts its instruction budget, then swaps its (possibly
-    // still-mid-frame) state back. Mirrors Odin's run_scheduler swap
-    // discipline (core/vm.odin), extended with the instruction budget.
+    // Выполняет ОДИН процесс на один такт планировщика: подставляет его
+    // сохранённые stack/frames в общие vm.stack/vm.frames (дёшево —
+    // заголовок ArrayList, не копия данных), шагает, пока не завершится,
+    // не упадёт, не приостановится (получить/получить_сигнал/Await_Async
+    // на пустой очереди) или не исчерпает бюджет инструкций, затем
+    // подставляет обратно его (возможно, ещё посреди кадра) состояние.
     fn runProcessSlice(self: *Vm, process: *value.Process) anyerror!SliceOutcome {
         self.stack = process.stack;
         self.frames = process.frames;
         self.failure = null;
         self.current_process = process;
         defer {
-            // Fully transfer ownership back (not just copy the header) —
-            // leaving self.stack/self.frames aliased to the same backing
-            // buffer as process.stack/process.frames would double-free at
-            // Vm.deinit() (both `self.frames.deinit()` and
-            // `process.deinit()` would free the same allocation).
+            // Полностью переносим владение обратно (не просто копируем
+            // заголовок) — если оставить self.stack/self.frames
+            // алиасированными на тот же буфер, что и у
+            // process.stack/process.frames, при Vm.deinit() произошёл бы
+            // двойной free (и `self.frames.deinit()`, и `process.deinit()`
+            // освободили бы одну и ту же аллокацию).
             process.stack = self.stack;
             process.frames = self.frames;
             self.stack = .empty;
@@ -5511,12 +5507,11 @@ pub const Vm = struct {
         return .{ .completed = .{ .void = {} } };
     }
 
-    // Round-robin driver (mirrors Odin's run_scheduler): a process is
-    // runnable if it has never run yet, or has a pending mailbox message /
-    // monitor signal / async result waiting for it. Returns as soon as the
-    // ROOT process (index 0, "старт()") finishes or crashes — orphaned
-    // processes are simply abandoned, same contract as before this
-    // refactor.
+    // Round-robin драйвер: процесс runnable, если он ещё никогда не
+    // выполнялся, или у него есть ожидающее сообщение mailbox / сигнал
+    // монитора / async-результат. Возвращается, как только КОРНЕВОЙ процесс
+    // (индекс 0, "старт()") завершается или падает — осиротевшие процессы
+    // просто забрасываются.
     fn runScheduler(self: *Vm, root: *value.Process) anyerror!Execution {
         while (true) {
             self.drainAsyncCompletions();
@@ -5525,12 +5520,13 @@ pub const Vm = struct {
             while (i < self.processes.items.len) : (i += 1) {
                 const process = self.processes.items[i];
                 if (process.status != .ready) continue;
-                // A budget-exhausted OR task-wakeup-pending process is NOT
-                // blocked on anything — it must always be eligible for its
-                // next slice, or (respectively) a CPU-bound busy loop, or a
-                // process whose `ждать`-ed task just finished, would be
-                // wrongly treated as "no work to do" the moment its
-                // mailbox/signals/async_results happen to all be empty.
+                // Процесс с исчерпанным бюджетом ИЛИ ожидающий пробуждения
+                // задачи НЕ заблокирован ни на чём — он всегда должен быть
+                // допущен к следующему такту, иначе CPU-bound активный цикл
+                // (или процесс, чья задача из `ждать` только что
+                // завершилась) был бы ошибочно принят за "нет работы" в тот
+                // момент, когда его mailbox/signals/async_results все
+                // пусты.
                 if (process.has_run and !process.budget_exhausted and !process.task_wakeup_pending and process.mailbox.items.len == 0 and process.signals.items.len == 0 and process.async_results.items.len == 0) continue;
 
                 any_ran = true;
@@ -5596,11 +5592,12 @@ pub const Vm = struct {
     }
 
     fn deliverAsyncResult(self: *Vm, completion: AsyncCompletion) !void {
-        // Handle-lifecycle side effects (unpin, clear in_flight, apply a
-        // deferred close) must run REGARDLESS of whether the target
-        // process is still alive — a `.закрыть()` while a read is in
-        // flight only sets close_requested, precisely because the actual
-        // close is applied HERE, not conditionally on delivery succeeding.
+        // Побочные эффекты жизненного цикла хендла (unpin, сброс
+        // in_flight, применение отложенного закрытия) должны выполняться
+        // НЕЗАВИСИМО от того, жив ли ещё целевой процесс — `.закрыть()`
+        // пока чтение в полёте лишь устанавливает close_requested, именно
+        // потому что реальное закрытие применяется ЗДЕСЬ, а не только при
+        // успешной доставке.
         switch (completion.payload) {
             .connection_read => |data| self.finishConnectionFlight(data.connection),
             .connection_write => |data| self.finishConnectionFlight(data.connection),
@@ -5634,11 +5631,12 @@ pub const Vm = struct {
         self.heap.unpin(.{ .connection = connection });
         if (connection.close_requested) {
             if (comptime builtin.target.os.tag == .freestanding) {
-                // Unreachable in practice — connection_read completions
-                // only ever originate from submitConnectionRead, itself
-                // gated to non-freestanding — but this function is called
-                // unconditionally from drainAsyncCompletions for every
-                // target, so it still needs a real `if`/`else` split.
+                // Недостижимо на практике — завершения connection_read
+                // всегда происходят только из submitConnectionRead,
+                // которая сама доступна только не под freestanding — но эта
+                // функция вызывается безусловно из drainAsyncCompletions
+                // для каждой цели, поэтому всё равно нужно настоящее
+                // разделение `if`/`else`.
             } else {
                 var io = std.Io.Threaded.init(self.allocator, .{});
                 defer io.deinit();
@@ -5806,12 +5804,13 @@ pub const Vm = struct {
         process.watchers.clearRetainingCapacity();
     }
 
-    // Delivers a process's terminal outcome and wakes anything blocked
-    // in `ждать(это)` — called exactly once per process, from whichever
-    // path actually ends it (normal completion in `runScheduler`, or
-    // `terminateProcess` for a crash/forceful `убить()`). Harmless no-op
-    // work for a `запусти`-spawned process that nothing ever
-    // calls `ждать` on (empty `task_waiters`, `result` simply unused).
+    // Доставляет финальный исход процесса и будит всё заблокированное на
+    // `ждать(это)` — вызывается ровно один раз на процесс, из того пути,
+    // который его реально завершает (нормальное завершение в
+    // `runScheduler`, либо `terminateProcess` при крахе/принудительном
+    // `убить()`). Безвредный no-op для процесса, порождённого `запусти`,
+    // на котором никто никогда не вызывает `ждать` (пустой `task_waiters`,
+    // `result` просто не используется).
     fn completeTask(process: *value.Process, outcome: value.TaskResult) void {
         process.result = outcome;
         for (process.task_waiters.items) |waiter| waiter.task_wakeup_pending = true;
@@ -8218,15 +8217,13 @@ test "VM cascades linked process failures" {
     const parser = @import("parser.zig");
     const resolver = @import("resolver.zig");
     const type_checker = @import("type_checker.zig");
-    // The round-robin scheduler does NOT run отправить()'s target
-    // synchronously (unlike the old recursive-execution model this test was
-    // originally written against) — сосед() must stay alive (loop forever
-    // instead of completing) so the link to жертва is still valid whenever
-    // жертва actually gets scheduled and crashes. Same rendezvous idiom as
-    // Odin's own equivalent test (core/e2e_actors_test.odin,
-    // test_link_cascades_crash_to_linked_process): сосед pings родитель
-    // back only AFTER связать() has run, so отправить(жертва, ...) below is
-    // guaranteed to happen after the link exists.
+    // Round-robin планировщик НЕ выполняет цель отправить() синхронно —
+    // сосед() должен оставаться живым (зациклен вечно, а не завершаться),
+    // чтобы связь с жертва оставалась валидной, когда жертва реально
+    // попадёт в планировщик и упадёт. Идиома рандеву: сосед пингует
+    // родитель обратно только ПОСЛЕ того, как выполнился связать(), так что
+    // отправить(жертва, ...) ниже гарантированно происходит после того, как
+    // связь уже установлена.
     const source =
         \\функ падающий() -> Пусто
         \\    получить()
@@ -8469,13 +8466,10 @@ test "VM reorders named spawn arguments" {
     }
 }
 
-// Regression for a real bug found auditing panosiki's `cli` package:
-// named-argument struct constructors were type-checked in the CALLER's
-// argument order (correct, via `reorderNamedArguments`), but codegen
-// zipped the raw, UNREORDERED `call.arguments` against the struct's
-// declared field order — silently storing each value in the wrong
-// field slot at runtime. `Точка(y = 1, x = 2)` (fields declared `x`
-// then `y`) must build `x=2, y=1`, not `x=1, y=2`.
+// Именованные аргументы конструктора структуры должны собираться в
+// ПОРЯДКЕ ОБЪЯВЛЕНИЯ ПОЛЕЙ, а не в порядке, в котором их написал вызывающий
+// — `Точка(y = 1, x = 2)` (поля объявлены `x`, затем `y`) должно построить
+// `x=2, y=1`, а не `x=1, y=2`.
 test "VM reorders named struct constructor arguments" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -8517,13 +8511,12 @@ test "VM reorders named struct constructor arguments" {
     }
 }
 
-// Regression for a real bug found auditing panosiki's `gitsync`: a
-// `выбор`/`если` whose arms are one bare interface-typed value and one
-// concrete implementor (both individually assignable to a KNOWN
-// `expected` type, e.g. a function's declared return type) must be
-// accepted — `assignable` is directional for interfaces, so the old
-// mutual pairwise check between arms rejected this even though each
-// arm independently satisfies `expected`.
+// `выбор`/`если`, чьи ветви — одно значение с типом интерфейса и один
+// конкретный реализующий тип (оба по отдельности присваиваемы к ИЗВЕСТНОМУ
+// `expected` типу, например объявленному возвращаемому типу функции),
+// должны приниматься — `assignable` для интерфейсов направленное, поэтому
+// взаимная попарная проверка между ветвями отклонила бы это, даже если
+// каждая ветвь по отдельности удовлетворяет `expected`.
 test "VM allows if/match branches that satisfy expected type asymmetrically via an interface" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -8571,13 +8564,12 @@ test "VM allows if/match branches that satisfy expected type asymmetrically via 
     }
 }
 
-// Regression for a real bug found auditing panosiki's `configor`: a
-// generic function whose parameter is bound by a USER-DEFINED interface
-// (`[T: ИзTOML]`) calling a method on that bare parameter inside its own
-// body (`это.метод()`) — panos generics aren't monomorphized, so this
-// only works if the caller's concrete argument gets cast to the bound
-// interface at the call site, and the method call inside the generic
-// body dispatches through that same interface's vtable.
+// Обобщённая функция, чей параметр ограничен ПОЛЬЗОВАТЕЛЬСКИМ интерфейсом
+// (`[T: ИзTOML]`), вызывающая метод на этом голом параметре внутри своего
+// тела (`это.метод()`) — обобщения панос не мономорфизируются, поэтому это
+// работает только если конкретный аргумент вызывающего приводится к
+// связанному интерфейсу в точке вызова, а вызов метода внутри тела
+// обобщённой функции диспетчеризуется через vtable того же интерфейса.
 test "VM dispatches an interface method through a generic bound parameter" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -8676,24 +8668,15 @@ test "VM dispatches a second interface method through multiple generic bounds" {
     }
 }
 
-// Regression for a real bug found auditing panosiki's `cli-selector`
-// (`новый_селектор[T](заголовок: Строка) -> Селектор(T)` whose body is
-// `Селектор(заголовок, массив())`): a generic struct's own type
-// parameter couldn't be inferred from an EMPTY array-literal
-// constructor argument (`массив()` infers as `Массив(poison)`, and the
-// old `inferGenericSubstitution` gave up silently instead of
-// substituting `poison`) — the function's declared return type
-// (`Коробка(T)`, the FUNCTION's own `T`) then failed to unify against
-// the constructed `Коробка(poison)` at all, since plain nominal-type
-// assignability required an exact argument match before the sibling
-// `assignable` fix (see the elementwise-recursion case) started
-// tolerating `poison` there too. This checks the DECLARATION alone —
-// deliberately not a call site: calling a generic function whose type
-// parameter appears ONLY in the return type (never in any parameter)
-// can't be resolved from argument types either way, an entirely
-// separate, orthogonal limitation real panosiki callers route around by
-// never annotating the call (`пер с1 = выборка.новый_селектор(...)`,
-// no `: Тип`) rather than something this fix touches.
+// Тип-параметр обобщённой структуры должен выводиться даже из ПУСТОГО
+// аргумента-конструктора array-литерала (`массив()` выводится как
+// `Массив(poison)`, а объявленный тип возврата функции — `Коробка(T)`,
+// СОБСТВЕННЫЙ `T` функции — должен унифицироваться с построенным
+// `Коробка(poison)`, допуская `poison` при присваиваемости номинальных
+// типов). Проверяет только ОБЪЯВЛЕНИЕ, намеренно не точку вызова: вызов
+// обобщённой функции, чей тип-параметр встречается ТОЛЬКО в типе возврата
+// (никогда ни в одном параметре), не может быть разрешён из типов
+// аргументов в принципе — это отдельное, ортогональное ограничение.
 test "type checker infers a generic struct's type parameter through an empty array literal argument" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -8719,11 +8702,10 @@ test "type checker infers a generic struct's type parameter through an empty arr
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
-// Regression for the bidirectional-inference fix this session added
-// (`inferCallExpected`): `новая_коробка[T](метка: Строка) -> Коробка(T)`
-// has `T` ONLY in the return type — with an explicit `: Коробка(Число)`
-// annotation on the call site, `T` must now resolve to `Число` for real
-// (seeded from the expected type), not silently fall back to `poison`.
+// `новая_коробка[T](метка: Строка) -> Коробка(T)` имеет `T` ТОЛЬКО в типе
+// возврата — с явной аннотацией `: Коробка(Число)` в точке вызова `T`
+// должен по-настоящему разрешиться в `Число` (засеяно из ожидаемого типа),
+// а не тихо откатиться на `poison`.
 test "VM resolves a generic call's return-only type parameter from an annotated let" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -8769,11 +8751,10 @@ test "VM resolves a generic call's return-only type parameter from an annotated 
     }
 }
 
-// Regression: an ANNOTATED call whose generic type parameter STILL can't
-// be resolved (expected type given, but structurally incompatible with
-// the function's own return type) must now be a hard Type Error — not a
-// silently-poisoned success. This is the "no unconstrained T out of thin
-// air when context exists" half of the bidirectional-inference fix.
+// АННОТИРОВАННЫЙ вызов, чей тип-параметр обобщения ВСЁ РАВНО не может быть
+// разрешён (ожидаемый тип дан, но структурно несовместим с собственным
+// типом возврата функции), должен быть жёсткой ошибкой типа — не тихо
+// испорченным (poison) успехом.
 test "type checker reports an error when an annotated generic call's type parameter is genuinely unresolvable" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -8798,9 +8779,9 @@ test "type checker reports an error when an annotated generic call's type parame
     defer resolved.deinit();
     var checked = try type_checker.check(std.testing.allocator, &parsed.ast, &resolved);
     defer checked.deinit();
-    // `Строка` (the annotation) is structurally incompatible with
-    // `Коробка(T)` (the function's real return shape) — `T` can never be
-    // seeded from it, and there's no argument to fall back to either.
+    // `Строка` (аннотация) структурно несовместима с `Коробка(T)`
+    // (реальная форма возврата функции) — `T` из неё никогда не может быть
+    // засеян, а аргумента для отката тоже нет.
     var found = false;
     for (checked.diagnostics.items.items) |diagnostic_value| {
         if (std.mem.indexOf(u8, diagnostic_value.message, "не удалось вывести type-параметр") != null) found = true;
@@ -8888,18 +8869,13 @@ test "VM guards a native builtin when bytecode bypasses static checking" {
     }
 }
 
-// Direct reproduction of the scheduler-fairness bug (Phase A of the
-// concurrency remediation plan): a CPU-bound process that never calls
-// получить()/получить_сигнал()/an async builtin must NOT be able to starve
-// a sibling process forever. `бесконечный` below is a genuinely
-// non-terminating loop — before the instruction-budget fix, spawning it
-// FIRST made `runProcessSlice` (and therefore this whole test) hang
-// forever the moment the scheduler gave it a turn (`while (true) { step() }`
-// with no exit condition it could ever reach). With the fix, the busy
-// process yields back to the scheduler every `process_instruction_budget`
-// instructions, so the sibling `ответчик` still gets scheduled, sends its
-// reply, and `проверка` (root) receives it — even though `бесконечный`
-// itself never completes and is simply abandoned when root returns.
+// CPU-bound процесс, никогда не вызывающий получить()/получить_сигнал()/
+// асинхронный билтин, не должен морить голодом соседний процесс вечно.
+// `бесконечный` ниже — по-настоящему незавершающийся цикл; процесс
+// уступает планировщику каждые `process_instruction_budget` инструкций, так
+// что соседний `ответчик` всё равно попадает в планировщик, отправляет свой
+// ответ, и `проверка` (корень) его получает — хотя сам `бесконечный`
+// никогда не завершается и просто забрасывается, когда корень возвращается.
 test "VM scheduler does not let a CPU-bound process starve a sibling forever" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -8945,12 +8921,12 @@ test "VM scheduler does not let a CPU-bound process starve a sibling forever" {
     }
 }
 
-// Phase B (concurrency remediation plan): `отправить` restores the
-// Odin-era copy-on-send isolation guarantee (ROADMAP.md Стадия 24). The
-// sender mutates its own array AFTER spawning a child and sending it a
-// struct wrapping that array — the child must see the array as it was AT
-// SEND TIME, not reflect the sender's later mutation, proving the message
-// was NOT shared by reference.
+// `отправить` обеспечивает гарантию изоляции copy-on-send. Отправитель
+// мутирует свой собственный массив ПОСЛЕ порождения дочернего процесса и
+// отправки ему структуры, оборачивающей этот массив — дочерний процесс
+// должен видеть массив таким, каким он был В МОМЕНТ ОТПРАВКИ, не отражая
+// последующую мутацию отправителя, что доказывает, что сообщение НЕ было
+// разделено по ссылке.
 test "VM deep-copies a message on send, isolating it from the sender's later mutations" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -8997,10 +8973,11 @@ test "VM deep-copies a message on send, isolating it from the sender's later mut
     }
 }
 
-// A `реализация Копируемое` override is invoked directly at send time
-// instead of the default reflective walk — proving the custom clone (which
-// deliberately replaces the label field) actually ran, not the structural
-// default (which would have preserved the original label unchanged).
+// Переопределение `реализация Копируемое` вызывается напрямую в момент
+// отправки вместо обычного рефлективного обхода — проверяет, что реально
+// выполнился кастомный клон (который намеренно заменяет поле метки), а не
+// структурный обход по умолчанию (который сохранил бы исходную метку без
+// изменений).
 test "VM dispatches a custom Копируемое override on send instead of reflective copy" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -9050,11 +9027,10 @@ test "VM dispatches a custom Копируемое override on send instead of re
     }
 }
 
-// Phase C (concurrency remediation plan, simplified per user feedback to
-// avoid a redundant Erlang-less keyword/type): `запусти <вызов>` spawns a
-// `Процесс(T)` where T is now correctly inferred from the spawned
-// function's own return type. `ждать` blocks on that same `Процесс(T)`
-// handle until it completes and returns `Результат.Успех(T)`.
+// `запусти <вызов>` порождает `Процесс(T)`, где T корректно выводится из
+// собственного типа возврата порождаемой функции. `ждать` блокируется на
+// том же хендле `Процесс(T)`, пока он не завершится и не вернёт
+// `Результат.Успех(T)`.
 test "VM spawns a process and ждать returns its successful result" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -9098,9 +9074,10 @@ test "VM spawns a process and ждать returns its successful result" {
     }
 }
 
-// A spawned process that CRASHES (panics) must not take down the whole VM
-// — `ждать` on it returns `Результат.Неудача(Ошибка(...))`, exactly like
-// any other fallible native operation, not a propagated runtime fault.
+// Порождённый процесс, который ПАДАЕТ (паникует), не должен обрушивать всю
+// VM — `ждать` на нём возвращает `Результат.Неудача(Ошибка(...))`, точно
+// как любая другая фейлящаяся нативная операция, а не распространённый
+// runtime-сбой.
 test "VM converts a crashed process into a failed Результат, not a VM-wide crash" {
     const compiler = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -9153,14 +9130,14 @@ fn findStartFunction(resolved: anytype, compiled: anytype) ?bytecode.FunctionId 
     return null;
 }
 
-// Regression: default methods on interfaces (`функ метод(это: Интерфейс
-// (...), ...) -> Тип ... конец` inside `тип X = интерфейс ... конец`) —
-// a method NOT overridden by an implementor falls back to this body,
-// which can itself call OTHER interface methods on `это` (dispatched
-// dynamically, exactly like an ordinary interface-typed call) and be
-// invoked directly on a concrete value with no explicit interface
-// annotation anywhere (`Диапазон(...).сумма()` — the whole point of the
-// feature, fluent chaining starting from a plain concrete value).
+// Методы по умолчанию на интерфейсах (`функ метод(это: Интерфейс(...),
+// ...) -> Тип ... конец` внутри `тип X = интерфейс ... конец`) — метод, не
+// переопределённый реализующим типом, откатывается на это тело, которое
+// само может вызывать ДРУГИЕ методы интерфейса на `это` (диспетчеризуется
+// динамически, точно как обычный вызов через тип интерфейса), и может быть
+// вызвано напрямую на конкретном значении без явной аннотации интерфейса
+// где бы то ни было (`Диапазон(...).сумма()` — в этом весь смысл фичи,
+// цепочка вызовов начиная с обычного конкретного значения).
 test "VM dispatches an interface default method not overridden by the implementor" {
     const compiler_mod = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -9230,9 +9207,9 @@ test "VM dispatches an interface default method not overridden by the implemento
     }
 }
 
-// An implementor that DOES override a default method uses its own —
-// the fallback in `defineInterfaceImplementation` only fires when
-// `matched == null`.
+// Реализующий тип, который ДЕЙСТВИТЕЛЬНО переопределяет метод по
+// умолчанию, использует своё переопределение — откат в
+// `defineInterfaceImplementation` срабатывает только при `matched == null`.
 test "VM prefers an implementor's own override over an interface default method" {
     const compiler_mod = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -9288,20 +9265,19 @@ test "VM prefers an implementor's own override over an interface default method"
     }
 }
 
-// Regression: a GENERIC struct implementing a GENERIC interface,
-// dispatched polymorphically at an arbitrary instantiation — real gap
-// found building a lazy-iterator-style default method (`отобразить[U]`)
-// that constructs+returns a wrapper struct cast to the interface.
-// Chains 3 separate fixes: `findInterfaceImplementation`'s substitution
-// fallback (exact-`eql` never matches a generic target's OWN
-// placeholders against a call site's concrete instantiation),
-// `inferInterfaceCall`'s method-level generic inference (`U`, distinct
-// from the interface's own `T`, previously never bound at all), and
-// `inferDefaultInterfaceMethodCall` substituting `implementation.
-// arguments` through the CONCRETE target before building the interface
-// type (previously left it still abstract). Also exercises
-// `inferGenericSubstitution`'s new `.function` case (`U` appears ONLY
-// inside a callback parameter's return position, nowhere else).
+// ОБОБЩЁННАЯ структура, реализующая ОБОБЩЁННЫЙ интерфейс, диспетчеризуемая
+// полиморфно при произвольной инстанциации — метод по умолчанию в стиле
+// ленивого итератора (`отобразить[U]`), который строит и возвращает
+// структуру-обёртку, приведённую к интерфейсу, опирается на три разных
+// механизма: подстановочный откат `findInterfaceImplementation` (точное
+// сравнение `eql` никогда не совпадает с СОБСТВЕННЫМИ плейсхолдерами
+// обобщённой цели против конкретной инстанциации в точке вызова);
+// вывод обобщённых типов на уровне метода в `inferInterfaceCall` (`U`,
+// отдельный от собственного `T` интерфейса); и подстановка
+// `implementation.arguments` через КОНКРЕТНУЮ цель в
+// `inferDefaultInterfaceMethodCall` перед построением типа интерфейса.
+// Также проверяет случай `.function` в `inferGenericSubstitution` (`U`
+// встречается ТОЛЬКО в позиции возврата параметра-колбэка, больше нигде).
 test "VM dispatches a default method calling a generic struct that implements a generic interface" {
     const compiler_mod = @import("compiler.zig");
     const lexer = @import("lexer.zig");
@@ -9395,14 +9371,13 @@ test "VM dispatches a default method calling a generic struct that implements a 
     }
 }
 
-// Regression: `для x в ... цикл` over a value implementing `Итерируемое`
-// stopped recognizing ANY implementor at all the moment the interface
-// gained a second method (`отобразить`/`отфильтровать`/`взять`/
-// `собрать`, all default methods) — `iterableForIn`/
-// `interfaceIterableElement` hardcoded "Итерируемое has exactly ONE
-// method" (`следующий`), and the compiled `call_interface` for the
-// `.interface`-dispatch path hardcoded `method_index = 0`. Both now
-// look `следующий` up by name/index instead of assuming array length 1.
+// `для x в ... цикл` над значением, реализующим `Итерируемое`, должен
+// продолжать работать, даже когда у интерфейса больше одного метода
+// (`отобразить`/`отфильтровать`/`взять`/`собрать`, все — методы по
+// умолчанию) — `iterableForIn`/`interfaceIterableElement` и
+// скомпилированный `call_interface` для пути `.interface`-диспетчеризации
+// ищут `следующий` по имени/индексу, а не предполагают, что у интерфейса
+// ровно один метод с индексом 0.
 test "VM for-in still dispatches следующий() after Итерируемое gained default methods" {
     const compiler_mod = @import("compiler.zig");
     const lexer = @import("lexer.zig");

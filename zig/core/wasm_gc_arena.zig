@@ -6,39 +6,38 @@ const types = @import("types.zig");
 const wasm_heap = @import("wasm_heap.zig");
 const wasm_emit = @import("wasm_emit.zig");
 
-// Phase 1 GC for WASM AOT — see `project_panos_wasm_aot_memory_growth_fix`/
-// `project_panos_elm_architecture_dom_storage_design` for the full design
-// discussion. WASM AOT has no tracing collector (a real one needs type-
-// layout descriptors + spilling every local to linear memory, deferred as
-// Phase 2) — this pass gets a cheap, correct-by-construction fraction of
-// the value instead: reset the bump-allocator arena (`global 0`,
-// `wasm_heap.zig`'s `@runtime_alloc`) to a checkpoint at the START of
-// every JS-invoked ENTRY-POINT call, restoring it when that call returns.
-// Reclaims everything allocated (and necessarily dead, since nothing
-// outside the call can still reference it once it returns) across
-// REPEATED calls — the exact shape of the Elm-architecture DOM-as-storage
-// pattern (`старт`, then many independent `DOM.на_клик`/`после_кадра`
-// callbacks) that motivated this work. Does NOT reclaim garbage
-// generated WITHIN one long single call (a big loop) — that still relies
-// on `memory.grow` alone (`project_panos_wasm_aot_memory_growth_fix`).
+// GC для WASM AOT. У WASM AOT нет трассирующего сборщика мусора (для
+// настоящего потребовались бы дескрипторы раскладки типов и выгрузка
+// каждой локальной переменной в линейную память) — этот проход даёт
+// дешёвую, корректную по построению часть той же пользы: сбрасывает арену
+// bump-аллокатора (`global 0`, `@runtime_alloc` в `wasm_heap.zig`) до
+// контрольной точки в НАЧАЛЕ каждого вызова ТОЧКИ ВХОДА со стороны JS,
+// восстанавливая её при возврате из вызова. Освобождает всё, что было
+// выделено (и гарантированно мертво, поскольку ничто вне вызова не может
+// на это ссылаться после его завершения) между ПОВТОРНЫМИ вызовами —
+// именно такой формы паттерн Elm-архитектуры DOM-как-хранилища (`старт`,
+// затем много независимых колбэков `DOM.на_клик`/`после_кадра`). НЕ
+// освобождает мусор, порождённый ВНУТРИ одного долгого вызова (большого
+// цикла) — для этого случая остаётся полагаться только на `memory.grow`.
 //
-// Runs LAST in the AOT expand pipeline (after `wasm_objects`/
-// `wasm_strings`/`wasm_interfaces`/`wasm_actors`), reusing
-// `wasm_actors.zig`'s `buildScheduler` rename-and-wrap precedent: rename
-// the original entry-point function to an internal name, build a NEW
-// function under the ORIGINAL export name that does
-// `checkpoint = arena; call original; arena = checkpoint; return result`.
+// Выполняется ПОСЛЕДНИМ в пайплайне AOT-развёртывания (после
+// `wasm_objects`/`wasm_strings`/`wasm_interfaces`/`wasm_actors`),
+// переиспользуя приём переименования-и-обёртывания из `buildScheduler`
+// в `wasm_actors.zig`: исходная функция точки входа переименовывается во
+// внутреннее имя, а под ИСХОДНЫМ экспортируемым именем строится НОВАЯ
+// функция вида `checkpoint = arena; call original; arena = checkpoint;
+// return result`.
 //
-// Which functions get wrapped is deliberately NOT "every WASM export" —
-// `wasm_emit.zig` exports every compiled top-level function under its
-// own name, not just the ones JS actually invokes directly; wrapping an
-// incidentally-exported internal helper would reset arena state in the
-// MIDDLE of whatever top-level call happens to invoke it, corrupting
-// live intra-call data. The exact set: `старт` plus
-// `module.dom_handler_names` (collected during `mir_lowering.zig`'s
-// tree-shaking reachability walk — the same "handler registered by
-// string-literal name" detection already built for that pass, reused
-// here for an unrelated purpose).
+// Набор оборачиваемых функций намеренно НЕ "каждый WASM-экспорт" —
+// `wasm_emit.zig` экспортирует каждую скомпилированную функцию верхнего
+// уровня под её именем, а не только те, что JS вызывает напрямую;
+// обёртывание случайно экспортированного внутреннего хелпера сбросило бы
+// состояние арены В СЕРЕДИНЕ вызова, который его использует, повредив
+// живые данные внутри вызова. Точный набор: `старт` плюс
+// `module.dom_handler_names` (собирается во время обхода достижимости
+// для tree-shaking в `mir_lowering.zig` — то же обнаружение "обработчик,
+// зарегистрированный по строковому имени", что уже построено для того
+// прохода, здесь переиспользуется для другой цели).
 
 fn uniqueInternalName(module: *mir.Module, original_name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(module.arena.allocator(), "@arena_impl_{s}", .{original_name});
@@ -73,18 +72,16 @@ fn wrapEntryPoint(allocator: std.mem.Allocator, module: *mir.Module, type_store:
     }
     builder.currentFunction().parameters = try new_params.toOwnedSlice(allocator);
 
-    // Checkpoint the arena bump pointer BEFORE running the wrapped body.
+    // Фиксируем указатель bump-арены ДО выполнения оборачиваемого тела.
     const checkpoint = try builder.newValue(type_store.builtins.boolean);
     try builder.emit(.{ .global_get = .{ .dst = checkpoint, .global = wasm_emit.actor_heap_global_index } });
     const checkpoint_local = try wasm_heap.storeLocal(&builder, "@gc_checkpoint", type_store.builtins.boolean, checkpoint);
 
-    // `module.arena`, not `allocator` — this slice is stored permanently
-    // inside the `.call` instruction below, which `Block.deinit` never
-    // frees on its own (only the instruction LIST itself, not variable-
-    // length fields inside individual instructions — see
-    // `mir.Module.arena`'s own doc comment). Confirmed as a real leak via
-    // `DebugAllocator` before this fix (same class of bug `lowerCallArgs`
-    // in `mir_lowering.zig` already avoids for the same reason).
+    // `module.arena`, а не `allocator` — этот срез хранится постоянно
+    // внутри инструкции `.call` ниже, которую `Block.deinit` сама по себе
+    // никогда не освобождает (освобождается только СПИСОК инструкций, но
+    // не поля переменной длины внутри отдельных инструкций — см.
+    // doc-комментарий `mir.Module.arena`).
     const arena = module.arena.allocator();
     var call_args: std.ArrayList(mir.ValueId) = .empty;
     for (builder.currentFunction().parameters, param_types.items) |local_id, type_id| {
@@ -109,18 +106,18 @@ fn wrapEntryPoint(allocator: std.mem.Allocator, module: *mir.Module, type_store:
         builder.terminate(.{ .return_value = .{ .value = result_for_return } });
     }
 
-    // Old entry point is no longer externally reachable under its
-    // original export name (the new wrapper above owns that now) —
-    // renamed so `wasm_emit.zig`'s "export every function by name"
-    // doesn't produce a colliding second export.
+    // Старая точка входа больше не достижима извне под исходным
+    // экспортируемым именем (теперь им владеет обёртка выше) —
+    // переименовывается, чтобы "экспортировать каждую функцию по имени" в
+    // `wasm_emit.zig` не породило конфликтующий второй экспорт.
     module.functions.items[@intFromEnum(original_id)].name = internal_name;
 }
 
 pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore) !void {
-    // No heap used at all (no `@runtime_alloc`/global 0 in the final
-    // module, `wasm_emit.zig`'s own `has_actors` gate) — nothing to
-    // reset, and generating a wrapper that references a nonexistent
-    // global would produce an invalid module.
+    // Куча вообще не используется (нет `@runtime_alloc`/global 0 в
+    // итоговом модуле, определяется собственным флагом `has_actors` в
+    // `wasm_emit.zig`) — сбрасывать нечего, а генерация обёртки со
+    // ссылкой на несуществующий global дала бы невалидный модуль.
     if (!mir_cps.usesActorMemory(module)) return;
 
     var seen: std.StringHashMap(void) = .init(allocator);

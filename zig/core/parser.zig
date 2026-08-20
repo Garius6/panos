@@ -660,18 +660,17 @@ const Parser = struct {
         default_decl: ?ast.DeclId,
     };
 
-    // A method WITHOUT a body — `функ имя(...) -> Тип`, immediately
-    // followed by `конец`/the next `функ` — parses exactly as before
-    // (abstract signature only, `parameters` excludes any receiver,
-    // matching every interface method ever written so far). A method
-    // WITH a body — the receiver `это: Интерфейс(...)` is written
-    // EXPLICITLY as `parameters[0]` (same convention as any ordinary
-    // `реализация`-block method), body parsed the same tail
-    // `parseFunction` uses — registered as a REAL `.function` decl
-    // (`default_decl`) so it reuses that machinery for typechecking/
-    // compiling wholesale, PLUS a receiver-stripped `MethodSignature`
-    // (`parameters[1..]`) so the abstract-shape bookkeeping (interface
-    // definitions, impl validation) doesn't need a second code path.
+    // Метод БЕЗ тела — `функ имя(...) -> Тип`, сразу за которым следует
+    // `конец`/следующий `функ` — парсится как абстрактная сигнатура
+    // (`parameters` без получателя). Метод С телом — получатель
+    // `это: Интерфейс(...)` пишется ЯВНО как `parameters[0]` (та же
+    // конвенция, что и у обычного метода в блоке `реализация`), тело
+    // парсится тем же хвостом, что использует `parseFunction` —
+    // регистрируется как настоящий `.function`-декл (`default_decl`),
+    // чтобы переиспользовать всю машинерию тайпчекинга/компиляции целиком,
+    // ПЛЮС `MethodSignature` без получателя (`parameters[1..]`), чтобы
+    // учёт абстрактной формы (определения интерфейсов, валидация impl) не
+    // нуждался во втором пути кода.
     fn parseInterfaceMethod(self: *Parser) !InterfaceMethodParse {
         const start = try self.expect(.function, "Синтаксическая ошибка: в интерфейсе ожидается 'функ'");
         const name_token = try self.expect(.ident, "Синтаксическая ошибка: после 'функ' ожидается имя метода");
@@ -1050,13 +1049,13 @@ const Parser = struct {
 
     fn parseReturn(self: *Parser) !ast.StmtId {
         const start = self.next();
-        // Bare `возврат` (no expression) — a void return, valid wherever
-        // the enclosing function returns `Пусто`, checked later by
-        // `type_checker.zig`, not here. `.end`/`.else_expr` are the only
-        // tokens that can legally follow a statement with nothing else in
-        // its block (`если x тогда возврат конец`, `если x тогда возврат
-        // иначе ... конец`) — anything else starts parsing an expression
-        // exactly as before.
+        // Голый `возврат` (без выражения) — возврат из Пусто-функции,
+        // проверяется позже в `type_checker.zig`, не здесь. `.end`/
+        // `.else_expr` — единственные токены, которые могут законно
+        // следовать за таким оператором без ничего другого в блоке
+        // (`если x тогда возврат конец`, `если x тогда возврат иначе ...
+        // конец`) — во всех остальных случаях начинается парсинг
+        // выражения как обычно.
         if (self.at(.end) or self.at(.else_expr)) {
             return self.result.ast.addStmt(.{ .return_stmt = .{
                 .span = start.span,
@@ -1112,16 +1111,16 @@ const Parser = struct {
                     } });
                     continue;
                 }
-                // `x как Тип` binds tighter than every binary operator
-                // (precedence 10, just below unary's inner-operand
-                // recursion threshold of 11 — see `parsePrefix`'s
-                // `.minus`/`.negate`/`.tilde` case) but is NOT part of
-                // the unconditional postfix cluster above (unlike
-                // call/property/index/`?`) — gating it on
-                // `minimum_precedence` this way means it does NOT get
-                // swallowed into a unary operand's own `parseExpression(11)`
-                // recursion, so `-x как Целое` parses as `(-x) как
-                // Целое`, not `-(x как Целое)` — matches Rust's `as`.
+                // `x как Тип` связывает крепче любого бинарного оператора
+                // (приоритет 10, чуть ниже порога рекурсии внутреннего
+                // операнда унарных операторов, равного 11 — см. `.minus`/
+                // `.negate`/`.tilde` в `parsePrefix`), но НЕ входит в
+                // безусловный постфиксный кластер выше (в отличие от
+                // вызова/свойства/индекса/`?`) — такое ограничение через
+                // `minimum_precedence` означает, что он НЕ поглощается
+                // собственной рекурсией `parseExpression(11)` унарного
+                // операнда, поэтому `-x как Целое` парсится как `(-x) как
+                // Целое`, а не `-(x как Целое)` — как в Rust с `as`.
                 if (cast_precedence >= minimum_precedence and self.at(.as)) {
                     left = try self.parseCast(left);
                     continue;
@@ -1259,15 +1258,11 @@ const Parser = struct {
                 end = (try self.expect(.end, "Синтаксическая ошибка: блок ветки 'выбор' не закрыт 'конец'")).span;
             } else {
                 _ = try self.expect(.arrow, "Синтаксическая ошибка: после шаблона 'выбор' ожидается '->'");
-                // `Шаблон -> возврат значение` (or bare `возврат`) — real
-                // gap found auditing panosiki's `скобки`: `возврат` starts
-                // a STATEMENT (`parseReturn`), not a valid expression, so
-                // `parseExpression` below always failed immediately for
-                // this otherwise completely ordinary early-return arm
-                // body; only `Шаблон -> значение` (no `возврат`) ever
-                // worked. `возврат` needs its own statement parse here,
-                // same special-case `если`-as-single-arm-statement bodies
-                // don't need (an ordinary expression already covers those).
+                // `Шаблон -> возврат значение` (или голый `возврат`) —
+                // `возврат` начинает СТЕЙТМЕНТ (`parseReturn`), а не
+                // валидное выражение, поэтому для тела такой ветки нужен
+                // отдельный разбор через `parseReturn`, а не обычный
+                // `parseExpression` ниже.
                 if (self.at(.return_expr)) {
                     const statement = try self.parseReturn();
                     body = try self.result.ast.copySlice(ast.StmtId, &.{statement});
@@ -1345,21 +1340,18 @@ const Parser = struct {
             },
             .ident => {},
             else => {
-                // Real trap found running actual code, not just reading
-                // it: forgetting `тогда ... конец` after a multi-statement
-                // match arm (`Шаблон -> первое_выражение\nвторой_statement`
-                // — legal only as `Шаблон тогда ... конец`) makes the
-                // PARSER, not just the user, misread the orphaned second
-                // statement as the start of a NEW arm's pattern — which
-                // lands here once its tokens don't parse as one. The
-                // cascade of confusing follow-on errors after this one
-                // (from whatever partial pattern/expression got parsed
-                // from the orphaned statement) isn't safely fixable via
-                // lookahead without real backtracking (this parser has
-                // none — see 005-language-fixes' precedent for the same
-                // constraint), so only THIS first, always-correct
-                // diagnostic gets a hint — the point where the parser is
-                // already, unambiguously, reporting an error regardless.
+                // Забытый `тогда ... конец` после многостейтментной ветки
+                // `выбор` (`Шаблон -> первое_выражение\nвторой_statement`
+                // — легально только как `Шаблон тогда ... конец`) приводит
+                // к тому, что осиротевший второй стейтмент ошибочно
+                // читается как начало паттерна НОВОЙ ветки — сюда попадает
+                // именно этот случай, когда его токены не парсятся как
+                // паттерн. Каскад запутанных ошибок после этой точки не
+                // исправить безопасно через lookahead без настоящего
+                // бэктрекинга (у этого парсера его нет), поэтому подсказку
+                // получает только ПЕРВАЯ, всегда корректная диагностика —
+                // точка, где парсер уже однозначно сообщает об ошибке
+                // независимо от дальнейшего разбора.
                 try self.report(value.span, "Синтаксическая ошибка: такой шаблон в выборе не поддержан (если это продолжение предыдущей ветки с несколькими операторами — используйте 'тогда ... конец')");
                 return self.result.ast.addPattern(.{ .error_node = value.span });
             },
@@ -1470,7 +1462,7 @@ const Parser = struct {
     }
 
     fn parseCast(self: *Parser, operand: ast.ExprId) anyerror!ast.ExprId {
-        _ = self.next(); // consume `как`
+        _ = self.next(); // съедаем `как`
         const target = try self.parseType();
         const target_span = self.astTypeSpan(target);
         return self.result.ast.addExpr(.{ .cast = .{
@@ -1836,14 +1828,14 @@ test "parser explains multi-statement match arms without тогда" {
     );
 }
 
-// Crash-oracle fuzz test — `parse` must never panic on ANY token stream a
-// lexer can produce, however garbled the underlying bytes (a malformed
-// token stream degrading to syntax-error diagnostics + recovery is the
-// whole point of the parser's error-recovery machinery; a panic would mean
-// recovery missed a case). Feeds the SAME arbitrary bytes through the
-// lexer first — panosiki bugs found this session were mostly "syntax that
-// looks almost right", not pure garbage, so exercising the real lexer
-// (not synthetic tokens) is closer to the actual failure class.
+// Fuzz-тест на отсутствие паники — `parse` не должен паниковать НИ на
+// каком потоке токенов, который может выдать лексер, каким бы испорченным
+// ни были исходные байты (деградация в синтаксические диагностики +
+// восстановление — весь смысл механизма восстановления после ошибок в
+// парсере; паника означала бы, что восстановление пропустило случай).
+// Прогоняет те же произвольные байты СНАЧАЛА через реальный лексер (а не
+// синтетические токены) — это ближе к реальному классу отказов, чем
+// генерация токенов напрямую.
 test "parser never panics on arbitrary token streams" {
     try std.testing.fuzz(std.testing.allocator, testParseNeverPanics, .{
         .corpus = &.{

@@ -60,11 +60,11 @@ fn hasErrors(diagnostics: *const panos_core.diagnostic.DiagnosticList) bool {
 }
 
 fn writeAnalysisDiagnostics(writer: *std.Io.Writer, analysis: *const panos_core.runner.SourceAnalysis) !void {
-    // `analysis.graph` is null only when `reportUnsupportedImports` rejects
-    // the source before a graph is ever built (`runner.zig`) — there's no
-    // module/file to resolve a span against in that case, so fall back to
-    // the bare message (same fallback `writeGraphDiagnostics` itself
-    // already uses when a specific file lookup fails).
+    // `analysis.graph` равен null, только если `reportUnsupportedImports`
+    // отклоняет исходник ещё до построения графа (`runner.zig`) — в этом
+    // случае нет модуля/файла, относительно которого разрешать диапазон,
+    // поэтому используется голое сообщение (тот же fallback, что и у
+    // `writeGraphDiagnostics`, когда поиск конкретного файла не удаётся).
     if (analysis.graph) |*graph| {
         try writeGraphDiagnostics(writer, graph, &analysis.diagnostics);
     } else {
@@ -72,15 +72,16 @@ fn writeAnalysisDiagnostics(writer: *std.Io.Writer, analysis: *const panos_core.
     }
 }
 
-// `panos build --compile <файл.pns> [-o выход]` — Bun-style standalone
-// executable. See `zig/core/bundle.zig`'s module doc comment for the full
-// design (embeds SOURCE, not compiled bytecode — recompiles at every
-// startup of the produced binary). This command runs the ordinary
-// `module_loader.Graph.load` exactly like a normal `panos <file>` run
-// (real `$PANOS_STDLIB`/exe-relative `std/` search — at BUILD time we
-// genuinely want the real stdlib, so `bundle.collect` can capture
-// whichever modules the program actually used), then hands the resulting
-// graph to `bundle.collect` to walk it into an embeddable bundle.
+// `panos build --compile <файл.pns> [-o выход]` — автономный исполняемый
+// файл в стиле Bun. Полный дизайн см. в doc-комментарии модуля
+// `zig/core/bundle.zig` (внутрь встраивается ИСХОДНИК, а не байткод —
+// получившийся бинарник перекомпилирует его при каждом запуске). Эта
+// команда прогоняет обычный `module_loader.Graph.load` точно так же, как
+// нормальный запуск `panos <file>` (реальный поиск через `$PANOS_STDLIB`/
+// `std/` рядом с исполняемым файлом — на этапе СБОРКИ нужна именно
+// настоящая stdlib, чтобы `bundle.collect` мог захватить те модули,
+// которые программа реально использовала), затем передаёт полученный
+// граф в `bundle.collect`, чтобы свернуть его во встраиваемый bundle.
 fn runCompile(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writer, input: []const u8, output_arg: []const u8) !void {
     if (input.len == 0) {
         try stderr.print("panos build --compile <файл.pns> [-o выход]\n", .{});
@@ -148,9 +149,9 @@ fn runCompile(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Wr
         try stderr.flush();
         std.process.exit(1);
     };
-    // Executable bit — the source binary this was copied from already has
-    // it, but `writeFile`/`createFile` above start a NEW file at the
-    // default (non-executable) mode, not inherited from anywhere.
+    // Бит "исполняемый" — у исходного бинарника, откуда всё скопировано, он
+    // уже стоит, но `writeFile`/`createFile` выше создают НОВЫЙ файл с
+    // правами по умолчанию (не исполняемый), не наследуя их ниоткуда.
     var output_file = std.Io.Dir.cwd().openFile(init.io, output, .{}) catch |err| {
         try stderr.print("panos build --compile: записан {s}, но не удалось выставить право на выполнение: {t}\n", .{ output, err });
         try stderr.flush();
@@ -167,14 +168,17 @@ fn runCompile(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Wr
     try stdout.flush();
 }
 
-// `panos build --target=wasm <файл.ps> [-o выход.wasm]` — T048. Deliberately
-// single-file only: `mir_lowering.zig` lowers exactly ONE `ast.Ast` (see its
-// own scope note), and `runner.analyzeSource`'s single-file entry point
-// already rejects `импорт` up front — the two constraints line up, this
-// isn't an artificial narrowing added just for this command. Unlike Odin's
-// `run_build` (`main.odin`, full multi-file module graph via
-// `lower_program_graph`), there is no cross-module wasm build support yet;
-// that would need `mir_lowering.zig` to grow module-graph awareness first.
+// `panos build --target=wasm <файл.ps> [-o выход.wasm]`. Поддержка
+// многофайлового `импорт` по-настоящему: `graph.load` ниже разрешает весь
+// граф модулей входного файла на диске (`FileReader`, корень поиска
+// `PANOS_STDLIB`) так же, как это делает нативное исполнение, а
+// `mir_lowering.zig` опускает уровнем ниже получившийся граф целиком, а не
+// изолированный `ast.Ast`. Обычные (негенерик) файловые импорты `std/`
+// работают целиком — проверено на `импорт "математика"`, скомпилированном
+// и запущенном под wasmtime. Остаётся более узкий пробел именно для
+// ГЕНЕРИК файловых импортов (например `импорт "коллекции"`, все
+// экспортируемые функции которого — `[T]`) — понижение MIR отклоняет их с
+// `AotUnsupported`, первопричина ещё не найдена.
 fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writer, arguments: *std.process.Args.Iterator) !void {
     var target: []const u8 = "";
     var input: []const u8 = "";
@@ -224,10 +228,11 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         output = output_owned.?;
     }
 
-    // AOT now follows the same module-loader/resolver/type-checker graph as
-    // native execution. MIR lowering still supports only its Phase-1
-    // language subset, but a plain local `импорт` no longer forces callers
-    // to paste the imported source into one file before building WASM.
+    // AOT идёт по тому же графу module-loader/resolver/type-checker, что и
+    // нативное исполнение. Понижение MIR всё ещё поддерживает только свой
+    // подмножество языка Phase-1, но обычный локальный `импорт` больше не
+    // заставляет склеивать импортируемый исходник в один файл перед сборкой
+    // WASM.
     var graph = panos_core.module_loader.Graph.init(init.gpa);
     defer graph.deinit();
     var global_search_roots: std.ArrayList([]const u8) = .empty;
@@ -266,10 +271,10 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         std.process.exit(1);
     };
 
-    // `mir_lowering.zig` returns an AOT-specific reason as data instead of
-    // writing behind the caller's `std.Io.Writer`. This keeps the CLI in
-    // charge of output and lets in-process tests observe failures without
-    // corrupting Zig's test-runner protocol.
+    // `mir_lowering.zig` возвращает специфичную для AOT причину как данные,
+    // а не пишет напрямую в `std.Io.Writer` вызывающей стороны. Это
+    // оставляет вывод под контролем CLI и позволяет внутрипроцессным тестам
+    // наблюдать сбои, не повреждая протокол Zig-тест-раннера.
     var aot_diagnostic: panos_core.mir_lowering.AotDiagnostic = .{};
     var module = panos_core.mir_lowering.lowerGraphWithDiagnostic(init.gpa, &graph, &compiled, &aot_diagnostic) catch |err| {
         if (err != error.AotUnsupported) return err;
@@ -309,8 +314,9 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         try stderr.flush();
         std.process.exit(1);
     };
-    // Phase 1 GC (per-call arena reset) — last, after every other pass
-    // has finished deciding the module's final function set/names.
+    // GC Phase 1 (сброс арены на каждый вызов) — последним, после того как
+    // все остальные проходы уже определили финальный набор/имена функций
+    // модуля.
     panos_core.wasm_gc_arena.expand(init.gpa, &module, &entry_checked.types) catch |err| {
         try stderr.print("panos build: GC-обёртка: {t}\n", .{err});
         try stderr.flush();
@@ -334,21 +340,20 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
 }
 
 pub fn main(init: std.process.Init) !void {
-    // `.initStreaming`, NOT the default `.init` (`.positional` mode) —
-    // `.positional` writes via `pwrite` at a `Writer`-local `pos` that
-    // starts at 0 and is invisible to any OTHER `Writer` on the same
-    // underlying file. Under `panos run x.ps > log.txt 2>&1` (or any
-    // shell redirect that dups stdout/stderr to the SAME seekable file),
-    // stdout's and stderr's independently-tracked positions both start at
-    // 0 — whichever one flushes second overwrites the other's bytes at
-    // that shared offset instead of appending after them, silently
-    // dropping real program output whenever a warning diagnostic was also
-    // printed. Found by running a program with an unused-variable warning
-    // through `2>&1`: the warning survived, the actual return value never
-    // appeared. Streaming mode uses a plain sequential `write()`, the
-    // only correct choice for stdout/stderr (never actually random-access
-    // files we own exclusively, unlike `--target=wasm`'s output file
-    // below, which legitimately wants `.positional`).
+    // `.initStreaming`, а НЕ `.init` по умолчанию (режим `.positional`) —
+    // `.positional` пишет через `pwrite` по локальной для `Writer` позиции
+    // `pos`, которая стартует с 0 и невидима для любого ДРУГОГО `Writer`
+    // на том же файле. Под `panos run x.ps > log.txt 2>&1` (или любым
+    // shell-редиректом, дублирующим stdout/stderr в ОДИН и тот же
+    // seekable-файл) независимо отслеживаемые позиции stdout и stderr
+    // обе начинаются с 0 — тот, кто флашится вторым, перезаписывает байты
+    // первого по общему смещению вместо дописывания после них, незаметно
+    // теряя реальный вывод программы всякий раз, когда параллельно
+    // печаталось предупреждение. Потоковый режим использует обычный
+    // последовательный `write()` — единственно верный выбор для
+    // stdout/stderr (в отличие от файла вывода `--target=wasm` ниже,
+    // которому `.positional` действительно нужен, это никогда не файлы
+    // произвольного доступа в нашем эксклюзивном владении).
     var stdout_buffer: [256]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
@@ -356,20 +361,21 @@ pub fn main(init: std.process.Init) !void {
     var stderr_file_writer: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &stderr_buffer);
     const stderr = &stderr_file_writer.interface;
 
-    // Standalone-executable check (`panos build --compile`, see `zig/core/
-    // bundle.zig`) — FIRST thing, before any normal argv parsing: an
-    // ordinary `panos <file>` invocation (no trailer) pays for exactly one
-    // small positional read of its own last 16 bytes (`bundle.readTrailer`'s
-    // own doc comment), everything else below is unchanged. A fat binary
-    // has NO separate "which file" argument — the binary itself IS the
-    // program, so every real argv entry becomes `program_args` directly.
+    // Проверка на автономный исполняемый файл (`panos build --compile`,
+    // см. `zig/core/bundle.zig`) — ПЕРВЫМ делом, до любого обычного
+    // разбора argv: обычный вызов `panos <file>` (без трейлера) платит
+    // ровно одним маленьким positional-чтением своих последних 16 байт
+    // (см. doc-комментарий `bundle.readTrailer`), всё остальное ниже без
+    // изменений. У fat-бинарника НЕТ отдельного аргумента "какой файл" —
+    // сам бинарник И ЕСТЬ программа, поэтому каждая реальная запись argv
+    // напрямую становится `program_args`.
     var exe_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (std.process.executablePath(init.io, &exe_path_buffer)) |exe_path_len| {
         if (panos_core.bundle.readTrailer(init.io, init.gpa, exe_path_buffer[0..exe_path_len]) catch null) |bundle_bytes| {
             defer init.gpa.free(bundle_bytes);
             var fat_arguments = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
             defer fat_arguments.deinit();
-            _ = fat_arguments.next(); // argv[0] — the fat binary's own path
+            _ = fat_arguments.next(); // argv[0] — собственный путь fat-бинарника
             var fat_program_args: std.ArrayList([]const u8) = .empty;
             defer {
                 for (fat_program_args.items) |argument| init.gpa.free(argument);
@@ -386,12 +392,8 @@ pub fn main(init: std.process.Init) !void {
     _ = arguments.next();
     var verbose = false;
     var profile_ffi = false;
-    // `contracts/cli.md` says "with no file.ps, panos starts the existing
-    // REPL mode" — but Odin's own `repl()` (`main.odin:205-207`) is an
-    // empty stub, no output, exit 0. No REPL exists on either toolchain —
-    // Odin is being deleted, not a compatibility target, so this stays a
-    // clear, informative message rather than silently matching Odin's
-    // no-op.
+    // REPL нет ни в одном из тулчейнов — без файла-аргумента выводится
+    // понятное информационное сообщение, а не молчаливый no-op.
     var file_path = arguments.next() orelse {
         try stdout.print("Panos REPL пока не реализован\n", .{});
         try stdout.flush();
@@ -414,12 +416,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Everything left on the command line after the script path — `ос.
-    // аргументы()` (`vm.zig`'s `Vm.program_args`), symmetric to Odin's
-    // `run_file(filename, program_args, ...)` (`main.odin`). Duped with
-    // `init.gpa` because `arguments.next()` points into the iterator's own
-    // buffer, which `arguments.deinit()` below invalidates — but these
-    // strings need to outlive that, through the whole VM run.
+    // Всё, что осталось в командной строке после пути к скрипту — это `ос.
+    // аргументы()` (`Vm.program_args` в `vm.zig`). Копируется через
+    // `init.gpa`, потому что `arguments.next()` указывает во внутренний
+    // буфер итератора, который инвалидируется `arguments.deinit()` ниже —
+    // а эти строки должны пережить это, на весь запуск VM.
     var program_args: std.ArrayList([]const u8) = .empty;
     defer {
         for (program_args.items) |argument| init.gpa.free(argument);
@@ -432,10 +433,11 @@ pub fn main(init: std.process.Init) !void {
         for (global_search_roots.items) |root| init.gpa.free(root);
         global_search_roots.deinit(init.gpa);
     }
-    // `$PANOS_STDLIB`, then `std/` next to this binary — tiers 3/4 of the
-    // documented module search (`docs/src/getting-started/installation.md`
-    // §"Поиск модулей"), tier 2 (`модули/` next to the importer) is
-    // per-importer and lives entirely in `module_loader.zig` itself.
+    // `$PANOS_STDLIB`, затем `std/` рядом с этим бинарником — уровни 3/4
+    // документированного поиска модулей (`docs/src/getting-started/
+    // installation.md` §"Поиск модулей"), уровень 2 (`модули/` рядом с
+    // импортирующим файлом) относится к каждому импортёру отдельно и
+    // целиком живёт в `module_loader.zig`.
     if (init.environ_map.get("PANOS_STDLIB")) |stdlib_dir| {
         try global_search_roots.append(init.gpa, try init.gpa.dupe(u8, stdlib_dir));
     }
@@ -443,22 +445,20 @@ pub fn main(init: std.process.Init) !void {
     if (std.process.executableDirPath(init.io, &exe_dir_buffer)) |len| {
         try global_search_roots.append(init.gpa, try std.fmt.allocPrint(init.gpa, "{s}/std", .{exe_dir_buffer[0..len]}));
     } else |_| {
-        // No real executable path (e.g. some sandboxed/embedded launch
-        // context) — tier 4 is simply unavailable then, not a fatal error;
-        // tiers 1-3 still work exactly as documented.
+        // Нет реального пути к исполняемому файлу (например, песочница
+        // или встроенный контекст запуска) — тогда уровень 4 просто
+        // недоступен, это не фатальная ошибка; уровни 1-3 по-прежнему
+        // работают точно как задокументировано.
     }
 
     try runGraph(init, stdout, stderr, FileReader{ .io = init.io }, file_path, global_search_roots.items, program_args.items, verbose, profile_ffi);
 }
 
-// Shared by the normal file-based `panos <file>` path above (`reader` =
-// `FileReader`, real disk) and the standalone-executable fat-binary path
-// below (`reader` = `bundle.BundleReader`, in-memory `.pns` content) —
-// `anytype` so both satisfy `module_loader.Graph.load`'s duck-typed
-// `reader` interface without a shared base type. Identical to the
-// previous inline body of `main()` from `graph.load` through the final
-// `switch (execution)` — no behavioral change for the existing file-based
-// path, purely an extraction so the fat-binary path can reuse it exactly.
+// Общая функция для обычного файлового пути `panos <file>` выше (`reader`
+// = `FileReader`, реальный диск) и пути автономного fat-бинарника ниже
+// (`reader` = `bundle.BundleReader`, содержимое `.pns` в памяти) —
+// `anytype`, чтобы оба варианта удовлетворяли duck-typed интерфейсу
+// `reader` из `module_loader.Graph.load` без общего базового типа.
 fn runGraph(
     init: std.process.Init,
     stdout: *std.Io.Writer,
@@ -477,12 +477,12 @@ fn runGraph(
     });
     defer runtime.deinit();
     try runtime.load(&reader, entry_path);
-    // Real prelude module (same as runner.zig's single-file pipeline and
-    // the LSP already do) instead of the type-checker's hardcoded
-    // Опция/Результат/interface stand-ins — `module_compiler.zig`'s
-    // `ImportContext.collect` bridges its real definitions into every
-    // other module, `preludePass` (`type_checker.zig`) skips its own
-    // hardcode once it detects this.
+    // Настоящий модуль prelude (как и в однофайловом пайплайне
+    // `runner.zig`, и в LSP) вместо захардкоженных заглушек типов
+    // Опция/Результат/интерфейс в тайпчекере — `ImportContext.collect` из
+    // `module_compiler.zig` прокидывает его настоящие определения во все
+    // остальные модули, `preludePass` (`type_checker.zig`) пропускает свой
+    // хардкод, как только это обнаруживает.
     if (runtime.graphDiagnostics().items.items.len != 0) {
         try writeModuleDiagnostics(stderr, runtime.graph());
         if (runtime.hasGraphErrors()) {
@@ -527,23 +527,20 @@ fn runGraph(
             const output = try panos_core.runner.renderValue(init.gpa, runtime_value);
             defer init.gpa.free(output);
             if (verbose) try stdout.print("EXECUTION\n--------------------------\n", .{});
-            // `machine.output` — accumulated `ввод_вывод.печать`/`.строка`
-            // calls made DURING execution — printed first, same order a
-            // real stdout write during the program's own run would have
-            // appeared in.
+            // `machine.output` — накопленные вызовы `ввод_вывод.печать`/
+            // `.строка`, сделанные ВО ВРЕМЯ исполнения — печатаются первыми,
+            // в том же порядке, в каком реальная запись в stdout появилась
+            // бы во время самого запуска программы.
             try stdout.print("{s}{s}\n", .{ runtime.output(), output });
             try stdout.flush();
-            // `stderr` is buffered (`stderr_buffer` above) and otherwise
-            // only ever flushed on the error-exit paths — a WARNING-only
-            // diagnostic (e.g. "неиспользованная переменная") written by
-            // `writeGraphDiagnostics` above never reaches the real
-            // terminal on the success path without this: the process
-            // just returns normally, and Zig's buffered `Io.Writer` has
-            // no destructor-style auto-flush on exit. Found by actually
-            // running the built binary, not by reading the code — a unit
-            // test calling `compileGraph` directly (bypassing `main`
-            // entirely) saw the diagnostic just fine, which is why this
-            // stayed hidden.
+            // `stderr` буферизован (`stderr_buffer` выше) и иначе флашится
+            // только на путях выхода с ошибкой — диагностика, состоящая
+            // ТОЛЬКО из предупреждения (например "неиспользованная
+            // переменная"), написанная `writeGraphDiagnostics` выше, без
+            // этого никогда не доходит до настоящего терминала на пути
+            // успеха: процесс просто нормально завершается, а у
+            // буферизованного `Io.Writer` в Zig нет авто-флаша при выходе
+            // по типу деструктора.
             try stderr.flush();
         },
         .runtime_error => |message| {
@@ -558,12 +555,13 @@ fn runGraph(
     }
 }
 
-// Runs a standalone-executable bundle embedded via `panos build --compile`
-// (`zig/core/bundle.zig`). `.pns` content is served straight from memory
-// (`bundle.BundleReader`, no temp directory at all for it) — a real temp
-// directory is only created on disk if the bundle carries at least one
-// `внешний`-library entry, since `dlopen`/`LoadLibraryW` need a real file.
-// Both cases share `runGraph` unchanged, parameterized only by `reader`.
+// Запускает автономный bundle, встроенный через `panos build --compile`
+// (`zig/core/bundle.zig`). Содержимое `.pns` отдаётся прямо из памяти
+// (`bundle.BundleReader`, для него вообще нет временной директории) —
+// настоящая временная директория на диске создаётся, только если bundle
+// несёт хотя бы одну запись `внешний`-библиотеки, поскольку `dlopen`/
+// `LoadLibraryW` нужен реальный файл. Оба случая используют один и тот же
+// `runGraph`, параметризованный только `reader`.
 fn runFatBinary(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writer, bundle_bytes: []const u8, program_args: []const []const u8) !void {
     var decoded = panos_core.bundle.deserialize(init.gpa, bundle_bytes) catch |err| {
         try stderr.print("panos: повреждённый встроенный bundle: {t}\n", .{err});
@@ -572,12 +570,12 @@ fn runFatBinary(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.
     };
     defer decoded.deinit();
 
-    // A namespace prefix for every entry's virtual path — used to build
-    // `entry_path` for `graph.load` below regardless of whether anything
-    // is ever actually written to disk under it. Only `внешний`-library
-    // entries (if any) get REAL bytes written here; `.pns` content is
-    // served by `BundleReader` straight from `decoded`, never touching
-    // this directory at all.
+    // Префикс пространства имён для виртуального пути каждой записи —
+    // используется для построения `entry_path` для `graph.load` ниже вне
+    // зависимости от того, пишется ли под ним что-то реально на диск.
+    // Только записи `внешний`-библиотек (если есть) получают здесь РЕАЛЬНЫЕ
+    // байты на диске; содержимое `.pns` отдаётся `BundleReader` прямо из
+    // `decoded`, вообще не касаясь этой директории.
     const now_ns = std.Io.Timestamp.now(init.io, .real).nanoseconds;
     const temp_root = try std.fmt.allocPrint(init.gpa, ".panos-fat-{d}", .{now_ns});
     defer init.gpa.free(temp_root);
@@ -594,18 +592,19 @@ fn runFatBinary(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.
     const entry_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{ temp_root, decoded.entry_path });
     defer init.gpa.free(entry_path);
 
-    // A SINGLE synthetic root, not the real `$PANOS_STDLIB`/exe-relative
-    // `std/` — a standalone executable carries its ENTIRE dependency
-    // closure (including any `std/` modules it used) inside the bundle
-    // itself, never touching the real filesystem for it (see `bundle.
-    // collect`'s/`bundle.bundleKey`'s doc comments for why this exact
-    // shape — `module_loader.zig`'s own bare-name candidate search tries
-    // `{root}/{name}(.pns|.ps)` for each `global_search_roots` entry, and
-    // `bundleKey` stores exactly matching `"std/{name}.pns"` bundle keys
-    // for anything reached this way at build time). Pulling in the REAL
-    // `$PANOS_STDLIB` here would make a "standalone" binary's behavior
-    // depend on what happens to be installed on the machine running it —
-    // exactly what this feature exists to avoid.
+    // ОДИН синтетический корень, а не настоящий `$PANOS_STDLIB`/`std/`
+    // рядом с исполняемым файлом — автономный исполняемый файл несёт ВСЮ
+    // свою транзитивную зависимость (включая любые использованные модули
+    // `std/`) внутри самого bundle, вообще не трогая для этого реальную
+    // файловую систему (почему форма именно такая — см. doc-комментарии
+    // `bundle.collect`/`bundle.bundleKey`: собственный поиск кандидатов по
+    // голому имени в `module_loader.zig` пробует `{root}/{name}(.pns|.ps)`
+    // для каждой записи `global_search_roots`, а `bundleKey` на этапе
+    // сборки хранит ключи bundle вида ровно `"std/{name}.pns"` для всего,
+    // до чего дотянулись таким путём). Подключение сюда РЕАЛЬНОГО
+    // `$PANOS_STDLIB` сделало бы поведение "автономного" бинарника
+    // зависящим от того, что случайно установлено на машине, где он
+    // запускается — именно то, чего эта функциональность избегает.
     const synthetic_root = try std.fmt.allocPrint(init.gpa, "{s}/std", .{temp_root});
     defer init.gpa.free(synthetic_root);
     const global_search_roots = [_][]const u8{synthetic_root};

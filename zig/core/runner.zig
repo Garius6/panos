@@ -18,9 +18,9 @@ const types = @import("types.zig");
 const value = @import("value.zig");
 const vm = @import("vm.zig");
 
-// A single-file program has exactly one real module — this reader only ever
-// serves that one path; the embedded prelude is appended separately via
-// `Graph.appendPreludeModule`, never through this reader.
+// В программе из одного файла ровно один настоящий модуль — этот reader
+// отдаёт только этот путь; встроенный prelude добавляется отдельно через
+// `Graph.appendPreludeModule`, а не через этот reader.
 const SingleFileReader = struct {
     path: []const u8,
     bytes: []const u8,
@@ -47,9 +47,9 @@ pub const SourceAnalysis = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     diagnostics: diagnostic.DiagnosticList = .{},
-    // The user's own file is always module 0 — it's loaded via `graph.load`
-    // before the embedded prelude is appended, and `appendPreludeModule`
-    // only ever adds modules AFTER whatever's already there.
+    // Файл пользователя всегда модуль 0 — он загружается через `graph.load`
+    // до добавления встроенного prelude, а `appendPreludeModule` всегда
+    // добавляет модули ПОСЛЕ уже имеющихся.
     graph: ?module_loader.Graph = null,
     compiled: ?module_compiler.GraphCompileResult = null,
 
@@ -100,11 +100,11 @@ pub const SourceAnalysis = struct {
         return @as(?[]const u8, try formatTypeName(self.arena.allocator(), &checked.types, &resolved.symbols, type_id));
     }
 
-    /// Returns the `///`-doc-comment text attached to the declaration a use
-    /// resolves to, if any. `Resolution` only exposes the forward
-    /// `DeclId -> SymbolId` direction (`decl_symbols`), so this inverts it
-    /// on the spot — cheap enough for one file's worth of declarations per
-    /// hover request, not worth a permanent index.
+    /// Возвращает текст doc-комментария (`///`), прикреплённого к декларации,
+    /// на которую резолвится использование, если он есть. `Resolution`
+    /// хранит только прямое направление `DeclId -> SymbolId` (`decl_symbols`),
+    /// поэтому здесь оно инвертируется на месте — дёшево для деклараций
+    /// одного файла на один hover-запрос, постоянный индекс не оправдан.
     pub fn expressionDoc(self: *SourceAnalysis, expression: ast.ExprId) ?[]const u8 {
         const resolved = self.resolution() orelse return null;
         const symbol = resolved.expr_symbols.get(expression) orelse return null;
@@ -305,12 +305,12 @@ pub fn analyzeSourceForTarget(
     var analysis = SourceAnalysis.init(allocator);
     errdefer analysis.deinit();
 
-    // A real `импорт` isn't supported by this single-file entry point (the
-    // embedded prelude below is injected separately, never through user
-    // `импорт` syntax) — checked with a throwaway parse so the rejection
-    // keeps its own specific message instead of surfacing as a confusing
-    // "не удалось загрузить модуль" from the graph loader, which has no
-    // other file to find.
+    // Настоящий `импорт` не поддержан этой точкой входа для одного файла
+    // (встроенный prelude ниже подключается отдельно, никогда через
+    // пользовательский синтаксис `импорт`) — проверяется черновым разбором,
+    // чтобы отказ нёс собственное специфичное сообщение, а не запутывающее
+    // "не удалось загрузить модуль" из загрузчика графа, которому попросту
+    // некуда больше смотреть.
     if (try reportUnsupportedImports(allocator, input, &analysis)) return analysis;
 
     var graph = module_loader.Graph.init(allocator);
@@ -394,10 +394,10 @@ fn reportUnsupportedImports(allocator: std.mem.Allocator, input: []const u8, ana
     return analysis.hasErrors();
 }
 
-// Thin re-export — the real implementation lives in `vm.zig`
-// (`renderRuntimeValue`) since `ввод_вывод.печать`/`.строка` need the
-// SAME value-to-text conversion at RUNTIME, not just here at the final
-// return-value line.
+// Тонкий реэкспорт — реальная реализация живёт в `vm.zig`
+// (`renderRuntimeValue`), поскольку `ввод_вывод.печать`/`.строка` нуждаются
+// в ТОМ ЖЕ преобразовании значения в текст ВО ВРЕМЯ ВЫПОЛНЕНИЯ, а не только
+// здесь, в финальной строке возвращаемого значения.
 pub fn renderValue(allocator: std.mem.Allocator, runtime_value: value.Value) ![]const u8 {
     return vm.renderRuntimeValue(allocator, runtime_value);
 }
@@ -823,11 +823,10 @@ test "runner round-trips an environment variable through установить_о
 }
 
 test "runner captures exit code and stdout through ос.выполнить" {
-    // `/bin/echo` doesn't exist on Windows at all (no POSIX filesystem
-    // layout, and there's no single universal standalone echo.exe path —
-    // `echo` there is a `cmd.exe` builtin, not a real executable file) —
-    // this was never a real cross-platform test, just never compile-
-    // tested on Windows until `внешний`/FFI itself started working there.
+    // `/bin/echo` вообще не существует на Windows (нет POSIX-раскладки
+    // файловой системы, и нет единого универсального пути к echo.exe —
+    // `echo` там встроенная команда `cmd.exe`, а не отдельный исполняемый
+    // файл).
     if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var result = try runSource(std.testing.allocator, "пример.ps",
         \\экспорт функ старт() -> Строка
@@ -885,11 +884,12 @@ test "browser target still allows ос.аргументы/ос.версия_па
 }
 
 test "runner decompresses a real gzip file through фс.прочитать + сжатие.разжать_gzip" {
-    // Real gzip bytes for "hello world" (`gzip.compress(b"hello world", mtime=0)` in
-    // Python) — a Panos source LITERAL can't hold this (arbitrary bytes, not
-    // valid UTF-8), so this goes through a file on disk exactly like real
-    // usage would (read a `.gz` file, decompress its raw byte content),
-    // never through source-embedded string escapes.
+    // Настоящие байты gzip для "hello world" (`gzip.compress(b"hello world",
+    // mtime=0)` в Python) — строковый ЛИТЕРАЛ панос не может их хранить
+    // (произвольные байты, не валидный UTF-8), поэтому тест идёт через файл
+    // на диске точно так же, как реальное использование (прочитать `.gz`
+    // файл, разжать его сырое байтовое содержимое), а не через
+    // строковые escape-последовательности в исходнике.
     const gzip_bytes = [_]u8{
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x48, 0xcd,
         0xc9, 0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0x01, 0x00, 0x85, 0x11, 0x4a,
@@ -1206,11 +1206,9 @@ test "runner percent-encodes reserved bytes through сеть.кодироват�
 }
 
 test "runner reports a Result failure when сеть.подключиться can't reach the host" {
-    // Port 1 is a reserved low port almost never bound on a dev/CI machine —
-    // deterministic connection-refused without needing a real listener in
-    // this test (the success path — real bytes over a real accepted TCP
-    // connection — was verified manually against a live Python socket
-    // server during development, see progress-report.md).
+    // Порт 1 — зарезервированный низкий порт, почти никогда не занятый на
+    // машине разработки/CI — детерминированный connection-refused без
+    // необходимости в реальном слушателе для этого теста.
     var result = try runSource(std.testing.allocator, "пример.ps", "экспорт функ старт() -> Булево\nсеть.подключиться(\"127.0.0.1\", 1.0).успех()\nконец");
     defer result.deinit();
 
@@ -1235,11 +1233,8 @@ test "browser target still allows сеть.кодировать_url" {
 }
 
 test "runner reports a Result failure when сеть.http_запрос can't reach the host" {
-    // Deterministic connection-refused (port 1, almost never bound) without
-    // needing a real listener in this test — the happy path (real request
-    // to a real server, headers sent, body/status/headers read back
-    // correctly) was verified manually against a live Python
-    // `http.server` during development, see progress-report.md.
+    // Детерминированный connection-refused (порт 1, почти никогда не занят)
+    // без необходимости в реальном слушателе для этого теста.
     var result = try runSource(std.testing.allocator, "пример.ps", "экспорт функ старт() -> Булево\nпер пусто: Соответствие(Строка, Строка) = соответствие()\nсеть.http_запрос(\"GET\", \"http://127.0.0.1:1/\", \"\", пусто).успех()\nконец");
     defer result.deinit();
 
@@ -1276,15 +1271,12 @@ test "browser target rejects сеть.http_запрос before compilation" {
 }
 
 test "runner performs a full CRUD round-trip through бд.открыть/выполнить/запрос, omitting NULL columns" {
-    // Unique per test RUN (not just per test name) — this exact test
-    // block gets compiled into more than one `zig build test` root
-    // (`runner.zig` itself, plus anything that imports it, e.g.
-    // `lsp_graph.zig`), and those binaries run concurrently on CI. A
-    // fixed filename let two separate processes race on the SAME sqlite
-    // file — confirmed on real CI (linux-amd64, 2026-08-18): one process
-    // saw "database is locked", the other read the OTHER process's
-    // in-progress rows. Not a flaky assertion — a genuine missing
-    // per-process isolation bug.
+    // Уникально на каждый ЗАПУСК теста (не только на имя теста) — этот
+    // тестовый блок компилируется в несколько корней `zig build test`
+    // (сам `runner.zig`, плюс всё, что его импортирует, например
+    // `lsp_graph.zig`), и эти бинарники выполняются на CI параллельно.
+    // Фиксированное имя файла даёт двум разным процессам гонку за один
+    // и тот же sqlite-файл.
     var io = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io.deinit();
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "zzz_runner_sql_probe_{x}.sqlite", .{std.Io.Timestamp.now(io.io(), .real).nanoseconds});
@@ -1320,19 +1312,19 @@ test "runner performs a full CRUD round-trip through бд.открыть/вып�
 
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
     switch (result.execution orelse return error.TestUnexpectedResult) {
-        // Order: "груша" sorts before "яблоко" (Cyrillic г < я) — its
-        // NULL цена is omitted from the map entirely (`получить` falls
-        // back to "?"), "яблоко" has a real цена and `.есть("цена")`
-        // confirms it.
+        // Порядок: "груша" сортируется раньше "яблоко" (кириллическое
+        // г < я) — её NULL-цена целиком отсутствует в отображении
+        // (`получить` возвращает запасное "?"), у "яблоко" реальная цена,
+        // что подтверждает `.есть("цена")`.
         .success => |output| try std.testing.expectEqualStrings("груша|?|яблоко|есть", output),
         .runtime_error => return error.TestUnexpectedResult,
     }
 }
 
 test "runner reports a Result failure for bad SQL and for a closed connection" {
-    // Unique per test RUN, same reason as the CRUD round-trip test just
-    // above — this exact test also gets compiled into multiple `zig
-    // build test` roots that run concurrently on CI.
+    // Уникально на каждый запуск теста, причина та же, что и у CRUD-теста
+    // выше — этот тест тоже компилируется в несколько корней `zig build
+    // test`, выполняющихся на CI параллельно.
     var io = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io.deinit();
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "zzz_runner_sql_errors_{x}.sqlite", .{std.Io.Timestamp.now(io.io(), .real).nanoseconds});
@@ -1405,8 +1397,8 @@ test "runner marshals КСтрока arguments and return through внешний
     defer length_result.deinit();
     try std.testing.expectEqual(@as(usize, 0), length_result.diagnostics.items.items.len);
     switch (length_result.execution orelse return error.TestUnexpectedResult) {
-        // "привет" — 6 Cyrillic letters, 2 UTF-8 bytes each — strlen
-        // counts bytes, not runes.
+        // "привет" — 6 кириллических букв по 2 байта UTF-8 каждая — strlen
+        // считает байты, а не руны.
         .success => |output| try std.testing.expectEqualStrings("12", output),
         .runtime_error => return error.TestUnexpectedResult,
     }
@@ -1415,13 +1407,12 @@ test "runner marshals КСтрока arguments and return through внешний
     defer getenv_result.deinit();
     try std.testing.expectEqual(@as(usize, 0), getenv_result.diagnostics.items.items.len);
     switch (getenv_result.execution orelse return error.TestUnexpectedResult) {
-        // A real C NULL return, coerced to an empty `Строка` by
-        // `std.mem.span` on a null pointer would itself crash — this
-        // just confirms a genuinely-missing env var round-trips without
-        // panicking; a real end-to-end non-empty round-trip was verified
-        // manually (`PANOS_FFI_TEST_VAR=... zig build run -- ...`, see
-        // progress-report.md) since setting real process environment for
-        // a `std.testing`-run test is its own can of worms.
+        // Настоящий NULL от C, приведение к пустой `Строка` через
+        // `std.mem.span` на null-указателе само по себе крашнулось бы —
+        // этот тест лишь подтверждает, что реально отсутствующая
+        // переменная окружения проходит без паники; выставление настоящего
+        // окружения процесса для теста под `std.testing` — отдельная
+        // головная боль, поэтому не проверяется здесь.
         .success => |output| try std.testing.expect(output.len == 0),
         .runtime_error => return error.TestUnexpectedResult,
     }
@@ -1440,12 +1431,12 @@ test "runner reports a Resolve Error for a missing внешний library or sym
 }
 
 test "runner resolves a relative внешний library path against the script's own directory, not cwd" {
-    // No real shared library needs to exist on disk for this — a
-    // missing-library error still reports the path the resolver
-    // actually TRIED, which is enough to confirm it joined against
-    // "проект" (the script's directory) rather than leaving
-    // "./libs/zzz_missing" untouched (which would mean cwd-relative
-    // resolution, not script-relative).
+    // Реальной разделяемой библиотеке не нужно существовать на диске —
+    // ошибка "библиотека не найдена" всё равно сообщает путь, который
+    // резолвер РЕАЛЬНО пытался открыть, этого достаточно, чтобы убедиться,
+    // что путь собран относительно "проект" (директории скрипта), а не
+    // остался как "./libs/zzz_missing" (что означало бы резолюцию
+    // относительно cwd, а не скрипта).
     var result = try runSource(std.testing.allocator, "проект/main.ps", "внешний \"./libs/zzz_missing_lib\" функ f() -> Целое(32)\nэкспорт функ старт() -> Целое\n0\nконец");
     defer result.deinit();
     try std.testing.expect(result.hasErrors());
@@ -1459,10 +1450,11 @@ test "browser target rejects внешний before compilation" {
     try std.testing.expectEqualStrings("Resolve Error: 'внешний' недоступно в этом runtime-таргете", result.diagnostics.items.items[0].message);
 }
 
-// Best-effort single HTTP/1.0 GET over a raw socket — `null` on connection
-// failure (server not listening YET — the accept happens on a background
-// worker thread only after the VM scheduler actually reaches it, so the
-// caller retries instead of assuming a fixed startup delay).
+// Одиночный HTTP/1.0 GET через сырой сокет по принципу best-effort —
+// `null` при ошибке соединения (сервер ЕЩЁ не слушает — accept выполняется
+// в фоновом рабочем потоке только после того, как планировщик VM реально
+// до него доходит, поэтому вызывающий код повторяет попытки вместо того,
+// чтобы полагаться на фиксированную задержку старта).
 fn tryHttpGetOnce(allocator: std.mem.Allocator, port: u16, path: []const u8) !?[]u8 {
     return tryHttpGetOnceWithHeader(allocator, port, path, null);
 }
@@ -1605,18 +1597,19 @@ test "runner reads a custom request header through Запрос.заголово
     try std.testing.expect(std.mem.indexOf(u8, body, "заголовок-ok") != null);
 }
 
-// Crash-oracle fuzz test over the ENTIRE pipeline (lex → parse → resolve →
-// typecheck → compile → run) — the class of bug this session actually
-// found in panosiki was never a lexer/parser crash, it was VM/typechecker
-// invariants breaking on legitimate-looking but unusual programs (empty
-// collection literals feeding generic inference, named-argument
-// constructors, cross-pass argument-order desync, ...). Random bytes
-// essentially never get past parsing, so the corpus below seeds a handful
-// of REAL near-miss shapes (empty generic literals, reordered named args,
-// nested match/if with mixed interface types) that the mutator can then
-// perturb — closer to what actually broke than pure byte noise. Diagnostics
-// and runtime errors are both an expected, PASSING outcome here; only an
-// actual panic/crash fails this test.
+// Fuzz-тест на панику по ВСЕМУ пайплайну (лексер → парсер → резолвер →
+// тайпчекер → компилятор → исполнение) — класс багов, интересующий этот
+// тест, это не крэши лексера/парсера, а нарушения инвариантов VM/тайпчекера
+// на выглядящих легитимно, но необычных программах (пустые литералы
+// коллекций, питающие вывод дженериков, конструкторы с именованными
+// аргументами, рассинхрон порядка аргументов между проходами, ...).
+// Случайные байты почти никогда не проходят парсинг, поэтому корпус ниже
+// содержит несколько РЕАЛЬНЫХ пограничных форм (пустые generic-литералы,
+// переставленные именованные аргументы, вложенные match/if со смешанными
+// типами интерфейсов), которые мутатор может затем возмущать — это ближе
+// к тому, что реально ломалось, чем чистый байтовый шум. Диагностики и
+// runtime-ошибки — оба ожидаемый, ПРОХОДЯЩИЙ исход; тест падает только
+// при настоящей панике/крэше.
 test "full pipeline never panics on arbitrary or near-valid programs" {
     try std.testing.fuzz(std.testing.allocator, testPipelineNeverPanics, .{
         .corpus = &.{
@@ -1627,14 +1620,14 @@ test "full pipeline never panics on arbitrary or near-valid programs" {
             "экспорт функ старт() -> Число\nвыбор 1\n1 -> 2\n_ -> 3\nконец\nконец",
             "экспорт функ старт() -> Пусто\nпер x: Соответствие(Строка, Число) = соответствие()\nx[\"a\"] = 1\nконец",
             "функ ф() -> Никогда\nпаника(\"x\")\nконец",
-            // Return-only generic type parameter, seeded from an
-            // annotated `пер` (bidirectional inference, added this
-            // session) — both the resolvable and genuinely-unresolvable
-            // shapes.
+            // Параметр generic-типа, выводимый только по возвращаемому
+            // значению, засеянный через аннотированный `пер`
+            // (двунаправленный вывод типов) — обе формы, разрешимая и
+            // принципиально неразрешимая.
             "тип К[T] = структура\nэ: Массив(T)\nконец\nфунк ф[T]() -> К(T)\nК(массив())\nконец\nэкспорт функ старт() -> Пусто\nпер к: К(Число) = ф()\nконец",
             "тип К[T] = структура\nэ: Массив(T)\nконец\nфунк ф[T]() -> К(T)\nК(массив())\nконец\nэкспорт функ старт() -> Пусто\nпер к: Строка = ф()\nконец",
-            // Cross-module-shaped generic interface bound (single-file
-            // approximation) — the class of bug that broke `pan init`.
+            // Ограничение generic-интерфейса в форме, приближающей
+            // межмодульный случай (в рамках одного файла).
             "тип Т = структура\nx: Число\nконец\nреализация Печатаемое для Т\nфунк вСтроку(это: Т) -> Строка\n\"т\"\nконец\nконец\nфунк ф[T: Печатаемое](x: T) -> Строка\nx.вСтроку()\nконец\nэкспорт функ старт() -> Строка\nф(Т(1))\nконец",
         },
     });

@@ -252,12 +252,12 @@ pub const ScopeStack = struct {
         return &self.scopes.items[@intFromEnum(id)];
     }
 
-    // Public so callers (e.g. `resolver.zig`'s unused-variable warning
-    // check) can enumerate a scope's own symbols right before it's
-    // popped — the only safe moment: blocks are strictly nested, no
-    // hoisting, so by `pop`-time every possible reference into this
-    // scope has already been visited by the resolver's single forward
-    // pass.
+    // Публичный метод, чтобы вызывающий код (например, проверка
+    // неиспользуемых переменных в `resolver.zig`) мог перечислить символы
+    // области видимости прямо перед её удалением — единственный безопасный
+    // момент: блоки строго вложены, подъёма объявлений нет, поэтому к
+    // моменту `pop` все возможные ссылки на эту область уже посещены
+    // однопроходным прямым обходом резолвера.
     pub fn scopeByIdConst(self: *const ScopeStack, id: ScopeId) *const Scope {
         return &self.scopes.items[@intFromEnum(id)];
     }

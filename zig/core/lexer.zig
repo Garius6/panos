@@ -697,13 +697,14 @@ test "lexer reports invalid UTF-8 and continues" {
     try std.testing.expectEqualDeep(source.Span{ .file_id = 3, .start = 0, .end = 1 }, result.diagnostics.items.items[0].span);
 }
 
-// Crash-oracle fuzz test — `tokenize` must never panic/UB on ANY byte
-// sequence, valid UTF-8 or not (the whole point of `Лексическая ошибка:
-// некорректный UTF-8`/`неожиданный символ` recovery above is that malformed
-// input degrades to a diagnostic, never a crash). `zig build test --fuzz`
-// runs this continuously against libFuzzer-style coverage-guided mutation;
-// a plain `zig build test` still runs it once against the seed corpus
-// below, so a regression here fails CI even without fuzzing turned on.
+// Crash-oracle fuzz-тест — `tokenize` не должен паниковать/UB на ЛЮБОЙ
+// последовательности байт, валидной UTF-8 или нет (смысл восстановления
+// через `Лексическая ошибка: некорректный UTF-8`/`неожиданный символ` выше
+// именно в том, что некорректный ввод превращается в диагностику, а не в
+// падение). `zig build test --fuzz` гоняет этот тест непрерывно с
+// coverage-guided мутацией в стиле libFuzzer; обычный `zig build test`
+// всё равно прогоняет его один раз по seed-корпусу ниже, так что регрессия
+// здесь роняет CI даже без включённого фаззинга.
 test "lexer never panics on arbitrary bytes" {
     try std.testing.fuzz(std.testing.allocator, testTokenizeNeverPanics, .{
         .corpus = &.{

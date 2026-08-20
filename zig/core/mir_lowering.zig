@@ -10,29 +10,28 @@ const types = @import("types.zig");
 const wasm_module = @import("wasm_module.zig");
 const wasm_heap = @import("wasm_heap.zig");
 
-// Not tied to any real declared variable — same "dummy" convention
-// `wasm_heap.zig` already established for compiler-synthesized locals.
+// Не привязан ни к одной реальной объявленной переменной — то же
+// соглашение о "заглушке", что уже установлено в `wasm_heap.zig` для
+// локальных переменных, синтезированных компилятором.
 const dummy_symbol: symbols.SymbolId = @enumFromInt(0);
 
-// AST (post resolve+typecheck) → MIR. Ported from `core/mir_lowering.odin`
-// (~2000 lines there) — works at the SAME pipeline point `compiler.zig`
-// already does: reads the already-computed resolver/type-checker side
-// tables (`resolution.expr_symbols`/`decl_symbols`/`function_parameters`,
-// `checked.expression_types`/`symbol_types`/`types`), NEVER mutates or
-// recomputes them, never modifies the AST.
+// AST (после resolve+typecheck) → MIR. Работает в ТОЙ ЖЕ точке пайплайна,
+// что и `compiler.zig`: читает уже вычисленные таблицы resolver/
+// type-checker (`resolution.expr_symbols`/`decl_symbols`/
+// `function_parameters`, `checked.expression_types`/`symbol_types`/
+// `types`), НИКОГДА их не мутирует и не пересчитывает, не изменяет AST.
 //
-// SCOPE — deliberately narrower than even Odin's own "Phase 1" (see that
-// file's own doc comment): number/boolean/string literals, locals
-// (declare/read via `пер`/parameters), unary/binary operators (including
-// short-circuit `и`/`или`), `если`/`иначе`, `пока` (+ `прервать`/
-// `продолжить`), plain function calls (by identifier OR by an arbitrary
-// value — the generic `Call_Value_Instr` fallback), `возврат`. NOT covered
-// (reported via `AotDiagnostic` + `error.AotUnsupported`, rather than
-// silently producing incorrect MIR):
-// `выбор`/ADTs, closures, interfaces, actors, async I/O, generics,
-// operator-overload sugar (Сравниваемое/Арифметика), `для`/`для..in`,
-// destructuring, builtins, methods, `внешний`. Each of these is a REAL
-// Phase-2-equivalent addition, not an oversight — same split Odin made.
+// ОБЛАСТЬ ПОКРЫТИЯ: числовые/булевы/строковые литералы, локальные
+// переменные (объявление/чтение через `пер`/параметры), унарные/бинарные
+// операторы (включая короткое замыкание `и`/`или`), `если`/`иначе`,
+// `пока` (+ `прервать`/`продолжить`), обычные вызовы функций (по
+// идентификатору ИЛИ по произвольному значению — общий запасной вариант
+// `Call_Value_Instr`), `возврат`. НЕ покрыто (сообщается через
+// `AotDiagnostic` + `error.AotUnsupported`, а не молча производит
+// некорректный MIR): `выбор`/ADT, замыкания, интерфейсы, акторы,
+// асинхронный I/O, generic'и, sugar операторной перегрузки
+// (Сравниваемое/Арифметика), `для`/`для..in`, деструктуризация,
+// builtin'ы, методы, `внешний`.
 
 pub const FlowResult = enum { continues, terminates };
 
@@ -52,11 +51,11 @@ const LoopTargets = struct {
     break_target: mir.BlockId,
 };
 
-// One lowering attempt stops at the first unsupported AOT construct, so a
-// single structured diagnostic is sufficient. All slices are borrowed from
-// static strings or the source AST and therefore remain valid for the whole
-// lowering call (and while the caller reports the failure immediately after
-// it returns).
+// Одна попытка понижения останавливается на первой неподдержанной
+// AOT-конструкции, поэтому одной структурированной диагностики достаточно.
+// Все срезы заимствованы из статических строк или исходного AST и потому
+// остаются валидными на весь вызов понижения (и пока вызывающая сторона
+// сразу же сообщает об ошибке после возврата).
 pub const AotDiagnostic = struct {
     reason: ?[]const u8 = null,
     subject: ?[]const u8 = null,
@@ -72,14 +71,14 @@ pub const AotDiagnostic = struct {
     }
 };
 
-// Populated ONLY while lowering a lambda BODY (`lowerLambda` below) — a
-// captured symbol resolves via `frame_load{env_local, slot}` instead of
-// the ordinary `symbol_to_local` map, since it lives in the closure's
-// environment allocation, not a real WASM local of the lambda body
-// itself. `env_local` is the lambda body's own trailing `env_ptr`
-// parameter (a `LocalId`, loaded fresh via `load_local` each time it's
-// needed — same "reload from a Local" discipline this whole file
-// already uses everywhere else).
+// Заполняется ТОЛЬКО во время понижения ТЕЛА лямбды (`lowerLambda` ниже) —
+// захваченный символ разрешается через `frame_load{env_local, slot}`
+// вместо обычной карты `symbol_to_local`, поскольку живёт в аллокации
+// окружения замыкания, а не в настоящей WASM-локали самого тела лямбды.
+// `env_local` — это собственный завершающий параметр `env_ptr` тела
+// лямбды (`LocalId`, заново загружается через `load_local` при каждой
+// надобности — та же дисциплина "перезагрузки из Local", что уже
+// используется повсюду в этом файле).
 const CaptureEnv = struct {
     env_local: mir.LocalId,
     index_of: std.AutoHashMap(symbols.SymbolId, u32),
@@ -97,10 +96,11 @@ const LoweringContext = struct {
     builder: mir_builder.Builder,
     symbol_to_local: std.AutoHashMap(symbols.SymbolId, mir.LocalId),
     symbol_to_function: *const std.AutoHashMap(symbols.SymbolId, mir.FunctionId),
-    // Known only while a local still holds the literal lambda assigned by
-    // `пер f = функ ... конец`. This gives DOM promotion the exact nested
-    // environment layout without changing the runtime closure-box ABI.
-    // Any later assignment invalidates the entry conservatively.
+    // Известно, только пока локаль всё ещё держит литеральную лямбду,
+    // присвоенную через `пер f = функ ... конец`. Это даёт DOM-промоушену
+    // точную раскладку вложенного окружения без изменения рантайм-ABI
+    // бокса замыкания. Любое последующее присваивание консервативно
+    // инвалидирует запись.
     closure_origins: std.AutoHashMap(symbols.SymbolId, ast.ExprId),
     diagnostic: *AotDiagnostic,
     loops: std.ArrayList(LoopTargets) = .empty,
@@ -162,36 +162,36 @@ pub fn lowerModuleWithDiagnostic(
 
     const program = tree.program orelse return module;
 
-    // Two-pass — pass 1 reserves every function (forward references and
-    // recursion both need the callee's FunctionId to exist before any
-    // body is lowered); pass 2 lowers bodies.
+    // Два прохода — проход 1 резервирует каждую функцию (и опережающим
+    // ссылкам, и рекурсии нужно, чтобы FunctionId вызываемой функции
+    // существовал до понижения любого тела); проход 2 понижает тела.
     for (program.declarations) |decl_id| {
         const function = switch (tree.decl(decl_id).*) {
             .function => |value| value,
             else => continue,
         };
-        // Generic free functions are no longer skipped (were, "Phase 2")
-        // — panos generics are never monomorphized (see `type_checker.
-        // zig`'s own doc comments), so a generic body compiles exactly
-        // once, unspecialized, the SAME reasoning already applied to
-        // `.interface_decl` default methods this session (see
-        // `reserveMethods`'s own doc comment on that arm). Safe under
-        // the same condition: `T` must only ever be touched through an
-        // interface bound (ordinary `checked.interface_calls`/
-        // `interface_casts` dispatch, ALREADY handled by `lowerCall`/
-        // `applyInterfaceCast` — ordinary interface dispatch doesn't
-        // care whether the interface-typed value came from a generic
-        // bound-cast or an explicit non-generic interface parameter) or
-        // as an opaque `.nominal`/`.function`/struct-field pass-through
-        // (`wasm_objects.zig`'s `frame_store`/`frame_load` type each
-        // value from its OWN concrete producing expression at that call
-        // site, never from the generic declared type) — NOT as a bare
-        // returned/stored `T` value whose OWN WASM representation
-        // (i32 vs f64) could legitimately differ across different
-        // instantiations reachable from the same compiled body (that
-        // narrower case would need real per-instantiation specialization,
-        // not attempted here — no such function exists in the prelude or
-        // any current fixture).
+        // Generic-функции компилируются: generic'и панос никогда не
+        // монoморфизируются (см. собственные doc-комментарии
+        // `type_checker.zig`), поэтому тело generic-функции компилируется
+        // ровно один раз, неспециализированным — та же логика, что и для
+        // default-методов `.interface_decl` (см. собственный
+        // doc-комментарий `reserveMethods` на этой ветке). Безопасно при
+        // условии, что `T` затрагивается ТОЛЬКО через ограничение
+        // интерфейса (обычная диспетчеризация `checked.interface_calls`/
+        // `interface_casts`, УЖЕ обрабатываемая `lowerCall`/
+        // `applyInterfaceCast` — обычной диспетчеризации интерфейса не
+        // важно, пришло ли значение типа интерфейса из generic-приведения
+        // по ограничению или из явного не-generic параметра интерфейса)
+        // или как непрозрачный `.nominal`/`.function`/сквозной проброс
+        // поля структуры (`frame_store`/`frame_load` в `wasm_objects.zig`
+        // типизируют каждое значение по его СОБСТВЕННОМУ конкретному
+        // производящему выражению в этом месте вызова, никогда по
+        // объявленному generic-типу) — а НЕ как голое возвращаемое/
+        // сохраняемое значение `T`, чьё СОБСТВЕННОЕ WASM-представление
+        // (i32 против f64) могло бы законно различаться между разными
+        // инстанциациями, достижимыми из одного скомпилированного тела
+        // (этот более узкий случай потребовал бы настоящей специализации
+        // по инстанциации, здесь не реализовано).
         const symbol = resolution.decl_symbols.get(decl_id) orelse continue;
         const result_type = functionReturnType(checked, symbol);
         const function_id = try mir_builder.newFunction(&module, allocator, function.name, symbol, result_type, function.span);
@@ -214,27 +214,23 @@ pub fn lowerModuleWithDiagnostic(
     return module;
 }
 
-// `реализация Тип ... конец` methods — compiled by the NATIVE bytecode
-// backend (`compiler.zig`) as nothing more than an extra pass over
-// `implementation.methods` calling the same `predeclareFunction`/
-// `compileFunction` used for top-level `.function` decls (`это` is
-// just `parameters[0]`, no special binding) — `mir_lowering.zig` had
-// ZERO handling for `.impl` at all before this (confirmed: reservation
-// switched only `.function`, `.impl` fell into `else => continue`),
-// which made ANY struct method (e.g. `std/математика.pns`'s
-// `Генератор.следующее()`) an AOT-unsupported compile error (a process
-// panic before an earlier fix this session). Mirrors the native path
-// exactly: `lowerFunctionBody` is already fully generic over
-// `decl_id`/`body`, a method needs nothing method-specific there.
+// Методы `реализация Тип ... конец` — компилируются НАТИВНЫМ bytecode-
+// бэкендом (`compiler.zig`) как обычный дополнительный проход по
+// `implementation.methods`, вызывающий те же `predeclareFunction`/
+// `compileFunction`, что и для верхнеуровневых `.function`-деклараций
+// (`это` — это просто `parameters[0]`, без специального связывания).
+// `mir_lowering.zig` зеркалит нативный путь: `lowerFunctionBody` уже
+// полностью обобщён по `decl_id`/`body`, методу здесь не нужно ничего
+// специфичного.
 //
-// The one real difference from a plain function: the name a method's
-// `FunctionId` is reserved under is MANGLED (`"{Тип}::{метод}"`, same
-// convention the native VM already uses for its own method registry —
-// see the "interface vtables" fix) rather than the bare method name,
-// because `wasm_emit.zig`'s export section writes EVERY function's
-// name unconditionally with no dedup — two different structs both
-// defining a same-named method (e.g. `.длина()`-shaped collisions)
-// would otherwise produce duplicate WASM export entries.
+// Единственное реальное отличие от обычной функции: имя, под которым
+// резервируется `FunctionId` метода, MANGLED (`"{Тип}::{метод}"`, та же
+// конвенция, которую нативная VM уже использует для своего реестра
+// методов), а не голое имя метода, потому что секция экспорта
+// `wasm_emit.zig` пишет имя КАЖДОЙ функции безусловно, без дедупликации
+// — две разные структуры, объявляющие одноимённый метод (например,
+// коллизии вида `.длина()`), иначе произвели бы дублирующиеся записи
+// экспорта WASM.
 fn mangledMethodName(module: *mir.Module, target_type: []const u8, method_name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(module.arena.allocator(), "{s}::{s}", .{ target_type, method_name });
 }
@@ -262,16 +258,17 @@ fn reserveMethods(
                 module.functions.items[@intFromEnum(function_id)].type_store = &checked.types;
                 try symbol_to_function.put(symbol, function_id);
             },
-            // Default interface methods (`тип X = интерфейс \n функ м(это:
-            // X(...), ...) -> ... \n <тело> \n конец`) — a SEPARATE
-            // declaration kind from `.impl` (mirrors `compiler.zig`'s own
-            // `predeclareFunctions`: `.impl` and `.interface_decl` handled
-            // as two arms of the same switch, not one). `это`'s receiver
-            // here is the ABSTRACT interface type, not a concrete struct —
-            // reserved the SAME way regardless (mangled `"{Интерфейс}::
-            // {метод}"` name, ordinary `newFunction` — the interface-vs-
-            // concrete distinction only matters for the CALLING convention,
-            // handled separately in `wasm_interfaces.zig`).
+            // Default-методы интерфейса (`тип X = интерфейс \n функ м(это:
+            // X(...), ...) -> ... \n <тело> \n конец`) — ОТДЕЛЬНЫЙ вид
+            // декларации от `.impl` (зеркалит собственный
+            // `predeclareFunctions` из `compiler.zig`: `.impl` и
+            // `.interface_decl` обрабатываются как две ветки одного
+            // switch, не одна). Получатель `это` здесь — АБСТРАКТНЫЙ тип
+            // интерфейса, а не конкретная структура — резервируется ТЕМ ЖЕ
+            // способом в любом случае (mangled-имя
+            // `"{Интерфейс}::{метод}"`, обычный `newFunction` — различие
+            // интерфейс-vs-конкретный тип важно только для соглашения о
+            // ВЫЗОВЕ, обрабатываемого отдельно в `wasm_interfaces.zig`).
             .interface_decl => |interface| for (interface.default_methods) |method_decl_id| {
                 const function = tree.decl(method_decl_id).function;
                 const symbol = resolution.decl_symbols.get(method_decl_id) orelse continue;
@@ -316,45 +313,40 @@ fn lowerMethods(
     }
 }
 
-// --- Tree-shaking -----------------------------------------------------
+// --- Отсечение недостижимого кода (tree-shaking) -----------------------
 //
-// `cli/main.zig`'s AOT build path always links the FULL prelude into the
-// module graph, unconditionally — every declaration, whether or not the
-// actual program calls it. Every "AOT (wasm) не поддерживает X" build
-// failure hit across this whole multi-session WASM-AOT initiative
-// (generic struct fields, interface dispatch, default interface methods,
-// closures-as-values, cross-module TypeStore bugs...) was in prelude code
-// NO test program was even using — just reachable-in-principle. Without
-// reachability filtering, the NEXT unfamiliar prelude feature blocks the
-// NEXT program the exact same way, forever. This must run BEFORE
-// lowering (not as a dead-code-eliminate pass on the already-lowered MIR
-// module) — an unreachable declaration that fails to LOWER aborts the
-// whole build before any later pass could ever get a chance to discard
-// it.
+// AOT-путь сборки в `cli/main.zig` безусловно линкует ПОЛНЫЙ prelude в
+// граф модулей — каждую декларацию, независимо от того, вызывает ли её
+// реальная программа. Без фильтрации по достижимости следующая незнакомая
+// возможность prelude блокирует следующую программу тем же способом,
+// навсегда. Это должно выполняться ДО lowering (а не как проход
+// отсечения мёртвого кода над уже понижённым MIR-модулем) —
+// недостижимая декларация, которую не удаётся ПОНИЗИТЬ, прерывает всю
+// сборку раньше, чем у любого последующего прохода появился бы шанс её
+// отбросить.
 //
-// `SymbolId` is scoped per-module (a fresh `Resolution` per file — see
-// `lowerGraph`'s own "Imported symbols are freshly minted in the
-// importing Resolution" comment above), so a bare `SymbolId` is not
-// globally unique across the graph; every reachability key carries its
-// owning module index alongside the symbol.
+// `SymbolId` имеет область видимости per-module (свежий `Resolution` на
+// файл), поэтому голый `SymbolId` не уникален глобально по всему графу;
+// каждый ключ достижимости несёт вместе с символом индекс владеющего им
+// модуля.
 const ReachKey = struct {
     module_index: usize,
     symbol: symbols.SymbolId,
 };
 pub const ReachableSet = std.AutoHashMap(ReachKey, void);
 
-// A generic function/method's parameter or return type that stays a
-// BARE, unwrapped `.generic_parameter` (not `.nominal`/`.function` — see
-// `5cced87`'s own doc comment on why those ARE safe unspecialized) needs
-// ONE consistent WASM representation across every call site reachable in
-// the compiled program. `Category` classifies a concrete instantiation's
-// WASM value shape the same way `wasm_module.wasmValTypeForStore` does;
-// `MixedMap` records, per generic symbol, which categories were actually
-// seen — more than one means a single unspecialized compiled body would
-// need to treat the SAME local/return slot as both an i32 handle and an
-// f64 number depending on the caller, which is not representable without
-// real per-instantiation specialization (deliberately not implemented —
-// see `project_panos_wasm_no_monomorphization_needed` memory).
+// Параметр или тип возврата generic-функции/метода, остающийся ГОЛЫМ,
+// необёрнутым `.generic_parameter` (в отличие от `.nominal`/`.function` —
+// те безопасны неспециализированными), нуждается в ОДНОМ согласованном
+// WASM-представлении на всех местах вызова, достижимых в скомпилированной
+// программе. `Category` классифицирует форму WASM-значения конкретной
+// инстанциации тем же способом, что и `wasm_module.wasmValTypeForStore`;
+// `MixedMap` записывает, для каждого generic-символа, какие категории
+// реально встретились — больше одной означает, что единственное
+// неспециализированное скомпилированное тело должно было бы трактовать
+// ОДИН И ТОТ ЖЕ слот локали/возврата и как i32-хендл, и как f64-число в
+// зависимости от вызывающей стороны, что непредставимо без настоящей
+// специализации по инстанциации (сознательно не реализовано).
 const Category = enum { i32_like, f64_like };
 const MixedMap = std.AutoHashMap(ReachKey, std.EnumSet(Category));
 
@@ -367,13 +359,14 @@ fn isBareGenericParameter(store: *const types.TypeStore, type_id: types.TypeId) 
     return entry.* == .generic_parameter;
 }
 
-// Resolves `symbol`'s own function/method SIGNATURE type directly from
-// `checked.symbol_types` (a `.function{parameters, return_type}` —
-// panos generic signatures are stored as ordinary function types, T's
-// substitution status included, same lookup `functionReturnType` already
-// uses for the return half). Returns `null` for anything that isn't a
-// "risky" generic signature (no bare `.generic_parameter` anywhere in
-// it) — the common, safe case, skipped without further work.
+// Разрешает собственный тип СИГНАТУРЫ функции/метода `symbol` напрямую из
+// `checked.symbol_types` (`.function{parameters, return_type}` —
+// generic-сигнатуры панос хранятся как обычные функциональные типы,
+// включая статус подстановки T, тот же lookup, что `functionReturnType`
+// уже использует для половины с возвратом). Возвращает `null` для всего,
+// что не является "рискованной" generic-сигнатурой (нигде нет голого
+// `.generic_parameter`) — обычный, безопасный случай, пропускаемый без
+// дальнейшей работы.
 const RiskySignature = struct { parameters: []const types.TypeId, return_type: types.TypeId };
 
 fn riskyGenericSignature(checked: *const type_checker.CheckResult, symbol: symbols.SymbolId) ?RiskySignature {
@@ -394,12 +387,14 @@ fn riskyGenericSignature(checked: *const type_checker.CheckResult, symbol: symbo
     return RiskySignature{ .parameters = function_type.parameters, .return_type = function_type.return_type };
 }
 
-// Records, for a CALL to a "risky" generic symbol, which WASM
-// representation category each risky-typed argument's ACTUAL concrete
-// type maps to — called from `walkExpr`'s own `.call` case, reusing the
-// SAME import-redirect logic `recordReference` already applies (a
-// generic function called across a module boundary must be tracked
-// under the EXPORTING module's own symbol, not the importing alias).
+// Записывает, для ВЫЗОВА "рискованного" generic-символа, в какую
+// категорию WASM-представления отображается ФАКТИЧЕСКИЙ конкретный тип
+// каждого рискованно типизированного аргумента — вызывается из
+// собственного случая `.call` в `walkExpr`, переиспользуя ТУ ЖЕ логику
+// перенаправления импорта, что уже применяет `recordReference` (generic-
+// функция, вызванная через границу модуля, должна отслеживаться под
+// собственным символом ЭКСПОРТИРУЮЩЕГО модуля, а не импортирующим
+// псевдонимом).
 fn recordGenericInstantiation(
     compiled: anytype,
     resolution: *const resolver.Resolution,
@@ -432,10 +427,11 @@ fn recordGenericInstantiation(
 }
 
 fn isReachable(reachable: ?*const ReachableSet, module_index: usize, symbol: symbols.SymbolId) bool {
-    // `null` — no filtering at all (the single-file `lowerModule` path
-    // used by unit tests, which has no real module graph / entry point
-    // to compute reachability from) — every declaration compiles,
-    // exactly like before tree-shaking existed.
+    // `null` — фильтрации нет вовсе (путь `lowerModule` для одного файла,
+    // используемый юнит-тестами, у которого нет настоящего графа модулей
+    // / точки входа, от которой вычислять достижимость) — компилируется
+    // каждая декларация, точно как до появления отсечения недостижимого
+    // кода.
     const set = reachable orelse return true;
     return set.contains(.{ .module_index = module_index, .symbol = symbol });
 }
@@ -447,12 +443,13 @@ fn markReachable(allocator: std.mem.Allocator, set: *ReachableSet, worklist: *st
     try worklist.append(allocator, key);
 }
 
-// A referenced symbol may be a LOCAL declaration in `module_index`'s own
-// module, or an IMPORT ALIAS — `resolution.imported_symbols` (freshly
-// minted per importing module, see `lowerGraph`'s own comment) redirects
-// an alias straight to the exporting declaration's OWN module + symbol,
-// the exact same redirect `lowerGraph`'s existing "Imported symbols..."
-// loop already performs for `function_maps` — reused here unchanged.
+// Символ, на который есть ссылка, может быть ЛОКАЛЬНОЙ декларацией в
+// собственном модуле `module_index`, либо ПСЕВДОНИМОМ ИМПОРТА —
+// `resolution.imported_symbols` (свежеиспечён на каждый импортирующий
+// модуль) перенаправляет псевдоним прямо на СОБСТВЕННЫЙ модуль + символ
+// экспортирующей декларации — то же самое перенаправление, что уже
+// выполняет существующий цикл `lowerGraph` для `function_maps`,
+// переиспользуется здесь без изменений.
 fn recordReference(
     allocator: std.mem.Allocator,
     compiled: anytype,
@@ -471,12 +468,12 @@ fn recordReference(
     try markReachable(allocator, set, worklist, module_index, symbol);
 }
 
-// Finds the body of whichever declaration (top-level function, `.impl`
-// method, or `.interface_decl` default method) owns `symbol` in this
-// module — a plain linear scan (not a pre-built reverse index): this
-// runs once per worklist item, not a hot path, and program sizes here
-// are small enough that the extra bookkeeping of a cached reverse map
-// isn't worth it.
+// Находит тело той декларации (верхнеуровневая функция, метод `.impl`
+// или default-метод `.interface_decl`), которой в этом модуле принадлежит
+// `symbol` — обычное линейное сканирование (не заранее построенный
+// обратный индекс): это выполняется один раз на элемент worklist, не
+// горячий путь, и размеры программ здесь достаточно малы, чтобы
+// дополнительный учёт кэшируемой обратной карты того не стоил.
 fn findSymbolBody(tree: *const ast.Ast, resolution: *const resolver.Resolution, symbol: symbols.SymbolId) ?[]const ast.StmtId {
     const program = tree.program orelse return null;
     for (program.declarations) |decl_id| {
@@ -496,14 +493,15 @@ fn findSymbolBody(tree: *const ast.Ast, resolution: *const resolver.Resolution, 
     return null;
 }
 
-// Every interface cast anywhere in reachable code pulls in the concrete
-// implementation it resolves to — mirrors `applyInterfaceCast`'s own
-// vtable-building loop exactly (same `findInterfaceImplementation` call,
-// same default-vs-override method selection), just marking symbols
-// reachable instead of emitting MIR. Checked at EVERY expression (not
-// just calls) — `registerInterfaceCast` (type_checker.zig) attaches a
-// cast to let-bindings/returns/params/array-or-map-elements, not only
-// call arguments.
+// Каждое приведение к интерфейсу где-либо в достижимом коде подтягивает
+// конкретную реализацию, к которой оно разрешается — точно зеркалит
+// собственный цикл построения vtable в `applyInterfaceCast` (тот же
+// вызов `findInterfaceImplementation`, тот же выбор
+// default-vs-переопределённый метод), просто помечая символы
+// достижимыми вместо испускания MIR. Проверяется на КАЖДОМ выражении (не
+// только на вызовах) — `registerInterfaceCast` (type_checker.zig)
+// прикрепляет приведение к let-связываниям/возвратам/параметрам/
+// элементам массива-или-карты, не только к аргументам вызова.
 fn recordInterfaceCastEdges(
     allocator: std.mem.Allocator,
     compiled: anytype,
@@ -627,13 +625,14 @@ fn walkStmts(
     }
 }
 
-// `DOM.после_кадра` still takes a handler function's NAME as a STRING
-// LITERAL (`aot-dom-loader.js`'s `instance.exports[name]` — resolved by
-// STRING at runtime, invisible to the ordinary call-graph walk above).
-// `DOM.на_клик` uses a real closure and therefore needs no string root.
-// Scan reachable code for the remaining name-based callback, add the
-// matching function as an extra root, then let the caller re-drain the
-// worklist to a fixpoint.
+// `DOM.после_кадра` по-прежнему принимает ИМЯ функции-обработчика как
+// СТРОКОВЫЙ ЛИТЕРАЛ (`instance.exports[name]` в `aot-dom-loader.js` —
+// разрешается СТРОКОЙ во время выполнения, невидимо для обычного обхода
+// графа вызовов выше). `DOM.на_клик` использует настоящее замыкание и
+// потому не нуждается в строковом корне. Сканирует достижимый код на
+// оставшийся коллбэк по имени, добавляет подходящую функцию как
+// дополнительный корень, затем даёт вызывающей стороне заново
+// продренировать worklist до неподвижной точки.
 fn addDomHandlerRoots(
     allocator: std.mem.Allocator,
     graph: anytype,
@@ -678,10 +677,11 @@ fn scanDomHandlerRootsInDecls(
             else => &.{},
         };
         const symbol = resolution.decl_symbols.get(decl_id);
-        // Only scan a declaration reachable via the main worklist — the
-        // whole point is finding string-literal roots inside code that's
-        // ALREADY known to run, not resurrecting dead code via its own
-        // handler-registration calls.
+        // Сканируем только декларацию, достижимую через основной
+        // worklist — весь смысл в поиске строково-литеральных корней
+        // внутри кода, УЖЕ известного как выполняемый, а не в
+        // воскрешении мёртвого кода через его собственные вызовы
+        // регистрации обработчика.
         if (symbol == null or !set.contains(.{ .module_index = module_index, .symbol = symbol.? })) continue;
         try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, body);
     }
@@ -776,14 +776,12 @@ fn scanDomHandlerRootsInExpr(
     }
 }
 
-// A DOM-handler name is always a plain top-level `функ`, never a method
-// (see the delayed-callback doc comment in `aot-dom-loader.js`:
-// "name remains a static exported function") — search every module's
-// top-level function declarations for a name match, add the FIRST one
-// found (handler names are meant to be unambiguous top-level entry
-// points; a genuine collision across modules would already be a
-// same-module-shadowing question the resolver itself handles elsewhere,
-// out of scope here).
+// Имя DOM-обработчика — всегда обычный верхнеуровневый `функ`, никогда не
+// метод — ищет совпадение имени среди верхнеуровневых деклараций функций
+// каждого модуля, добавляет ПЕРВОЕ найденное (имена обработчиков
+// задуманы как однозначные верхнеуровневые точки входа; настоящая
+// коллизия между модулями уже была бы вопросом затенения внутри модуля,
+// который резолвер обрабатывает где-то ещё, вне области этой функции).
 fn addRootByName(allocator: std.mem.Allocator, graph: anytype, compiled: anytype, set: *ReachableSet, worklist: *std.ArrayList(ReachKey), name: []const u8) !void {
     for (graph.order.items) |module_index| {
         const resolution = if (compiled.modules[module_index].resolution) |*value| value else continue;
@@ -804,19 +802,21 @@ fn addRootByName(allocator: std.mem.Allocator, graph: anytype, compiled: anytype
 
 pub const ReachabilityResult = struct {
     reachable: ReachableSet,
-    // Generic symbols with a bare `.generic_parameter` return/parameter
-    // type, called with BOTH i32-category and f64-category concrete
-    // arguments somewhere in reachable code — see `MixedMap`'s own doc
-    // comment. Empty in the overwhelmingly common case; `lowerGraph`
-    // reports these as a clear diagnostic instead of silently
-    // miscompiling one of the two instantiations.
+    // Generic-символы с голым типом параметра/возврата `.generic_parameter`,
+    // вызванные где-то в достижимом коде И с i32-категорией, И с
+    // f64-категорией конкретных аргументов — см. собственный
+    // doc-комментарий `MixedMap`. Пусто в подавляющем большинстве
+    // случаев; `lowerGraph` сообщает о них явной диагностикой вместо
+    // того, чтобы молча некорректно скомпилировать одну из двух
+    // инстанциаций.
     conflicts: std.ArrayList(ReachKey),
-    // Every function name found registered as a `.после_кадра` handler
-    // during `addDomHandlerRoots` — see
-    // `mir.Module.dom_handler_names`'s own doc comment for why
-    // `wasm_gc_arena.zig` needs this. Borrowed slices into AST memory
-    // (`graph`/`compiled`'s lifetime) — `lowerGraph` dupes them into
-    // `mir.Module`'s own arena before this result is torn down.
+    // Каждое имя функции, найденное зарегистрированным как обработчик
+    // `.после_кадра` во время `addDomHandlerRoots` — зачем это нужно
+    // `wasm_gc_arena.zig`, см. собственный doc-комментарий
+    // `mir.Module.dom_handler_names`. Заимствованные срезы в память AST
+    // (живут, пока живы `graph`/`compiled`) — `lowerGraph` копирует их в
+    // собственную арену `mir.Module`, прежде чем этот результат
+    // уничтожается.
     dom_handler_names: std.ArrayList([]const u8),
 
     pub fn deinit(self: *ReachabilityResult, allocator: std.mem.Allocator) void {
@@ -826,10 +826,11 @@ pub const ReachabilityResult = struct {
     }
 };
 
-// A symbol's own top-level function/method NAME (for the mixed-generic-
-// instantiation diagnostic message) — same linear-scan shape as
-// `findSymbolBody`, kept separate rather than combined since most
-// callers (the reachability walk itself) only ever need the body.
+// Собственное ИМЯ верхнеуровневой функции/метода символа (для
+// диагностического сообщения о смешанной generic-инстанциации) — та же
+// форма линейного сканирования, что и `findSymbolBody`, хранится
+// отдельно, а не объединена с ней, поскольку большинству вызывающих
+// сторон (самому обходу достижимости) нужно только тело.
 fn findSymbolName(tree: *const ast.Ast, resolution: *const resolver.Resolution, symbol: symbols.SymbolId) ?[]const u8 {
     const program = tree.program orelse return null;
     for (program.declarations) |decl_id| {
@@ -857,14 +858,14 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
     var mixed: MixedMap = .init(allocator);
     defer mixed.deinit();
 
-    // Module index 0 is ALWAYS the entry module — `graph.load(...)` (the
-    // very first call, before `appendPreludeModule`/any import) assigns
-    // it, and `cli/main.zig` itself relies on this exact convention
-    // (`compiled.modules[0]`) — NOT `graph.order.items[len - 1]` (that
-    // ordering is dependency-topological, and the prelude — appended
-    // separately, no explicit import edges pointing AT it — actually
-    // sorts FIRST, not last; confirmed by `module_loader.zig`'s own test
-    // `expectEqual(prelude_index, graph.order.items[0])`).
+    // Индекс модуля 0 ВСЕГДА является входным модулем — `graph.load(...)`
+    // (самый первый вызов, до `appendPreludeModule`/любого импорта)
+    // назначает его, и сам `cli/main.zig` полагается именно на это
+    // соглашение (`compiled.modules[0]`), а НЕ на
+    // `graph.order.items[len - 1]` (тот порядок — топологический по
+    // зависимостям, а prelude — добавленный отдельно, без явных рёбер
+    // импорта, указывающих НА него — на самом деле оказывается ПЕРВЫМ, а
+    // не последним).
     if (graph.modules.items.len == 0) return .{ .reachable = set, .conflicts = .empty, .dom_handler_names = .empty };
     const entry_module_index: usize = 0;
     const entry_resolution = if (compiled.modules[entry_module_index].resolution) |*value| value else return .{ .reachable = set, .conflicts = .empty, .dom_handler_names = .empty };
@@ -910,11 +911,10 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
     return .{ .reachable = set, .conflicts = conflicts, .dom_handler_names = dom_handler_names };
 }
 
-// Link the already resolved/type-checked module graph into one AOT MIR
-// module. The bytecode compiler has its own linker; this deliberately keeps
-// an AOT-specific, small equivalent so WASM does not inherit bytecode VM
-// assumptions. The initial slice supports plain non-generic functions and
-// direct local-file imports — exactly the Phase-1 MIR surface.
+// Связывает уже разрешённый и типопроверенный граф модулей в один AOT
+// MIR-модуль. У bytecode-компилятора есть собственный линкер; здесь
+// сознательно сохраняется небольшой AOT-специфичный аналог, чтобы WASM не
+// наследовал допущения bytecode VM.
 pub fn lowerGraph(
     allocator: std.mem.Allocator,
     graph: anytype,
@@ -934,9 +934,9 @@ pub fn lowerGraphWithDiagnostic(
     var module = mir.Module.init(allocator);
     errdefer module.deinit(allocator);
 
-    // Tree-shaking — see `computeReachableSymbols`'s own doc comment for
-    // why this MUST run before any lowering happens, not as a dead-code-
-    // eliminate pass afterward.
+    // Отсечение недостижимого кода — почему это ДОЛЖНО выполняться до
+    // начала любого понижения, а не как проход отсечения мёртвого кода
+    // после, см. собственный doc-комментарий `computeReachableSymbols`.
     var reachability = try computeReachableSymbols(allocator, graph, compiled);
     defer reachability.deinit(allocator);
     if (reachability.conflicts.items.len > 0) {
@@ -946,7 +946,7 @@ pub fn lowerGraphWithDiagnostic(
         if (compiled.modules[first.module_index].resolution) |*resolution| {
             subject = findSymbolName(tree, resolution, first.symbol) orelse "<аноним>";
         }
-        diagnostic.report("generic-функция/метод с несовместимыми инстанциациями T (число и структура/массив в одном скомпилированном теле — не монoморфизировано, см. project_panos_wasm_no_monomorphization_needed)", subject);
+        diagnostic.report("generic-функция/метод с несовместимыми инстанциациями T (число и структура/массив в одном скомпилированном теле — не монoморфизировано)", subject);
         return error.AotUnsupported;
     }
     const reachable = &reachability.reachable;
@@ -959,9 +959,9 @@ pub fn lowerGraphWithDiagnostic(
     try function_maps.ensureTotalCapacity(allocator, graph.modules.items.len);
     for (0..graph.modules.items.len) |_| try function_maps.append(allocator, .init(allocator));
 
-    // Reserve every local function before lowering any body. This gives
-    // forward references, recursion and cross-module direct calls stable
-    // global FunctionIds in the resulting WASM module.
+    // Резервирует каждую локальную функцию до понижения любого тела. Это
+    // даёт опережающим ссылкам, рекурсии и прямым межмодульным вызовам
+    // стабильные глобальные FunctionId в результирующем WASM-модуле.
     for (graph.order.items) |module_index| {
         const resolution = if (compiled.modules[module_index].resolution) |*value| value else continue;
         const checked = if (compiled.modules[module_index].checked) |*value| value else continue;
@@ -982,8 +982,9 @@ pub fn lowerGraphWithDiagnostic(
         try reserveMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index], reachable, module_index);
     }
 
-    // Imported symbols are freshly minted in the importing Resolution. Map
-    // each one back to the reserved FunctionId of its exporting declaration.
+    // Импортированные символы свежеиспечены в импортирующем Resolution.
+    // Отображаем каждый обратно на зарезервированный FunctionId его
+    // экспортирующей декларации.
     for (graph.order.items) |module_index| {
         const resolution = if (compiled.modules[module_index].resolution) |*value| value else continue;
         var imports = resolution.imported_symbols.iterator();
@@ -1013,12 +1014,12 @@ pub fn lowerGraphWithDiagnostic(
         try lowerMethods(&module, allocator, tree, resolution, checked, program, &function_maps.items[module_index], diagnostic);
     }
 
-    // `reachability.dom_handler_names` holds borrowed slices into AST
-    // memory (`graph`'s lifetime) — dupe into `module.arena` (dedup by
-    // the same name possibly registered from more than one call site)
-    // so `wasm_gc_arena.zig` can rely on them staying valid for as long
-    // as the module itself does, without needing `graph`/`compiled`
-    // still around.
+    // `reachability.dom_handler_names` хранит заимствованные срезы в
+    // память AST (живёт, пока жив `graph`) — копируем в `module.arena`
+    // (с дедупликацией — одно и то же имя может быть зарегистрировано
+    // более чем с одного места вызова), чтобы `wasm_gc_arena.zig` мог
+    // полагаться на их валидность столько же, сколько живёт сам модуль,
+    // без необходимости, чтобы `graph`/`compiled` всё ещё существовали.
     var seen_handler_names: std.StringHashMap(void) = .init(allocator);
     defer seen_handler_names.deinit();
     var handler_names_owned: std.ArrayList([]const u8) = .empty;
@@ -1028,9 +1029,10 @@ pub fn lowerGraphWithDiagnostic(
         try seen_handler_names.put(name, {});
         try handler_names_owned.append(module_arena, try module_arena.dupe(u8, name));
     }
-    // Click closures have no literal export name, but the one fixed
-    // trampoline is still a JS-invoked entry point and must receive the
-    // same arena checkpoint/restore wrapper as name-based callbacks.
+    // У замыканий-кликов нет литерального имени экспорта, но единственный
+    // фиксированный трамплин всё равно является точкой входа, вызываемой
+    // из JS, и должен получить ту же обёртку checkpoint/restore арены,
+    // что и коллбэки по имени.
     if (wasm_heap.findFunctionByName(&module, invoke_click_trampoline_name) != null) {
         try handler_names_owned.append(module_arena, invoke_click_trampoline_name);
     }
@@ -1082,10 +1084,11 @@ fn lowerFunctionBody(
     }
 }
 
-// Block as a value (same principle as `compileBlockValue` today): the last
-// expression-statement, in value context, yields its value as the block's
-// result instead of being discarded; earlier statements are effect-only.
-// An empty block, in value context, is a 0.0 placeholder — same as today.
+// Блок как значение (тот же принцип, что и у `compileBlockValue`):
+// последний expression-statement в контексте значения отдаёт своё
+// значение как результат блока вместо того, чтобы быть отброшенным;
+// более ранние операторы существуют только ради побочного эффекта.
+// Пустой блок в контексте значения — заглушка 0.0.
 fn lowerBlock(ctx: *LoweringContext, statements: []const ast.StmtId, want_value: bool) anyerror!ExprOutcome {
     if (statements.len == 0) {
         if (!want_value) return continuesWith(mir.invalid_value);
@@ -1107,10 +1110,10 @@ fn lowerBlock(ctx: *LoweringContext, statements: []const ast.StmtId, want_value:
         const flow = try lowerStmt(ctx, statement);
         if (flow == .terminates) return terminated;
     }
-    // Only reachable when `want_value == false` — the last statement, in a
-    // value-requesting context, always returns from within the loop above
-    // (either via the extracted-expression path or the early-return for a
-    // non-expression last statement).
+    // Достижимо только когда `want_value == false` — последний statement в
+    // контексте, требующем значение, всегда возвращается изнутри цикла
+    // выше (либо через путь извлечённого выражения, либо через ранний
+    // возврат для последнего statement, не являющегося выражением).
     return continuesWith(mir.invalid_value);
 }
 
@@ -1150,16 +1153,16 @@ fn lowerStmt(ctx: *LoweringContext, statement: ast.StmtId) anyerror!FlowResult {
             return .terminates;
         },
         .expr => |expr_statement| {
-            // `если` as a bare statement: lowerIfExpr always lowers with
-            // want_value=true when called from expression context (needed
-            // for если-as-value), but here (Expr_Stmt — value is ALWAYS
-            // discarded) that would create a synthetic merge slot and try
-            // to Store_Local an invalid value in any branch with no real
-            // value (e.g. `если ... тогда сумма = сумма + i конец` — an
-            // assignment produces no value). Real bug Odin's own
-            // differential testing caught this exact way — lower with
-            // want_value=false explicitly here instead of going through
-            // lowerExpr's hardcoded true.
+            // `если` как голый statement: lowerIfExpr при вызове из
+            // контекста выражения всегда понижает с want_value=true
+            // (нужно для если-как-значения), но здесь (Expr_Stmt —
+            // значение ВСЕГДА отбрасывается) это создало бы синтетический
+            // слот слияния и попыталось бы сделать Store_Local с
+            // недействительным значением в любой ветке без реального
+            // значения (например, `если ... тогда сумма = сумма + i
+            // конец` — присваивание не производит значения). Поэтому
+            // здесь явно понижаем с want_value=false, а не идём через
+            // захардкоженный true в lowerExpr.
             if (ctx.tree.expr(expr_statement.value).* == .if_expr) {
                 const if_expr = ctx.tree.expr(expr_statement.value).if_expr;
                 const outcome = try lowerIfExpr(ctx, expr_statement.value, if_expr, false);
@@ -1228,16 +1231,16 @@ fn lowerForRange(ctx: *LoweringContext, statement: ast.StmtId, range: anytype) a
     return .continues;
 }
 
-// `для x в массив цикл` — `.array`-shaped iteration only (see
-// `type_checker.ForInInfo.kind`, `checked.for_in_infos`); mirrors
-// `lowerForRange`'s CFG (header/body/step/exit blocks, index local,
-// `.jump` back-edge) with an extra `get_index` per iteration instead of
-// yielding the raw counter, matching the native bytecode reference
-// (`compiler.zig`'s `compileArrayForIn`). `.iterator`-shaped for-in
-// (`следующее()`/`Опция`-based) has no MIR opcodes yet anywhere in this
-// file (no `match_enum`/`call_interface`-equivalent instruction exists
-// for Phase 1) — stays `unsupported`, a genuinely separate, larger
-// follow-up, not a small gap.
+// `для x в массив цикл` — поддерживается только итерация вида `.array`
+// (см. `type_checker.ForInInfo.kind`, `checked.for_in_infos`); зеркалит
+// CFG `lowerForRange` (блоки header/body/step/exit, локаль индекса,
+// обратное ребро `.jump`) с дополнительным `get_index` на каждой
+// итерации вместо выдачи сырого счётчика, соответствуя нативному
+// bytecode-эталону (`compileArrayForIn` в `compiler.zig`). Для for-in
+// вида `.iterator` (на основе `следующее()`/`Опция`) в этом файле пока
+// нет MIR-опкодов (нет эквивалента инструкции
+// `match_enum`/`call_interface`) — остаётся `unsupported`, это отдельная,
+// более крупная работа.
 fn lowerForIn(ctx: *LoweringContext, statement: ast.StmtId, loop: anytype) anyerror!FlowResult {
     const info = ctx.checked.for_in_infos.get(statement) orelse return ctx.unsupported("для..в без определённой формы цикла");
     if (info.kind != .array) return ctx.unsupported("для..в по итератору (Фаза 2)");
@@ -1270,16 +1273,14 @@ fn lowerForIn(ctx: *LoweringContext, statement: ast.StmtId, loop: anytype) anyer
     const exit = try ctx.builder.newBlock();
     ctx.builder.terminate(.{ .jump = .{ .target = header } });
     ctx.builder.setCurrentBlock(header);
-    // Operand order here matters for MORE than readability: `wasm_emit.zig`
-    // re-materializes each MIR value in CREATION order when it lowers a
-    // comparison, not strictly by the `lhs`/`rhs` argument order passed to
-    // `emitCompare` below — `index_value` must therefore be created BEFORE
-    // `length` (mirroring `lowerForRange`'s exact index-then-bound order),
-    // or the two operands land on the WASM stack swapped and `.less`
-    // silently computes `length < index` instead of `index < length`.
-    // Found by running the compiled program and comparing wasm2wat output
-    // against `lowerForRange`'s (working) codegen — the loop body simply
-    // never executed, no compile-time signal of the mistake at all.
+    // Порядок операндов здесь важен для БОЛЬШЕГО, чем читаемость:
+    // `wasm_emit.zig` заново материализует каждое MIR-значение в порядке
+    // СОЗДАНИЯ при понижении сравнения, не строго по порядку аргументов
+    // `lhs`/`rhs`, переданному в `emitCompare` ниже — `index_value`
+    // поэтому должен быть создан ДО `length` (зеркалит точный порядок
+    // индекс-затем-граница у `lowerForRange`), иначе два операнда
+    // окажутся на WASM-стеке переставленными местами, и `.less` молча
+    // вычислит `length < index` вместо `index < length`.
     const index_value = try ctx.builder.newValue(index_type);
     try ctx.builder.emit(.{ .load_local = .{ .dst = index_value, .local = index_local } });
     const array_value = try ctx.builder.newValue(array_type);
@@ -1312,46 +1313,47 @@ fn lowerForIn(ctx: *LoweringContext, statement: ast.StmtId, loop: anytype) anyer
     return .continues;
 }
 
-// Wraps every expression lowering with the SAME "was this expression's
-// value just cast to an interface type?" check the native bytecode
-// compiler applies universally (`compiler.zig`'s `compileExpression`/
-// `emitInterfaceCast` — called after EVERY expression, not just
-// call-shaped ones, since a cast can happen at a let-binding, return,
-// array/map element, or plain function argument just as easily as at a
-// call). `lowerExprInner` is the real per-kind dispatch; this wrapper
-// is the one thing every recursive `lowerExpr` call site already goes
-// through, so hooking here reaches every cast site for free.
+// Оборачивает понижение каждого выражения ТОЙ ЖЕ проверкой "было ли
+// значение этого выражения только что приведено к типу интерфейса?", что
+// нативный bytecode-компилятор применяет универсально
+// (`compileExpression`/`emitInterfaceCast` в `compiler.zig` — вызывается
+// после КАЖДОГО выражения, а не только вызовов, поскольку приведение
+// может произойти при let-связывании, возврате, элементе массива/карты
+// или обычном аргументе функции так же легко, как и при вызове).
+// `lowerExprInner` — это настоящая диспетчеризация по виду; эта обёртка —
+// единственное место, через которое уже проходит каждый рекурсивный
+// вызов `lowerExpr`, поэтому подключение здесь бесплатно достигает всех
+// мест приведения.
 fn lowerExpr(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOutcome {
     const outcome = try lowerExprInner(ctx, expression);
     if (outcome.flow == .terminates) return outcome;
     return try applyInterfaceCast(ctx, expression, outcome);
 }
 
-// Mirrors `compiler.zig`'s `emitInterfaceCast` exactly (same resolution
-// call, same error conditions) — reuses `type_checker.
-// findInterfaceImplementation` (compile-time exact-match-then-generic-
-// pattern-fallback resolution, already proven correct by the native
-// backend) rather than re-deriving vtable-matching logic here. Builds
-// `mir.InterfaceMethodBinding{method_name, function}` pairs by zipping
-// the interface's OWN declared method order (`InterfaceDefinition.
-// methods[i].name`) with the implementation's method symbols (`entry.
-// methods[i]`, SAME index — `defineInterfaceImplementation` guarantees
-// this pairing) — `wasm_interfaces.zig` (the WASM-specific expansion of
-// `.cast_interface`) is what turns FunctionIds into WASM table indices;
-// this stays target-agnostic.
+// Точно зеркалит `emitInterfaceCast` из `compiler.zig` (тот же вызов
+// разрешения, те же условия ошибки) — переиспользует
+// `type_checker.findInterfaceImplementation` (разрешение
+// точное-совпадение-затем-generic-паттерн-запасной-вариант на этапе
+// компиляции) вместо повторного вывода логики сопоставления vtable
+// здесь. Строит пары `mir.InterfaceMethodBinding{method_name, function}`,
+// зипуя СОБСТВЕННЫЙ объявленный порядок методов интерфейса
+// (`InterfaceDefinition.methods[i].name`) с символами методов реализации
+// (`entry.methods[i]`, ТОТ ЖЕ индекс — `defineInterfaceImplementation`
+// гарантирует это соответствие) — `wasm_interfaces.zig` (WASM-специфичное
+// расширение `.cast_interface`) — это то, что превращает FunctionId в
+// индексы WASM-таблицы; здесь же логика остаётся независимой от цели.
 fn applyInterfaceCast(ctx: *LoweringContext, expression: ast.ExprId, outcome: ExprOutcome) anyerror!ExprOutcome {
     const cast = ctx.checked.interface_casts.get(expression) orelse return outcome;
-    // `mir.Instruction.cast_interface`'s `vtable` is ONE flat list (no
-    // `vtable_index`-style nesting the way the bytecode backend's
-    // `interface_vtables` constant supports multiple simultaneous
-    // interfaces per cast) — `checked.interface_calls`'s own
-    // `vtable_index` field is unused below as a result. A value cast to
-    // MULTIPLE interfaces at once (e.g. satisfying two bounds
-    // simultaneously) would need `method_index` reinterpreted per-entry,
-    // which this flat scheme can't represent; explicitly rejected rather
-    // than silently invoking the wrong method. Not hit by anything this
-    // plan's own verification cases (prelude iterators) exercise — a
-    // real, scoped Phase-2 gap, not a silent correctness risk.
+    // `vtable` в `mir.Instruction.cast_interface` — ОДИН плоский список
+    // (без вложенности вида `vtable_index`, которую константа
+    // `interface_vtables` bytecode-бэкенда поддерживает для нескольких
+    // одновременных интерфейсов на одно приведение) — поэтому собственное
+    // поле `vtable_index` в `checked.interface_calls` ниже не
+    // используется. Значение, приведённое сразу к НЕСКОЛЬКИМ интерфейсам
+    // (например, удовлетворяющее двум ограничениям одновременно),
+    // потребовало бы переинтерпретации `method_index` для каждой записи,
+    // что эта плоская схема представить не может; явно отклоняется вместо
+    // того, чтобы молча вызвать не тот метод.
     if (cast.entries.len > 1) return ctx.unsupported("значение приведено сразу к нескольким интерфейсам (Phase 2)");
     var vtable: std.ArrayList(mir.InterfaceMethodBinding) = .empty;
     for (cast.entries) |entry| {
@@ -1373,11 +1375,10 @@ fn applyInterfaceCast(ctx: *LoweringContext, expression: ast.ExprId, outcome: Ex
             try vtable.append(ctx.builder.module.arena.allocator(), .{ .method_name = method.name, .function = function_id, .is_default = is_default });
         }
     }
-    // Same WASM representation (opaque i32 handle) either way — the
-    // source expression's own type is reused rather than the (not
-    // separately tracked at this stage — see `type_checker.zig`'s own
-    // "NO implicit wrapping at type-checker level" design note)
-    // interface type itself.
+    // В любом случае одно и то же WASM-представление (непрозрачный
+    // i32-хендл) — переиспользуется собственный тип исходного выражения,
+    // а не тип интерфейса как таковой (он отдельно на этом этапе не
+    // отслеживается).
     const dst = try ctx.builder.newValue(ctx.builder.currentFunction().valueType(outcome.value));
     try ctx.builder.emit(.{ .cast_interface = .{ .dst = dst, .src = outcome.value, .vtable = try vtable.toOwnedSlice(ctx.builder.module.arena.allocator()) } });
     return continuesWith(dst);
@@ -1420,9 +1421,10 @@ fn lowerExprInner(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOu
     };
 }
 
-// Keep actor creation explicit in MIR. CPS lowering consumes this before the
-// WASM emitter; representing it as an ordinary call would lose the child
-// frame and make a later `получить()` impossible to resume correctly.
+// Создание актора остаётся явным в MIR. CPS-понижение потребляет это до
+// WASM-эмиттера; представление этого обычным вызовом потеряло бы
+// дочерний фрейм и сделало бы последующий `получить()` невозможным
+// корректно возобновить.
 fn lowerSpawn(ctx: *LoweringContext, expression: ast.ExprId, spawn: anytype) anyerror!ExprOutcome {
     const call = switch (ctx.tree.expr(spawn.call).*) {
         .call => |value| value,
@@ -1506,9 +1508,10 @@ fn bindVariantPattern(ctx: *LoweringContext, pattern: ast.PatternId, subject_loc
     for (constructor.arguments, 0..) |argument, index| {
         const binding = ctx.resolution.pattern_symbols.get(argument) orelse continue;
         const field_type = ctx.checked.pattern_types.get(argument) orelse blk: {
-            // `получить()` deliberately has poison as its static subject
-            // type. The checker still resolved the constructor variant, so
-            // recover its positional field type from that enum definition.
+            // У `получить()` сознательно poison в качестве статического
+            // типа субъекта. Type checker всё равно разрешил вариант
+            // конструктора, поэтому восстанавливаем позиционный тип поля
+            // из этого определения enum.
             const variant_symbol = ctx.checked.pattern_variants.get(pattern) orelse return ctx.unsupported("payload pattern без типа");
             const entry = ctx.resolution.symbols.get(variant_symbol) orelse return ctx.unsupported("payload variant без symbol");
             const definition = ctx.checked.enum_definitions.get(entry.owner_type) orelse return ctx.unsupported("payload variant без enum definition");
@@ -1570,20 +1573,21 @@ fn lowerIndex(ctx: *LoweringContext, expression: ast.ExprId, index: anytype) any
     return continuesWith(dst);
 }
 
-// `nominal_fields` only has entries for CONCRETE (non-generic) struct
-// declarations — a generic one (`тип X[T] = структура ...`, e.g. the
-// prelude's own `МассивИтератор[T]`, hit by every plain `для x в
-// массив` loop) only has an entry in `generic_nominal_fields`, keyed the
-// same way. Field LOOKUP here only needs each field's NAME and ordinal
-// POSITION (`field_index`, used by `.get_property`/`.set_property` at
-// the MIR level) — never its type-parameter-substituted type (the
-// result type instead comes from `ctx.checked.expression_types`,
-// already resolved earlier by the type checker) — so the generic
-// declaration's own unsubstituted `.fields` list is exactly as usable
-// as a concrete struct's, no substitution needed at this stage. Mirrors
-// `type_checker.zig`'s own `fieldsForNominal` fallback (that one DOES
-// substitute, because it needs to type-check field access expressions;
-// this one only needs positions).
+// В `nominal_fields` есть записи только для КОНКРЕТНЫХ (не generic)
+// объявлений структур — generic-объявление (`тип X[T] = структура ...`,
+// например собственный `МассивИтератор[T]` из prelude, задействуемый
+// каждым обычным циклом `для x в массив`) имеет запись только в
+// `generic_nominal_fields`, с тем же ключом. Поиск поля здесь нуждается
+// только в ИМЕНИ и порядковой ПОЗИЦИИ поля (`field_index`, используется
+// `.get_property`/`.set_property` на уровне MIR) — никогда в его типе с
+// подставленным типовым параметром (тип результата вместо этого берётся
+// из `ctx.checked.expression_types`, уже разрешённого ранее type
+// checker'ом) — поэтому собственный неподставленный список `.fields`
+// generic-объявления пригоден точно так же, как и у конкретной
+// структуры, подстановка на этом этапе не нужна. Зеркалит собственный
+// запасной вариант `fieldsForNominal` в `type_checker.zig` (тот ДЕЛАЕТ
+// подстановку, поскольку ему нужно типопроверять выражения доступа к
+// полю; этому же нужны только позиции).
 fn fieldsForNominalSymbol(ctx: *LoweringContext, symbol: symbols.SymbolId) ?[]const type_checker.NominalField {
     if (ctx.checked.nominal_fields.get(symbol)) |fields| return fields;
     if (ctx.checked.generic_nominal_fields.get(symbol)) |generic_nominal| return generic_nominal.fields;
@@ -1591,8 +1595,9 @@ fn fieldsForNominalSymbol(ctx: *LoweringContext, symbol: symbols.SymbolId) ?[]co
 }
 
 fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytype) anyerror!ExprOutcome {
-    // Module members and enum variants are resolved symbols and are handled
-    // by their callers. A remaining property expression is a struct field.
+    // Члены модуля и варианты enum — это разрешённые символы, и ими
+    // занимаются вызывающие стороны. Оставшееся выражение-свойство — это
+    // поле структуры.
     if (ctx.resolution.expr_symbols.contains(expression)) return ctx.unsupported("свойство-модуль или вариант перечисления вне вызова");
     const object = try lowerExpr(ctx, property.object);
     if (object.flow == .terminates) return terminated;
@@ -1614,12 +1619,12 @@ fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytyp
 }
 
 fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: source.Span) !mir.ValueId {
-    // Captured symbol, resolved INSIDE a lambda body — see `CaptureEnv`'s
-    // own doc comment. Checked BEFORE `symbol_to_local`: a capture and an
-    // ordinary lambda-body local can never collide (captures never get a
-    // `symbol_to_local` entry in the inner `LoweringContext` at all, see
-    // `lowerLambda`), but checking first keeps the precedence explicit
-    // rather than accidental.
+    // Захваченный символ, разрешаемый ВНУТРИ тела лямбды — см.
+    // собственный doc-комментарий `CaptureEnv`. Проверяется ПЕРЕД
+    // `symbol_to_local`: захват и обычная локаль тела лямбды никогда не
+    // могут столкнуться (захваты вообще никогда не получают запись в
+    // `symbol_to_local` внутреннего `LoweringContext`, см. `lowerLambda`),
+    // но проверка первой делает приоритет явным, а не случайным.
     if (ctx.capture_env) |*env| {
         if (env.index_of.get(symbol)) |slot| {
             const type_id = ctx.checked.symbol_types.get(symbol) orelse ctx.checked.types.builtins.void;
@@ -1636,14 +1641,15 @@ fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: so
         return dst;
     }
     if (ctx.symbol_to_function.get(symbol)) |function_id| {
-        // A plain named function used as an ordinary VALUE (not
-        // immediately called — `lowerCall`'s OWN ident-callee fast path
-        // never reaches this function at all, see this file's own
-        // closure design notes) — uniform closure representation, zero
-        // captures, `already_env_aware = false` since the ORIGINAL
-        // function's signature has no `env_ptr` param and must stay
-        // untouched for its own direct-call sites. `wasm_interfaces.zig`
-        // synthesizes a thin ignored-`env_ptr` wrapper for this case.
+        // Обычная именованная функция, используемая как обычное ЗНАЧЕНИЕ
+        // (не вызываемая немедленно — собственный быстрый путь
+        // ident-callee в `lowerCall` вообще никогда не доходит до этой
+        // функции) — единообразное представление замыкания, ноль
+        // захватов, `already_env_aware = false`, поскольку у сигнатуры
+        // ИСХОДНОЙ функции нет параметра `env_ptr`, и она должна остаться
+        // нетронутой для собственных мест прямого вызова.
+        // `wasm_interfaces.zig` синтезирует для этого случая тонкую
+        // обёртку с игнорируемым `env_ptr`.
         const dst = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
         try ctx.builder.emit(.{ .build_closure = .{ .dst = dst, .function = function_id, .captured = &.{}, .already_env_aware = false } });
         return dst;
@@ -1661,18 +1667,17 @@ fn lambdaReturnType(checked: *const type_checker.CheckResult, expression: ast.Ex
     };
 }
 
-// WASM AOT closure support, Stage A (see the `project_panos_wasm_aot_closures`
-// design notes) — real `.lambda` lowering. Captures are BY VALUE, taken
-// at closure-CONSTRUCTION time (matches the bytecode VM's own
-// `.build_closure`/`compileLambda` semantics exactly, `compiler.zig`) —
-// each captured symbol is read via the OUTER `ctx`'s ordinary
-// `lowerSymbolValueRef` (so a capture can itself be a parameter, a
-// local, or — recursively — another OUTER capture) and stored into a
-// fresh environment allocation; the resolver propagates a grandparent
-// capture into every intervening lambda, so each environment stays flat
-// and no runtime parent pointer is needed. The lambda
-// BODY is lowered as a genuinely separate MIR function whose captured-
-// symbol lookups are redirected through `CaptureEnv` instead of
+// Настоящее понижение `.lambda`. Захваты БЕРУТСЯ ПО ЗНАЧЕНИЮ в момент
+// СОЗДАНИЯ замыкания (точно соответствует семантике
+// `.build_closure`/`compileLambda` самой bytecode VM, `compiler.zig`) —
+// каждый захваченный символ читается через обычный
+// `lowerSymbolValueRef` ВНЕШНЕГО `ctx` (поэтому захват сам может быть
+// параметром, локалью или — рекурсивно — другим ВНЕШНИМ захватом) и
+// сохраняется в свежую аллокацию окружения; резолвер распространяет
+// захват "дедушки" в каждую промежуточную лямбду, поэтому каждое
+// окружение остаётся плоским и рантайм-указатель на родителя не нужен.
+// ТЕЛО лямбды понижается как настоящая отдельная MIR-функция, чей поиск
+// захваченных символов перенаправлен через `CaptureEnv` вместо
 // `symbol_to_local`.
 fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) anyerror!ExprOutcome {
     const captures = ctx.resolution.lambda_captures.get(expression) orelse &.{};
@@ -1712,12 +1717,12 @@ fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) a
         try inner_ctx.symbol_to_local.put(symbol, local);
         try param_locals.append(ctx.allocator, local);
     }
-    // `env_ptr` is a TRAILING parameter, uniformly, matching the "append
-    // env_ptr as a trailing call_indirect argument" convention on the
-    // CALLING side (`wasm_interfaces.zig`'s `.call_value` expansion) —
-    // one calling convention everywhere a `.function`-typed value is
-    // invoked, no branching between "closure" and "plain function"
-    // shapes at the call site.
+    // `env_ptr` — единообразно ЗАВЕРШАЮЩИЙ параметр, соответствует
+    // соглашению "добавлять env_ptr как завершающий аргумент
+    // call_indirect" на СТОРОНЕ ВЫЗОВА (разворачивание `.call_value` в
+    // `wasm_interfaces.zig`) — одно соглашение о вызове везде, где
+    // вызывается значение типа `.function`, без ветвления между формами
+    // "замыкание" и "обычная функция" в месте вызова.
     const env_param = try inner_ctx.builder.newLocal(dummy_symbol, "@env", ctx.checked.types.builtins.boolean);
     try param_locals.append(ctx.allocator, env_param);
     inner_ctx.builder.currentFunction().parameters = try param_locals.toOwnedSlice(ctx.allocator);
@@ -1739,29 +1744,28 @@ fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) a
 }
 
 fn emitFunctionRef(ctx: *LoweringContext, function_id: mir.FunctionId) !mir.ValueId {
-    // A function reference is a genuine first-class VALUE (storable in a
-    // local/field, passable as an argument, callable through
-    // `call_value`) — typed `boolean` here purely as a stand-in for "i32
-    // opaque handle" (see `wasm_module.wasmValTypeForStore`'s `.function`
-    // case: any function-typed value maps to i32, same category as
-    // nominal/array/process). The exact declared type doesn't matter
-    // beyond that WASM-type-category selection.
+    // Ссылка на функцию — настоящее полноправное ЗНАЧЕНИЕ (может
+    // храниться в локали/поле, передаваться как аргумент, вызываться
+    // через `call_value`) — здесь типизировано как `boolean` исключительно
+    // как заменитель для "непрозрачного i32-хендла" (см. случай
+    // `.function` в `wasm_module.wasmValTypeForStore`: любое значение
+    // функционального типа отображается в i32, та же категория, что и
+    // nominal/array/process). Точный объявленный тип не важен, кроме как
+    // для выбора этой WASM-категории типа.
     const dst = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
     try ctx.builder.emit(.{ .function_ref = .{ .dst = dst, .function = function_id } });
     return dst;
 }
 
-// `.call_value`'s callee must be the LAST-produced operand by the time
-// WASM codegen turns it into `call_indirect` (`[args..., table_index]`,
-// index popped topmost) — but every call site here computes the callee
-// BEFORE its arguments (matching the language's own left-to-right
-// evaluation order, callee-before-args, mirrored from `compiler.zig`'s
-// `compileCall`). Routes the callee through an ordinary Local
-// (target-agnostic MIR, no WASM-specific knowledge needed here) so it
-// can be re-produced fresh, after every argument, right at the call
-// site — same "buried value" fix shape as `wasm_interfaces.zig`'s own
-// `.cast_interface`/`.invoke_interface` expansions, just done here at
-// the MIR level since ordinary Locals are backend-agnostic.
+// Callee у `.call_value` должен быть ПОСЛЕДНИМ произведённым операндом к
+// моменту, когда WASM-кодогенерация превращает его в `call_indirect`
+// (`[args..., table_index]`, индекс снимается верхним) — но каждое место
+// вызова здесь вычисляет callee ДО его аргументов (соответствует
+// собственному порядку вычисления языка слева направо, callee перед
+// аргументами, зеркалит `compileCall` из `compiler.zig`). Пропускает
+// callee через обычную Local (MIR не зависит от цели, WASM-специфичное
+// знание здесь не нужно), чтобы его можно было заново произвести,
+// свежим, после каждого аргумента, прямо на месте вызова.
 fn storeCalleeLocal(ctx: *LoweringContext, callee: mir.ValueId) !mir.LocalId {
     const callee_type = ctx.builder.currentFunction().valueType(callee);
     const local = try ctx.builder.newLocal(dummy_symbol, "@callee", callee_type);
@@ -1820,11 +1824,11 @@ fn lowerBinary(ctx: *LoweringContext, expression: ast.ExprId, binary: anytype) a
     return continuesWith(dst);
 }
 
-// Assignment produces NO value
-// (matches Odin's `INVALID_VALUE`/`.Continues` and the bytecode compiler's
-// own `y = (x = 1)` restriction) — a well-typed program can never observe
-// this, since the type checker requires an if-expression's branches to share
-// a common value type before this lowering ever runs.
+// Присваивание НЕ производит значения (то же ограничение `y = (x = 1)`,
+// что и у bytecode-компилятора) — корректно типизированная программа
+// никогда не может это заметить, поскольку type checker требует, чтобы
+// ветви if-выражения делили общий тип значения ещё до того, как это
+// понижение вообще запускается.
 fn lowerAssign(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcome {
     switch (ctx.tree.expr(binary.left).*) {
         .ident => {
@@ -1886,9 +1890,9 @@ fn emitCompare(ctx: *LoweringContext, operator: anytype, lhs: mir.ValueId, rhs: 
     return dst;
 }
 
-// `и`/`или` — same non-SSA "merge through a temp local" trick `lowerIfExpr`
-// uses for a branch's result value, via `lowerCondition` building real CFG
-// edges instead of computing a bool eagerly.
+// `и`/`или` — тот же не-SSA приём "слияние через временную локаль", что
+// `lowerIfExpr` использует для результата ветки, через `lowerCondition`,
+// строящий настоящие рёбра CFG вместо жадного вычисления bool.
 fn lowerShortCircuit(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcome {
     const result_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$logic", ctx.checked.types.builtins.boolean);
     const rhs_block = try ctx.builder.newBlock();
@@ -1921,11 +1925,11 @@ fn lowerShortCircuit(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcom
     return continuesWith(result);
 }
 
-// Branch-context lowering — builds CFG edges directly instead of computing
-// a bool value, needed for short-circuit `и`/`или` (above) and for
-// `если`/`пока` conditions. `a и b` lowers as: lowerCondition(a, rhs_block,
-// false_target), inside rhs_block — lowerCondition(b, true_target,
-// false_target); `a или b` is symmetric.
+// Понижение в контексте ветвления — строит рёбра CFG напрямую вместо
+// вычисления bool-значения, нужно для короткого замыкания `и`/`или`
+// (выше) и для условий `если`/`пока`. `a и b` понижается как:
+// lowerCondition(a, rhs_block, false_target), внутри rhs_block —
+// lowerCondition(b, true_target, false_target); `a или b` симметрично.
 fn lowerCondition(ctx: *LoweringContext, expression: ast.ExprId, true_target: mir.BlockId, false_target: mir.BlockId) anyerror!void {
     if (ctx.tree.expr(expression).* == .binary) {
         const binary = ctx.tree.expr(expression).binary;
@@ -1949,9 +1953,9 @@ fn lowerCondition(ctx: *LoweringContext, expression: ast.ExprId, true_target: mi
     ctx.builder.terminate(.{ .branch = .{ .cond = outcome.value, .then_block = true_target, .else_block = false_target } });
 }
 
-// Non-SSA "temp slot" merge (Store_Local in each LIVE — non-terminating —
-// branch, Load_Local in the merge block), not a phi node — MIR Phase 1 is
-// deliberately not SSA.
+// Не-SSA слияние через "временный слот" (Store_Local в каждой ЖИВОЙ —
+// незавершающейся — ветке, Load_Local в блоке слияния), а не phi-узел —
+// MIR сознательно не SSA.
 fn lowerIfExpr(ctx: *LoweringContext, expression: ast.ExprId, conditional: anytype, want_value: bool) anyerror!ExprOutcome {
     const cond = try lowerExpr(ctx, conditional.condition);
     if (cond.flow == .terminates) return terminated;
@@ -1996,9 +2000,10 @@ fn lowerIfExpr(ctx: *LoweringContext, expression: ast.ExprId, conditional: anyty
     return continuesWith(mir.invalid_value);
 }
 
-// Only ever lowered as a statement (Phase 1: no scenario needs a пока-as-
-// value — the one caller in `lowerExpr` above just supplies a constant 0
-// placeholder, same treatment as an empty block in value context).
+// Всегда понижается только как statement — нет сценария, которому нужен
+// `пока` как значение; единственный вызывающий в `lowerExpr` выше просто
+// подставляет константную заглушку 0, та же трактовка, что и у пустого
+// блока в контексте значения.
 fn lowerWhile(ctx: *LoweringContext, loop: anytype) anyerror!FlowResult {
     const header_block = try ctx.builder.newBlock();
     const body_block = try ctx.builder.newBlock();
@@ -2022,14 +2027,12 @@ fn lowerWhile(ctx: *LoweringContext, loop: anytype) anyerror!FlowResult {
     return .continues;
 }
 
-// Scope note: only two shapes are lowered — a statically-known top-level
-// function called by bare identifier (the fast path — Odin's own
-// equivalent), and the fully generic fallback (callee lowered as an
-// ORDINARY expression, called through `Call_Value_Instr` — covers a
-// closure/higher-order-function value, resolved by the backend, not
-// lowering). Builtins, methods, constructors, `внешний`, `получить`/
-// `получить_сигнал`, generics — all explicitly `unsupported` here (Phase
-// 2 in the Odin original too).
+// Заметка об области покрытия: понижаются только две формы —
+// статически известная верхнеуровневая функция, вызванная по голому
+// идентификатору (быстрый путь), и полностью общий запасной вариант
+// (callee понижается как ОБЫЧНОЕ выражение, вызывается через
+// `Call_Value_Instr` — покрывает значение замыкания/функции высшего
+// порядка, разрешается бэкендом, не понижением).
 fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyerror!ExprOutcome {
     const result_type = ctx.checked.expression_types.get(expression) orelse ctx.checked.types.builtins.void;
 
@@ -2050,19 +2053,18 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
     }
 
     if (ctx.tree.expr(call.callee).* == .property) {
-        // `значение.метод(...)` where `значение`'s static type is an
-        // INTERFACE (not a concrete struct — that's `checked.
-        // method_calls` below, resolved to a fixed `Symbol_Id`).
-        // `checked.interface_calls` gives `method_index` (the interface's
-        // OWN declared method order — matches `applyInterfaceCast`'s
-        // `vtable` construction, same order, same source:
-        // `InterfaceDefinition.methods`) — the concrete function is only
-        // known at RUNTIME (read from whichever cast produced this
-        // particular receiver value), hence `.invoke_interface`, not an
-        // ordinary `.call`/`.call_value`. `wasm_interfaces.zig` (WASM-
-        // specific expansion, mirrors `wasm_objects.zig`'s own generic-
-        // MIR → target-specific-codegen split) turns this into the
-        // box-unwrap + `call_indirect` chain.
+        // `значение.метод(...)`, где статический тип `значение` — это
+        // ИНТЕРФЕЙС (не конкретная структура — это `checked.method_calls`
+        // ниже, разрешаемый в фиксированный `Symbol_Id`).
+        // `checked.interface_calls` даёт `method_index` (СОБСТВЕННЫЙ
+        // объявленный порядок методов интерфейса — соответствует
+        // построению `vtable` в `applyInterfaceCast`, тот же порядок, тот
+        // же источник: `InterfaceDefinition.methods`) — конкретная
+        // функция известна только во ВРЕМЯ ВЫПОЛНЕНИЯ (читается из того,
+        // какое приведение произвело именно это значение-приёмник),
+        // отсюда `.invoke_interface`, а не обычный `.call`/`.call_value`.
+        // `wasm_interfaces.zig` (WASM-специфичное расширение) превращает
+        // это в цепочку распаковки бокса + `call_indirect`.
         if (ctx.checked.interface_calls.get(expression)) |interface_call| {
             const property = ctx.tree.expr(call.callee).property;
             const receiver = try lowerExpr(ctx, property.object);
@@ -2072,16 +2074,16 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
             try ctx.builder.emit(.{ .invoke_interface = .{ .dst = dst, .receiver = receiver.value, .method_name = "", .method_index = interface_call.method_index, .args = args } });
             return .{ .value = dst orelse mir.invalid_value, .flow = .continues };
         }
-        // `значение.метод(...)` where `значение`'s static type is a
-        // concrete struct — the type checker already resolved this to
-        // the method's own `Symbol_Id` in `method_calls` (`type_checker.
-        // zig:4437`), the exact same map the native bytecode compiler
-        // reads (`compiler.zig`'s `Method_Struct` case) instead of
-        // re-deriving struct-field lookup here. `это` is just
-        // `parameters[0]` on the method's own side (see
-        // `reserveMethods`/`lowerMethods`) — the receiver (`property.
-        // object`) is lowered as an ordinary argument and placed FIRST,
-        // matching that.
+        // `значение.метод(...)`, где статический тип `значение` —
+        // конкретная структура — type checker уже разрешил это в
+        // собственный `Symbol_Id` метода в `method_calls`, ту же самую
+        // карту, что читает нативный bytecode-компилятор (случай
+        // `Method_Struct` в `compiler.zig`), вместо повторного вывода
+        // поиска поля структуры здесь. `это` — это просто
+        // `parameters[0]` на стороне самого метода (см.
+        // `reserveMethods`/`lowerMethods`) — приёмник (`property.object`)
+        // понижается как обычный аргумент и ставится ПЕРВЫМ, соответствуя
+        // этому.
         if (ctx.checked.method_calls.get(expression)) |method_symbol| {
             if (ctx.symbol_to_function.get(method_symbol)) |function_id| {
                 const function_ref = try emitFunctionRef(ctx, function_id);
@@ -2096,11 +2098,11 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
                 return emitCallValue(ctx, function_ref, try args.toOwnedSlice(arena), result_type);
             }
         }
-        // A function imported from a local file is represented in the AST
-        // as `модуль.функция`, not as a bare identifier. Resolution has
-        // already associated that property expression with the importer-side
-        // symbol; lowerGraph rebinds that symbol to the exporter's global
-        // MIR FunctionId.
+        // Функция, импортированная из локального файла, представлена в
+        // AST как `модуль.функция`, а не как голый идентификатор.
+        // Resolution уже связал это выражение-свойство с символом на
+        // стороне импортёра; lowerGraph перепривязывает этот символ к
+        // глобальному MIR FunctionId экспортёра.
         if (ctx.resolution.expr_symbols.get(call.callee)) |symbol| {
             if (ctx.symbol_to_function.get(symbol)) |function_id| {
                 const function_ref = try emitFunctionRef(ctx, function_id);
@@ -2180,9 +2182,8 @@ fn lowerArrayMethodCall(ctx: *LoweringContext, call: anytype, result_type: types
     return continuesWith(dst orelse mir.invalid_value);
 }
 
-// `Опция` is a two-tag ADT from the prelude (`Нет = 0`, `Есть = 1`). These
-// two accessors are sufficient for the conventional guarded pattern in the
-// todo AOT demo and reuse the same variant ABI as explicit `выбор`.
+// `Опция` — двухтеговый ADT из prelude (`Нет = 0`, `Есть = 1`). Эти два
+// метода-обёртки переиспользуют тот же ABI варианта, что и явный `выбор`.
 fn lowerOptionMethodCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const property = ctx.tree.expr(call.callee).property;
     const object_type = ctx.checked.expression_types.get(property.object) orelse return null;
@@ -2202,8 +2203,8 @@ fn lowerOptionMethodCall(ctx: *LoweringContext, call: anytype, result_type: type
         return continuesWith(dst);
     }
     if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 1) {
-        // Both receiver and fallback are evaluated before selecting the
-        // result, exactly as for an ordinary Panos method call.
+        // И приёмник, и запасное значение вычисляются до выбора
+        // результата, точно как при обычном вызове метода панос.
         const option_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$option", object_type);
         try ctx.builder.emit(.{ .store_local = .{ .local = option_local, .src = receiver.value } });
         const fallback = try lowerExpr(ctx, call.arguments[0]);
@@ -2242,28 +2243,30 @@ fn lowerOptionMethodCall(ctx: *LoweringContext, call: anytype, result_type: type
     return null;
 }
 
-// `Результат(T,E)`'s sibling of `lowerOptionMethodCall` — same reason:
-// `type_checker.zig`'s `inferPreludeEnumMethod` hard-codes the return
-// TYPE for `.успех()`/`.ошибка()`/etc. by property-name string compare,
-// entirely bypassing `checked.method_calls` (the map ordinary
-// `реализация`-declared methods populate) — even though `prelude.zig`
-// ALSO declares real `реализация Результат` bodies for these exact
-// names. Those real bodies exist for the native bytecode backend
-// (`compiler.zig` doesn't share this type-checker fast path the same
-// way) but are effectively unreachable from THIS backend's call sites:
-// `checked.method_calls.get(expression)` is null for every `.успех()`-
-// shaped call, so `lowerCall` never finds them, regardless of whether
-// the call is external user code OR (as found investigating this)
-// `Результат::ошибка`'s OWN body calling `это.успех()` internally —
-// hand-rolling the same `match_tag`/`get_variant_field` codegen here
-// fixes BOTH at once, since `lowerCall` is used uniformly everywhere.
-// `Успех`=tag 0, `Неудача`=tag 1 (`prelude.zig`'s own declaration
-// order). Scope matches `lowerOptionMethodCall`'s own precedent —
-// covers the methods actually needed so far, not the full 13-method
-// surface `inferPreludeEnumMethod` type-checks (ожидать/ожидать_ошибку/
-// запас/заменить_значение/заменить_ошибку/опция/ошибка_опция still fall
-// through to the generic-property-access `unsupported` path — a known,
-// narrower-scoped-on-purpose gap, not silently mishandled).
+// Аналог `lowerOptionMethodCall` для `Результат(T,E)` — по той же
+// причине: `inferPreludeEnumMethod` в `type_checker.zig` жёстко задаёт
+// ТИП возврата для `.успех()`/`.ошибка()`/и т.д. сравнением строки имени
+// свойства, полностью минуя `checked.method_calls` (карту, которую
+// заполняют обычные `реализация`-объявленные методы), хотя `prelude.zig`
+// ТАКЖЕ объявляет настоящие тела `реализация Результат` для этих же
+// имён. Эти настоящие тела существуют для нативного bytecode-бэкенда
+// (`compiler.zig` не разделяет этот быстрый путь type checker'а таким же
+// образом), но фактически недостижимы с мест вызова ЭТОГО бэкенда:
+// `checked.method_calls.get(expression)` равен null для каждого вызова
+// вида `.успех()`, поэтому `lowerCall` их никогда не находит — вне
+// зависимости от того, внешний ли это пользовательский код, ИЛИ
+// СОБСТВЕННОЕ тело `Результат::ошибка`, внутренне вызывающее
+// `это.успех()` — ручная реализация той же кодогенерации
+// `match_tag`/`get_variant_field` здесь чинит ОБА случая разом, поскольку
+// `lowerCall` используется единообразно повсюду. `Успех`=тег 0,
+// `Неудача`=тег 1 (собственный порядок объявления `prelude.zig`). Область
+// покрытия соответствует прецеденту `lowerOptionMethodCall` — покрывает
+// методы, реально нужные на данный момент, а не всю поверхность из 13
+// методов, которую типопроверяет `inferPreludeEnumMethod`
+// (ожидать/ожидать_ошибку/запас/заменить_значение/заменить_ошибку/опция/
+// ошибка_опция по-прежнему проваливаются в путь `unsupported` для
+// обычного доступа к свойству — известный, сознательно более узкий
+// пробел, не обрабатывается молча неправильно).
 fn lowerResultMethodCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const property = ctx.tree.expr(call.callee).property;
     const object_type = ctx.checked.expression_types.get(property.object) orelse return null;
@@ -2288,11 +2291,11 @@ fn lowerResultMethodCall(ctx: *LoweringContext, call: anytype, result_type: type
         try ctx.builder.emit(.{ .match_tag = .{ .dst = dst, .subject = receiver.value, .tag = 1 } });
         return continuesWith(dst);
     }
-    // `значение()`/`причина()`: extract the matching variant's field,
-    // trap (`.unreachable_term`) on the wrong tag — matches
-    // `prelude.zig`'s own `паника("нет значения")`/`паника("нет
-    // ошибки")` bodies (message text lost under WASM AOT, same
-    // documented gap as `lowerPanicBuiltinCall`).
+    // `значение()`/`причина()`: извлекает поле подходящего варианта,
+    // ловушка (`.unreachable_term`) при неверном теге — соответствует
+    // собственным телам `паника("нет значения")`/`паника("нет ошибки")`
+    // из `prelude.zig` (текст сообщения теряется под WASM AOT, тот же
+    // задокументированный пробел, что и у `lowerPanicBuiltinCall`).
     if ((std.mem.eql(u8, property.property, "значение") or std.mem.eql(u8, property.property, "причина")) and call.arguments.len == 0) {
         const want_success = std.mem.eql(u8, property.property, "значение");
         const receiver_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$result", object_type);
@@ -2315,9 +2318,9 @@ fn lowerResultMethodCall(ctx: *LoweringContext, call: anytype, result_type: type
         try ctx.builder.emit(.{ .get_variant_field = .{ .dst = dst, .subject = ok_loaded, .field_index = 0 } });
         return continuesWith(dst);
     }
-    // `получить(запасное)`/`получить_ошибку(запасное)`: same branch-
-    // extract-or-fallback shape as `lowerOptionMethodCall`'s own
-    // `получить`.
+    // `получить(запасное)`/`получить_ошибку(запасное)`: та же форма
+    // ветвление-извлечь-или-запасное-значение, что и у собственного
+    // `получить` в `lowerOptionMethodCall`.
     if ((std.mem.eql(u8, property.property, "получить") or std.mem.eql(u8, property.property, "получить_ошибку")) and call.arguments.len == 1) {
         const want_success = std.mem.eql(u8, property.property, "получить");
         const result_local_name = if (want_success) "$result" else "$result_err";
@@ -2377,12 +2380,11 @@ fn lowerStructConstructor(ctx: *LoweringContext, expression: ast.ExprId, symbol:
     return continuesWith(dst);
 }
 
-// `x как Целое` / `x как Число` — same real gap `compiler.zig`'s
-// `.cast` codegen fixes on the native/bytecode path (see its doc
-// comment) — `mir_lowering.zig` needs the SAME handling independently
-// since it never routes through `compiler.zig` at all. `Число` is a
-// pure no-op (identity — both share one f64 MIR/WASM representation),
-// `Целое` truncates toward zero via `UnOp.int_trunc`.
+// `x как Целое` / `x как Число` — `mir_lowering.zig` нуждается в этой
+// обработке независимо, поскольку никогда не проходит через
+// `compiler.zig`. `Число` — чистый no-op (тождество — оба используют
+// одно f64 MIR/WASM-представление), `Целое` усекает к нулю через
+// `UnOp.int_trunc`.
 fn lowerCast(ctx: *LoweringContext, expression: ast.ExprId, cast: anytype) anyerror!ExprOutcome {
     const argument_outcome = try lowerExpr(ctx, cast.operand);
     if (argument_outcome.flow == .terminates) return terminated;
@@ -2409,20 +2411,19 @@ fn lowerLengthBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call:
     return continuesWith(dst);
 }
 
-// `паника(текст)` — native compiler compiles the message expression
-// then emits a `.panic` bytecode instruction that halts with that exact
-// runtime string (`compiler.zig`'s `compilePanicBuiltin`). WASM has no
-// analogous "trap with a runtime message" primitive — `unreachable`
-// (opcode `0x00`, already used via `.unreachable_term` for non-
-// exhaustive `выбор` at `mir_lowering.zig:719` and `wasm_strings.zig`'s
-// own invalid-UTF-8/out-of-range panics) takes no operand at all. The
-// message argument is still LOWERED (via `lowerCallArgs`, same as every
-// other builtin here) so any `unsupported()` inside IT still surfaces
-// correctly, but its VALUE is discarded — the message text itself is
-// unrecoverably lost under WASM AOT, a known, accepted gap (matches
-// this codebase's own established practice for this class of WASM-only
-// divergence, e.g. `wasm_strings.zig`'s из_числа/в_число doc comments)
-// rather than blocking on it.
+// `паника(текст)` — нативный компилятор компилирует выражение сообщения,
+// затем испускает bytecode-инструкцию `.panic`, останавливающуюся с этой
+// точной строкой времени выполнения. У WASM нет аналогичного примитива
+// "ловушка с сообщением времени выполнения" — `unreachable` (опкод
+// `0x00`, уже используется через `.unreachable_term` для
+// неисчерпывающего `выбор` и собственных паник invalid-UTF-8/выход-за-
+// границы в `wasm_strings.zig`) вообще не принимает операнд. Аргумент-
+// сообщение всё равно ПОНИЖАЕТСЯ (через `lowerCallArgs`, как и у любого
+// другого builtin здесь), поэтому любой `unsupported()` внутри НЕГО всё
+// равно корректно всплывает, но его ЗНАЧЕНИЕ отбрасывается — сам текст
+// сообщения безвозвратно теряется под WASM AOT, известный, принятый
+// пробел (соответствует уже устоявшейся практике этой кодовой базы для
+// этого класса WASM-специфичных расхождений), а не блокирующая проблема.
 fn lowerPanicBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype) anyerror!?ExprOutcome {
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
     if (entry.kind != .builtin or entry.module_path != null or !std.mem.eql(u8, entry.name, "паника")) return null;
@@ -2460,11 +2461,12 @@ fn lowerProcessBuiltinCall(ctx: *LoweringContext, symbol: symbols.SymbolId, call
     return null;
 }
 
-// The JS string runtime owns the actual UTF-16 storage; Panos string values
-// remain opaque i32 handles in WASM. `строки.срез`/`.найти` deliberately use
-// Unicode scalar indices, matching the VM contract, rather than JS UTF-16
-// offsets. `в_число` constructs the standard Результат handle in that same
-// host runtime, so ordinary Panos `выбор` handles both outcomes unchanged.
+// Фактическим хранилищем UTF-16 владеет JS string runtime; значения
+// строк панос в WASM остаются непрозрачными i32-хендлами.
+// `строки.срез`/`.найти` сознательно используют индексы юникодных
+// скаляров, соответствуя контракту VM, а не смещениям JS UTF-16.
+// `в_число` строит стандартный хендл Результат в том же хост-рантайме,
+// так что обычный `выбор` панос обрабатывает оба исхода без изменений.
 fn lowerStringBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
@@ -2494,10 +2496,10 @@ fn lowerStringBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: typ
     return continuesWith(dst);
 }
 
-// AOT's deliberately narrow browser-network bridge. The host performs a
-// same-origin synchronous XHR because the current WASM ABI has no suspension
-// or continuation support; success is `Опция.Есть(тело)`, any failed request
-// is `Опция.Нет()`.
+// Сознательно узкий сетевой мост AOT для браузера. Хост выполняет
+// синхронный same-origin XHR, поскольку у текущего WASM ABI нет
+// поддержки приостановки или продолжений; успех — `Опция.Есть(тело)`,
+// любой неудачный запрос — `Опция.Нет()`.
 fn lowerNetworkBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
@@ -2513,17 +2515,14 @@ fn lowerNetworkBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: ty
     return continuesWith(dst);
 }
 
-// `время.сейчас_мс`/`.монотонно_мс` — the only builtin-module calls this
-// Phase-1a-plus slice lowers, matching exactly what `zig/wasm_runtime/
-// runtime_wasi.zig`'s own doc comment already anticipated ("Phase-1a never
-// lowers a string at all... no clock reads reachable from any lowered
-// program yet EITHER" — this is that "either" becoming true). Emitted as
-// `call_builtin` with the SAME "модуль::имя" name convention `target.zig`
-// already uses for runtime availability checks, not a new naming scheme.
-// `время.спать_мс` deliberately has no case here — it's native-only
-// (`target.zig`'s `builtinAvailability`), and stays an `unsupported()`
-// panic in AOT WASM, same failure mode every other native-only feature
-// already gets in this file.
+// `время.сейчас_мс`/`.монотонно_мс` — единственные вызовы builtin-модуля,
+// которые понижает этот срез. Испускаются как `call_builtin` с ТЕМ ЖЕ
+// соглашением об имени "модуль::имя", что уже использует `target.zig`
+// для проверок доступности рантайма, а не новой схемой именования.
+// `время.спать_мс` намеренно не имеет здесь case — это native-only
+// builtin (`builtinAvailability` в `target.zig`), и остаётся паникой
+// `unsupported()` в AOT WASM, тот же режим отказа, что и у любой другой
+// native-only возможности в этом файле.
 fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const property = ctx.tree.expr(call.callee).property;
     const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
@@ -2544,69 +2543,74 @@ fn lowerTimeBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types
     return continuesWith(dst);
 }
 
-// DOM supports the compatible numeric methods plus textual content/input
-// methods. The browser emitter transports every Panos `Строка` as an
-// opaque JS-runtime handle; click callbacks are still named, zero-argument
-// exports and cannot capture a Panos context yet.
-// WASM AOT closures, Stage C — type-directed classification of a
-// captured value, decided entirely at COMPILE TIME from the capture's
-// own static type (no runtime type tag exists to drive real recursion
-// in emitted code — same reasoning `.new_aggregate`'s per-field
-// expansion in `wasm_objects.zig` already relies on).
-//   `.scalar`        — Число/Булево/Целое: raw 8-byte copy, no
-//                       pointer-chasing needed at all.
-//   `.string`        — Строка: promote via the existing
+// DOM поддерживает совместимые числовые методы плюс методы
+// текстового содержимого/ввода. Эмиттер браузера транспортирует каждую
+// `Строка` панос как непрозрачный хендл JS-рантайма; обработчики клика
+// пока остаются именованными экспортами с нулём аргументов и не могут
+// захватывать контекст панос.
+// Классификация захваченного значения по типу, решаемая полностью на
+// ЭТАПЕ КОМПИЛЯЦИИ по собственному статическому типу захвата (нет
+// рантайм-тега типа, который мог бы управлять настоящей рекурсией в
+// испускаемом коде — та же логика, на которую уже опирается поэлементное
+// разворачивание `.new_aggregate` в `wasm_objects.zig`).
+//   `.scalar`        — Число/Булево/Целое: сырое копирование 8 байт,
+//                       разыменование указателей вообще не нужно.
+//   `.string`        — Строка: промоутируется через существующий
 //                       `wasm_heap.findOrBuildPromoteToPermanent`.
-//   `.structure`      — a nominal struct whose complete field graph can
-//                       be promoted recursively.
-//   `.array`          — an array whose element graph can be promoted
-//                       recursively with a runtime loop.
-//   `.function_ref`   — a `.function`-typed capture. Real, common case
-//                       found only by RUNNING this, not by reading the
-//                       type system: `symbols.zig`'s `lookupTrackingCaptures`
-//                       registers ANY `.function`-kind symbol referenced
-//                       across a lambda boundary as a capture —
-//                       including a plain top-level function called
-//                       DIRECTLY inside the handler body (e.g.
-//                       `обработать_переключить(id)`), even though
-//                       `mir_lowering.zig`'s own direct-call fast path
-//                       means that reference never actually needs a
-//                       boxed closure value at the CALL site at all.
-//                       `lowerLambda`'s env-building step doesn't know
-//                       this either — it captures every symbol the
-//                       resolver listed, unconditionally. A local whose
-//                       current origin is a literal lambda carries its
-//                       exact resolver capture list in `closure_origins`,
-//                       so its box+env are promoted recursively. For an
-//                       unknown-origin function value, a RUNTIME check
-//                       (`promoteFunctionRefCapture`) still permits a
-//                       plain function box (`env_ptr == 0`) and traps on
-//                       an opaque non-zero env rather than guessing its
-//                       layout and producing a dangling pointer.
-//   `.unsupported`    — `Процесс` (its AOT handle is an actor-frame
-//                       pointer allocated in the resettable arena, not a
-//                       permanent scalar ID), a generic struct whose
-//                       concrete fields are unavailable here, or a
-//                       recursive type graph (cycle preservation needs an
-//                       identity map).
+//   `.structure`      — nominal-структура, чей полный граф полей можно
+//                       промоутировать рекурсивно.
+//   `.array`          — массив, чей граф элементов можно промоутировать
+//                       рекурсивно рантайм-циклом.
+//   `.function_ref`   — захват типа `.function`. Реальный, частый
+//                       случай: `lookupTrackingCaptures` в `symbols.zig`
+//                       регистрирует ЛЮБОЙ символ вида `.function`,
+//                       упомянутый через границу лямбды, как захват —
+//                       включая обычную верхнеуровневую функцию,
+//                       вызванную НАПРЯМУЮ внутри тела обработчика
+//                       (например, `обработать_переключить(id)`), хотя
+//                       собственный быстрый путь прямого вызова в
+//                       `mir_lowering.zig` означает, что этой ссылке в
+//                       МЕСТЕ ВЫЗОВА вообще никогда не нужно
+//                       упакованное значение замыкания. Шаг построения
+//                       окружения в `lowerLambda` этого тоже не знает —
+//                       он безусловно захватывает каждый символ, который
+//                       перечислил резолвер. Локаль, чьё текущее
+//                       происхождение — литеральная лямбда, несёт свой
+//                       точный список захватов резолвера в
+//                       `closure_origins`, поэтому её бокс+окружение
+//                       промоутируются рекурсивно. Для значения-функции
+//                       с неизвестным происхождением рантайм-проверка
+//                       (`promoteFunctionRefCapture`) всё равно разрешает
+//                       обычный бокс функции (`env_ptr == 0`) и
+//                       ловушится на непрозрачном ненулевом окружении
+//                       вместо того, чтобы угадывать его раскладку и
+//                       производить висящий указатель.
+//   `.unsupported`    — `Процесс` (его AOT-хендл — это указатель на
+//                       фрейм актора, выделенный в сбрасываемой арене, а
+//                       не постоянный скалярный ID), generic-структура,
+//                       чьи конкретные поля здесь недоступны, или
+//                       рекурсивный граф типов (сохранение цикла требует
+//                       карты идентичности).
 const CaptureKind = enum { scalar, string, structure, array, function_ref, unsupported };
 
 fn classifyCapture(checked: *const type_checker.CheckResult, type_id: types.TypeId) CaptureKind {
     return classifyCaptureDepth(checked, type_id, 0);
 }
 
-// Generic nominal declarations keep their field types in terms of the
-// declaration's parameter placeholders.  A concrete value crossing a DOM
-// closure boundary has the actual arguments on its nominal TypeId, so resolve
-// direct placeholders here without allocating a second type graph.  A field
-// whose OWN type is itself a generic nominal (`Коробка(T)` inside
-// `Коробка(Коробка(T))`) still carries the OUTER nominal's bare placeholders
-// in its argument list — recurse into those arguments through the same
-// substitution before returning, so nested generic captures resolve to a
-// fully concrete type, not a partially-substituted one. Materializing the
-// substituted nominal mutates `checked.types` (append-only TypeStore —
-// existing TypeIds stay valid); `@constCast` is safe here because this pass
-// runs strictly after typechecking has finished reading the store.
+// Generic nominal-объявления хранят типы своих полей в терминах
+// параметров-заполнителей объявления. Конкретное значение, пересекающее
+// границу DOM-замыкания, несёт реальные аргументы в своём nominal
+// TypeId, поэтому прямые заполнители разрешаются здесь без выделения
+// второго графа типов. Поле, чей СОБСТВЕННЫЙ тип сам является generic
+// nominal-типом (`Коробка(T)` внутри `Коробка(Коробка(T))`), всё равно
+// несёт голые заполнители ВНЕШНЕГО nominal-типа в своём списке
+// аргументов — рекурсивно проходим через ту же подстановку перед
+// возвратом, чтобы вложенные generic-захваты разрешались в полностью
+// конкретный тип, а не частично подставленный. Материализация
+// подставленного nominal-типа мутирует `checked.types` (TypeStore
+// только-на-добавление — существующие TypeId остаются валидными);
+// `@constCast` здесь безопасен, поскольку этот проход выполняется строго
+// после того, как typecheck закончил читать хранилище.
 fn concreteCaptureFieldType(checked: *const type_checker.CheckResult, nominal: types.Type, field_type: types.TypeId) ?types.TypeId {
     const entry = checked.types.get(field_type) orelse return field_type;
     switch (entry.*) {
@@ -2647,10 +2651,11 @@ fn classifyCaptureDepth(checked: *const type_checker.CheckResult, type_id: types
                 if (checked.generic_nominal_fields.get(nominal.symbol)) |generic| generic.fields else break :blk .unsupported;
             for (fields) |field| {
                 const concrete_type = concreteCaptureFieldType(checked, .{ .nominal = nominal }, field.typ) orelse break :blk .unsupported;
-                // A function stored inside an aggregate has no capture-symbol
-                // metadata at this boundary, so its environment layout cannot
-                // be promoted safely. Directly captured local function values
-                // remain supported through the symbol-aware path below.
+                // У функции, хранящейся внутри агрегата, на этой границе
+                // нет метаданных символа захвата, поэтому раскладку её
+                // окружения нельзя безопасно промоутировать. Напрямую
+                // захваченные локальные функциональные значения остаются
+                // поддержаны через путь ниже, знающий о символе.
                 if (checked.types.get(concrete_type)) |field_entry| {
                     if (field_entry.* == .function) break :blk .unsupported;
                 }
@@ -2660,16 +2665,18 @@ fn classifyCaptureDepth(checked: *const type_checker.CheckResult, type_id: types
         },
         .function => .function_ref,
         .array => |element| if (classifyCaptureDepth(checked, element, depth + 1) == .unsupported) .unsupported else .array,
-        // A `Процесс` value is a plain frame pointer (`i32`, same shape
-        // as any other pointer capture) — copying it into a closure box
-        // needs no special promotion logic (`.scalar`'s identity copy
-        // already suffices). Safe ONLY because the caller
-        // (`lowerDomClickClosure`) marks `module.actor_captured_by_dom_closure`
-        // whenever this case is reached, so `wasm_actors.zig`'s
-        // `expandSpawn` allocates the underlying frame in PERMANENT
-        // memory from the start — by the time this captured value is
-        // actually read, it already points into memory that survives
-        // the arena reset between calls. See `specs/016-actor-dom-persistence/`.
+        // Значение `Процесс` — это обычный указатель на фрейм (`i32`, та
+        // же форма, что и у любого другого захвата-указателя) —
+        // копирование его в бокс замыкания не требует специальной логики
+        // промоушена (тождественного копирования `.scalar` уже
+        // достаточно). Безопасно ТОЛЬКО потому, что вызывающая сторона
+        // (`lowerDomClickClosure`) помечает
+        // `module.actor_captured_by_dom_closure` при каждом достижении
+        // этого случая, поэтому `expandSpawn` в `wasm_actors.zig` с
+        // самого начала выделяет базовый фрейм в ПОСТОЯННОЙ памяти — к
+        // моменту, когда это захваченное значение действительно
+        // читается, оно уже указывает в память, переживающую сброс арены
+        // между вызовами.
         .process => .scalar,
         else => .scalar,
     };
@@ -2682,10 +2689,11 @@ fn isProcessCapture(checked: *const type_checker.CheckResult, type_id: types.Typ
 
 pub const invoke_click_trampoline_name = "@invoke_click";
 
-// One fixed browser entry point for every click closure. JS passes the
-// permanent closure box plus flattened MouseEvent scalars. The trampoline
-// builds the public nominal `DOM.СобытиеКлика` value in the resettable
-// per-call arena, then delegates closure unboxing and `call_indirect` to
+// Единая фиксированная точка входа браузера для каждого замыкания-клика.
+// JS передаёт постоянный бокс замыкания плюс развёрнутые скаляры
+// MouseEvent. Трамплин строит публичное nominal-значение
+// `DOM.СобытиеКлика` в сбрасываемой per-call арене, затем делегирует
+// распаковку замыкания и `call_indirect` в
 // `wasm_interfaces.expandCallValue`.
 fn findOrBuildInvokeClickTrampoline(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, event_type: types.TypeId) !mir.FunctionId {
     if (wasm_heap.findFunctionByName(module, invoke_click_trampoline_name)) |id| return id;
@@ -2713,23 +2721,25 @@ fn findOrBuildInvokeClickTrampoline(allocator: std.mem.Allocator, module: *mir.M
     try fields.append(arena, try wasm_heap.loadLocal(&builder, meta_local, type_store.builtins.boolean));
     const event = try builder.newValue(event_type);
     try builder.emit(.{ .new_aggregate = .{ .dst = event, .type_name = "DOM.СобытиеКлика", .elements = try fields.toOwnedSlice(arena) } });
-    // `.call_value` expansion consumes the callee before its arguments.
-    // Produce the reloaded box LAST so it is on top of the WASM stack;
-    // the already-produced event remains directly underneath it.
+    // Разворачивание `.call_value` потребляет callee до своих аргументов.
+    // Заново загруженный бокс производится ПОСЛЕДНИМ, чтобы он оказался
+    // на вершине WASM-стека; уже произведённое событие остаётся прямо
+    // под ним.
     const box_val = try wasm_heap.loadLocal(&builder, box_local, layout.ptr_type);
     try builder.emit(.{ .call_value = .{ .dst = null, .callee = box_val, .args = try module.arena.allocator().dupe(mir.ValueId, &.{event}) } });
     builder.terminate(.{ .return_value = .{ .value = null } });
     return id;
 }
 
-// Promotes ONE already-loaded value (`old_value`, typed `value_type`)
-// into the permanent region, per `classifyCapture`'s classification —
-// the shared leaf operation both `promoteClosureBoxToPermanent` (env
-// slots) and recursive aggregate promotion reduce
-// to. `.scalar` is a no-op (the raw value IS already permanent-region-
-// safe — it carries no pointer at all). `.unsupported` never reaches
-// here — rejected earlier, before any lowering happens, by
-// `lowerDomClickClosure`'s own pre-check.
+// Промоутирует ОДНО уже загруженное значение (`old_value` типа
+// `value_type`) в постоянный регион согласно классификации
+// `classifyCapture` — общая листовая операция, к которой сводятся и
+// `promoteClosureBoxToPermanent` (слоты окружения), и рекурсивный
+// промоушен агрегатов. `.scalar` — no-op (сырое значение уже безопасно
+// для постоянного региона — оно вообще не несёт указателя).
+// `.unsupported` сюда никогда не доходит — отклоняется раньше, до
+// начала любого понижения, собственной предварительной проверкой
+// `lowerDomClickClosure`.
 fn promoteCaptureValue(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, value_type: types.TypeId, old_value: mir.ValueId, capture_symbol: ?symbols.SymbolId, closure_depth: u8) anyerror!mir.ValueId {
     return switch (classifyCapture(ctx.checked, value_type)) {
         .scalar => old_value,
@@ -2755,17 +2765,20 @@ fn promoteCaptureValue(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, value
     };
 }
 
-// A captured `.function`-typed value's box, copied into the permanent
-// region — see `CaptureKind.function_ref`'s own doc comment for WHY
-// this case exists at all (the resolver captures every function
-// reference crossing a lambda boundary, even ones the lowering-time
-// direct-call fast path never actually boxes). This is the fallback for
-// an UNKNOWN origin: a plain named function has `env_ptr == 0` and can
-// be copied safely, while a non-zero env has no available slot layout.
-// Known local literal lambdas take the recursive
-// `promoteClosureBoxToPermanent` path in `promoteCaptureValue` instead.
-// The runtime check here traps rather than silently retaining a dangling
-// pointer for an opaque closure from a parameter/field/reassignment.
+// Бокс захваченного значения типа `.function`, скопированный в
+// постоянный регион — почему этот случай вообще существует, см.
+// собственный doc-комментарий `CaptureKind.function_ref` (резолвер
+// захватывает каждую ссылку на функцию, пересекающую границу лямбды,
+// даже те, что быстрый путь прямого вызова во время понижения
+// фактически никогда не боксирует). Это запасной вариант для
+// НЕИЗВЕСТНОГО происхождения: у обычной именованной функции
+// `env_ptr == 0`, и её можно безопасно скопировать, в то время как у
+// ненулевого окружения нет доступной раскладки слотов. Известные
+// локальные литеральные лямбды вместо этого идут по рекурсивному пути
+// `promoteClosureBoxToPermanent` в `promoteCaptureValue`. Рантайм-
+// проверка здесь ловушится вместо того, чтобы молча сохранить висящий
+// указатель для непрозрачного замыкания из параметра/поля/
+// переприсваивания.
 fn promoteFunctionRefCapture(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, old_box: mir.ValueId) anyerror!mir.ValueId {
     const module = ctx.builder.module;
     const old_box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_old_fn_box", layout.ptr_type, old_box);
@@ -2811,10 +2824,11 @@ fn promoteFunctionRefCapture(ctx: *LoweringContext, layout: wasm_heap.PtrLayout,
     return try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
 }
 
-// Allocate a same-field-count struct copy in the permanent region and
-// recursively promote every field. Same 8-byte-slot `frame_load`/
-// `frame_store` layout `wasm_objects.zig` already established for
-// plain structs (no tag slot — that's a variant-only convention).
+// Выделяет копию структуры с тем же числом полей в постоянном регионе и
+// рекурсивно промоутирует каждое поле. Та же раскладка
+// `frame_load`/`frame_store` со слотами по 8 байт, что уже установлена
+// `wasm_objects.zig` для обычных структур (без слота тега — это
+// соглашение только для вариантов).
 fn promoteStructToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, struct_type: types.TypeId, old_struct_ptr: mir.ValueId, closure_depth: u8) anyerror!mir.ValueId {
     const module = ctx.builder.module;
     const type_entry = ctx.checked.types.get(struct_type) orelse return ctx.unsupported("захват структуры неизвестного типа (Stage C)");
@@ -2938,18 +2952,17 @@ fn promoteArrayToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, a
     return wasm_heap.loadLocal(&ctx.builder, new_header_local, layout.ptr_type);
 }
 
-// Rebuilds a `.build_closure`-produced box (table_index + env_ptr,
-// currently in the ordinary RESETTABLE arena) directly in the
-// PERMANENT region — needed even for SCALAR-only captures (Stage B):
-// the box+env ALLOCATIONS themselves are still pointers that JS holds
-// raw across a separate later export call (the click), regardless of
-// what's inside them. Stage C extends this from a flat byte copy (only
-// correct when every slot is scalar) to a per-slot, TYPE-DIRECTED copy
-// — a `Строка`/aggregate slot gets its OWN pointed-to data promoted
-// too (`promoteCaptureValue`), not just its raw pointer bit-pattern
-// (which would otherwise dangle after the next arena reset — the exact
-// bug this whole function exists to avoid, one level up the pointer
-// chain from the old click-context string promotion).
+// Перестраивает бокс, произведённый `.build_closure` (table_index +
+// env_ptr, сейчас в обычной СБРАСЫВАЕМОЙ арене), прямо в ПОСТОЯННОМ
+// регионе — нужно даже для захватов, состоящих только из СКАЛЯРОВ: сами
+// АЛЛОКАЦИИ бокса+окружения остаются указателями, которые JS хранит
+// сырыми через отдельный последующий экспортируемый вызов (клик),
+// независимо от того, что внутри них. Копия по слотам, направленная по
+// ТИПУ, вместо плоского побайтового копирования (корректного только
+// когда каждый слот скалярен) — слот `Строка`/агрегата получает
+// промоушен и СВОИХ данных, на которые указывает (`promoteCaptureValue`),
+// а не только сырого битового паттерна указателя (который иначе повис
+// бы после следующего сброса арены).
 fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayout, box_value: mir.ValueId, captures: []const symbols.SymbolId, closure_depth: u8) anyerror!mir.ValueId {
     const module = ctx.builder.module;
     const box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_box", layout.ptr_type, box_value);
@@ -3012,12 +3025,11 @@ fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayo
     return try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
 }
 
-// `DOM.на_клик(selector, обработчик)` deliberately requires the handler
-// argument to be a literal
-// `.lambda` expression AT THE CALL SITE (not an arbitrary closure-typed
-// value from elsewhere) — this is what makes the capture list
-// statically inspectable here via `lambda_captures`, needed for the
-// scalar-only restriction below. See `project_panos_wasm_aot_closures`.
+// `DOM.на_клик(selector, обработчик)` сознательно требует, чтобы
+// аргумент обработчика был литеральным выражением `.lambda` ПРЯМО НА
+// МЕСТЕ ВЫЗОВА (не произвольным значением типа замыкания откуда-то ещё)
+// — именно это делает список захватов статически инспектируемым здесь
+// через `lambda_captures`.
 fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutcome {
     if (call.arguments.len != 2) return ctx.unsupported("DOM.на_клик() ожидает 2 аргумента");
     const handler_expr = call.arguments[1];
@@ -3035,17 +3047,17 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     const captures = ctx.resolution.lambda_captures.get(handler_expr) orelse &.{};
     for (captures) |capture_symbol| {
         const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
-        // A captured `Процесс` needs its underlying frame allocated in
-        // PERMANENT memory (see `specs/016-actor-dom-persistence/`) —
-        // flag it for `wasm_actors.zig`'s `expandSpawn` to read later;
-        // `classifyCaptureDepth`'s `.process => .scalar` already treats
-        // the capture itself as an ordinary pointer copy, safe once this
-        // flag makes the underlying allocation permanent.
+        // Захваченному `Процесс` нужно, чтобы его базовый фрейм был
+        // выделен в ПОСТОЯННОЙ памяти — помечаем это для последующего
+        // чтения `expandSpawn` в `wasm_actors.zig`; `.process => .scalar`
+        // в `classifyCaptureDepth` уже трактует сам захват как обычное
+        // копирование указателя, безопасное, как только этот флаг делает
+        // базовую аллокацию постоянной.
         if (isProcessCapture(ctx.checked, capture_type)) {
             ctx.builder.module.actor_captured_by_dom_closure = true;
         }
         if (classifyCapture(ctx.checked, capture_type) == .unsupported) {
-            return ctx.unsupported("DOM.на_клик(): захват рекурсивного/обобщённого агрегата или иного неподдержанного типа (Stage C ограничение, project_panos_wasm_aot_closures)");
+            return ctx.unsupported("DOM.на_клик(): захват рекурсивного/обобщённого агрегата или иного неподдержанного типа");
         }
     }
 
@@ -3055,11 +3067,12 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
         .bool_type = ctx.checked.types.builtins.boolean,
     };
 
-    // Preserve source-order evaluation: selector first, handler second.
-    // Both results cross promotion's possible `if/else`, so keep them in
-    // real MIR locals and reload them contiguously immediately before the
-    // builtin call. A bare ValueId is a one-use stack value and cannot
-    // safely survive that branch.
+    // Сохраняем порядок вычисления как в исходнике: сначала селектор,
+    // затем обработчик. Оба результата пересекают возможный `if/else`
+    // промоушена, поэтому храним их в настоящих MIR-локалях и заново
+    // загружаем смежно непосредственно перед вызовом builtin. Голый
+    // ValueId — это одноразовое стековое значение и не может безопасно
+    // пережить эту ветку.
     const selector_outcome = try lowerExpr(ctx, call.arguments[0]);
     if (selector_outcome.flow == .terminates) return terminated;
     const selector_local = try wasm_heap.storeLocal(&ctx.builder, "@click_selector", ctx.checked.types.builtins.string, selector_outcome.value);
@@ -3116,19 +3129,16 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
 
     var args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
 
-    // `после_кадра`'s context argument is captured RAW by the JS loader
-    // (`aot-dom-loader.js`'s `dom_after_frame`) and handed back UNCHANGED
-    // to a handler invoked
-    // in a wholly SEPARATE, later export call — see
-    // `project_panos_elm_architecture_dom_storage_design`/
-    // `project_panos_wasm_aot_memory_growth_fix` for the full research.
-    // `wasm_gc_arena.zig`'s per-call arena reset (Phase 1 GC) would free
-    // this value out from under JS on the very next event if it stayed
-    // in the ordinary arena. Promote (copy) it into the non-resettable
-    // permanent region here, at the exact point it's about to be handed
-    // to the host import — everything else keeps going through the
-    // ordinary arena, no call-graph analysis needed (see
-    // `wasm_heap.findOrBuildPromoteToPermanent`'s own doc comment).
+    // Аргумент-контекст `после_кадра` захватывается JS-загрузчиком СЫРЫМ
+    // (`dom_after_frame` в `aot-dom-loader.js`) и передаётся обратно БЕЗ
+    // ИЗМЕНЕНИЙ обработчику, вызываемому в совершенно ОТДЕЛЬНОМ, более
+    // позднем экспортируемом вызове. Сброс per-call арены в
+    // `wasm_gc_arena.zig` освободил бы это значение из-под JS уже на
+    // следующем же событии, если бы оно оставалось в обычной арене.
+    // Промоутируем (копируем) его здесь, в непересбрасываемый постоянный
+    // регион, ровно в той точке, где оно вот-вот будет передано хост-
+    // импорту — всё остальное продолжает идти через обычную арену, анализ
+    // графа вызовов не нужен.
     const context_arg_index: ?usize = if (std.mem.eql(u8, name, "DOM::после_кадра"))
         1
     else
@@ -3158,15 +3168,14 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
     return continuesWith(dst);
 }
 
-// `состояние.прочитать`/`.записать` — the JS-loader-held Model
-// (`aot-dom-loader.js`'s `heldModel` closure variable), NOT a DOM
-// attribute — see `project_panos_elm_architecture_dom_storage_design`.
-// Unlike `после_кадра`'s context argument, NOTHING
-// here needs `wasm_heap.findOrBuildPromoteToPermanent` — the value
-// always flows as a full byte COPY through `readString`/`writeString`
-// on the JS side (never a raw pointer JS holds onto across calls), so
-// it's automatically safe under `wasm_gc_arena.zig`'s per-call arena
-// reset with no special handling.
+// `состояние.прочитать`/`.записать` — Model, удерживаемая JS-загрузчиком
+// (переменная-замыкание `heldModel` в `aot-dom-loader.js`), а НЕ атрибут
+// DOM. В отличие от аргумента-контекста `после_кадра`, здесь НИЧЕГО не
+// нуждается в `wasm_heap.findOrBuildPromoteToPermanent` — значение всегда
+// проходит как полная побайтовая КОПИЯ через `readString`/`writeString`
+// на стороне JS (никогда как сырой указатель, который JS удерживает
+// между вызовами), поэтому оно автоматически безопасно под сбросом
+// per-call арены в `wasm_gc_arena.zig` без специальной обработки.
 fn lowerStateBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const symbol = ctx.resolution.expr_symbols.get(call.callee) orelse return null;
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
@@ -3192,9 +3201,9 @@ fn lowerStateBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: type
 }
 
 fn lowerCallArgs(ctx: *LoweringContext, expressions: []const ast.ExprId) anyerror!?[]const mir.ValueId {
-    // Arena-backed (see `mir.Module.arena`'s doc comment) — this slice is
-    // stored permanently inside a `call_value` instruction, unlike
-    // `ctx.allocator`-backed temporaries that get freed within this call.
+    // Выделяется в арене — этот срез хранится постоянно внутри
+    // инструкции `call_value`, в отличие от временных значений на
+    // `ctx.allocator`, которые освобождаются в рамках этого вызова.
     const arena = ctx.builder.module.arena.allocator();
     var args: std.ArrayList(mir.ValueId) = .empty;
     for (expressions) |expression| {
@@ -3246,8 +3255,8 @@ test "lowerModule lowers a recursive arithmetic function to a valid CFG" {
     try std.testing.expectEqual(@as(usize, 1), module.functions.items.len);
     const function = &module.functions.items[0];
     try std.testing.expectEqualStrings("факториал", function.name);
-    // entry (condition) + then + else + merge — the if-expression's own
-    // 4-block shape, nothing more (this function's body IS the if-expr).
+    // entry (условие) + then + else + merge — собственная 4-блочная форма
+    // if-выражения, не больше (тело этой функции И ЕСТЬ if-выражение).
     try std.testing.expectEqual(@as(usize, 4), function.blocks.items.len);
 
     var cfg = try @import("mir_cfg.zig").computeCfgInfo(allocator, function);
@@ -3260,10 +3269,11 @@ test "lowerModule lowers пока into header/body/exit blocks, no back-edge whe
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
     const type_checker_mod = @import("type_checker.zig");
-    // Deliberately avoids assignment here to isolate header/body/exit block
-    // wiring and a body that TERMINATES (return), which must suppress the
-    // loop's back-edge jump — see the accumulator test below for the
-    // assignment-driven back-edge case.
+    // Сознательно избегает присваивания здесь, чтобы изолировать монтаж
+    // блоков header/body/exit и тело, которое ЗАВЕРШАЕТСЯ (return), что
+    // должно подавить обратное ребро (back-edge) цикла — см. тест с
+    // аккумулятором ниже для случая обратного ребра, вызванного
+    // присваиванием.
     const source_text =
         \\функ цикл_тест(n: Число) -> Число
         \\    пока n > 0.0 цикл
@@ -3288,8 +3298,8 @@ test "lowerModule lowers пока into header/body/exit blocks, no back-edge whe
 
     try std.testing.expectEqual(@as(usize, 1), module.functions.items.len);
     const function = &module.functions.items[0];
-    // entry (jump to header) + header (condition) + body (returns) + exit
-    // (falls through to the trailing `0`).
+    // entry (переход к header) + header (условие) + body (возвращает) +
+    // exit (проваливается в завершающий `0`).
     try std.testing.expectEqual(@as(usize, 4), function.blocks.items.len);
 
     const header = function.blockConst(@enumFromInt(1));
@@ -3332,8 +3342,9 @@ test "lowerModule lowers an accumulator пока loop with assignment, back-edge
 
     try std.testing.expectEqual(@as(usize, 1), module.functions.items.len);
     const function = &module.functions.items[0];
-    // entry (jump to header) + header (condition) + body (falls off the end,
-    // must jump BACK to header) + exit (falls through to trailing `итог`).
+    // entry (переход к header) + header (условие) + body (проваливается в
+    // конец, должен перейти НАЗАД к header) + exit (проваливается в
+    // завершающий `итог`).
     try std.testing.expectEqual(@as(usize, 4), function.blocks.items.len);
 
     const body = function.blockConst(@enumFromInt(2));

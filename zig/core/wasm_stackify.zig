@@ -2,27 +2,27 @@ const std = @import("std");
 const mir = @import("mir.zig");
 const mir_cfg = @import("mir_cfg.zig");
 
-// Ported from `core/wasm_stackify.odin` — structural queries over the MIR
-// CFG (`mir_cfg.zig`) that `wasm_emit.zig` needs to decide where to open/
-// close WASM `loop`/`if` (structured control flow — block/loop/if, no
-// goto). Not a separate IR tree — pure QUERIES, called directly from the
-// emit pass.
+// Структурные запросы над MIR CFG (`mir_cfg.zig`), нужные `wasm_emit.zig`,
+// чтобы решить, где открывать/закрывать WASM `loop`/`if` (структурированное
+// управление потоком — block/loop/if, без goto). Не отдельное IR-дерево —
+// чистые ЗАПРОСЫ, вызываемые напрямую из прохода эмиссии.
 //
-// Why not a full Emscripten-style relooper: panos as a LANGUAGE has no
-// goto/arbitrary jumps — the ONLY source of a MIR CFG is `mir_lowering.zig`,
-// which builds если/иначе and пока STRUCTURALLY (see `lowerIfExpr`/
-// `lowerWhile`) — the graph is always reducible. But "where do если/иначе
-// branches merge" and "which Branch arm of a loop header is the body vs.
-// the exit" can't be reliably determined from reverse-postorder position
-// alone (unlike a back-edge, see `isLoopHeader`) — dominance is needed:
-// an если/иначе merge is the UNIQUE block M with idom[M] == branch_block,
-// M ∉ {then_block, else_block} (see `findMerge`) — only such an M has
-// EVERY converging path pass exclusively through branch_block, which is
-// what "merge point of THIS если/иначе" actually means, as opposed to a
-// block shared with something external (e.g. a loop's exit_block, which
-// both прервать from inside if/else AND the header's own else-branch can
-// reach — without dominance, "more than one predecessor" alone confuses
-// "merge of my two branches" with "a point shared with outside code").
+// Почему не полноценный relooper в стиле Emscripten: у панос как у ЯЗЫКА
+// нет goto/произвольных переходов — ЕДИНСТВЕННЫЙ источник MIR CFG —
+// `mir_lowering.zig`, который строит если/иначе и пока СТРУКТУРНО (см.
+// `lowerIfExpr`/`lowerWhile`) — граф всегда редуцируем. Но "где сходятся
+// ветви если/иначе" и "какая из ветвей Branch у заголовка цикла — тело, а
+// какая — выход" нельзя надёжно определить только по позиции в
+// reverse-postorder (в отличие от обратного ребра, см. `isLoopHeader`) —
+// нужна доминация: место слияния если/иначе — ЕДИНСТВЕННЫЙ блок M с
+// idom[M] == branch_block, M ∉ {then_block, else_block} (см. `findMerge`)
+// — только у такого M ВСЕ сходящиеся пути проходят исключительно через
+// branch_block, что и означает "точка слияния ИМЕННО ЭТОГО если/иначе", в
+// отличие от блока, разделяемого с чем-то внешним (например, exit_block
+// цикла, куда может попасть и прервать изнутри if/else, и собственная
+// ветка-иначе заголовка — без доминации "больше одного предшественника"
+// путает "слияние моих двух веток" с "точкой, разделяемой с внешним
+// кодом").
 
 pub fn buildRpoIndex(allocator: std.mem.Allocator, info: *const mir_cfg.CfgInfo) !std.AutoHashMap(mir.BlockId, usize) {
     var index: std.AutoHashMap(mir.BlockId, usize) = .init(allocator);
@@ -30,11 +30,11 @@ pub fn buildRpoIndex(allocator: std.mem.Allocator, info: *const mir_cfg.CfgInfo)
     return index;
 }
 
-// True if block `b` has a predecessor `p` with rpo_index[p] >= rpo_index[b]
-// (a back-edge). Correct precisely because a jump-to-loop-header is the
-// ONLY kind of backward edge this lowering can ever produce (the same
-// fact `mir_lowering.zig`'s CFG shape already relies on: a `branch`
-// terminator always points forward).
+// Истина, если у блока `b` есть предшественник `p` с rpo_index[p] >=
+// rpo_index[b] (обратное ребро). Корректно именно потому, что переход к
+// заголовку цикла — ЕДИНСТВЕННЫЙ вид обратного ребра, который может
+// произвести это понижение (тот же факт, на который уже опирается форма
+// CFG в `mir_lowering.zig`: терминатор `branch` всегда указывает вперёд).
 pub fn isLoopHeader(info: *const mir_cfg.CfgInfo, rpo_index: *const std.AutoHashMap(mir.BlockId, usize), b: mir.BlockId) bool {
     const b_index = rpo_index.get(b) orelse return false;
     for (info.predecessors[@intFromEnum(b)].items) |p| {
@@ -44,8 +44,8 @@ pub fn isLoopHeader(info: *const mir_cfg.CfgInfo, rpo_index: *const std.AutoHash
     return false;
 }
 
-// Reachable from `from` to `target` via `successors()` (`mir_cfg.zig`),
-// without revisiting an already-seen block.
+// Достижимость от `from` до `target` через `successors()` (`mir_cfg.zig`),
+// без повторного посещения уже увиденных блоков.
 pub fn canReach(allocator: std.mem.Allocator, function: *const mir.Function, from: mir.BlockId, target: mir.BlockId) !bool {
     var visited: std.AutoHashMap(mir.BlockId, void) = .init(allocator);
     defer visited.deinit();
@@ -65,17 +65,18 @@ pub fn canReach(allocator: std.mem.Allocator, function: *const mir.Function, fro
     return false;
 }
 
-// A loop header's `branch(cond, t, e)`: which of t/e is the loop BODY (can
-// reach back to header), which is the block AFTER the loop. Does not rely
-// on argument order — checks structurally.
+// Для `branch(cond, t, e)` заголовка цикла: какой из t/e — ТЕЛО цикла
+// (может достичь заголовка обратно), какой — блок ПОСЛЕ цикла. Не
+// полагается на порядок аргументов — проверяет структурно.
 pub fn identifyLoopBodyAndExit(allocator: std.mem.Allocator, function: *const mir.Function, header: mir.BlockId, then_block: mir.BlockId, else_block: mir.BlockId) !struct { body: mir.BlockId, exit: mir.BlockId } {
     if (try canReach(allocator, function, then_block, header)) return .{ .body = then_block, .exit = else_block };
     return .{ .body = else_block, .exit = then_block };
 }
 
-// Immediate dominators — standard iterative algorithm (Cooper/Harvey/
-// Kennedy, "A Simple, Fast Dominance Algorithm") over reverse-postorder +
-// predecessors, both already computed by `mir_cfg.CfgInfo`.
+// Непосредственные доминаторы — стандартный итеративный алгоритм
+// (Cooper/Harvey/Kennedy, "A Simple, Fast Dominance Algorithm") над
+// reverse-postorder + предшественниками, оба уже вычислены в
+// `mir_cfg.CfgInfo`.
 pub fn computeIdom(allocator: std.mem.Allocator, function: *const mir.Function, info: *const mir_cfg.CfgInfo, rpo_index: *const std.AutoHashMap(mir.BlockId, usize)) !std.AutoHashMap(mir.BlockId, mir.BlockId) {
     var idom: std.AutoHashMap(mir.BlockId, mir.BlockId) = .init(allocator);
     const entry = function.entry;
@@ -117,10 +118,9 @@ fn intersectDoms(idom: *const std.AutoHashMap(mir.BlockId, mir.BlockId), rpo_ind
     return x;
 }
 
-// The UNIQUE block M with idom[M] == branch_block, other than then_block/
-// else_block themselves (see this file's doc comment). `null` — both
-// branches terminate execution (return/panic/loop forever), there is no
-// merge.
+// ЕДИНСТВЕННЫЙ блок M с idom[M] == branch_block, отличный от then_block/
+// else_block (см. doc-комментарий этого файла). `null` — обе ветки
+// завершают выполнение (return/паника/вечный цикл), слияния нет.
 pub fn findMerge(function: *const mir.Function, idom: *const std.AutoHashMap(mir.BlockId, mir.BlockId), branch_block: mir.BlockId, then_block: mir.BlockId, else_block: mir.BlockId) ?mir.BlockId {
     for (0..function.blocks.items.len) |i| {
         const b: mir.BlockId = @enumFromInt(i);

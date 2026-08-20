@@ -6,15 +6,12 @@ const source = @import("source.zig");
 const symbols = @import("symbols.zig");
 const target_policy = @import("target.zig");
 
-// Every ambient native builtin module name (`installBuiltins` below
-// registers each of these) — `module_loader.zig`'s import search uses the
-// SAME list to decide whether `импорт <имя>` with no `.ps` file anywhere
-// on the search path should silently resolve to the native module instead
-// of a `FileNotFound` error (documented behavior,
-// `docs/src/getting-started/installation.md` § "Поиск модулей" — real
-// gap found auditing panosiki: `импорт время`/`импорт фс`/etc. failed
-// outright before this, since NOTHING taught the loader these names
-// don't need a file at all).
+// Полный список имён встроенных нативных модулей (каждый регистрируется
+// ниже в `installBuiltins`) — поиск импортов в `module_loader.zig`
+// использует ЭТОТ ЖЕ список, чтобы понять, что `импорт <имя>` без файла
+// `.ps` на пути поиска должен молча разрешиться в нативный модуль, а не
+// выдать ошибку `FileNotFound` (документированное поведение,
+// `docs/src/getting-started/installation.md` § "Поиск модулей").
 pub const native_builtin_modules = [_][]const u8{
     "фс",
     "ос",
@@ -29,13 +26,13 @@ pub const native_builtin_modules = [_][]const u8{
     "бд",
 };
 
-// Export names per native module. Values are builtins unless
-// `nativeModuleExportKind` marks a name as a public native type. Used by
-// `module_linker.zig` to bind an ALIASED native import (`импорт
-// "ввод_вывод" как ио`) — `module_loader.zig`'s `native_module` field on
-// `Import` says a name resolved natively, but the alias itself still
-// needs SOMETHING declared as its exports, exactly like a real file
-// import gets from `buildExportsForTarget`.
+// Экспортируемые имена по каждому нативному модулю. Значения — builtin'ы,
+// если `nativeModuleExportKind` не пометит имя как публичный нативный тип.
+// Используется `module_linker.zig` для привязки АЛИАСИРОВАННОГО нативного
+// импорта (`импорт "ввод_вывод" как ио`) — поле `native_module` у `Import`
+// в `module_loader.zig` говорит, что имя разрешилось нативно, но самому
+// алиасу всё равно нужно ЧТО-ТО объявленное как его экспорты, так же как
+// обычный файловый импорт получает их из `buildExportsForTarget`.
 pub fn nativeModuleExports(name: []const u8) ?[]const []const u8 {
     const table = [_]struct { name: []const u8, exports: []const []const u8 }{
         .{ .name = "фс", .exports = &.{ "есть", "удалить", "прочитать", "записать", "открыть", "это_директория", "создать_директорию", "список_директории", "удалить_директорию" } },
@@ -96,20 +93,21 @@ pub const ImportedExport = struct {
     origin: ?ImportedSymbolOrigin = null,
     methods: []const ImportedMethodExport = &.{},
     variants: []const ImportedVariantExport = &.{},
-    // Set ONLY for a native-builtin export reached through an ALIASED
-    // `импорт "ввод_вывод" как ио` — the member's `module_path` must stay
-    // the module's REAL name ("ввод_вывод"), never the local alias
-    // ("ио"), because every `compileXBuiltin`/`isBuiltinModule` dispatch
-    // in `compiler.zig`/`type_checker.zig` hardcodes the real name.
-    // `null` (the overwhelmingly common case — a real file import) keeps
-    // `predeclareImports`'s existing `module_path = import.alias`
-    // behavior exactly as before.
+    // Заполняется ТОЛЬКО для нативного builtin-экспорта, достигнутого через
+    // АЛИАСИРОВАННЫЙ `импорт "ввод_вывод" как ио` — `module_path` у члена
+    // должен оставаться РЕАЛЬНЫМ именем модуля ("ввод_вывод"), никогда не
+    // локальным алиасом ("ио"), потому что каждый диспетчер
+    // `compileXBuiltin`/`isBuiltinModule` в `compiler.zig`/`type_checker.zig`
+    // жёстко завязан на реальное имя. `null` (подавляющее большинство
+    // случаев — обычный файловый импорт) сохраняет существующее поведение
+    // `predeclareImports` (`module_path = import.alias`) без изменений.
     builtin_module_path: ?[]const u8 = null,
 };
 
-// A variant of an imported enum type — construction/matching is entirely
-// name-string-based at compile time, so unlike methods no declaration or
-// FunctionId needs to travel with it, just the bare name.
+// Вариант импортированного перечисления — конструирование/сопоставление
+// целиком основано на имени-строке во время компиляции, поэтому, в отличие
+// от методов, с ним не нужно тащить декларацию или FunctionId — только
+// голое имя.
 pub const ImportedVariantExport = struct {
     name: []const u8,
     span: source.Span,
@@ -120,19 +118,19 @@ pub const ImportedSymbolOrigin = struct {
     declaration: ast.DeclId,
 };
 
-// A method declared on an imported owner type — dispatched structurally on
-// the owner's value (`точка.метод()`), never bound to a name in scope, so it
-// needs its own local Symbol_Id minted alongside the owner's, not a scope
-// declaration like other imported exports.
+// Метод, объявленный на импортированном типе-владельце — диспетчеризуется
+// структурно по значению владельца (`точка.метод()`), никогда не
+// привязывается к имени в области видимости, поэтому ему нужен собственный
+// локальный Symbol_Id, заведённый рядом с владельцем, а не декларация в
+// области видимости, как у других импортируемых экспортов.
 pub const ImportedMethodExport = struct {
     name: []const u8,
-    // The module where this method's `функ` body is physically written
-    // (an impl block's own file) — needed separately from the owning
-    // export's `origin.module` (the STRUCT's module) because a
-    // qualified impl target (`реализация X для Модуль.Тип`) can live in
-    // a THIRD file, distinct from both the struct's and the consumer's.
-    // `declaration` below is a `DeclId` into THIS module's own AST, not
-    // the struct's.
+    // Модуль, где физически написано тело `функ` этого метода (файл
+    // самого impl-блока) — нужен отдельно от `origin.module` владеющего
+    // экспорта (модуль СТРУКТУРЫ), потому что квалифицированная цель impl
+    // (`реализация X для Модуль.Тип`) может жить в ТРЕТЬЕМ файле, отличном
+    // и от файла структуры, и от файла потребителя. `declaration` ниже —
+    // это `DeclId` в AST ЭТОГО модуля, не структуры.
     module: usize,
     declaration: ast.DeclId,
     span: source.Span,
@@ -142,16 +140,17 @@ pub const ImportedModule = struct {
     alias: []const u8,
     span: source.Span,
     exports: []const ImportedExport,
-    // True only for the implicit prelude import — merges `exports` DIRECTLY
-    // into the importer's own bare scope (`Опция(T)`, not `alias.Опция`)
-    // instead of nesting them under an `alias`-qualified module symbol.
+    // Истинно только для неявного импорта прелюдии — сливает `exports`
+    // НАПРЯМУЮ в собственную область видимости импортёра (`Опция(T)`, а не
+    // `alias.Опция`), вместо вложения под символ модуля, квалифицированный
+    // `alias`.
     unqualified: bool = false,
 };
 
-// Binds a freshly-minted local Symbol_Id for an imported method to the owner
-// type's own local Symbol_Id and the method's origin declaration in the
-// exporting module — mirrors `imported_symbols` but keyed by owner+name
-// instead of a scope-visible qualified name.
+// Привязывает свежесозданный локальный Symbol_Id импортированного метода к
+// собственному локальному Symbol_Id типа-владельца и к декларации-источнику
+// метода в экспортирующем модуле — зеркалит `imported_symbols`, но с ключом
+// владелец+имя вместо видимого в области видимости квалифицированного имени.
 pub const ImportedMethodBinding = struct {
     owner: symbols.SymbolId,
     name: []const u8,
@@ -180,18 +179,18 @@ pub const Resolution = struct {
     imported_symbols: std.AutoHashMap(symbols.SymbolId, ImportedSymbolOrigin),
     imported_methods: std.ArrayList(ImportedMethodBinding) = .empty,
     enum_variants: std.ArrayList(EnumVariants) = .empty,
-    // `внешний` (FFI) — resolved function pointer per symbol, as a plain
-    // `usize` (0 = lookup failed, already reported as a diagnostic at
-    // that point) rather than an actual pointer type or `std.DynLib`
-    // value: this `Resolution` struct is compiled into the shared
-    // `core_module`, which the wasm32-freestanding browser build also
-    // imports, and `std.DynLib` doesn't need to (and shouldn't) ever
-    // become a stored field type here — `predeclare`'s `.foreign`
-    // handling only ever uses it as a local inside a real `if`/`else` on
-    // `builtin.target.os.tag == .freestanding`, then deliberately lets it
-    // go out of scope WITHOUT closing (the loaded library must outlive
-    // this resolution pass — matches Odin's `module_graph.
-    // foreign_libraries`, never explicitly unloaded either).
+    // `внешний` (FFI) — разрешённый указатель на функцию для каждого
+    // символа хранится как обычный `usize` (0 = поиск не удался, диагностика
+    // уже выдана в этот момент), а не как настоящий тип указателя или
+    // значение `std.DynLib`: структура `Resolution` компилируется в общий
+    // `core_module`, который также импортирует сборка браузера
+    // wasm32-freestanding, и `std.DynLib` не должен становиться здесь типом
+    // хранимого поля — обработка `.foreign` в `predeclare` использует его
+    // только как локальную переменную внутри `if`/`else` по
+    // `builtin.target.os.tag == .freestanding`, затем сознательно даёт ей
+    // выйти из области видимости БЕЗ закрытия (загруженная библиотека
+    // должна пережить этот проход разрешения — как и `module_graph.
+    // foreign_libraries` в Odin, тоже никогда явно не выгружаемая).
     foreign_functions: std.AutoHashMap(symbols.SymbolId, usize),
 
     pub fn init(allocator: std.mem.Allocator) !Resolution {
@@ -240,34 +239,35 @@ pub const Resolution = struct {
     }
 };
 
-// Extracted as a standalone function (not just a `Resolver` method) so
-// `bundle.zig` (standalone-executable embedding, `panos build --compile`)
-// can resolve the SAME path-style `внешний "./lib.so"` a real compile
-// would, WITHOUT needing a whole `Resolver` instance — it only ever needs
-// this one pure computation (given a `.pns` file's own path and the
-// logical library name as written, what real file path does `внешний`
-// resolve it to). `Resolver.foreignLibraryFilename` below is now a thin
-// wrapper supplying its own `self.source_path`.
+// Вынесено в отдельную функцию (а не оставлено только методом `Resolver`),
+// чтобы `bundle.zig` (встраивание автономного исполняемого файла, `panos
+// build --compile`) мог разрешать ТОТ ЖЕ путь-подобный `внешний "./lib.so"`,
+// что и обычная компиляция, БЕЗ необходимости в целом экземпляре
+// `Resolver` — ему нужно только это одно чистое вычисление (по пути файла
+// `.pns` и логическому имени библиотеки как оно написано — в какой
+// реальный путь файла его разрешает `внешний`). `Resolver.
+// foreignLibraryFilename` ниже — теперь тонкая обёртка, подставляющая
+// собственный `self.source_path`.
 pub fn resolveForeignLibraryPath(allocator: std.mem.Allocator, source_path: []const u8, logical_name: []const u8) ![]const u8 {
     const suffix = switch (builtin.target.os.tag) {
         .macos, .ios, .tvos, .watchos => ".dylib",
         .windows => ".dll",
         else => ".so",
     };
-    // A path-like library reference (contains '/') is an explicit
-    // file path, not a bare logical name resolved via the OS
-    // loader's own search path (LD_LIBRARY_PATH/DYLD_.../PATH) — a
-    // bare logical name (`"libc"`, `"raylib"`) never contains '/'.
-    // Resolved the same way `импорт` resolves a relative module path
-    // (`module_loader.resolveImportPath`): against the DIRECTORY of
-    // THIS `.pns`/`.ps` file (`source_path`), not the process's
-    // current working directory — a library shipped next to a
-    // script keeps working regardless of where `panos` is invoked
-    // from. An already-absolute path, or an inline/test caller with
-    // no real `source_path` (empty — nothing to be relative
-    // to), is used exactly as given, which then resolves against the
-    // process's own CWD via the OS loader — the same fallback
-    // `импорт` itself uses (`importer_path.len == 0`).
+    // Путь-подобная ссылка на библиотеку (содержит '/') — это явный путь к
+    // файлу, а не голое логическое имя, разрешаемое через собственный путь
+    // поиска загрузчика ОС (LD_LIBRARY_PATH/DYLD_.../PATH) — голое
+    // логическое имя (`"libc"`, `"raylib"`) никогда не содержит '/'.
+    // Разрешается так же, как `импорт` разрешает относительный путь модуля
+    // (`module_loader.resolveImportPath`): относительно ДИРЕКТОРИИ этого
+    // файла `.pns`/`.ps` (`source_path`), а не текущей рабочей директории
+    // процесса — библиотека, поставляемая рядом со скриптом, продолжает
+    // работать независимо от того, откуда запущен `panos`. Уже абсолютный
+    // путь, либо inline/тестовый вызывающий без реального `source_path`
+    // (пустой — относительно нечего разрешать), используется как есть и
+    // затем разрешается относительно CWD процесса через загрузчик ОС — тот
+    // же резервный путь, что использует сам `импорт`
+    // (`importer_path.len == 0`).
     if (std.mem.indexOfScalar(u8, logical_name, '/') != null) {
         const suffixed = if (std.mem.endsWith(u8, logical_name, suffix))
             logical_name
@@ -278,19 +278,19 @@ pub fn resolveForeignLibraryPath(allocator: std.mem.Allocator, source_path: []co
         if (suffixed[0] == '/' or source_path.len == 0) return allocator.dupe(u8, suffixed);
         const directory = std.fs.path.dirname(source_path) orelse "";
         if (directory.len == 0) return allocator.dupe(u8, suffixed);
-        // Strips a leading "./" (but not "../", which is meaningful)
-        // before joining — purely cosmetic, "dir/./libs/x.so" would
-        // still resolve fine, this just keeps reported paths and
-        // `Resolve Error` messages readable.
+        // Убирает ведущее "./" (но не "../", оно значимо) перед
+        // объединением — чисто косметически, "dir/./libs/x.so" и так бы
+        // разрешился нормально, это просто держит выводимые пути и
+        // сообщения `Resolve Error` читаемыми.
         const relative = if (std.mem.startsWith(u8, suffixed, "./")) suffixed[2..] else suffixed;
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, relative });
     }
-    // Windows has no file called "libc.dll" — the C runtime there is
-    // `msvcrt.dll` (present on every Windows version since NT4, the
-    // same universal-CRT-analog role `dlopen(NULL)` fills on POSIX
-    // above). Only "libc" gets this special case; any other bare
-    // library name still goes through the generic `<name>.dll`
-    // suffix rule.
+    // В Windows нет файла "libc.dll" — тамошний C runtime это
+    // `msvcrt.dll` (присутствует в каждой версии Windows начиная с NT4,
+    // ту же роль универсального аналога CRT на POSIX выше выполняет
+    // `dlopen(NULL)`). Этот особый случай только для "libc"; любое другое
+    // голое имя библиотеки всё равно проходит через общее правило
+    // суффикса `<name>.dll`.
     if (comptime builtin.target.os.tag == .windows) {
         if (std.mem.eql(u8, logical_name, "libc")) return allocator.dupe(u8, "msvcrt.dll");
     }
@@ -304,20 +304,19 @@ const Resolver = struct {
     tree: *const ast.Ast = undefined,
     module_members: std.ArrayList(ModuleMembers) = .empty,
     target_profile: target_policy.TargetProfile = .native,
-    // The `.pns`/`.ps` file this module was loaded from (e.g.
-    // "проект/main.ps") — empty for every inline/test caller of `resolve`
-    // (no real file on disk to be relative to). Only consumed by
-    // `resolveForeignFunction` to make an explicit relative `внешний`
-    // library path (`"./libs/foo.so"`) resolve against THIS file's own
-    // directory, not the process's current working directory — matching
-    // `импорт`'s existing relative-path convention
-    // (`module_loader.resolveImportPath`), so a library shipped alongside
-    // a `.pns` file keeps working regardless of where `panos` is invoked
-    // from.
+    // Файл `.pns`/`.ps`, из которого загружен этот модуль (например,
+    // "проект/main.ps") — пустой для любого inline/тестового вызывающего
+    // `resolve` (нет реального файла на диске, относительно которого
+    // считать путь). Используется только `resolveForeignFunction`, чтобы
+    // разрешать явный относительный путь библиотеки `внешний`
+    // (`"./libs/foo.so"`) относительно директории ЭТОГО файла, а не
+    // текущей рабочей директории процесса — соответствует существующему
+    // соглашению `импорт` об относительных путях
+    // (`module_loader.resolveImportPath`), поэтому библиотека, поставляемая
+    // рядом с `.pns`-файлом, продолжает работать независимо от того,
+    // откуда запущен `panos`.
     source_path: []const u8 = "",
-    // Ported from `core/resolver.odin`'s `used_symbols`/
-    // `unused_check_symbols` (`Symbol_Id -> bool` maps there, sets here) —
-    // see `popScopeAndWarnUnused` for the actual warning.
+    // См. `popScopeAndWarnUnused` — фактическое предупреждение.
     used_symbols: std.AutoHashMap(symbols.SymbolId, void),
     unused_check_symbols: std.AutoHashMap(symbols.SymbolId, void),
 
@@ -339,12 +338,12 @@ const Resolver = struct {
         self.* = undefined;
     }
 
-    // Ported from `core/resolver.odin`'s `pop_scope` — checks the
-    // ABOUT-TO-CLOSE scope's own symbols for unused `пер`-declared
-    // variables before actually popping (`scopeByIdConst(self.scopes.
-    // current)` reads the CURRENT scope, still valid at this point —
-    // `self.scopes.pop()` only moves the cursor to the parent, it never
-    // frees/invalidates the popped scope's storage).
+    // Проверяет символы ЗАКРЫВАЕМОЙ области видимости на неиспользованные
+    // переменные, объявленные через `пер`, перед фактическим извлечением из
+    // стека (`scopeByIdConst(self.scopes.current)` читает ТЕКУЩУЮ область
+    // видимости, всё ещё валидную в этот момент — `self.scopes.pop()`
+    // только сдвигает курсор к родителю, никогда не освобождает/делает
+    // невалидным хранилище извлечённой области видимости).
     fn popScopeAndWarnUnused(self: *Resolver) !void {
         const scope = self.scopes.scopeByIdConst(self.scopes.current);
         var iterator = scope.symbols.valueIterator();
@@ -367,8 +366,8 @@ const Resolver = struct {
         });
     }
 
-    // Ported from `core/resolver.odin`'s `report_resolve_warning` — same
-    // shape as `report` above, `.severity = .warning` instead of `.err`.
+    // Та же форма, что у `report` выше, только `.severity = .warning`
+    // вместо `.err`.
     fn reportWarning(self: *Resolver, span: source.Span, comptime format: []const u8, args: anytype) !void {
         const message = try std.fmt.allocPrint(self.result.arena.allocator(), format, args);
         _ = try self.result.diagnostics.appendUnique(self.result.allocator, .{
@@ -379,13 +378,12 @@ const Resolver = struct {
         });
     }
 
-    // `skip_prelude_hardcode` is true ONLY when resolving the embedded
-    // prelude module itself (see `module_compiler.zig`'s `compileGraph`) —
-    // its own real `тип Опция[T] = перечисление ...` declarations would
-    // otherwise collide with these hand-installed duplicates. Every other
-    // caller keeps the hardcode until the single-file (non-graph) pipeline
-    // also merges the real prelude module (see `Recent Changes`/tasks.md
-    // T032 for the remaining single-file-path work).
+    // `skip_prelude_hardcode` истинно ТОЛЬКО при разрешении самого
+    // встроенного модуля прелюдии (см. `compileGraph` в
+    // `module_compiler.zig`) — иначе его собственные реальные декларации
+    // `тип Опция[T] = перечисление ...` столкнулись бы с этими вручную
+    // установленными дубликатами. Все прочие вызывающие сохраняют этот
+    // хардкод.
     fn installBuiltins(self: *Resolver, skip_prelude_hardcode: bool) !void {
         const builtin_names = [_][]const u8{
             "Ошибка",
@@ -398,31 +396,32 @@ const Resolver = struct {
             "получить_сигнал",
             "убить",
             "связать",
-            // `ждать` — blocks until a process spawned via `запусти
-            // <вызов>` completes or fails, returning `Результат(R,
-            // Ошибка)` where R is the spawned function's return type.
-            // Sibling to `получить`, not a replacement.
+            // `ждать` — блокируется до завершения или падения процесса,
+            // запущенного через `запусти <вызов>`, возвращая
+            // `Результат(R, Ошибка)`, где R — тип возврата запущенной
+            // функции. Соседствует с `получить`, не заменяет его.
             "ждать",
             "встроку",
             "Целое",
             "Число",
-            // Bounded mailbox (Phase F, item 6): `ограничить_почту(N)`
-            // sets a capacity on the CURRENT process's own mailbox
-            // (called from within an actor's body, mirrors `себя()`'s
-            // "acts on current process" shape) — unbounded (no cap) stays
-            // the default. `отправить_или` is a SEPARATE, opt-in send
-            // that respects that cap and rejects with `Ошибка` instead of
-            // appending when full; plain `отправить` is deliberately left
-            // UNCHANGED (always succeeds) — bounded behavior only applies
-            // when BOTH sides opt in.
+            // Ограниченный почтовый ящик: `ограничить_почту(N)`
+            // устанавливает ёмкость почтового ящика ТЕКУЩЕГО процесса
+            // (вызывается изнутри тела актора, зеркалит поведение
+            // `себя()` — "действует на текущий процесс") — по умолчанию
+            // ящик остаётся неограниченным. `отправить_или` — ОТДЕЛЬНАЯ,
+            // добровольная отправка, которая учитывает этот лимит и
+            // отклоняет с `Ошибка` вместо добавления при переполнении;
+            // обычный `отправить` намеренно ОСТАВЛЕН БЕЗ ИЗМЕНЕНИЙ (всегда
+            // успешен) — ограниченное поведение действует, только когда
+            // ОБЕ стороны согласны на него явно.
             "ограничить_почту",
             "отправить_или",
-            // Cooperative cancellation (Phase F, item 7): `отмена(proc)`
-            // sets a flag on the TARGET process, `отменено()` polls the
-            // CURRENT process's own flag — purely advisory, the target
-            // must observe it itself via `отменено()`; forceful
-            // `убить()`/`остановить()` (супервизор.ps) are unchanged and
-            // unrelated.
+            // Кооперативная отмена: `отмена(proc)` устанавливает флаг на
+            // ЦЕЛЕВОМ процессе, `отменено()` опрашивает собственный флаг
+            // ТЕКУЩЕГО процесса — чисто рекомендательно, цель должна сама
+            // наблюдать за ним через `отменено()`; принудительные
+            // `убить()`/`остановить()` (супервизор.ps) не изменяются и не
+            // связаны с этим механизмом.
             "отмена",
             "отменено",
         };
@@ -443,34 +442,29 @@ const Resolver = struct {
         try self.installBuiltinType("Файл");
         try self.installBuiltinModule("ос", &.{ "аргументы", "версия_паноса", "окружение", "установить_окружение", "удалить_окружение", "выполнить", "завершить" });
         try self.installBuiltinModule("время", &.{ "сейчас_мс", "монотонно_мс", "спать_мс" });
-        // `ввод_вывод` — real gap found auditing panosiki: this module
-        // never existed in Zig at all (`Resolve Error: неопределённое имя
-        // 'ввод_вывод'`), silently breaking EVERY consumer of `std/тест.ps`
-        // (which itself does `импорт ввод_вывод` on line 1) across every
-        // panosiki package. Scoped to `.печать`/`.строка` only for now —
-        // `.прочитать_строку`/`.поток` (`target.zig`'s `native_only` list
-        // already anticipates both by name) need the same async-stdin
-        // machinery `Файл`'s streaming reads use, a separate follow-up.
-        // `прочитать_строку` — real gap found auditing panosiki's
-        // `cli-selector` package (an interactive menu that reads real
-        // stdin lines to drive its prompts): blocking, native-only (see
-        // `target.zig`'s `native_only` list, which already anticipated
-        // this exact name) — returns `Опция(Строка)`, `Нет()` on EOF
-        // rather than an empty string, so callers can distinguish "user
-        // pressed Enter on an empty line" from "stdin closed".
+        // `ввод_вывод` — ограничен только `.печать`/`.строка` пока что —
+        // `.прочитать_строку`/`.поток` (список `native_only` в
+        // `target.zig` уже предусматривает оба этих имени) нуждаются в той
+        // же асинхронной машинерии stdin, что и потоковое чтение `Файл`, —
+        // отдельная последующая работа.
+        // `прочитать_строку` — блокирующая, только для нативной сборки
+        // (см. список `native_only` в `target.zig`) — возвращает
+        // `Опция(Строка)`, `Нет()` при EOF, а не пустую строку, чтобы
+        // вызывающий мог отличить "пользователь нажал Enter на пустой
+        // строке" от "stdin закрыт".
         try self.installBuiltinModule("ввод_вывод", &.{ "печать", "строка", "прочитать_строку" });
-        // `строки` — native module (`std/*.ps` can't build these string
-        // primitives out of other panos-level ops). `байт`/`длина_байт`/
-        // `срез_байт` were REMOVED (not deprecated) — they exposed a
-        // BYTE index on `Строка` alongside `найти`/`срез`'s RUNE index,
-        // both typed as bare `Целое` with nothing preventing mixing the
-        // two (confirmed real data corruption on Cyrillic input, see
-        // `docs/src/language/standard-library.md` §"Байты"). Go-style
-        // fix: byte-level work now goes through `строки.в_байты(s) ->
-        // Массив(Целое)` + ordinary array methods (`.длина()`/
-        // `.получить()`/`.срез()`, already existing) — a rune index and
-        // a byte-array index are now different in-language index spaces
-        // (`Строка` vs `Массив`), not just a documentation warning.
+        // `строки` — нативный модуль (`std/*.ps` не может собрать эти
+        // строковые примитивы из других операций уровня panos). `байт`/
+        // `длина_байт`/`срез_байт` были УДАЛЕНЫ (не устарели) — они
+        // выставляли БАЙТОВЫЙ индекс на `Строка` рядом с РУНОВЫМ индексом
+        // `найти`/`срез`, оба типизированные просто как `Целое`, ничто не
+        // мешало их перепутать (см. `docs/src/language/standard-library.md`
+        // §"Байты"). Исправление в стиле Go: работа с байтами теперь идёт
+        // через `строки.в_байты(s) -> Массив(Целое)` + обычные методы
+        // массива (`.длина()`/`.получить()`/`.срез()`, уже существующие) —
+        // руновый индекс и индекс байтового массива теперь разные
+        // индексные пространства на уровне языка (`Строка` vs `Массив`), а
+        // не просто предупреждение в документации.
         try self.installBuiltinModule("строки", &.{
             "из_байтов",
             "в_число",
@@ -495,14 +489,15 @@ const Resolver = struct {
             "из_рун",
             "кодовая_точка",
         });
-        // `DOM` — AOT WASM only (`target.zig`'s `builtinAvailability`), a
-        // Numeric methods stay compatible with the first AOT DOM slice;
-        // the string methods use opaque handles supplied by its JS runtime.
+        // `DOM` — только AOT WASM (`target.zig`'s `builtinAvailability`).
+        // Числовые методы совместимы с первым AOT DOM-срезом; строковые
+        // методы используют opaque-хендлы, предоставляемые его JS-рантаймом.
         try self.installBuiltinModule("DOM", &.{ "текст", "установить_текст", "на_клик", "текст_строка", "установить_текст_строка", "значение_поля", "установить_значение_поля", "создать_и_добавить", "после_кадра", "атрибут", "установить_атрибут" });
         try self.installBuiltinModuleType("DOM", "СобытиеКлика");
-        // `состояние` — the JS-loader-held Model, AOT WASM only (same
-        // `target.zig` restriction as `DOM`, same reasoning: backed by a
-        // JS closure variable that only exists in `aot-dom-loader.js`).
+        // `состояние` — Model, хранимая JS-загрузчиком, только AOT WASM
+        // (то же ограничение `target.zig`, что и у `DOM`, по той же причине:
+        // опирается на JS-замыкание-переменную, существующую только в
+        // `aot-dom-loader.js`).
         try self.installBuiltinModule("состояние", &.{ "прочитать", "записать" });
         try self.installBuiltinModule("сжатие", &.{"разжать_gzip"});
         try self.installBuiltinModule("синтаксис", &.{ "структуры", "поля", "импорты", "аннотации", "аргумент_аннотации", "аннотации_поля", "аргумент_аннотации_поля" });
@@ -527,60 +522,40 @@ const Resolver = struct {
         if (skip_prelude_hardcode) return;
         try self.installPreludeEnum("Опция", &.{ "Нет", "Есть" });
         try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });
-        // `выбор ожидание(...)` (select-style multi-source wait) matches
-        // against this synthetic enum's variants the exact same way any
-        // ordinary `выбор` matches `Опция`/`Результат` — same hardcoded
-        // bare-name registration those two need for the identical reason
-        // (panos never merges an imported module's names into scope, so
-        // the prelude's own real declaration in `prelude.zig` alone isn't
-        // enough to make `Сообщение`/`Сигнал`/`Готово` resolvable
-        // unqualified).
+        // `выбор ожидание(...)` (мультиисточниковое ожидание в стиле select)
+        // сопоставляется с вариантами этого синтетического перечисления
+        // точно так же, как обычный `выбор` сопоставляется с
+        // `Опция`/`Результат` — та же жёстко прописанная регистрация
+        // голых имён нужна по той же причине (панос никогда не сливает
+        // имена импортированного модуля в область видимости, поэтому
+        // одного лишь реального объявления в `prelude.zig` недостаточно,
+        // чтобы `Сообщение`/`Сигнал`/`Готово` разрешались без квалификации).
         try self.installPreludeEnum("ИсточникОжидания", &.{ "Сообщение", "Сигнал", "Готово" });
         try self.installPreludeInterface("Сравниваемое");
         try self.installPreludeInterface("Итерируемое");
-        // `Печатаемое` — real gap found auditing panosiki's `cli` package
-        // (`реализация Печатаемое для X`): DECLARED in the embedded
-        // prelude source (`prelude.zig`) alongside `Сравниваемое`/
-        // `Итерируемое`, but the real CLI run path never actually loads
-        // that embedded module at all (`zig/cli/main.zig`'s `main()`
-        // never calls `graph.appendPreludeModule` — only the LSP/test-
-        // harness entry points do) — so `Печатаемое` was NEVER resolvable
-        // as a symbol for a normal `panos file.ps` run, unlike
-        // `Сравниваемое`/`Итерируемое`, which work ONLY because of this
-        // same hardcoded `installPreludeInterface` call plus a matching
-        // hardcoded `interface_definitions` entry in `type_checker.zig`'s
-        // `preludePass`. `Печатаемое`'s `вСтроку() -> Строка` has no
-        // self-referencing parameter/return type at all (unlike
-        // `Сравниваемое`'s `сравнить(другое: Сравниваемое) -> Число`),
-        // so it needs none of that interface's `Никогда`-placeholder
-        // workaround — a plain, ordinary interface method signature.
+        // `Печатаемое`'s `вСтроку() -> Строка` не имеет
+        // самоссылающегося параметра/возврата вообще (в отличие от
+        // `Сравниваемое.сравнить(другое: Сравниваемое) -> Число`), поэтому
+        // ему не нужен обходной приём с `Никогда`-плейсхолдером этого
+        // интерфейса — обычная, ничем не примечательная сигнатура метода
+        // интерфейса.
         try self.installPreludeInterface("Печатаемое");
-        // `Копируемое` — needed to restore reflective deep-copy-on-send
-        // (ROADMAP.md Стадия 24, "copy-on-send": reflective by default,
-        // `реализация Копируемое` as an opt-in override — silently
-        // dropped in the Zig migration, `отправить` currently does a bare
-        // shallow copy sharing heap payloads by pointer between
-        // processes). Earlier assumed (see the comment this replaces)
-        // that a Self-typed return (`клонировать() -> Копируемое`) needed
-        // "a substitution mechanism this hardcoded prelude has none of" —
-        // verified false by reading `defineInterfaceImplementation`
-        // directly: it already unifies an interface method's return type
-        // against the impl's ACTUAL return type via the same
-        // `inferGenericSubstitution`/`substituteGeneric` machinery used
-        // for ordinary generic parameters, as long as the interface's
-        // declared return type is some bare `.generic_parameter` — which
-        // is exactly what `type_checker.zig`'s `preludePass` mints for
-        // this entry (a throwaway placeholder, not tied to any real
-        // declared type parameter).
+        // `Копируемое` — восстанавливает рефлективное глубокое
+        // копирование при отправке (`отправить` иначе делает голое
+        // поверхностное копирование, разделяя heap-payload'ы по указателю
+        // между процессами); `реализация Копируемое` — опциональное
+        // переопределение. `defineInterfaceImplementation` уже унифицирует
+        // тип возврата метода интерфейса с ФАКТИЧЕСКИМ типом возврата impl
+        // через тот же механизм `inferGenericSubstitution`/
+        // `substituteGeneric`, что используется для обычных generic-
+        // параметров, пока объявленный тип возврата интерфейса — голый
+        // `.generic_parameter` (именно это `type_checker.zig`'s
+        // `preludePass` создаёт для этой записи — одноразовый плейсхолдер,
+        // не привязанный ни к одному реально объявленному параметру типа).
         try self.installPreludeInterface("Копируемое");
         // `Складываемое`/`Вычитаемое`/`Умножаемое`/`Делимое`/`Равнозначное`
-        // — same SAME technique as `Копируемое` just above, now applied
-        // (`type_checker.zig`'s `preludePass` mints a placeholder per
-        // interface). Real gap found via a docs-example sweep —
-        // `prelude-interfaces.md` documents `Равнозначное`/`Складываемое`
-        // with real code examples that never actually compiled, because
-        // these 5 were declared in the embedded prelude source
-        // (`prelude.zig`) but never installed here at all.
+        // — тот же приём, что у `Копируемое` выше (`type_checker.zig`'s
+        // `preludePass` создаёт плейсхолдер на каждый интерфейс).
         try self.installPreludeInterface("Равнозначное");
         try self.installPreludeInterface("Складываемое");
         try self.installPreludeInterface("Вычитаемое");
@@ -707,13 +682,14 @@ const Resolver = struct {
         }
     }
 
-    // Merges the implicit prelude import's exports DIRECTLY into the current
-    // scope — no module wrapper, no `alias.Имя` qualification, matching how
-    // panos resolves a top-level local declaration (`Опция(T)`, not
-    // `прелюдия.Опция(T)`). Methods/variants use the exact same mechanism as
-    // `predeclareImports`'s qualified path (mint a local symbol per method/
-    // variant, keyed by owner) — only the owner-type symbol's OWN visibility
-    // differs.
+    // Сливает экспорты неявного импорта прелюдии НАПРЯМУЮ в текущую
+    // область видимости — без обёртки-модуля, без квалификации
+    // `alias.Имя`, соответствуя тому, как панос разрешает обычную
+    // top-level локальную декларацию (`Опция(T)`, а не `прелюдия.Опция(T)`).
+    // Методы/варианты используют тот же самый механизм, что и
+    // квалифицированный путь `predeclareImports` (заводят локальный символ
+    // на каждый метод/вариант, ключ — владелец) — отличается только
+    // видимость самого символа типа-владельца.
     fn predeclareUnqualifiedImport(self: *Resolver, import: ImportedModule) !void {
         for (import.exports) |exported| {
             const member = try self.result.symbols.add(.{
@@ -894,39 +870,40 @@ const Resolver = struct {
         return symbol;
     }
 
-    // Bare (unqualified, non-module-namespaced) builtin type names —
-    // unlike `сеть.*`/`строки.*`/`бд.*` builtins, these collide directly
-    // with any user `тип X = ...` of the same name (`installBuiltinType`
-    // declares them straight into the root scope). Listed here just to
-    // give a clearer diagnostic than the generic "уже объявлен" when a
-    // user picks one of these fairly ordinary words for their own type —
-    // most commonly `Запрос`, common enough to be a real trap (see
-    // `installBuiltinType` call sites above for the authoritative list).
+    // Голые (неквалифицированные, вне пространства имён модуля) имена
+    // встроенных типов — в отличие от `сеть.*`/`строки.*`/`бд.*` builtin'ов,
+    // эти напрямую сталкиваются с любым пользовательским `тип X = ...` с
+    // тем же именем (`installBuiltinType` объявляет их прямо в корневую
+    // область видимости). Перечислены здесь только чтобы дать более
+    // понятную диагностику, чем общее "уже объявлен", когда пользователь
+    // выбирает одно из этих довольно обычных слов для своего типа —
+    // чаще всего `Запрос`, достаточно частое имя, чтобы быть реальной
+    // ловушкой (авторитетный список — сайты вызова `installBuiltinType`
+    // выше).
     fn isReservedBuiltinTypeName(name: []const u8) bool {
         const reserved = [_][]const u8{ "Файл", "Соединение", "Слушатель", "Запрос", "Соединение_БД" };
         for (reserved) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
         return false;
     }
 
-    // Loads `foreign.library` (an ARBITRARY, user-named shared library —
-    // not one of this project's own vendored dependencies) and resolves
-    // `foreign.name` in it, caching the resulting function pointer on
-    // `symbol` for `compiler.zig`/`vm.zig` to embed into the compiled
-    // `Program` later. Mirrors Odin's `core/resolver.odin` `^Foreign_Decl`
-    // case exactly (same load-once-per-declaration timing, same "leak the
-    // library, never unload" contract) — see `Resolution.foreign_
-    // functions`'s doc comment for why nothing here becomes a stored
-    // field on `Resolution` itself.
+    // Загружает `foreign.library` (ПРОИЗВОЛЬНУЮ, заданную пользователем
+    // разделяемую библиотеку — не одну из собственных вендоренных
+    // зависимостей проекта) и разрешает в ней `foreign.name`, кэшируя
+    // полученный указатель на функцию в `symbol` — `compiler.zig`/`vm.zig`
+    // позже встроит его в скомпилированную `Program`. См. doc-комментарий
+    // `Resolution.foreign_functions` — почему ничто здесь не становится
+    // хранимым полем самой `Resolution`.
     fn resolveForeignFunction(self: *Resolver, symbol: symbols.SymbolId, foreign: anytype) !void {
-        // Two separate guards, not one: `comptime` handles the REAL
-        // wasm32-freestanding compile (browser build) — Sema-eliminates
-        // the `std.DynLib` branch entirely, see `Resolution.foreign_
-        // functions`'s doc comment. The runtime `target_profile` check
-        // handles every OTHER case that ALSO shouldn't load a native
-        // library — e.g. the LSP/`checkSourceForTarget`-style "would this
-        // program pass for `.browser_interpreter`" queries, which run
-        // inside an ordinary NATIVE binary (so the comptime check alone
-        // never fires for them).
+        // Два отдельных guard'а, не один: `comptime` обрабатывает РЕАЛЬНУЮ
+        // компиляцию wasm32-freestanding (браузерная сборка) — Sema
+        // полностью исключает ветку `std.DynLib`, см. doc-комментарий
+        // `Resolution.foreign_functions`. Проверка `target_profile` в
+        // рантайме обрабатывает все ОСТАЛЬНЫЕ случаи, которым ТАКЖЕ не
+        // следует загружать нативную библиотеку — например, запросы вида
+        // LSP/`checkSourceForTarget` "прошла бы эта программа для
+        // `.browser_interpreter`", которые выполняются внутри обычного
+        // НАТИВНОГО бинарника (поэтому одна лишь comptime-проверка для
+        // них никогда не сработает).
         if (comptime builtin.target.os.tag == .freestanding) {
             try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
         } else if (self.target_profile != .native) {
@@ -934,47 +911,42 @@ const Resolver = struct {
         } else if ((comptime builtin.target.os.tag != .windows and builtin.link_libc) and
             (std.mem.eql(u8, foreign.library, "libc") or std.mem.eql(u8, foreign.library, "хост")))
         {
-            // Real bug found via CI (not local — this machine always
-            // links libc for every build): `std.c.dlopen` referenced
-            // UNCONDITIONALLY (no `builtin.link_libc` guard) forces
-            // EVERY test binary that merely compiles `resolver.zig`
-            // (virtually all of them, via `predeclare`/
-            // `resolveModuleForTarget` — reachable regardless of
-            // whether that specific test ever declares `внешний`) to
-            // link libc at compile time, even ones that otherwise never
-            // needed it — Zig's own `std.DynLib` (the path this branch
-            // replaces) avoids exactly this by internally picking a
-            // libc-free pure-Zig ELF parser (`ElfDynLib`) instead of the
-            // libc-`dlopen`-based one (`DlDynLib`) whenever `!builtin.
-            // link_libc` — a fallback this direct `std.c.dlopen` call
-            // doesn't get for free, so it needs the same guard here.
+            // `std.c.dlopen`, использованный БЕЗУСЛОВНО (без guard'а
+            // `builtin.link_libc`), заставил бы КАЖДЫЙ тестовый бинарник,
+            // который просто компилирует `resolver.zig` (практически все
+            // — через `predeclare`/`resolveModuleForTarget`, независимо
+            // от того, объявляет ли конкретный тест `внешний`), линковать
+            // libc на этапе компиляции, даже если он иначе никогда бы в
+            // ней не нуждался — собственный `std.DynLib` из Zig (путь,
+            // который заменяет эта ветка) избегает именно этого, внутренне
+            // выбирая чистый Zig-парсер ELF без libc (`ElfDynLib`) вместо
+            // основанного на libc-`dlopen` (`DlDynLib`), когда `!builtin.
+            // link_libc` — этот резервный вариант прямой вызов `std.c.
+            // dlopen` бесплатно не получает, поэтому здесь нужен тот же
+            // guard.
             //
-            // `внешний "libc"` doesn't need to find and load a SEPARATE
-            // shared object file at all — libc is ALREADY linked into
-            // this very process (every native panos binary links libc).
-            // `внешний "хост"` uses the same POSIX mechanism for a Zig
-            // executable embedding Panos: its `pub export fn` C-ABI entry
-            // points live in the main process image, not in a fake dynamic
-            // library next to a map. The host must enable `rdynamic` so
-            // those exports reach the dynamic symbol table.
-            // `dlopen(NULL, ...)` is POSIX for exactly this: "give me a
-            // handle to the running program's own already-loaded image"
-            // (main executable + every shared library already mapped
-            // in, libc included) — `std.c.dlopen`'s first param is
-            // `?[*:0]const u8`, so `null` is directly expressible, no
-            // need to drop to raw libc bindings by hand.
+            // `внешний "libc"` вообще не нужно искать и загружать
+            // ОТДЕЛЬНЫЙ файл разделяемого объекта — libc УЖЕ слинкована
+            // в этот самый процесс (каждый нативный бинарник паноса
+            // линкует libc). `внешний "хост"` использует тот же POSIX-
+            // механизм для Zig-исполняемого файла, встраивающего Panos:
+            // его точки входа `pub export fn` в C-ABI живут в образе
+            // основного процесса, а не в поддельной динамической
+            // библиотеке рядом с картой. Хост должен включить `rdynamic`,
+            // чтобы эти экспорты попали в таблицу динамических символов.
+            // `dlopen(NULL, ...)` — это POSIX-способ получить хендл на
+            // уже загруженный образ самой запущенной программы (основной
+            // исполняемый файл + каждая уже отображённая разделяемая
+            // библиотека, включая libc) — первый параметр `std.c.dlopen`
+            // это `?[*:0]const u8`, так что `null` выражается напрямую,
+            // без необходимости опускаться до сырых libc-биндингов
+            // вручную.
             //
-            // Replaces an EARLIER version of this fix that hardcoded
-            // the filename `"libc.so.6"` for non-macOS/Windows — found
-            // wrong by inspection before it ever shipped: that's the
-            // glibc SONAME specifically, and doesn't exist AT ALL on
-            // musl-based Linux (Alpine and similar) — same class of
-            // "guessed a filename, wrong on a platform nobody tested"
-            // mistake the .so-vs-.so.6 fix was itself catching. dlopen
-            // (NULL) needs no filename, no libc-flavor knowledge, and
-            // is exactly as valid on macOS as it is on any POSIX system
-            // — used unconditionally for both process-image libraries on
-            // every non-Windows target, not just Linux.
+            // dlopen(NULL) не требует ни имени файла, ни знания о
+            // конкретном варианте libc, и одинаково валиден на macOS и
+            // на любой POSIX-системе — используется безусловно и для
+            // библиотек процесс-образа на любой не-Windows платформе, не
+            // только на Linux.
             const handle = std.c.dlopen(null, .{ .LAZY = true }) orelse {
                 try self.report(foreign.span, "Resolve Error: библиотека '{s}' не найдена (dlopen(NULL) в этом процессе)", .{foreign.library});
                 return;
@@ -986,23 +958,17 @@ const Resolver = struct {
             };
             try self.result.foreign_functions.put(symbol, @intFromPtr(fn_ptr));
         } else if (comptime builtin.target.os.tag == .windows) {
-            // Real, previously-latent gap found via CI (not this
-            // session's own commits — masked until now by an UNRELATED
-            // broken `wasmtime` install step that failed before the
-            // build ever got this far): `std.DynLib` in this Zig
-            // version has NO Windows implementation at all
-            // (`dynamic_library.zig`'s inner-type switch only lists
-            // linux/macos/bsd-family, everything else — including
-            // Windows — hits `@compileError("unsupported platform")`).
-            // `внешний` has never actually worked on Windows through
-            // this codebase; it just never got compile-tested there
-            // until the wasmtime-install fix let CI reach this file.
+            // `std.DynLib` в этой версии Zig вообще не имеет реализации
+            // для Windows (внутренний switch по типам в
+            // `dynamic_library.zig` перечисляет только linux/macos/
+            // bsd-семейство, всё остальное — включая Windows — попадает
+            // в `@compileError("unsupported platform")`).
             //
-            // `std` also doesn't expose `LoadLibraryW`/`GetProcAddress`
-            // bindings anywhere in this version — hand-rolled `extern
-            // "kernel32"` declarations below are the direct Win32 API,
-            // same shape `std.DynLib` used internally in Zig versions
-            // where it DID support Windows.
+            // `std` также нигде в этой версии не предоставляет биндинги
+            // `LoadLibraryW`/`GetProcAddress` — самодельные декларации
+            // `extern "kernel32"` ниже — это прямой Win32 API, той же
+            // формы, что `std.DynLib` использовал внутри себя в версиях
+            // Zig, где Windows ПОДДЕРЖИВАЛАСЬ.
             const filename = try self.foreignLibraryFilename(self.result.arena.allocator(), foreign.library);
             const filename_w = std.unicode.utf8ToUtf16LeAllocZ(self.result.arena.allocator(), filename) catch {
                 try self.report(foreign.span, "Resolve Error: имя библиотеки '{s}' не в UTF-8", .{filename});
@@ -1034,10 +1000,11 @@ const Resolver = struct {
         }
     }
 
-    // Minimal direct Win32 bindings — `std.DynLib` doesn't cover Windows
-    // in this Zig version (see `resolveForeignFunction`'s Windows
-    // branch). `callconv(.winapi)` matches every other raw Win32 extern
-    // already used where this project talks to Windows directly.
+    // Минимальные прямые биндинги Win32 — `std.DynLib` не покрывает
+    // Windows в этой версии Zig (см. ветку Windows в
+    // `resolveForeignFunction`). `callconv(.winapi)` соответствует
+    // каждому другому сырому Win32 extern, уже используемому там, где
+    // проект напрямую обращается к Windows.
     const WindowsDynLib = if (builtin.target.os.tag == .windows) struct {
         extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
         extern "kernel32" fn GetProcAddress(hModule: *anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
@@ -1087,22 +1054,21 @@ const Resolver = struct {
         var parameter_symbols: std.ArrayList(symbols.SymbolId) = .empty;
         defer parameter_symbols.deinit(self.result.allocator);
         for (parameters) |parameter| {
-            // `track_unused = false` — Odin deliberately excludes function
-            // parameters from the unused-variable warning (see
-            // `resolver.odin`'s own doc comment: often intentionally
-            // unused when implementing an interface/callback signature
-            // that requires an exact match).
+            // `track_unused = false` — параметры функции намеренно
+            // исключены из предупреждения о неиспользованных переменных:
+            // часто намеренно не используются при реализации сигнатуры
+            // интерфейса/колбэка, требующей точного соответствия.
             try parameter_symbols.append(self.result.allocator, try self.declareLocal(parameter.name, parameter.span, true, false, false));
         }
         return self.result.arena.allocator().dupe(symbols.SymbolId, parameter_symbols.items);
     }
 
-    // `track_unused` — Odin's `unused_check_symbols` only ever covers
-    // `пер`-declared variables (plain or destructured) and for-loop
-    // variables, NEVER function parameters or match/pattern binders (see
-    // `resolver.odin`'s own doc comment on `unused_check_symbols`) — `"_"`
-    // is excluded by every CALLER already (the same opt-out `_` already
-    // gets from pattern matching), not checked again here.
+    // `track_unused` — `unused_check_symbols` покрывает ТОЛЬКО переменные,
+    // объявленные через `пер` (обычные или деструктурированные), и
+    // переменные for-цикла, НИКОГДА параметры функции или биндеры
+    // match/pattern. `"_"` уже исключается каждым ВЫЗЫВАЮЩИМ (тот же
+    // opt-out, что `_` уже получает при сопоставлении с образцом), здесь
+    // повторно не проверяется.
     fn declareLocal(self: *Resolver, name: []const u8, span: source.Span, is_const: bool, is_pattern_binder: bool, track_unused: bool) !symbols.SymbolId {
         if (isReservedBuiltin(name)) {
             try self.report(span, "Resolve Error: '{s}' — зарезервированное имя, нельзя использовать", .{name});
@@ -1114,12 +1080,12 @@ const Resolver = struct {
             .is_pattern_binder = is_pattern_binder,
             .span = span,
         });
-        // `_` is the universal discard binder (params, `пер`, pattern
-        // binders alike) — it's meant to be written arbitrarily many
-        // times in the same scope (e.g. two discarded lambda parameters,
-        // `функ(_: А, _: Б)`) without ever being looked up again, so it's
-        // deliberately exempt from the duplicate-declaration check that
-        // every other name is subject to.
+        // `_` — универсальный биндер-заглушка (параметры, `пер`, биндеры
+        // образцов — все одинаково), рассчитан на то, чтобы писаться
+        // произвольное число раз в одной области видимости (например,
+        // два отброшенных параметра лямбды, `функ(_: А, _: Б)`) без
+        // последующего поиска, поэтому намеренно освобождён от проверки
+        // на повторное объявление, которой подчиняется любое другое имя.
         if (!std.mem.eql(u8, name, "_")) {
             self.scopes.declare(&self.result.symbols, symbol) catch |err| switch (err) {
                 error.DuplicateSymbol => try self.report(span, "Resolve Error: символ '{s}' уже объявлен", .{name}),
@@ -1186,12 +1152,11 @@ const Resolver = struct {
                     break :blk symbols.invalid_symbol;
                 };
                 try self.result.expr_symbols.put(expression, symbol);
-                // Ported from `core/resolver.odin`'s `used_symbols` — ANY
-                // reference through a bare `.ident` (read OR assignment
-                // target — `x = 5`'s left side resolves through this same
-                // case, no separate handling needed) marks the symbol
-                // used, for the unused-variable warning in `popScope`
-                // below.
+                // ЛЮБАЯ ссылка через голый `.ident` (чтение ИЛИ цель
+                // присваивания — левая часть `x = 5` разрешается через
+                // тот же самый case, отдельная обработка не нужна) метит
+                // символ как использованный, для предупреждения о
+                // неиспользованной переменной в `popScope` ниже.
                 if (symbol != symbols.invalid_symbol) try self.used_symbols.put(symbol, {});
             },
             .unary => |unary| try self.resolveExpression(tree, unary.operand),
@@ -1241,27 +1206,29 @@ const Resolver = struct {
             },
             .index => |index| {
                 try self.resolveExpression(tree, index.object);
-                // `ф[Тип](...)` — explicit generic-argument call (see
-                // `specs/013-explicit-generic-args/`) parses as an
-                // ordinary `Index_Expr`. Indexing a plain FUNCTION
-                // symbol was never valid ordinary semantics (only
-                // arrays/maps are indexable) — when `index.object`
-                // resolves to one, `index.index` may be a TYPE name
-                // (a builtin primitive like `Число`/`Строка` has no
-                // resolvable value-symbol in this scope table at all,
-                // unlike a user struct's auto-registered constructor)
-                // rather than an ordinary value reference. The resolver
-                // has no notion of generics (that's computed later, by
-                // `type_checker.zig`), so it cannot tell explicit-generic
-                // calls apart from a genuinely broken index here — it
-                // simply skips resolving `index.index` as a value in
-                // this one narrow shape, deferring entirely to
-                // `resolveTypeFromExpr` (does its own independent
-                // lookup, doesn't need this pass's `expr_symbols`) to
-                // decide whether it is a real type argument. Every OTHER
-                // index target (arrays, maps, unresolved names) keeps
-                // today's exact behavior — an unresolved index there
-                // remains a hard Resolve Error.
+                // `ф[Тип](...)` — вызов с явным generic-аргументом
+                // парсится как обычный `Index_Expr`. Индексация голого
+                // символа ФУНКЦИИ никогда не была валидной обычной
+                // семантикой (индексируемы только массивы/соответствия)
+                // — когда `index.object` разрешается в такой символ,
+                // `index.index` может быть именем ТИПА (у встроенного
+                // примитива вроде `Число`/`Строка` вообще нет
+                // разрешимого символа-значения в этой таблице областей
+                // видимости, в отличие от автозарегистрированного
+                // конструктора пользовательской структуры), а не обычной
+                // ссылкой на значение. У резолвера нет понятия о
+                // generic'ах (это вычисляется позже, `type_checker.zig`),
+                // поэтому он не может отличить явный generic-вызов от
+                // реально сломанной индексации здесь — он просто
+                // пропускает разрешение `index.index` как значения в
+                // этой одной узкой форме, полностью откладывая решение
+                // на `resolveTypeFromExpr` (делает собственный
+                // независимый поиск, не нуждается в `expr_symbols` этого
+                // прохода) — является ли это реальным аргументом типа.
+                // Любая ДРУГАЯ цель индексации (массивы, соответствия,
+                // неразрешённые имена) сохраняет сегодняшнее поведение
+                // без изменений — неразрешённая индексация там остаётся
+                // жёсткой Resolve Error.
                 const indexes_a_function = if (self.result.expr_symbols.get(index.object)) |object_symbol|
                     if (self.result.symbols.get(object_symbol)) |entry| entry.kind == .function else false
                 else
@@ -1308,23 +1275,18 @@ const Resolver = struct {
             },
             .constructor => |constructor| {
                 if (constructor.module_name) |owner_name| {
-                    // `parser.zig`'s 3-level qualified pattern
-                    // (`алиас.Тип.Вариант(...)`) concatenates the first
-                    // two segments into ONE `module_name` string
-                    // ("алиас.Тип") rather than keeping them separate —
-                    // a plain scope lookup of that compound string can
-                    // never succeed (scopes only ever hold bare
-                    // identifiers). Real gap found auditing panosiki's
-                    // `скобки` package: matching an ALIASED cross-module
-                    // enum in `выбор` (`алиас.Тип.Вариант(...)`, as
-                    // opposed to the un-aliased same-module `Тип.
-                    // Вариант(...)` case, which already worked via a
-                    // direct single-name lookup) always failed
-                    // "неопределённый тип перечисления". Fixed by
-                    // splitting on the LAST '.' and resolving in two
-                    // steps — module alias, then that module's own
-                    // member — exactly like an ordinary `алиас.Тип`
-                    // qualified type annotation already does elsewhere.
+                    // 3-уровневый квалифицированный образец из `parser.zig`
+                    // (`алиас.Тип.Вариант(...)`) склеивает первые два
+                    // сегмента в ОДНУ строку `module_name` ("алиас.Тип"),
+                    // а не хранит их раздельно — обычный поиск в области
+                    // видимости по этой составной строке никогда не
+                    // может увенчаться успехом (области видимости
+                    // хранят только голые идентификаторы). Исправляется
+                    // разбиением по ПОСЛЕДНЕЙ '.' и разрешением в два
+                    // шага — сначала алиас модуля, затем собственный член
+                    // этого модуля — точно так же, как это уже делает
+                    // обычная квалифицированная аннотация типа
+                    // `алиас.Тип` в других местах.
                     const owner_symbol = self.scopes.lookupTrackingCaptures(&self.result.symbols, owner_name) catch null orelse blk: {
                         const separator = std.mem.lastIndexOfScalar(u8, owner_name, '.') orelse break :blk null;
                         const module_alias = owner_name[0..separator];
@@ -1526,14 +1488,13 @@ test "resolver records all statement binders for destructuring and loops" {
     var resolved = try resolve(std.testing.allocator, &parsed.ast);
     defer resolved.deinit();
 
-    // 2, not 0: `ключ`/`значение` (destructured, line 2) are never
-    // referenced anywhere in this body — both now warn "неиспользованная
-    // переменная" (the unused-variable check ported from `core/resolver.
-    // odin`'s `pop_scope`). `элемент`/`индекс` ARE referenced inside their
-    // own loop bodies, so neither warns. Order between the two warnings
-    // is NOT asserted — `popScopeAndWarnUnused` iterates a `StringHashMap`
-    // (`symbols.Scope.symbols`), whose iteration order is unspecified,
-    // same as Odin's own equivalent map iteration.
+    // 2, а не 0: `ключ`/`значение` (деструктурированы, строка 2) нигде
+    // в этом теле не упоминаются — оба теперь выдают предупреждение
+    // "неиспользованная переменная". `элемент`/`индекс` действительно
+    // упоминаются внутри своих циклов, поэтому ни один из них не
+    // предупреждает. Порядок между двумя предупреждениями НЕ
+    // гарантируется — `popScopeAndWarnUnused` обходит `StringHashMap`
+    // (`symbols.Scope.symbols`), чей порядок итерации не определён.
     try std.testing.expectEqual(@as(usize, 2), resolved.diagnostics.items.items.len);
     try std.testing.expectEqual(diagnostic.Severity.warning, resolved.diagnostics.items.items[0].severity);
     try std.testing.expectEqual(diagnostic.Severity.warning, resolved.diagnostics.items.items[1].severity);
@@ -1586,9 +1547,9 @@ test "resolver does not warn on a used пер-variable" {
 test "resolver does not warn on пер-variable used only as an assignment target" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    // `x = 2` resolves `x` through the same `.ident` case as a read (see
-    // `resolveExpression`'s doc comment) — matches Odin's own documented
-    // choice not to distinguish read vs. write-only uses.
+    // `x = 2` разрешает `x` через тот же case `.ident`, что и чтение
+    // (см. doc-комментарий `resolveExpression`) — сознательный выбор не
+    // различать чтение и использование только для записи.
     var lexed = try lexer.tokenize(std.testing.allocator, "функ f() -> Число\nпер x: Число = 1\nx = 2\nx\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);

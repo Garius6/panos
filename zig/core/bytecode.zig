@@ -5,13 +5,14 @@ pub const FunctionId = enum(u32) { _ };
 
 pub const invalid_function: FunctionId = @enumFromInt(std.math.maxInt(u32));
 
-// A `внешний` call target — `fn_ptr` is resolved once, at resolve time
-// (`resolver.zig`'s `resolveForeignFunction`, via `std.DynLib`), and
-// copied here (arena-owned, independent of `Resolution`'s lifetime) so
-// the compiled `Program` is fully self-contained, matching every other
-// `Constant` variant. `0` means the resolver already reported a
-// diagnostic (library/symbol not found) — `vm.zig` treats it as a
-// runtime panic, unreachable if the program actually type-checked clean.
+// Цель вызова `внешний` — `fn_ptr` резолвится один раз, во время resolve
+// (`resolver.zig`'s `resolveForeignFunction`, через `std.DynLib`), и
+// копируется сюда (владение ареной, не зависит от времени жизни
+// `Resolution`), чтобы скомпилированная `Program` была полностью
+// самодостаточной, как и все остальные варианты `Constant`. `0` означает,
+// что resolver уже сообщил диагностику (библиотека/символ не найдены) —
+// `vm.zig` трактует это как runtime panic, недостижимый, если программа
+// прошла типизацию чисто.
 pub const ForeignFunctionConstant = struct {
     fn_ptr: usize,
     // Имя C-символа сохраняется рядом с адресом только для диагностик и
@@ -19,15 +20,15 @@ pub const ForeignFunctionConstant = struct {
     // остальные строковые константы байткода.
     name: []const u8,
     param_kinds: []const ast.ForeignMarshalKind,
-    // Parallel to `param_kinds` — empty slice for every non-`.struct_value`
-    // parameter, the `ff_структура`'s field marshal kinds (declaration
-    // order) for a `.struct_value` one. Needed at the VM's FFI call site to
-    // build a libffi struct `ffi_type` (its `elements` array) and pack the
-    // panos-side struct `Value`'s fields into raw C ABI bytes.
+    // Параллельно `param_kinds` — пустой срез для любого параметра, не
+    // являющегося `.struct_value`, и marshal kind полей `ff_структура` (в
+    // порядке объявления) для `.struct_value`. Нужно в месте FFI-вызова VM,
+    // чтобы построить libffi struct `ffi_type` (его массив `elements`) и
+    // упаковать поля panos-структуры `Value` в сырые байты C ABI.
     param_struct_layouts: []const []const ast.ForeignMarshalKind,
     return_kind: ast.ForeignMarshalKind,
-    // Same shape as one `param_struct_layouts` entry — empty unless
-    // `return_kind == .struct_value`.
+    // Та же форма, что и одна запись `param_struct_layouts` — пусто, если
+    // не `return_kind == .struct_value`.
     return_struct_layout: []const ast.ForeignMarshalKind,
 };
 
@@ -180,11 +181,10 @@ pub const Opcode = enum {
     call_foreign,
     // Неблокирующий I/O: submit-опкоды кладут задачу в воркер-пул и
     // возвращают управление сразу (не блокируют) — компилятор ВСЕГДА
-    // эмитит await_async сразу после (compiler.zig, compileFilesystemBuiltin)
-    // — та же пара, что Odin's Call_Builtin_Async/Await_Async
-    // (core/vm.odin). await_async — ОДНА инструкция на ВСЕ async-builtin'ы
-    // (результат приходит из process.async_results, FIFO — порядок
-    // гарантирован тем, что submit и await всегда эмитятся смежной парой).
+    // эмитит await_async сразу после (compiler.zig, compileFilesystemBuiltin).
+    // await_async — ОДНА инструкция на ВСЕ async-builtin'ы (результат
+    // приходит из process.async_results, FIFO — порядок гарантирован тем,
+    // что submit и await всегда эмитятся смежной парой).
     file_read_submit,
     file_write_submit,
     net_connect_submit,
@@ -347,10 +347,10 @@ pub const Instruction = union(Opcode) {
     sql_exec_submit: void,
     sql_query_submit: void,
     sql_close: void,
-    // `constant_index` — the pool slot holding this call's
-    // `ForeignFunctionConstant`; `argument_count` — how many already-
-    // compiled argument values are on the stack below it, same
-    // convention as `call`.
+    // `constant_index` — слот пула констант с `ForeignFunctionConstant`
+    // этого вызова; `argument_count` — сколько уже скомпилированных
+    // значений-аргументов лежит на стеке под ним, та же конвенция, что и
+    // у `call`.
     call_foreign: struct {
         constant_index: u16,
         argument_count: u16,
@@ -378,12 +378,13 @@ pub const Function = struct {
     capture_count: u16 = 0,
     returns_value: bool = true,
     local_count: u16 = 0,
-    // Compiled from an interface's default-method body (`это: Интерфейс
-    // (...)` receiver) — `vm.zig`'s `callInterface` passes the BOXED
-    // `.interface` value as this-arg for these (so a default method's
-    // own `это.другой_метод()` calls can dispatch through the vtable),
-    // unlike an ordinary impl method, which gets the RAW underlying
-    // value (needs real field access on a concrete struct).
+    // Скомпилирован из тела метода по умолчанию интерфейса (получатель
+    // `это: Интерфейс (...)`) — `callInterface` в `vm.zig` передаёт для
+    // таких методов ОБЁРНУТОЕ значение `.interface` как this-аргумент
+    // (чтобы собственные вызовы `это.другой_метод()` внутри метода по
+    // умолчанию тоже диспетчеризовались через vtable), в отличие от
+    // обычного impl-метода, который получает СЫРОЕ базовое значение
+    // (нужен настоящий доступ к полям конкретной структуры).
     is_default_interface_method: bool = false,
     instructions: std.ArrayList(Instruction) = .empty,
     constants: std.ArrayList(Constant) = .empty,
@@ -406,20 +407,20 @@ pub const Function = struct {
     }
 };
 
-// Name-keyed dispatch table shared by two unrelated single-method
-// interfaces: `Сравниваемое` (comparison operators need to know, at
-// RUNTIME — the value's exact struct name is only known once it's an
-// actual `Aggregate` on the heap — whether the type declared a custom
-// `реализация Сравниваемое`) and `Копируемое` (same lookup shape,
-// `отправить`/message-send needs it to know whether to run a custom
-// copy-on-send — restoring ROADMAP.md Стадия 24, see `vm.zig`'s
-// `send`/`deepCopyForSend`). One table keyed by `interface_name` instead
-// of two structurally-identical `ArrayList`s — `addComparableMethod`/
-// `comparableMethod`/`addCopyableMethod`/`copyableMethod` below stay as
-// thin wrappers with their ORIGINAL signatures, so `compiler.zig`'s
-// `registerSingleMethodInterface` (calls them as function pointers) and
-// `vm.zig`'s lookup call sites need no changes at all — purely an
-// internal storage merge.
+// Таблица диспетчеризации по имени, общая для двух не связанных между
+// собой однометодных интерфейсов: `Сравниваемое` (операторам сравнения
+// нужно знать, в RUNTIME — точное имя структуры значения известно только
+// когда это уже реальный `Aggregate` в куче — объявлен ли у типа
+// кастомный `реализация Сравниваемое`) и `Копируемое` (та же форма
+// поиска, `отправить`/отправке сообщения нужно знать, запускать ли
+// кастомное копирование при отправке, см. `send`/`deepCopyForSend` в
+// `vm.zig`). Одна таблица, ключ — `interface_name`, вместо двух
+// структурно идентичных `ArrayList` — `addComparableMethod`/
+// `comparableMethod`/`addCopyableMethod`/`copyableMethod` ниже остаются
+// тонкими обёртками с ИСХОДНЫМИ сигнатурами, так что `compiler.zig`'s
+// `registerSingleMethodInterface` (вызывает их как указатели на функции)
+// и точки вызова поиска в `vm.zig` не требуют изменений — чисто
+// внутреннее объединение хранилища.
 pub const SingleMethodInterface = struct {
     interface_name: []const u8,
     type_name: []const u8,

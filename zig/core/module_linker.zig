@@ -11,10 +11,10 @@ pub const ImportScope = struct {
         return initWithPrelude(allocator, graph, importer, null);
     }
 
-    // `prelude_module`, if set and not the importer itself, gets merged as
-    // an UNQUALIFIED implicit import (no `импорт`/alias) ahead of the
-    // importer's own explicit imports — see `resolver.zig`'s
-    // `predeclareUnqualifiedImports`.
+    // `prelude_module`, если задан и не совпадает с самим импортёром,
+    // сливается как НЕКВАЛИФИЦИРОВАННЫЙ неявный импорт (без `импорт`/
+    // алиаса) перед собственными явными импортами импортёра — см.
+    // `predeclareUnqualifiedImports` в `resolver.zig`.
     pub fn initWithPrelude(allocator: std.mem.Allocator, graph: *const module_loader.Graph, importer: usize, prelude_module: ?usize) !ImportScope {
         var result = ImportScope{
             .arena = std.heap.ArenaAllocator.init(allocator),
@@ -37,23 +37,19 @@ pub const ImportScope = struct {
         for (graph.imports.items) |import| {
             if (import.importer != importer) continue;
             const target = import.target orelse {
-                // Aliased native import (`импорт "ввод_вывод" как ио`) —
-                // `target == null` here doesn't mean "failed to load"
-                // (the module_loader.zig diagnostic already handles that
-                // case), it means "resolved ambiently, no file at all".
-                // Real gap found auditing panosiki's `std/слог.ps`: the
-                // BARE unaliased form (`импорт время`) already worked
-                // (resolver.zig's `installBuiltins` makes it globally
-                // ambient regardless of any `импорт`), but the alias
-                // itself was never bound to anything.
+                // Импорт нативного модуля с алиасом (`импорт "ввод_вывод"
+                // как ио`) — `target == null` здесь не значит "не удалось
+                // загрузить" (этот случай уже обрабатывает диагностика в
+                // module_loader.zig), это значит "разрешился амбиентно,
+                // без файла вообще".
                 const native_name = import.native_module orelse continue;
-                // Bare, unaliased native import (`импорт время`) — the
-                // real name is ALREADY globally ambient
-                // (`resolver.zig`'s `installBuiltins`), predeclaring a
-                // SECOND `время` module symbol here would just collide
-                // with it (`Resolve Error: символ 'время' уже объявлен`).
-                // Only a GENUINE rename (`как ...`) needs anything built
-                // here at all.
+                // Голый импорт нативного модуля без алиаса (`импорт
+                // время`) — реальное имя УЖЕ глобально амбиентно
+                // (`installBuiltins` в resolver.zig), предобъявление
+                // ВТОРОГО символа модуля `время` здесь просто
+                // столкнётся с ним (`Resolve Error: символ 'время' уже
+                // объявлен`). Что-то строить здесь нужно только при
+                // настоящем переименовании (`как ...`).
                 if (std.mem.eql(u8, import.alias, native_name)) continue;
                 const export_names = resolver.nativeModuleExports(native_name) orelse continue;
                 var exports: std.ArrayList(resolver.ImportedExport) = .empty;
@@ -96,18 +92,14 @@ pub const ImportScope = struct {
             if (exported.kind == .type) {
                 for (graph.methods.items) |method| {
                     if (method.owner_module != target or method.owner_declaration != exported.declaration) continue;
-                    // A qualified-target impl declared in THIS SAME
-                    // module (`importer`) that also happens to import
-                    // the struct's own file — the method is already a
-                    // plain LOCAL declaration there, not something to
-                    // bridge as "imported" (bridging it would make
-                    // `importer`'s own `collect()` try to read its OWN
-                    // not-yet-populated `checked`/`compiled` results,
-                    // `error.ImportNotChecked` — real crash found via
-                    // the exact codegen-shaped 3-file test: связка.ps
-                    // implements a qualified interface for точки.Точка,
-                    // and ALSO gets imported directly by consumers of
-                    // связка's own OTHER exports).
+                    // Impl с квалифицированным таргетом, объявленный в
+                    // ЭТОМ ЖЕ модуле (`importer`), который к тому же
+                    // импортирует файл самой структуры — метод там уже
+                    // обычная ЛОКАЛЬНАЯ декларация, мостить его как
+                    // "импортированный" не нужно (иначе собственный
+                    // `collect()` импортёра попытается прочитать свои же
+                    // ещё не заполненные результаты `checked`/`compiled`,
+                    // `error.ImportNotChecked`).
                     if (method.module == importer) continue;
                     try methods.append(allocator, .{
                         .name = method.name,

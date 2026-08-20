@@ -4,43 +4,46 @@ const mir_builder = @import("mir_builder.zig");
 const types = @import("types.zig");
 const wasm_heap = @import("wasm_heap.zig");
 
-// Eliminates interface dynamic dispatch's LAST remaining gap after
-// `mir_lowering.zig` starts emitting `.cast_interface`/`.invoke_interface`
-// (both target-agnostic MIR, computed via `type_checker.
-// findInterfaceImplementation` — the SAME compile-time resolution the
-// native bytecode backend already uses) — turns them into real
-// in-module linear-memory code + `call_indirect`, reusing `wasm_heap.zig`'s
-// bump allocator (shared with `wasm_objects.zig`/`wasm_strings.zig`/
-// `wasm_actors.zig`). Runs in the SAME pass slot as those (before
-// `mir_cps.prepare`).
+// Превращает `.cast_interface`/`.invoke_interface` (оба —
+// целенезависимый MIR, вычисленный через `type_checker.
+// findInterfaceImplementation` — ТО ЖЕ разрешение времени компиляции,
+// что уже использует нативный байткод-бэкенд) в настоящий код в
+// линейной памяти модуля + `call_indirect`, переиспользуя bump-
+// аллокатор `wasm_heap.zig` (общий с `wasm_objects.zig`/
+// `wasm_strings.zig`/`wasm_actors.zig`). Выполняется в ТОМ ЖЕ слоте
+// прохода, что и они (до `mir_cps.prepare`).
 //
-// Representation: an interface value is a boxed heap value — `alloc(8)`,
-// `receiver: i32` at offset 0 (the underlying concrete struct/enum's own
-// handle, untouched), `vtable_ptr: i32` at offset 4 (a small flat array
-// of i32 WASM TABLE INDICES, one per interface method, in the
-// interface's own declared method order — `InterfaceMethodBinding`'s
-// order, already resolved by `mir_lowering.zig`). Both the vtable array
-// and the box are allocated fresh every time a `.cast_interface`
-// executes (the RECEIVER is a genuine runtime value — which concrete
-// struct backs it can differ per call — so the box itself can't be a
-// compile-time constant, unlike `wasm_strings.zig`'s literal strings);
-// the CONTENT of the vtable array (which table indices) is compile-time
-// constant, written via ordinary `mem_store` of `.const_value{.address}`
-// constants, same pattern as `wasm_strings.zig`'s `emitConstString`.
+// Представление: значение интерфейса — упакованное значение в куче —
+// `alloc(8)`, `receiver: i32` по смещению 0 (собственный хэндл
+// нижележащей конкретной структуры/перечисления, нетронутый),
+// `vtable_ptr: i32` по смещению 4 (небольшой плоский массив i32-
+// ИНДЕКСОВ ТАБЛИЦЫ WASM, по одному на метод интерфейса, в порядке
+// объявления методов самого интерфейса — порядок
+// `InterfaceMethodBinding`, уже разрешённый `mir_lowering.zig`). И
+// массив vtable, и сам box аллоцируются заново при каждом выполнении
+// `.cast_interface` (ПОЛУЧАТЕЛЬ — настоящее значение времени
+// выполнения — какая конкретная структура стоит за ним, может
+// отличаться от вызова к вызову — так что сам box не может быть
+// константой времени компиляции, в отличие от строковых литералов
+// `wasm_strings.zig`); СОДЕРЖИМОЕ массива vtable (какие индексы
+// таблицы) — константа времени компиляции, записывается обычным
+// `mem_store` констант `.const_value{.address}`, тот же паттерн, что
+// `emitConstString` в `wasm_strings.zig`.
 //
-// `.invoke_interface`'s dispatch chain: unwrap the box (two `mem_load`s
-// — receiver, vtable_ptr), read the vtable slot at `method_index*4` (a
-// WASM table index, resolved only at RUNTIME — this is genuinely
-// dynamic dispatch, not a compile-time-resolvable call), then
-// `.call_indirect` with `[receiver] ++ args`.
+// Цепочка диспетчеризации `.invoke_interface`: распаковать box (два
+// `mem_load` — receiver, vtable_ptr), прочитать слот vtable по
+// `method_index*4` (индекс таблицы WASM, разрешается только во ВРЕМЯ
+// ВЫПОЛНЕНИЯ — это подлинно динамическая диспетчеризация, а не вызов,
+// разрешимый на этапе компиляции), затем `.call_indirect` с
+// `[receiver] ++ args`.
 //
-// The WASM function TABLE itself (every function ever placed in ANY
-// vtable, deduplicated, in first-seen order) is accumulated as a side
-// effect of this pass and returned to the caller — `wasm_emit.
-// emitModule`'s `interface_table` parameter needs the EXACT same list,
-// in the EXACT same order, that this pass already baked as literal
-// table-index constants into every `.cast_interface`'s vtable-array
-// construction.
+// Сама ТАБЛИЦА функций WASM (каждая функция, когда-либо помещённая в
+// ЛЮБУЮ vtable, без дублей, в порядке первого появления) накапливается
+// как побочный эффект этого прохода и возвращается вызывающему коду —
+// параметру `interface_table` в `wasm_emit.emitModule` нужен ТОЧНО
+// ТОТ ЖЕ список, в ТОМ ЖЕ порядке, что этот проход уже запёк как
+// литеральные константы индексов таблицы в построение массива vtable
+// каждой `.cast_interface`.
 
 fn unsupported(comptime what: []const u8) error{InterfaceExpandUnsupported} {
     std.debug.print("panos build: AOT (wasm) интерфейсы — " ++ what ++ "\n", .{});
@@ -66,54 +69,55 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     };
     _ = try wasm_heap.findOrBuildAlloc(allocator, module, type_store, layout);
 
-    // Assigned in first-seen order while rewriting `.cast_interface`
-    // sites below — a plain `AutoHashMap` walk order isn't stable across
-    // runs, so the assignment MUST happen via a single linear scan (not
-    // e.g. iterating some hash map of "every method ever seen"), which
-    // `expandBlock`'s own block-by-block, instruction-by-instruction
-    // walk already naturally gives for free.
+    // Присваивается в порядке первого появления при переписывании мест
+    // `.cast_interface` ниже — порядок обхода обычной `AutoHashMap` не
+    // стабилен между запусками, поэтому присваивание ДОЛЖНО идти через
+    // единый линейный проход (не через, скажем, обход хэш-мапы "все
+    // когда-либо виденные методы"), который собственный поблочный,
+    // поинструкционный обход `expandBlock` уже естественно даёт
+    // бесплатно.
     var table: std.ArrayList(mir.FunctionId) = .empty;
     var table_index_of: std.AutoHashMap(mir.FunctionId, u32) = .init(allocator);
     defer table_index_of.deinit();
-    // Ordinary (non-default) methods placed in an interface vtable need
-    // a thin unwrap-the-box WRAPPER (see `wrapperFor`'s own doc comment)
-    // — memoized per ORIGINAL FunctionId so the same method reached via
-    // multiple casts only gets ONE wrapper, appended to `module.functions`
-    // lazily the first time it's needed (safe mid-loop: the outer `while`
-    // below re-checks `module.functions.items.len` every iteration, same
-    // pattern `wasm_objects.zig`'s own runtime-function construction
-    // already established).
+    // Обычным (не-default) методам, помещаемым в vtable интерфейса,
+    // нужна тонкая ОБЁРТКА-распаковщик box (см. doc-комментарий
+    // `wrapperFor`) — мемоизируется по ИСХОДНОМУ FunctionId, так что
+    // один и тот же метод, достигнутый через несколько cast'ов,
+    // получает только ОДНУ обёртку, добавляемую в `module.functions`
+    // лениво при первой надобности (безопасно посреди цикла: внешний
+    // `while` ниже перепроверяет `module.functions.items.len` на каждой
+    // итерации, тот же паттерн, что уже установлен построением
+    // runtime-функций в `wasm_objects.zig`).
     var wrapper_of: std.AutoHashMap(mir.FunctionId, mir.FunctionId) = .init(allocator);
     defer wrapper_of.deinit();
-    // Same memoization shape as `wrapper_of` above, for `.build_closure`'s
-    // OWN wrapper need — see `closureWrapperFor`'s doc comment. Separate
-    // map (not shared with `wrapper_of`) since the two wrappers have
-    // different shapes (box-unwrap-receiver vs. trailing-ignored-env_ptr)
-    // and could, in principle, both be needed for the SAME target
-    // function (used both as an interface method AND passed around as a
-    // first-class value).
+    // Та же форма мемоизации, что и `wrapper_of` выше, но для
+    // собственной нужды `.build_closure` в обёртке — см. doc-комментарий
+    // `closureWrapperFor`. Отдельная карта (не общая с `wrapper_of`),
+    // так как у двух обёрток разная форма (распаковка box в receiver
+    // против игнорируемого хвостового env_ptr) и обе, в принципе, могут
+    // понадобиться для ОДНОЙ И ТОЙ ЖЕ целевой функции (используемой и
+    // как метод интерфейса, и передаваемой как значение первого
+    // класса).
     var closure_wrapper_of: std.AutoHashMap(mir.FunctionId, mir.FunctionId) = .init(allocator);
     defer closure_wrapper_of.deinit();
 
     var index: usize = 0;
     while (index < module.functions.items.len) : (index += 1) {
         const function_id: mir.FunctionId = @enumFromInt(index);
-        // Each function in the module graph may belong to a DIFFERENT
-        // source file/module, hence a DIFFERENT `types.TypeStore`
-        // instance (`TypeId.owner` is deliberately store-specific — see
-        // `types.zig`'s own doc comment: "makes accidental cross-store
-        // use fail"). Box/vtable-array values created below must be
-        // typed against THIS function's own store, not the caller-
-        // supplied top-level `type_store` (which is only the ENTRY
-        // module's) — using the wrong store here silently produced a
-        // `TypeId` that `wasm_emit.zig` could never look up later
-        // (`store.get` returns null for a foreign owner), defaulting
-        // that value's WASM type to f64 instead of i32 and corrupting
-        // the `call_indirect` type-index computation. Found by tracing
-        // `Итерируемое::собрать` (a prelude function, non-entry module)
-        // failing `call_indirect: тип не найден` — `это`'s own type
-        // resolved fine (same store), but the box value built here for
-        // `.следующий()`'s receiver did not.
+        // Каждая функция в графе модуля может принадлежать РАЗНОМУ
+        // исходному файлу/модулю, а значит РАЗНОМУ экземпляру
+        // `types.TypeStore` (`TypeId.owner` намеренно специфичен для
+        // хранилища — см. doc-комментарий `types.zig`: "делает
+        // случайное межхранилищное использование ошибочным"). Значения
+        // box/массива vtable, создаваемые ниже, должны быть
+        // типизированы относительно СОБСТВЕННОГО хранилища ЭТОЙ
+        // функции, а не переданного вызывающим кодом верхнеуровневого
+        // `type_store` (это хранилище только ВХОДНОГО модуля) —
+        // использование не того хранилища здесь тихо породило бы
+        // `TypeId`, который `wasm_emit.zig` потом никогда не смог бы
+        // найти (`store.get` возвращает null для чужого владельца),
+        // подставляя для этого значения WASM-тип f64 вместо i32 и
+        // портя вычисление индекса типа для `call_indirect`.
         const function_store = module.functions.items[index].type_store orelse type_store;
         const function_layout = wasm_heap.PtrLayout{
             .ptr_type = function_store.builtins.string,
@@ -123,20 +127,19 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
         const function_ctx = ExpandCtx{ .layout = function_layout, .type_store = function_store };
         var direct_call_callees = try directCallCallees(allocator, &module.functions.items[index]);
         defer direct_call_callees.deinit();
-        // Populated by the `.function_ref` case below, WHENEVER it hits
-        // the `direct_call_callees` exclusion (i.e. this function_ref's
-        // `dst` feeds a SAME-function `call_value`'s callee directly) —
-        // this is the correct "is this call_value's callee actually a
-        // known-static function" signal for `expandCallValue` to use.
-        // `direct_call_callees` ITSELF is the wrong thing to check there:
-        // it's populated by scanning `.call_value.callee` fields
-        // directly, so a call_value's OWN callee is trivially always a
-        // member of that set — checking it against itself is a tautology
-        // that made `expandCallValue` treat EVERY closure call as a
-        // static direct call, silently passing the raw (unboxed) box
-        // pointer straight to `call_indirect` as a table index. Real bug,
-        // found via `wasmtime`: "undefined element: out of bounds table
-        // access" on the very first closure invocation tested.
+        // Заполняется веткой `.function_ref` ниже КАЖДЫЙ РАЗ, когда она
+        // попадает в исключение `direct_call_callees` (т.е. `dst` этого
+        // function_ref напрямую питает callee `call_value` В ТОЙ ЖЕ
+        // функции) — это правильный сигнал "является ли callee этого
+        // call_value на самом деле известной статической функцией" для
+        // `expandCallValue`. Сам `direct_call_callees` для этой
+        // проверки не годится: он заполняется прямым сканированием
+        // полей `.call_value.callee`, так что собственный callee
+        // call_value тривиально всегда входит в это множество —
+        // сверка с самим собой была бы тавтологией, из-за которой
+        // `expandCallValue` посчитал бы КАЖДЫЙ вызов замыкания
+        // статическим прямым вызовом, тихо передав сырой (нераспакованный)
+        // указатель box прямо в `call_indirect` как индекс таблицы.
         var static_callees: std.AutoHashMap(mir.ValueId, mir.FunctionId) = .init(allocator);
         defer static_callees.deinit();
         const block_count = module.functions.items[index].blocks.items.len;
@@ -150,37 +153,41 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     return .{ .table = try table.toOwnedSlice(allocator) };
 }
 
-// Ordinary `реализация X для Y` methods expect `это` as the RAW
-// underlying concrete value (real field access on a real struct) —
-// but every interface vtable slot is called uniformly through the SAME
-// boxed `это` (see `expandInvokeInterface`), since a DEFAULT interface
-// method's `это` must stay the ABSTRACT boxed value (to keep
-// dispatching polymorphically via `это.другой_метод()` — mirrors
-// `vm.zig`'s own `callInterface`/`is_default_interface_method` split
-// exactly, same reasoning, WASM-shaped). Rather than making
-// `expandInvokeInterface` runtime-branch on which kind of callee it
-// might hit (WASM has no "inspect this function" reflection), every
-// ORDINARY method gets a trampoline here instead: unwrap the box once
-// (`mem_load` box+0), forward to the real method with the raw receiver
-// + the rest of the args unchanged. Default methods need NO wrapper —
-// the box IS already the shape they expect.
+// Обычные методы `реализация X для Y` ожидают `это` как СЫРОЕ
+// нижележащее конкретное значение (настоящий доступ к полю настоящей
+// структуры) — но каждый слот vtable интерфейса вызывается единообразно
+// через ОДИН И ТОТ ЖЕ упакованный `это` (см. `expandInvokeInterface`),
+// поскольку `это` метода интерфейса по умолчанию должен оставаться
+// АБСТРАКТНЫМ упакованным значением (чтобы продолжать полиморфную
+// диспетчеризацию через `это.другой_метод()` — зеркалит разделение
+// `callInterface`/`is_default_interface_method` в `vm.zig`, то же
+// рассуждение, только в форме WASM). Вместо того чтобы заставлять
+// `expandInvokeInterface` ветвиться во время выполнения по тому, какой
+// callee ей попался (у WASM нет рефлексии "исследовать эту функцию"),
+// каждый ОБЫЧНЫЙ метод вместо этого получает здесь трамплин:
+// распаковать box один раз (`mem_load` box+0), передать в реальный
+// метод с сырым receiver + остальные аргументы без изменений. Методам
+// по умолчанию обёртка НЕ нужна — box УЖЕ имеет ту форму, которую они
+// ожидают.
 fn wrapperFor(module: *mir.Module, allocator: std.mem.Allocator, fallback_type_store: *const types.TypeStore, wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), target: mir.FunctionId) !mir.FunctionId {
     if (wrapper_of.get(target)) |existing| return existing;
 
-    // Copy everything needed from the target BEFORE calling
-    // `mir_builder.newFunction`/`beginFunction` below — both APPEND to
-    // `module.functions`, which can reallocate the backing array and
-    // invalidate a raw `*mir.Function` held across the call (`mir_builder
-    // .zig`'s own module doc comment).
+    // Копируем всё нужное из target ДО вызова
+    // `mir_builder.newFunction`/`beginFunction` ниже — обе функции
+    // ДОБАВЛЯЮТ в `module.functions`, что может переаллоцировать
+    // подложный массив и инвалидировать сырой `*mir.Function`,
+    // удерживаемый через вызов (собственный doc-комментарий модуля в
+    // `mir_builder.zig`).
     const target_function = &module.functions.items[@intFromEnum(target)];
-    // The wrapper's own types (box param, receiver, result) must come
-    // from the TARGET's store, not the CALLER's (`.cast_interface` site)
-    // — the target may live in a different module than the cast site
-    // (e.g. a prelude default method casting a struct declared in the
-    // SAME prelude module, wrapped and called from an entry-module
-    // function). Using the caller's store here would reproduce the
-    // exact cross-store `TypeId` bug `expand()`'s own per-function
-    // `type_store` derivation was added to fix.
+    // Собственные типы обёртки (параметр box, receiver, результат)
+    // должны браться из хранилища TARGET, а не вызывающего кода (места
+    // `.cast_interface`) — target может жить в другом модуле, чем
+    // место cast'а (например, метод прелюдии по умолчанию кастует
+    // структуру, объявленную в ТОМ ЖЕ модуле прелюдии, обёрнутую и
+    // вызываемую из функции входного модуля). Использование здесь
+    // хранилища вызывающего кода воспроизвело бы ту же межхранилищную
+    // ошибку `TypeId`, для исправления которой добавлен собственный
+    // поэкземплярный вывод `type_store` в `expand()`.
     const target_type_store = target_function.type_store orelse fallback_type_store;
     const target_layout = wasm_heap.PtrLayout{
         .ptr_type = target_type_store.builtins.string,
@@ -232,25 +239,27 @@ fn wrapperFor(module: *mir.Module, allocator: std.mem.Allocator, fallback_type_s
     return wrapper_id;
 }
 
-// A plain named function used as a first-class closure VALUE
-// (`.build_closure{already_env_aware: false}` — `mir_lowering.zig`'s
-// `lowerSymbolValueRef`) needs a thin WRAPPER placed in the table
-// instead of the original function itself: every closure is called
-// uniformly through `call_indirect` with a TRAILING `env_ptr` argument
-// (see `expandCallValue`), but the original function's own real
-// signature/direct-call sites must stay untouched — adding a param to
-// the function ITSELF would break every ordinary `f(x)` call to it
-// elsewhere. The wrapper forwards to the real function unchanged,
-// simply dropping the trailing `env_ptr` (a plain function-ref-turned-
-// value never has real captures). Memoized per ORIGINAL FunctionId in
-// `closure_wrapper_of`, same "build once, first time needed" shape as
-// `wrapperFor` above.
+// Обычной именованной функции, используемой как ЗНАЧЕНИЕ замыкания
+// первого класса (`.build_closure{already_env_aware: false}` —
+// `lowerSymbolValueRef` в `mir_lowering.zig`), нужна тонкая ОБЁРТКА,
+// помещаемая в таблицу вместо самой оригинальной функции: каждое
+// замыкание вызывается единообразно через `call_indirect` с
+// ХВОСТОВЫМ аргументом `env_ptr` (см. `expandCallValue`), но
+// собственная реальная сигнатура/места прямого вызова оригинальной
+// функции должны остаться нетронутыми — добавление параметра САМОЙ
+// функции сломало бы каждый обычный вызов `f(x)` к ней в другом
+// месте. Обёртка передаёт вызов в реальную функцию без изменений,
+// просто отбрасывая хвостовой `env_ptr` (у обычной ссылки-на-функцию,
+// ставшей значением, никогда нет реальных захватов). Мемоизируется по
+// ИСХОДНОМУ FunctionId в `closure_wrapper_of`, та же форма "построить
+// один раз, при первой надобности", что и `wrapperFor` выше.
 fn closureWrapperFor(module: *mir.Module, allocator: std.mem.Allocator, fallback_type_store: *const types.TypeStore, closure_wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId), target: mir.FunctionId) !mir.FunctionId {
     if (closure_wrapper_of.get(target)) |existing| return existing;
 
-    // Same "copy everything BEFORE calling newFunction/beginFunction"
-    // discipline as `wrapperFor` — both APPEND to `module.functions`,
-    // which can reallocate and invalidate a raw `*mir.Function`.
+    // Та же дисциплина "скопировать всё ДО вызова newFunction/
+    // beginFunction", что и в `wrapperFor` — обе функции ДОБАВЛЯЮТ в
+    // `module.functions`, что может переаллоцировать и инвалидировать
+    // сырой `*mir.Function`.
     const target_function = &module.functions.items[@intFromEnum(target)];
     const target_type_store = target_function.type_store orelse fallback_type_store;
     const target_layout = wasm_heap.PtrLayout{
@@ -299,42 +308,38 @@ fn closureWrapperFor(module: *mir.Module, allocator: std.mem.Allocator, fallback
     return wrapper_id;
 }
 
-// Expands `.build_closure{dst, function, captured, already_env_aware}`
-// into: an ENVIRONMENT allocation (one 8-byte `frame_store` slot per
-// captured value, same plain-struct shape `wasm_objects.zig` already
-// uses — heterogeneous i32/f64 captures both fit uniformly, unlike a
-// byte-packed layout) — skipped entirely (env_ptr = constant 0) for the
-// common zero-capture case (a plain function reference used as a
-// value) — then a 2-FIELD BOX, `mem_load`/`mem_store` at byte offsets 0
-// and 4 (NOT frame slots — both box fields are always plain i32s, never
-// a captured f64 directly, matching `expandCastInterface`'s own
-// `{receiver, vtable_ptr}` box shape exactly): `table_index` at +0,
-// `env_ptr` at +4. `already_env_aware` decides whether `function` is
-// placed in the table directly (a lambda body, already synthesized
-// with its own trailing `env_ptr` parameter — `mir_lowering.zig`'s
-// `lowerLambda`) or via `closureWrapperFor` (a plain named function,
-// needs the ignored-`env_ptr` wrapper).
+// Раскрывает `.build_closure{dst, function, captured, already_env_aware}`
+// в: аллокацию ОКРУЖЕНИЯ (по одному 8-байтовому слоту `frame_store` на
+// захваченное значение, та же форма обычной структуры, что уже
+// использует `wasm_objects.zig` — разнородные захваты i32/f64
+// одинаково подходят, в отличие от побайтовой упаковки) — полностью
+// пропускается (env_ptr = константа 0) для общего случая без захватов
+// (обычная ссылка на функцию, используемая как значение) — затем BOX
+// ИЗ 2 ПОЛЕЙ, `mem_load`/`mem_store` по смещениям байт 0 и 4 (НЕ слоты
+// фрейма — оба поля box всегда обычные i32, никогда напрямую
+// захваченный f64, в точности совпадает с формой box `{receiver,
+// vtable_ptr}` из `expandCastInterface`): `table_index` в +0, `env_ptr`
+// в +4. `already_env_aware` решает, помещается ли `function` в таблицу
+// напрямую (тело лямбды, уже синтезированное с собственным хвостовым
+// параметром `env_ptr` — `lowerLambda` в `mir_lowering.zig`) или через
+// `closureWrapperFor` (обычная именованная функция, нуждается в
+// обёртке с игнорируемым `env_ptr`).
 fn expandBuildClosure(builder: *mir_builder.Builder, allocator: std.mem.Allocator, v: anytype, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), closure_wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId)) !void {
     const layout = ctx.layout;
     const module = builder.module;
     const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
 
-    // `v.captured` are pre-existing values (produced earlier in the
-    // instruction stream by whatever computed each captured expression,
-    // IN ARRAY ORDER — `mir_lowering.zig`'s `lowerLambda` emits each
-    // one's producer right when it iterates `captures`) — route through
-    // Locals IMMEDIATELY, same "buried value" discipline as
-    // `expandCastInterface`'s `v.src` (this whole initiative's most
-    // load-bearing lesson) — but REVERSE order specifically: with N>1
-    // captures, `v.captured[N-1]`'s producer was the LAST one replayed,
-    // so it's the value actually sitting on TOP of the real WASM stack
-    // at this point — processing `storeLocal` in ARRAY order (index 0
-    // first) tried to pop it into the WRONG local. Real bug, found only
-    // by running a genuine 2-capture closure under wasmtime/V8 (every
-    // earlier fixture this session had exactly one capture, which
-    // can't expose an ordering bug at all) — `wasm2wat`/`wasm-objdump`
-    // traced it to a `local.set` receiving an f64 where an i32 local
-    // was declared, two captures' values swapped.
+    // `v.captured` — предсуществующие значения (произведены раньше в
+    // потоке инструкций тем, что вычислило каждое захваченное выражение,
+    // В ПОРЯДКЕ МАССИВА — `lowerLambda` в `mir_lowering.zig` эмитит
+    // производителя каждого прямо при обходе `captures`) — маршрутизируем
+    // через Locals НЕМЕДЛЕННО, та же дисциплина "погребённого значения",
+    // что и у `v.src` в `expandCastInterface` — но именно в ОБРАТНОМ
+    // порядке: при N>1 захватах производитель `v.captured[N-1]` был
+    // воспроизведён ПОСЛЕДНИМ, так что это значение, реально лежащее
+    // НАВЕРХУ настоящего стека WASM в этой точке — обработка
+    // `storeLocal` в порядке МАССИВА (сначала индекс 0) пыталась бы
+    // вытолкнуть его в НЕ ТУ локаль.
     const capture_locals = try module.arena.allocator().alloc(mir.LocalId, v.captured.len);
     var capture_index = v.captured.len;
     while (capture_index > 0) {
@@ -352,9 +357,9 @@ fn expandBuildClosure(builder: *mir_builder.Builder, allocator: std.mem.Allocato
         try builder.emit(.{ .call = .{ .dst = env, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, env_size) } });
         const local = try wasm_heap.storeLocal(builder, "@env", layout.ptr_type, env);
 
-        // Reverse order — established stack-order convention (see
-        // `wasm_objects.zig`'s own plain-struct field-store loop, same
-        // reasoning repeated throughout this session's work).
+        // Обратный порядок — установленное соглашение о порядке стека
+        // (см. собственный цикл сохранения полей обычной структуры в
+        // `wasm_objects.zig`, то же рассуждение).
         var i = capture_locals.len;
         while (i > 0) {
             i -= 1;
@@ -387,17 +392,19 @@ fn expandBuildClosure(builder: *mir_builder.Builder, allocator: std.mem.Allocato
     try builder.emit(.{ .load_local = .{ .dst = v.dst, .local = box_local } });
 }
 
-// Expands a closure-typed `.call_value{callee, args, dst}` (a
-// `.build_closure`-produced box, or any local/parameter/field holding
-// one) into: unbox (`mem_load` table_index @+0, `mem_load` env_ptr
-// @+4), append `env_ptr` as a TRAILING argument, `.call_indirect` —
-// mirrors `expandInvokeInterface`'s own unbox-then-`call_indirect`
-// shape exactly, same stack-order discipline (`table_index` must be the
-// LAST-produced operand, per `call_indirect`'s own WASM semantics).
-// STATIC direct calls (`static_callees` — see its own doc comment at
-// the call site in `expand`) are left completely untouched —
-// `wasm_emit.zig`'s existing `value_to_function` fast path still
-// handles them as an ordinary `call`, zero closure overhead.
+// Раскрывает `.call_value{callee, args, dst}` с типом замыкания (box,
+// произведённый `.build_closure`, или любая локаль/параметр/поле,
+// держащие его) в: распаковку (`mem_load` table_index @+0, `mem_load`
+// env_ptr @+4), добавление `env_ptr` ХВОСТОВЫМ аргументом,
+// `.call_indirect` — в точности зеркалит собственную форму
+// распаковка-затем-`call_indirect` из `expandInvokeInterface`, та же
+// дисциплина порядка стека (`table_index` должен быть ПОСЛЕДНИМ
+// произведённым операндом, по семантике WASM для `call_indirect`).
+// СТАТИЧЕСКИЕ прямые вызовы (`static_callees` — см. собственный
+// doc-комментарий в месте вызова в `expand`) остаются полностью
+// нетронутыми — существующий быстрый путь `value_to_function` в
+// `wasm_emit.zig` по-прежнему обрабатывает их как обычный `call`, без
+// накладных расходов на замыкание.
 fn expandCallValue(builder: *mir_builder.Builder, allocator: std.mem.Allocator, v: anytype, ctx: ExpandCtx, static_callees: *const std.AutoHashMap(mir.ValueId, mir.FunctionId)) !void {
     if (static_callees.contains(v.callee)) {
         try builder.emit(.{ .call_value = .{ .dst = v.dst, .callee = v.callee, .args = v.args } });
@@ -437,13 +444,14 @@ fn expandCallValue(builder: *mir_builder.Builder, allocator: std.mem.Allocator, 
     try builder.emit(.{ .call_indirect = .{ .dst = v.dst, .table_index = table_index_for_call, .args = try args.toOwnedSlice(arena) } });
 }
 
-// Also gates first-class function VALUES (`.function_ref` used as
-// anything other than `.spawn`'s own statically-resolved callee — see
-// `directCallCallees`/`.function_ref`'s rewrite in `expandInstruction`)
-// AND closures (`.build_closure`, WASM AOT closure support Stage A —
-// `mir_lowering.zig`'s `lowerLambda`/`lowerSymbolValueRef`) — all three
-// features share this pass's alloc/table infrastructure, and a program
-// using none of them shouldn't pay for any of their setup.
+// Также включает вентиль для ЗНАЧЕНИЙ функций первого класса
+// (`.function_ref`, использованный как что-либо, кроме собственного
+// статически разрешённого callee у `.spawn` — см. переписывание
+// `directCallCallees`/`.function_ref` в `expandInstruction`) И
+// замыканий (`.build_closure` — `lowerLambda`/`lowerSymbolValueRef` в
+// `mir_lowering.zig`) — все три возможности делят инфраструктуру
+// alloc/таблицы этого прохода, и программа, не использующая ни одну
+// из них, не должна платить за их настройку.
 fn usesInterfaces(module: *const mir.Module) bool {
     for (module.functions.items) |function| for (function.blocks.items) |block|
         for (block.instructions.items) |instruction| switch (instruction) {
@@ -453,38 +461,41 @@ fn usesInterfaces(module: *const mir.Module) bool {
     return false;
 }
 
-// Two callee kinds must NEVER have their `.function_ref` rewritten into
-// a real i32 table constant — both stay as a literal, no-op-producing
-// `.function_ref`, resolved by a downstream direct-call scan instead of
+// Два вида callee НИКОГДА не должны иметь свой `.function_ref`
+// переписанным в настоящую константу-индекс таблицы i32 — оба
+// остаются литеральным, ничего не делающим `.function_ref`,
+// разрешаемым нижестоящим сканированием прямых вызовов вместо
 // `call_indirect`:
 //
-// 1. `.spawn`'s own callee — `wasm_actors.zig`'s `resolveSpawnTarget`
-//    scans for a matching `.function_ref` instruction (`wasm_actors.
-//    expand` runs AFTER this pass, so rewriting it away here would
-//    silently break every `запусти` call).
+// 1. Собственный callee `.spawn` — `resolveSpawnTarget` в
+//    `wasm_actors.zig` сканирует на совпадающую инструкцию
+//    `.function_ref` (`wasm_actors.expand` выполняется ПОСЛЕ этого
+//    прохода, так что переписывание её здесь тихо сломало бы каждый
+//    вызов `запусти`).
 //
-// 2. `.call_value`'s own callee, for every STATICALLY known named call
-//    (`mir_lowering.zig`'s ident/method_calls/module-import fast paths
-//    — the common case, `.function_ref` feeds `call_value.callee`
-//    DIRECTLY, no intervening store/reload). `wasm_emit.zig`'s
-//    `value_to_function` map resolves these into an ordinary direct
-//    `call`, no indirection needed. Rewriting these into table entries
-//    is not just wasted work — for a SELF-recursive call specifically,
-//    it is actively wrong: `wasm_actors.zig` reuses/renames a function's
-//    OWN `FunctionId` in place when turning it into an actor scheduler
-//    function, so a table entry registered against that `FunctionId`
-//    BEFORE the rename ends up pointing at the WRONG (post-rename)
-//    signature by the time `emitModule` builds the Table/Element
-//    sections — confirmed via `wasmtime`: "indirect call type mismatch"
-//    trapping a recursive actor message handler calling itself. (A
-//    call_value whose callee comes from `mir_lowering.zig`'s
-//    `storeCalleeLocal`/`reloadCalleeLocal` — the genuinely dynamic
-//    fallback path — uses a FRESH `ValueId` from the reload, never the
-//    original `.function_ref`'s own `dst`, so it's naturally excluded
-//    from this set and still gets rewritten as needed.)
+// 2. Собственный callee `.call_value` для каждого СТАТИЧЕСКИ известного
+//    именованного вызова (быстрые пути ident/method_calls/module-import
+//    в `mir_lowering.zig` — общий случай, `.function_ref` питает
+//    `call_value.callee` НАПРЯМУЮ, без промежуточного store/reload).
+//    Карта `value_to_function` в `wasm_emit.zig` разрешает их в обычный
+//    прямой `call`, без нужды в косвенности. Переписывание их в записи
+//    таблицы — не просто лишняя работа: для конкретно САМОрекурсивного
+//    вызова это активно неверно: `wasm_actors.zig` переиспользует/
+//    переименовывает собственный `FunctionId` функции на месте, когда
+//    превращает её в функцию планировщика актора, так что запись
+//    таблицы, зарегистрированная для этого `FunctionId` ДО
+//    переименования, к моменту, когда `emitModule` строит секции
+//    Table/Element, указывает на НЕ ТУ (постпереименованную)
+//    сигнатуру. (call_value, чей callee приходит из
+//    `storeCalleeLocal`/`reloadCalleeLocal` в `mir_lowering.zig` —
+//    подлинно динамический запасной путь — использует СВЕЖИЙ `ValueId`
+//    из перезагрузки, никогда не собственный `dst` оригинального
+//    `.function_ref`, так что он естественно исключён из этого
+//    множества и по-прежнему переписывается по мере надобности.)
 //
-// Collected per-function (matching `resolveSpawnTarget`'s own
-// whole-function scan) before any rewriting happens.
+// Собирается по функциям (соответствует собственному сканированию
+// всей функции у `resolveSpawnTarget`) до начала какого-либо
+// переписывания.
 fn directCallCallees(allocator: std.mem.Allocator, function: *const mir.Function) !std.AutoHashMap(mir.ValueId, void) {
     var set: std.AutoHashMap(mir.ValueId, void) = .init(allocator);
     for (function.blocks.items) |block| for (block.instructions.items) |instruction| switch (instruction) {
@@ -525,10 +536,10 @@ fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator
         .invoke_interface => |v| {
             try expandInvokeInterface(builder, ctx, v);
         },
-        // Rewrites a function reference into a real i32 WASM table
-        // index (`.const_value{.address}`) — see `usesInterfaces`'s and
-        // `directCallCallees`'s own doc comments for why `.spawn`'s own
-        // callee is deliberately excluded.
+        // Переписывает ссылку на функцию в настоящий индекс таблицы
+        // WASM i32 (`.const_value{.address}`) — см. doc-комментарии
+        // `usesInterfaces` и `directCallCallees` о том, почему
+        // собственный callee `.spawn` намеренно исключён.
         .function_ref => |v| {
             if (direct_call_callees.contains(v.dst)) {
                 try static_callees.put(v.dst, v.function);
@@ -538,16 +549,16 @@ fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator
             const table_index = try tableIndexFor(table, table_index_of, allocator, v.function);
             try builder.emit(.{ .const_value = .{ .dst = v.dst, .value = .{ .address = table_index } } });
         },
-        // WASM AOT closures, Stage A — see `expandBuildClosure`'s own
-        // doc comment.
+        // Замыкания WASM AOT — см. doc-комментарий `expandBuildClosure`.
         .build_closure => |v| {
             try expandBuildClosure(builder, allocator, v, ctx, table, table_index_of, closure_wrapper_of);
         },
-        // A closure-typed callee (`.function`-typed value, produced by
-        // `.build_closure` or an ordinary local/parameter/field holding
-        // one) — see `expandCallValue`'s own doc comment. The STATIC
-        // direct-call fast path (`static_callees`) is untouched, exactly
-        // as `.function_ref`'s own rewrite above.
+        // Callee с типом замыкания (значение типа `.function`,
+        // произведённое `.build_closure` или обычной локалью/
+        // параметром/полем, держащими его) — см. doc-комментарий
+        // `expandCallValue`. Быстрый путь СТАТИЧЕСКОГО прямого вызова
+        // (`static_callees`) не затрагивается, точно как в
+        // переписывании `.function_ref` выше.
         .call_value => |v| {
             try expandCallValue(builder, allocator, v, ctx, static_callees);
         },
@@ -555,26 +566,26 @@ fn expandInstruction(builder: *mir_builder.Builder, allocator: std.mem.Allocator
     }
 }
 
-// `alloc(vtable.len * 4)`, one `mem_store` per entry (each a
-// compile-time-constant WASM table index — resolved via `tableIndexFor`,
-// same alloc-a-fresh-array-of-constants shape `wasm_strings.zig`'s
-// `emitConstString` already established for per-byte string content),
-// then `alloc(8)` for the box itself (`receiver` at offset 0, the
-// vtable array's own address at offset 4).
+// `alloc(vtable.len * 4)`, по одному `mem_store` на запись (каждая —
+// константный времени компиляции индекс таблицы WASM, разрешённый
+// через `tableIndexFor`, та же форма "аллоцировать свежий массив
+// констант", что уже установлена `emitConstString` в
+// `wasm_strings.zig` для побайтового содержимого строк), затем
+// `alloc(8)` для самого box (`receiver` по смещению 0, собственный
+// адрес массива vtable по смещению 4).
 fn expandCastInterface(builder: *mir_builder.Builder, allocator: std.mem.Allocator, v: anytype, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId)) !void {
     const layout = ctx.layout;
     const module = builder.module;
     const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
 
-    // `v.src` is a PRE-EXISTING value, already produced (and left on the
-    // real WASM stack) by whatever instruction came immediately before
-    // the original (now-being-expanded) `.cast_interface` — it must be
-    // routed through a Local IMMEDIATELY, before any of this function's
-    // OWN instructions run, or it ends up buried under everything this
-    // function inserts (vtable-array alloc/stores, box alloc) with no
-    // way to reach it again. The single most load-bearing lesson of this
-    // whole multi-session WASM-AOT initiative — see `wasm_strings.zig`'s
-    // own arg-order bug history for the same mistake recurring.
+    // `v.src` — ПРЕДСУЩЕСТВУЮЩЕЕ значение, уже произведённое (и
+    // оставленное на настоящем стеке WASM) той инструкцией, что
+    // непосредственно предшествовала исходной (сейчас раскрываемой)
+    // `.cast_interface` — его нужно немедленно маршрутизировать через
+    // Local, до выполнения любых СОБСТВЕННЫХ инструкций этой функции,
+    // иначе оно окажется погребено под всем, что эта функция вставляет
+    // (аллокация/сохранения массива vtable, аллокация box), без
+    // возможности снова до него добраться.
     const src_local = try wasm_heap.storeLocal(builder, "@src", layout.ptr_type, v.src);
 
     const vtable_size = try wasm_heap.addressConst(builder, layout.idx_type, @intCast(v.vtable.len * 4));
@@ -583,10 +594,11 @@ fn expandCastInterface(builder: *mir_builder.Builder, allocator: std.mem.Allocat
     const vtable_array_local = try wasm_heap.storeLocal(builder, "@vtable", layout.ptr_type, vtable_array);
 
     for (v.vtable, 0..) |binding, i| {
-        // Ordinary (non-default) methods get routed through a thin
-        // unwrap-the-box wrapper — see `wrapperFor`'s own doc comment for
-        // why. Default methods use their own FunctionId directly (the
-        // box IS the shape they expect for `это`).
+        // Обычные (не-default) методы маршрутизируются через тонкую
+        // обёртку-распаковщик box — почему, см. doc-комментарий
+        // `wrapperFor`. Методы по умолчанию используют собственный
+        // FunctionId напрямую (box И ЕСТЬ та форма, которую они
+        // ожидают для `это`).
         const callee = if (binding.is_default) binding.function else try wrapperFor(module, allocator, ctx.type_store, wrapper_of, binding.function);
         const table_index = try tableIndexFor(table, table_index_of, allocator, callee);
         const table_index_const = try wasm_heap.addressConst(builder, layout.idx_type, table_index);
@@ -601,27 +613,18 @@ fn expandCastInterface(builder: *mir_builder.Builder, allocator: std.mem.Allocat
     try builder.emit(.{ .call = .{ .dst = box, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, box_size) } });
     const box_local = try wasm_heap.storeLocal(builder, "@box", layout.ptr_type, box);
 
-    // `src` (the receiver) reloaded fresh from `src_local`, BEFORE `box`
-    // (reloaded fresh too) — the established `mem_store` stack
-    // convention (`src` first, `addr` last/adjacent).
+    // `src` (receiver) перезагружается свежим из `src_local`, ДО `box`
+    // (тоже перезагружаемого свежим) — установленное соглашение стека
+    // для `mem_store` (`src` первым, `addr` последним/смежным).
     const src_for_receiver = try wasm_heap.loadLocal(builder, src_local, layout.ptr_type);
     const box_for_receiver = try wasm_heap.loadLocal(builder, box_local, layout.ptr_type);
     try builder.emit(.{ .mem_store = .{ .addr = box_for_receiver, .src = src_for_receiver } });
 
-    // `src` (`vtable_array_for_store`) produced BEFORE `addr`
-    // (`vtable_field_addr`) — an earlier version computed the ADDRESS
-    // first (via the `box+4` arithmetic) and loaded `src` LAST, backwards
-    // from `mem_store`'s convention. Since `mem_store`'s codegen just
-    // pops whatever's on top as `addr` and the next as `src` with no
-    // semantic check, the swap silently stored `vtable_field_addr`'s
-    // VALUE (the address itself) INTO `vtable_array`'s own first slot
-    // instead of writing `vtable_array`'s address into the box — for the
-    // single-method-interface fixtures this file's own tests use, that
-    // clobbered the just-written table index with the box's own address,
-    // and the box's vtable-pointer FIELD was left holding stale
-    // (zero-initialized) memory. Found via wasm-objdump byte tracing
-    // after runtime dispatch consistently picked the first-ever-cast
-    // implementation regardless of which was actually passed.
+    // `src` (`vtable_array_for_store`) производится ДО `addr`
+    // (`vtable_field_addr`) — соглашение `mem_store`: кодогенерация
+    // просто выталкивает то, что наверху, как `addr`, и следующее как
+    // `src`, без семантической проверки, так что нарушение этого
+    // порядка тихо записало бы значение адреса не туда.
     const vtable_array_for_store = try wasm_heap.loadLocal(builder, vtable_array_local, layout.ptr_type);
     const four = try wasm_heap.addressConst(builder, layout.idx_type, 4);
     const box_for_vtable_addr = try wasm_heap.loadLocal(builder, box_local, layout.ptr_type);
@@ -631,24 +634,26 @@ fn expandCastInterface(builder: *mir_builder.Builder, allocator: std.mem.Allocat
     try builder.emit(.{ .load_local = .{ .dst = v.dst, .local = box_local } });
 }
 
-// Reads the vtable slot at `method_index*4` (the ONLY genuinely dynamic
-// part — a runtime i32, not known until the program actually runs),
-// then `.call_indirect` with `[box] ++ args` — the BOX ITSELF (not an
-// unwrapped receiver) is passed uniformly to every vtable slot; see
-// `wrapperFor`'s doc comment for why (ordinary methods get a thin
-// unwrap-the-box wrapper generated at their `.cast_interface` site,
-// default methods already expect the box directly as `это`).
+// Читает слот vtable по `method_index*4` (ЕДИНСТВЕННАЯ подлинно
+// динамическая часть — i32 времени выполнения, неизвестный до
+// фактического запуска программы), затем `.call_indirect` с
+// `[box] ++ args` — САМ BOX (не распакованный receiver) передаётся
+// единообразно в каждый слот vtable; почему — см. doc-комментарий
+// `wrapperFor` (обычные методы получают тонкую обёртку-распаковщик
+// box, порождённую в их месте `.cast_interface`, методы по умолчанию
+// уже ожидают box напрямую как `это`).
 fn expandInvokeInterface(builder: *mir_builder.Builder, ctx: ExpandCtx, v: anytype) !void {
     const layout = ctx.layout;
 
     const box_for_receiver = v.receiver;
     const box_local = try wasm_heap.storeLocal(builder, "@iface_box", layout.ptr_type, box_for_receiver);
 
-    // `v.args` are ALSO pre-existing values (from the original
-    // instruction stream, produced before this `.invoke_interface`) —
-    // routed through Locals immediately, same reasoning as `v.receiver`
-    // above and `v.src` in `expandCastInterface`, since they're only
-    // actually needed much later (after the vtable-lookup code below).
+    // `v.args` — ТОЖЕ предсуществующие значения (из исходного потока
+    // инструкций, произведены до этой `.invoke_interface`) —
+    // маршрутизируются через Locals немедленно, то же рассуждение, что
+    // и для `v.receiver` выше и `v.src` в `expandCastInterface`,
+    // поскольку реально нужны намного позже (после кода поиска vtable
+    // ниже).
     const arg_locals = try builder.module.arena.allocator().alloc(mir.LocalId, v.args.len);
     for (v.args, arg_locals) |arg, *local| {
         local.* = try wasm_heap.storeLocal(builder, "@iface_arg", builder.currentFunction().valueType(arg), arg);
@@ -661,13 +666,14 @@ fn expandInvokeInterface(builder: *mir_builder.Builder, ctx: ExpandCtx, v: anyty
     try builder.emit(.{ .mem_load = .{ .dst = vtable_array, .addr = vtable_field_addr } });
     const vtable_array_local = try wasm_heap.storeLocal(builder, "@vtable", layout.ptr_type, vtable_array);
 
-    // `call_indirect`'s WASM stack requirement is `[args..., table_index]`
-    // (the index popped FIRST/topmost) — args (box + real args) must
-    // therefore be produced BEFORE `table_index`, not after, even though
-    // the vtable slot needed to COMPUTE `table_index` was already read
-    // above; the read (`mem_load` into `table_index`'s own ValueId) is
-    // deferred to right before the call specifically to keep it the
-    // LAST-produced operand.
+    // Требование стека WASM для `call_indirect` — `[args...,
+    // table_index]` (индекс выталкивается ПЕРВЫМ/сверху) — поэтому
+    // args (box + реальные аргументы) должны быть произведены ДО
+    // `table_index`, а не после, хотя слот vtable, нужный для
+    // ВЫЧИСЛЕНИЯ `table_index`, уже прочитан выше; само чтение
+    // (`mem_load` в собственный ValueId `table_index`) отложено до
+    // момента прямо перед вызовом специально, чтобы оставаться
+    // ПОСЛЕДНИМ произведённым операндом.
     const box_for_call = try wasm_heap.loadLocal(builder, box_local, layout.ptr_type);
     const arena = builder.module.arena.allocator();
     var args: std.ArrayList(mir.ValueId) = .empty;

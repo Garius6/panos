@@ -9,35 +9,37 @@ const wasm_module = @import("wasm_module.zig");
 const wasm_stackify = @import("wasm_stackify.zig");
 const wasm_heap = @import("wasm_heap.zig");
 
-// Ported from `core/wasm_emit.odin` (~1922 lines there) — scoped to
-// EXACTLY what `mir_lowering.zig` can produce (see that file's own scope
-// note): number/boolean constants, locals, arithmetic/comparison/unary
-// operators, `если`/`пока`, direct function calls, `возврат`. No
-// aggregates/arrays/maps/interfaces/closures/`?`-operator/strings —
-// those need an object-table runtime (`pw_alloc_aggregate` etc. in the
-// Odin original) that doesn't exist on this side yet. Anything MIR
-// contains outside this set is a lowering bug, not an emission gap — MIR
-// can't contain it in the first place (`mir_lowering.zig`'s `unsupported`
-// panics before such an instruction is ever built).
+// Область действия строго ограничена тем, что может произвести
+// `mir_lowering.zig` (см. собственную заметку об области видимости в
+// этом файле): числовые/булевы константы, локальные переменные,
+// арифметические/сравнивающие/унарные операторы, `если`/`пока`, прямые
+// вызовы функций, `возврат`. Нет агрегатов/массивов/карт/интерфейсов/
+// замыканий/оператора `?`/строк — для них нужен рантайм с таблицей
+// объектов, которого здесь пока нет. Всё, что встречается в MIR за
+// пределами этого набора — баг понижения (lowering), а не пробел в
+// генерации кода: MIR в принципе не может это содержать (`unsupported`
+// в `mir_lowering.zig` паникует раньше, чем такая инструкция вообще
+// будет построена).
 
 const ScopeKind = enum { loop, if_scope };
 const Scope = struct { kind: ScopeKind, header: mir.BlockId = mir.invalid_block };
 
-// Serializes a WASM function signature (param types + optional result
-// type) into a byte key suitable for a `StringHashMap` — used to give
-// EVERY function callable through the interface table a SHARED type
-// index for its structural shape, instead of the ordinary one-type-
-// per-function scheme the rest of this file uses. `call_indirect`
-// validates the runtime callee's OWN type-section index against the
-// literal typeidx baked into the call site — it does NOT do structural
-// matching across separate (even byte-identical) type entries, so two
-// different concrete implementations of the same interface method
-// (different functions, hence different individual type indices under
-// the ordinary scheme) would make `call_indirect` trap for every
-// implementation except whichever one happens to share the literal
-// index used at the call site. `0xFE` separates params from the result
-// byte (`0xFD` for void) — neither collides with `wasm_i32`(0x7F)/
-// `wasm_f64`(0x7C), the only two WASM value types this backend emits.
+// Сериализует сигнатуру WASM-функции (типы параметров + опциональный
+// тип результата) в байтовый ключ для `StringHashMap` — используется,
+// чтобы дать КАЖДОЙ функции, вызываемой через таблицу интерфейса, ОБЩИЙ
+// индекс типа для её структурной формы, вместо обычной схемы
+// "один тип на функцию", которую использует остальной код в этом файле.
+// `call_indirect` проверяет СОБСТВЕННЫЙ индекс типа реального вызываемого
+// объекта в секции типов против literal typeidx, зашитого в место
+// вызова — он НЕ делает структурное сопоставление между отдельными (даже
+// побайтово идентичными) записями типов, поэтому разные конкретные
+// реализации одного и того же метода интерфейса (разные функции, значит
+// разные индивидуальные индексы типов при обычной схеме) заставили бы
+// `call_indirect` паниковать (trap) для всех реализаций, кроме той,
+// чей индекс случайно совпал с использованным в месте вызова. `0xFE`
+// отделяет параметры от байта результата (`0xFD` для void) — ни один не
+// пересекается с `wasm_i32`(0x7F)/`wasm_f64`(0x7C), единственными двумя
+// типами значений WASM, которые генерирует этот бэкенд.
 fn signatureShapeKey(allocator: std.mem.Allocator, params: []const u8, result: ?u8) ![]u8 {
     var key: std.ArrayList(u8) = .empty;
     try key.appendSlice(allocator, params);
@@ -46,12 +48,13 @@ fn signatureShapeKey(allocator: std.mem.Allocator, params: []const u8, result: ?
     return try key.toOwnedSlice(allocator);
 }
 
-// Shared by `emitModule`'s two shape-collecting scans (interface-table
-// member functions, and every `.call_value` call site's own required
-// shape) — registers one new type-section entry per DISTINCT shape,
-// no-op if already registered. `total_functions` is `module.functions.
-// items.len` (the shared type-section entries start right after every
-// ordinary function's own unique entry).
+// Используется обоими сканами `emitModule`, собирающими формы (функции-
+// члены таблицы интерфейса и требуемая форма каждого места вызова
+// `.call_value`) — регистрирует одну новую запись в секции типов для
+// КАЖДОЙ РАЗЛИЧНОЙ формы, не-операция если уже зарегистрирована.
+// `total_functions` — это `module.functions.items.len` (общие записи
+// секции типов начинаются сразу после собственной уникальной записи
+// каждой обычной функции).
 fn registerInterfaceShape(
     allocator: std.mem.Allocator,
     interface_type_index: *std.StringHashMap(u32),
@@ -88,65 +91,69 @@ const EmitContext = struct {
     visited: std.AutoHashMap(mir.BlockId, void),
     scope_stack: std.ArrayList(Scope) = .empty,
     code: std.ArrayList(u8) = .empty,
-    // `Function_Ref_Instr` has no WASM-level stack representation on its
-    // own (no closure/table support yet) — it only ever feeds a
-    // STATICALLY known `call_value` immediately after (that's the only
-    // shape `mir_lowering.zig`'s `lowerCall` ever produces). Recorded here
-    // instead of pushed onto the WASM stack; `call_value` looks the
-    // callee up here and emits a direct `call`.
+    // У `Function_Ref_Instr` нет собственного представления на стеке WASM
+    // (пока нет поддержки замыканий/таблиц) — он всегда только питает
+    // СТАТИЧЕСКИ известный `call_value` сразу после себя (это единственная
+    // форма, которую `lowerCall` в `mir_lowering.zig` вообще производит).
+    // Записывается здесь вместо того, чтобы попадать на стек WASM;
+    // `call_value` ищет здесь вызываемую функцию и генерирует прямой `call`.
     value_to_function: std.AutoHashMap(mir.ValueId, mir.FunctionId),
     use_count: std.AutoHashMap(mir.ValueId, u32),
-    // `call_builtin`'s "модуль::имя" (`time_now`/`time_monotonic`
-    // строки) → WASM import function index — empty for any module that
-    // never calls a builtin (the common case; see `collectBuiltinNames`).
+    // "модуль::имя" из `call_builtin` (строки `time_now`/`time_monotonic`)
+    // → индекс импортируемой функции WASM — пусто для любого модуля,
+    // который никогда не вызывает builtin (обычный случай; см.
+    // `collectBuiltinNames`).
     builtin_index: *const std.StringHashMap(u32),
-    // Every string CONSTANT literal in the module → its byte offset into
-    // the module's own static data section (see `collectStringConstants`)
-    // — empty for any module with no string literals at all.
+    // Каждый строковый КОНСТАНТНЫЙ литерал модуля → его байтовое смещение
+    // в собственной статической секции данных модуля (см.
+    // `collectStringConstants`) — пусто для любого модуля без строковых
+    // литералов вообще.
     string_offsets: *const std.StringHashMap(u32),
-    // `signatureShapeKey(params, result) -> shared type-section index` —
-    // only populated for modules with a non-empty interface function
-    // table; `.call_indirect`'s own codegen looks up its call site's
-    // (args, dst) shape here to find the SAME shared type index the
-    // table's member functions were assigned in `emitModule`'s Function
-    // section overrides.
+    // `signatureShapeKey(params, result) -> общий индекс в секции типов` —
+    // заполняется только для модулей с непустой таблицей функций
+    // интерфейса; собственная кодогенерация `.call_indirect` ищет здесь
+    // форму (args, dst) своего места вызова, чтобы найти ТОТ ЖЕ общий
+    // индекс типа, который функциям-членам таблицы присвоили переопределения
+    // секции Function в `emitModule`.
     interface_type_index: *const std.StringHashMap(u32),
-    // Lazily reserved the first time a function needs `%`/bitwise ops
-    // (see `.binary`'s `.modulo`/`.bit_*`/`.shift_*` cases) — WASM's f64
-    // has no modulo/bitwise instructions at all, only i32/i64 do, and
-    // Phase-1a numbers are uniformly f64 (see `.binary`'s own comment on
-    // that convention). Converting BOTH operands to i32 needs a scratch
-    // local: they're already both live on the WASM value stack by the
-    // time this instruction runs (stack machine — no way to reach the
-    // BOTTOM one, `lhs`, without first popping the top one, `rhs`,
-    // somewhere). One local suffices for a whole function — each use is
-    // fully consumed (stored then immediately reloaded) before the next,
-    // never overlapping. Declared in the function's local section by
-    // `emitFunctionWasm` only if `scratch_i32_local != null` after the
-    // body's been fully emitted (its index is fixed the moment it's
-    // first reserved: `function.locals.items.len`, i.e. right past every
-    // real MIR local).
+    // Резервируется лениво при первой потребности функции в `%`/побитовых
+    // операциях (см. случаи `.modulo`/`.bit_*`/`.shift_*` в `.binary`) —
+    // у f64 в WASM вообще нет инструкций modulo/побитовых операций, только
+    // у i32/i64, а числа Phase-1a единообразно представлены как f64 (см.
+    // собственный комментарий `.binary` об этом соглашении). Преобразование
+    // ОБОИХ операндов в i32 требует scratch-локали: оба уже живут на стеке
+    // значений WASM к моменту выполнения этой инструкции (стековая машина —
+    // нет способа добраться до НИЖНЕГО, `lhs`, не вытолкнув сначала верхний,
+    // `rhs`, куда-то). Одной локали хватает на всю функцию — каждое
+    // использование полностью потребляется (сохраняется и сразу же
+    // перезагружается) перед следующим, без пересечений. Объявляется в
+    // секции локальных переменных функции в `emitFunctionWasm` только если
+    // `scratch_i32_local != null` после того, как тело полностью
+    // сгенерировано (её индекс фиксируется в момент первого резервирования:
+    // `function.locals.items.len`, то есть сразу за каждой реальной
+    // локалью MIR).
     scratch_i32_local: ?u32 = null,
-    // `frame_store` (`mir_cps.zig`'s CPS rewrite output, and
-    // `wasm_actors.zig`'s hand-built functions) needs to compute an
-    // ADDRESS (frame + slot*8, real i32 arithmetic). The REAL stack
-    // order at this instruction's own arm, confirmed by actually running
-    // real output through `wasm2wat`/`wasmtime` (not assumed): `[src,
-    // frame]` — `frame` is a value BOTH callers construct via a fresh
-    // `frameValue()`/`loadLocal()` call emitted immediately adjacent to
-    // this instruction (so it's always the LAST, i.e. topmost, thing
-    // pushed), while `src` is very often a value produced much EARLIER
-    // (e.g. converting an existing `store_local{src}` into
-    // `frame_store` — `src`'s own producer is wherever it already was
-    // in the instruction stream, unmovable) — the reverse of the
-    // "operands pre-pushed in field-declaration order" convention
-    // `.binary`/etc rely on. Needs TWO scratch locals live at once (pop
-    // frame off the top first, then src, so the address math can run on
-    // a clean stack) — `frame` is always `ptr_type` (i32), `src`'s WASM
-    // type (i32 handle vs f64 number) depends on what's being stored, so
-    // (like `scratch_i32_local` above) this needs one local per src type
-    // PLUS one dedicated for frame; only ever declared if a function
-    // actually contains a `frame_store`.
+    // `frame_store` (вывод CPS-переписывания `mir_cps.zig`, и
+    // вручную построенные функции `wasm_actors.zig`) должен вычислить
+    // АДРЕС (frame + slot*8, реальная арифметика i32). Реальный порядок
+    // стека в этом месте инструкции: `[src, frame]` — `frame` это
+    // значение, которое ОБА вызывающих строят через свежий вызов
+    // `frameValue()`/`loadLocal()`, генерируемый непосредственно рядом с
+    // этой инструкцией (поэтому это всегда ПОСЛЕДНЕЕ, то есть самое
+    // верхнее, что попадает на стек), тогда как `src` очень часто —
+    // значение, произведённое намного РАНЬШЕ (например, при превращении
+    // существующего `store_local{src}` в `frame_store` — собственный
+    // производитель `src` находится там, где он уже был в потоке
+    // инструкций, и его нельзя переместить) — обратный порядок по
+    // сравнению с соглашением "операнды предварительно помещаются в
+    // порядке объявления полей", на которое опираются `.binary` и другие.
+    // Требуются ДВЕ живые scratch-локали одновременно (сначала вытолкнуть
+    // frame сверху, затем src, чтобы адресная арифметика работала на
+    // чистом стеке) — `frame` всегда `ptr_type` (i32), тип WASM для `src`
+    // (i32-хэндл или f64-число) зависит от того, что сохраняется, поэтому
+    // (как и `scratch_i32_local` выше) нужна одна локаль на тип src ПЛЮС
+    // одна выделенная под frame; объявляется только если функция
+    // действительно содержит `frame_store`.
     frame_store_scratch_frame: ?u32 = null,
     frame_store_scratch_i32: ?u32 = null,
     frame_store_scratch_f64: ?u32 = null,
@@ -228,17 +235,11 @@ const EmitContext = struct {
     }
 };
 
-// Same treatment as `mir_lowering.zig`'s `unsupported()` (see that
-// file's doc comment) — was `@panic`, crashed the whole `panos build
-// --target=wasm` process with a Zig stack trace on any Phase-1a
-// codegen gap (found running the actual motivating case for the
-// struct-methods feature: `std/математика.pns`'s `Генератор.
-// следующее()` PRNG uses `%`/bitwise ops, which this backend's
-// arithmetic emission doesn't cover yet — a genuinely separate,
-// pre-existing gap from method dispatch itself). `cli/main.zig`
-// already wraps `emitModule(...)` in a `catch |err| { print; exit(1);
-// }` (needed for its OTHER failure modes already) — no caller-side
-// change needed here, just stop crashing.
+// То же обращение, что и с `unsupported()` в `mir_lowering.zig` (см.
+// doc-комментарий того файла) — возвращает управляемую ошибку вместо
+// краша всего процесса `panos build --target=wasm` со стек-трейсом Zig
+// при любом пробеле в кодогенерации Phase-1a. `cli/main.zig` уже
+// оборачивает `emitModule(...)` в `catch |err| { print; exit(1); }`.
 fn unsupported(comptime what: []const u8) error{WasmEmitUnsupported} {
     std.debug.print("panos build: AOT (wasm) кодогенерация не поддерживает — " ++ what ++ "\n", .{});
     return error.WasmEmitUnsupported;
@@ -249,9 +250,10 @@ fn countUse(counts: *std.AutoHashMap(mir.ValueId, u32), value: mir.ValueId) !voi
     entry.value_ptr.* += 1;
 }
 
-// Only the operand shapes Phase-1a MIR can contain — see this file's own
-// doc comment for why an exhaustive `mir.Instruction`/`mir.Terminator`
-// switch isn't needed (lowering never produces anything else).
+// Только те формы операндов, которые может содержать MIR Phase-1a — см.
+// собственный doc-комментарий этого файла о том, почему исчерпывающий
+// switch по `mir.Instruction`/`mir.Terminator` не нужен (lowering
+// никогда не производит ничего другого).
 fn computeUseCount(allocator: std.mem.Allocator, function: *const mir.Function) !std.AutoHashMap(mir.ValueId, u32) {
     var counts: std.AutoHashMap(mir.ValueId, u32) = .init(allocator);
     for (function.blocks.items) |block| {
@@ -338,16 +340,16 @@ fn findBrDepth(ctx: *EmitContext, target: mir.BlockId) !usize {
 
 const ProcessOutcome = struct { fallthrough: mir.BlockId, ok: bool };
 
-// Emits block `start` and everything structurally belonging to its
-// region, until `stop_at` (a boundary already known to the caller) or a
-// Return/Unreachable/back-edge. Returns `{stop_at, true}` if the region
-// normally falls through to `stop_at` (caller continues from there),
-// otherwise `{_, false}` — every path in the region either returned/
-// panicked, or went to a loop via `br`.
-// `anyerror`, not inferred — `processFrom`/`emitBranch` are now mutually
-// recursive (the loop-header case can call `emitBranch`, which calls
-// `processFrom`), and Zig can't infer an error set across a dependency
-// cycle between two functions.
+// Генерирует блок `start` и всё, что структурно принадлежит его региону,
+// до `stop_at` (граница, уже известная вызывающей стороне) или
+// Return/Unreachable/обратного ребра. Возвращает `{stop_at, true}`, если
+// регион обычным образом проваливается в `stop_at` (вызывающая сторона
+// продолжает оттуда), иначе `{_, false}` — каждый путь в регионе либо
+// вернул значение/запаниковал, либо ушёл в цикл через `br`.
+// `anyerror`, не выводимый автоматически — `processFrom`/`emitBranch`
+// теперь взаимно рекурсивны (случай заголовка цикла может вызвать
+// `emitBranch`, который вызывает `processFrom`), а Zig не может вывести
+// набор ошибок через цикл зависимостей между двумя функциями.
 fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) anyerror!ProcessOutcome {
     var b = start;
     while (true) {
@@ -363,28 +365,27 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) anye
 
             try ctx.code.appendSlice(ctx.allocator, &.{ 0x03, 0x40 }); // loop (empty blocktype)
             try ctx.scope_stack.append(ctx.allocator, .{ .kind = .loop, .header = b });
-            // The header's OWN instructions (computing cond) go INSIDE the
-            // loop, not before it — cond is part of the loop body (`пока
-            // cond цикл`), it must be recomputed every iteration via `br 0`
-            // back to the loop's start, not once before the first entry.
+            // Собственные инструкции заголовка (вычисление cond) идут
+            // ВНУТРИ цикла, а не до него — cond является частью тела
+            // цикла (`пока cond цикл`), его нужно пересчитывать каждую
+            // итерацию через `br 0` обратно к началу цикла, а не один раз
+            // перед первым входом.
             try emitBlockInstructions(ctx, block);
 
-            // `identifyLoopBodyAndExit`'s assumption — exactly ONE side of
-            // the header's own branch loops back (the body), the other
-            // falls through to a block after the loop (the exit) — holds
-            // for every ordinary `пока` loop (`mir_lowering.zig`'s
-            // `lowerWhile` only ever produces that single-body-single-exit
-            // shape). It does NOT hold for `mir_cps.zig`'s dispatch-entry
-            // loop header: a self-tail-call can make BOTH branches
-            // eventually loop back (or return/suspend deep inside),
-            // with no CFG edge to "after the loop" at all — found by
-            // actually running that shape and hitting "br-цель не
-            // найдена среди открытых scope" here, not by reading alone.
-            // Checked directly via `canReach` (not
-            // `identifyLoopBodyAndExit`, which can't express "both/
-            // neither") so the common case below is BYTE-IDENTICAL to
-            // before this fix — zero behavior change for any program
-            // that already compiled.
+            // Предположение `identifyLoopBodyAndExit` — ровно ОДНА сторона
+            // собственного branch заголовка уходит назад (тело), другая
+            // проваливается в блок после цикла (выход) — выполняется для
+            // каждого обычного цикла `пока` (`lowerWhile` в
+            // `mir_lowering.zig` производит только эту форму
+            // "одно тело — один выход"). Оно НЕ выполняется для заголовка
+            // цикла диспетчеризации `mir_cps.zig`: самохвостовой вызов
+            // может заставить ОБЕ ветви в итоге уйти назад (или
+            // вернуть/приостановить выполнение глубоко внутри), без
+            // какого-либо CFG-ребра к "после цикла" вообще. Проверяется
+            // напрямую через `canReach` (не через `identifyLoopBodyAndExit`,
+            // который не может выразить "обе/ни одна"), поэтому обычный
+            // случай ниже остаётся ПОБАЙТОВО ИДЕНТИЧНЫМ — никакого
+            // изменения поведения для уже скомпилированных программ.
             const then_reaches_header = try wasm_stackify.canReach(ctx.allocator, ctx.function, branch.then_block, b);
             const else_reaches_header = try wasm_stackify.canReach(ctx.allocator, ctx.function, branch.else_block, b);
 
@@ -396,26 +397,27 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) anye
                     .{ .body = branch.else_block, .exit = branch.then_block };
                 try ctx.code.appendSlice(ctx.allocator, &.{ 0x04, 0x40 }); // if (empty blocktype)
                 try ctx.scope_stack.append(ctx.allocator, .{ .kind = .if_scope });
-                // The return of processFrom(body, ...) is intentionally
-                // ignored: the body ALWAYS either reaches stop_at=exit
-                // (e.g. via прервать, possibly from a nested если/иначе)
-                // or ends via back-edge-br/return/unreachable — either
-                // way the body is fully emitted by this point; what
-                // exactly happened doesn't matter here, exit_block
-                // follows regardless.
+                // Возврат processFrom(body, ...) намеренно игнорируется:
+                // тело ВСЕГДА либо достигает stop_at=exit (например через
+                // прервать, возможно из вложенного если/иначе), либо
+                // завершается через обратное ребро-br/return/unreachable —
+                // в любом случае тело к этому моменту полностью
+                // сгенерировано; что именно произошло здесь не важно,
+                // exit_block следует в любом случае.
                 _ = try processFrom(ctx, identified.body, identified.exit);
                 _ = ctx.scope_stack.pop(); // if
                 try ctx.code.append(ctx.allocator, 0x05); // else — empty
                 try ctx.code.append(ctx.allocator, 0x0B); // end if
                 loop_outcome = .{ .fallthrough = identified.exit, .ok = true };
             } else {
-                // BOTH (or, degenerate, NEITHER) side reaches back — no
-                // clean body/exit split exists at this branch. Fall back
-                // to the same general merge/diverge handling ordinary
-                // (non-header) branches already use — still nested
-                // inside this SAME open `loop` scope, so a `br` found
-                // deep inside either side still resolves correctly via
-                // `findBrDepth`.
+                // ОБЕ (или, вырожденно, НИ ОДНА) стороны уходят назад —
+                // чистого разделения тело/выход для этого branch не
+                // существует. Используется тот же общий механизм
+                // объединения/расхождения, который уже применяется для
+                // обычных (не заголовочных) branch — по-прежнему вложенный
+                // в этот ЖЕ открытый scope `loop`, так что `br`, найденный
+                // глубоко внутри любой стороны, всё ещё корректно
+                // разрешается через `findBrDepth`.
                 loop_outcome = try emitBranch(ctx, b, branch, mir.invalid_block);
             }
 
@@ -423,20 +425,19 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) anye
             try ctx.code.append(ctx.allocator, 0x0B); // end loop
 
             if (!loop_outcome.ok) {
-                // Real bug found running actual code, not just reading:
-                // every OTHER divergent path in this file (an ordinary
-                // `.branch`'s own both-diverged fallback, `.return_value`,
-                // `.unreachable_term`, `.suspend_return`) writes an
-                // explicit terminating byte (`return`/`unreachable`)
-                // before signaling `ok = false` upward — this is the
-                // ONE spot that didn't: `emitBranch`'s own internal
-                // `unreachable` (when IT can't find a fallthrough)
-                // satisfies ONLY the if/else block's own (void)
-                // blocktype, not what comes AFTER the loop closes. With
-                // nothing here, a suspend-capable function's `i32`
-                // result requirement at the function's own trailing
-                // `end` had nothing on the stack — confirmed via
-                // `wasmtime`: "expected i32 but nothing on stack".
+                // Каждый ДРУГОЙ расходящийся путь в этом файле (собственный
+                // фолбэк `.branch` при расхождении обеих сторон,
+                // `.return_value`, `.unreachable_term`, `.suspend_return`)
+                // пишет явный завершающий байт (`return`/`unreachable`)
+                // перед тем как сигнализировать `ok = false` наверх — это
+                // ЕДИНСТВЕННОЕ место, где это не делалось: собственный
+                // внутренний `unreachable` в `emitBranch` (когда ОН не
+                // может найти fallthrough) удовлетворяет ТОЛЬКО
+                // собственному (void) blocktype блока if/else, а не тому,
+                // что идёт ПОСЛЕ закрытия цикла. Без этого байта
+                // требование `i32`-результата у функции, способной на
+                // приостановку, на собственном завершающем `end` функции
+                // оставалось бы без значения на стеке.
                 try ctx.code.append(ctx.allocator, 0x00); // unreachable
                 return .{ .fallthrough = mir.invalid_block, .ok = false };
             }
@@ -474,13 +475,14 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) anye
                 return .{ .fallthrough = mir.invalid_block, .ok = false };
             },
             .none => return unsupported("блок без terminator'а"),
-            // Same control-flow opcode as `.return_value` (`0x0F`, WASM
-            // `return`), but UNLIKE it, no preceding instruction pushed a
-            // value — `mir_cps.zig` rewrites every suspend-capable
-            // function's result type to `Булево` (done/suspended status,
-            // see `mir_cps.zig`'s `result_slot` doc comment), so this
-            // terminator pushes the `false` ("still running") status
-            // itself, right here, unconditionally.
+            // Тот же управляющий опкод, что и у `.return_value` (`0x0F`,
+            // WASM `return`), но, В ОТЛИЧИЕ от него, никакая предыдущая
+            // инструкция значение не проталкивала — `mir_cps.zig`
+            // переписывает тип результата КАЖДОЙ функции, способной на
+            // приостановку, в `Булево` (статус done/suspended, см.
+            // doc-комментарий `result_slot` в `mir_cps.zig`), поэтому этот
+            // terminator сам, здесь же, безусловно, проталкивает статус
+            // `false` ("всё ещё выполняется").
             .suspend_return => {
                 try ctx.code.append(ctx.allocator, 0x41); // i32.const 0 (false — suspended)
                 try wasm_module.writeSleb128(&ctx.code, ctx.allocator, 0);
@@ -491,19 +493,20 @@ fn processFrom(ctx: *EmitContext, start: mir.BlockId, stop_at: mir.BlockId) anye
     }
 }
 
-// Shared by ordinary (non-loop-header) `.branch` terminators AND (since
-// this fix) a loop-header's own branch when it doesn't have the simple
-// "one side loops back, one side exits" shape `identifyLoopBodyAndExit`
-// assumes — see `processFrom`'s loop-header case for why. `stop_at` is
-// where to converge if BOTH sides actually fall through with no dominance
-// merge (only relevant for the ordinary-branch call site — the loop-
-// header call site passes `mir.invalid_block`, which can never match, on
-// purpose: there's no meaningful outer boundary to fall back to there).
+// Используется для обычных (не заголовочных) терминаторов `.branch`, а
+// также для собственного branch заголовка цикла, когда он не имеет
+// простой формы "одна сторона зацикливается, другая выходит", которую
+// предполагает `identifyLoopBodyAndExit` — см. случай заголовка цикла в
+// `processFrom` для объяснения. `stop_at` — точка схождения, если ОБЕ
+// стороны действительно проваливаются без объединения через доминирование
+// (актуально только для места вызова с обычным branch — вызов из
+// заголовка цикла передаёт `mir.invalid_block`, который никогда не может
+// совпасть, намеренно: там нет осмысленной внешней границы для отката).
 fn emitBranch(ctx: *EmitContext, b: mir.BlockId, branch: anytype, stop_at: mir.BlockId) !ProcessOutcome {
     const merge = wasm_stackify.findMerge(ctx.function, &ctx.idom, b, branch.then_block, branch.else_block);
     const sub_stop = merge orelse stop_at;
 
-    // cond is already on the stack.
+    // cond уже на стеке.
     try ctx.code.appendSlice(ctx.allocator, &.{ 0x04, 0x40 }); // if (empty blocktype)
     try ctx.scope_stack.append(ctx.allocator, .{ .kind = .if_scope });
     const then_outcome = try processFrom(ctx, branch.then_block, sub_stop);
@@ -515,32 +518,30 @@ fn emitBranch(ctx: *EmitContext, b: mir.BlockId, branch: anytype, stop_at: mir.B
     if (merge != null) return .{ .fallthrough = merge.?, .ok = true };
     if (then_outcome.ok) return .{ .fallthrough = then_outcome.fallthrough, .ok = true };
     if (else_outcome.ok) return .{ .fallthrough = else_outcome.fallthrough, .ok = true };
-    // Real bug found running actual code, not just reading it: this
-    // `if`/`else` was emitted with an empty (void) blocktype (see the
-    // `0x04, 0x40` above) — valid ONLY if code reachable from AT LEAST
-    // ONE branch could fall through to the `if`'s own `end` leaving the
-    // stack unchanged. Here NEITHER branch does (both diverged —
-    // `возврат`, `прервать`/`продолжить`, or panic —
-    // `then_outcome.ok`/`else_outcome.ok` both false) — every real
-    // `если`+`иначе` diverging shape (most commonly `если x тогда
-    // возврат Y конец` with no `иначе`, i.e. ANY early-return) hit this.
-    // Semantically the code point right after `end` is unreachable, but
-    // real WASM validators (confirmed against both `wat2wasm` and
-    // `wasmtime`, independent of any panos codegen) do NOT infer that
-    // automatically from "both branches diverged" — they need an
-    // EXPLICIT `unreachable` marker here, or they reject the whole
-    // module as invalid (not a runtime failure — it never even LOADS).
-    // One byte fixes it.
+    // Этот `if`/`else` эмитируется с пустым (void) blocktype (см. `0x04,
+    // 0x40` выше) — это корректно ТОЛЬКО если код, достижимый ХОТЯ БЫ ИЗ
+    // ОДНОЙ ветви, может провалиться в собственный `end` блока `if`, не
+    // меняя высоту стека. Здесь ни одна из ветвей этого не делает (обе
+    // разошлись — `возврат`, `прервать`/`продолжить` или паника —
+    // `then_outcome.ok`/`else_outcome.ok` оба false); под это попадает
+    // любая реальная расходящаяся форма `если`+`иначе` (чаще всего `если
+    // x тогда возврат Y конец` без `иначе`, то есть ЛЮБОЙ ранний возврат).
+    // Семантически точка кода сразу после `end` недостижима, но реальные
+    // валидаторы WASM (`wat2wasm` и `wasmtime`) НЕ выводят это автоматически
+    // из "обе ветви разошлись" — им нужен ЯВНЫЙ маркер `unreachable` здесь,
+    // иначе весь модуль отвергается как невалидный (это не ошибка времени
+    // выполнения — модуль вообще не ЗАГРУЖАЕТСЯ).
     try ctx.code.append(ctx.allocator, 0x00); // unreachable
     return .{ .fallthrough = mir.invalid_block, .ok = false };
 }
 
-// `mir_bytecode.odin`'s replay model doesn't care whether an instruction's
-// dst gets used (an unused value is just "garbage" living on `vm.stack`
-// until Return, which discards the whole frame's stack) — WASM's
-// structural validator can't tolerate that: every block/if/loop/function
-// must have a STATICALLY balanced stack height at its boundaries. So: a
-// zero-use value (see `computeUseCount` above) is `drop`ped immediately.
+// Модели воспроизведения байткода не важно, используется ли `dst`
+// инструкции (неиспользуемое значение — просто "мусор", живущий на стеке
+// до Return, который отбрасывает весь стек фрейма целиком) — структурный
+// валидатор WASM этого не терпит: у каждого block/if/loop/function должна
+// быть СТАТИЧЕСКИ сбалансированная высота стека на границах. Поэтому
+// значение с нулевым числом использований (см. `computeUseCount` выше)
+// сразу же `drop`ится.
 fn emitBlockInstructions(ctx: *EmitContext, block: *const mir.Block) !void {
     for (block.instructions.items) |instruction| {
         const dst = try emitMirInstr(ctx, instruction);
@@ -554,10 +555,11 @@ fn wasmType(ctx: *EmitContext, value: mir.ValueId) u8 {
     return wasm_module.wasmValTypeForStore(ctx.type_store, ctx.function.valueType(value));
 }
 
-// Returns the instruction's `dst`, if any (for the caller's drop-if-unused
-// check) — `function_ref` has a `dst` in MIR terms but pushes nothing onto
-// the real WASM stack (see `EmitContext.value_to_function`'s doc comment),
-// so it returns `null` here despite having a MIR-level dst.
+// Возвращает `dst` инструкции, если он есть (для проверки drop-if-unused
+// у вызывающей стороны) — `function_ref` имеет `dst` в терминах MIR, но
+// ничего не проталкивает на реальный стек WASM (см. doc-комментарий
+// `EmitContext.value_to_function`), поэтому здесь возвращается `null`,
+// несмотря на наличие dst на уровне MIR.
 fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
     const code = &ctx.code;
     const allocator = ctx.allocator;
@@ -573,13 +575,12 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
                     try wasm_module.writeSleb128(code, allocator, if (b) 1 else 0);
                 },
                 .string => |s| {
-                    // A literal's handle IS its data-section offset,
-                    // directly — the length-prefixed `[len][bytes]` layout
-                    // `wasm_strings.zig` establishes needs no runtime
-                    // construction at all for literals (see that file's
-                    // doc comment). No host call, unlike the old
-                    // `@runtime::строка_литерал` host-import path this
-                    // replaces.
+                    // Хэндл литерала НАПРЯМУЮ и есть его смещение в
+                    // data-секции — layout с префиксом длины
+                    // `[len][bytes]`, который устанавливает
+                    // `wasm_strings.zig`, вообще не требует рантайм-
+                    // построения для литералов (см. doc-комментарий того
+                    // файла). Вызова хоста не требуется.
                     const offset = ctx.string_offsets.get(s) orelse return unsupported("строковая константа без выделенного смещения (баг сборки data-секции)");
                     try code.append(allocator, 0x41); // i32.const
                     try wasm_module.writeSleb128(code, allocator, @intCast(offset));
@@ -602,26 +603,27 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             return null;
         },
         .binary => |binary| {
-            // `wasm_strings.zig`'s `expand()` rewrites every string-typed
-            // `.binary{.add}` into a real `.call(@string_concat, ...)`
-            // BEFORE this codegen ever runs (same "must be expanded
-            // before codegen" invariant `wasm_objects.zig`'s struct/
-            // array/variant instructions already established) — reaching
-            // this point with a string-typed `.binary` means that
-            // expansion was skipped somewhere, a real bug, not a case to
-            // silently handle here.
+            // `expand()` в `wasm_strings.zig` переписывает каждый
+            // строково-типизированный `.binary{.add}` в реальный
+            // `.call(@string_concat, ...)` ДО того, как эта кодогенерация
+            // вообще запускается (тот же инвариант "должно быть развёрнуто
+            // до кодогенерации", который уже установлен для struct/array/
+            // variant инструкций в `wasm_objects.zig`) — если сюда попал
+            // строково-типизированный `.binary`, значит разворачивание
+            // где-то было пропущено, это реальный баг, не случай для
+            // тихой обработки здесь.
             if (ctx.type_store.eql(ctx.function.valueType(binary.dst), ctx.type_store.builtins.string)) {
                 return unsupported("строковая конкатенация должна быть развёрнута wasm_strings.zig до кодогенерации");
             }
-            // Phase-1a user-facing numbers (`Целое`/`Число`) are always
-            // f64 (see the modulo/bitwise comment below) — a
-            // GENUINELY-i32-typed dst only ever comes from
-            // `wasm_actors.zig`'s own hand-built runtime functions
-            // (ring-buffer head/count/mask arithmetic), never from
-            // ordinary `mir_lowering.zig` output. Both operands are
-            // already real i32 values on the stack in that case (no
-            // f64 conversion dance needed at all — simpler than the
-            // f64 path below, not just a variant of it).
+            // Пользовательские числа Phase-1a (`Целое`/`Число`) всегда f64
+            // (см. комментарий про modulo/побитовые операции ниже) —
+            // ДЕЙСТВИТЕЛЬНО i32-типизированный dst встречается только в
+            // собственных, вручную построенных рантайм-функциях
+            // `wasm_actors.zig` (арифметика head/count/mask кольцевого
+            // буфера), никогда — в обычном выводе `mir_lowering.zig`. В
+            // этом случае оба операнда уже реальные i32-значения на стеке
+            // (никакого преобразования в f64 не нужно вообще — проще, чем
+            // путь для f64 ниже, а не просто его вариант).
             if (wasmType(ctx, binary.dst) == wasm_module.wasm_i32) {
                 const int_opcode: u8 = switch (binary.op) {
                     .add => 0x6A, // i32.add
@@ -640,29 +642,22 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             }
             switch (binary.op) {
                 .modulo, .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => {
-                    // Stack on entry: [lhs_f64, rhs_f64] (both already
-                    // pushed by earlier instructions — see
-                    // `scratch_i32_local`'s doc comment for why a scratch
-                    // local is unavoidable here). Shuffle rhs through the
-                    // scratch local so both operands can be converted in
-                    // the right order, do the integer op, convert the
-                    // result back to f64 (matching every other Phase-1a
-                    // numeric op's f64 representation).
+                    // Стек на входе: [lhs_f64, rhs_f64] (оба уже
+                    // проталкиваются предыдущими инструкциями — см.
+                    // doc-комментарий `scratch_i32_local` о том, почему
+                    // scratch-локаль здесь неизбежна). rhs прогоняется
+                    // через scratch-локаль, чтобы оба операнда можно было
+                    // преобразовать в правильном порядке, затем выполняется
+                    // целочисленная операция, результат преобразуется
+                    // обратно в f64 (соответствует представлению f64 любой
+                    // другой числовой операции Phase-1a).
                     //
-                    // i64, NOT i32 — real bug found running actual code:
-                    // `std/математика.pns`'s own PRNG seeds itself from
-                    // `время.сейчас_мс()` (unix-ms, ~1.8e12 — WAY past
-                    // i32's ~2.1e9 ceiling) precisely THROUGH a `%`
-                    // (`Целое(мс) % Целое(2147483647)`, deliberately
-                    // brings a huge timestamp down into range) — i32.
-                    // trunc_f64_s on that входной value traps
-                    // ("float unrepresentable in integer range") before
-                    // the modulo ever runs, defeating the exact use case
-                    // that motivated needing % in WASM at all. `Целое`
-                    // is documented (see математика.pns) to be exact up
-                    // to 2^53 in its f64 representation — i64 covers
-                    // that with enormous headroom, i32 doesn't come
-                    // close.
+                    // i64, а НЕ i32: `Целое` документирован (см.
+                    // математика.pns) как точный вплоть до 2^53 в своём
+                    // представлении f64 — i32 с потолком ~2.1e9 для этого
+                    // категорически недостаточно (например, unix-ms
+                    // временная метка из `время.сейчас_мс()` уже ~1.8e12),
+                    // а i64 покрывает диапазон с огромным запасом.
                     const scratch = ctx.reserveScratchLocal();
                     try code.append(allocator, 0x21); // local.set scratch  (pops rhs_f64)
                     try wasm_module.writeUleb128(code, allocator, scratch);
@@ -698,10 +693,11 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             return binary.dst;
         },
         .compare => |compare| {
-            // Numbers (including Panos `Целое`) use f64; strings, booleans,
-            // variants and aggregates are opaque i32 handles. Equality of
-            // the latter must use the i32 family — emitting f64.eq for a
-            // string comparison makes a formally invalid WASM module.
+            // Числа (включая panos `Целое`) используют f64; строки,
+            // булевы, variant и агрегаты — непрозрачные i32-хэндлы.
+            // Сравнение на равенство последних должно использовать
+            // семейство i32 — эмиссия f64.eq для сравнения строк даёт
+            // формально невалидный модуль WASM.
             const opcode: u8 = if (wasmType(ctx, compare.lhs) == wasm_module.wasm_i32) switch (compare.op) {
                 .less => 0x48, // i32.lt_s
                 .greater => 0x4A, // i32.gt_s
@@ -735,37 +731,40 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try ctx.value_to_function.put(function_ref.dst, function_ref.function);
             return null;
         },
-        // Two shapes reach here: (1) a STATICALLY known named-function
-        // call (the common case — `mir_lowering.zig`'s ident/method_calls/
-        // module-import fast paths) — `callee` traces back to a
-        // `.function_ref` in the SAME function, tracked in
-        // `value_to_function`, and this is an ordinary direct `call` (no
-        // indirection needed, and critically: `.function_ref` for these
-        // pushes NOTHING onto the real stack, so `call.args` are the
-        // ONLY real stack contents — the callee is resolved purely at
-        // compile time via the map). (2) a genuinely dynamic function
-        // VALUE (`ф(x)` where `ф` is a parameter/field/local, not a
-        // statically-known callee, or a value routed through
-        // `mir_lowering.zig`'s `storeCalleeLocal`/`reloadCalleeLocal`) —
-        // `call_indirect`, same mechanism `.call_indirect` itself uses
-        // (shared type-index-by-shape scheme). `.function_ref` for THESE
-        // is rewritten to a real i32 table-index constant by
-        // `wasm_interfaces.zig` before this ever runs. Two cases are
-        // deliberately excluded from that rewrite and therefore MUST hit
-        // the value_to_function fast path here, never call_indirect: (a)
-        // `.spawn`'s own callee (`wasm_actors.zig`'s `resolveSpawnTarget`
-        // scans for a literal un-rewritten `.function_ref`), and (b) a
-        // SELF-recursive call, since `wasm_actors.zig` reuses/renames a
-        // function's OWN `FunctionId` in place when turning it into an
-        // actor's scheduler function — a table entry registered against
-        // that FunctionId BEFORE the rename would point at the WRONG
-        // (post-rename) signature by the time `emitModule` builds the
-        // Table/Element sections, an "indirect call type mismatch" trap
-        // confirmed via `wasmtime` (a recursive actor handler calling
-        // itself, `wasm_interfaces.zig`'s own `spawnCallees`-style
-        // exclusion, extended to `.call_value`'s own callee below).
+        // Сюда попадают две формы: (1) СТАТИЧЕСКИ известный вызов именованной
+        // функции (обычный случай — быстрые пути ident/method_calls/module-
+        // import в `mir_lowering.zig`) — `callee` восходит к `.function_ref`
+        // в ЭТОЙ ЖЕ функции, отслеживается в `value_to_function`, и это
+        // обычный прямой `call` (косвенность не нужна, и критично важно:
+        // `.function_ref` для таких случаев НИЧЕГО не проталкивает на
+        // реальный стек, поэтому `call.args` — ЕДИНСТВЕННОЕ реальное
+        // содержимое стека, а вызываемая функция разрешается чисто на
+        // этапе компиляции через карту). (2) по-настоящему динамическое
+        // функциональное ЗНАЧЕНИЕ (`ф(x)`, где `ф` — параметр/поле/локаль,
+        // а не статически известная вызываемая функция, либо значение,
+        // прошедшее через `storeCalleeLocal`/`reloadCalleeLocal` в
+        // `mir_lowering.zig`) — `call_indirect`, тот же механизм, что
+        // использует сам `.call_indirect` (общая схема индекса типа по
+        // форме). `.function_ref` для ЭТИХ случаев переписывается
+        // `wasm_interfaces.zig` в реальную i32-константу индекса таблицы
+        // до того, как этот код вообще запускается. Два случая намеренно
+        // исключены из этого переписывания и поэтому ДОЛЖНЫ попадать в
+        // быстрый путь value_to_function здесь, никогда в call_indirect:
+        // (a) собственная вызываемая функция `.spawn` (`resolveSpawnTarget`
+        // в `wasm_actors.zig` ищет буквальный непереписанный
+        // `.function_ref`), и (b) САМО-рекурсивный вызов, поскольку
+        // `wasm_actors.zig` переиспользует/переименовывает СОБСТВЕННЫЙ
+        // `FunctionId` функции на месте, превращая её в функцию-планировщик
+        // актора — запись таблицы, зарегистрированная под этим FunctionId
+        // ДО переименования, указывала бы на НЕПРАВИЛЬНУЮ (пост-
+        // переименование) сигнатуру к моменту, когда `emitModule` строит
+        // секции Table/Element — trap "indirect call type mismatch"
+        // (рекурсивный обработчик актора, вызывающий сам себя; то же
+        // исключение в стиле `spawnCallees` из `wasm_interfaces.zig`,
+        // распространённое ниже на собственную вызываемую функцию
+        // `.call_value`).
         .call_value => |call| {
-            for (call.args) |_| {} // args are already on the stack — replayed earlier, in order, by their own instructions.
+            for (call.args) |_| {} // аргументы уже на стеке — воспроизведены раньше, по порядку, собственными инструкциями.
             if (ctx.value_to_function.get(call.callee)) |function_id| {
                 const function_index = ctx.func_index.get(function_id) orelse return unsupported("функция не найдена в индексе модуля");
                 try code.append(allocator, 0x10); // call
@@ -785,26 +784,28 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             return call.dst;
         },
         .call => |call| {
-            for (call.args) |_| {} // already on the stack, same convention as `.call_value`.
+            for (call.args) |_| {} // уже на стеке, то же соглашение, что и у `.call_value`.
             const function_index = ctx.func_index.get(call.callee) orelse return unsupported("функция не найдена в индексе модуля");
             try code.append(allocator, 0x10); // call
             try wasm_module.writeUleb128(code, allocator, function_index);
             return call.dst;
         },
-        // WASM-only, produced exclusively by `wasm_interfaces.zig`'s own
-        // expansion of `.invoke_interface`. Stack on entry: `[args...,
-        // table_index]` — `table_index` (the runtime-resolved WASM table
-        // slot) must be the LAST-produced/topmost operand, matching
-        // `call_indirect`'s own WASM semantics (pops the index first, args
-        // matching the type signature underneath). The type index is
-        // derived from `args`/`dst`'s OWN MIR types (never a raw
-        // `FunctionId` — the callee isn't statically known), looked up in
-        // `interface_type_index` — see `signatureShapeKey`'s doc comment
-        // for why every candidate callee MUST already share this exact
-        // type-section entry (`emitModule`'s Function-section override for
-        // `interface_table` members).
+        // Только для WASM, производится исключительно собственным
+        // разворачиванием `.invoke_interface` в `wasm_interfaces.zig`.
+        // Стек на входе: `[args..., table_index]` — `table_index`
+        // (разрешённый в рантайме слот таблицы WASM) должен быть
+        // ПОСЛЕДНИМ-произведённым/верхним операндом, что соответствует
+        // собственной семантике WASM у `call_indirect` (сначала выталкивает
+        // индекс, аргументы под ним по сигнатуре типа). Индекс типа
+        // выводится из СОБСТВЕННЫХ MIR-типов `args`/`dst` (никогда из
+        // сырого `FunctionId` — вызываемая функция статически не известна),
+        // ищется в `interface_type_index` — см. doc-комментарий
+        // `signatureShapeKey` о том, почему у каждой кандидатной вызываемой
+        // функции ДОЛЖНА уже быть та же самая запись секции типов
+        // (переопределение секции Function для членов `interface_table` в
+        // `emitModule`).
         .call_indirect => |call| {
-            for (call.args) |_| {} // already on the stack, same convention as `.call`.
+            for (call.args) |_| {} // уже на стеке, то же соглашение, что и у `.call`.
             var params: std.ArrayList(u8) = .empty;
             defer params.deinit(allocator);
             for (call.args) |arg| try params.append(allocator, wasmType(ctx, arg));
@@ -817,12 +818,13 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try code.append(allocator, 0x00); // tableidx 0
             return call.dst;
         },
-        // CPS rewrite output (`mir_cps.zig`) — `frame` is an opaque i32
-        // linear-memory address, `slot` a compile-time word index within
-        // it (8 bytes/slot, wide enough for either an f64 number or an
-        // i32 handle). `frame` is a single operand, already on the stack
-        // (pushed by its own producer before this arm runs) — no
-        // reordering needed, unlike `frame_store` below.
+        // Вывод CPS-переписывания (`mir_cps.zig`) — `frame` это непрозрачный
+        // i32-адрес в линейной памяти, `slot` — известный на этапе
+        // компиляции индекс слова внутри него (8 байт на слот, достаточно
+        // и для f64-числа, и для i32-хэндла). `frame` — единственный
+        // операнд, уже на стеке (протолкнут собственным производителем до
+        // выполнения этой ветви) — переупорядочивание не нужно, в отличие
+        // от `frame_store` ниже.
         .frame_load => |load| {
             try code.append(allocator, 0x41); // i32.const slot*8
             try wasm_module.writeSleb128(code, allocator, @as(i64, load.slot) * 8);
@@ -833,18 +835,19 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try wasm_module.writeUleb128(code, allocator, 0); // offset
             return load.dst;
         },
-        // `frame` and `src` are BOTH already pushed (stack: [frame, src])
-        // by the time this arm runs — same convention as `.binary`. To
-        // compute the store ADDRESS (frame + slot*8) without losing
-        // `src`, park `src` in a type-matched scratch local, do the
-        // address arithmetic on the now-exposed `frame`, then reload
-        // `src` — same scratch-local reordering trick already used by
-        // `.binary`'s modulo/bitwise ops above.
+        // И `frame`, и `src` уже протолкнуты (стек: [frame, src]) к моменту
+        // выполнения этой ветви — то же соглашение, что и у `.binary`.
+        // Чтобы вычислить АДРЕС записи (frame + slot*8), не потеряв `src`,
+        // `src` временно паркуется в scratch-локали подходящего типа,
+        // адресная арифметика выполняется над теперь-открытым `frame`,
+        // затем `src` перезагружается — тот же трюк переупорядочивания
+        // через scratch-локаль, что уже используется в операциях
+        // modulo/побитовых у `.binary` выше.
         .frame_store => |store| {
-            // Stack on entry: [src, frame] — see `EmitContext.
-            // frame_store_scratch_frame`'s doc comment. Pop frame first
-            // (it's on top), then src, so the address math below runs
-            // against a clean stack.
+            // Стек на входе: [src, frame] — см. doc-комментарий
+            // `EmitContext.frame_store_scratch_frame`. Сначала выталкивается
+            // frame (он сверху), затем src, чтобы адресная арифметика ниже
+            // выполнялась над чистым стеком.
             const frame_scratch = ctx.reserveFrameScratch();
             try code.append(allocator, 0x21); // local.set frame_scratch (pops frame)
             try wasm_module.writeUleb128(code, allocator, frame_scratch);
@@ -881,14 +884,14 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             return v.dst;
         },
         .memory_grow => |v| {
-            // `pages` already on the stack, produced by its own instruction.
+            // `pages` уже на стеке, произведён собственной инструкцией.
             try code.append(allocator, 0x40); // memory.grow
             try code.append(allocator, 0x00); // memory index (always 0)
             return v.dst;
         },
-        // Single operand (`addr`), already fully computed and on the
-        // stack by its own producer — no offset math needed here, unlike
-        // `frame_load` above.
+        // Единственный операнд (`addr`), уже полностью вычислен и на стеке
+        // собственным производителем — арифметика смещения здесь не
+        // нужна, в отличие от `frame_load` выше.
         .mem_load => |load| {
             const dst_type = wasmType(ctx, load.dst);
             try code.append(allocator, if (dst_type == wasm_module.wasm_i32) 0x28 else 0x2B); // i32.load / f64.load
@@ -896,19 +899,16 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try wasm_module.writeUleb128(code, allocator, 0);
             return load.dst;
         },
-        // `addr` and `src` are both pre-pushed in exactly the order WASM
-        // `*.store` wants ([address, value]) — unlike `frame_store`, no
-        // offset arithmetic has to be inserted BETWEEN them, so no
-        // scratch-local reordering is needed here.
-        // Stack on entry: `[src, addr]`, NOT `[addr, src]` — same root
-        // cause as `frame_store` above (`addr` is freshly computed
-        // right up against this instruction by every current caller,
-        // while `src` is very often a pre-existing value from earlier —
-        // e.g. `wasm_actors.zig`'s `expandSend`, where `src` is
-        // `.send`'s own, already-produced `message` operand). Reuses
-        // the SAME scratch locals `frame_store` uses (`addr` is
-        // `ptr_type`/i32, exactly like `frame`) — the two instructions
-        // never interleave within a single store, so sharing is safe.
+        // Стек на входе: `[src, addr]`, НЕ `[addr, src]` — та же первопричина,
+        // что и у `frame_store` выше (`addr` вычисляется заново, вплотную
+        // к этой инструкции, каждым текущим вызывающим, тогда как `src`
+        // очень часто — уже существующее значение из более раннего кода,
+        // например `expandSend` в `wasm_actors.zig`, где `src` — это
+        // собственный, уже произведённый операнд `message` инструкции
+        // `.send`). Переиспользует ТЕ ЖЕ scratch-локали, что и
+        // `frame_store` (`addr` имеет `ptr_type`/i32, точно как `frame`) —
+        // эти две инструкции никогда не пересекаются в пределах одного
+        // store, так что совместное использование безопасно.
         .mem_store => |store| {
             const addr_scratch = ctx.reserveFrameScratch();
             try code.append(allocator, 0x21); // local.set addr_scratch (pops addr)
@@ -927,12 +927,12 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try wasm_module.writeUleb128(code, allocator, 0);
             return null;
         },
-        // Byte-granular siblings of `mem_load`/`mem_store` above — same
-        // stack conventions (single operand for load; `[src, addr]` with
-        // addr freshest for store, same shared scratch locals since
-        // `src` here is always i32), just `i32.load8_u`/`i32.store8`
-        // (opcodes `0x2D`/`0x3A`) with byte alignment (0) instead of the
-        // word-granular opcodes/alignment above.
+        // Побайтовые аналоги `mem_load`/`mem_store` выше — те же соглашения
+        // о стеке (единственный операнд для load; `[src, addr]` с addr
+        // самым свежим для store, те же общие scratch-локали, так как
+        // `src` здесь всегда i32), только `i32.load8_u`/`i32.store8`
+        // (опкоды `0x2D`/`0x3A`) с байтовым выравниванием (0) вместо
+        // словных опкодов/выравнивания выше.
         .mem_load8 => |load| {
             try code.append(allocator, 0x2D); // i32.load8_u
             try wasm_module.writeUleb128(code, allocator, 0); // align (byte)
@@ -957,23 +957,22 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             return null;
         },
         .call_builtin => |call| {
-            for (call.args) |_| {} // время.сейчас_мс/монотонно_мс take no args — nothing to replay yet.
+            for (call.args) |_| {} // время.сейчас_мс/монотонно_мс не принимают аргументов — воспроизводить пока нечего.
             const import_index = ctx.builtin_index.get(call.name) orelse return unsupported("call_builtin без соответствующего host-импорта");
             try code.append(allocator, 0x10); // call
             try wasm_module.writeUleb128(code, allocator, import_index);
             return call.dst;
         },
-        // `wasm_objects.zig`'s `expand()` runs on every module BEFORE
-        // this emitter and rewrites every one of these nine instruction
-        // kinds into `frame_load`/`frame_store`/`mem_load`/`mem_store`/
-        // `.call` — real in-module linear-memory code, zero host
-        // imports. Reaching this arm at all means `expand()` was
-        // skipped or missed a case — a genuine `wasm_objects.zig` bug,
-        // not a normal "feature not supported yet" gap, so this fails
-        // loudly (mirrors the identical invariant `mir_cps.zig`
-        // documents for actor instructions never reaching codegen
-        // un-rewritten) instead of silently falling back to the OLD
-        // JS-host object-table imports this file used to emit here.
+        // `expand()` в `wasm_objects.zig` запускается на каждом модуле ДО
+        // этого эмиттера и переписывает каждый из этих девяти видов
+        // инструкций в `frame_load`/`frame_store`/`mem_load`/`mem_store`/
+        // `.call` — реальный внутримодульный код линейной памяти, ноль
+        // host-импортов. Попадание в эту ветвь вообще означает, что
+        // `expand()` был пропущен или упустил случай — настоящий баг
+        // `wasm_objects.zig`, не обычный пробел "функция ещё не
+        // поддерживается" (отражает тот же инвариант, который
+        // `mir_cps.zig` документирует для actor-инструкций, никогда не
+        // достигающих кодогенерации непереписанными).
         .new_aggregate, .get_property, .set_property, .new_array, .get_index, .set_index, .build_variant, .match_tag, .get_variant_field => return unsupported("структура/массив/вариант должны быть развёрнуты wasm_objects.zig до кодогенерации"),
         else => return unsupported("вид MIR-инструкции"),
     }
@@ -1007,19 +1006,20 @@ pub fn emitFunctionWasm(
         const store = function.type_store orelse &checked.types;
         try out.append(allocator, wasm_module.wasmValTypeForStore(store, function.locals.items[i].type_id));
     }
-    // Declaration order must match the ACTUAL index each scratch local was
-    // handed out at by `reserveScratchLocal`/`reserveFrameScratch`/
-    // `reserveFrameStoreScratch` (`nextFrameStoreScratchIndex`) — indices
-    // are assigned in ENCOUNTER order (whichever scratch kind a function's
-    // instruction stream needs first gets the lowest index), which is NOT
-    // necessarily scratch_i32_local/frame/i32/f64 field-declaration order
-    // (e.g. a function whose first `mem_store` has an f64 `src` reserves
-    // `frame_store_scratch_f64` before `frame_store_scratch_i32` ever gets
-    // touched). Emitting declarations in fixed field order regardless
-    // produced a real, confirmed-via-wasmtime bug: the local at a given
-    // index could be declared as the WRONG WASM value type, causing
-    // "type mismatch: expected i32, found f64" at validation. Sort the
-    // present scratch locals by their actual assigned index instead.
+    // Порядок деклараций должен соответствовать РЕАЛЬНОМУ индексу, под
+    // которым каждая scratch-локаль была выдана
+    // `reserveScratchLocal`/`reserveFrameScratch`/`reserveFrameStoreScratch`
+    // (`nextFrameStoreScratchIndex`) — индексы назначаются в порядке
+    // ВСТРЕЧИ (какой бы вид scratch ни понадобился потоку инструкций
+    // функции первым, тот и получает наименьший индекс), что НЕ обязательно
+    // совпадает с порядком объявления полей scratch_i32_local/frame/i32/f64
+    // (например, функция, чей первый `mem_store` имеет f64-типизированный
+    // `src`, резервирует `frame_store_scratch_f64` раньше, чем вообще
+    // затрагивается `frame_store_scratch_i32`). Эмиссия деклараций в
+    // фиксированном порядке полей независимо от этого дала бы локаль по
+    // данному индексу с НЕПРАВИЛЬНЫМ типом значения WASM ("type mismatch").
+    // Вместо этого присутствующие scratch-локали сортируются по их
+    // реально назначенному индексу.
     var scratch_decls: [4]struct { index: u32, wasm_type: u8 } = undefined;
     var scratch_decl_count: usize = 0;
     if (ctx.scratch_i32_local) |index| {
@@ -1052,19 +1052,20 @@ pub fn emitFunctionWasm(
     return try out.toOwnedSlice(allocator);
 }
 
-// `call_builtin`'s "модуль::имя" name → the host runtime export it needs
-// (`zig/wasm_runtime/runtime_wasi.zig`/`runtime_js.zig`'s `pw_now_ms`/
-// `pw_monotonic_ms` — built for exactly this, previously never called by
-// anything). `время.спать_мс` never reaches this function at all —
-// `mir_lowering.zig`'s `lowerTimeBuiltinCall` panics before producing a
-// `call_builtin` for it (native-only builtin, not an AOT WASM host call).
+// Имя "модуль::имя" из `call_builtin` → нужный ему хост-рантайм-экспорт
+// (`pw_now_ms`/`pw_monotonic_ms` из `zig/wasm_runtime/runtime_wasi.zig`/
+// `runtime_js.zig`). `время.спать_мс` до этой функции вообще не доходит —
+// `lowerTimeBuiltinCall` в `mir_lowering.zig` паникует раньше, чем
+// произведёт для него `call_builtin` (только native builtin, не хост-вызов
+// AOT WASM).
 fn hostImportNameForBuiltin(name: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "время::сейчас_мс")) return "pw_now_ms";
     if (std.mem.eql(u8, name, "время::монотонно_мс")) return "pw_monotonic_ms";
     if (std.mem.eql(u8, name, "сеть::http_запрос_sync")) return "pw_http_request_sync";
-    // `DOM::*` string arguments are opaque i32 handles maintained by the
-    // JS host. `@runtime::строка_литерал` converts data-section offsets to
-    // those handles and `@runtime::строка_сложить` creates dynamic values.
+    // Строковые аргументы `DOM::*` — непрозрачные i32-хэндлы, которые
+    // поддерживает JS-хост. `@runtime::строка_литерал` преобразует смещения
+    // в data-секции в эти хэндлы, а `@runtime::строка_сложить` создаёт
+    // динамические значения.
     if (std.mem.eql(u8, name, "DOM::текст")) return "dom_get_text_num";
     if (std.mem.eql(u8, name, "DOM::установить_текст")) return "dom_set_text_num";
     if (std.mem.eql(u8, name, "DOM::на_клик")) return "dom_on_click";
@@ -1188,16 +1189,17 @@ fn builtinSignature(name: []const u8) !BuiltinSignature {
     return unsupported("call_builtin с именем без известной сигнатуры импорта");
 }
 
-// Every DISTINCT string literal any function in `module` uses,
-// concatenated into one blob — each entry LENGTH-PREFIXED (`u32`
-// little-endian byte count, then the raw bytes, no null terminator;
-// `wasm_strings.zig`'s own doc comment explains why this exact layout
-// is what every string operation, literal or heap-allocated, expects).
-// `offsets.get(s)` points at the START of the length prefix, so
-// `.const_value{.string}`'s codegen can turn a literal directly into a
-// bare `i32.const <offset>` — a fully-formed string handle needing ZERO
-// runtime work, not even a host call. Empty for a module with no string
-// literals at all.
+// Каждый РАЗЛИЧНЫЙ строковый литерал, используемый любой функцией в
+// `module`, конкатенированный в один blob — каждая запись с ПРЕФИКСОМ
+// ДЛИНЫ (`u32` little-endian количество байт, затем сырые байты, без
+// нуль-терминатора; собственный doc-комментарий `wasm_strings.zig`
+// объясняет, почему именно такой layout ожидает каждая строковая операция,
+// литеральная или выделенная в куче). `offsets.get(s)` указывает на
+// НАЧАЛО префикса длины, поэтому кодогенерация `.const_value{.string}`
+// может превратить литерал напрямую в голый `i32.const <offset>` —
+// полностью сформированный строковый хэндл, не требующий НИКАКОЙ рантайм-
+// работы, даже вызова хоста. Пусто для модуля вообще без строковых
+// литералов.
 fn collectStringConstants(allocator: std.mem.Allocator, module: *const mir.Module) !struct {
     data: []u8,
     offsets: std.StringHashMap(u32),
@@ -1230,11 +1232,11 @@ fn collectStringConstants(allocator: std.mem.Allocator, module: *const mir.Modul
     return .{ .data = try data.toOwnedSlice(allocator), .offsets = offsets };
 }
 
-// Every DISTINCT builtin name any function in `module` calls, in first-seen
-// order — the common case (no builtin calls anywhere) returns an empty
-// list, so a program that never touches `время.*` gets a WASM module with
-// NO import section at all, same as before this feature existed (no host
-// needs to supply anything to run it).
+// Каждое РАЗЛИЧНОЕ имя builtin, которое вызывает любая функция в `module`,
+// в порядке первого появления — в обычном случае (нигде нет вызовов
+// builtin) возвращается пустой список, поэтому программа, которая никогда
+// не трогает `время.*`, получает WASM-модуль вообще БЕЗ секции импорта
+// (хосту не нужно ничего предоставлять для его запуска).
 fn collectBuiltinNames(allocator: std.mem.Allocator, module: *const mir.Module) !std.ArrayList([]const u8) {
     var seen: std.StringHashMap(void) = .init(allocator);
     defer seen.deinit();
@@ -1247,13 +1249,14 @@ fn collectBuiltinNames(allocator: std.mem.Allocator, module: *const mir.Module) 
                     .call_builtin => |call| {
                         try appendBuiltinName(allocator, &seen, &names, call.name);
                     },
-                    // String literals/concatenation need NO host import
-                    // any more — `wasm_strings.zig` handles both entirely
-                    // in-module (see its own doc comment). Registering
-                    // `@runtime::строка_литерал`/`строка_сложить` here
-                    // would declare an import nothing under plain
-                    // wasmtime provides, failing instantiation even
-                    // though it's never actually called.
+                    // Строковые литералы/конкатенация не требуют
+                    // host-импорта вообще — `wasm_strings.zig` обрабатывает
+                    // оба случая полностью внутримодульно (см. собственный
+                    // doc-комментарий того файла). Регистрация здесь
+                    // `@runtime::строка_литерал`/`строка_сложить` объявила
+                    // бы импорт, который под чистым wasmtime никто не
+                    // предоставляет, что провалит инстанциирование, даже
+                    // если он реально никогда не вызывается.
                     .const_value => {},
                     .binary => {},
                     .new_aggregate => |aggregate| {
@@ -1370,23 +1373,24 @@ fn appendBuiltinName(
     }
 }
 
-// Assembles a complete, standalone `.wasm` binary — Type/Import/Function/
-// Export/Code sections, one function type per MIR function (no
-// deduplication — wasteful but valid, matching the Odin original's own
-// choice not to bother sharing signatures), every function exported under
-// its MIR name. WASM's function index space is imports-first: every
-// `call_builtin` name used anywhere in `module` becomes ONE import (module
-// "env", field = `hostImportNameForBuiltin`'s host export name) at the
-// FRONT of the index space, so every module-defined function's real index
-// is `builtin_count + declaration_order` — `func_index`/`function_section`/
-// `export_section` all apply that same offset consistently.
-// `mir_validate.zig`'s own construction-time invariants already guarantee
-// `mir_lowering.zig`'s OWN output is well-formed — but running this here
-// unconditionally is what turns a FUTURE lowering bug into a clean error
-// message ("v3 используется 2 раза") instead of an out-of-bounds panic or
-// silently-wrong WASM bytes deep inside `processFrom`'s stack-machine
-// replay. Warnings (unreachable blocks) are logged, not fatal — same
-// severity split `mir_validate.zig` itself documents.
+// Собирает полный, самодостаточный `.wasm`-бинарник — секции Type/Import/
+// Function/Export/Code, один тип функции на каждую MIR-функцию (без
+// дедупликации — расточительно, но валидно), каждая функция экспортируется
+// под своим MIR-именем. Пространство индексов функций WASM начинается с
+// импортов: каждое имя `call_builtin`, используемое где-либо в `module`,
+// становится ОДНИМ импортом (модуль "env", поле = имя хост-экспорта из
+// `hostImportNameForBuiltin`) в НАЧАЛЕ пространства индексов, поэтому
+// реальный индекс каждой определённой в модуле функции —
+// `builtin_count + порядок_объявления` — `func_index`/`function_section`/
+// `export_section` все последовательно применяют это же смещение.
+// Собственные инварианты времени построения `mir_validate.zig` уже
+// гарантируют, что СОБСТВЕННЫЙ вывод `mir_lowering.zig` корректен — но
+// безусловный прогон здесь превращает БУДУЩИЙ баг lowering в чистое
+// сообщение об ошибке ("v3 используется 2 раза") вместо panic
+// out-of-bounds или тихо-неправильных байт WASM глубоко внутри
+// стек-машинного воспроизведения `processFrom`. Предупреждения
+// (недостижимые блоки) логируются, не фатальны — то же разделение по
+// серьёзности, что документирует сам `mir_validate.zig`.
 fn validateOrFail(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, module: *const mir.Module) !void {
     for (module.functions.items) |*function| {
         const store = function.type_store orelse &checked.types;
@@ -1400,23 +1404,22 @@ fn validateOrFail(allocator: std.mem.Allocator, checked: *const type_checker.Che
     }
 }
 
-// Both consumed by `wasm_actors.zig` when it synthesizes the bump
-// allocator/scheduler MIR functions — kept here since they describe a
-// property of the MODULE ASSEMBLY (memory/global section layout), not of
-// the actor runtime's own logic.
+// Обе константы используются `wasm_actors.zig` при синтезе MIR-функций
+// bump-аллокатора/планировщика — оставлены здесь, так как описывают
+// свойство СБОРКИ МОДУЛЯ (layout секций memory/global), а не собственной
+// логики actor-рантайма.
 pub const actor_heap_global_index: u32 = 0;
 pub const actor_heap_bytes: u32 = 1 << 20;
 
-// `interface_table`: every `mir.FunctionId` that must be reachable via
-// `call_indirect` (a WASM function-table entry), in the exact order they
-// should be placed in the table (table index == position in this
-// slice). Empty for any module with no interface dispatch — the Table/
-// Element sections are omitted entirely in that case (WASM makes both
-// fully optional). Deliberately a plain caller-supplied list rather than
-// derived internally: the ORDER must match whatever a caller (currently
-// only test code — `wasm_interfaces.zig`'s expansion pass will be the
-// real producer once wired in) already baked into `.call_indirect`
-// call-site table-index constants elsewhere in the module.
+// `interface_table`: каждый `mir.FunctionId`, который должен быть достижим
+// через `call_indirect` (запись таблицы функций WASM), в точном порядке,
+// в котором они должны быть размещены в таблице (индекс таблицы == позиция
+// в этом срезе). Пусто для любого модуля без диспетчеризации интерфейсов —
+// в этом случае секции Table/Element полностью опускаются (WASM делает обе
+// полностью опциональными). Намеренно простой список, предоставляемый
+// вызывающей стороной, а не выводимый внутренне: ПОРЯДОК должен совпадать
+// с тем, что вызывающая сторона уже зашила в константы table-index на
+// местах вызова `.call_indirect` в остальной части модуля.
 pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, module: *const mir.Module, interface_table: []const mir.FunctionId) ![]u8 {
     try validateOrFail(allocator, checked, module);
 
@@ -1433,30 +1436,28 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     defer strings.offsets.deinit();
     const has_actors = mir_cps.usesActorMemory(module);
     const needs_memory = strings.data.len != 0 or has_actors;
-    // Actor process/frame/mailbox records live in the SAME linear memory
-    // as string literals, past the string data blob (8-byte aligned —
-    // wide enough for either an i32 handle or an f64 number in every
-    // `frame_load`/`frame_store` slot). Fixed 1 MiB Phase-1 heap, no
-    // growth — plenty for the single request/reply actor this backend
-    // currently supports; revisit once Phase 2 needs more processes.
-    // `@max(_, 8)` — `wasm_actors.zig`'s scheduler uses address 0 as a
-    // "not yet spawned" sentinel for the one child-process slot; a
-    // module with zero string literals would otherwise start the heap
-    // at literally byte 0, making a real first allocation
-    // indistinguishable from "nothing allocated yet".
+    // Записи actor-процесса/фрейма/почтового ящика живут в ТОЙ ЖЕ линейной
+    // памяти, что и строковые литералы, сразу после blob строковых данных
+    // (выровнено по 8 байт — достаточно и для i32-хэндла, и для f64-числа
+    // в каждом слоте `frame_load`/`frame_store`). `@max(_, 8)` — планировщик
+    // `wasm_actors.zig` использует адрес 0 как сторожевое значение "ещё не
+    // порождён" для единственного слота дочернего процесса; модуль с нулём
+    // строковых литералов иначе начал бы кучу буквально с байта 0, сделав
+    // реальное первое выделение неотличимым от "ничего ещё не выделено".
     const actor_heap_base: u32 = @max(@as(u32, @intCast(std.mem.alignForward(usize, strings.data.len, 8))), 8);
 
     var func_index: std.AutoHashMap(mir.FunctionId, u32) = .init(allocator);
     defer func_index.deinit();
     for (module.functions.items, 0..) |function, i| try func_index.put(function.id, builtin_count + @as(u32, @intCast(i)));
 
-    // For every function reachable via `call_indirect` (`interface_table`),
-    // compute its WASM param/result shape and assign ONE SHARED type-
-    // section index per distinct shape (see `signatureShapeKey`'s own doc
-    // comment for why this can't just reuse each function's ordinary
-    // individual type index). New entries are appended to the type
-    // section AFTER every builtin/function's own (unique) entry, starting
-    // at index `builtin_count + module.functions.items.len`.
+    // Для каждой функции, достижимой через `call_indirect` (`interface_table`),
+    // вычисляется её форма параметров/результата WASM и назначается ОДИН
+    // ОБЩИЙ индекс секции типов на каждую отдельную форму (см. собственный
+    // doc-комментарий `signatureShapeKey` о том, почему нельзя просто
+    // переиспользовать обычный индивидуальный индекс типа каждой функции).
+    // Новые записи добавляются в секцию типов ПОСЛЕ собственной
+    // (уникальной) записи каждого builtin/функции, начиная с индекса
+    // `builtin_count + module.functions.items.len`.
     var interface_type_index: std.StringHashMap(u32) = .init(allocator);
     defer {
         var it = interface_type_index.keyIterator();
@@ -1480,19 +1481,19 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         try registerInterfaceShape(allocator, &interface_type_index, &interface_shape_types, &interface_shape_count, builtin_count, module.functions.items.len, params.items, result);
     }
 
-    // A `.call_value` call site's OWN required shape (from its args/dst
-    // types) may have NO real registered callee anywhere in the compiled
-    // program — the whole prelude compiles unconditionally (no tree-
-    // shaking, see this file's own commit history), so a generic
-    // callback body (e.g. `отобразить`'s `ф(значение)`) can be compiled
-    // and reachable-in-principle from `call_indirect`'s codegen even
-    // when NOTHING in this particular program ever actually calls it
-    // with a real closure. Without this, such a site's shape would have
-    // no type-section entry at all and fail to emit, even though the
-    // code is dead in practice. Harmless if genuinely unreachable at
-    // runtime; if it WERE reachable with a mismatched real callee,
-    // `call_indirect` traps at that point — same behavior any WASM
-    // engine gives for a genuine type mismatch.
+    // У СОБСТВЕННОЙ требуемой формы места вызова `.call_value` (по типам
+    // его args/dst) может НЕ быть реальной зарегистрированной вызываемой
+    // функции нигде в скомпилированной программе — весь prelude
+    // компилируется безусловно, так что типовое тело callback'а (например,
+    // `ф(значение)` у `отобразить`) может быть скомпилировано и в принципе
+    // достижимо из кодогенерации `call_indirect`, даже когда НИЧТО в этой
+    // конкретной программе реально не вызывает его с реальным замыканием.
+    // Без этого у такого места вызова вообще не было бы записи секции
+    // типов, и эмиссия провалилась бы, хотя на практике код мёртв.
+    // Безвредно, если действительно недостижимо в рантайме; если бы это
+    // БЫЛО достижимо с несовпадающей реальной вызываемой функцией,
+    // `call_indirect` в этой точке паникует (trap) — то же поведение, что
+    // любой движок WASM даёт при настоящем несовпадении типов.
     for (module.functions.items) |function| {
         const store = function.type_store orelse &checked.types;
         for (function.blocks.items) |block| for (block.instructions.items) |instruction| {
@@ -1508,10 +1509,10 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         };
     }
 
-    // Import types come FIRST in the type section — import type index `i`
-    // is simply `i` for `i < builtin_count`, per each builtin's own
-    // `builtinSignature` (NOT uniformly `() -> f64` any more — `DOM.*`
-    // needs real params/void results too).
+    // Типы импортов идут ПЕРВЫМИ в секции типов — индекс типа импорта `i`
+    // просто равен `i` для `i < builtin_count`, по собственной
+    // `builtinSignature` каждого builtin (уже НЕ единообразно `() -> f64` —
+    // `DOM.*` тоже нужны реальные параметры/void-результаты).
     var type_section: std.ArrayList(u8) = .empty;
     defer type_section.deinit(allocator);
     try wasm_module.writeUleb128(&type_section, allocator, builtin_count + module.functions.items.len + interface_shape_count);
@@ -1560,9 +1561,9 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     defer function_section.deinit(allocator);
     try wasm_module.writeUleb128(&function_section, allocator, module.functions.items.len);
     for (module.functions.items, 0..) |function, i| {
-        // A function reachable via `call_indirect` gets the SHARED type
-        // index for its shape instead of its own unique one — see
-        // `interface_type_index`'s own construction above.
+        // Функция, достижимая через `call_indirect`, получает ОБЩИЙ индекс
+        // типа для своей формы вместо собственного уникального — см.
+        // построение `interface_type_index` выше.
         if (interface_table_members.contains(function.id)) {
             const store = function.type_store orelse &checked.types;
             var params: std.ArrayList(u8) = .empty;
@@ -1582,24 +1583,23 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         try wasm_module.writeUleb128(&function_section, allocator, builtin_count + i);
     }
 
-    // `wasm_gc_arena.zig`'s per-call arena-reset (Phase 1 GC — see
-    // `project_panos_elm_architecture_dom_storage_design`/
-    // `project_panos_wasm_aot_memory_growth_fix`) needs a SECOND,
-    // non-resettable bump region for values that must survive across
-    // separate JS-invoked export calls (DOM handler context pointers,
-    // promoted at their `mir_lowering.zig` lowering site via
-    // `wasm_heap.findOrBuildAllocPermanent`) — only reserved when the
-    // module actually built that function (`uses_permanent_heap`),
-    // sitting in a fixed gap right after the string data, with the
-    // ordinary bump arena (`global 0`) starting after IT instead of
-    // directly after the string data as before.
+    // Сброс арены при каждом вызове (`wasm_gc_arena.zig`, Phase 1 GC)
+    // требует ВТОРОЙ, несбрасываемой bump-области для значений, которые
+    // должны пережить отдельные экспортные вызовы со стороны JS (контекстные
+    // указатели DOM-обработчиков, продвигаемые на месте своего lowering в
+    // `mir_lowering.zig` через `wasm_heap.findOrBuildAllocPermanent`) —
+    // резервируется только когда модуль реально построил эту функцию
+    // (`uses_permanent_heap`), располагается в фиксированном промежутке
+    // сразу после строковых данных, а обычная bump-арена (`global 0`)
+    // начинается уже ПОСЛЕ НЕЁ, а не сразу после строковых данных, как
+    // раньше.
     const uses_permanent_heap = wasm_heap.findFunctionByName(module, wasm_heap.permanent_alloc_function_name) != null;
     const permanent_reserved_bytes: u32 = if (uses_permanent_heap) wasm_heap.permanent_reserved_bytes else 0;
     const arena_base: u32 = actor_heap_base + permanent_reserved_bytes;
 
-    // Linear memory holds only the flat blob of literal strings. Dynamic
-    // strings are host handles; this deliberately avoids a WASM GC/heap in
-    // the first browser runtime ABI.
+    // Линейная память хранит только плоский blob строковых литералов.
+    // Динамические строки — хэндлы хоста; это намеренно избегает GC/кучи
+    // WASM в первом ABI браузерного рантайма.
     var memory_section: std.ArrayList(u8) = .empty;
     defer memory_section.deinit(allocator);
     var data_section: std.ArrayList(u8) = .empty;
@@ -1622,12 +1622,13 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         }
     }
 
-    // Global 0: the arena bump pointer (`actor_heap_global_index`),
-    // initialized past the permanent-region gap (if any). Absent
-    // entirely for any module that never touches the heap at all.
-    // Globals 1/2 (permanent bump pointer + its immutable ceiling) are
-    // ONLY present when `uses_permanent_heap` — most modules (no DOM
-    // handler context args) never need them.
+    // Global 0: bump-указатель арены (`actor_heap_global_index`),
+    // инициализируется после промежутка постоянной области (если он есть).
+    // Полностью отсутствует для любого модуля, который вообще никогда не
+    // трогает кучу. Globals 1/2 (постоянный bump-указатель + его
+    // неизменяемый потолок) присутствуют ТОЛЬКО когда `uses_permanent_heap` —
+    // большинству модулей (без аргументов контекста DOM-обработчика) они
+    // никогда не нужны.
     var global_section: std.ArrayList(u8) = .empty;
     defer global_section.deinit(allocator);
     if (has_actors) {
@@ -1638,19 +1639,20 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         try wasm_module.writeSleb128(&global_section, allocator, @intCast(arena_base));
         try global_section.append(allocator, 0x0B); // end
         if (uses_permanent_heap) {
-            // Global 1: permanent bump pointer, mutable, starts right
-            // after the string data (`actor_heap_base`).
+            // Global 1: постоянный bump-указатель, изменяемый, начинается
+            // сразу после строковых данных (`actor_heap_base`).
             try global_section.append(allocator, wasm_module.wasm_i32);
             try global_section.append(allocator, 0x01); // mutable
             try global_section.append(allocator, 0x41); // i32.const
             try wasm_module.writeSleb128(&global_section, allocator, @intCast(actor_heap_base));
             try global_section.append(allocator, 0x0B); // end
-            // Global 2: the permanent region's ceiling — IMMUTABLE,
-            // same value as global 0's own initial value (`arena_base`).
-            // `buildAllocPermanent` (`wasm_heap.zig`) only ever needs
-            // this global's INDEX at MIR-construction time, not the
-            // actual number — the real value is only known here, after
-            // `strings.data.len` has been finalized.
+            // Global 2: потолок постоянной области — НЕИЗМЕНЯЕМЫЙ, то же
+            // значение, что и собственное начальное значение global 0
+            // (`arena_base`). `buildAllocPermanent` (`wasm_heap.zig`)
+            // на этапе построения MIR нуждается только в ИНДЕКСЕ этой
+            // глобали, не в реальном числе — реальное значение известно
+            // только здесь, после того как `strings.data.len` окончательно
+            // определён.
             try global_section.append(allocator, wasm_module.wasm_i32);
             try global_section.append(allocator, 0x00); // immutable
             try global_section.append(allocator, 0x41); // i32.const
@@ -1675,11 +1677,11 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         try wasm_module.writeUleb128(&export_section, allocator, 0); // memidx 0
     }
 
-    // One `funcref` table, sized exactly to `interface_table` — every
-    // entry filled by a single active element segment (offset 0), no
-    // holes. Omitted entirely (both sections) when `interface_table` is
-    // empty, matching every other optional section in this function
-    // (`needs_memory`/`has_actors`).
+    // Одна таблица `funcref`, размер точно как у `interface_table` —
+    // каждая запись заполняется единым активным element-сегментом
+    // (смещение 0), без дыр. Полностью опускается (обе секции), когда
+    // `interface_table` пуста, как и любая другая опциональная секция в
+    // этой функции (`needs_memory`/`has_actors`).
     var table_section: std.ArrayList(u8) = .empty;
     defer table_section.deinit(allocator);
     var element_section: std.ArrayList(u8) = .empty;
@@ -1722,18 +1724,16 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     if (needs_memory) try wasm_module.writeSection(&out, allocator, 5, memory_section.items);
     if (has_actors) try wasm_module.writeSection(&out, allocator, 6, global_section.items);
     try wasm_module.writeSection(&out, allocator, 7, export_section.items);
-    // Element section (9) between Export(7)/Start(8, unused) and Code(10)
-    // — fixed WASM canonical section order.
+    // Секция Element (9) между Export(7)/Start(8, не используется) и
+    // Code(10) — фиксированный канонический порядок секций WASM.
     if (interface_table.len != 0) try wasm_module.writeSection(&out, allocator, 9, element_section.items);
     try wasm_module.writeSection(&out, allocator, 10, code_section.items);
-    // `strings.data.len != 0`, NOT `needs_memory` — a module can need
-    // memory purely for the actor heap with ZERO string literals (no
-    // data segment to write at all); the Data section is fully
-    // optional in WASM, but writing it with EMPTY content (no even a
-    // "0 segments" count) produces a truncated section a real parser
-    // rejects ("unable to read u32 leb128: data segment count") —
-    // found by actually running `wasmtime`/`wasm2wat` against real
-    // output, not by reading alone.
+    // `strings.data.len != 0`, а НЕ `needs_memory` — модулю может требоваться
+    // память чисто под actor-кучу при НУЛЕ строковых литералов (писать
+    // сегмент данных вообще нечего); секция Data полностью опциональна
+    // в WASM, но запись её с ПУСТЫМ содержимым (даже без счётчика
+    // "0 сегментов") даёт усечённую секцию, которую реальный парсер
+    // отвергает ("unable to read u32 leb128: data segment count").
     if (strings.data.len != 0) try wasm_module.writeSection(&out, allocator, 11, data_section.items);
     return try out.toOwnedSlice(allocator);
 }
@@ -1769,15 +1769,14 @@ test "emitModule produces a valid, executable .wasm for a recursive MIR function
     var module = try mir_lowering.lowerModule(allocator, &parsed.ast, &resolved, &checked);
     defer module.deinit(allocator);
 
-    // The recursive self-call here compiles to `.function_ref` +
-    // `.call_value` (see `mir_lowering.zig`'s `lowerCall`) — `.call_value`
-    // ALWAYS lowers to `call_indirect` now (first-class function values,
-    // not just interfaces, need this — see `wasm_interfaces.zig`'s own
-    // doc comment), which depends on `wasm_interfaces.expand` having
-    // already rewritten `.function_ref` into a real i32 table-index
-    // constant. Every real caller (`cli/main.zig`) always runs this pass
-    // before `emitModule`; this test skipped it before `.call_value`
-    // needed real dispatch machinery, which is no longer true.
+    // Рекурсивный самовызов здесь компилируется в `.function_ref` +
+    // `.call_value` (см. `lowerCall` в `mir_lowering.zig`) — `.call_value`
+    // теперь ВСЕГДА понижается в `call_indirect` (это нужно не только
+    // интерфейсам, но и полноценным функциональным значениям — см.
+    // собственный doc-комментарий `wasm_interfaces.zig`), что зависит от
+    // того, что `wasm_interfaces.expand` уже переписал `.function_ref` в
+    // реальную i32-константу индекса таблицы. Каждый реальный вызывающий
+    // (`cli/main.zig`) всегда прогоняет этот проход до `emitModule`.
     const wasm_interfaces = @import("wasm_interfaces.zig");
     const iface_result = try wasm_interfaces.expand(allocator, &module, &checked.types);
     defer allocator.free(iface_result.table);
@@ -1786,16 +1785,15 @@ test "emitModule produces a valid, executable .wasm for a recursive MIR function
     defer allocator.free(wasm_bytes);
     try std.testing.expect(std.mem.eql(u8, wasm_bytes[0..4], &.{ 0x00, 0x61, 0x73, 0x6D }));
 
-    // `Io.Threaded.Options.environ` defaults to EMPTY (by design — spawning
-    // a child with the real environment must be opt-in) — `expand_arg0 =
-    // .expand`'s own `$PATH` search reads THIS field, not the real OS
-    // environment, so without passing `std.testing.environ` (populated by
-    // the standard test runner from the real process env) it silently
-    // falls back to a tiny hardcoded default (`/usr/local/bin:/bin/:/usr/
-    // bin`) and reports `FileNotFound` even when `wasmtime` is genuinely on
-    // `$PATH` (confirmed empirically — an earlier version of this test
-    // hardcoded `/opt/homebrew/bin/wasmtime` to work around exactly this,
-    // which broke on any machine/CI runner using a different install path).
+    // `Io.Threaded.Options.environ` по умолчанию ПУСТ (осознанно —
+    // порождение дочернего процесса с реальным окружением должно быть
+    // явным выбором) — собственный поиск по `$PATH` у `expand_arg0 =
+    // .expand` читает ИМЕННО это поле, а не реальное окружение ОС, поэтому
+    // без передачи `std.testing.environ` (заполняется стандартным тестовым
+    // раннером из реального окружения процесса) он тихо откатывается к
+    // крошечному захардкоженному значению по умолчанию (`/usr/local/bin:
+    // /bin/:/usr/bin`) и сообщает `FileNotFound`, даже если `wasmtime`
+    // реально есть в `$PATH`.
     var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
     defer io.deinit();
     const path = "zzz_wasm_emit_test.wasm";
@@ -1884,7 +1882,7 @@ test "emitModule produces a valid, executable .wasm for a real iterating пок�
         std.debug.print("wasmtime failed: {s}\n", .{result.stderr});
         return error.WasmtimeFailed;
     }
-    // 1+2+...+9 == 45 (i < 10, not <=)
+    // 1+2+...+9 == 45 (i < предел, не <=)
     try std.testing.expectEqualStrings("45\n", result.stdout);
 }
 
@@ -1899,9 +1897,10 @@ test "emitModule fails cleanly on a malformed MIR module instead of crashing" {
     defer module.deinit(allocator);
     const function_id = try mir_builder.newFunction(&module, allocator, "сломано", @enumFromInt(0), checked.types.builtins.void, .{ .file_id = 0, .start = 0, .end = 0 });
     var builder = try mir_builder.Builder.beginFunction(&module, allocator, function_id);
-    // Jump to a block that doesn't exist — exactly the invariant
-    // `mir_validate.zig` exists to catch before it reaches `processFrom`'s
-    // stack-machine replay (which would otherwise index out of bounds).
+    // Переход на несуществующий блок — именно тот инвариант, который
+    // `mir_validate.zig` призван поймать до того, как это дойдёт до
+    // стек-машинного воспроизведения в `processFrom` (которое иначе вышло
+    // бы за границы индекса).
     builder.terminate(.{ .jump = .{ .target = @enumFromInt(99) } });
 
     try std.testing.expectError(error.InvalidMir, emitModule(allocator, &checked, &module, &.{}));

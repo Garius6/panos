@@ -23,16 +23,13 @@ pub const Import = struct {
     target: ?usize,
     alias: []const u8,
     span: source.Span,
-    // Set when `target == null` because this import resolved to a native
-    // builtin module (see `resolveAndLoadImport`) instead of failing —
-    // holds the module's REAL name (e.g. "ввод_вывод"), which may differ
-    // from `alias` (`импорт "ввод_вывод" как ио"`). `module_linker.zig`
-    // uses this to bind the alias to the native module's exports, same as
-    // it already does for a real file target — without it, an ALIASED
-    // native import resolved with no diagnostic (correct) but then the
-    // alias itself was never bound to anything (`Resolve Error:
-    // неопределённое имя 'ио'`), a real gap found auditing panosiki's
-    // `std/слог.ps` (`импорт "ввод_вывод" как ио`).
+    // Заполняется, когда `target == null`, потому что импорт разрешился
+    // в нативный встроенный модуль (см. `resolveAndLoadImport`), а не
+    // из-за ошибки — хранит РЕАЛЬНОЕ имя модуля (например,
+    // "ввод_вывод"), которое может отличаться от `alias` (`импорт
+    // "ввод_вывод" как ио`). `module_linker.zig` использует это поле,
+    // чтобы связать алиас с экспортами нативного модуля, так же как для
+    // обычного файлового таргета.
     native_module: ?[]const u8 = null,
 };
 
@@ -50,23 +47,25 @@ pub const Export = struct {
     span: source.Span,
 };
 
-// Methods declared via a same-file `реализация Тип ... конец` block (plain
-// or interface) on an exported owner type — separate from `Export` because a
-// method is never reachable by a qualified name (`модуль.метод`), only by
-// dispatch on a value of the owner's nominal type.
+// Методы, объявленные блоком `реализация Тип ... конец` в том же файле
+// (обычным или интерфейсным) на экспортируемом типе-владельце — отдельно
+// от `Export`, потому что метод никогда не достижим по квалифицированному
+// имени (`модуль.метод`), только через диспетчеризацию на значении
+// номинального типа владельца.
 pub const MethodExport = struct {
-    // The module where this method's `функ` body is PHYSICALLY written
-    // (an impl block's own file) — used to dereference `.declaration`
-    // into a real AST node/compiled artifact.
+    // Модуль, где ФИЗИЧЕСКИ написано тело этого метода (`функ`, файл
+    // самого impl-блока) — используется, чтобы разыменовать
+    // `.declaration` в реальный AST-узел/скомпилированный артефакт.
     module: usize,
-    // The module where the TARGET struct/enum is declared — usually
-    // equal to `module` (same-file or consumer-file impl), but distinct
-    // for a qualified target declared in a THIRD file (`реализация X
-    // для Модуль.Тип`, e.g. a codegen-generated `_gen.ps`). Used to
-    // match this method against the RIGHT `Export` entry when building
-    // a consumer's import view (`module_linker.zig`'s
-    // `buildExportsForTarget`) — matching by `module` there would only
-    // ever find same-file impls.
+    // Модуль, где объявлена ЦЕЛЕВАЯ структура/перечисление — обычно
+    // совпадает с `module` (impl в том же файле или в файле
+    // потребителя), но отличается для квалифицированного таргета,
+    // объявленного в ТРЕТЬЕМ файле (`реализация X для Модуль.Тип`,
+    // например сгенерированный кодогенератором `_gen.ps`). Используется
+    // для сопоставления метода с ПРАВИЛЬНОЙ записью `Export` при
+    // построении представления импорта у потребителя
+    // (`buildExportsForTarget` в `module_linker.zig`) — сопоставление
+    // по `module` там нашло бы только impl'ы в том же файле.
     owner_module: usize,
     owner_declaration: ast.DeclId,
     declaration: ast.DeclId,
@@ -74,10 +73,11 @@ pub const MethodExport = struct {
     span: source.Span,
 };
 
-// Variants of an exported enum type — construction/matching is entirely
-// name-string-based at compile time (`compiler.zig`'s `enumVariantName`
-// builds "Owner.Variant" from the owner symbol's own `.name`), so no
-// declaration/FunctionId re-hosting is needed, only the variant's bare name.
+// Варианты экспортируемого перечисления — конструирование/сопоставление
+// целиком строится по имени во время компиляции (`enumVariantName` в
+// `compiler.zig` строит "Owner.Variant" из собственного `.name` символа
+// владельца), поэтому перенос declaration/FunctionId не нужен, только
+// голое имя варианта.
 pub const VariantExport = struct {
     module: usize,
     owner_declaration: ast.DeclId,
@@ -85,29 +85,31 @@ pub const VariantExport = struct {
     span: source.Span,
 };
 
-// A same-file `реализация Интерфейс для Тип ... конец` block on an exported
-// owner type — needed separately from `MethodExport` because interface-bound
-// generic dispatch (`T: Сравниваемое`) requires the owner's
-// `InterfaceImplementation` entry itself, not just its methods (which
-// `MethodExport` already covers as ordinary inherent methods).
+// Блок `реализация Интерфейс для Тип ... конец` в том же файле на
+// экспортируемом типе-владельце — нужен отдельно от `MethodExport`, потому
+// что диспетчеризация generic-параметров, связанных интерфейсом
+// (`T: Сравниваемое`), требует самой записи `InterfaceImplementation`
+// владельца, а не только её методов (их `MethodExport` уже покрывает как
+// обычные методы).
 pub const ImplExport = struct {
-    // See `MethodExport.module` — the module where the `реализация`
-    // block itself is written.
+    // См. `MethodExport.module` — модуль, где написан сам блок
+    // `реализация`.
     module: usize,
-    // See `MethodExport.owner_module` — the module declaring the
-    // target struct/enum (may differ from `module` for a qualified
-    // target in a third file).
+    // См. `MethodExport.owner_module` — модуль, объявляющий целевую
+    // структуру/перечисление (может отличаться от `module` для
+    // квалифицированного таргета в третьем файле).
     owner_module: usize,
     owner_declaration: ast.DeclId,
     interface_name: []const u8,
-    // Non-null when the INTERFACE side is also qualified (`реализация
-    // Модуль.Интерфейс для ...` — e.g. codegen's `json.ВJSON`) — the
-    // module/declaration where the interface is itself declared, needed
-    // by `module_compiler.zig` to resolve the interface to a real local
-    // symbol in a consuming module (a bare-name lookup can't find it —
-    // the consumer only has it in scope as `модуль.Интерфейс`, never
-    // unqualified). `null` for a local (unqualified) interface name,
-    // resolved the existing way (`findTypeSymbol` by bare name).
+    // Не `null`, когда СТОРОНА ИНТЕРФЕЙСА тоже квалифицирована
+    // (`реализация Модуль.Интерфейс для ...`, например `json.ВJSON` из
+    // кодогенератора) — модуль/декларация, где сам интерфейс объявлен,
+    // нужны `module_compiler.zig` для разрешения интерфейса в реальный
+    // локальный символ в модуле-потребителе (поиск по голому имени его
+    // не найдёт — у потребителя он в области видимости только как
+    // `модуль.Интерфейс`, никогда неквалифицированно). `null` для
+    // локального (неквалифицированного) имени интерфейса, разрешаемого
+    // существующим способом (`findTypeSymbol` по голому имени).
     interface_module: ?usize = null,
     interface_declaration: ?ast.DeclId = null,
     span: source.Span,
@@ -126,17 +128,14 @@ pub const Graph = struct {
     variants: std.ArrayList(VariantExport) = .empty,
     impls: std.ArrayList(ImplExport) = .empty,
     diagnostics: diagnostic.DiagnosticList = .{},
-    // `PANOS_STDLIB` env dir + the `std/` next to the running `panos`
-    // binary, in that priority order, checked AFTER same-directory and
-    // `модули/` — set by the caller (`zig/cli/main.zig`) before `.load()`,
-    // empty by default so every existing test/synthetic-reader caller
-    // (which has no such directories to offer) keeps its exact current
-    // behavior. See `docs/src/getting-started/installation.md` §"Поиск
-    // модулей" for the full documented 4-tier contract this implements —
-    // real gap found auditing panosiki: NONE of tiers 2-4 (nor the
-    // native-module fallback below) existed before this, only tier 1
-    // (same directory) did, silently breaking every multi-file program
-    // that imports a real stdlib module by bare name.
+    // Директория из переменной окружения `PANOS_STDLIB` + `std/` рядом с
+    // запущенным бинарником `panos`, в этом порядке приоритета,
+    // проверяются ПОСЛЕ той же директории и `модули/` — задаётся
+    // вызывающей стороной (`zig/cli/main.zig`) перед `.load()`, пустой по
+    // умолчанию, чтобы все существующие тесты/вызовы с
+    // synthetic-reader'ом сохраняли текущее поведение. Полный
+    // 4-уровневый контракт поиска модулей документирован в
+    // `docs/src/getting-started/installation.md` §"Поиск модулей".
     global_search_roots: []const []const u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator) Graph {
@@ -189,12 +188,12 @@ pub const Graph = struct {
         return null;
     }
 
-    // Bare (extension-less) entry paths get the same `.pns`-then-`.ps`
-    // try-both treatment as bare `импорт` names (`appendCandidateBothSuffixes`)
-    // — otherwise an unmigrated `.ps`-only project passed as `panos run
-    // проект/main` (no explicit extension) would resolve straight to a
-    // nonexistent `main.pns` and fail. An entry path with an explicit
-    // extension resolves once, as given.
+    // Голые (без расширения) пути входной точки получают ту же
+    // попытку `.pns`-затем-`.ps`, что и голые имена в `импорт`
+    // (`appendCandidateBothSuffixes`) — иначе немигрированный
+    // `.ps`-only проект, переданный как `panos run проект/main` (без
+    // явного расширения), сразу упёрся бы в несуществующий `main.pns`.
+    // Путь с явным расширением разрешается один раз, как есть.
     pub fn load(self: *Graph, reader: anytype, entry_path: []const u8) !void {
         if (hasKnownSourceExtension(entry_path)) {
             const canonical_path = try resolveImportPath(self.allocator, entry_path, "", ".pns");
@@ -216,15 +215,16 @@ pub const Graph = struct {
         _ = try self.loadRecursive(reader, ps_path, null);
     }
 
-    // Appends embedded prelude source as a module with NO explicit `импорт`
-    // — takes the next available file_id, appended AFTER every module
-    // already loaded via `load()`, so existing diagnostics' `file_id`
-    // expectations for real modules are never shifted. Prepended to
-    // `order` (not appended) so it compiles before every real module, which
-    // implicitly depends on it. Reuses `collectExports`/`collectMethods`
-    // exactly as a real file would, so its types/methods/interfaces flow
-    // through the same cross-module machinery — only the merge itself
-    // (unqualified, no `импорт` alias) is special-cased, in
+    // Добавляет встроенный исходник прелюдии как модуль БЕЗ явного
+    // `импорт` — берёт следующий свободный file_id, добавляется ПОСЛЕ
+    // всех модулей, уже загруженных через `load()`, так что ожидания
+    // `file_id` в диагностиках для реальных модулей никогда не
+    // сдвигаются. Вставляется в начало `order` (не в конец), чтобы
+    // компилироваться раньше любого реального модуля, который неявно от
+    // него зависит. Переиспользует `collectExports`/`collectMethods`
+    // так же, как для обычного файла, поэтому её типы/методы/интерфейсы
+    // проходят через тот же межмодульный механизм — особый случай
+    // только само слияние (неквалифицированное, без алиаса `импорт`) в
     // `module_linker.zig`.
     pub fn appendPreludeModule(self: *Graph, source_text: []const u8) !usize {
         const bytes = try self.allocator.dupe(u8, source_text);
@@ -274,14 +274,15 @@ pub const Graph = struct {
         return try self.registerModule(reader, path, bytes);
     }
 
-    // Same as `loadRecursive`, but a read failure PROPAGATES instead of
-    // being reported — used only by `resolveAndLoadImport`'s fallback
-    // chain, which needs to try the next search-root candidate silently
-    // and only report once EVERY candidate has failed (or fall back to a
-    // native builtin module, which needs no diagnostic at all). A cyclic
-    // import is still reported directly here — trying a different search
-    // root can never resolve a real cycle, so there is no "next candidate"
-    // that would help.
+    // То же, что `loadRecursive`, но ошибка чтения ПРОБРАСЫВАЕТСЯ, а не
+    // репортится — используется только цепочкой фолбэков в
+    // `resolveAndLoadImport`, которой нужно молча пробовать следующий
+    // кандидат из корней поиска и репортить только когда провалились
+    // ВСЕ кандидаты (или откатиться на нативный встроенный модуль, для
+    // которого диагностика вообще не нужна). Циклический импорт всё
+    // равно репортится прямо здесь — другой корень поиска не может
+    // разрешить настоящий цикл, поэтому "следующего кандидата", который
+    // бы помог, не существует.
     fn tryLoadSilently(self: *Graph, reader: anytype, path: []const u8, importer_span: ?source.Span) anyerror!?usize {
         if (self.loading.contains(path)) {
             try self.report(importer_span orelse .{ .file_id = 0, .start = 0, .end = 0 }, "Module Loader Error: обнаружен циклический импорт '{s}'", .{path});
@@ -296,14 +297,15 @@ pub const Graph = struct {
         return try self.registerModule(reader, path, bytes);
     }
 
-    // Lex/parse/register a module whose SOURCE BYTES are already read —
-    // shared by `loadRecursive` (entry file, reports on its own read
-    // failure) and `tryLoadSilently` (import fallback candidates, read
-    // failure already propagated by the caller). Recurses into `path`'s
-    // OWN imports via `resolveAndLoadImport`, not directly into
-    // `loadRecursive`/`tryLoadSilently` — every nested import gets the
-    // full search-path fallback too, not just the entry file's direct
-    // imports.
+    // Лексинг/парсинг/регистрация модуля, чьи ИСХОДНЫЕ БАЙТЫ уже
+    // прочитаны — общая для `loadRecursive` (входной файл, сам
+    // репортит ошибку чтения) и `tryLoadSilently` (кандидаты фолбэка
+    // импорта, ошибку чтения уже пробросил вызывающий код).
+    // Рекурсивно обрабатывает СОБСТВЕННЫЕ импорты `path` через
+    // `resolveAndLoadImport`, а не напрямую через
+    // `loadRecursive`/`tryLoadSilently` — каждый вложенный импорт тоже
+    // получает полный фолбэк по путям поиска, а не только прямые
+    // импорты входного файла.
     fn registerModule(self: *Graph, reader: anytype, path: []const u8, bytes: []u8) anyerror!usize {
         var owns_bytes = true;
         errdefer if (owns_bytes) self.allocator.free(bytes);
@@ -353,40 +355,43 @@ pub const Graph = struct {
                 .native_module = resolved.native_module,
             });
         }
-        // Must run AFTER the import loop above — a qualified impl
-        // target (`реализация X для Модуль.Тип`) resolves `Модуль` via
-        // `self.imports`, which only has entries for THIS module's own
-        // imports once that loop has finished.
+        // Должно выполняться ПОСЛЕ цикла импортов выше — квалифицированный
+        // таргет impl'а (`реализация X для Модуль.Тип`) разрешает
+        // `Модуль` через `self.imports`, где записи для СОБСТВЕННЫХ
+        // импортов этого модуля появляются только после завершения того
+        // цикла.
         try self.collectMethods(index);
         try self.order.append(self.allocator, index);
         return index;
     }
 
-    // The documented 4-tier search (`docs/src/getting-started/
-    // installation.md` §"Поиск модулей"): same directory as the importer,
-    // then `модули/` next to the importer, then each of
-    // `global_search_roots` in order (`$PANOS_STDLIB`, `std/` next to the
-    // `panos` binary — populated by `zig/cli/main.zig`, empty for every
-    // other caller, which keeps their exact previous single-tier
-    // behavior). If NONE of those have the file AND the bare import name
-    // matches a registered native builtin module (`resolver.
-    // native_builtin_modules` — the SAME list `installBuiltins` uses, so
-    // the two can never drift apart), this resolves to `null` with NO
-    // diagnostic — the module is already ambiently available without a
-    // file at all, exactly like calling it without ever writing `импорт`
-    // in the first place. A genuinely missing module (not native, not
-    // found anywhere) reports the SAME "FileNotFound" message the single-
-    // tier version always did, against the same-directory candidate (so
-    // existing diagnostic-text assertions keep matching).
+    // Документированный 4-уровневый поиск (`docs/src/getting-started/
+    // installation.md` §"Поиск модулей"): та же директория, что у
+    // импортёра, затем `модули/` рядом с импортёром, затем каждый из
+    // `global_search_roots` по порядку (`$PANOS_STDLIB`, `std/` рядом с
+    // бинарником `panos` — заполняется `zig/cli/main.zig`, пуст для
+    // всех остальных вызывающих, что сохраняет их прежнее
+    // одноуровневое поведение). Если файла нет НИ В ОДНОМ из этих мест
+    // И голое имя импорта совпадает с зарегистрированным нативным
+    // встроенным модулем (`resolver.native_builtin_modules` — тот же
+    // список, что использует `installBuiltins`, поэтому они не могут
+    // разойтись), это разрешается в `null` БЕЗ диагностики — модуль уже
+    // амбиентно доступен без какого-либо файла, точно как если бы
+    // `импорт` вообще не был написан. По-настоящему отсутствующий
+    // модуль (не нативный, нигде не найден) репортит ТО ЖЕ сообщение
+    // "FileNotFound", что и одноуровневая версия, для кандидата из той
+    // же директории (чтобы существующие проверки текста диагностики
+    // продолжали совпадать).
     const ImportResolution = struct { target: ?usize, native_module: ?[]const u8 = null };
 
-    // Bare (extension-less) import names get tried as `.pns` first, then
-    // `.ps` — the FileNotFound-tolerant candidate loop in
-    // `resolveAndLoadImport` already treats "not found" as "try the next
-    // candidate", so this reuses that machinery rather than adding a
-    // second resolution pass. An import path that already names an
-    // extension explicitly resolves once, as given (no `.ps` file ever
-    // gets probed for an explicit `.pns` import or vice versa).
+    // Голые (без расширения) имена импорта пробуются сначала как
+    // `.pns`, затем как `.ps` — толерантный к FileNotFound цикл
+    // кандидатов в `resolveAndLoadImport` уже трактует "не найдено" как
+    // "попробовать следующего кандидата", поэтому здесь переиспользуется
+    // тот же механизм вместо отдельного второго прохода. Путь импорта с
+    // уже явно указанным расширением разрешается один раз, как есть (за
+    // явным `.pns`-импортом никогда не пробуется файл `.ps`, и
+    // наоборот).
     fn appendCandidateBothSuffixes(self: *Graph, candidates: *std.ArrayList([]u8), raw_path: []const u8, importer_path: []const u8) !void {
         try candidates.append(self.allocator, try resolveImportPath(self.allocator, raw_path, importer_path, ".pns"));
         if (!hasKnownSourceExtension(raw_path)) {
@@ -495,14 +500,17 @@ pub const Graph = struct {
         }
     }
 
-    // Same-file impl blocks (plain OR interface) on an exported owner type:
-    // methods are reachable cross-module by dispatch on the owner's value,
-    // never by a qualified name, so they never enter `exports` — only
-    // `methods`. Interface-impl methods are ordinary inherent methods too
-    // (`defineMethodSignature`/`self.result.methods` in type_checker.zig
-    // doesn't distinguish), so they're collected here the same way. Also
-    // records `ImplExport` for interface-based impls — needed separately for
-    // interface-bound generic dispatch (`T: Сравниваемое`) across modules.
+    // Impl-блоки в том же файле (обычные ИЛИ интерфейсные) на
+    // экспортируемом типе-владельце: методы достижимы между модулями
+    // через диспетчеризацию на значении владельца, никогда по
+    // квалифицированному имени, поэтому они никогда не попадают в
+    // `exports` — только в `methods`. Методы интерфейсных impl'ов —
+    // тоже обычные собственные методы (`defineMethodSignature`/
+    // `self.result.methods` в type_checker.zig их не различает),
+    // поэтому собираются здесь так же. Также записывает `ImplExport`
+    // для impl'ов на основе интерфейса — нужно отдельно для
+    // межмодульной диспетчеризации generic-параметров, связанных
+    // интерфейсом (`T: Сравниваемое`).
     fn collectMethods(self: *Graph, module: usize) !void {
         const tree = &self.modules.items[module].tree;
         for (tree.program.?.declarations) |declaration| {
@@ -510,15 +518,16 @@ pub const Graph = struct {
                 .impl => |value| value,
                 else => continue,
             };
-            // A qualified target (`реализация X для Модуль.Тип`) means
-            // the struct lives in ANOTHER module — resolve that alias
-            // via THIS module's own import table (populated by the
-            // caller before `collectMethods` runs, see `registerModule`/
-            // `appendPreludeModule`) to find which module to search for
-            // the exported declaration. An unresolvable alias (typo,
-            // native-builtin target, etc.) skips this impl silently —
-            // matches the existing silent-skip-on-unknown-target
-            // behavior for the unqualified case below (`orelse continue`).
+            // Квалифицированный таргет (`реализация X для Модуль.Тип`)
+            // означает, что структура живёт в ДРУГОМ модуле — разрешаем
+            // этот алиас через собственную таблицу импортов текущего
+            // модуля (заполняется вызывающей стороной до запуска
+            // `collectMethods`, см. `registerModule`/
+            // `appendPreludeModule`), чтобы найти, в каком модуле искать
+            // экспортируемую декларацию. Неразрешимый алиас (опечатка,
+            // нативный встроенный таргет и т.п.) молча пропускает этот
+            // impl — так же, как неквалифицированный случай ниже
+            // (`orelse continue`).
             const owner_module = if (implementation.target_module) |alias|
                 self.resolveImportedModule(module, alias) orelse continue
             else
@@ -536,10 +545,12 @@ pub const Graph = struct {
                 });
             }
             if (implementation.interface_name) |interface_name| {
-                // Same alias-resolution as the target above, for a
-                // qualified interface (`реализация Модуль.Интерфейс для
-                // ...`, e.g. codegen's `json.ВJSON`) — `null` interface
-                // module/declaration stays the existing local-name path.
+                // То же разрешение алиаса, что и для таргета выше, для
+                // квалифицированного интерфейса (`реализация
+                // Модуль.Интерфейс для ...`, например `json.ВJSON` из
+                // кодогенератора) — `null` в module/declaration
+                // интерфейса означает существующий путь по локальному
+                // имени.
                 var interface_module: ?usize = null;
                 var interface_declaration: ?ast.DeclId = null;
                 if (implementation.interface_module) |alias| {
@@ -561,13 +572,14 @@ pub const Graph = struct {
         }
     }
 
-    // Resolves an import ALIAS (as written in `module`'s own source,
-    // e.g. `"точки"` from `импорт "./точки" как точки`) to the target
-    // module's index, by scanning `self.imports` — populated for a
-    // module's OWN direct imports before `collectMethods` runs on it
-    // (see call sites). Returns `null` for an unresolvable alias
-    // (typo) or a native-builtin import (`.target == null`) — a
-    // qualified impl target can only ever be a real file module.
+    // Разрешает АЛИАС импорта (как он написан в исходнике `module`,
+    // например `"точки"` из `импорт "./точки" как точки`) в индекс
+    // целевого модуля, сканируя `self.imports` — заполняется
+    // СОБСТВЕННЫМИ прямыми импортами модуля до запуска на нём
+    // `collectMethods` (см. места вызова). Возвращает `null` для
+    // неразрешимого алиаса (опечатка) или нативного импорта
+    // (`.target == null`) — квалифицированный таргет impl'а может быть
+    // только реальным файловым модулем.
     fn resolveImportedModule(self: *const Graph, module: usize, alias: []const u8) ?usize {
         for (self.imports.items) |import| {
             if (import.importer == module and std.mem.eql(u8, import.alias, alias)) return import.target;
@@ -606,12 +618,13 @@ pub const Graph = struct {
     }
 };
 
-// `.pns` is the primary source extension; `.ps` is accepted permanently
-// for backward compatibility (pre-migration files, unmigrated panosiki
-// packages) — GitHub Linguist misclassifies `.ps` as PostScript, `.pns`
-// doesn't collide with any registered language. An import path that
-// already names either extension explicitly is never re-suffixed;
-// `preferred_suffix` only applies to bare names (`импорт "модуль"`).
+// `.pns` — основное расширение исходников; `.ps` принимается постоянно
+// ради обратной совместимости (немигрированные файлы, непортированные
+// пакеты panosiki) — GitHub Linguist ошибочно классифицирует `.ps` как
+// PostScript, `.pns` ни с одним зарегистрированным языком не
+// конфликтует. Путь импорта, уже явно называющий любое из расширений,
+// никогда не получает второй суффикс; `preferred_suffix` применяется
+// только к голым именам (`импорт "модуль"`).
 fn hasKnownSourceExtension(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".ps") or std.mem.endsWith(u8, path, ".pns");
 }

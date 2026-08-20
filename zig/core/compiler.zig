@@ -183,13 +183,14 @@ const Compiler = struct {
         }
     }
 
-    // Shared by `registerComparableMethods`/`registerCopyableMethods` —
-    // both scan for a single-method interface implementation by name and
-    // register the compiled method under the target struct's name, only
-    // differing in which interface they look for and which `Program.add*`
-    // table they feed. `отправить` needs the copyable one to look up a
-    // custom `клонировать()` override by the message's runtime struct name
-    // (see `vm.zig`'s `send`), restoring copy-on-send (ROADMAP.md Стадия 24).
+    // Общий код для `registerComparableMethods`/`registerCopyableMethods` —
+    // оба сканируют реализации интерфейса с одним методом по имени и
+    // регистрируют скомпилированный метод под именем целевой структуры,
+    // различаясь только тем, какой интерфейс ищут и в какую таблицу
+    // `Program.add*` пишут результат. `отправить` использует copyable-таблицу,
+    // чтобы найти пользовательский `клонировать()` по имени структуры
+    // сообщения в рантайме (см. `send` в `vm.zig`) — так реализуется
+    // copy-on-send.
     fn registerSingleMethodInterface(self: *Compiler, interface_name: []const u8, register: *const fn (*bytecode.Program, []const u8, bytecode.FunctionId) std.mem.Allocator.Error!void) !void {
         for (self.checked.interface_implementations.items) |implementation| {
             const interface = self.resolution.symbols.get(implementation.interface) orelse continue;
@@ -475,20 +476,21 @@ const FunctionCompiler = struct {
         var vtables: std.ArrayList([]const bytecode.FunctionId) = .empty;
         defer vtables.deinit(self.compiler.result.allocator);
         for (cast.entries) |entry| {
-            // Reuses `type_checker.findInterfaceImplementation` (exact
-            // `.arguments` match first — picks correctly between TWO
-            // `реализация` blocks for the SAME (interface, target) at
-            // different arguments, e.g. `реализация Получатель(Число)
-            // для Пара` AND `реализация Получатель(Строка) для Пара`;
-            // falls back to a precise generic-pattern match, via
-            // `entry.target_arguments`, only when the target itself is
-            // generic and exact fails) instead of an independent copy of
-            // the same matching logic. Opts into the `ambiguous` output
-            // param — unlike `assignable`'s speculative, boolean-only
-            // uses of the same function, picking the wrong candidate
-            // HERE means compiling the wrong vtable at runtime, not just
-            // a wrong static type, so a second matching candidate is a
-            // hard error rather than "pick the first one".
+            // Переиспользует `type_checker.findInterfaceImplementation`
+            // (сначала точное совпадение `.arguments` — корректно выбирает
+            // между ДВУМЯ блоками `реализация` для ОДНОЙ пары
+            // (интерфейс, цель) с разными аргументами, например
+            // `реализация Получатель(Число) для Пара` и
+            // `реализация Получатель(Строка) для Пара`; откатывается к
+            // сопоставлению по generic-паттерну через `entry.target_arguments`
+            // только если цель сама generic и точное совпадение не найдено),
+            // а не независимую копию той же логики сопоставления.
+            // Используется выходной параметр `ambiguous` — в отличие от
+            // спекулятивных булевых вызовов той же функции в `assignable`,
+            // здесь выбор неверного кандидата означает компиляцию неверной
+            // vtable в рантайме, а не просто неверный статический тип,
+            // поэтому наличие второго подходящего кандидата — это жёсткая
+            // ошибка, а не выбор первого попавшегося.
             var ambiguous = false;
             const implementation = type_checker.findInterfaceImplementation(
                 self.compiler.checked,
@@ -631,13 +633,13 @@ const FunctionCompiler = struct {
             return;
         }
         if (try self.enumConstructor(call.callee)) |enumeration| {
-            // `arguments` (possibly name-reordered, see `ordered_arguments`
-            // above), NOT raw `call.arguments` — an enum-variant
-            // constructor called with named args in a different order
-            // than the variant's declared field order type-checked
-            // correctly against the REORDERED list but was CODEGEN'd in
-            // raw call-site order, silently building a struct whose
-            // fields held the wrong values at runtime.
+            // Используется `arguments` (возможно, переупорядоченный по
+            // именам, см. `ordered_arguments` выше), а НЕ сырой
+            // `call.arguments` — иначе для конструктора enum-варианта,
+            // вызванного с именованными аргументами не в порядке
+            // объявления полей, значения попадут не в те поля структуры
+            // в рантайме, несмотря на то что тайпчекер уже проверил
+            // переупорядоченный список.
             for (arguments) |argument| try self.compileExpression(argument);
             if (arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
             const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(enumeration) });
@@ -648,17 +650,13 @@ const FunctionCompiler = struct {
             return;
         }
         if (try self.structConstructor(call.callee)) |structure| {
-            // Same fix as the enum-variant case just above — real bug
-            // found auditing panosiki's `cli` package (`Конфигурация(флаги
-            // = ..., наименование = ..., ...)`, named args not in field
-            // declaration order): type-checking already reorders via
-            // `reorderNamedArguments`/`call_arguments`, but codegen here
-            // still zipped raw `call.arguments` positionally against the
-            // struct's DECLARED field order, silently storing each value
-            // in the wrong field slot at runtime (e.g. a `Соответствие`
-            // ending up in a `Строка`-typed slot) — a real bug, not
-            // detected by type-checking, which discards on runtime
-            // access.
+            // То же самое, что и для enum-варианта выше: тайпчекер уже
+            // переупорядочивает аргументы через
+            // `reorderNamedArguments`/`call_arguments`, поэтому здесь
+            // тоже нужен переупорядоченный `arguments`, а не сырой
+            // `call.arguments` в порядке вызова — иначе значения
+            // раскладываются по ОБЪЯВЛЕННОМУ порядку полей структуры и
+            // попадают не в те слоты в рантайме.
             for (arguments) |argument| try self.compileExpression(argument);
             if (arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
             const name_constant = try self.function.addConstant(self.compiler.result.allocator, .{ .string = try self.compiler.program().copyString(structure) });
@@ -674,22 +672,21 @@ const FunctionCompiler = struct {
         try self.function.emit(self.compiler.result.allocator, .{ .call = @intCast(arguments.len) });
     }
 
-    // `ф[Тип](...)` — explicit generic-argument call (see
-    // `specs/013-explicit-generic-args/`) — parses as `Call_Expr{
-    // callee: Index_Expr{ object, index } }`, the SAME shape as
-    // "index an array of functions, then call the result". The
-    // typechecker reinterprets this at `inferCallExpected` time when
-    // `index.object` resolves to a generic-function symbol, but codegen
-    // walks the SAME raw AST independently and would otherwise try to
-    // compile `index.index` (a compile-time-only type name, e.g.
-    // `Число`) as an ordinary runtime index operand — panos generics are
-    // never monomorphized (no per-call-site specialization exists), so
-    // the explicit type argument carries no runtime information at all;
-    // codegen only needs to skip straight to `index.object`, exactly
-    // mirroring the typechecker's `effective_callee` detection. Returns
-    // `callee` unchanged for every other shape (ordinary calls, and
-    // genuine index-then-call on a non-generic value) — zero behavior
-    // change there.
+    // `ф[Тип](...)` — явный generic-аргумент вызова — парсится как
+    // `Call_Expr{ callee: Index_Expr{ object, index } }`, точно так же,
+    // как "индексация массива функций с последующим вызовом результата".
+    // Тайпчекер переинтерпретирует это в `inferCallExpected`, когда
+    // `index.object` резолвится в generic-функцию, но кодогенерация
+    // обходит то же самое сырое AST независимо и иначе попыталась бы
+    // скомпилировать `index.index` (имя типа, существующее только на
+    // этапе компиляции, например `Число`) как обычный операнд индексации
+    // в рантайме. Дженерики паноса никогда не мономорфизируются
+    // (специализации под конкретный call site не существует), поэтому
+    // явный аргумент типа не несёт никакой информации в рантайме —
+    // кодогенерации достаточно перейти сразу к `index.object`, зеркально
+    // повторяя определение `effective_callee` в тайпчекере. Для любой
+    // другой формы (обычные вызовы и настоящая индексация-с-вызовом
+    // не-generic значения) `callee` возвращается без изменений.
     fn explicitGenericCallCallee(self: *FunctionCompiler, callee: ast.ExprId) ast.ExprId {
         const index = switch (self.compiler.tree.expr(callee).*) {
             .index => |value| value,
@@ -715,16 +712,12 @@ const FunctionCompiler = struct {
         return true;
     }
 
-    // `встроку(x)` — real gap found auditing panosiki: string
-    // interpolation (`"\(expr)"`) desugars to this exact call at PARSE
-    // time (`parser.zig`), and `резолвер.zig` has always registered
-    // "встроку" as a resolvable bare builtin name, but NOTHING ever gave
-    // it actual codegen — so EVERY interpolation containing a function
-    // call (`"\(слог.из_числа(x))"`, `"\(f())"`, ...) failed with
-    // "вызвано значение, не являющееся функцией". Reuses `vm.zig`'s
-    // `renderRuntimeValue` (built for `ввод_вывод.печать`/`.строка`) —
-    // the exact "value of any type → display string" conversion the
-    // docs already promise for `\( )` interpolation.
+    // `встроку(x)` — интерполяция строк (`"\(expr)"`) разворачивается
+    // в этот вызов ещё на этапе парсинга (`parser.zig`). Переиспользует
+    // `renderRuntimeValue` из `vm.zig` (уже используется для
+    // `ввод_вывод.печать`/`.строка`) — то же самое преобразование
+    // "значение любого типа → строка для отображения", которое
+    // документация обещает для `\( )`-интерполяции.
     fn compileToDisplayStringBuiltin(self: *FunctionCompiler, call: anytype) !bool {
         const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
         const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
@@ -886,22 +879,23 @@ const FunctionCompiler = struct {
         return false;
     }
 
-    // `DOM.*` is `aot_wasm_only` (`target.zig`'s `builtinAvailability`) —
-    // the bytecode VM (native CLI, browser interpreter) has no DOM opcode
-    // at all, only `mir_lowering.zig`/`wasm_emit.zig`'s AOT path knows how
-    // to lower it. A COMPILE-time diagnostic here would be wrong: `panos
-    // build --target=wasm` ALSO runs this same bytecode compiler as an
-    // incidental part of full analysis (`module_compiler.compileGraphForTarget`,
-    // used by every entry point, not just `panos run`) even though it
-    // never actually EXECUTES the resulting bytecode for that command — a
-    // hard compile error here would wrongly block a legitimate AOT wasm
-    // build. Instead this compiles to a genuine RUNTIME panic (same
-    // `.panic` opcode `паника(...)` uses), matching every OTHER
-    // cross-target-restricted builtin's OWN pattern
-    // (`target_policy.ensureRuntimeBuiltinAvailable` faulting inside
-    // `vm.zig`, not `compiler.zig`) — the panic only actually fires if
-    // someone runs a DOM-using program THROUGH the bytecode VM, which
-    // legitimately can never work, on any target.
+    // `DOM.*` доступен только в `aot_wasm_only` (`builtinAvailability` в
+    // `target.zig`) — байткод-VM (нативный CLI, браузерный интерпретатор)
+    // вообще не имеет опкода для DOM, его умеет опускать только AOT-путь
+    // (`mir_lowering.zig`/`wasm_emit.zig`). Диагностика на этапе
+    // компиляции здесь была бы ошибочной: `panos build --target=wasm`
+    // ТОЖЕ прогоняет этот байткод-компилятор как часть полного анализа
+    // (`module_compiler.compileGraphForTarget`, используется каждой точкой
+    // входа, не только `panos run`), даже не выполняя итоговый байткод —
+    // жёсткая ошибка компиляции здесь ошибочно заблокировала бы
+    // легитимную AOT-сборку под wasm. Поэтому вместо неё компилируется
+    // настоящая RUNTIME-паника (тот же опкод `.panic`, что и у
+    // `паника(...)`), по тому же паттерну, что и у ЛЮБОГО другого
+    // builtin с ограничением по таргету (`target_policy.
+    // ensureRuntimeBuiltinAvailable`, срабатывающий внутри `vm.zig`, а не
+    // `compiler.zig`) — паника реально срабатывает только если программу
+    // с использованием DOM запустить ЧЕРЕЗ байткод-VM, что законно
+    // невозможно ни на одном таргете.
     fn compileDomBuiltin(self: *FunctionCompiler, call: anytype) !bool {
         const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
         const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
@@ -912,12 +906,12 @@ const FunctionCompiler = struct {
         return true;
     }
 
-    // `состояние.*` is `aot_wasm_only`, same reasoning as `compileDomBuiltin`
-    // right above — a genuine RUNTIME panic, not a compile error, since
-    // this same bytecode compiler runs unconditionally as part of
-    // `panos build --target=wasm`'s own full analysis
-    // (`module_compiler.compileGraphForTarget`) even though the result
-    // is never executed for that command.
+    // `состояние.*` тоже `aot_wasm_only`, та же причина, что и у
+    // `compileDomBuiltin` выше — настоящая RUNTIME-паника, а не ошибка
+    // компиляции, так как этот же байткод-компилятор безусловно
+    // запускается как часть полного анализа `panos build --target=wasm`
+    // (`module_compiler.compileGraphForTarget`), даже не выполняя
+    // результат для этой команды.
     fn compileStateBuiltin(self: *FunctionCompiler, call: anytype) !bool {
         const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
         const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
@@ -1072,11 +1066,11 @@ const FunctionCompiler = struct {
             try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
             return true;
         }
-        // Browser-only synchronous HTTP is lowered directly by the AOT MIR
-        // backend. `compileGraphForTarget` still invokes this shared bytecode
-        // compiler for diagnostics, but the VM target rejects this builtin
-        // before execution (target.zig: aot_wasm_only), so there must not be
-        // a pretend native bytecode implementation here.
+        // Синхронный HTTP только для браузера опускается напрямую AOT MIR
+        // бэкендом. `compileGraphForTarget` всё равно вызывает этот общий
+        // байткод-компилятор для диагностики, но VM-таргет отклоняет этот
+        // builtin до выполнения (target.zig: aot_wasm_only) — поэтому
+        // здесь не должно быть притворной нативной байткод-реализации.
         if (call.arguments.len == 3 and std.mem.eql(u8, property.property, "http_запрос_sync")) {
             for (call.arguments) |argument| try self.compileExpression(argument);
             try self.emitVoid();
@@ -1118,13 +1112,13 @@ const FunctionCompiler = struct {
         for (call.arguments) |argument| try self.compileExpression(argument);
         const param_kinds = try self.compiler.program().arena.allocator().alloc(ast.ForeignMarshalKind, foreign.parameters.len);
         for (foreign.parameters, param_kinds) |parameter, *kind| kind.* = parameter.marshal;
-        // Struct-by-value field layouts — resolved from the ALREADY
-        // TYPE-CHECKED function signature (`checked.symbol_types`), not by
-        // re-resolving `parameter.struct_type_name` here: the type checker
-        // already turned each `.struct_value` parameter into a real
-        // nominal `Вектор2`/`Цвет`-style TypeId (`type_checker.zig`'s
-        // `foreignMarshalType`), so its underlying symbol is just sitting
-        // in the signature, one lookup away.
+        // Раскладка полей struct-by-value берётся из УЖЕ
+        // ПРОТИПИЗИРОВАННОЙ сигнатуры функции (`checked.symbol_types`), а
+        // не через повторный резолв `parameter.struct_type_name` здесь:
+        // тайпчекер уже превратил каждый `.struct_value`-параметр в
+        // настоящий именованный TypeId вроде `Вектор2`/`Цвет`
+        // (`foreignMarshalType` в `type_checker.zig`), так что его символ
+        // достаётся одним поиском по сигнатуре.
         const signature = self.compiler.checked.symbol_types.get(symbol);
         const function_type = if (signature) |value| self.compiler.checked.types.get(value) else null;
         const param_struct_layouts = try self.compiler.program().arena.allocator().alloc([]const ast.ForeignMarshalKind, foreign.parameters.len);
@@ -1140,10 +1134,10 @@ const FunctionCompiler = struct {
             else => null,
         } else null;
         const return_struct_layout: []const ast.ForeignMarshalKind = if (foreign.return_marshal != .struct_value) &.{} else self.ffiStructLayoutFor(return_type);
-        // `0` (never a valid function pointer) if the resolver already
-        // failed to load the library/symbol — that's already a reported
-        // diagnostic by this point, this call is unreachable in a
-        // program that actually passed resolution cleanly.
+        // `0` (никогда не валидный указатель на функцию), если резолвер
+        // уже не смог загрузить библиотеку/символ — диагностика об этом
+        // уже выдана на этом этапе, этот код недостижим для программы,
+        // которая реально прошла резолвинг без ошибок.
         const fn_ptr = self.compiler.resolution.foreign_functions.get(symbol) orelse 0;
         const constant_index = try self.function.addConstant(self.compiler.result.allocator, .{ .foreign_function = .{
             .fn_ptr = fn_ptr,
@@ -1161,11 +1155,11 @@ const FunctionCompiler = struct {
         return true;
     }
 
-    // `type_id` (a `.struct_value` parameter/return's already-resolved
-    // panos type) -> its `ff_структура`'s field marshal kinds, or `&.{}`
-    // if it isn't one (shouldn't happen for a program that type-checked
-    // cleanly, but this is compile-time metadata plumbing, not a place to
-    // introduce a NEW crash on a malformed/poisoned type).
+    // `type_id` (уже разрешённый тип паноса для `.struct_value`-параметра
+    // или возврата) -> виды маршалинга полей его `ff_структура`, либо
+    // `&.{}`, если это не она (не должно случаться для программы, прошедшей
+    // тайпчекинг без ошибок, но это компиляционная метаданные-обвязка, не
+    // место для новых паник на некорректном/poison-типе).
     fn ffiStructLayoutFor(self: *FunctionCompiler, type_id: ?types.TypeId) []const ast.ForeignMarshalKind {
         const id = type_id orelse return &.{};
         const entry = self.compiler.checked.types.get(id) orelse return &.{};
@@ -1176,12 +1170,13 @@ const FunctionCompiler = struct {
         return self.compiler.checked.ffi_struct_layouts.get(nominal_symbol) orelse &.{};
     }
 
-    // Reverse `decl_symbols` lookup (same linear-scan pattern already
-    // used by the LSP's `definitionSpan`/`preciseDeclarationSpan`,
-    // compile-time-only cost) — `внешний` decls are registered as plain
-    // `.function`-kind symbols (see `resolver.zig`'s `predeclare`), so
-    // there's no symbol-kind shortcut to tell a foreign call apart from
-    // an ordinary one without checking the actual declaration.
+    // Обратный поиск по `decl_symbols` (тот же паттерн линейного
+    // сканирования, что уже используют `definitionSpan`/
+    // `preciseDeclarationSpan` LSP — цена только на этапе компиляции) —
+    // декларации `внешний` регистрируются как обычные символы вида
+    // `.function` (см. `predeclare` в `resolver.zig`), поэтому нет
+    // способа отличить внешний вызов от обычного по виду символа без
+    // проверки самой декларации.
     fn findForeignDecl(self: *FunctionCompiler, symbol: symbols.SymbolId) ?@FieldType(ast.Decl, "foreign") {
         var iterator = self.compiler.resolution.decl_symbols.iterator();
         while (iterator.next()) |entry| {

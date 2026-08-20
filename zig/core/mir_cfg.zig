@@ -2,11 +2,11 @@ const std = @import("std");
 const mir = @import("mir.zig");
 const types = @import("types.zig");
 
-// Ported from `core/mir_cfg.odin`. Computed ON THE FLY from block
-// terminators, never stored as a synchronized graph on `mir.Function`
-// itself — a terminator is the sole source of truth for control flow (see
-// `mir.zig`'s doc comment); caching this anywhere risks it going stale
-// the moment lowering/optimization rewrites a terminator.
+// Вычисляется НА ЛЕТУ по терминаторам блоков, никогда не хранится как
+// синхронизированный граф в `mir.Function` — терминатор является
+// единственным источником истины о потоке управления (см. doc-комментарий
+// `mir.zig`); кеширование этого где-либо рискует устареть в момент, когда
+// lowering/оптимизация переписывают терминатор.
 pub const CfgInfo = struct {
     allocator: std.mem.Allocator,
     predecessors: []std.ArrayList(mir.BlockId),
@@ -22,10 +22,10 @@ pub const CfgInfo = struct {
     }
 };
 
-// Where control flow goes from a block according to ITS OWN terminator. A
-// fixed 2-element array + count (not a slice) — a terminator can never
-// have more than two successors today, and returning a slice into a local
-// array would dangle.
+// Куда уходит поток управления из блока согласно ЕГО СОБСТВЕННОМУ
+// терминатору. Фиксированный массив из 2 элементов + счётчик (не срез) —
+// у терминатора сегодня не может быть больше двух преемников, а возврат
+// среза на локальный массив привёл бы к висячей ссылке.
 pub const Successors = struct {
     blocks: [2]mir.BlockId = undefined,
     count: u2 = 0,
@@ -39,13 +39,14 @@ pub fn successors(terminator: mir.Terminator) Successors {
     };
 }
 
-// PRECONDITION: every Jump/Branch target in `function` is a valid in-range
-// block id — `predecessors` is indexed directly by raw id with no bounds
-// check (this runs on every lowered function, so a hash map here would be
-// real overhead for no benefit on trusted input). `mir_validate.zig` is
-// what actually checks that precondition on untrusted/newly-lowered MIR —
-// callers that haven't already run validation must do so first, or risk an
-// out-of-bounds index panic here instead of a clean diagnostic.
+// ПРЕДУСЛОВИЕ: каждая цель Jump/Branch в `function` — валидный id блока в
+// допустимом диапазоне — `predecessors` индексируется напрямую по сырому
+// id без проверки границ (это выполняется на каждой lowered-функции,
+// поэтому хеш-таблица здесь была бы реальным оверхедом без пользы на
+// доверенном входе). Именно `mir_validate.zig` проверяет это предусловие
+// на непроверенном/только что lowered MIR — вызывающий код, который ещё
+// не прогнал валидацию, должен сделать это сначала, иначе рискует
+// получить панику по выходу за границы массива вместо чистой диагностики.
 pub fn computeCfgInfo(allocator: std.mem.Allocator, function: *const mir.Function) !CfgInfo {
     const n = function.blocks.items.len;
     const predecessors = try allocator.alloc(std.ArrayList(mir.BlockId), n);
@@ -62,9 +63,9 @@ pub fn computeCfgInfo(allocator: std.mem.Allocator, function: *const mir.Functio
         };
     }
 
-    // Iterative post-order DFS (no recursion — a CFG can go deep on a long
-    // chain of если/иначе, and recursion risks the Zig call stack on a
-    // large enough function).
+    // Итеративный post-order DFS (без рекурсии — CFG может уйти глубоко на
+    // длинной цепочке если/иначе, а рекурсия рискует переполнить стек Zig
+    // на достаточно большой функции).
     var postorder: std.ArrayList(mir.BlockId) = .empty;
     defer postorder.deinit(allocator);
     const visited = try allocator.alloc(bool, n);
@@ -126,7 +127,7 @@ test "computeCfgInfo finds a diamond если/иначе join reachable with two
     const allocator = std.testing.allocator;
     var function = try testFunction(allocator);
     defer function.deinit(allocator);
-    // entry -> {then, else} -> join
+    // entry -> {then, else} -> join (ромб слияния если/иначе)
     try function.blocks.append(allocator, .{ .id = @enumFromInt(0), .terminator = .{ .branch = .{ .cond = @enumFromInt(0), .then_block = @enumFromInt(1), .else_block = @enumFromInt(2) } } });
     try function.blocks.append(allocator, .{ .id = @enumFromInt(1), .terminator = .{ .jump = .{ .target = @enumFromInt(3) } } });
     try function.blocks.append(allocator, .{ .id = @enumFromInt(2), .terminator = .{ .jump = .{ .target = @enumFromInt(3) } } });

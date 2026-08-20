@@ -4,13 +4,13 @@ const resolver = @import("resolver.zig");
 const source = @import("source.zig");
 const symbols = @import("symbols.zig");
 
-// Ported from `core/semantic_tokens.odin`. Classifies identifiers by the
-// resolver's ALREADY-computed `Symbol.kind` — not by regex/naming
-// convention (a regex-based highlighter can't tell a variable from a
-// function from a type by name alone, especially with Cyrillic, which has
-// no universal "Type starts with a capital letter" convention). Variant
-// order here MUST match `token_type_names` below — the index IS the
-// LSP-protocol token type (`zig/lsp/main.zig`'s legend).
+// Классифицирует идентификаторы по УЖЕ вычисленному резолвером
+// `Symbol.kind` — не по регулярным выражениям/соглашениям об именовании
+// (регекс-подсветка не может по одному лишь имени отличить переменную от
+// функции от типа, особенно с кириллицей, где нет универсального
+// соглашения "тип начинается с заглавной буквы"). Порядок вариантов здесь
+// ДОЛЖЕН совпадать с `token_type_names` ниже — индекс И ЕСТЬ тип токена
+// протокола LSP (легенда в `zig/lsp/main.zig`).
 pub const TokenType = enum(u32) {
     namespace,
     type,
@@ -27,16 +27,17 @@ pub const Token = struct {
     token_type: TokenType,
 };
 
-// Only bare identifiers (`.ident` expressions, via `resolution.expr_symbols`
-// — an expression that resolved to a concrete symbol). `.property` access
-// (`x.поле`/`x.метод()`) is NOT included: the resolver also records the
-// resolved symbol under the Property expression's OWN id (for
-// go-to-definition on a module-qualified call like `математика.пи()`) —
-// without filtering to `.ident` only, that would produce a second,
-// overlapping token spanning the whole "математика.пи", not just the
-// module name. Struct fields/methods aren't classified yet either way,
-// only module-level identifiers (variables, parameters, functions, types,
-// enum variants, module names).
+// Только "голые" идентификаторы (выражения `.ident` через
+// `resolution.expr_symbols` — выражение, разрешившееся в конкретный
+// символ). Доступ через `.property` (`x.поле`/`x.метод()`) НЕ включается:
+// резолвер также записывает разрешённый символ под СОБСТВЕННЫМ id
+// выражения Property (для перехода к определению по
+// модуль-квалифицированному вызову вроде `математика.пи()`) — без
+// фильтрации только по `.ident` это дало бы второй, перекрывающий токен
+// на весь "математика.пи", а не только на имя модуля. Поля/методы
+// структур пока не классифицируются в любом случае — только
+// идентификаторы уровня модуля (переменные, параметры, функции, типы,
+// варианты перечислений, имена модулей).
 pub fn computeSemanticTokens(allocator: std.mem.Allocator, tree: *const ast.Ast, resolution: *const resolver.Resolution) ![]Token {
     var tokens: std.ArrayList(Token) = .empty;
     errdefer tokens.deinit(allocator);
@@ -61,11 +62,11 @@ pub fn computeSemanticTokens(allocator: std.mem.Allocator, tree: *const ast.Ast,
     return tokens.toOwnedSlice(allocator);
 }
 
-// A parameter is any Symbol_Id that shows up in SOMEONE's
-// `function_parameters` — the only way to tell a parameter apart from an
-// ordinary `пер`-local (both are `SymbolKind.variable`, the difference is
-// only where the symbol came from, and `function_parameters` is the thing
-// that knows that — see `resolver.zig`'s `resolveFunctionBody`).
+// Параметром считается любой Symbol_Id, встречающийся в чьих-либо
+// `function_parameters` — единственный способ отличить параметр от
+// обычной локальной переменной `пер` (у обоих `SymbolKind.variable`,
+// разница только в происхождении символа, и именно `function_parameters`
+// об этом знает — см. `resolveFunctionBody` в `resolver.zig`).
 fn isParameterSymbol(resolution: *const resolver.Resolution, symbol_id: symbols.SymbolId) bool {
     var iterator = resolution.function_parameters.valueIterator();
     while (iterator.next()) |parameter_symbols| {
@@ -118,12 +119,11 @@ test "computeSemanticTokens does not duplicate a token for a module-qualified ca
     const allocator = std.testing.allocator;
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    // `фс` (not `строки`) — a real NATIVE builtin module
-    // (`resolver.zig`'s `installBuiltinModule`), resolvable without a full
-    // import graph/file loading; `строки` is a user-level `std/строки.ps`
-    // file in this Zig port (unlike Odin's, where it was a core builtin —
-    // see the project's own migration notes), which this single-file
-    // resolver test has no way to load.
+    // `фс` (не `строки`) — настоящий НАТИВНЫЙ встроенный модуль
+    // (`installBuiltinModule` в `resolver.zig`), разрешимый без полного
+    // графа импортов/загрузки файлов; `строки` в этом Zig-порте —
+    // пользовательский файл `std/строки.ps`, который этот однофайловый
+    // тест резолвера загрузить не может.
     const source_text =
         \\импорт фс
         \\
@@ -150,7 +150,7 @@ test "computeSemanticTokens does not duplicate a token for a module-qualified ca
         if (length > max_len) max_len = length;
     }
     try std.testing.expectEqual(@as(usize, 1), namespace_count);
-    // "фс" is 2 Cyrillic characters (4 UTF-8 bytes); a `.property`-span
-    // leak would cover "фс.есть", much longer.
+    // "фс" — 2 кириллических символа (4 байта UTF-8); утечка span'а
+    // `.property` покрыла бы "фс.есть", что заметно длиннее.
     try std.testing.expect(max_len <= 10);
 }

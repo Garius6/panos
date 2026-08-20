@@ -3,45 +3,48 @@ const ast = @import("ast.zig");
 const module_loader = @import("module_loader.zig");
 const resolver = @import("resolver.zig");
 
-// `panos build --compile` (Bun-style standalone executable) support.
+// Поддержка `panos build --compile` (автономный исполняемый файл в духе Bun).
 //
-// Design: embed SOURCE (the resolved `module_loader.Graph` closure — every
-// `.pns` file actually reached, including `std/` modules used), not
-// compiled `bytecode.Program` — that struct is fully pointer-based
-// (`ArrayList`/arena/slices, see its own doc comments), no serialization
-// format exists anywhere in this codebase, and a raw `внешний` function
-// pointer (`bytecode.Constant.foreign_function.fn_ptr`) genuinely CANNOT
-// survive serialization across process invocations (addresses aren't
-// stable between runs) — so bytecode-embedding wouldn't even solve FFI,
-// the one thing explicitly required. A standalone executable instead
-// carries its own source + `внешний`-library bytes and recompiles at
-// every startup, reusing the ordinary `module_loader.Graph`/
-// `module_compiler.compileGraph`/`vm.Vm` pipeline unchanged — a few
-// milliseconds of extra startup cost for a typical program, in exchange
-// for zero new serialization surface.
+// Дизайн: встраивается ИСХОДНЫЙ КОД (замыкание зависимостей
+// `module_loader.Graph` — каждый реально достигнутый `.pns`-файл, включая
+// используемые модули `std/`), а не скомпилированная `bytecode.Program` —
+// эта структура целиком построена на указателях (`ArrayList`/арена/срезы,
+// см. её собственные doc-комментарии), формата сериализации для неё в
+// кодовой базе нет, а сырой указатель на функцию `внешний`
+// (`bytecode.Constant.foreign_function.fn_ptr`) в принципе не переживёт
+// сериализацию между запусками процесса (адреса не стабильны между
+// запусками) — так что встраивание байткода всё равно не решило бы FFI,
+// а это как раз то, что требуется. Вместо этого автономный исполняемый файл
+// несёт с собой собственный исходный код и байты библиотек `внешний` и
+// перекомпилируется при каждом запуске, повторно используя без изменений
+// обычный конвейер `module_loader.Graph`/`module_compiler.compileGraph`/
+// `vm.Vm` — несколько миллисекунд дополнительного времени запуска для
+// типичной программы взамен на отсутствие новой поверхности сериализации.
 //
-// Bundle entries are keyed by path RELATIVE TO THE ENTRY MODULE's own
-// directory (`std.fs.path.relative`, `..`-segments included where a file
-// — e.g. a `$PANOS_STDLIB` module — lives outside that directory). At
-// runtime the whole bundle is read straight from memory via `BundleReader`
-// (the SAME duck-typed `reader` interface `module_loader.Graph.load`
-// already accepts — no real temp directory needed for `.pns` content, see
-// `BundleReader`'s own doc comment) — a real temp directory is only
-// created if the bundle contains at least one `внешний`-library entry,
-// since `dlopen`/`LoadLibraryW` fundamentally need a real file on disk.
+// Записи бандла адресуются путём ОТНОСИТЕЛЬНО СОБСТВЕННОЙ ДИРЕКТОРИИ
+// ВХОДНОГО МОДУЛЯ (`std.fs.path.relative`, включая сегменты `..` там, где
+// файл — например, модуль `$PANOS_STDLIB` — лежит вне этой директории). Во
+// время выполнения весь бандл читается прямо из памяти через
+// `BundleReader` (тот же самый duck-typed интерфейс `reader`, который уже
+// принимает `module_loader.Graph.load` — реальная временная директория для
+// содержимого `.pns` не нужна, см. doc-комментарий самого `BundleReader`) —
+// реальная временная директория создаётся только если в бандле есть хотя
+// бы одна запись библиотеки `внешний`, поскольку `dlopen`/`LoadLibraryW`
+// принципиально нуждаются в реальном файле на диске.
 
 pub const bundle_magic: [8]u8 = "PANOSBDL".*;
 pub const trailer_magic: [8]u8 = "PANOSFAT".*;
 pub const format_version: u32 = 1;
 
 pub const Entry = struct {
-    // Relative to the bundle root (the entry module's own directory at
-    // build time) — may start with "../" for a file outside it.
+    // Относительно корня бандла (собственной директории входного модуля
+    // на момент сборки) — может начинаться с "../" для файла вне неё.
     path: []const u8,
     content: []const u8,
-    // `внешний`-library bytes (must land on REAL disk at run time,
-    // `dlopen` needs a path) vs `.pns` source (served straight from
-    // memory by `BundleReader`, never touches disk).
+    // Байты библиотеки `внешний` (должны оказаться на РЕАЛЬНОМ диске во
+    // время выполнения — `dlopen` нужен путь) в противовес исходнику
+    // `.pns` (отдаётся прямо из памяти через `BundleReader`, диска не
+    // касается).
     is_library: bool,
 };
 
@@ -69,21 +72,22 @@ pub const Bundle = struct {
     }
 };
 
-// Walks every module `graph.load` already resolved (the entry file's own
-// dependency closure — local `импорт`s AND `std/` modules alike, exactly
-// what a real compile would need) plus every path-style `внешний
-// "./lib.so"` declaration reachable from them (bare-name `внешний
-// "libname"`, resolved via the OS loader's own search path, is NOT
-// embedded — v1 limitation, documented in the plan — it stays a runtime
-// system dependency exactly as it already is for an ordinary `panos
-// <file>` invocation).
+// Обходит каждый модуль, уже разрешённый `graph.load` (собственное
+// замыкание зависимостей входного файла — локальные `импорт`ы и модули
+// `std/` вместе, именно то, что нужно реальной сборке), плюс каждое
+// достижимое из них путевое объявление `внешний "./lib.so"` (объявление
+// `внешний "libname"` с голым именем, разрешаемое через собственный путь
+// поиска загрузчика ОС, НЕ встраивается — ограничение v1: остаётся
+// системной зависимостью времени выполнения точно так же, как и при
+// обычном запуске `panos <file>`).
 pub fn collect(allocator: std.mem.Allocator, io: std.Io, graph: *const module_loader.Graph, search_roots: []const []const u8) !Bundle {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const arena_allocator = arena.allocator();
 
-    // Module 0 is always the entry module (`module_loader.zig`'s own
-    // invariant — `Graph.load` appends it first, before any import).
+    // Модуль 0 — всегда входной модуль (собственный инвариант
+    // `module_loader.zig` — `Graph.load` добавляет его первым, до любого
+    // импорта).
     const entry_module_path = graph.modules.items[0].file.path;
     const root_dir = std.fs.path.dirname(entry_module_path) orelse ".";
     const entry_relative = try bundleKey(arena_allocator, root_dir, search_roots, entry_module_path);
@@ -106,28 +110,30 @@ pub fn collect(allocator: std.mem.Allocator, io: std.Io, graph: *const module_lo
                 .foreign => |value| value,
                 else => continue,
             };
-            // Bare logical name (no '/') — resolved via the OS loader's
-            // own search path, not a project-relative file; nothing to
-            // embed (see module doc comment).
+            // Голое логическое имя (без '/') — разрешается через
+            // собственный путь поиска загрузчика ОС, а не как файл
+            // относительно проекта; встраивать нечего (см. doc-комментарий
+            // модуля).
             if (std.mem.indexOfScalar(u8, foreign.library, '/') == null) continue;
 
             const library_path = try resolver.resolveForeignLibraryPath(allocator, module.file.path, foreign.library);
             defer allocator.free(library_path);
             const library_bytes = std.Io.Dir.cwd().readFileAlloc(io, library_path, allocator, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
-                // Let the ORDINARY compile path (which resolves `внешний`
-                // for real, `resolver.zig:resolveForeignFunction`) report
-                // this properly, with the right span/diagnostic — this
-                // collection pass runs BEFORE typecheck, so it can't
-                // itself distinguish "genuinely missing" from "will be
-                // reported shortly" and shouldn't try to duplicate that
-                // diagnostic.
+                // Пусть об этом как следует, с правильным span/диагностикой,
+                // сообщит ОБЫЧНЫЙ путь компиляции (который реально
+                // разрешает `внешний`, `resolver.zig:resolveForeignFunction`)
+                // — этот проход сборки бандла выполняется ДО тайпчека, так
+                // что сам не может отличить "реально отсутствует" от
+                // "вот-вот будет сообщено", и не должен дублировать эту
+                // диагностику.
                 else => continue,
             };
             defer allocator.free(library_bytes);
             const library_relative = try bundleKey(arena_allocator, root_dir, search_roots, library_path);
-            // A library referenced from more than one module (or the
-            // same module twice) — dedupe by relative path so the
-            // bundle doesn't carry duplicate multi-megabyte copies.
+            // Библиотека, на которую ссылаются из более чем одного модуля
+            // (или из одного модуля дважды) — дедуплицируется по
+            // относительному пути, чтобы бандл не нёс дублирующиеся
+            // многомегабайтные копии.
             var already_present = false;
             for (entries.items) |entry| {
                 if (entry.is_library and std.mem.eql(u8, entry.path, library_relative)) {
@@ -152,29 +158,25 @@ pub fn collect(allocator: std.mem.Allocator, io: std.Io, graph: *const module_lo
     };
 }
 
-// A module resolved via a build-time `global_search_root` (`$PANOS_STDLIB`
-// or exe-relative `std/` — bare-name imports like `импорт математика`)
-// canNOT reuse `relativize`-against-the-entry's-own-directory the way a
-// plain `импорт "./x"` local file does: at RUN time the standalone binary
-// has NO real `$PANOS_STDLIB` (the whole point is to need none), so
-// `module_loader.zig`'s bare-name candidate search — which tries each
-// `global_search_roots` entry in turn — has nothing to match against
-// unless `runFatBinary` (`zig/cli/main.zig`) supplies a SYNTHETIC root
-// pointing at `<temp_root>/std`. So any module whose real (build-time)
-// path falls under ONE of `search_roots` gets a key namespaced under
-// `"std/"` (the part of its path AFTER whichever root matched) instead
-// of a path relative to the entry module — `runFatBinary` sets its own
-// (single, synthetic) `global_search_roots = &.{temp_root ++ "/std"}` to
-// match this exactly: `module_loader`'s own candidate-building naturally
-// produces `<temp_root>/std/<name>.pns`, `BundleReader` strips the
-// `<temp_root>/` prefix, and the remainder (`"std/<name>.pns"`) is
-// EXACTLY this key. Real bug found by actually running a `--compile`d
-// binary with a `импорт математика` in it (not by reasoning alone): the
-// naive "always relative to entry dir" scheme produced a bundle key like
-// `"../Users/x/dev/panos/std/математика.pns"` that no runtime candidate
-// path could ever reconstruct without the real `$PANOS_STDLIB` being
-// present on the machine running the binary — defeating the entire
-// point of "standalone".
+// Модуль, разрешённый через `global_search_root` времени сборки
+// (`$PANOS_STDLIB` или `std/` относительно исполняемого файла — импорты с
+// голым именем вроде `импорт математика`), НЕ МОЖЕТ переиспользовать
+// `relativize`-относительно-собственной-директории-входного-модуля так,
+// как это делает обычный локальный файл `импорт "./x"`: во ВРЕМЯ
+// ВЫПОЛНЕНИЯ у автономного бинарника НЕТ реального `$PANOS_STDLIB` (в этом
+// и весь смысл — не нуждаться в нём), так что поиск кандидатов с голым
+// именем в `module_loader.zig` (который перебирает по очереди каждую
+// запись `global_search_roots`) не с чем сопоставлять, если только
+// `runFatBinary` (`zig/cli/main.zig`) не подставит СИНТЕТИЧЕСКИЙ корень,
+// указывающий на `<temp_root>/std`. Поэтому любой модуль, чей реальный
+// (времени сборки) путь попадает ПОД один из `search_roots`, получает
+// ключ, пространство имён которого — `"std/"` (часть пути ПОСЛЕ
+// совпавшего корня), вместо пути относительно входного модуля —
+// `runFatBinary` выставляет свой собственный (единственный,
+// синтетический) `global_search_roots = &.{temp_root ++ "/std"}` именно
+// под это: собственное построение кандидатов в `module_loader` естественно
+// порождает `<temp_root>/std/<name>.pns`, `BundleReader` отрезает префикс
+// `<temp_root>/`, и остаток (`"std/<name>.pns"`) — РОВНО этот ключ.
 fn bundleKey(allocator: std.mem.Allocator, root_dir: []const u8, search_roots: []const []const u8, path: []const u8) ![]const u8 {
     for (search_roots) |root| {
         if (root.len == 0) continue;
@@ -193,17 +195,14 @@ fn pathComponents(allocator: std.mem.Allocator, path: []const u8) ![][]const u8 
     return list.toOwnedSlice(allocator);
 }
 
-// Deliberately NOT `std.fs.path.relative` — that function needs the REAL
-// process CWD to make a relative `from`/`to` absolute first (no cheap way
-// to get it under this Zig version's `Io`-based `process`/`Dir` API), and
-// passing an empty placeholder produced WRONG results for this exact
-// shape (`from="."`, `to="main.pns"` — verified by running the actual
-// `--compile` output: it silently produced `"../main.pns"` instead of
-// `"main.pns"`, and the produced standalone binary failed to find its own
-// entry module at startup). `from`/`to` here always come from the SAME
-// `module_loader.Graph` (both either bare-relative-to-the-real-CWD or
-// both absolute, consistently) — a pure component-wise string diff needs
-// no CWD at all and is fully deterministic given that invariant.
+// Намеренно НЕ `std.fs.path.relative` — этой функции для начала нужен
+// РЕАЛЬНЫЙ CWD процесса, чтобы сделать относительные `from`/`to`
+// абсолютными (в этой версии Zig нет дешёвого способа его получить через
+// `Io`-based API `process`/`Dir`). `from`/`to` здесь всегда приходят из
+// ОДНОГО И ТОГО ЖЕ `module_loader.Graph` (оба либо согласованно
+// относительны реальному CWD, либо оба абсолютны) — чисто покомпонентное
+// сравнение строк не нуждается в CWD вообще и полностью детерминировано
+// при этом инварианте.
 fn relativize(allocator: std.mem.Allocator, from_dir: []const u8, to: []const u8) ![]const u8 {
     if (from_dir.len == 0 or std.mem.eql(u8, from_dir, ".")) return allocator.dupe(u8, to);
 
@@ -249,8 +248,8 @@ fn appendString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []c
     try out.appendSlice(allocator, text);
 }
 
-// Serializes ONLY the bundle payload (no trailer/length/magic — see
-// `appendTrailer` for the executable-level framing that wraps this).
+// Сериализует ТОЛЬКО полезную нагрузку бандла (без трейлера/длины/магии —
+// framing уровня исполняемого файла, оборачивающий это, см. `appendTrailer`).
 pub fn serialize(allocator: std.mem.Allocator, bundle: *const Bundle) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -328,9 +327,9 @@ pub fn deserialize(allocator: std.mem.Allocator, bytes: []const u8) !Bundle {
     };
 }
 
-// Wraps a serialized bundle in the trailer framing appended to a copy of
-// the `panos` executable: `[base binary][bundle][u64 bundle length]
-// ["PANOSFAT"]`. `readTrailer` below is the exact inverse.
+// Оборачивает сериализованный бандл в framing трейлера, дописываемый к
+// копии исполняемого файла `panos`: `[базовый бинарник][бандл][u64 длина
+// бандла]["PANOSFAT"]`. `readTrailer` ниже — точная обратная операция.
 pub fn appendTrailer(allocator: std.mem.Allocator, base_binary: []const u8, bundle_bytes: []const u8) ![]u8 {
     var out = try allocator.alloc(u8, base_binary.len + bundle_bytes.len + 16);
     errdefer allocator.free(out);
@@ -343,13 +342,12 @@ pub fn appendTrailer(allocator: std.mem.Allocator, base_binary: []const u8, bund
     return out;
 }
 
-// Reads ONLY the trailing 16 bytes first (magic + length) — the common,
-// overwhelmingly frequent case (an ORDINARY `panos <file>` invocation,
-// running the real `panos` binary with no trailer at all) must stay
-// cheap: one small positional read, not loading megabytes of the
-// binary's own code into memory on every single invocation. Only when
-// the magic actually matches does this read the (much smaller) bundle
-// payload itself.
+// Сначала читает ТОЛЬКО последние 16 байт (магия + длина) — обычный,
+// подавляюще частый случай (ОБЫЧНЫЙ запуск `panos <file>`, реальный
+// бинарник `panos` вовсе без трейлера) должен оставаться дешёвым: одно
+// маленькое позиционное чтение, а не загрузка мегабайт кода самого
+// бинарника в память на каждый запуск. Только когда магия действительно
+// совпадает, читается (гораздо меньшая) полезная нагрузка бандла.
 pub fn readTrailer(io: std.Io, allocator: std.mem.Allocator, exe_path: []const u8) !?[]u8 {
     var file = try std.Io.Dir.cwd().openFile(io, exe_path, .{});
     defer file.close(io);
@@ -366,18 +364,18 @@ pub fn readTrailer(io: std.Io, allocator: std.mem.Allocator, exe_path: []const u
     return bundle_bytes;
 }
 
-// `module_loader.Graph.load`'s duck-typed `reader` interface for a
-// bundle-backed graph — `.pns` content is served straight out of the
-// in-memory `Bundle`, never touching disk. `temp_root` is the SAME
-// prefix used to build `entry_path` for `graph.load` (see `zig/cli/
-// main.zig`'s fat-binary startup path) — every import path
-// `module_loader.zig` derives is a join starting from `entry_path`, so
-// they all stay `temp_root`-prefixed automatically; this reader just
-// strips that prefix back off to find the matching bundle entry.
-// `внешний`-library entries are NOT served through this reader at all —
-// they're written to real files under `temp_root` BEFORE `graph.load`
-// runs, so `resolver.zig`'s unmodified `dlopen`-based resolution finds
-// them directly on disk (see module doc comment).
+// Реализация duck-typed интерфейса `reader` из `module_loader.Graph.load`
+// для графа, опирающегося на бандл — содержимое `.pns` отдаётся прямо из
+// `Bundle` в памяти, диска не касаясь. `temp_root` — ТОТ ЖЕ префикс, что
+// использован для построения `entry_path` для `graph.load` (см. путь
+// запуска fat-binary в `zig/cli/main.zig`) — каждый путь импорта, который
+// выводит `module_loader.zig`, строится присоединением к `entry_path`, так
+// что все они автоматически остаются с префиксом `temp_root`; этот reader
+// просто отрезает этот префикс обратно, чтобы найти соответствующую
+// запись бандла. Записи библиотек `внешний` через этот reader вообще НЕ
+// отдаются — они записываются в реальные файлы под `temp_root` ДО запуска
+// `graph.load`, так что немодифицированное разрешение через `dlopen` в
+// `resolver.zig` находит их прямо на диске (см. doc-комментарий модуля).
 pub const BundleReader = struct {
     bundle: *const Bundle,
     temp_root: []const u8,
@@ -395,9 +393,9 @@ pub const BundleReader = struct {
 
 test "bundle round-trips through serialize/deserialize" {
     const allocator = std.testing.allocator;
-    // `serialize` only ever reads `.entry_path`/`.entries` — `.arena` is
-    // unused for a Bundle built directly from literals (nothing ever
-    // allocates through it), so there is nothing to free here.
+    // `serialize` читает только `.entry_path`/`.entries` — `.arena` не
+    // используется для Bundle, построенного напрямую из литералов (через
+    // неё ничего не аллоцируется), так что освобождать здесь нечего.
     const bundle = Bundle{
         .allocator = allocator,
         .arena = std.heap.ArenaAllocator.init(allocator),

@@ -111,10 +111,11 @@ pub fn lookupKeyword(identifier: []const u8) TokenKind {
         .{ .spelling = "выбор", .kind = .match },
         .{ .spelling = "как", .kind = .as },
         .{ .spelling = "запусти", .kind = .spawn },
-        // `выбор ожидание(...)` — select-style multi-source blocking wait,
-        // only meaningful directly after `выбор` (see `parser.zig`'s
-        // `parseMatchExpression`); a bare `ожидание` anywhere else is a
-        // parse error the same way a stray `тогда`/`конец` would be.
+        // `выбор ожидание(...)` — блокирующее ожидание из нескольких
+        // источников в стиле select; имеет смысл только сразу после
+        // `выбор` (см. `parseMatchExpression` в `parser.zig`) — одиночное
+        // `ожидание` где-либо ещё — ошибка разбора, как и лишний
+        // `тогда`/`конец`.
         .{ .spelling = "ожидание", .kind = .wait_select },
         .{ .spelling = "в", .kind = .in },
         .{ .spelling = "внешний", .kind = .foreign },
@@ -160,10 +161,11 @@ test "Russian keywords retain their Odin token kinds" {
         .{ .spelling = "выбор", .kind = .match },
         .{ .spelling = "как", .kind = .as },
         .{ .spelling = "запусти", .kind = .spawn },
-        // `выбор ожидание(...)` — select-style multi-source blocking wait,
-        // only meaningful directly after `выбор` (see `parser.zig`'s
-        // `parseMatchExpression`); a bare `ожидание` anywhere else is a
-        // parse error the same way a stray `тогда`/`конец` would be.
+        // `выбор ожидание(...)` — блокирующее ожидание из нескольких
+        // источников в стиле select; имеет смысл только сразу после
+        // `выбор` (см. `parseMatchExpression` в `parser.zig`) — одиночное
+        // `ожидание` где-либо ещё — ошибка разбора, как и лишний
+        // `тогда`/`конец`.
         .{ .spelling = "ожидание", .kind = .wait_select },
         .{ .spelling = "в", .kind = .in },
         .{ .spelling = "внешний", .kind = .foreign },

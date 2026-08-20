@@ -4,17 +4,17 @@ const source = @import("source.zig");
 const symbols = @import("symbols.zig");
 const types = @import("types.zig");
 
-// Ported from `core/mir_builder.odin`. `Builder` is a thin wrapper around
-// ONE module function, accumulating instructions into a "current" block.
-// It references the function through `module`+`function_id` (an index),
-// NEVER a raw `*mir.Function` — `module.functions.append` can reallocate
-// the backing buffer, invalidating any previously-taken pointer (same
-// discipline `ValueId`/`LocalId`/`BlockId` already enforce as plain
-// indices, not pointers). This matters even for a single top-level
-// function once lowering is extended to closures (Phase 2): a lambda
-// expression registers its OWN function lazily, mid-lowering of the
-// OUTER function's body — an `append` at that point could invalidate an
-// outer-scope `*mir.Function` a caller might otherwise have cached.
+// `Builder` — тонкая обёртка вокруг ОДНОЙ функции модуля, накапливающая
+// инструкции в "текущий" блок. Ссылается на функцию через
+// `module`+`function_id` (индекс), НИКОГДА не через сырой `*mir.Function` —
+// `module.functions.append` может переаллоцировать буфер, инвалидируя
+// любой ранее взятый указатель (та же дисциплина, что уже соблюдают
+// `ValueId`/`LocalId`/`BlockId`, будучи простыми индексами, а не
+// указателями). Это важно даже для одной верхнеуровневой функции: лямбда
+// регистрирует СВОЮ функцию лениво, посреди лоуэринга тела ВНЕШНЕЙ
+// функции — `append` в этот момент мог бы инвалидировать
+// `*mir.Function` внешней области видимости, если бы вызывающий код его
+// закэшировал.
 
 pub fn newFunction(
     module: *mir.Module,
@@ -43,15 +43,15 @@ pub const Builder = struct {
     current_block_id: mir.BlockId = mir.invalid_block,
     terminated: bool = false,
 
-    // A fresh dereference of `module.functions.items[function_id]` on
-    // EVERY call (never cached on the Builder) — see the module doc
-    // comment above for why.
+    // Свежее разыменование `module.functions.items[function_id]` при
+    // КАЖДОМ вызове (никогда не кэшируется в Builder) — см. комментарий
+    // к модулю выше.
     pub fn currentFunction(self: *Builder) *mir.Function {
         return &self.module.functions.items[@intFromEnum(self.function_id)];
     }
 
-    // Creates a builder for lowering the BODY of a function already
-    // reserved via `newFunction` — immediately opens an entry block.
+    // Создаёт builder для лоуэринга ТЕЛА функции, уже зарезервированной
+    // через `newFunction` — сразу открывает entry-блок.
     pub fn beginFunction(module: *mir.Module, allocator: std.mem.Allocator, function_id: mir.FunctionId) !Builder {
         var self = Builder{ .module = module, .allocator = allocator, .function_id = function_id };
         const entry = try self.newBlock();
@@ -94,11 +94,11 @@ pub const Builder = struct {
         return self.currentFunction().block(self.current_block_id);
     }
 
-    // `emit`/`terminate` panic if the current block is ALREADY closed —
-    // the same invariant lowering's own flow-tracking must uphold (after
-    // возврат/прервать/продолжить, lowering must not try to append to
-    // that same block) — this panic is a second, defensive line, not the
-    // primary enforcement.
+    // `emit`/`terminate` паникуют, если текущий блок УЖЕ закрыт — тот же
+    // инвариант, что должно соблюдать отслеживание потока управления
+    // самим лоуэрингом (после возврат/прервать/продолжить лоуэринг не
+    // должен пытаться добавлять инструкции в тот же блок) — эта паника
+    // лишь вторая, защитная линия, а не основной механизм проверки.
     pub fn emit(self: *Builder, instruction: mir.Instruction) !void {
         if (self.terminated) @panic("mir_builder: текущий блок уже завершён terminator'ом");
         try self.currentBlock().instructions.append(self.allocator, instruction);
@@ -145,10 +145,8 @@ test "mir_builder panics when emitting past a terminated block" {
     var builder = try Builder.beginFunction(&module, allocator, function_id);
     builder.terminate(.{ .return_value = .{ .value = null } });
 
-    // Zig has no `expectPanic` — this is exercised END-TO-END instead by
-    // `mir_lowering_test.zig`'s exhaustiveness check (a real lowering bug
-    // hitting this path would abort that test binary, same as any other
-    // Zig `@panic`), matching how this VM already treats its own internal
-    // invariant panics elsewhere (never unit-tested by triggering the
-    // panic directly).
+    // В Zig нет `expectPanic` — этот путь проверяется СКВОЗНЫМ образом
+    // через проверку исчерпывающести в `mir_lowering_test.zig` (реальный
+    // баг лоуэринга, попавший в этот путь, завершит тестовый бинарник
+    // аварийно, как любая другая `@panic` в Zig).
 }

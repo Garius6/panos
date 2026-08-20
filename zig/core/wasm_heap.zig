@@ -5,24 +5,27 @@ const types = @import("types.zig");
 const source = @import("source.zig");
 const symbols = @import("symbols.zig");
 
-// Shared MIR-construction helpers + the one bump allocator, used by BOTH
-// `wasm_actors.zig` and `wasm_objects.zig` — extracted so the two passes
-// cooperate on the SAME heap (global 0) safely: whichever pass runs
-// first creates the one `@runtime_alloc` function, the other reuses it
-// by name lookup (`findOrBuildAlloc`). Either pass's `alloc` calls read/
-// write the same global, so interleaved allocations from both passes
-// are safe by construction — nothing here needs to know which OTHER
-// pass, if any, also uses the heap.
+// Общие помощники построения MIR + единственный bump-аллокатор,
+// используемые ОБОИМИ проходами `wasm_actors.zig` и `wasm_objects.zig` —
+// вынесены сюда, чтобы оба прохода безопасно делили ОДНУ кучу
+// (global 0): какой проход выполнится первым, тот и создаст функцию
+// `@runtime_alloc`, другой переиспользует её через поиск по имени
+// (`findOrBuildAlloc`). Вызовы `alloc` из любого прохода читают/пишут
+// один и тот же global, поэтому чередующиеся аллокации из обоих
+// проходов безопасны по построению — ни одному из них не нужно знать,
+// какой ДРУГОЙ проход тоже использует кучу.
 
 pub const dummy_span: source.Span = .{ .file_id = 0, .start = 0, .end = 0 };
 pub const dummy_symbol: symbols.SymbolId = @enumFromInt(0);
 
-// Types wide enough to be a real WASM i32 (`wasm_module.wasmValTypeForStore`)
-// without inventing a new panos-level type — `ptr_type` (reused `Строка`)
-// for addresses/handles, `idx_type` (reused `Булево`) for plain integer
-// arithmetic (ring/array indices, counters) that must never collide with
-// `.binary`'s string-concat special case (which checks equality against
-// `builtins.string` specifically — `idx_type` deliberately avoids that).
+// Типы, достаточно широкие для настоящего WASM i32
+// (`wasm_module.wasmValTypeForStore`) без изобретения нового типа
+// уровня панос — `ptr_type` (переиспользует `Строка`) для адресов/
+// хэндлов, `idx_type` (переиспользует `Булево`) для обычной целочисленной
+// арифметики (индексы кольца/массива, счётчики), которая не должна
+// пересекаться со спецкейсом конкатенации строк в `.binary` (тот
+// проверяет равенство именно с `builtins.string` — `idx_type`
+// намеренно этого избегает).
 pub const PtrLayout = struct {
     ptr_type: types.TypeId,
     idx_type: types.TypeId,
@@ -54,13 +57,9 @@ pub fn boolConst(builder: *mir_builder.Builder, bool_type: types.TypeId, value: 
     return dst;
 }
 
-// `addressConst` above always emits `.address` (i32.const) — wrong for
-// an f64-typed (`Число`) value, which needs `.number` (f64.const).
-// Found as a real bug (`wasm_strings.zig`'s `@string_replace`, needing
-// an f64-typed -1.0 sentinel to compare against `@string_find`'s
-// rune-index return) — using `addressConst` there would have produced
-// an invalid module (WASM validator: "type mismatch: expected f64
-// found i32").
+// `addressConst` выше всегда эмитит `.address` (i32.const) — это не
+// годится для значения типа f64 (`Число`), которому нужен `.number`
+// (f64.const).
 pub fn numberConst(builder: *mir_builder.Builder, number_type: types.TypeId, value: f64) !mir.ValueId {
     const dst = try builder.newValue(number_type);
     try builder.emit(.{ .const_value = .{ .dst = dst, .value = .{ .number = value } } });
@@ -85,16 +84,17 @@ pub fn notOp(builder: *mir_builder.Builder, bool_type: types.TypeId, value: mir.
     return dst;
 }
 
-// This whole file's #1 rule (inherited by every caller): a `ValueId` is a
-// STACK VALUE, consumed by its single use the moment `wasm_emit.zig`
-// replays it — reusing one across two or more later instructions
-// (`mir_validate.zig`'s "single-use инвариант") is invalid MIR, not just
-// a style question. Any value needed more than once MUST go through a
-// real `Local` (store once, reload fresh at each use) — exactly what
-// `frameValue` already does for a frame pointer; `storeLocal`/
-// `loadLocal` generalize that to every other repeated value (found by
-// actually running `mir_validate.zig` over hand-built output, not by
-// reading alone, while building `wasm_actors.zig`).
+// Главное правило всего файла (наследуется каждым вызывающим кодом):
+// `ValueId` — это ЗНАЧЕНИЕ СТЕКА, потребляемое своим единственным
+// использованием в момент, когда `wasm_emit.zig` его воспроизводит —
+// повторное использование в двух и более последующих инструкциях
+// (инвариант единственного использования в `mir_validate.zig`) — это
+// невалидный MIR, а не вопрос стиля. Любое значение, нужное более
+// одного раза, ДОЛЖНО пройти через настоящий `Local` (сохранить один
+// раз, перезагружать заново при каждом использовании) — именно это
+// `frameValue` уже делает для указателя на фрейм; `storeLocal`/
+// `loadLocal` обобщают это на любое другое повторно используемое
+// значение.
 pub fn storeLocal(builder: *mir_builder.Builder, name: []const u8, type_id: types.TypeId, value: mir.ValueId) !mir.LocalId {
     const local = try builder.newLocal(dummy_symbol, name, type_id);
     try builder.emit(.{ .store_local = .{ .local = local, .src = value } });
@@ -113,8 +113,9 @@ pub fn dupeOne(module: *mir.Module, value: mir.ValueId) ![]const mir.ValueId {
 
 pub const alloc_function_name = "@runtime_alloc";
 
-// 64 KiB — the fixed WASM page size (`memory.size`/`memory.grow` always
-// operate in units of this, never bytes directly).
+// 64 KiB — фиксированный размер страницы WASM (`memory.size`/
+// `memory.grow` всегда оперируют в этих единицах, никогда напрямую в
+// байтах).
 const wasm_page_bytes: u32 = 65536;
 
 fn buildAlloc(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
@@ -128,43 +129,33 @@ fn buildAlloc(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     try builder.emit(.{ .load_local = .{ .dst = size, .local = size_local } });
     const ptr = try builder.newValue(layout.ptr_type);
     try builder.emit(.{ .global_get = .{ .dst = ptr, .global = 0 } });
-    const ptr_local = try storeLocal(&builder, "ptr", layout.ptr_type, ptr); // `ptr` used twice below (add, return) — must go through a Local
+    const ptr_local = try storeLocal(&builder, "ptr", layout.ptr_type, ptr); // `ptr` используется ниже дважды (сложение, возврат) — обязан идти через Local
     const ptr_for_add = try loadLocal(&builder, ptr_local, layout.ptr_type);
-    // Result typed `idx_type`, not `ptr_type` (`builtins.string`) —
-    // `.binary`'s codegen special-cases ANY result typed `builtins.string`
-    // as string concatenation (`wasm_emit.zig`), which silently
-    // miscompiled this bump-pointer arithmetic into a call to a host
-    // string-concat import that then had to be declared but was never
-    // actually reachable at runtime (confirmed via wasmtime: "unknown
-    // import: env::pw_string_concat" even though no code path called it).
-    // `global_set` only cares about the underlying WASM primitive (i32,
-    // same for both `idx_type`/`ptr_type` here), so no conversion needed.
+    // Результат типизирован как `idx_type`, а не `ptr_type`
+    // (`builtins.string`) — кодогенерация `.binary` спецкейсит ЛЮБОЙ
+    // результат типа `builtins.string` как конкатенацию строк
+    // (`wasm_emit.zig`), что превратило бы эту арифметику
+    // bump-указателя в вызов хостового string-concat импорта.
+    // `global_set` заботится только о базовом примитиве WASM (i32,
+    // одинаковом для `idx_type`/`ptr_type` здесь), так что конвертация
+    // не нужна.
     const new_ptr = try binOp(&builder, layout.idx_type, .add, ptr_for_add, size);
     const new_ptr_local = try storeLocal(&builder, "new_ptr", layout.idx_type, new_ptr);
 
-    // Real bug found running a synthetic serialize/parse benchmark: this
-    // bump pointer never checked against the module's ACTUAL memory size
-    // at all — any allocation past the initial page count (fixed at
-    // compile time, `wasm_emit.zig`'s `actor_heap_base` computation)
-    // trapped with a raw "memory access out of bounds" on the very next
-    // read/write through the returned pointer, the first time a program
-    // allocated enough (a few thousand small strings — no GC exists here
-    // to reclaim any of them either) to walk past it. Grow the memory
-    // FIRST, only when actually needed, before ever handing out a
-    // pointer past the current boundary.
-    // A MIR `compare`/`binary` instruction doesn't re-push its operands —
-    // it consumes whatever's already on the WASM stack, in the order
-    // those operands were EMITTED (program order), regardless of which
-    // one is written as `lhs`/`rhs` in this Zig code. Real bug found
-    // running this against a real allocation-heavy program: emitting
-    // `current_bytes`'s computation before reloading `new_ptr_for_cmp`
-    // put `current_bytes` UNDER `new_ptr` on the stack, so `i32.gt_s`
-    // (which pops top-as-c2, next-as-c1) actually computed
-    // `current_bytes > new_ptr` — the exact opposite of the intended
-    // check — so growth was silently never triggered and the module
-    // still trapped at the old boundary. `new_ptr_for_cmp` MUST be
-    // loaded first here to land at the bottom of the two-operand stack
-    // window matching `cmpOp`'s `lhs` argument.
+    // Bump-указатель нужно сверять с ФАКТИЧЕСКИМ размером памяти
+    // модуля — аллокация за пределами начального числа страниц
+    // (зафиксированного на этапе компиляции, `wasm_emit.zig`'s
+    // `actor_heap_base`) иначе трапнет с "memory access out of bounds"
+    // при первом же чтении/записи через возвращённый указатель. Память
+    // нужно растить СНАЧАЛА, только когда это реально требуется, до
+    // того как указатель за текущей границей будет кому-то отдан.
+    // Инструкция MIR `compare`/`binary` не проталкивает свои операнды
+    // заново — она потребляет то, что уже лежит на стеке WASM, в
+    // порядке ЭМИССИИ (порядке программы), независимо от того, что
+    // в этом Zig-коде записано как `lhs`/`rhs`. `new_ptr_for_cmp`
+    // ОБЯЗАН быть загружен первым здесь, чтобы оказаться снизу
+    // двухоперандного окна стека, соответствуя аргументу `lhs` в
+    // `cmpOp`.
     const new_ptr_for_cmp = try loadLocal(&builder, new_ptr_local, layout.idx_type);
     const pages = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .memory_size = .{ .dst = pages } });
@@ -172,32 +163,31 @@ fn buildAlloc(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     const current_bytes = try binOp(&builder, layout.idx_type, .multiply, pages, page_bytes_const);
     const needs_growth = try cmpOp(&builder, layout.bool_type, .greater, new_ptr_for_cmp, current_bytes);
 
-    // Single branch level only — `wasm_stackify.zig`'s merge-point
-    // detection (`findMerge`) relies on the CFG staying REDUCIBLE the way
-    // `mir_lowering.zig`'s own если/иначе lowering always produces it
-    // (each branch's merge is a block dominated ONLY by that branch).
-    // A second, nested branch inside `grow_block` sharing the SAME
-    // `ok_block` merge as the outer branch breaks that (`ok_block`'s
-    // dominator becomes the outer branch, not `grow_block`) — confirmed
-    // as a real bug: it compiled but wasmtime rejected the module
-    // ("invalid var_i32: integer too large", a corrupted LEB128 from the
-    // stackifier misplacing block boundaries). Fixed by not branching a
-    // second time on `memory.grow`'s result at all — an actual growth
-    // failure (host memory limit hit) just falls through to the same
-    // "memory access out of bounds" trap this bug fixes the COMMON case
-    // of, on the very next read/write past the boundary; genuinely
-    // running out of host memory is not something this allocator can
-    // recover from either way.
+    // Только один уровень ветвления — определение точки слияния
+    // (`findMerge`) в `wasm_stackify.zig` полагается на то, что CFG
+    // остаётся РЕДУЦИРУЕМЫМ, как его всегда порождает лоуеринг если/
+    // иначе в `mir_lowering.zig` (слияние каждой ветви — блок,
+    // доминируемый ТОЛЬКО этой ветвью). Второе, вложенное ветвление
+    // внутри `grow_block`, делящее ТО ЖЕ слияние `ok_block`, что и
+    // внешняя ветвь, это нарушает (доминатором `ok_block` становится
+    // внешняя ветвь, а не `grow_block`). Поэтому по результату
+    // `memory.grow` ветвление вообще не делается второй раз: реальный
+    // сбой роста (упёрлись в лимит памяти хоста) просто проваливается
+    // в тот же трап "memory access out of bounds" при следующем
+    // чтении/записи за границей — по-настоящему закончившаяся память
+    // хоста всё равно не то, из чего этот аллокатор способен
+    // восстановиться.
     const grow_block = try builder.newBlock();
     const ok_block = try builder.newBlock();
     builder.terminate(.{ .branch = .{ .cond = needs_growth, .then_block = grow_block, .else_block = ok_block } });
 
     builder.setCurrentBlock(grow_block);
     const new_ptr_for_grow = try loadLocal(&builder, new_ptr_local, layout.idx_type);
-    // `pages`/`page_bytes_const` (used above, in the branch condition)
-    // are stack values already consumed by that one use — re-derive
-    // fresh copies here rather than reusing them (single-use invariant,
-    // see the file-level comment on `ValueId`).
+    // `pages`/`page_bytes_const` (использованы выше, в условии ветвления)
+    // — значения стека, уже потреблённые тем единственным
+    // использованием — здесь заново выводим свежие копии вместо
+    // переиспользования (инвариант единственного использования, см.
+    // комментарий на уровне файла про `ValueId`).
     const pages_fresh = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .memory_size = .{ .dst = pages_fresh } });
     const page_bytes_const2 = try addressConst(&builder, layout.idx_type, wasm_page_bytes);
@@ -221,45 +211,45 @@ fn buildAlloc(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
 
 pub const permanent_alloc_function_name = "@runtime_alloc_permanent";
 
-// Global 1: the permanent-region bump pointer (mutable, starts at
-// `actor_heap_base`, per `wasm_emit.zig`'s memory layout). Global 2: an
-// IMMUTABLE ceiling constant — the fixed boundary between the permanent
-// region and the arena (`global 0`) — `wasm_emit.zig` computes and
-// writes its real value at final module assembly, AFTER this function
-// has already been built as MIR; referencing it by global INDEX here
-// (rather than needing the actual numeric value at MIR-construction
-// time) is what makes that ordering work, the same way `buildAlloc`
-// above only ever needs to know global 0's INDEX, never its value.
+// Global 1: bump-указатель постоянной области (изменяемый, стартует с
+// `actor_heap_base` по разметке памяти из `wasm_emit.zig`). Global 2:
+// НЕИЗМЕНЯЕМАЯ константа-потолок — фиксированная граница между
+// постоянной областью и ареной (`global 0`) — `wasm_emit.zig`
+// вычисляет и записывает её реальное значение при финальной сборке
+// модуля, УЖЕ ПОСЛЕ того, как эта функция построена как MIR;
+// обращение к ней по ИНДЕКСУ global (а не по фактическому числовому
+// значению на момент построения MIR) — то, что делает этот порядок
+// рабочим, точно так же как `buildAlloc` выше нужен только ИНДЕКС
+// global 0, но никогда не его значение.
 pub const permanent_heap_global_index: u32 = 1;
 pub const permanent_ceiling_global_index: u32 = 2;
 
-// Fixed budget for the permanent region — one WASM page. Generous for
-// the actual use case (a handful of small DOM-handler context-id
-// strings), a documented Phase 1 limitation otherwise (see
-// `buildAllocPermanent`'s own doc comment) — consumed by
-// `wasm_emit.zig` to size the reserved gap in the module's memory
-// layout.
+// Фиксированный бюджет постоянной области — одна страница WASM. С
+// запасом для реального сценария использования (горстка мелких строк
+// context-id обработчиков DOM), задокументированное ограничение Phase 1
+// в остальном (см. doc-комментарий `buildAllocPermanent`) —
+// используется `wasm_emit.zig` для расчёта размера зарезервированного
+// промежутка в разметке памяти модуля.
 pub const permanent_reserved_bytes: u32 = 65536;
 
-// Phase 1 GC (arena reset at every JS-invoked entry-point call,
-// `wasm_gc_arena.zig`) needs SOMETHING to survive the reset — a DOM
-// delayed callback context (`DOM.после_кадра`) or a click closure,
-// which JS captures RAW across two SEPARATE future export calls (see
-// `project_panos_elm_architecture_dom_storage_design`/this session's
-// research — confirmed live in `demo/todo-app/frontend/main.pns`'s
-// `обработать_переключить`). An unconditional arena reset would free
-// that string out from under JS on the very next click. This second,
-// non-resettable bump region is where such values get PROMOTED (copied)
-// at the exact delayed-callback/closure lowering site
-// (`mir_lowering.zig`) — everything else keeps going through the
-// ordinary arena (`buildAlloc`/global 0).
+// Сборщику мусора Phase 1 (сброс арены при каждом вызове точки входа
+// со стороны JS, `wasm_gc_arena.zig`) нужно, чтобы ЧТО-ТО пережило
+// сброс — контекст отложенного колбэка DOM (`DOM.после_кадра`) или
+// замыкание клика, которые JS захватывает НАПРЯМУЮ через два ОТДЕЛЬНЫХ
+// будущих вызова экспорта. Безусловный сброс арены освободил бы эту
+// строку из-под JS на самом следующем клике. Эта вторая,
+// не сбрасываемая bump-область — куда такие значения ПРОМОУТЯТСЯ
+// (копируются) точно на месте лоуеринга отложенного колбэка/замыкания
+// (`mir_lowering.zig`) — всё остальное продолжает идти через обычную
+// арену (`buildAlloc`/global 0).
 //
-// Deliberately NOT growable via `memory.grow` like the arena — fixed
-// budget (`wasm_emit.zig`'s reserved gap), trapping with a clear
-// diagnostic if exceeded. A real per-object collector (Phase 2, see
-// `project_panos_elm_architecture_dom_storage_design`) would replace
-// this workaround with a genuine GC root instead of a capacity limit;
-// Phase 1 accepts the limit as documented scope, not a silent failure.
+// Намеренно НЕ растёт через `memory.grow`, в отличие от арены —
+// фиксированный бюджет (зарезервированный промежуток в
+// `wasm_emit.zig`), трапает с понятной диагностикой при превышении.
+// Настоящий поэкземплярный сборщик (Phase 2) заменил бы этот обходной
+// путь настоящим корнем GC вместо ограничения ёмкости; Phase 1
+// принимает лимит как задокументированную границу объёма, а не тихий
+// отказ.
 fn buildAllocPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, permanent_alloc_function_name, dummy_symbol, layout.ptr_type, dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -276,11 +266,11 @@ fn buildAllocPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_s
     const new_ptr = try binOp(&builder, layout.idx_type, .add, ptr_for_add, size);
     const new_ptr_local = try storeLocal(&builder, "new_ptr", layout.idx_type, new_ptr);
 
-    // Operand emission order matters for the stack machine, not
-    // declared `lhs`/`rhs` — see `buildAlloc`'s own comment on this
-    // exact class of bug (found and fixed there first). `new_ptr`
-    // loaded first, `ceiling` second, so `.greater`'s `lhs`/`rhs`
-    // actually lines up with the emitted stack order.
+    // Для стековой машины важен порядок ЭМИССИИ операндов, а не то,
+    // что объявлено как `lhs`/`rhs` — см. комментарий `buildAlloc` про
+    // этот же класс проблемы. `new_ptr` загружается первым, `ceiling`
+    // вторым, чтобы `lhs`/`rhs` в `.greater` действительно совпадали
+    // с порядком на стеке.
     const new_ptr_for_cmp = try loadLocal(&builder, new_ptr_local, layout.idx_type);
     const ceiling = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .global_get = .{ .dst = ceiling, .global = permanent_ceiling_global_index } });
@@ -306,13 +296,14 @@ pub fn findOrBuildAllocPermanent(allocator: std.mem.Allocator, module: *mir.Modu
     return buildAllocPermanent(allocator, module, type_store, layout);
 }
 
-// Byte-for-byte copy loop, `count_local` bytes from `src_base_local` to
-// `dst_base_local` — duplicated from `wasm_strings.zig`'s own (private)
-// `emitByteCopyLoop` rather than importing it: `wasm_strings.zig`
-// already imports THIS file (`wasm_heap.zig`) as the shared lower-level
-// substrate, so the reverse import would be circular. Kept in exact
-// lockstep with that version's shape (same instruction sequence,
-// same "byte reloaded before dst_addr is computed" stack-order note).
+// Побайтовый цикл копирования `count_local` байт из `src_base_local` в
+// `dst_base_local` — продублирован из собственной (приватной)
+// `emitByteCopyLoop` в `wasm_strings.zig`, а не импортирован оттуда:
+// `wasm_strings.zig` уже импортирует ЭТОТ файл (`wasm_heap.zig`) как
+// общий низкоуровневый субстрат, так что обратный импорт был бы
+// циклическим. Держится в точном соответствии с той версией (та же
+// последовательность инструкций, тот же порядок стека — байт
+// перезагружается до вычисления `dst_addr`).
 fn emitByteCopyLoop(builder: *mir_builder.Builder, layout: PtrLayout, src_base_local: mir.LocalId, dst_base_local: mir.LocalId, count_local: mir.LocalId) !void {
     const i_local = try builder.newLocal(dummy_symbol, "@i", layout.idx_type);
     const zero = try addressConst(builder, layout.idx_type, 0);
@@ -354,14 +345,14 @@ fn emitByteCopyLoop(builder: *mir_builder.Builder, layout: PtrLayout, src_base_l
 
 pub const promote_to_permanent_function_name = "@promote_to_permanent";
 
-// `@promote_to_permanent(src: Строка) -> Строка`: copies a whole
-// length-prefixed string (`[u32 byte_length][bytes...]` — see
-// `wasm_strings.zig`'s own doc comment for this layout) from wherever
-// it currently lives (arena, or even the read-only data section for a
-// literal) into the permanent region, byte-for-byte including its
-// length header — the copy doesn't need to interpret the length at
-// all beyond using it as the byte count, since the header is just the
-// first 4 bytes of the very same buffer being copied.
+// `@promote_to_permanent(src: Строка) -> Строка`: копирует целиком
+// строку с префиксом длины (`[u32 byte_length][bytes...]` — см. про
+// эту раскладку doc-комментарий `wasm_strings.zig`) откуда бы она ни
+// жила сейчас (арена или даже секция read-only данных для литерала) в
+// постоянную область, байт-в-байт вместе с заголовком длины — копии не
+// нужно интерпретировать длину вообще, кроме как использовать её как
+// счётчик байт, поскольку заголовок — это просто первые 4 байта того
+// же самого копируемого буфера.
 fn buildPromoteToPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, promote_to_permanent_function_name, dummy_symbol, layout.ptr_type, dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -396,16 +387,17 @@ pub fn findOrBuildPromoteToPermanent(allocator: std.mem.Allocator, module: *mir.
 
 pub const promote_bytes_to_permanent_function_name = "@promote_bytes_to_permanent";
 
-// `@promote_bytes_to_permanent(src: Строка, size: idx) -> Строка`: like
-// `@promote_to_permanent` above, but `size` is an explicit RUNTIME
-// argument instead of read from a length-prefix header — for copying a
-// fixed-size raw block with no such header, e.g. a WASM AOT closure's
-// environment allocation (`mir_lowering.zig`'s closure-based `на_клик`
-// lowering, Stage B — the closure's ENV/BOX must live in the permanent
-// region too, not just its (currently scalar-only) captured VALUES, or
-// the box pointer itself would dangle across the next arena reset —
-// same class of problem `@promote_to_permanent` already solves for
-// a delayed callback's context string, one level up the pointer chain).
+// `@promote_bytes_to_permanent(src: Строка, size: idx) -> Строка`: как
+// `@promote_to_permanent` выше, но `size` — явный аргумент ВРЕМЕНИ
+// ВЫПОЛНЕНИЯ, а не читается из заголовка-префикса длины — для
+// копирования сырого блока фиксированного размера без такого
+// заголовка, например аллокации окружения замыкания WASM AOT (лоуеринг
+// `на_клик` на основе замыканий в `mir_lowering.zig` — ENV/BOX
+// замыкания тоже должны жить в постоянной области, не только его
+// (пока только скалярные) захваченные ЗНАЧЕНИЯ, иначе сам указатель
+// box повис бы после следующего сброса арены — тот же класс проблемы,
+// что `@promote_to_permanent` уже решает для строки контекста
+// отложенного колбэка, на уровень выше по цепочке указателей).
 fn buildPromoteBytesToPermanent(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, promote_bytes_to_permanent_function_name, dummy_symbol, layout.ptr_type, dummy_span);
     var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
@@ -432,14 +424,13 @@ pub fn findOrBuildPromoteBytesToPermanent(allocator: std.mem.Allocator, module: 
     return buildPromoteBytesToPermanent(allocator, module, type_store, layout);
 }
 
-// Real bug found while extracting this from `wasm_actors.zig`: the
-// original had a process-global `var g_alloc_id: ?mir.FunctionId = null`
-// cache — stale across separate compilations within the same process
-// (e.g. this codebase's own multi-case `zig test` runs), since a
-// `FunctionId` is only valid for the ONE `mir.Module` it was allocated
-// in. Fixed by dropping the cache entirely — `findFunctionByName` is a
-// cheap linear scan, called at most a handful of times per compile, no
-// need to cache across compiles at all.
+// Кэш по имени функции не хранится намеренно: `FunctionId` валиден
+// только для ОДНОГО `mir.Module`, в котором был выделен — процесс-
+// глобальный кэш был бы устаревшим между отдельными компиляциями в
+// рамках одного процесса (например, между кейсами `zig test`).
+// `findFunctionByName` — дешёвое линейное сканирование, вызывается не
+// более нескольких раз за компиляцию, кэшировать между компиляциями
+// незачем вовсе.
 pub fn findOrBuildAlloc(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: PtrLayout) !mir.FunctionId {
     if (findFunctionByName(module, alloc_function_name)) |id| return id;
     return buildAlloc(allocator, module, type_store, layout);

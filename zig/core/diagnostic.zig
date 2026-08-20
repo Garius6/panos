@@ -56,10 +56,11 @@ pub const FormatError = error{
     InvalidSpan,
 };
 
-/// Renders one diagnostic as `путь:строка:колонка: сообщение`, using the
-/// exact `SourceFile` the diagnostic's span belongs to. `file.id` must match
-/// `value.span.file_id` — callers with only a `Graph` should use `writeGraph`
-/// instead, which resolves the right file per diagnostic itself.
+/// Отображает один диагностический объект как `путь:строка:колонка: сообщение`,
+/// используя тот `SourceFile`, которому принадлежит span диагностики. `file.id`
+/// должен совпадать с `value.span.file_id` — вызывающим, у которых есть только
+/// `Graph`, следует использовать `writeGraph`, который сам находит нужный файл
+/// для каждой диагностики.
 pub fn format(
     allocator: std.mem.Allocator,
     file: source.SourceFile,
@@ -80,10 +81,10 @@ pub fn format(
     );
 }
 
-/// Writes every diagnostic in `diagnostics`, one per line, resolving each
-/// one's source file through `graph`. A diagnostic whose file cannot be
-/// found in `graph` (e.g. a graph-level diagnostic with no specific file)
-/// falls back to printing its bare message.
+/// Выводит каждую диагностику из `diagnostics`, по одной на строку, находя
+/// исходный файл каждой через `graph`. Если файл диагностики не найден в
+/// `graph` (например, диагностика уровня графа без привязки к конкретному
+/// файлу), выводится только голое сообщение.
 pub fn writeGraph(
     writer: *std.Io.Writer,
     graph: *const module_loader.Graph,

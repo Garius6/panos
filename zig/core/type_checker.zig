@@ -38,9 +38,9 @@ pub const InterfaceMethod = struct {
     name: []const u8,
     parameters: []const types.TypeId,
     return_type: types.TypeId,
-    // Non-null when this method has a default body (`interfacePass`) —
-    // the compiled function an implementor falls back to when it
-    // doesn't override this method itself (`defineInterfaceImplementation`).
+    // Не null, если у метода есть тело по умолчанию (`interfacePass`) —
+    // скомпилированная функция, к которой откатывается реализация, не
+    // переопределившая этот метод сама (`defineInterfaceImplementation`).
     default_symbol: ?symbols.SymbolId = null,
 };
 
@@ -60,10 +60,10 @@ pub const InterfaceCastEntry = struct {
     interface: symbols.SymbolId,
     arguments: []const types.TypeId,
     target: symbols.SymbolId,
-    // The target's OWN generic instantiation at this cast site (e.g.
-    // `Отображённый(Число, Строка)`'s `[Число, Строка]`) — needed by
-    // `findInterfaceImplementation`'s generic-pattern fallback when the
-    // compiler re-resolves the vtable at codegen time.
+    // Собственная генерик-инстанциация target в точке приведения (например,
+    // `[Число, Строка]` для `Отображённый(Число, Строка)`) — нужна
+    // резервному пути по генерик-шаблону в `findInterfaceImplementation`,
+    // когда компилятор повторно разрешает vtable на этапе кодогенерации.
     target_arguments: []const types.TypeId,
 };
 
@@ -86,65 +86,61 @@ pub const ImportedSymbolType = struct {
     symbol: symbols.SymbolId,
     store: *const types.TypeStore,
     type_id: types.TypeId,
-    // Non-null when the imported symbol is a GENERIC FREE FUNCTION (`функ
-    // ф[T: Интерфейс](...)`) — the source module's own, UNREMAPPED
-    // generic-parameter TypeIds/bounds (bound interface symbols are
-    // still the SOURCE module's local symbols here; the importer remaps
-    // them via `imports.nominals` when consuming this). Real gap found
-    // auditing panosiki's `pan` (`томл.сериализовать_из(манифест)` —
-    // `std/кодирование/toml.ps`'s `сериализовать_из[T: ВTOML](это: T)`
-    // called cross-module): without this, `copyImportedType`'s
-    // `.generic_parameter` case had no remap to consult and silently
-    // degraded `T` to `poison` for ANY cross-module generic function
-    // call — `poison` is universally assignable, so the call
-    // type-checked with zero diagnostics, but the callee's compiled
-    // body still expected `это` to arrive already `Cast_Interface`'d
-    // (see `interfaceBoundOf`/`inferGenericBoundInterfaceCall`, which
-    // never fired here since `generic_function_parameters` was never
-    // populated for the imported symbol either) — a silent, guaranteed
-    // "Runtime Error: попытка вызвать интерфейсный метод у не-интерфейса"
-    // crash on the very first real cross-module use of this pattern.
+    // Не null, если импортируемый символ — ГЕНЕРИК-ФУНКЦИЯ верхнего уровня
+    // (`функ ф[T: Интерфейс](...)`): собственные, НЕ ПЕРЕОТОБРАЖЁННЫЕ
+    // TypeId/ограничения генерик-параметров исходного модуля (символы
+    // ограничивающих интерфейсов здесь всё ещё локальные символы ИСХОДНОГО
+    // модуля; импортёр переотображает их через `imports.nominals` при
+    // использовании). Без этого поля `copyImportedType` в ветке
+    // `.generic_parameter` не имела бы соответствия для переотображения и
+    // молча вырождала бы `T` в `poison` для любого межмодульного вызова
+    // генерик-функции — `poison` совместим с чем угодно, поэтому вызов
+    // проходил тайпчек без единой диагностики, но скомпилированное тело
+    // вызываемой функции всё равно ожидало, что `это` придёт уже
+    // приведённым через `Cast_Interface`.
     generic_parameters: ?[]const GenericParameter = null,
 };
 
 pub const ImportedNominal = struct {
-    // Store in which `source_symbol` appears in an imported signature.
+    // Хранилище, в котором `source_symbol` встречается в импортируемой сигнатуре.
     store: *const types.TypeStore,
-    // Store that owns fields, variants and generic parameters of the
-    // nominal's declaration. These differ for a transitive import: module B
-    // refers to C.Type through B's local TypeStore, while C owns Type's
-    // definition.
+    // Хранилище, владеющее полями, вариантами и генерик-параметрами
+    // объявления номинального типа. Они различаются для транзитивного
+    // импорта: модуль B ссылается на C.Тип через собственный локальный
+    // TypeStore модуля B, тогда как определением Тип владеет C.
     definition_store: *const types.TypeStore,
     source_symbol: symbols.SymbolId,
     local_symbol: symbols.SymbolId,
     identity: u32,
     fields: ?[]const NominalField = null,
-    // References the source module's own `EnumDefinition.variants` directly
-    // (alive for the whole graph compile) — only `.name`/`.fields` are used;
-    // `.symbol` is the source module's own variant symbol, irrelevant here
-    // since the local variant symbol is looked up by name instead.
+    // Прямая ссылка на `EnumDefinition.variants` исходного модуля (живо
+    // на весь компилируемый граф) — используются только `.name`/`.fields`;
+    // `.symbol` — собственный символ варианта исходного модуля, здесь не
+    // важен, так как локальный символ варианта ищется по имени отдельно.
     enum_variants: ?[]const EnumVariant = null,
-    // Non-null for a generic owner (struct, enum or interface) — the source
-    // module's own generic-parameter TypeIds; importSignaturePass mints fresh
-    // local ones, remaps through them for `fields`/`enum_variants`/
-    // `interface_methods`, and reuses the same remap for that owner's
-    // imported methods.
+    // Не null для генерик-владельца (структура, перечисление или
+    // интерфейс) — собственные TypeId генерик-параметров исходного
+    // модуля; importSignaturePass чеканит свежие локальные, переотображает
+    // через них `fields`/`enum_variants`/`interface_methods`, и то же
+    // переотображение переиспользуется для импортированных методов этого
+    // владельца.
     generic_parameters: ?[]const GenericParameter = null,
-    // References the source module's own `InterfaceDefinition.methods`
-    // directly (alive for the whole graph compile), non-null when this
-    // nominal is itself an INTERFACE declared in another module — lets a
-    // THIRD module implement/bound-check against an interface it never
-    // declared itself (`реализация чужой_модуль.Интерфейс для Тип`).
+    // Прямая ссылка на `InterfaceDefinition.methods` исходного модуля
+    // (живо на весь компилируемый граф), не null, если этот номинальный
+    // тип сам является ИНТЕРФЕЙСОМ, объявленным в другом модуле —
+    // позволяет ТРЕТЬЕМУ модулю реализовать интерфейс/проверить
+    // ограничение по интерфейсу, который он сам никогда не объявлял
+    // (`реализация чужой_модуль.Интерфейс для Тип`).
     interface_methods: ?[]const InterfaceMethod = null,
-    // Parallel to `interface_methods` (same length) — the LOCAL (this
-    // module's own) synthetic symbol standing in for
-    // `interface_methods[i]`'s default-method body, or `null` if that
-    // method has no default. `interface_methods[i].default_symbol`
-    // itself is a symbol in the SOURCE module's own symbol space,
-    // meaningless here — `module_compiler.zig` mints a real local
-    // stand-in (same "synthetic symbol + imports.functions" pattern
-    // already used for inherent methods) and threads it through here,
-    // since only it has a mutable `resolver.Resolution` to mint into.
+    // Параллельно `interface_methods` (та же длина) — ЛОКАЛЬНЫЙ (этого
+    // модуля) синтетический символ, замещающий тело метода по умолчанию
+    // `interface_methods[i]`, либо `null`, если у метода нет значения по
+    // умолчанию. Сам `interface_methods[i].default_symbol` — символ в
+    // пространстве символов ИСХОДНОГО модуля, здесь бессмыслен —
+    // `module_compiler.zig` чеканит настоящий локальный заменитель (тот
+    // же паттерн "синтетический символ + imports.functions", что уже
+    // используется для собственных методов) и прокидывает его сюда, так
+    // как только он владеет изменяемым `resolver.Resolution` для чеканки.
     default_method_symbols: ?[]const ?symbols.SymbolId = null,
 };
 
@@ -157,28 +153,30 @@ pub const ImportedMethod = struct {
     parameter_names: []const []const u8 = &.{},
 };
 
-// An owner's interface implementation, re-hosted from the source module.
-// `interface_name` is resolved by name in the IMPORTER's own scope (every
-// file gets its own local prelude "Сравниваемое" symbol, so the source
-// module's raw interface Symbol_Id is never valid here) — `method_names`
-// are matched by name against methods already registered via `ImportContext.
-// methods` (interface-impl methods are ordinary inherent methods too, see
-// `module_loader.zig`'s `collectMethods`), so no separate FunctionId
-// re-hosting is needed for this list itself.
+// Реализация интерфейса владельцем, перенесённая из исходного модуля.
+// `interface_name` разрешается по имени в собственной области видимости
+// ИМПОРТЁРА (у каждого файла свой локальный символ прелюдии "Сравниваемое",
+// поэтому исходный Symbol_Id интерфейса здесь никогда не валиден) —
+// `method_names` сопоставляются по имени с методами, уже
+// зарегистрированными через `ImportContext.methods` (методы реализации
+// интерфейса — это обычные собственные методы, см. `collectMethods` в
+// `module_loader.zig`), так что отдельного переноса FunctionId для этого
+// списка не требуется.
 pub const ImportedImpl = struct {
     owner: symbols.SymbolId,
     interface_name: []const u8,
-    // Set when the interface itself is QUALIFIED (`реализация
-    // Модуль.Интерфейс для ...`, e.g. codegen's `json.ВJSON`) AND the
-    // importing module has its own local symbol for it — `interface_name`
-    // alone can't be resolved by `findTypeSymbol` in that case (it's
-    // only in scope as `модуль.Интерфейс`, never unqualified). `null`
-    // falls back to the existing bare-name lookup (local/unqualified
-    // interface, the common case).
+    // Задано, если сам интерфейс КВАЛИФИЦИРОВАН (`реализация
+    // Модуль.Интерфейс для ...`, например `json.ВJSON` из codegen) И
+    // импортирующий модуль имеет для него собственный локальный символ —
+    // в этом случае `interface_name` сам по себе не разрешается через
+    // `findTypeSymbol` (он в области видимости только как
+    // `модуль.Интерфейс`, никогда без квалификации). `null` откатывается
+    // к обычному поиску по голому имени (локальный/неквалифицированный
+    // интерфейс, обычный случай).
     interface_symbol: ?symbols.SymbolId = null,
-    // References the source module's own `InterfaceImplementation.methods`
-    // and `Resolution` directly (both alive for the whole graph compile) —
-    // names are looked up on demand, no separate name-list allocation.
+    // Прямая ссылка на `InterfaceImplementation.methods` и `Resolution`
+    // исходного модуля (оба живы на весь компилируемый граф) — имена
+    // ищутся по требованию, отдельного списка имён не выделяется.
     method_symbols: []const symbols.SymbolId,
     target_resolution: *const resolver.Resolution,
     store: *const types.TypeStore,
@@ -187,32 +185,34 @@ pub const ImportedImpl = struct {
 
 pub const ImportContext = struct {
     symbols: []const ImportedSymbolType = &.{},
-    // A qualified reference to a TYPE ALIAS (`lib.Обработчик`, `тип
-    // Обработчик = функ(Число) -> Число` in `lib`) — reuses
-    // `ImportedSymbolType`'s exact shape (symbol/store/type_id) since
-    // bridging one is structurally identical to bridging an imported
-    // function's signature (`imports.symbols` below): copy the
-    // ALREADY-RESOLVED aliased `TypeId` from the defining module's own
-    // store into this module's, via `copyImportedType`. Kept as a
-    // SEPARATE list (not merged into `symbols`) because the two feed
-    // different result maps — `symbols` populates `symbol_types` (VALUE
-    // symbols: functions/constants), this populates `type_aliases` (TYPE
-    // symbols, consulted by `resolveType`'s `.qualified` case). Generic
-    // type aliases are out of scope here (`ImportedSymbolType.
-    // generic_parameters` is ignored for entries in this list).
+    // Квалифицированная ссылка на ПСЕВДОНИМ ТИПА (`lib.Обработчик`, где
+    // `тип Обработчик = функ(Число) -> Число` объявлен в `lib`) —
+    // переиспользует ту же форму `ImportedSymbolType` (symbol/store/
+    // type_id), поскольку перенос псевдонима структурно идентичен
+    // переносу сигнатуры импортированной функции (`imports.symbols`
+    // ниже): УЖЕ РАЗРЕШЁННЫЙ `TypeId` псевдонима копируется из
+    // хранилища определяющего модуля в хранилище этого модуля через
+    // `copyImportedType`. Хранится ОТДЕЛЬНЫМ списком (не объединяется с
+    // `symbols`), так как они наполняют разные результирующие карты —
+    // `symbols` наполняет `symbol_types` (символы ЗНАЧЕНИЙ: функции/
+    // константы), этот список наполняет `type_aliases` (символы ТИПОВ,
+    // используемые веткой `.qualified` в `resolveType`). Генерик-
+    // псевдонимы типов здесь вне области действия (`ImportedSymbolType.
+    // generic_parameters` игнорируется для записей в этом списке).
     type_aliases: []const ImportedSymbolType = &.{},
     nominals: []const ImportedNominal = &.{},
     methods: []const ImportedMethod = &.{},
     impls: []const ImportedImpl = &.{},
-    // True when a real prelude module (`module_loader.Graph.
-    // appendPreludeModule`) is present in the graph — `preludePass`
-    // skips its own hardcoded Опция/Результат/interface stand-ins in
-    // that case (this module's own `interfacePass`/`enumPass` handle it
-    // directly if IT is the prelude module; every other module gets the
-    // real definitions bridged in via `nominals`/`importIdentityPass`).
-    // Defaults false — every EXISTING caller (inline single-source
-    // tests, any graph built without `appendPreludeModule`) keeps
-    // exactly its previous behavior.
+    // Истина, если в графе присутствует настоящий модуль прелюдии
+    // (`module_loader.Graph.appendPreludeModule`) — в этом случае
+    // `preludePass` пропускает собственные захардкоженные заглушки
+    // Опция/Результат/интерфейсов (собственные `interfacePass`/
+    // `enumPass` этого модуля обрабатывают их напрямую, если ОН сам и
+    // есть модуль прелюдии; каждый другой модуль получает настоящие
+    // определения, перенесённые через `nominals`/`importIdentityPass`).
+    // По умолчанию false — каждый СУЩЕСТВУЮЩИЙ вызывающий (встроенные
+    // однофайловые тесты, любой граф, построенный без
+    // `appendPreludeModule`) сохраняет прежнее поведение без изменений.
     has_real_prelude: bool = false,
 };
 
@@ -225,13 +225,11 @@ pub const ForInInfo = struct {
     kind: ForInKind,
     iterator_dispatch: IteratorDispatch = .direct,
     next_method: symbols.SymbolId = symbols.invalid_symbol,
-    // `следующий`'s position within the interface's OWN vtable — used
-    // only by `.iterator_dispatch = .interface`. Was hardcoded `0`
-    // (compiler.zig) on the assumption `следующий` is Итерируемое's
-    // ONLY method; still true by declaration order today (`prelude.
-    // zig`'s `следующий` comes first), but no longer guaranteed once
-    // Итерируемое gained default methods — computed properly instead of
-    // relying on that coincidence.
+    // Позиция `следующий` в собственной vtable интерфейса — используется
+    // только при `.iterator_dispatch = .interface`. Вычисляется явно, а
+    // не полагается на порядок объявления (`следующий` идёт первым в
+    // `prelude.zig`), поскольку после появления у Итерируемое методов по
+    // умолчанию этот порядок больше не гарантирован.
     next_method_index: u16 = 0,
 };
 
@@ -260,11 +258,12 @@ pub const CheckResult = struct {
     unsupported_imports: std.AutoHashMap(symbols.SymbolId, void),
     imported_nominal_identities: std.AutoHashMap(symbols.SymbolId, u32),
     nominal_fields: std.AutoHashMap(symbols.SymbolId, []const NominalField),
-    // Field marshal kinds (declaration order) for `ff_структура` types
-    // ONLY — needed at `внешний` struct-by-value call sites to build a
-    // libffi struct `ffi_type` (its `elements` array) and to pack/unpack
-    // raw bytes at each field's C ABI offset. Ordinary (non-`ff_структура`)
-    // nominals never get an entry here.
+    // Виды маршалинга полей (в порядке объявления) ТОЛЬКО для типов
+    // `ff_структура` — нужны в точках вызова `внешний` со структурой по
+    // значению для построения libffi-структуры `ffi_type` (её массива
+    // `elements`) и для упаковки/распаковки сырых байт по смещению
+    // каждого поля в C ABI. У обычных (не-`ff_структура`) номинальных
+    // типов записи здесь никогда не бывает.
     ffi_struct_layouts: std.AutoHashMap(symbols.SymbolId, []const ast.ForeignMarshalKind),
     type_aliases: std.AutoHashMap(symbols.SymbolId, types.TypeId),
     alias_type_nodes: std.AutoHashMap(symbols.SymbolId, ast.TypeId),
@@ -272,18 +271,16 @@ pub const CheckResult = struct {
     generic_nominal_fields: std.AutoHashMap(symbols.SymbolId, GenericNominal),
     enum_definitions: std.AutoHashMap(symbols.SymbolId, EnumDefinition),
     interface_definitions: std.AutoHashMap(symbols.SymbolId, InterfaceDefinition),
-    // Which throwaway `genericParameter` placeholder (`preludePass`, e.g.
-    // `Сравниваемое.сравнить(другое: <placeholder>)`) stands for "the
-    // SAME type as whatever implements this interface" — needed ONLY at
-    // an interface-TYPED call site (`x: Сравниваемое; x.сравнить(y)`,
-    // `inferInterfaceCall`). Impl-time validation (`defineInterfaceImplementation`)
-    // already resolves the placeholder correctly via ordinary generic
-    // unification against the concrete impl; the call site has no
-    // concrete type to unify against (the value could be ANY
-    // implementor), so the only sound substitution is the INTERFACE type
-    // itself — real gap found via a regression: `x.сравнить(y)` left the
-    // placeholder unsubstituted, so `y`'s concrete type could never be
-    // assignable to it.
+    // Какая одноразовая заглушка `genericParameter` (`preludePass`,
+    // например `Сравниваемое.сравнить(другое: <заглушка>)`) обозначает
+    // "тот же тип, что и реализующий этот интерфейс" — нужна ТОЛЬКО в
+    // точке вызова через значение с ИНТЕРФЕЙСНЫМ типом (`x: Сравниваемое;
+    // x.сравнить(y)`, `inferInterfaceCall`). Проверка в момент реализации
+    // (`defineInterfaceImplementation`) уже разрешает заглушку корректно
+    // через обычную генерик-унификацию с конкретной реализацией; в точке
+    // вызова конкретного типа для унификации нет (значением может быть
+    // ЛЮБОЙ реализующий тип), поэтому единственная корректная подстановка
+    // — сам тип ИНТЕРФЕЙСА.
     interface_self_placeholders: std.AutoHashMap(symbols.SymbolId, types.TypeId),
     interface_implementations: std.ArrayList(InterfaceImplementation) = .empty,
     pattern_variants: std.AutoHashMap(ast.PatternId, symbols.SymbolId),
@@ -366,37 +363,35 @@ pub fn nominalParametersOf(checked: *const CheckResult, symbol: symbols.SymbolId
 const generic_substitution_pair_limit = 8;
 const GenericSubstitutionPair = struct { placeholder: types.TypeId, concrete: types.TypeId };
 
-// `target_arguments` — the ACTUAL/instantiated generic arguments of
-// `target` at THIS call site (e.g. `Отображённый(Число, Строка)`'s
-// `[Число, Строка]`), separate from a candidate `InterfaceImplementation.
-// arguments` (an EXPRESSION over `target`'s OWN declared placeholders,
-// e.g. `[U_of_Отображённый]` for `реализация Итерируемое для
-// Отображённый`, since Отображённый's OWN `U` is what unified against
-// Итерируемое's `T`). Real gap found building a generic wrapper struct
-// implementing a generic interface polymorphically: the OLD exact-`eql`
-// match compared DIFFERENT TypeIds that only happen to be semantically
-// the same AFTER substitution — always failed for any generic struct/
-// generic interface pairing. Fast path (exact match) stays first —
-// covers the overwhelmingly common non-generic case (INCLUDING a
-// non-generic target implementing the SAME interface at several
-// different concrete argument sets, e.g. `реализация Получатель(Число)`
-// AND `реализация Получатель(Строка)` for the same struct — a real,
-// separately-tested feature dropping the arguments check entirely would
-// have broken) without the extra work; the substitution fallback only
-// runs when the target itself is generic and the exact match fails.
-// A free function (not a `Checker` method) so `compiler.zig`'s vtable
-// resolution — which only has a `*const CheckResult`, not a full
-// `Checker` — can reuse the SAME matching instead of a second,
-// independently-drifting copy.
-// `ambiguous` — opt-in (default `null`, preserving the original
-// first-match-wins behavior for every EXISTING caller, all of which go
-// through `assignable`'s pervasive, speculative compatibility checks and
-// only care about a yes/no answer). When passed, the generic-fallback
-// branch keeps scanning after its first match instead of returning
-// immediately, and sets `ambiguous.*` if a SECOND generic match is found
-// — `compiler.zig`'s `emitInterfaceCast` (the only caller that resolves
-// an ACTUAL vtable for codegen, where picking the wrong candidate means
-// compiling the wrong method, not just a wrong static type) opts in.
+// `target_arguments` — ФАКТИЧЕСКИЕ/инстанцированные генерик-аргументы
+// `target` в ЭТОЙ точке вызова (например, `[Число, Строка]` для
+// `Отображённый(Число, Строка)`), отдельно от `InterfaceImplementation.
+// arguments` кандидата (ВЫРАЖЕНИЯ над СОБСТВЕННЫМИ объявленными
+// заглушками `target`, например `[U_of_Отображённый]` для `реализация
+// Итерируемое для Отображённый`, поскольку именно собственный `U`
+// Отображённый унифицировался с `T` интерфейса Итерируемое). Быстрый
+// путь (точное совпадение) идёт первым — покрывает подавляющее
+// большинство не-генерик случаев (ВКЛЮЧАЯ не-генерик target, реализующий
+// ОДИН И ТОТ ЖЕ интерфейс с несколькими разными наборами конкретных
+// аргументов, например `реализация Получатель(Число)` И `реализация
+// Получатель(Строка)` для одной структуры) без лишней работы; резервный
+// путь с подстановкой запускается только когда сам target генерик и
+// точное совпадение не найдено. Свободная функция (не метод `Checker`),
+// чтобы разрешение vtable в `compiler.zig` — у которого есть только
+// `*const CheckResult`, а не полный `Checker` — могло переиспользовать
+// ТУ ЖЕ логику сопоставления вместо второй, независимо расходящейся
+// копии.
+// `ambiguous` — опциональный параметр (по умолчанию `null`, сохраняя
+// исходное поведение "первое совпадение побеждает" для каждого
+// СУЩЕСТВУЮЩЕГО вызывающего — все они проходят через повсеместные
+// спекулятивные проверки совместимости в `assignable` и им важен только
+// ответ да/нет). Если передан, резервная ветка с генериками продолжает
+// сканирование после первого совпадения вместо немедленного возврата и
+// выставляет `ambiguous.*`, если найдено ВТОРОЕ генерик-совпадение —
+// `emitInterfaceCast` в `compiler.zig` (единственный вызывающий, который
+// разрешает РЕАЛЬНУЮ vtable для кодогенерации, где выбор не того
+// кандидата означает компиляцию не того метода, а не просто неверный
+// статический тип) использует эту опцию.
 pub fn findInterfaceImplementation(checked: *const CheckResult, interface: symbols.SymbolId, arguments: []const types.TypeId, target: symbols.SymbolId, target_arguments: []const types.TypeId, ambiguous: ?*bool) ?InterfaceImplementation {
     var found: ?InterfaceImplementation = null;
     for (checked.interface_implementations.items) |implementation| {
@@ -410,21 +405,20 @@ pub fn findInterfaceImplementation(checked: *const CheckResult, interface: symbo
         }
         if (exact) return implementation;
         const target_params = nominalParametersOf(checked, target);
-        // A target with more than `generic_substitution_pair_limit`
-        // generic parameters silently falls through to "not found" here
-        // rather than a clearer "too many generic parameters" diagnostic
-        // — deliberately not fixed with a `report()` call: this function
-        // (via `interfaceImplementation`) is reached through `assignable`,
-        // a `*const Checker`, extremely pervasively-called, SPECULATIVE
-        // compatibility query (many call sites just want a bool, without
-        // committing to "this IS a type error" — the eventual real
-        // diagnostic, if any, is reported by whichever caller actually
-        // needed the answer). Reporting from here would need `assignable`
-        // itself to become mutable/fallible, a large ripple for a case
-        // that in practice is never hit (8 generic parameters on one
-        // target is not a realistic program). Fail-closed (silently
-        // "not found", same as any other non-match) is safe; only the
-        // error TEXT would be misleading if this were ever actually hit.
+        // target с числом генерик-параметров больше
+        // `generic_substitution_pair_limit` здесь молча проваливается в
+        // "не найдено" вместо более понятной диагностики "слишком много
+        // генерик-параметров" — эта функция вызывается через `assignable`,
+        // крайне часто вызываемый СПЕКУЛЯТИВНЫЙ запрос совместимости
+        // (многим точкам вызова нужен только булев ответ, без утверждения
+        // "это ОШИБКА типов" — реальную диагностику, если она нужна,
+        // сообщает тот вызывающий, которому действительно требовался
+        // ответ). Отчёт отсюда потребовал бы сделать сам `assignable`
+        // изменяемым/фаллибельным — большая волна изменений ради случая,
+        // который на практике не встречается (8 генерик-параметров на
+        // одном target — нереалистичная программа). "Отказ закрытым"
+        // (молчаливое "не найдено", как и при любом другом несовпадении)
+        // безопасен; вводящим в заблуждение был бы только ТЕКСТ ошибки.
         if (target_params.len != target_arguments.len or target_params.len > generic_substitution_pair_limit) continue;
         var buffer: [generic_substitution_pair_limit]GenericSubstitutionPair = undefined;
         for (target_params, target_arguments, 0..) |param, concrete, i| buffer[i] = .{ .placeholder = param.typ, .concrete = concrete };
@@ -451,30 +445,29 @@ pub fn findInterfaceImplementation(checked: *const CheckResult, interface: symbo
     return found;
 }
 
-// Structural "does `pattern` (an expression over `pairs`' placeholder
-// TypeIds) match `concrete` once those placeholders are substituted" —
-// a non-allocating twin of `substituteGeneric` + `TypeStore.eql`
-// combined, deliberately NOT calling `substituteGeneric` itself (which
-// needs a mutable `*Checker`, `!types.TypeId`, and a heap-backed
-// `AutoHashMap` — would have forced `assignable`, one of the most-called
-// functions in this file, to become fallible/mutable-self, a large
-// ripple affecting dozens of call sites for a check that only needs a
-// yes/no answer).
+// Структурная проверка "совпадает ли `pattern` (выражение над TypeId-
+// заглушками из `pairs`) с `concrete` после подстановки этих заглушек" —
+// неаллоцирующий аналог связки `substituteGeneric` + `TypeStore.eql`,
+// намеренно НЕ вызывающий сам `substituteGeneric` (которому нужны
+// изменяемый `*Checker`, `!types.TypeId` и `AutoHashMap` в куче — это
+// заставило бы `assignable`, одну из самых часто вызываемых функций в
+// этом файле, стать фаллибельной/изменяемой — большая волна изменений
+// ради проверки, которой нужен только ответ да/нет).
 fn matchesGenericPatternOf(checked: *const CheckResult, pattern: types.TypeId, concrete: types.TypeId, pairs: []const GenericSubstitutionPair) bool {
     const pattern_entry = checked.types.get(pattern) orelse return false;
     if (pattern_entry.* == .generic_parameter) {
         for (pairs) |pair| {
             if (pair.placeholder.eql(pattern)) return checked.types.eql(pair.concrete, concrete);
         }
-        // `pattern` is a generic placeholder with no entry in `pairs` —
-        // it belongs to some OTHER generic scope than the one being
-        // substituted here (a caller bug: `pairs` should always cover
-        // every placeholder actually reachable from `pattern`). Falls
-        // back to plain identity comparison, which is almost always
-        // false and therefore fail-closed (a spurious "no match" is
-        // safe; a spurious match would not be) — not a reported error,
-        // since this is an internal invariant check, not a user-facing
-        // type mismatch.
+        // `pattern` — генерик-заглушка без записи в `pairs`: она
+        // принадлежит какой-то ДРУГОЙ генерик-области, чем та, что
+        // подставляется здесь (ошибка вызывающего: `pairs` должен всегда
+        // покрывать каждую заглушку, реально достижимую из `pattern`).
+        // Откатывается к простому сравнению идентичности, которое почти
+        // всегда false и потому безопасно ("отказ закрытым": ложное "не
+        // совпадает" безопасно, ложное совпадение — нет) — не сообщается
+        // как ошибка, поскольку это внутренняя проверка инварианта, а не
+        // пользовательское несоответствие типов.
         return checked.types.eql(pattern, concrete);
     }
     const concrete_entry = checked.types.get(concrete) orelse return false;
@@ -542,13 +535,10 @@ const Checker = struct {
         });
     }
 
-    // Ported from `core/type_cheker.odin`'s `report_warning` — same
-    // shape as `report` above, `.severity = .warning` instead of `.err`.
-    // `diagnostics_have_error`-equivalent gating (`SourceRun.hasErrors`)
-    // already treats `.warning` as non-blocking; this is what actually
-    // PRODUCES that severity — before `check_unreachable_code`/unused-
-    // variable warnings below, NOTHING in `zig/core/*.zig` ever
-    // constructed a `.warning` diagnostic at all.
+    // Та же форма, что и `report` выше, но `.severity = .warning` вместо
+    // `.err`. Отбор по наличию ошибок (`SourceRun.hasErrors`) уже
+    // трактует `.warning` как неблокирующую; именно эта функция и
+    // ПОРОЖДАЕТ такую диагностику.
     fn reportWarning(self: *Checker, span: source.Span, comptime format: []const u8, args: anytype) !void {
         const message = try std.fmt.allocPrint(self.result.arena.allocator(), format, args);
         _ = try self.result.diagnostics.appendUnique(self.result.allocator, .{
@@ -587,25 +577,27 @@ const Checker = struct {
         }
     }
 
-    // Registers opaque cross-module identity for every imported nominal type
-    // BEFORE `signaturePass` runs — `signaturePass` already resolves qualified
-    // type annotations (e.g. an impl's receiver parameter, `это: точки.Точка`)
-    // via `nominalType`, which reads `imported_nominal_identities`; running
-    // this after `signaturePass` (as `importSignaturePass` does for
-    // fields/methods, which don't need it that early) left every qualified
-    // annotation resolved during `signaturePass` silently defaulting to
-    // identity=0 instead of the real opaque identity, causing "получатель
-    // метода имеет неверный тип" for a same-module qualified impl target
-    // (`реализация точки.Точка ... конец`) — the annotation and the call
-    // site's own value ended up with DIFFERENT identities for the same type.
-    // Also builds the per-owner generic-parameter remap and, for an imported
-    // INTERFACE type, its `InterfaceDefinition` — both must exist before
-    // `signaturePass` runs, since it resolves qualified impl targets
-    // (`реализация чужой_модуль.Интерфейс для Тип`) and needs
-    // `interface_definitions` to validate the implementation right away.
-    // `owner_remaps`/`owner_parameters_by_symbol` are then reused as-is by
-    // `importSignaturePass` for fields/enum variants/methods/impls, which
-    // don't need to run this early.
+    // Регистрирует непрозрачную межмодульную идентичность для каждого
+    // импортируемого номинального типа ДО запуска `signaturePass` —
+    // `signaturePass` уже разрешает квалифицированные аннотации типов
+    // (например, параметр-получатель импла, `это: точки.Точка`) через
+    // `nominalType`, которая читает `imported_nominal_identities`; запуск
+    // этого после `signaturePass` оставлял бы каждую квалифицированную
+    // аннотацию, разрешённую во время `signaturePass`, молча со значением
+    // по умолчанию identity=0 вместо настоящей непрозрачной идентичности,
+    // вызывая "получатель метода имеет неверный тип" для
+    // квалифицированной цели импла внутри одного модуля (`реализация
+    // точки.Точка ... конец`) — аннотация и собственное значение точки
+    // вызова получали бы РАЗНЫЕ идентичности для одного и того же типа.
+    // Также строит переотображение генерик-параметров по владельцам и,
+    // для импортированного типа-ИНТЕРФЕЙСА, его `InterfaceDefinition` —
+    // оба должны существовать до запуска `signaturePass`, так как она
+    // разрешает квалифицированные цели импла (`реализация
+    // чужой_модуль.Интерфейс для Тип`) и сразу нуждается в
+    // `interface_definitions` для проверки реализации. `owner_remaps`/
+    // `owner_parameters_by_symbol` затем переиспользуются как есть в
+    // `importSignaturePass` для полей/вариантов перечисления/методов/
+    // реализаций, которым не нужен настолько ранний запуск.
     fn importIdentityPass(
         self: *Checker,
         imports: ImportContext,
@@ -687,22 +679,20 @@ const Checker = struct {
                 var fields: std.ArrayList(NominalField) = .empty;
                 defer fields.deinit(self.result.allocator);
                 for (source_fields) |field| {
-                    // A field type may reference a nominal type from a
-                    // module the CURRENT file never imports directly (an
-                    // imported struct's field pointing at a THIRD
-                    // module's type, e.g. `слог.Логгер` reached via
-                    // `Менеджер.логгер` when only `Менеджер`'s owning
-                    // module is imported here) — `imports.nominals` only
-                    // ever lists the local file's OWN direct imports, so
-                    // `copyImportedType` correctly can't resolve it.
-                    // Falls back to `poison` (assignable to/from
-                    // anything, see `assignable`'s own top check) rather
-                    // than letting `error.UnsupportedImportedType`
-                    // propagate uncaught — a real gap found auditing
-                    // panosiki (`тест.ps` importing `tempfiles.ps`'s
-                    // `Менеджер`, itself importing `слог.Логгер`): the
-                    // WHOLE compilation crashed with a raw Zig stack
-                    // trace instead of failing (or degrading) cleanly.
+                    // Тип поля может ссылаться на номинальный тип из
+                    // модуля, который ТЕКУЩИЙ файл никогда не импортирует
+                    // напрямую (поле импортированной структуры,
+                    // указывающее на тип ТРЕТЬЕГО модуля, например
+                    // `слог.Логгер`, достижимый через `Менеджер.логгер`,
+                    // когда здесь импортирован только модуль-владелец
+                    // `Менеджер`) — `imports.nominals` перечисляет только
+                    // СОБСТВЕННЫЕ прямые импорты локального файла, поэтому
+                    // `copyImportedType` закономерно не может его
+                    // разрешить. Откатывается к `poison` (совместим с чем
+                    // угодно в обе стороны, см. верхнюю проверку в самом
+                    // `assignable`) вместо того, чтобы дать
+                    // `error.UnsupportedImportedType` распространиться
+                    // необработанным.
                     const field_type = self.copyImportedType(imported.definition_store, field.typ, imports.nominals, owner_remap) catch |err| switch (err) {
                         error.UnsupportedImportedType => try self.result.types.poison(),
                         else => return err,
@@ -747,16 +737,16 @@ const Checker = struct {
             }
         }
         for (imports.symbols) |imported| {
-            // Imported GENERIC FREE FUNCTION — mint fresh LOCAL
-            // generic-parameter TypeIds (one per target parameter),
-            // remap the signature through them (instead of `null`,
-            // which silently poisons every `T` reference — see
-            // `ImportedSymbolType.generic_parameters`'s own doc comment
-            // for the crash this caused), and register the remapped
-            // parameters/bounds into `generic_function_parameters` so
-            // the call site's existing same-file machinery
-            // (`interfaceBoundOf`/generic-call substitution) works
-            // identically for a cross-module call.
+            // Импортированная ГЕНЕРИК-ФУНКЦИЯ верхнего уровня — чеканим
+            // свежие ЛОКАЛЬНЫЕ TypeId генерик-параметров (по одному на
+            // параметр цели), переотображаем сигнатуру через них (вместо
+            // `null`, который молча превращает в poison каждую ссылку на
+            // `T` — см. doc-комментарий у `ImportedSymbolType.
+            // generic_parameters`), и регистрируем переотображённые
+            // параметры/ограничения в `generic_function_parameters`, чтобы
+            // существующий механизм точки вызова этого же файла
+            // (`interfaceBoundOf`/подстановка при генерик-вызове) работал
+            // идентично и для межмодульного вызова.
             var local_generic_remap: ?std.AutoHashMap(types.TypeId, types.TypeId) = null;
             defer if (local_generic_remap) |*map| map.deinit();
             if (imported.generic_parameters) |target_parameters| {
@@ -778,11 +768,12 @@ const Checker = struct {
                             remapped = true;
                             break;
                         }
-                        // A bound is part of the exported function's
-                        // contract. Dropping it turns `[T: Интерфейс]`
-                        // into `[T]` and lets an uncast value reach the
-                        // source module's interface dispatch at runtime.
-                        // Import only a complete contract.
+                        // Ограничение — часть контракта экспортируемой
+                        // функции. Отбросить его — значит превратить
+                        // `[T: Интерфейс]` в `[T]` и позволить неприведённому
+                        // значению дойти до интерфейсной диспетчеризации
+                        // исходного модуля во время выполнения. Импортируем
+                        // только полный контракт.
                         if (!remapped) {
                             unsupported_contract = true;
                             break;
@@ -800,15 +791,14 @@ const Checker = struct {
                     try self.result.unsupported_imports.put(imported.symbol, {});
                     continue;
                 }
-                // Invariant this whole bridging step depends on: one
-                // fresh local TypeId per target parameter, no collisions,
-                // nothing dropped. A violation here would silently
-                // produce a WRONG cross-module generic signature (the
-                // exact bug class `interfaceBoundOf`/bound-dispatch broke
-                // on before this session) — assert loudly in Debug
-                // instead of compiling a subtly incorrect signature that
-                // only surfaces as a confusing runtime crash three layers
-                // away, in a DIFFERENT file, later.
+                // Инвариант, на котором держится весь этот шаг переноса:
+                // один свежий локальный TypeId на параметр цели, без
+                // коллизий, ничего не потеряно. Нарушение здесь молча
+                // породило бы НЕВЕРНУЮ межмодульную генерик-сигнатуру —
+                // громко проверяем через assert в Debug вместо
+                // компиляции тонко некорректной сигнатуры, которая
+                // проявится позже как непонятный крах на этапе
+                // выполнения, тремя слоями дальше, в ДРУГОМ файле.
                 std.debug.assert(remap.count() == target_parameters.len);
                 std.debug.assert(local_parameters.items.len == target_parameters.len);
                 try self.result.generic_function_parameters.put(imported.symbol, try self.result.arena.allocator().dupe(GenericParameter, local_parameters.items));
@@ -875,17 +865,12 @@ const Checker = struct {
                     try methods.append(self.result.allocator, method.symbol);
                     continue;
                 }
-                // Not an override — `source_method_symbol` is a DEFAULT
-                // method's symbol (from the SOURCE module's own symbol
-                // space, meaningless here). Fall back to THIS module's
-                // own (already correctly-bridged, see
-                // `default_method_symbols`) copy of the SAME interface's
-                // default for a method by this name — real gap found
-                // via `коллекции.итератор(x).собрать()`: every method a
-                // struct DOESN'T override used to make this whole impl
-                // silently vanish (`methods.items.len !=
-                // imported.method_symbols.len` below, ALWAYS true once
-                // even one default went unmatched).
+                // Не переопределение — `source_method_symbol` — символ
+                // метода ПО УМОЛЧАНИЮ (из пространства символов ИСХОДНОГО
+                // модуля, здесь бессмыслен). Откатываемся к копии
+                // значения по умолчанию для метода с этим именем из ТОГО
+                // ЖЕ интерфейса, но уже принадлежащей ЭТОМУ модулю (уже
+                // корректно перенесённой, см. `default_method_symbols`).
                 if (local_definition) |definition| {
                     if (self.interfaceMethod(definition, source_method.name)) |interface_method| {
                         if (interface_method.default_symbol) |default_symbol| {
@@ -904,28 +889,27 @@ const Checker = struct {
         }
     }
 
-    // `generic_remap` maps an external generic-parameter TypeId to a FRESH
-    // local generic-parameter TypeId, minted once per imported generic owner
-    // and reused across that owner's fields/variants/methods so `T` in a
-    // struct field and `T` in one of its imported methods land on the SAME
-    // local type — without it (null), `.generic_parameter` stays unsupported,
-    // preserving prior behavior for non-generic imports.
-    // A NESTED type reference that can't be copied (see `copyImportedType`'s
-    // `.nominal` case) degrades to `poison` HERE instead of failing the
-    // WHOLE containing type — `poison` is universally assignable
-    // (`assignable`'s own top check), so one field/parameter/return
-    // reaching a type from a module the current file doesn't import
-    // directly (`Менеджер.логгер: слог.Логгер` when only `Менеджер`'s
-    // module is imported) no longer takes down the entire struct/method
-    // signature with it. Real gap found auditing panosiki: a method whose
-    // signature touched ANY such transitively-unsupported type used to
-    // vanish ENTIRELY from `self.result.methods` (the top-level `catch
-    // ... continue` in `importSignaturePass`), producing "у типа нет поля
-    // '...'" for methods that have NOTHING to do with the actually-broken
-    // type. The TOP-level call (`imports.symbols`' own `try
-    // self.copyImportedType(...)`) still propagates the error uncaught —
-    // that one path wants the "импортированный экспорт '...' использует
-    // пока неподдерживаемый тип" diagnostic, not a silent poison.
+    // `generic_remap` отображает внешний TypeId генерик-параметра в
+    // СВЕЖИЙ локальный TypeId генерик-параметра, чеканится один раз на
+    // импортируемого генерик-владельца и переиспользуется во всех его
+    // полях/вариантах/методах, чтобы `T` в поле структуры и `T` в одном
+    // из её импортированных методов оказались ОДНИМ И ТЕМ ЖЕ локальным
+    // типом — без него (null) `.generic_parameter` остаётся
+    // неподдерживаемым, сохраняя прежнее поведение для не-генерик
+    // импортов.
+    // ВЛОЖЕННАЯ ссылка на тип, которую нельзя скопировать (см. ветку
+    // `.nominal` в `copyImportedType`), здесь вырождается в `poison`
+    // вместо провала ВСЕГО содержащего типа — `poison` совместим с чем
+    // угодно в обе стороны (см. верхнюю проверку в самом `assignable`),
+    // поэтому одно поле/параметр/возврат, достигающее типа из модуля,
+    // который текущий файл не импортирует напрямую
+    // (`Менеджер.логгер: слог.Логгер`, когда импортирован только модуль
+    // `Менеджер`), больше не обрушивает всю сигнатуру структуры/метода
+    // целиком. ВЕРХНЕУРОВНЕВЫЙ вызов (собственный `try
+    // self.copyImportedType(...)` из `imports.symbols`) по-прежнему
+    // пробрасывает ошибку необработанной — этому пути нужна диагностика
+    // "импортированный экспорт '...' использует пока неподдерживаемый
+    // тип", а не тихий poison.
     fn copyImportedTypeOrPoison(self: *Checker, external_store: *const types.TypeStore, external_type: types.TypeId, nominals: []const ImportedNominal, generic_remap: ?*const std.AutoHashMap(types.TypeId, types.TypeId)) anyerror!types.TypeId {
         return self.copyImportedType(external_store, external_type, nominals, generic_remap) catch |err| switch (err) {
             error.UnsupportedImportedType => self.result.types.poison(),
@@ -973,15 +957,16 @@ const Checker = struct {
                 try self.copyImportedTypeOrPoison(external_store, map.value, nominals, generic_remap),
             ),
             .process => |message| self.result.types.process(try self.copyImportedTypeOrPoison(external_store, message, nominals, generic_remap)),
-            // `Сообщение(T)` never actually needs cross-module copying in
-            // practice (it only ever appears as a function's OWN declared
-            // return type, consulted locally by `checkFunction`/
-            // `inferSpawn`/the `получить` builtin — never stored in a
-            // field, variable, or generic argument that would need
-            // re-hosting into another module's store) — still handled
-            // here structurally, same shape as `.process`, for
-            // completeness rather than relying on this switch being
-            // silently non-exhaustive.
+            // `Сообщение(T)` на практике никогда не нуждается в
+            // межмодульном копировании (встречается только как
+            // СОБСТВЕННЫЙ объявленный тип возврата функции, используется
+            // локально в `checkFunction`/`inferSpawn`/встроенной
+            // `получить` — никогда не хранится в поле, переменной или
+            // генерик-аргументе, которым потребовался бы перенос в
+            // хранилище другого модуля) — тем не менее обрабатывается
+            // здесь структурно, той же формой, что и `.process`, ради
+            // полноты, а не в расчёте на то, что этот switch останется
+            // молча неисчерпывающим.
             .message => |payload| self.result.types.message(try self.copyImportedTypeOrPoison(external_store, payload, nominals, generic_remap)),
             .pointer => |pointee| self.result.types.pointer(try self.copyImportedTypeOrPoison(external_store, pointee, nominals, generic_remap)),
             .generic_parameter => blk: {
@@ -1003,20 +988,20 @@ const Checker = struct {
         }
     }
 
-    // Force-resolves EVERY declared alias into `self.result.type_aliases`
-    // regardless of whether this module's OWN code ever references it —
-    // `resolveAlias` is otherwise purely lazy (only resolved the first
-    // time a REFERENCE is type-checked), which is fine for same-module
-    // use but leaves an EXPORTED-ONLY alias (declared, never used
-    // locally — e.g. a type alias meant purely for other modules to
-    // import) with no entry at all by the time this module's `CheckResult`
-    // is done. `module_compiler.zig`'s cross-module bridging needs that
-    // entry to exist unconditionally so a qualified reference
-    // (`lib.Обработчик`) in a DIFFERENT module can find the real aliased
-    // shape (e.g. a function type) instead of falling back to an opaque
-    // nominal with no callable shape at all — real gap found via exactly
-    // that scenario (`тип Обработчик = функ(Число) -> Число`, declared in
-    // one file, only ever REFERENCED from another).
+    // Принудительно разрешает КАЖДЫЙ объявленный псевдоним в
+    // `self.result.type_aliases`, независимо от того, ссылается ли на
+    // него СОБСТВЕННЫЙ код этого модуля — иначе `resolveAlias` чисто
+    // ленивая (разрешается только при первом тайпчеке ССЫЛКИ), что
+    // нормально для использования внутри модуля, но оставляет
+    // ТОЛЬКО-ЭКСПОРТИРУЕМЫЙ псевдоним (объявлен, но никогда не
+    // используется локально — например, псевдоним типа, предназначенный
+    // исключительно для импорта другими модулями) вовсе без записи к
+    // моменту завершения `CheckResult` этого модуля. Межмодульному
+    // переносу в `module_compiler.zig` эта запись нужна безусловно,
+    // чтобы квалифицированная ссылка (`lib.Обработчик`) в ДРУГОМ модуле
+    // могла найти настоящую форму псевдонима (например, тип функции)
+    // вместо отката к непрозрачному номинальному типу вовсе без
+    // вызываемой формы.
     fn eagerAliasResolutionPass(self: *Checker) !void {
         var it = self.result.alias_type_nodes.keyIterator();
         while (it.next()) |symbol_ptr| {
@@ -1035,17 +1020,16 @@ const Checker = struct {
             };
             const symbol = self.resolution.decl_symbols.get(declaration) orelse continue;
             if (structure.is_ffi) {
-                // `ff_структура` fields carry a marshal kind, not a real
-                // type annotation (parser.zig's `parseFfiStructDeclaration`
-                // restricts them to Целое(8|32|64)/Число(32|64) — always
-                // scalar, never nested) — panos-side field TYPE is derived
-                // from that marshal kind the same way an ordinary
-                // `внешний функ` parameter's type is (`foreignMarshalType`),
-                // so `Вектор2(x, y)`/`.x` construction and field access get
-                // the SAME real arity/type checking an ordinary struct's
-                // fields already have — this was silently unchecked before
-                // (is_ffi structs got skipped here entirely, no
-                // `nominal_fields` entry at all).
+                // Поля `ff_структура` несут вид маршалинга, а не
+                // настоящую аннотацию типа (`parseFfiStructDeclaration` в
+                // parser.zig ограничивает их значениями
+                // Целое(8|32|64)/Число(32|64) — всегда скаляр, никогда
+                // не вложенный тип) — панос-ТИП поля выводится из этого
+                // вида маршалинга тем же способом, что и тип обычного
+                // параметра `внешний функ` (`foreignMarshalType`), так
+                // что конструирование `Вектор2(x, y)`/`.x` и доступ к
+                // полям получают ту же настоящую проверку арности/типов,
+                // что уже есть у полей обычной структуры.
                 var ffi_fields: std.ArrayList(NominalField) = .empty;
                 defer ffi_fields.deinit(self.result.allocator);
                 var layout: std.ArrayList(ast.ForeignMarshalKind) = .empty;
@@ -1089,9 +1073,10 @@ const Checker = struct {
         }
     }
 
-    // Native modules have no AST declaration from which `nominalPass`
-    // could read fields. Materialize the public click-event layout here;
-    // declaration order is also the WASM trampoline's in-memory order.
+    // У нативных модулей нет AST-объявления, из которого `nominalPass`
+    // могла бы прочитать поля. Материализуем публичную раскладку
+    // события клика прямо здесь; порядок объявления — это же порядок
+    // полей в памяти у WASM-трамплина.
     fn nativeNominalPass(self: *Checker) !void {
         for (self.resolution.symbols.symbols.items[1..], 1..) |entry, index| {
             if (entry.kind != .type or entry.module_path == null) continue;
@@ -1160,13 +1145,11 @@ const Checker = struct {
             for (interface.methods) |method| {
                 const default_decl = self.findDefaultMethodDecl(interface.default_methods, method.name);
                 var default_symbol: ?symbols.SymbolId = null;
-                // A default method's OWN type parameters (`отобразить[U]
-                // (...)`) must be in scope BEFORE resolving anything —
-                // including the ABSTRACT signature's `method.parameters`/
-                // `.return_type` below, which reference the SAME `U`.
-                // Real bug found via a generic combinator: resolving the
-                // abstract shape first (before this scope existed) gave
-                // "неизвестный тип 'U'".
+                // СОБСТВЕННЫЕ параметры типа метода по умолчанию
+                // (`отобразить[U](...)`) должны быть в области видимости
+                // ДО разрешения чего бы то ни было — включая
+                // АБСТРАКТНУЮ сигнатуру `method.parameters`/`.return_type`
+                // ниже, которая ссылается на тот же `U`.
                 var method_scope = parameters;
                 if (default_decl) |decl| {
                     const function = self.tree.decl(decl).function;
@@ -1221,17 +1204,18 @@ const Checker = struct {
     }
 
     fn preludePass(self: *Checker) !void {
-        // A real prelude module is in the graph (`appendPreludeModule`)
-        // — either THIS module IS the prelude module (its own
-        // `enumPass`/`interfacePass` handle its real `тип Опция[T] =
-        // перечисление ...`/`тип Сравниваемое = интерфейс ...`
-        // declarations directly, from its own AST), or it imports from
-        // one (`module_compiler.zig`'s prelude bridge feeds the real
-        // definitions in through `imports.nominals`/`importIdentityPass`
-        // instead). Either way, the hardcoded stand-ins below would be
-        // redundant at best — and, once default methods exist on
-        // interfaces, WRONG (they know nothing about a default method's
-        // body, only the abstract signature).
+        // В графе присутствует настоящий модуль прелюдии
+        // (`appendPreludeModule`) — либо ЭТОТ модуль сам и есть модуль
+        // прелюдии (его собственные `enumPass`/`interfacePass`
+        // обрабатывают настоящие объявления `тип Опция[T] = перечисление
+        // ...`/`тип Сравниваемое = интерфейс ...` напрямую, из его же
+        // AST), либо он импортирует их из другого модуля (перенос
+        // прелюдии в `module_compiler.zig` подаёт настоящие определения
+        // через `imports.nominals`/`importIdentityPass`). В обоих
+        // случаях захардкоженные заглушки ниже были бы в лучшем случае
+        // избыточны — а с появлением методов по умолчанию у интерфейсов
+        // ещё и НЕВЕРНЫ (они ничего не знают о теле метода по умолчанию,
+        // только об абстрактной сигнатуре).
         if (self.has_real_prelude) return;
         const option_symbol = self.findTypeSymbol("Опция") orelse return;
         const result_symbol = self.findTypeSymbol("Результат") orelse return;
@@ -1283,12 +1267,11 @@ const Checker = struct {
                 .name = "Сообщение",
                 .fields = try self.result.arena.allocator().dupe(types.TypeId, &.{message_type}),
             };
-            // `Сигнал` carries the SAME `(Число, Опция(Строка))` shape as
-            // `получить_сигнал()`'s own return value (see that builtin's
-            // handling above — the reason is a plain `Строка`, not an
-            // `Ошибка`), as a single tuple field — so a `Сигнал(с)` arm
-            // binds `с` the same way a direct `получить_сигнал()` call
-            // already would.
+            // `Сигнал` несёт ту же форму `(Число, Опция(Строка))`, что и
+            // собственное возвращаемое значение `получить_сигнал()`,
+            // единым полем-кортежем — поэтому ветка `Сигнал(с)`
+            // связывает `с` так же, как это уже делал бы прямой вызов
+            // `получить_сигнал()`.
             select_variants[1] = .{
                 .symbol = self.resolution.findEnumVariant(select_symbol, "Сигнал") orelse break :select_source,
                 .name = "Сигнал",
@@ -1313,32 +1296,17 @@ const Checker = struct {
             });
         }
         const comparable_methods = try self.result.arena.allocator().alloc(InterfaceMethod, 1);
-        // `.parameters` MUST be arena-allocated, not `&.{x}` (a
-        // single-runtime-value anonymous array literal materializes on
-        // THIS FUNCTION's stack in Zig, not in static/arena storage —
-        // the slice silently dangles the moment `preludePass` returns).
-        // Real bug found fixing the Равнозначное/Складываемое family
-        // below: `interfaceMethodMatches`'s generic branch (used by
-        // every OTHER interface) reads `interface_method.parameters`
-        // directly and got garbage; `Сравниваемое` itself never
-        // surfaced this because `isComparableInterface` short-circuits
-        // BEFORE that read (its own hardcoded parameter-count/type
-        // check never touches `interface_method.parameters` at all) —
-        // but the same dangling slice could still bite any OTHER code
-        // path that reads `Сравниваемое`'s stored parameters directly.
+        // `.parameters` ОБЯЗАН быть выделен в arena, а не `&.{x}` (в Zig
+        // анонимный литерал массива с одним рантайм-значением
+        // материализуется на стеке ЭТОЙ ФУНКЦИИ, а не в статическом/
+        // arena-хранилище — срез молча повисает сразу после возврата из
+        // `preludePass`).
         //
-        // Parameter is a genuine Self-typed placeholder (was
-        // `builtins.never` — a sentinel that only ever "worked" for a
-        // DIRECT `x.сравнить(y)` interface-typed call by accident, via
-        // the dangling-pointer bug above making `interfaceMethodMatches`
-        // read back garbage that happened to be the poison sentinel,
-        // which `assignable` treats as always-compatible; once the
-        // pointer was fixed to be valid, `never` correctly rejected
-        // every concrete argument, since nothing is assignable to
-        // `Никогда` as an EXPECTED type). Matches the placeholder
-        // technique the other 5 self-typed interfaces below use;
-        // `interface_self_placeholders` (see its own doc comment) is
-        // what makes it actually resolve at a call site.
+        // Параметр — настоящая заглушка Self-типа. Соответствует технике
+        // заглушек, которую используют остальные 5 интерфейсов с
+        // Self-типом ниже; именно `interface_self_placeholders` (см. его
+        // собственный doc-комментарий) заставляет её реально разрешаться
+        // в точке вызова.
         comparable_methods[0] = .{
             .name = "сравнить",
             .parameters = try self.result.arena.allocator().dupe(types.TypeId, &.{comparable_self}),
@@ -1372,17 +1340,15 @@ const Checker = struct {
                 .methods = printable_methods,
             });
         }
-        // `Копируемое` — restoring copy-on-send (see `resolver.zig`'s
-        // `installPreludeInterface("Копируемое")` comment for the full
-        // rationale). `клонировать() -> Копируемое` returns the
-        // implementing type itself ("Self") — a fresh, throwaway generic
-        // parameter here (never tied to any real declared type parameter
-        // list) lets `defineInterfaceImplementation`'s existing generic-
-        // substitution machinery unify it against whatever concrete
-        // return type each individual `реализация Копируемое для X`
-        // actually declares, exactly like an ordinary generic method
-        // parameter — no special-casing needed beyond minting the
-        // placeholder.
+        // `Копируемое` — `клонировать() -> Копируемое` возвращает сам
+        // реализующий тип ("Self") — свежий, одноразовый генерик-параметр
+        // здесь (никогда не привязанный к реальному объявленному списку
+        // параметров типа) позволяет существующему механизму
+        // генерик-подстановки в `defineInterfaceImplementation`
+        // унифицировать его с тем конкретным типом возврата, который
+        // объявляет каждая отдельная `реализация Копируемое для X`, в
+        // точности как обычный генерик-параметр метода — не нужно
+        // никакой особой обработки сверх чеканки заглушки.
         if (self.findTypeSymbol("Копируемое")) |symbol| {
             const self_placeholder = try self.result.types.genericParameter(self.next_generic_parameter);
             self.next_generic_parameter += 1;
@@ -1399,20 +1365,15 @@ const Checker = struct {
             try self.result.interface_self_placeholders.put(symbol, self_placeholder);
         }
         // `Равнозначное`/`Складываемое`/`Вычитаемое`/`Умножаемое`/`Делимое`
-        // — declared in the embedded prelude source (`prelude.zig`)
-        // alongside `Сравниваемое`/`Итерируемое`/`Печатаемое`/
-        // `Копируемое`, but never actually installed here — real gap
-        // found via a docs-example sweep (`prelude-interfaces.md`'s own
-        // documented examples for these two failed to compile). Same
-        // technique `Копируемое` already uses for its Self-typed
-        // RETURN: a throwaway generic-parameter placeholder, minted once
-        // per interface here, unified against whichever concrete type
-        // each `реализация X для Y` actually declares. `равно`'s
-        // PARAMETER is also Self-typed (`равно(другое: Равнозначное) ->
-        // Булево`) — same placeholder used for the parameter type this
-        // time, no special-casing needed: `defineInterfaceImplementation`
-        // already unifies parameter types via the same generic-
-        // substitution machinery as return types.
+        // — та же техника, что уже использует `Копируемое` для своего
+        // ВОЗВРАТА с Self-типом: одноразовая заглушка генерик-параметра,
+        // чеканится здесь один раз на интерфейс, унифицируется с тем
+        // конкретным типом, что объявляет каждая `реализация X для Y`.
+        // ПАРАМЕТР `равно` тоже Self-типа (`равно(другое: Равнозначное)
+        // -> Булево`) — на этот раз та же заглушка используется для типа
+        // параметра, особой обработки не нужно: `defineInterfaceImplementation`
+        // уже унифицирует типы параметров тем же механизмом
+        // генерик-подстановки, что и типы возврата.
         const equatable_self = try self.result.types.genericParameter(self.next_generic_parameter);
         self.next_generic_parameter += 1;
         if (self.findTypeSymbol("Равнозначное")) |symbol| {
@@ -1428,12 +1389,12 @@ const Checker = struct {
             });
             try self.result.interface_self_placeholders.put(symbol, equatable_self);
         }
-        // `Складываемое`/`Вычитаемое`/`Умножаемое`/`Делимое` all share the
-        // exact same shape — `функ X(другое: Тип) -> Тип`, parameter AND
-        // return both Self-typed — so a single loop mints one fresh
-        // placeholder per interface (each interface's Self is its OWN
-        // type, not shared across interfaces) and reuses it for both
-        // positions.
+        // `Складываемое`/`Вычитаемое`/`Умножаемое`/`Делимое` имеют в
+        // точности одну и ту же форму — `функ X(другое: Тип) -> Тип`,
+        // и параметр, и возврат Self-типа — поэтому единый цикл чеканит
+        // одну свежую заглушку на интерфейс (Self каждого интерфейса —
+        // его СОБСТВЕННЫЙ тип, не общий между интерфейсами) и
+        // переиспользует её для обеих позиций.
         const arithmetic_interfaces = [_]struct { name: []const u8, method: []const u8 }{
             .{ .name = "Складываемое", .method = "сложить" },
             .{ .name = "Вычитаемое", .method = "вычесть" },
@@ -1458,42 +1419,39 @@ const Checker = struct {
         }
     }
 
-    // Panos-side type for a `внешний` parameter/return marshal kind —
-    // marshal kind is purely ABI metadata (which C width to pack into),
-    // the panos type it appears as is independent of that width: Int8/32/
-    // 64 are all plain `Целое` (same `Число` int flavor a `для`-loop
-    // counter uses, matching Odin's `TY_INT` choice here), Float32/64 are
-    // both `Число`, `CString` is an ordinary `Строка` (copied into a real
-    // GC string on return, borrowed on the way in — see `vm.zig`).
-    // `.struct_value` (struct-by-value marshaling) isn't ported yet —
-    // mirrors Odin's own history, where it was a later addition on top
-    // of the scalar-only first slice, not a from-day-one requirement.
+    // Панос-тип для вида маршалинга параметра/возврата `внешний` — вид
+    // маршалинга это чисто ABI-метаданные (в какую C-разрядность
+    // упаковывать), сам панос-тип, в котором он проявляется, от этой
+    // разрядности не зависит: Int8/32/64 — все просто `Целое` (та же
+    // целочисленная разновидность `Число`, что использует счётчик цикла
+    // `для`), Float32/64 — оба `Число`, `CString` — обычная `Строка`
+    // (копируется в настоящую GC-строку при возврате, заимствуется на
+    // входе — см. `vm.zig`).
     fn foreignMarshalType(self: *Checker, marshal: ast.ForeignMarshalKind, pointee: ?ast.TypeId, struct_type_name: ?[]const u8, span: source.Span) anyerror!types.TypeId {
         return switch (marshal) {
             .void => self.result.types.builtins.void,
             .int8, .int32, .int64 => self.result.types.builtins.integer,
             .float32, .float64 => self.result.types.builtins.number,
             .c_string => self.result.types.builtins.string,
-            // A real, well-defined marshal kind — rejected here only
-            // because this VM has no `Указатель` RUNTIME value
-            // representation yet to marshal it into (the type system
-            // already models `Указатель(T)`, e.g. `types.zig`'s
-            // `.pointer` — nothing constructs a live value of it yet).
-            // Matches Odin's own history: `внешний` shipped scalar-only
-            // first, pointers were a later, separate addition.
+            // Настоящий, вполне определённый вид маршалинга — отклоняется
+            // здесь только потому, что у этой VM пока нет
+            // RUNTIME-представления значения `Указатель`, в которое его
+            // можно было бы промаршалить (система типов уже моделирует
+            // `Указатель(T)`, например `.pointer` в `types.zig` — просто
+            // ничто пока не конструирует живое значение этого типа).
             .pointer => blk: {
                 _ = pointee;
                 try self.report(span, "Type Error: 'внешний' с Указатель(T) ещё не поддержан Zig-версией", .{});
                 break :blk try self.result.types.poison();
             },
-            // The panos-side type of a struct-by-value parameter/return is
-            // the `ff_структура` itself — an ordinary nominal type, same
-            // as any other struct parameter (`nominalPass`'s `is_ffi`
-            // branch already registered real fields/a `ffi_struct_layouts`
-            // entry for it, keyed by the SAME symbol found here). The
-            // parser already restricted `ff_структура` fields to flat
-            // scalars (no nesting) — `invokeForeign` (vm.zig) relies on
-            // that invariant when packing/unpacking raw bytes.
+            // Панос-тип параметра/возврата "структура по значению" — сама
+            // `ff_структура`, обычный номинальный тип, как и любой другой
+            // параметр-структура (ветка `is_ffi` в `nominalPass` уже
+            // зарегистрировала для неё настоящие поля и запись
+            // `ffi_struct_layouts` под тем же символом, что найден здесь).
+            // Парсер уже ограничил поля `ff_структура` плоскими скалярами
+            // (без вложенности) — `invokeForeign` (vm.zig) полагается на
+            // этот инвариант при упаковке/распаковке сырых байт.
             .struct_value => blk: {
                 const name = struct_type_name orelse {
                     try self.report(span, "Type Error: 'внешний' ожидает имя ff_структура", .{});
@@ -1614,10 +1572,11 @@ const Checker = struct {
             }
             const method = matched orelse {
                 if (interface_method.default_symbol) |default_symbol| {
-                    // Not overridden — falls back to the interface's own
-                    // default-method body, already fully type-checked
-                    // once at its own declaration site (`interfacePass`);
-                    // no signature re-validation needed here.
+                    // Не переопределён — откатывается к собственному
+                    // телу метода по умолчанию интерфейса, уже полностью
+                    // проверенному один раз в месте своего объявления
+                    // (`interfacePass`); повторная проверка сигнатуры
+                    // здесь не нужна.
                     try implementation_methods.append(self.result.allocator, default_symbol);
                     continue;
                 }
@@ -1690,18 +1649,21 @@ const Checker = struct {
         var owner_arguments: std.ArrayList(types.TypeId) = .empty;
         defer owner_arguments.deinit(self.result.allocator);
         for (owner_parameters) |parameter| try owner_arguments.append(self.result.allocator, parameter.typ);
-        // `nominalType` (not a raw `types.nominal`) — for a QUALIFIED impl
-        // target (`owner` resolved cross-module via `findQualifiedTypeSymbol`),
-        // `resolveType`'s OWN `.qualified` case (which resolved the METHOD's
-        // `это: Модуль.Тип` receiver parameter) already goes through
-        // `nominalType` to attach the real bridged `imported_nominal_identities`
-        // value. Building `receiver` here via a raw `types.nominal` left it
-        // at the default identity=0 — `TypeStore.eql`'s nominal comparison
-        // switches to STRICT identity-equality the moment either side has a
-        // non-zero identity (`types.zig`'s `.nominal` case), so a real match
-        // (same symbol) was rejected as "first argument must have the
-        // implementing type" purely because of this identity mismatch, not
-        // an actual type mismatch.
+        // `nominalType` (не сырой `types.nominal`) — для КВАЛИФИЦИРОВАННОЙ
+        // цели импла (`owner` разрешён межмодульно через
+        // `findQualifiedTypeSymbol`) собственная ветка `.qualified` в
+        // `resolveType` (которая разрешала параметр-получатель метода
+        // `это: Модуль.Тип`) уже проходит через `nominalType`, чтобы
+        // прикрепить настоящее перенесённое значение
+        // `imported_nominal_identities`. Построение `receiver` здесь
+        // через сырой `types.nominal` оставило бы его со значением
+        // identity=0 по умолчанию — сравнение номинальных типов в
+        // `TypeStore.eql` переключается на СТРОГОЕ сравнение по
+        // идентичности, как только у любой стороны ненулевая identity
+        // (ветка `.nominal` в `types.zig`), так что настоящее совпадение
+        // (тот же символ) отклонялось бы как "первый аргумент должен
+        // иметь реализующий тип" исключительно из-за несовпадения
+        // identity, а не реального несовпадения типов.
         const receiver = try self.nominalType(owner, owner_arguments.items);
         if (!self.result.types.eql(function.parameters[0], receiver)) {
             try self.report(self.resolution.symbols.get(method_symbol).?.span, "Type Error: первый аргумент метода должен иметь тип реализующего типа", .{});
@@ -1727,17 +1689,15 @@ const Checker = struct {
         return true;
     }
 
-    // A REAL interface declaration (`prelude.zig`'s embedded source, or
-    // any user `тип X = интерфейс ... конец`) writes "Self" simply as
-    // the interface's OWN name — `равно(другое: Равнозначное) ->
-    // Булево`, not a synthesized generic placeholder (that placeholder
-    // trick only exists in the now-mostly-dead hardcoded
-    // `preludePass` stand-ins). A literal self-reference isn't a
-    // `.generic_parameter`, so `substituteGeneric` leaves it untouched
-    // and a plain `eql` against the impl's concrete parameter type
-    // always failed — real gap found only once the real prelude module
-    // path was exercised for the first time (`Равнозначное`/
-    // `Складываемое`/... have no `isComparableInterface`-style bypass).
+    // НАСТОЯЩЕЕ объявление интерфейса (встроенный исходник `prelude.zig`
+    // либо любой пользовательский `тип X = интерфейс ... конец`) пишет
+    // "Self" просто как СОБСТВЕННОЕ имя интерфейса — `равно(другое:
+    // Равнозначное) -> Булево`, а не синтезированную генерик-заглушку
+    // (этот приём с заглушкой существует только в захардкоженных
+    // заменителях `preludePass`). Буквальная self-ссылка — не
+    // `.generic_parameter`, поэтому `substituteGeneric` оставляет её
+    // нетронутой, и обычный `eql` с конкретным типом параметра импла
+    // всегда бы проваливался.
     fn isSelfReference(self: *const Checker, interface: symbols.SymbolId, type_id: types.TypeId) bool {
         const entry = self.result.types.get(type_id) orelse return false;
         return switch (entry.*) {
@@ -1823,14 +1783,11 @@ const Checker = struct {
         try self.checkUnreachableCode(body);
     }
 
-    // Ported from `core/type_cheker.odin`'s `stmt_always_diverges`/
-    // `block_always_diverges`/`expr_always_diverges`/
-    // `stmt_diverges_for_reachability`/`check_unreachable_code`/
-    // `check_unreachable_code_expr` — warns (`.severity = .warning`, does
-    // NOT block execution) about code that follows a guaranteed-diverging
-    // statement in the SAME block. `если` without `иначе` never counts as
-    // diverging (the false-condition path falls straight through) — only
-    // `stmtAlwaysDiverges`'s `.if_expr` case matters here, reached via
+    // Предупреждает (`.severity = .warning`, выполнение НЕ блокируется)
+    // о коде, следующем за гарантированно расходящимся оператором в ТОМ
+    // ЖЕ блоке. `если` без `иначе` никогда не считается расходящимся
+    // (путь при ложном условии проходит насквозь) — здесь важен только
+    // случай `.if_expr` в `stmtAlwaysDiverges`, достигаемый через
     // `exprAlwaysDiverges`.
     fn stmtAlwaysDiverges(self: *const Checker, statement: ast.StmtId) bool {
         return switch (self.tree.stmt(statement).*) {
@@ -1850,8 +1807,8 @@ const Checker = struct {
     fn exprAlwaysDiverges(self: *const Checker, expression: ast.ExprId) bool {
         switch (self.tree.expr(expression).*) {
             .if_expr => |conditional| {
-                // No `иначе` — the false-condition path falls straight
-                // through, never diverges.
+                // Нет `иначе` — путь при ложном условии проходит
+                // насквозь, никогда не расходится.
                 if (conditional.else_branch.len == 0) return false;
                 return self.blockAlwaysDiverges(conditional.then_branch) and self.blockAlwaysDiverges(conditional.else_branch);
             },
@@ -1864,18 +1821,18 @@ const Checker = struct {
             },
             else => {},
         }
-        // Everything else (panic/infinite recursion etc.) is already
-        // typed `Никогда` by ordinary Never-propagation — `expression_types`
-        // is already fully populated by the time this runs (after the
-        // whole body's been inferred once).
+        // Всё остальное (паника/бесконечная рекурсия и т.п.) уже имеет
+        // тип `Никогда` благодаря обычному распространению Never —
+        // `expression_types` к моменту этого вызова уже полностью
+        // заполнена (после того как всё тело один раз выведено).
         const expression_type = self.result.expression_types.get(expression) orelse return false;
         return self.isType(expression_type, self.result.types.builtins.never);
     }
 
-    // Superset of `stmtAlwaysDiverges` — `прервать`/`продолжить` also
-    // make the REST OF THIS BLOCK unreachable (they don't make the
-    // enclosing function/block itself always-diverge, which is why this
-    // is a SEPARATE function from `stmtAlwaysDiverges`, not a shared one).
+    // Надмножество `stmtAlwaysDiverges` — `прервать`/`продолжить` тоже
+    // делают ОСТАТОК ЭТОГО БЛОКА недостижимым (но не заставляют
+    // расходиться саму охватывающую функцию/блок, поэтому это ОТДЕЛЬНАЯ
+    // функция от `stmtAlwaysDiverges`, не общая с ней).
     fn stmtDivergesForReachability(self: *const Checker, statement: ast.StmtId) bool {
         return switch (self.tree.stmt(statement).*) {
             .return_stmt, .break_stmt, .continue_stmt => true,
@@ -1951,10 +1908,11 @@ const Checker = struct {
             },
             .return_stmt => |return_statement| blk: {
                 const return_value = return_statement.value orelse {
-                    // Bare `возврат` — a void return, only valid where the
-                    // function's declared return type actually IS `Пусто`
-                    // (matching an ordinary `Пусто`-returning function
-                    // that just falls off the end of its body).
+                    // Пустой `возврат` — возврат Пусто, допустим только
+                    // там, где объявленный тип возврата функции
+                    // действительно `Пусто` (как у обычной функции,
+                    // возвращающей `Пусто` просто выпадением из конца
+                    // своего тела).
                     if (!self.isType(expected_return, self.result.types.builtins.void)) {
                         try self.report(return_statement.span, "Type Error: 'возврат' без значения допустим только в функции, возвращающей Пусто", .{});
                     }
@@ -1966,17 +1924,14 @@ const Checker = struct {
                 } else {
                     try self.registerInterfaceCast(return_value, value_type, expected_return);
                 }
-                // `Никогда`, NOT `expected_return` — a `возврат` diverges
-                // the ENCLOSING FUNCTION, it doesn't produce a value at
-                // this point at all. Real gap found auditing panosiki's
-                // `std/математика.ps`: `если n == 0 тогда возврат 1 конец`
-                // (no `иначе`) used as a plain statement failed with
-                // "ветви 'если' возвращают разные типы" — `inferIfExpected`
-                // already has `isNever(then_type)`-based exemption logic
-                // for EXACTLY this shape, but it could never fire because
-                // this case returned `expected_return` (e.g. `Число`)
-                // instead of `Никогда`, so the then-branch's inferred type
-                // never matched the implicit empty else-branch's `Пусто`.
+                // `Никогда`, НЕ `expected_return` — `возврат` расходится с
+                // ОХВАТЫВАЮЩЕЙ ФУНКЦИЕЙ, сам по себе он вообще не
+                // производит значения в этой точке. `inferIfExpected` уже
+                // содержит освобождающую логику на основе
+                // `isNever(then_type)` именно для такой формы (`если n
+                // == 0 тогда возврат 1 конец` без `иначе`), но она может
+                // сработать только если здесь возвращается `Никогда`, а
+                // не `expected_return`.
                 break :blk self.result.types.builtins.never;
             },
             .expr => |expression| if (expected_value) |expected| blk: {
@@ -1984,34 +1939,26 @@ const Checker = struct {
                 if (self.assignable(actual, expected)) try self.registerInterfaceCast(expression.value, actual, expected);
                 break :blk actual;
             } else if (!tail_value_needed and self.tree.expr(expression.value).* == .if_expr)
-                // `если` used as a BARE STATEMENT (not the block's trailing
-                // value) never needs its branches to agree on a type — its
-                // result is unconditionally discarded, mirroring
-                // `compiler.zig`'s OWN `compileStatement` comment on this
-                // exact shape ("Expr_Stmt — value is ALWAYS discarded...
-                // lower with want_value=false"). The type-checker never
-                // got the matching exemption: `если снимок.содержит(x)
-                // тогда x.добавить(y) конец` (no `иначе`, `.добавить`
-                // returns `Пусто`) was fine, but `если ... тогда
-                // фс.удалить_директорию(x) конец` (no `иначе`,
-                // `удалить_директорию` returns `Результат(...)`) failed
-                // "ветви 'если' возвращают разные типы" against the
-                // implicit empty `Пусто` else-branch — a real gap found
-                // auditing panosiki's `std/tempfiles.ps`.
+                // `если`, используемый как ГОЛЫЙ ОПЕРАТОР (не хвостовое
+                // значение блока), никогда не требует согласования типов
+                // своих ветвей — его результат безусловно отбрасывается,
+                // отражая собственный комментарий `compileStatement` в
+                // `compiler.zig` для этой же формы ("Expr_Stmt — значение
+                // ВСЕГДА отбрасывается... компилировать с
+                // want_value=false").
                 //
-                // `tail_value_needed` is NOT the same thing as
-                // `expected_value != null`: a block's TRAILING statement
-                // whose value is actually consumed (function/lambda body,
-                // an if-expression branch, a match arm) but with no
-                // concrete expected type propagated to THIS point
-                // (expected_value == null) must still go through full
-                // branch unification — otherwise a nested if-expression as
-                // the tail of an else-branch (found running `pan`'s own
-                // `семвер` module) silently took the discard path, always
-                // inferred as `Пусто` regardless of its real branches, and
-                // the OUTER if-expression failed "ветви 'если' возвращают
-                // разные типы" against two branches whose types were
-                // actually identical.
+                // `tail_value_needed` — НЕ то же самое, что
+                // `expected_value != null`: ХВОСТОВОЙ оператор блока, чьё
+                // значение реально потребляется (тело функции/лямбды,
+                // ветвь if-выражения, ветвь match), но без конкретного
+                // ожидаемого типа, доведённого до ЭТОЙ точки
+                // (expected_value == null), всё равно должен пройти
+                // полную унификацию ветвей — иначе вложенное if-выражение
+                // в хвосте else-ветви молча уходило бы по пути отбрасывания,
+                // всегда выводясь как `Пусто` независимо от своих реальных
+                // ветвей, и ВНЕШНЕЕ if-выражение проваливалось бы с
+                // "ветви 'если' возвращают разные типы" для двух ветвей с
+                // на самом деле идентичными типами.
                 try self.inferIfAsStatement(self.tree.expr(expression.value).if_expr)
             else
                 self.infer(expression.value),
@@ -2031,11 +1978,11 @@ const Checker = struct {
 
     fn infer(self: *Checker, expression: ast.ExprId) anyerror!types.TypeId {
         const inferred = switch (self.tree.expr(expression).*) {
-            // Purely syntactic now — `1` is always `Целое`, `1.0` is
-            // always `Число`, regardless of surrounding context (no
-            // implicit coercion either way, matching Rust `as`/Haskell
-            // `fromIntegral`, both requiring an explicit cast even for
-            // widening int->float).
+            // Чисто синтаксически — `1` всегда `Целое`, `1.0` всегда
+            // `Число`, независимо от окружающего контекста (никакого
+            // неявного приведения ни в ту, ни в другую сторону,
+            // требуется явное преобразование даже для расширения
+            // int->float).
             .number => |number| if (number.is_integer_literal) self.result.types.builtins.integer else self.result.types.builtins.number,
             .boolean => self.result.types.builtins.boolean,
             .string => self.result.types.builtins.string,
@@ -2148,13 +2095,14 @@ const Checker = struct {
         return self.result.types.poison();
     }
 
-    // `выбор ожидание(источник) ... конец` — `источник` must be
-    // `Массив(Процесс(R))`; R comes straight from that array's element
-    // type (ordinary array-literal unification already rejects
-    // heterogeneous `Процесс(T)` elements, same as any other array — not
-    // a new limitation introduced here). The message payload of a
-    // `Сообщение` arm stays poison/untyped, matching `получить()`'s own
-    // return type — the mailbox has no static element type today either.
+    // `выбор ожидание(источник) ... конец` — `источник` должен быть
+    // `Массив(Процесс(R))`; R берётся прямо из типа элемента этого
+    // массива (обычная унификация литерала массива уже отклоняет
+    // разнородные элементы `Процесс(T)`, как и у любого другого
+    // массива). Полезная нагрузка сообщения в ветке `Сообщение` остаётся
+    // poison/нетипизированной, как и собственный тип возврата
+    // `получить()` — у почтового ящика тоже нет статического типа
+    // элемента.
     fn inferSelectWait(self: *Checker, select: anytype) !types.TypeId {
         const source_type = try self.infer(select.source);
         const source_entry = self.result.types.get(source_type) orelse return self.result.types.poison();
@@ -2163,15 +2111,11 @@ const Checker = struct {
                 const element_entry = self.result.types.get(element_type) orelse break :blk try self.result.types.poison();
                 break :blk switch (element_entry.*) {
                     .process => |r| r,
-                    // `массив()` (empty, no elements to infer an element
-                    // type from) — real bug found via a docs-example
-                    // sweep: post the poison/`unconstrained` split, an
-                    // empty array literal infers `Массив(unconstrained)`,
-                    // NOT `Массив(poison)` (`infer`'s `.array` case) —
-                    // this switch only ever special-cased `.poison`, so
-                    // the documented `выбор ожидание(массив())` idiom
-                    // ("block on mailbox + signals only, no watched
-                    // processes") always spuriously errored.
+                    // `массив()` (пустой, нет элементов для вывода их
+                    // типа) — после разделения poison/`unconstrained`
+                    // пустой литерал массива выводится как
+                    // `Массив(unconstrained)`, а НЕ `Массив(poison)`
+                    // (ветка `.array` в `infer`).
                     .poison, .unconstrained => try self.result.types.poison(),
                     else => blk2: {
                         try self.report(select.span, "Type Error: 'ожидание' ожидает Массив(Процесс(R))", .{});
@@ -2198,21 +2142,22 @@ const Checker = struct {
             },
         };
         const call_return_type = try self.inferCall(spawn.call, call);
-        // A long-lived actor DECLARES its accepted message type via `->
-        // Сообщение(T)` (see `types.zig`'s `Type.message` doc comment) —
-        // read straight off the callee's own signature, no body analysis
-        // needed. Plain `-> Пусто` (the old, still-supported actor shape
-        // with no declared message type) stays `Процесс(poison)`,
-        // unchecked, exactly as before — this is an opt-in annotation,
-        // not a requirement, so every actor that hasn't been updated to
-        // declare `Сообщение(T)` keeps working identically.
+        // Долгоживущий актор ОБЪЯВЛЯЕТ принимаемый тип сообщения через
+        // `-> Сообщение(T)` (см. doc-комментарий `Type.message` в
+        // `types.zig`) — читается прямо из собственной сигнатуры
+        // вызываемого, анализ тела не нужен. Простое `-> Пусто` (старая,
+        // всё ещё поддерживаемая форма актора без объявленного типа
+        // сообщения) остаётся `Процесс(poison)`, без проверки, как и
+        // раньше — это опциональная аннотация, а не требование, так что
+        // каждый актор, не обновлённый до объявления `Сообщение(T)`,
+        // продолжает работать так же.
         if (self.messagePayload(call_return_type)) |payload| {
             return self.result.types.process(payload);
         }
-        // A function that actually RETURNS a value is being used
-        // task-style instead (one-shot computation, result read back via
-        // `ждать`) — for that case T becomes the real return type, so
-        // `ждать` can deliver it.
+        // Функция, которая действительно ВОЗВРАЩАЕТ значение,
+        // используется в стиле задачи (одноразовое вычисление,
+        // результат читается через `ждать`) — в этом случае T становится
+        // настоящим типом возврата, чтобы `ждать` мог его доставить.
         if (self.isType(call_return_type, self.result.types.builtins.void)) {
             return self.result.types.process(try self.result.types.poison());
         }
@@ -2222,17 +2167,6 @@ const Checker = struct {
     fn inferExpected(self: *Checker, expression: ast.ExprId, expected: types.TypeId) anyerror!types.TypeId {
         return switch (self.tree.expr(expression).*) {
             .lambda => |lambda| self.recordExpressionType(expression, try self.inferLambda(expression, lambda, expected)),
-            // `.number`/`.unary`/`.binary` used to have special cases
-            // here that FORCED a bare literal (which defaulted to
-            // `Число`) into `Целое` when the surrounding context
-            // expected it — no longer needed: a literal's type is now
-            // a purely syntactic fact (`1` is always `Целое`, `1.0`
-            // always `Число`, see `infer`'s `.number` case), so plain
-            // `self.infer(expression)` already produces the right type,
-            // and `inferBinary`'s own operand-type-match checks
-            // (`оператор '+' ожидает два числа одного типа` etc.)
-            // already give an equivalent diagnostic for a genuine
-            // mismatch — nothing lost by falling through to `infer`.
             .tuple => |tuple| blk: {
                 const expected_type = self.result.types.get(expected) orelse break :blk self.infer(expression);
                 if (expected_type.* != .tuple or expected_type.tuple.len != tuple.elements.len) break :blk self.infer(expression);
@@ -2246,20 +2180,16 @@ const Checker = struct {
                 }
                 break :blk self.recordExpressionType(expression, expected);
             },
-            // `Массив(Интерфейс) = массив(КонкретныйТип(...), ...)` — real
-            // gap found designing `супервизор.ps`'s Phase E rewrite:
-            // unlike a `пер`/return/argument site (all of which call
-            // `registerInterfaceCast` on an assignable mismatch), a
-            // collection LITERAL's element only ever ran `assignable()`
-            // here — true (poison-tolerant `.process`-style structural
-            // check aside), but never recorded the cast the COMPILER
-            // needs to actually BOX the concrete struct value as an
-            // interface at runtime. Every element ended up stored
-            // unboxed, and any later interface-dispatched call through it
-            // (`массив[i].метод()`, even via an intermediate local)
-            // panicked "попытка вызвать интерфейсный метод у
-            // не-интерфейса" — 100% reproducible, not an edge case, for
-            // ANY interface-typed collection literal.
+            // `Массив(Интерфейс) = массив(КонкретныйТип(...), ...)` —
+            // в отличие от точки `пер`/return/аргумент (все они вызывают
+            // `registerInterfaceCast` при совместимом несовпадении),
+            // элемент коллекции-ЛИТЕРАЛА здесь раньше только проходил
+            // `assignable()`, но никогда не записывал приведение,
+            // которое нужно КОМПИЛЯТОРУ, чтобы реально УПАКОВАТЬ
+            // конкретное значение структуры как интерфейс во время
+            // выполнения — иначе каждый элемент хранился бы неупакованным,
+            // и любой последующий вызов с интерфейсной диспетчеризацией
+            // через него паниковал бы.
             .array => |array| blk: {
                 const expected_type = self.result.types.get(expected) orelse break :blk self.infer(expression);
                 const element_type = switch (expected_type.*) {
@@ -2316,30 +2246,31 @@ const Checker = struct {
         };
     }
 
-    // `inferBlock` is used ONLY for loop bodies (см. `inferForIn`/
-    // `inferForRange`/`выбор` над `получить`) — a loop's body value is
-    // NEVER consumed by anything, so its trailing statement is discarded
-    // exactly like `инferIfAsStatement`'s two sub-blocks, not "value
-    // needed, type unknown" (`discard_tail = true`, see `inferBlockExpected`).
+    // `inferBlock` используется ТОЛЬКО для тел циклов (см. `inferForIn`/
+    // `inferForRange`/`выбор` над `получить`) — значение тела цикла
+    // НИКОГДА никем не потребляется, так что его хвостовой оператор
+    // отбрасывается точно так же, как два подблока `inferIfAsStatement`,
+    // а не по схеме "значение нужно, тип неизвестен" (`discard_tail =
+    // true`, см. `inferBlockExpected`).
     fn inferBlock(self: *Checker, statements: []const ast.StmtId) anyerror!types.TypeId {
         return self.inferBlockExpected(statements, null, true);
     }
 
-    // `discard_tail` distinguishes two DIFFERENT reasons the trailing
-    // statement's `expected_last` can be `null`: (1) the block's value is
-    // never consumed at all (loop bodies, `inferIfAsStatement`'s two
-    // branches — `discard_tail = true`, trailing `если` may still take
-    // the cheap discard path in `inferStatement`), vs (2) the block's
-    // value genuinely matters (function/lambda body, an if-expression
-    // branch, a match arm) but no concrete type was propagated INTO this
-    // point (`discard_tail = false` — the trailing statement must still
-    // be fully inferred/unified, see `tail_value_needed` in
-    // `inferStatement`). Conflating these two into a single `null` was a
-    // real bug found running `pan`'s own `семвер` module: a nested
-    // if-expression as the tail of an else-branch silently discarded
-    // instead of unifying, and the OUTER if-expression then failed
-    // "ветви 'если' возвращают разные типы" on two branches whose actual
-    // types were identical.
+    // `discard_tail` различает две РАЗНЫЕ причины, по которым
+    // `expected_last` хвостового оператора может быть `null`: (1)
+    // значение блока вообще никогда не потребляется (тела циклов, два
+    // подблока `inferIfAsStatement` — `discard_tail = true`, хвостовой
+    // `если` может по-прежнему пойти дешёвым путём отбрасывания в
+    // `inferStatement`), в отличие от (2) значение блока действительно
+    // важно (тело функции/лямбды, ветвь if-выражения, ветвь match), но
+    // конкретный тип не был доведён ДО этой точки (`discard_tail =
+    // false` — хвостовой оператор всё равно должен быть полностью
+    // выведен/унифицирован, см. `tail_value_needed` в `inferStatement`).
+    // Смешивание этих двух случаев в единый `null` было реальной
+    // ошибкой: вложенное if-выражение в хвосте else-ветви молча
+    // отбрасывалось вместо унификации, и ВНЕШНЕЕ if-выражение затем
+    // проваливалось с "ветви 'если' возвращают разные типы" для двух
+    // ветвей с фактически идентичными типами.
     fn inferBlockExpected(self: *Checker, statements: []const ast.StmtId, expected_last: ?types.TypeId, discard_tail: bool) anyerror!types.TypeId {
         var result_type = self.result.types.builtins.void;
         for (statements, 0..) |statement, index| {
@@ -2366,22 +2297,21 @@ const Checker = struct {
         const diagnostics_before_else = self.result.diagnostics.items.items.len;
         var else_type = try self.inferBlockExpected(conditional.else_branch, expected, false);
         const else_failed = self.result.diagnostics.items.items.len > diagnostics_before_else;
-        // Real gap found auditing panosiki's `gitsync`
-        // (`пер remote_опция = если remote == "" тогда Опция.Нет()
-        // иначе Опция.Есть(remote) конец`, no `: Тип` annotation): with
-        // no `expected` propagated at all, `Опция.Нет()` has ZERO
-        // arguments to infer its own `T` from (`inferEnumVariantCall`
-        // reports "не удалось вывести type-параметр 'T'" and falls back
-        // to `poison`) — a fully ordinary, common panos idiom that
-        // NEVER worked without an explicit annotation. When exactly ONE
-        // branch fails this way while the other infers cleanly, retry
-        // the FAILED branch using the SUCCESSFUL branch's inferred type
-        // as `expected` — this routes back through the SAME
-        // `inferEnumVariantCallExpected` mechanism that already makes
-        // `Опция.Нет()` work fine in every OTHER expected-type context
-        // (a struct field, a return position, ...). The failed attempt's
-        // diagnostics are rolled back (`shrinkRetainingCapacity`) before
-        // retrying so a since-fixed error doesn't linger.
+        // Без доведённого `expected` у `Опция.Нет()` НОЛЬ аргументов,
+        // из которых можно вывести собственный `T`
+        // (`inferEnumVariantCall` сообщает "не удалось вывести
+        // type-параметр 'T'" и откатывается к `poison`) — вполне обычная
+        // распространённая идиома панос, которая никогда не работала бы
+        // без явной аннотации. Если ровно ОДНА ветвь проваливается таким
+        // образом, а другая выводится чисто, повторяем ПРОВАЛИВШУЮСЯ
+        // ветвь, используя выведенный тип УСПЕШНОЙ ветви как `expected`
+        // — это направляет обратно через ТОТ ЖЕ механизм
+        // `inferEnumVariantCallExpected`, который уже заставляет
+        // `Опция.Нет()` работать в любом ДРУГОМ контексте с ожидаемым
+        // типом (поле структуры, позиция возврата, ...). Диагностика
+        // проваленной попытки откатывается (`shrinkRetainingCapacity`)
+        // перед повтором, чтобы уже исправленная ошибка не осталась
+        // висеть.
         if (expected == null and then_failed and !else_failed and !self.isNever(else_type)) {
             self.result.diagnostics.items.shrinkRetainingCapacity(diagnostics_before_then);
             then_type = try self.inferBlockExpected(conditional.then_branch, else_type, false);
@@ -2390,22 +2320,19 @@ const Checker = struct {
             else_type = try self.inferBlockExpected(conditional.else_branch, then_type, false);
         }
         const joined = if (self.isNever(then_type)) else_type else if (self.isNever(else_type)) then_type else null;
-        // `both_satisfy_expected` — when `expected` is known AND both
-        // branches are ALREADY individually valid against it (checked
-        // again, explicitly, right below), the pairwise mutual check is
-        // skipped: `assignable` isn't symmetric for interfaces, so two
-        // branches that each satisfy an interface-typed `expected` (one
-        // via a bare interface-typed value, the other via a concrete
-        // implementor — e.g. `слог.Логгер` vs a bare `СтандартныйЛоггер`)
-        // can still fail the OLD mutual check against each other even
-        // though the join is perfectly sound. Scoped narrowly to that
-        // case (not "skip whenever expected != null") so a GENUINELY
-        // mismatched pair (e.g. one branch's actual type failing
-        // `expected` outright) still falls through to the pairwise
-        // check below and keeps reporting the same
-        // "ветви 'если' возвращают разные типы" message existing tests
-        // rely on, rather than the different "не совпадают с ожидаемым
-        // типом" message from the check further down.
+        // `both_satisfy_expected` — когда `expected` известен И обе
+        // ветви УЖЕ по отдельности валидны против него (проверяется
+        // явно ещё раз чуть ниже), взаимная попарная проверка
+        // пропускается: `assignable` не симметричен для интерфейсов,
+        // поэтому две ветви, каждая из которых удовлетворяет
+        // интерфейсному `expected` (одна через голое значение
+        // интерфейсного типа, другая через конкретную реализацию —
+        // например `слог.Логгер` против голого `СтандартныйЛоггер`),
+        // всё ещё могли бы провалить СТАРУЮ взаимную проверку друг с
+        // другом, хотя объединение совершенно корректно. Ограничено
+        // узко этим случаем (не "пропускать всегда, когда expected !=
+        // null"), чтобы ДЕЙСТВИТЕЛЬНО несовпадающая пара по-прежнему
+        // проваливалась в попарную проверку ниже.
         const both_satisfy_expected = if (expected) |expected_type|
             (self.isNever(then_type) or self.assignable(then_type, expected_type)) and (self.isNever(else_type) or self.assignable(else_type, expected_type))
         else
@@ -2424,13 +2351,11 @@ const Checker = struct {
         return joined orelse then_type;
     }
 
-    // `если` as a bare statement — type-checks the condition and BOTH
-    // branch bodies independently (each with `expected_value = null`, so
-    // a NESTED trailing если/выбор inside either branch still gets its
-    // own correct treatment), but never requires them to agree with each
-    // other or produce any usable value — see the call site's comment in
-    // `inferStatement` for why (`compiler.zig`'s existing want_value=false
-    // codegen for this exact shape has no such requirement either).
+    // `если` как голый оператор — проверяет типы условия и ОБЕИХ тел
+    // ветвей независимо (у каждой `expected_value = null`, так что
+    // ВЛОЖЕННЫЙ хвостовой если/выбор внутри любой ветви всё равно
+    // получает собственную корректную обработку), но никогда не требует
+    // их согласования друг с другом или получения полезного значения.
     fn inferIfAsStatement(self: *Checker, conditional: anytype) anyerror!types.TypeId {
         const condition = try self.infer(conditional.condition);
         if (!self.assignable(condition, self.result.types.builtins.boolean)) {
@@ -2462,18 +2387,18 @@ const Checker = struct {
             try self.report(match.span, "Type Error: выбор не поддерживает этот тип", .{});
             return self.result.types.poison();
         }
-        // Value = "has a fully catch-all (unrefined) arm for this variant
-        // already been seen". Two arms for the SAME variant are only
-        // genuinely duplicate/unreachable once one of them has no field
-        // narrowing at all (`Клик -> ...` after an earlier `Клик ->
-        // ...`, or any arm after that) — `выбор` tries arms in order, so
-        // a catch-all arm makes every later arm for that variant dead
-        // code regardless of its own narrowing. Two arms with DIFFERENT
-        // field patterns (e.g. `Клик(x: 0, y)` then `Клик(x, y)` —
-        // literal-narrowed then a plain binder) are NOT duplicates: the
-        // second only catches what the first didn't. Previously this
-        // flagged ANY repeated variant symbol regardless of narrowing,
-        // rejecting that idiom outright.
+        // Значение = "уже встречена полностью универсальная
+        // (неуточнённая) ветка для этого варианта". Две ветки для ОДНОГО
+        // варианта по-настоящему дублируют/недостижимы только когда одна
+        // из них вовсе не сужает поля (`Клик -> ...` после более раннего
+        // `Клик -> ...`, или любая ветка после этого) — `выбор` пробует
+        // ветки по порядку, так что универсальная ветка делает каждую
+        // последующую ветку для этого варианта мёртвым кодом независимо
+        // от её собственного сужения. Две ветки с РАЗНЫМИ шаблонами
+        // полей (например `Клик(x: 0, y)`, затем `Клик(x, y)` —
+        // сначала сужение литералом, потом обычное связывание) НЕ
+        // дублируют друг друга: вторая ловит только то, что не поймала
+        // первая.
         var covered = std.AutoHashMap(symbols.SymbolId, bool).init(self.result.allocator);
         defer covered.deinit();
         var fallback_seen = false;
@@ -2484,13 +2409,14 @@ const Checker = struct {
             if (fallback_seen) try self.report(arm.span, "Type Error: шаблон после универсальной ветки недостижим", .{});
             if (try self.inferMatchPattern(arm.pattern, subject_type, true)) |variant| {
                 if (enum_definition != null) {
-                    // Unlike `isCatchAllPattern` (used below for
-                    // `fallback_seen`, which asks "catch-all for the
-                    // WHOLE match"), this asks "given we already know
-                    // this arm targets `variant`, does it narrow the
-                    // variant's OWN fields at all?" — a bare `Клик` or
-                    // `Клик(x, y)` (plain binders) is fully generic for
-                    // that variant; `Клик(x: 0, y)` is not.
+                    // В отличие от `isCatchAllPattern` (используется
+                    // ниже для `fallback_seen`, спрашивающего "универсальна
+                    // ли ветка для ВСЕГО match"), здесь вопрос "раз уже
+                    // известно, что эта ветка нацелена на `variant`,
+                    // сужает ли она СОБСТВЕННЫЕ поля варианта вообще?" —
+                    // голый `Клик` или `Клик(x, y)` (обычные связывания)
+                    // полностью универсален для этого варианта;
+                    // `Клик(x: 0, y)` — нет.
                     const is_fully_generic = self.isVariantPatternFullyGeneric(arm.pattern);
                     if (covered.get(variant)) |already_catch_all| {
                         if (already_catch_all) {
@@ -2511,26 +2437,18 @@ const Checker = struct {
                 }
             }
             const arm_type = try self.inferBlockExpected(arm.body, expected, false);
-            // When `expected` is known (the match sits in a context with
-            // a declared type — a function's return position, an
-            // annotated `пер`, ...), each arm is ALREADY validated
-            // against it individually just below — that alone is enough
-            // to prove the join is sound, so the separate pairwise
-            // mutual-assignability check between arms is skipped
-            // entirely in that case. Real gap found auditing panosiki's
-            // `gitsync` (`выбор контекст.логгер \n Опция.Есть(л) -> л \n
-            // Опция.Нет -> слог.логгер().с_уровнем(...) \n конец`,
-            // function declared `-> слог.Логгер`): one arm's value is
-            // already interface-typed (`л`, unwrapped from
-            // `Опция(слог.Логгер)`), the other a CONCRETE
-            // `СтандартныйЛоггер` — each is individually assignable to
-            // the declared `слог.Логгер` (one directly, one via
-            // interface implementation), but `assignable` is NOT
-            // symmetric for interface types (a concrete struct is
-            // assignable TO an interface it implements, never the
-            // reverse) — the old pairwise check compared the two arms
-            // directly against EACH OTHER (mutually, both directions)
-            // and always failed for exactly this legitimate pattern.
+            // Когда `expected` известен (match находится в контексте с
+            // объявленным типом — позиция возврата функции,
+            // аннотированный `пер`, ...), каждая ветка УЖЕ проверена
+            // против него по отдельности чуть ниже — этого достаточно,
+            // чтобы доказать корректность объединения, поэтому отдельная
+            // попарная проверка взаимной совместимости между ветками в
+            // этом случае полностью пропускается: `assignable` НЕ
+            // симметричен для интерфейсных типов (конкретная структура
+            // совместима С интерфейсом, который реализует, но не
+            // наоборот) — старая попарная проверка сравнивала две ветки
+            // напрямую ДРУГ С ДРУГОМ (взаимно, в обе стороны) и всегда
+            // проваливалась именно на этом законном паттерне.
             if (expected == null) {
                 if (result_type) |previous| {
                     if (self.isNever(previous)) {
@@ -2593,25 +2511,13 @@ const Checker = struct {
                 if (subject_entry.* == .poison or subject_entry.* == .unconstrained) {
                     if (self.resolution.pattern_symbols.get(pattern_id)) |variant| {
                         try self.result.pattern_variants.put(pattern_id, variant);
-                        // Real bug found running actual code, not just
-                        // reading: a `poison`/`unconstrained` SUBJECT
-                        // (`получить()`'s own type whenever the
-                        // enclosing function isn't declared `->
-                        // Сообщение(T)` — see that builtin's own
-                        // handling above) used to short-circuit here
-                        // WITHOUT ever recursing into the pattern's own
-                        // field arguments — every field binding
-                        // (`Тип.Вариант(шаг, отвечающему)`'s `шаг`/
-                        // `отвечающему`) was left with no
-                        // `symbol_types` entry at all, silently staying
-                        // poison too, and poisoning any ordinary
-                        // arithmetic done on them afterward. `Тип.
-                        // Вариант` is explicitly qualified — the ENUM
-                        // identity doesn't need `subject_type` at all,
-                        // only its (possibly generic) TYPE ARGUMENTS
-                        // do; for the common non-generic case those
-                        // don't exist, so the variant's own declared
-                        // field types can be used directly.
+                        // `Тип.Вариант` явно квалифицирован — идентичность
+                        // ПЕРЕЧИСЛЕНИЯ вообще не нуждается в
+                        // `subject_type`, в нём нуждаются только его
+                        // (возможно генерик) АРГУМЕНТЫ ТИПА; для
+                        // обычного не-генерик случая их не существует,
+                        // так что можно напрямую использовать
+                        // собственные объявленные типы полей варианта.
                         if (self.enumVariant(variant)) |enum_variant| {
                             const owner = self.resolution.symbols.get(variant);
                             const definition = if (owner) |o| self.result.enum_definitions.get(o.owner_type) else null;
@@ -2624,11 +2530,11 @@ const Checker = struct {
                                     _ = try self.inferMatchPattern(argument, field, false);
                                 }
                             }
-                            // A GENERIC enum's field types depend on
-                            // `subject_type`'s own (unknown, since it's
-                            // poison) type arguments — no way to resolve
-                            // concrete field types here; those bindings
-                            // stay poison, same as before this fix.
+                            // Типы полей ГЕНЕРИК-перечисления зависят от
+                            // собственных (неизвестных, поскольку это
+                            // poison) аргументов типа `subject_type` —
+                            // здесь нет способа разрешить конкретные типы
+                            // полей; эти связывания остаются poison.
                         }
                         return variant;
                     }
@@ -2719,12 +2625,12 @@ const Checker = struct {
         };
     }
 
-    // Same recursive "are all sub-patterns unrefined" check as
-    // `isCatchAllPattern`'s `.constructor` case, but WITHOUT that
-    // function's own top-level `patternVariant != null` guard — that
-    // guard means "this pattern targets one specific variant, so it's
-    // not a catch-all for the whole `выбор`", which is the wrong
-    // question here (see call site in `inferMatchExpected`).
+    // Та же рекурсивная проверка "все подшаблоны неуточнены", что и
+    // ветка `.constructor` в `isCatchAllPattern`, но БЕЗ её собственной
+    // верхнеуровневой защиты `patternVariant != null` — эта защита
+    // означает "этот шаблон нацелен на один конкретный вариант, значит
+    // не универсален для всего `выбор`", что здесь не тот вопрос (см.
+    // точку вызова в `inferMatchExpected`).
     fn isVariantPatternFullyGeneric(self: *const Checker, pattern_id: ast.PatternId) bool {
         return switch (self.tree.pattern(pattern_id).*) {
             .wildcard, .ident => true,
@@ -2804,16 +2710,14 @@ const Checker = struct {
         const iterable = self.findTypeSymbol("Итерируемое") orelse return null;
         const definition = self.result.interface_definitions.get(iterable) orelse return null;
         if (definition.parameters.len != 1) return null;
-        // `следующий` is looked up BY NAME/index, not assumed to be the
-        // interface's only method — real gap found once `Итерируемое`
-        // gained default methods (`отобразить`/`отфильтровать`/`взять`/
-        // `собрать`): the old `.methods.len != 1` check made for-in stop
-        // recognizing ANY `Итерируемое` implementor at all the moment a
-        // second method (default or not) existed on the interface.
-        // `implementation.methods` is always parallel to `definition.
-        // methods` (same order, same length — `defineInterfaceImplementation`
-        // builds it that way), so the SAME index picks out the matching
-        // compiled function.
+        // `следующий` ищется ПО ИМЕНИ/индексу, а не предполагается
+        // единственным методом интерфейса — это важно после появления у
+        // `Итерируемое` методов по умолчанию (`отобразить`/
+        // `отфильтровать`/`взять`/`собрать`). `implementation.methods`
+        // всегда параллелен `definition.methods` (тот же порядок, та же
+        // длина — так строит его `defineInterfaceImplementation`), так
+        // что ТОТ ЖЕ индекс выбирает соответствующую скомпилированную
+        // функцию.
         const next_index = self.findMethodIndex(definition, "следующий") orelse return null;
         for (self.result.interface_implementations.items) |implementation| {
             if (implementation.interface != iterable or implementation.target != target or implementation.arguments.len != 1 or implementation.methods.len <= next_index) continue;
@@ -3043,14 +2947,13 @@ const Checker = struct {
         const previous_return = self.current_return;
         self.current_return = return_type;
         defer self.current_return = previous_return;
-        // Mirrors `checkFunction`'s OWN void-return exemption exactly — a
-        // real gap found auditing panosiki's `std/слог.ps`: an ordinary
-        // `функ ... -> Пусто ... конец` whose last statement is a non-void
-        // expression (its value simply discarded) has ALWAYS been allowed
-        // (`checkFunction` skips the assignability check entirely when
-        // the declared return type is `Пусто`), but a LAMBDA with the
-        // exact same shape (`функ(x) -> Пусто ... конец`) unconditionally
-        // required an exact type match, rejecting the identical pattern.
+        // Отражает СОБСТВЕННОЕ освобождение для возврата Пусто у
+        // `checkFunction` — обычная `функ ... -> Пусто ... конец`, чей
+        // последний оператор — не-void выражение (значение просто
+        // отбрасывается), всегда допускалась (`checkFunction` вовсе
+        // пропускает проверку совместимости, когда объявленный тип
+        // возврата — `Пусто`); ЛЯМБДА той же формы (`функ(x) -> Пусто
+        // ... конец`) должна получать то же освобождение.
         const expected_body = if (self.isType(return_type, self.result.types.builtins.void)) null else return_type;
         const body_type = try self.inferBlockExpected(lambda.body, expected_body, false);
         if (!self.isType(return_type, self.result.types.builtins.void) and !self.assignable(body_type, return_type)) {
@@ -3081,12 +2984,12 @@ const Checker = struct {
         };
     }
 
-    // `x как Тип` — scoped ONLY to Число<->Целое for now (deliberately
-    // not unified with interface casting, which already has its own
-    // separate, implicit, assignment-boundary mechanism —
-    // `registerInterfaceCast`/`Cast_Interface`). Both directions are
-    // ALWAYS explicit, no implicit widening (Целое->Число) either —
-    // matches Rust `as`/Haskell `fromIntegral`.
+    // `x как Тип` — пока ограничено только Число<->Целое (намеренно не
+    // объединено с приведением интерфейсов, у которого уже есть
+    // собственный отдельный неявный механизм на границе присваивания —
+    // `registerInterfaceCast`/`Cast_Interface`). Оба направления ВСЕГДА
+    // явные, никакого неявного расширения (Целое->Число) тоже нет —
+    // как в Rust `as`/Haskell `fromIntegral`.
     fn inferCast(self: *Checker, cast: anytype) anyerror!types.TypeId {
         const operand = try self.infer(cast.operand);
         const target = try self.resolveType(cast.target);
@@ -3102,18 +3005,16 @@ const Checker = struct {
     }
 
     fn inferBinary(self: *Checker, binary: anytype) anyerror!types.TypeId {
-        // `.assign` handled BEFORE the eager `left`/`right` infer below —
-        // unlike every other operator, its RHS needs the LHS's type as
-        // INFERENCE CONTEXT (`inferExpected`, the same mechanism a `пер
-        // x: T = ...` binding already uses), not just a post-hoc
-        // compatibility check. `это.поле = Опция.Нет()` (a bare enum-
-        // variant constructor call with no argument to infer T from)
-        // failed "не удалось вывести type-параметр 'T'" — `Опция.Нет()`
-        // was inferred BLIND (`self.infer`, no expected type in scope)
-        // before `left`'s type was ever consulted, even though
-        // `inferExpected`'s `.call` case already knows how to resolve an
-        // enum-variant constructor against an expected type (exactly
-        // what makes the `пер`-binding form of the same code work).
+        // `.assign` обрабатывается ДО безусловного вывода `left`/`right`
+        // ниже — в отличие от любого другого оператора, его правой части
+        // нужен тип левой части как КОНТЕКСТ ВЫВОДА (`inferExpected`, тот
+        // же механизм, что уже использует привязка `пер x: T = ...`), а
+        // не просто проверка совместимости постфактум. `это.поле =
+        // Опция.Нет()` (голый вызов конструктора варианта перечисления
+        // без аргумента, из которого можно вывести T) без этого
+        // проваливался бы, поскольку `Опция.Нет()` выводился бы ВСЛЕПУЮ
+        // (`self.infer`, без ожидаемого типа в области видимости) до
+        // того, как тип `left` вообще был бы учтён.
         if (binary.operator == .assign) {
             const left = try self.infer(binary.left);
             try self.checkAssignmentTarget(binary.left, binary.span);
@@ -3214,14 +3115,15 @@ const Checker = struct {
         return false;
     }
 
-    // `isComparableGeneric` only covers `<`/`>` inside a `[T:
-    // Сравниваемое]`-bounded generic — a CONCRETE type (`тип Деньги =
-    // структура ... конец`) with `реализация Сравниваемое для Деньги`
-    // used directly (`Деньги(1.0) < Деньги(2.0)`, no generic involved
-    // at all) has no bound to check, so it fell through to the plain
-    // `isNumeric` rejection. This checks the concrete-type path: does
-    // ANY registered `реализация Сравниваемое для <this type's own
-    // struct/enum symbol>` exist.
+    // `isComparableGeneric` покрывает только `<`/`>` внутри генерика,
+    // ограниченного `[T: Сравниваемое]` — КОНКРЕТНЫЙ тип (`тип Деньги =
+    // структура ... конец`) с `реализация Сравниваемое для Деньги`,
+    // используемый напрямую (`Деньги(1.0) < Деньги(2.0)`, без всякого
+    // генерика), не имеет ограничения для проверки, поэтому проваливался
+    // бы в обычный отказ `isNumeric`. Эта функция проверяет путь
+    // конкретного типа: существует ли ЛЮБАЯ зарегистрированная
+    // `реализация Сравниваемое для <собственный символ структуры/
+    // перечисления этого типа>`.
     fn isComparableNominal(self: *const Checker, type_id: types.TypeId) bool {
         const entry = self.result.types.get(type_id) orelse return false;
         const nominal = switch (entry.*) {
@@ -3235,15 +3137,14 @@ const Checker = struct {
         return false;
     }
 
-    // Broadened to also match `.unconstrained` — every EXISTING caller
-    // of `isPoison` uses it to mean "no real type info here, skip
-    // further constraint checking" (error-recovery AND the deliberate-
-    // permissive-generic case both qualify equally for that). Keeping
-    // that behavior identical for both variants is intentional — this
-    // pass only makes the two DISTINGUISHABLE in the type representation
-    // itself (`types.zig`'s `Type.unconstrained`), it does not change
-    // when either one is treated as "unconstrained" for checking
-    // purposes.
+    // Также совпадает с `.unconstrained` — каждый СУЩЕСТВУЮЩИЙ вызывающий
+    // `isPoison` использует его в значении "здесь нет реальной информации
+    // о типе, дальнейшую проверку ограничений пропустить" (равно
+    // подходит и восстановлению после ошибки, и намеренно разрешающему
+    // генерик-случаю). Различение этих двух вариантов существует только
+    // в самом представлении типа (`Type.unconstrained` в `types.zig`),
+    // но не меняет, когда каждый из них трактуется как "без ограничений"
+    // при проверке.
     fn isPoison(self: *const Checker, type_id: types.TypeId) bool {
         const entry = self.result.types.get(type_id) orelse return false;
         return entry.* == .poison or entry.* == .unconstrained;
@@ -3253,15 +3154,15 @@ const Checker = struct {
         return self.isType(type_id, self.result.types.builtins.never);
     }
 
-    // Shared by `отправить`/`отправить_или` — checks the message argument
-    // against the handle's `Процесс(T)` T (`inferExpected`, same
-    // mechanism a `пер x: T = ...` binding uses, so an enum-variant
-    // constructor like `Команда.Пинг(...)` sent bare still infers
-    // correctly). T is only ever REAL when the target actor declared `->
-    // Сообщение(T)`; plain `-> Пусто` actors keep `Процесс(poison)` (see
-    // `inferSpawn`), so this is a no-op check for every actor that
-    // hasn't opted in — poison is universally assignable, `assignable`'s
-    // own check already short-circuits true for it.
+    // Общая для `отправить`/`отправить_или` — проверяет аргумент
+    // сообщения против T из `Процесс(T)` дескриптора (`inferExpected`,
+    // тот же механизм, что использует привязка `пер x: T = ...`, так что
+    // конструктор варианта перечисления вроде `Команда.Пинг(...)`,
+    // отправленный напрямую, всё равно выводится корректно). T
+    // становится РЕАЛЬНЫМ только когда целевой актор объявил `->
+    // Сообщение(T)`; обычные акторы `-> Пусто` сохраняют
+    // `Процесс(poison)` (см. `inferSpawn`), так что для любого актора,
+    // не использующего эту опцию, эта проверка — no-op.
     fn checkSendMessageType(self: *Checker, span: source.Span, handle: ast.ExprId, message: ast.ExprId) !void {
         const handle_type = try self.infer(handle);
         const handle_entry = self.result.types.get(handle_type) orelse return;
@@ -3290,10 +3191,10 @@ const Checker = struct {
         return entry.* == .message;
     }
 
-    // The `T` inside a `-> Сообщение(T)` return-type annotation — `null`
-    // for anything else (including plain `Пусто`, which callers must
-    // check for separately when they want to distinguish "no declared
-    // message type" from "declared void").
+    // `T` внутри аннотации типа возврата `-> Сообщение(T)` — `null` для
+    // всего остального (включая простое `Пусто`, которое вызывающие
+    // должны проверять отдельно, если хотят отличить "тип сообщения не
+    // объявлен" от "объявлен void").
     fn messagePayload(self: *const Checker, type_id: types.TypeId) ?types.TypeId {
         const entry = self.result.types.get(type_id) orelse return null;
         return switch (entry.*) {
@@ -3327,19 +3228,20 @@ const Checker = struct {
         return entry.kind == .builtin and entry.module_path != null and std.mem.eql(u8, entry.module_path.?, module) and std.mem.eql(u8, entry.name, name);
     }
 
-    // `Результат(value_type, Ошибка)` for a native builtin that can fail —
-    // `Результат` is prelude-provided (hardcoded for direct pipelines,
-    // real-and-imported once a graph merges the embedded prelude, see
-    // `zig/core/prelude.zig`); `nominalType` picks the right identity for
-    // either case.
+    // `Результат(value_type, Ошибка)` для нативного встроенного, который
+    // может завершиться неудачей — `Результат` предоставляется прелюдией
+    // (захардкожен для прямых конвейеров, настоящий-и-импортированный,
+    // когда граф сливается со встроенной прелюдией, см.
+    // `zig/core/prelude.zig`); `nominalType` выбирает правильную
+    // идентичность для обоих случаев.
     fn resultOfString(self: *Checker, value_type: types.TypeId) ?types.TypeId {
         const result_symbol = self.findTypeSymbol("Результат") orelse return null;
         return self.nominalType(result_symbol, &.{ value_type, self.result.types.builtins.error_value }) catch null;
     }
 
-    // `Опция(value_type)` — symmetric to `resultOfString` above, for native
-    // builtins whose "failure" is absence rather than an `Ошибка` (`ос.
-    // окружение`, matching Odin's `stdlib_option_type`).
+    // `Опция(value_type)` — симметрично `resultOfString` выше, для
+    // нативных встроенных, чья "неудача" — это отсутствие значения, а не
+    // `Ошибка` (`ос.окружение`).
     fn optionOf(self: *Checker, value_type: types.TypeId) ?types.TypeId {
         const option_symbol = self.findTypeSymbol("Опция") orelse return null;
         return self.nominalType(option_symbol, &.{value_type}) catch null;
@@ -3367,21 +3269,20 @@ const Checker = struct {
         return self.inferCallExpected(expression, call, null);
     }
 
-    // `expected_return` — non-null only when this call is the value of an
-    // expression with a KNOWN expected type (currently: the right-hand
-    // side of an annotated `пер`, via `inferExpected`'s `.call` case).
-    // Used to seed generic substitutions from the function's RETURN type
-    // before falling back to argument-only inference — the bidirectional
-    // half `funcё[T](x: Строка) -> Тип(T)` needs when `T` never appears in
-    // any parameter. Real gap found auditing panosiki: `Тип(T)` could
-    // ONLY ever be inferred from arguments, so a type parameter used
-    // solely in the return position silently degraded to `poison` even
-    // when the caller had explicitly written the expected type
-    // (`пер к: Коробка(Число) = новая_коробка("x")`) right there — this
-    // is exactly the caller-provided context that should have resolved
-    // it. Deliberately does NOT attempt full Hindley-Milner unification
-    // (no cross-statement/deferred inference) — only this one caller-
-    // adjacent context.
+    // `expected_return` — не null только когда этот вызов — значение
+    // выражения с ИЗВЕСТНЫМ ожидаемым типом (сейчас: правая часть
+    // аннотированного `пер`, через ветку `.call` в `inferExpected`).
+    // Используется для затравки генерик-подстановок из типа ВОЗВРАТА
+    // функции перед откатом к выводу только по аргументам — та
+    // двунаправленная половина, что нужна `funcё[T](x: Строка) ->
+    // Тип(T)`, когда `T` никогда не встречается ни в одном параметре. Без
+    // этого `Тип(T)` мог бы выводиться ТОЛЬКО из аргументов, так что
+    // параметр типа, используемый исключительно в позиции возврата,
+    // молча вырождался бы в `poison`, даже когда вызывающий явно написал
+    // ожидаемый тип (`пер к: Коробка(Число) = новая_коробка("x")`) прямо
+    // здесь. Намеренно НЕ пытается выполнить полную унификацию
+    // Хиндли-Милнера (никакого межоператорного/отложенного вывода) —
+    // только этот один контекст, прилегающий к вызывающему.
     fn inferCallExpected(self: *Checker, expression: ast.ExprId, call: anytype, expected_return: ?types.TypeId) anyerror!types.TypeId {
         if (try self.rejectUnavailableBuiltin(call.callee, call.span)) {
             for (call.arguments) |argument| _ = try self.infer(argument);
@@ -3757,15 +3658,15 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.void;
             }
-            // `состояние.прочитать`/`.записать` — the JS-loader-held Model
-            // (aot-dom-loader.js's own `heldModel` closure variable), NOT
-            // a DOM attribute: unlike `DOM.атрибут`, the value never
-            // touches an actual element — the host just hands back
-            // whatever string the previous `.записать` call stored,
-            // across separate export calls. Deliberately zero-arg read /
-            // one-arg write, same shape family as `DOM.атрибут`/
-            // `установить_атрибут` (added earlier this session), backed
-            // by a different host mechanism.
+            // `состояние.прочитать`/`.записать` — модель, хранимая JS-
+            // загрузчиком (собственная замыкающая переменная `heldModel`
+            // из aot-dom-loader.js), НЕ атрибут DOM: в отличие от
+            // `DOM.атрибут`, значение никогда не касается реального
+            // элемента — хост просто возвращает ту строку, что сохранил
+            // предыдущий вызов `.записать`, через отдельные экспортные
+            // вызовы. Намеренно чтение без аргументов / запись с одним
+            // аргументом, та же форма, что у `DOM.атрибут`/
+            // `установить_атрибут`, но опирается на другой механизм хоста.
             if (self.isBuiltinModule(symbol, "состояние", "прочитать")) {
                 if (call.arguments.len != 0) {
                     try self.report(call.span, "Type Error: состояние.прочитать() не принимает аргументов", .{});
@@ -3791,13 +3692,12 @@ const Checker = struct {
                     for (call.arguments) |argument| _ = try self.infer(argument);
                     return self.result.types.builtins.void;
                 }
-                // "любой тип" — no assignability check, unlike every other
-                // builtin here: `.печать`/`.строка` accept literally
-                // anything (renders via `vm.zig`'s `renderRuntimeValue`,
-                // a structural dump for compound values — Печатаемое-
-                // interface dispatch, mentioned in the docs as the
-                // preferred path when implemented, is NOT wired up yet,
-                // a separate follow-up).
+                // "любой тип" — без проверки совместимости, в отличие от
+                // любого другого встроенного здесь: `.печать`/`.строка`
+                // принимают буквально что угодно (отображается через
+                // `renderRuntimeValue` в `vm.zig`, структурный дамп для
+                // составных значений — диспетчеризация через интерфейс
+                // Печатаемое пока не подключена).
                 _ = try self.infer(call.arguments[0]);
                 return self.result.types.builtins.void;
             }
@@ -3806,13 +3706,11 @@ const Checker = struct {
                     try self.report(call.span, "Type Error: ввод_вывод.прочитать_строку() не принимает аргументов", .{});
                     for (call.arguments) |argument| _ = try self.infer(argument);
                 }
-                // `Результат(Строка, Ошибка)`, NOT `Опция(Строка)` — real
-                // usage found auditing panosiki's `cli-selector`
-                // (`строка_ввода.ошибка()`/`.значение()`): EOF is
-                // reported as a real `Неудача(Ошибка(...))`, matching
-                // every OTHER native I/O builtin that can fail
-                // (`фс.прочитать`, `сеть.http_запрос`, ...), not the
-                // `Опция` shape this was first (wrongly) modeled after.
+                // `Результат(Строка, Ошибка)`, а НЕ `Опция(Строка)` — EOF
+                // сообщается как настоящая `Неудача(Ошибка(...))`, как и
+                // любой ДРУГОЙ нативный I/O встроенный, который может
+                // завершиться неудачей (`фс.прочитать`,
+                // `сеть.http_запрос`, ...).
                 const result_symbol = self.findTypeSymbol("Результат") orelse return self.result.types.poison();
                 return self.nominalType(result_symbol, &.{ self.result.types.builtins.string, self.result.types.builtins.error_value });
             }
@@ -3891,13 +3789,14 @@ const Checker = struct {
                     for (call.arguments) |argument| _ = try self.infer(argument);
                     return self.result.types.builtins.string;
                 }
-                // Accepts Число OR Целое directly — both share one f64
-                // runtime representation, so there's no formatting
-                // difference to lose by not forcing a cast, and
-                // requiring `значение как Число` at every call site just
-                // to stringify a Целое (array length, loop counter,
-                // etc.) is pure ceremony `строки.из_целого` already
-                // exists to avoid needing in the first place.
+                // Принимает Число ИЛИ Целое напрямую — оба разделяют
+                // одно рантайм-представление f64, так что нет разницы в
+                // форматировании, теряемой отказом от принудительного
+                // приведения, а требовать `значение как Число` в каждой
+                // точке вызова только чтобы застрочковать Целое (длина
+                // массива, счётчик цикла и т.п.) — чистая формальность,
+                // именно для избежания которой уже существует
+                // `строки.из_целого`.
                 const argument_type = try self.infer(call.arguments[0]);
                 if (!self.isPoison(argument_type) and !self.isNumeric(argument_type)) {
                     try self.report(call.span, "Type Error: строки.из_числа() ожидает Число или Целое", .{});
@@ -3979,12 +3878,7 @@ const Checker = struct {
             }
             if (self.isBuiltinModule(symbol, "строки", "найти")) {
                 // (s, подстрока, начало: Целое) -> Целое (-1, если не
-                // найдено) — matches every REAL caller found auditing
-                // panosiki (`gitrunner/git.ps`, `std/флаги.ps`, both
-                // `строки.найти(s, "=", 0)` compared against `-1`
-                // directly), not the `Опция(Целое)`/2-argument shape
-                // invented here originally with no real caller to check
-                // against.
+                // найдено).
                 if (call.arguments.len != 3) {
                     try self.report(call.span, "Type Error: строки.найти() ожидает 3 аргумента", .{});
                     for (call.arguments) |argument| _ = try self.infer(argument);
@@ -4220,12 +4114,12 @@ const Checker = struct {
             if (self.isBuiltin(symbol, "получить")) {
                 if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить() не принимает аргументы", .{});
                 for (call.arguments) |argument| _ = try self.infer(argument);
-                // Typed when the ENCLOSING function declared `->
-                // Сообщение(T)` (`self.current_return`, set for the
-                // duration of `checkFunction`'s body check) — a purely
-                // LOCAL read of the already-declared signature, not
-                // inference. Stays poison for every other function shape
-                // (including plain `Пусто`), exactly как before.
+                // Типизировано, когда ОХВАТЫВАЮЩАЯ функция объявила `->
+                // Сообщение(T)` (`self.current_return`, установлено на
+                // время проверки тела в `checkFunction`) — чисто
+                // ЛОКАЛЬНОЕ чтение уже объявленной сигнатуры, не вывод.
+                // Остаётся poison для любой другой формы функции
+                // (включая простое `Пусто`).
                 if (self.current_return) |return_type| {
                     if (self.messagePayload(return_type)) |payload| return payload;
                 }
@@ -4299,12 +4193,12 @@ const Checker = struct {
                 for (call.arguments) |argument| _ = try self.infer(argument);
                 const option = self.findTypeSymbol("Опция") orelse return self.result.types.poison();
                 const reason = try self.result.types.nominal(option, &.{self.result.types.builtins.string});
-                // Process id is discrete (`Целое`), matching the docs
-                // (`processes.md`) and `строки.из_целого`'s own expected
-                // argument type — the VM's actual runtime `Value` is a
-                // plain f64 regardless (`queueSignal`'s `@floatFromInt`),
-                // so this is a type-checker-only correction, no bytecode
-                // change needed.
+                // Идентификатор процесса дискретен (`Целое`), как и в
+                // документации, и как ожидаемый тип аргумента у
+                // `строки.из_целого` — фактическое рантайм-значение VM
+                // всё равно простой f64 (`@floatFromInt` в
+                // `queueSignal`), так что это исправление только для
+                // тайпчекера, изменений байткода не требует.
                 return self.result.types.tuple(&.{ self.result.types.builtins.integer, reason });
             }
             if (self.isBuiltin(symbol, "ограничить_почту")) {
@@ -4418,14 +4312,11 @@ const Checker = struct {
                         }
                     },
                     .primitive => |primitive| {
-                        // `Строка` had no `.длина()` at all — only the free
-                        // function `длина(x)` worked on strings (Массив/
-                        // Соответствие have BOTH), a confusing asymmetry
-                        // (`Type Error: у типа нет поля 'длина'` reads like
-                        // a typo, not "use the free function instead").
-                        // Same `.string_length`/`строки::длина` runtime
-                        // path the free function already uses — no VM
-                        // change, purely a dispatch gap.
+                        // Использует тот же путь выполнения
+                        // `.string_length`/`строки::длина`, что уже
+                        // использует свободная функция `длина(x)` —
+                        // изменений VM не требуется, чисто пробел в
+                        // диспетчеризации метода.
                         if (primitive == .string and std.mem.eql(u8, property.property, "длина")) {
                             try self.checkMethodArity(call, "длина", 0);
                             return self.result.types.builtins.integer;
@@ -4471,21 +4362,19 @@ const Checker = struct {
             },
             else => {},
         }
-        // `ф[Тип](...)` — explicit generic-argument call — parses
-        // TODAY, unchanged, as `Call_Expr{ callee: Index_Expr{ object,
-        // index } }` (the same shape as "index an array of functions,
-        // then call the result", e.g. `функции[0](args)` — see
-        // `specs/013-explicit-generic-args/`). The ambiguity is resolved
-        // HERE, semantically, not by the parser (which has no
-        // backtracking and cannot know at parse time whether `ф` is
-        // generic): if `index.object` resolves to a symbol with generic
-        // parameters, `ф[Тип](...)` is reinterpreted as an explicit call
-        // — `effective_callee` becomes `index.object` and
-        // `explicit_type_arguments` is seeded from `Тип`. When
-        // `index.object` is NOT a generic function (an ordinary
-        // indexable value), NEITHER changes — the existing
-        // index-then-call path below runs exactly as it always has
-        // (zero regression, see spec.md FR-006).
+        // `ф[Тип](...)` — вызов с явным генерик-аргументом — парсится
+        // как `Call_Expr{ callee: Index_Expr{ object, index } }` (та же
+        // форма, что и "индексировать массив функций, затем вызвать
+        // результат", например `функции[0](args)`). Неоднозначность
+        // разрешается ЗДЕСЬ, семантически, а не парсером (у которого нет
+        // отката назад и он не может знать во время парсинга, генерик ли
+        // `ф`): если `index.object` разрешается в символ с
+        // генерик-параметрами, `ф[Тип](...)` переинтерпретируется как
+        // явный вызов — `effective_callee` становится `index.object`, а
+        // `explicit_type_arguments` затравливается из `Тип`. Когда
+        // `index.object` НЕ генерик-функция (обычное индексируемое
+        // значение), ни то ни другое не меняется — существующий путь
+        // "индекс затем вызов" ниже работает точно как и раньше.
         var effective_callee = call.callee;
         var explicit_type_arguments: ?[]const types.TypeId = null;
         if (self.tree.expr(call.callee).* == .index) {
@@ -4523,63 +4412,54 @@ const Checker = struct {
                 if (generic_parameters.len != 0) {
                     var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
                     defer substitutions.deinit();
-                    // Explicit generic arguments (`ф[Тип](...)`, detected
-                    // above) are seeded FIRST, before anything inferred
-                    // from context — a disagreeing inferred argument
-                    // below (`inferGenericSubstitution`'s own
-                    // already-present-entry check) then reports the
-                    // conflict as ordinary substitution ambiguity, with
-                    // no separate mechanism needed (see
-                    // `specs/013-explicit-generic-args/research.md`
-                    // "Decision: конфликт explicit-vs-inferred ловится
-                    // БЕСПЛАТНО").
+                    // Явные генерик-аргументы (`ф[Тип](...)`, обнаружены
+                    // выше) затравливаются ПЕРВЫМИ, до всего, выведенного
+                    // из контекста — расходящийся выведенный аргумент
+                    // ниже (собственная проверка "запись уже
+                    // существует" в `inferGenericSubstitution`) тогда
+                    // сообщает конфликт как обычную неоднозначность
+                    // подстановки, без отдельного механизма.
                     if (explicit_type_arguments) |explicit_types| {
                         for (generic_parameters, explicit_types) |parameter, resolved| {
                             try substitutions.put(parameter.typ, resolved);
                         }
                     }
-                    // Seed from the caller's KNOWN expected type FIRST
-                    // (bidirectional half) — see `inferCallExpected`'s doc
-                    // comment. Structural unification against
-                    // `function.return_type`, same mechanism argument
-                    // inference already uses, just walked in the other
-                    // direction (parameter shape = return type, argument
-                    // shape = the caller's expected type).
+                    // Затравка из ИЗВЕСТНОГО ожидаемого типа вызывающего
+                    // ПЕРВОЙ (двунаправленная половина) — см.
+                    // doc-комментарий `inferCallExpected`. Структурная
+                    // унификация против `function.return_type`, тот же
+                    // механизм, что уже использует вывод аргументов,
+                    // просто пройденный в другую сторону (форма
+                    // параметра = тип возврата, форма аргумента =
+                    // ожидаемый тип вызывающего).
                     if (expected_return) |expected_type| {
                         try self.inferGenericSubstitution(function.return_type, expected_type, &substitutions, call.span);
                     }
                     for (arguments[0..shared], function.parameters[0..shared]) |argument, parameter| {
                         try self.inferGenericSubstitution(parameter, try self.infer(argument), &substitutions, call.span);
                     }
-                    // A type parameter that appears ONLY in the RETURN
-                    // type (never in any parameter) can't be inferred
-                    // from the call's arguments alone — the seeding step
-                    // above handles the case where the CALLER provided an
-                    // expected type; if that's ALSO absent, there is
-                    // truly no context anywhere to resolve it from (panos
-                    // has no cross-statement/deferred inference and no
-                    // explicit generic type-argument call syntax).
-                    // Silently substituting `poison` in that fully-
-                    // unconstrained case (not reporting an error) is NOT
-                    // a new leniency — real gap found the hard way:
-                    // before cross-module generic function signatures
-                    // started tracking `T` for real (see
-                    // `ImportedSymbolType.generic_parameters`), EVERY
-                    // such call already got exactly this behavior by
-                    // accident (`copyImportedType` degraded any
-                    // unremapped `.generic_parameter` to `poison` on
-                    // import, unconditionally). Panosiki code —
-                    // `выборка.новый_селектор(...)` (`cli-selector`),
-                    // i.e. `функ ф[T](x: Строка) -> Тип(T)` called with NO
-                    // annotation anywhere, T only ever pinned down later
-                    // through USAGE — depends on this exact fallback.
-                    // But when `expected_return` WAS available and
-                    // substitution STILL failed (the seeding step above
-                    // ran and didn't resolve every parameter), that's a
-                    // genuine inference failure, not an absence-of-
-                    // context case — report it instead of poisoning
-                    // silently, matching the "no unconstrained T out of
-                    // thin air when context exists" soundness goal.
+                    // Параметр типа, встречающийся ТОЛЬКО в типе
+                    // ВОЗВРАТА (никогда ни в одном параметре), нельзя
+                    // вывести из одних лишь аргументов вызова — шаг
+                    // затравки выше обрабатывает случай, когда
+                    // ВЫЗЫВАЮЩИЙ предоставил ожидаемый тип; если его ТОЖЕ
+                    // нет, контекста для разрешения действительно нет
+                    // нигде (у панос нет межоператорного/отложенного
+                    // вывода и нет синтаксиса вызова с явным
+                    // генерик-типом-аргументом в этом месте). Молчаливая
+                    // подстановка `poison` в этом полностью
+                    // неограниченном случае (без сообщения об ошибке) —
+                    // не новая снисходительность: до того как
+                    // межмодульные сигнатуры генерик-функций начали
+                    // по-настоящему отслеживать `T` (см.
+                    // `ImportedSymbolType.generic_parameters`), КАЖДЫЙ
+                    // такой вызов уже получал ровно это поведение
+                    // случайно. Но когда `expected_return` БЫЛ доступен,
+                    // а подстановка ВСЁ РАВНО провалилась (шаг затравки
+                    // выше отработал и не разрешил каждый параметр) — это
+                    // настоящий сбой вывода, а не случай отсутствия
+                    // контекста — сообщаем об этом вместо молчаливого
+                    // poison.
                     for (generic_parameters) |parameter| {
                         if (substitutions.contains(parameter.typ)) continue;
                         if (expected_return != null) {
@@ -4590,11 +4470,13 @@ const Checker = struct {
                         }
                     }
                     for (generic_parameters) |parameter| {
-                        // The fill-loop right above guarantees every
-                        // `generic_parameters` entry has a substitution
-                        // by now (found from context, or explicitly
-                        // poison-filled) — `orelse` here would mean that
-                        // guarantee broke silently; make it loud instead.
+                        // Цикл заполнения прямо выше гарантирует, что к
+                        // этому моменту у каждой записи
+                        // `generic_parameters` есть подстановка (найдена
+                        // из контекста либо явно заполнена poison) —
+                        // `orelse` здесь означал бы, что эта гарантия
+                        // молча нарушилась; делаем это громко вместо
+                        // этого.
                         const actual = substitutions.get(parameter.typ) orelse unreachable;
                         if (self.isPoison(actual)) continue;
                         for (parameter.bounds) |bound| {
@@ -4610,32 +4492,37 @@ const Checker = struct {
                         if (!self.assignable(actual, expected)) {
                             try self.report(call.span, "Type Error: аргумент не совпадает с типом параметра", .{});
                         } else if (try self.genericInterfaceBounds(parameter, generic_parameters)) |bounds| {
-                            // Generic function whose parameter is bound by
-                            // a user-defined interface (`функ ф[T: ИзTOML]
-                            // (это: T, ...)`), called with a concrete
-                            // struct argument. Panos generic functions are
-                            // NOT monomorphized (compiled once, generically
-                            // — no per-call-site specialization exists at
-                            // all), so `это.метод()` inside the generic
-                            // body has no concrete type to dispatch
-                            // against; the ONLY mechanism this VM has for
-                            // dispatching a method call without knowing
-                            // the concrete type at compile time is the
-                            // existing interface vtable (`Cast_Interface`/
-                            // `Invoke_Interface`). Casting the ARGUMENT to
-                            // the bound interface type here (instead of to
-                            // `expected`, which — since substitution
-                            // resolves T to the argument's OWN concrete
-                            // type — is always a same-type no-op cast) is
-                            // what makes that dispatch possible: the value
-                            // actually entering the generic function's `T`
-                            // parameter slot is the interface-wrapped
-                            // runtime representation, so `inferMethodCall`'s
-                            // sibling handling for `.generic_parameter`
-                            // receiver types (see `interfaceBoundOf`/
-                            // `inferInterfaceCall`) can compile `это.метод()`
-                            // as an ordinary `call_interface` against that
-                            // same vtable — no monomorphization needed.
+                            // Генерик-функция, параметр которой ограничен
+                            // пользовательским интерфейсом (`функ ф[T:
+                            // ИзTOML](это: T, ...)`), вызвана с
+                            // конкретным аргументом-структурой. Генерик-
+                            // функции панос НЕ мономорфизируются
+                            // (компилируются один раз, генерически — вовсе
+                            // не существует специализации по точке
+                            // вызова), так что `это.метод()` внутри
+                            // генерик-тела не имеет конкретного типа для
+                            // диспетчеризации; ЕДИНСТВЕННЫЙ механизм,
+                            // который у этой VM есть для диспетчеризации
+                            // вызова метода без знания конкретного типа во
+                            // время компиляции — существующая vtable
+                            // интерфейса (`Cast_Interface`/
+                            // `Invoke_Interface`). Приведение АРГУМЕНТА к
+                            // ограничивающему интерфейсному типу здесь
+                            // (вместо `expected`, что — поскольку
+                            // подстановка разрешает T в собственный
+                            // конкретный тип аргумента — всегда
+                            // приведение-заглушка того же типа) — именно
+                            // то, что делает такую диспетчеризацию
+                            // возможной: значение, реально попадающее в
+                            // слот параметра `T` генерик-функции — это
+                            // рантайм-представление, обёрнутое интерфейсом,
+                            // так что параллельная обработка типов
+                            // получателя `.generic_parameter` в
+                            // `inferMethodCall` (см. `interfaceBoundOf`/
+                            // `inferInterfaceCall`) может скомпилировать
+                            // `это.метод()` как обычный `call_interface`
+                            // против той же vtable — мономорфизация не
+                            // нужна.
                             try self.registerGenericInterfaceCasts(argument, actual, bounds);
                         } else {
                             try self.registerInterfaceCast(argument, actual, expected);
@@ -4655,23 +4542,13 @@ const Checker = struct {
             },
             .nominal => |nominal| {
                 if (self.result.generic_nominal_fields.get(nominal.symbol)) |generic_nominal| {
-                    // Named-argument constructor calls (`Тип(поле = x,
-                    // ...)`) were NEVER reordered here — every field got
-                    // checked in DECLARATION order regardless of what
-                    // order the CALLER actually wrote them in. Real gap
-                    // found auditing panosiki's `cli` package
-                    // (`Конфигурация(флаги = ..., действие = Опция.
-                    // Нет(), ...)`, field order in the call not matching
-                    // declaration order): `Опция.Нет()` got checked
-                    // against an unrelated field's type, so its own
-                    // generic `T` could never be inferred ("не удалось
-                    // вывести type-параметр 'T'"). Same
-                    // `reorderNamedArguments`/`call_arguments` cache a
-                    // regular named-argument FUNCTION call already used
-                    // above — `compiler.zig`'s `compileCall` already
-                    // reads that SAME cache for codegen, so fixing the
-                    // order here is enough for both type-checking AND
-                    // codegen.
+                    // Использует тот же кэш `reorderNamedArguments`/
+                    // `call_arguments`, что уже применяется выше для
+                    // обычного вызова ФУНКЦИИ с именованными аргументами
+                    // — `compileCall` в `compiler.zig` уже читает ТОТ ЖЕ
+                    // кэш для кодогенерации, так что исправления порядка
+                    // здесь достаточно и для тайпчека, И для
+                    // кодогенерации.
                     const arguments = if (call.argument_names) |_| blk: {
                         const names = try self.result.arena.allocator().alloc([]const u8, generic_nominal.fields.len);
                         for (generic_nominal.fields, names) |field, *name| name.* = field.name;
@@ -4715,18 +4592,17 @@ const Checker = struct {
                     if (arguments.len != fields.len) try self.report(call.span, "Type Error: неверное количество аргументов конструктора структуры", .{});
                     const shared = @min(arguments.len, fields.len);
                     for (arguments[0..shared], fields[0..shared]) |argument, field| {
-                        // `registerInterfaceCast` — real gap found
-                        // auditing panosiki: every OTHER argument-check
-                        // site (return, method call, enum variant) already
-                        // calls this on success; a plain struct
-                        // constructor never did, so `Держатель(слог.
-                        // логгер())` (a field typed `слог.Логгер`, an
-                        // interface, given a concrete `СтандартныйЛоггер`)
-                        // stored the raw concrete value uncast — calling
-                        // `.инфо(...)` on that field later crashed at
-                        // runtime ("попытка вызвать интерфейсный метод у
-                        // не-интерфейса") since the compiler had no cast
-                        // recorded to compile a real `Cast_Interface`.
+                        // `registerInterfaceCast` — каждая ДРУГАЯ точка
+                        // проверки аргумента (возврат, вызов метода,
+                        // вариант перечисления) уже вызывает это при
+                        // успехе; обычный конструктор структуры этого
+                        // не делал, так что поле с интерфейсным типом,
+                        // получившее конкретное значение, хранило бы сырое
+                        // значение неприведённым — вызов метода на этом
+                        // поле позже падал бы во время выполнения, так
+                        // как у компилятора не было записанного
+                        // приведения для компиляции настоящего
+                        // `Cast_Interface`.
                         const actual = try self.inferExpected(argument, field.typ);
                         if (!self.assignable(actual, field.typ)) {
                             try self.report(call.span, "Type Error: аргумент конструктора не совпадает с типом поля", .{});
@@ -4752,10 +4628,10 @@ const Checker = struct {
         for (call.arguments) |argument| _ = try self.infer(argument);
     }
 
-    // Shared arity+all-Строка-arguments check for `синтаксис.*` (2-4
-    // plain `Строка` path/name arguments, no per-argument distinctions
-    // worth spelling out individually — unlike `ос.выполнить`, which
-    // mixes `Строка`/`Массив(Строка)`).
+    // Общая проверка арности + все-аргументы-Строка для `синтаксис.*`
+    // (2-4 обычных аргумента-Строка путь/имя, различать по отдельности
+    // не имеет смысла — в отличие от `ос.выполнить`, где смешаны
+    // `Строка`/`Массив(Строка)`).
     fn checkStringArgsBuiltin(self: *Checker, call: anytype, name: []const u8, expected_arity: usize, result_type: types.TypeId) !types.TypeId {
         if (call.arguments.len != expected_arity) {
             try self.report(call.span, "Type Error: {s}() ожидает {d} аргумент(а)", .{ name, expected_arity });
@@ -4871,17 +4747,13 @@ const Checker = struct {
                     try self.report(qualified.span, "Type Error: неизвестный тип '{s}.{s}'", .{ qualified.module_name, qualified.name });
                     break :blk try self.result.types.poison();
                 };
-                // A qualified TYPE ALIAS (`lib.Обработчик`) bridged via
-                // `ImportContext.type_aliases` — checked BEFORE
-                // `nominalType` below, which would otherwise wrap it as
-                // an opaque nominal with no callable/structural shape at
-                // all (real bug: a qualified alias for a function type
-                // was never recognized as callable across a module
-                // boundary, even though the exact same alias resolved
-                // fine when referenced unqualified within its own file —
-                // see `resolveType`'s `.ident` case, which already
-                // checks `alias_type_nodes` this way for the same-module
-                // case).
+                // Квалифицированный ПСЕВДОНИМ ТИПА (`lib.Обработчик`),
+                // перенесённый через `ImportContext.type_aliases` —
+                // проверяется ДО `nominalType` ниже, которая иначе
+                // обернула бы его непрозрачным номинальным типом вовсе
+                // без вызываемой/структурной формы (см. ветку `.ident` в
+                // `resolveType`, которая уже проверяет `alias_type_nodes`
+                // таким же образом для случая внутри одного модуля).
                 if (self.result.type_aliases.get(symbol)) |aliased| break :blk aliased;
                 var arguments: std.ArrayList(types.TypeId) = .empty;
                 defer arguments.deinit(self.result.allocator);
@@ -4892,24 +4764,25 @@ const Checker = struct {
         };
     }
 
-    // Parallel to `resolveType` (`ast.TypeId -> types.TypeId`), but
-    // starting from an ORDINARY EXPRESSION instead of a real `TypeNode`.
-    // Needed for `ф[Тип](...)` explicit generic-argument calls: `Тип`
-    // parses as `Index_Expr`'s `index` field — an `Expr`, not a
-    // `TypeNode` — there is no real AST type-node to hand `resolveType`,
-    // and synthesizing one would mean mutating `self.tree`, which is
-    // `*const Ast` here (see `specs/013-explicit-generic-args/research.md`
-    // "Decision: Expr → TypeId напрямую"). Reuses the SAME symbol-lookup
-    // helpers `resolveType` already calls (`findGenericParameter`,
-    // `builtinType`, `findTypeSymbol`, `findQualifiedTypeSymbol`,
-    // `nominalType`) — only the entry shape differs.
+    // Параллельна `resolveType` (`ast.TypeId -> types.TypeId`), но
+    // отправляется от ОБЫЧНОГО ВЫРАЖЕНИЯ вместо настоящего `TypeNode`.
+    // Нужна для вызовов с явным генерик-аргументом `ф[Тип](...)`: `Тип`
+    // парсится как поле `index` у `Index_Expr` — это `Expr`, а не
+    // `TypeNode` — реального AST узла типа для передачи в `resolveType`
+    // нет, а синтезировать его означало бы изменять `self.tree`, который
+    // здесь `*const Ast`. Переиспользует ТЕ ЖЕ вспомогательные функции
+    // поиска символов, что уже вызывает `resolveType`
+    // (`findGenericParameter`, `builtinType`, `findTypeSymbol`,
+    // `findQualifiedTypeSymbol`, `nominalType`) — отличается только форма
+    // входа.
     //
-    // Returns `null` when `expr`'s shape cannot denote a type AT ALL
-    // (arithmetic, arbitrary calls, string/number literals, ...) — the
-    // caller (`inferCallExpected`'s explicit-generic-call detection)
-    // reports THAT case itself, with a message distinct from "this looks
-    // like a type but the name is unknown" (which this function reports
-    // directly, mirroring `resolveType`'s own diagnostics).
+    // Возвращает `null`, когда форма `expr` ВООБЩЕ не может обозначать
+    // тип (арифметика, произвольные вызовы, строковые/числовые
+    // литералы, ...) — вызывающий (обнаружение явного генерик-вызова в
+    // `inferCallExpected`) сообщает ЭТОТ случай сам, с сообщением,
+    // отличным от "похоже на тип, но имя неизвестно" (которое эта
+    // функция сообщает напрямую, отражая собственную диагностику
+    // `resolveType`).
     fn resolveTypeFromExpr(self: *Checker, expr: ast.ExprId) anyerror!?types.TypeId {
         return switch (self.tree.expr(expr).*) {
             .ident => |ident| self.findGenericParameter(ident.name) orelse builtinType(&self.result.types, ident.name) orelse blk: {
@@ -4920,11 +4793,11 @@ const Checker = struct {
                 try self.report(ident.span, "Type Error: неизвестный тип '{s}'", .{ident.name});
                 break :blk try self.result.types.poison();
             },
-            // `модуль.Тип` — qualified type name. Only a bare `.ident`
-            // object is type-like (`а.б.Тип`-style deeper chains don't
-            // exist for panos modules, which never nest); anything else
-            // means this `.property` is an ordinary value expression, not
-            // a type reference.
+            // `модуль.Тип` — квалифицированное имя типа. Только голый
+            // объект `.ident` похож на тип (более глубоких цепочек вроде
+            // `а.б.Тип` для модулей панос не существует, они никогда не
+            // вложены); всё остальное означает, что этот `.property` —
+            // обычное выражение-значение, не ссылка на тип.
             .property => |property| blk: {
                 if (self.tree.expr(property.object).* != .ident) break :blk null;
                 const module_name = self.tree.expr(property.object).ident.name;
@@ -4935,12 +4808,13 @@ const Checker = struct {
                 if (self.result.type_aliases.get(symbol)) |aliased| break :blk aliased;
                 break :blk try self.nominalType(symbol, &.{});
             },
-            // `Тип(Аргумент, ...)` — generic instantiation written at a
-            // call site, same shape a constructor call would have.
-            // `callee` must itself be type-like (`.ident`/`.property` as
-            // above); every argument is resolved recursively through this
-            // SAME function, so nested instantiations
-            // (`Список(Коробка(Число))`) work without extra cases.
+            // `Тип(Аргумент, ...)` — генерик-инстанциация, написанная в
+            // точке вызова, той же формы, что и вызов конструктора.
+            // `callee` сам должен быть похож на тип (`.ident`/`.property`
+            // как выше); каждый аргумент разрешается рекурсивно через ЭТУ
+            // ЖЕ функцию, так что вложенные инстанциации
+            // (`Список(Коробка(Число))`) работают без дополнительных
+            // случаев.
             .call => |call| blk: {
                 const callee_expr = self.tree.expr(call.callee).*;
                 const symbol = switch (callee_expr) {
@@ -4964,16 +4838,15 @@ const Checker = struct {
         };
     }
 
-    // Extracts the explicit type-argument list from an `Index_Expr`'s
-    // `index` field for a confirmed explicit-generic-call site (see
-    // `inferCallExpected`). A single argument is the bare expression
-    // itself (`ф[Тип](...)`); several are an existing `Tuple_Expr`
-    // reused as a container (`ф[(Т1, Т2)](...)`, see
-    // `specs/013-explicit-generic-args/research.md` "Decision: несколько
-    // type-аргументов"). Always returns exactly
-    // `generic_parameters.len` entries (poison-filled on arity mismatch
-    // or an unresolved shape) so the caller's substitution-seeding loop
-    // never has to special-case a short list.
+    // Извлекает список явных type-аргументов из поля `index` у
+    // `Index_Expr` для подтверждённой точки явного генерик-вызова (см.
+    // `inferCallExpected`). Один аргумент — само голое выражение
+    // (`ф[Тип](...)`); несколько — существующий `Tuple_Expr`,
+    // переиспользуемый как контейнер (`ф[(Т1, Т2)](...)`). Всегда
+    // возвращает ровно `generic_parameters.len` записей (заполнено
+    // poison при несовпадении арности или неразрешённой форме), так что
+    // цикл затравки подстановок у вызывающего никогда не должен
+    // отдельно обрабатывать короткий список.
     fn resolveExplicitGenericArguments(
         self: *Checker,
         index_value: ast.ExprId,
@@ -4999,37 +4872,40 @@ const Checker = struct {
         return resolved;
     }
 
-    // Returns the FIRST interface bound of `parameter`, if `parameter`
-    // (as written in the declaration, before generic substitution) is a
-    // `.generic_parameter` type with at least one interface bound.
-    // "first" — real usage in practice (`std/кодирование/toml.ps`'s
-    // `[T: ИзTOML]`/`[T: ВTOML]`) never declares more than one bound per
-    // parameter; a value can only be `Cast_Interface`'d to ONE interface
-    // type at a time anyway (see `registerInterfaceCast`'s single
-    // `interface_casts` entry per expression), so multiple bounds would
-    // need a genuinely different mechanism this doesn't attempt.
+    // Возвращает ПЕРВОЕ интерфейсное ограничение `parameter`, если
+    // `parameter` (как записан в объявлении, до генерик-подстановки) —
+    // тип `.generic_parameter` хотя бы с одним интерфейсным
+    // ограничением. "первое" — на практике ни один параметр не объявляет
+    // больше одного ограничения; значение в любом случае можно привести
+    // через `Cast_Interface` только к ОДНОМУ интерфейсному типу за раз
+    // (см. единственную запись `interface_casts` на выражение в
+    // `registerInterfaceCast`), так что несколько ограничений
+    // потребовали бы принципиально другого механизма, который здесь не
+    // реализован.
     fn interfaceBoundOf(self: *const Checker, parameter: types.TypeId, generic_parameters: []const GenericParameter) !?symbols.SymbolId {
         const entry = self.result.types.get(parameter) orelse return null;
         if (entry.* != .generic_parameter) return null;
         for (generic_parameters) |candidate| {
             if (!candidate.typ.eql(parameter)) continue;
             for (candidate.bounds) |bound| {
-                // `Сравниваемое` is deliberately EXCLUDED here — it has
-                // its own, older, non-vtable dispatch mechanism for
-                // generic-bound comparisons (`compiler.zig`'s
-                // `registerComparableMethods`/`addComparableMethod`,
-                // driven by the VM looking up a method by the runtime
-                // value's OWN struct name, not by an interface vtable).
-                // That mechanism requires the value to arrive at the
-                // generic function PLAIN (uncast) — an ordinary Число or
-                // an ordinary struct aggregate — so casting it to the
-                // interface type here (turning it into an
-                // interface-wrapped runtime value) would break `a > b`
-                // dispatch for every existing `[T: Сравниваемое]` caller.
-                // Every OTHER user-defined interface bound has no such
-                // pre-existing mechanism, so casting is the only way
-                // `это.метод()` inside the generic body can dispatch at
-                // all (see `inferGenericBoundInterfaceCall`).
+                // `Сравниваемое` намеренно ИСКЛЮЧЕНО здесь — у него
+                // собственный, более старый, не через vtable механизм
+                // диспетчеризации для сравнений с генерик-ограничением
+                // (`registerComparableMethods`/`addComparableMethod` в
+                // `compiler.zig`, VM ищет метод по СОБСТВЕННОМУ имени
+                // структуры рантайм-значения, не по vtable интерфейса).
+                // Этот механизм требует, чтобы значение поступало в
+                // генерик-функцию НЕИЗМЕНЁННЫМ (без приведения) — обычное
+                // Число или обычный агрегат структуры — так что
+                // приведение его здесь к интерфейсному типу (превращение
+                // в обёрнутое интерфейсом рантайм-значение) сломало бы
+                // диспетчеризацию `a > b` для каждого существующего
+                // вызывающего `[T: Сравниваемое]`. У каждого ДРУГОГО
+                // пользовательского интерфейсного ограничения нет такого
+                // ранее существовавшего механизма, так что приведение —
+                // единственный способ, которым `это.метод()` внутри
+                // генерик-тела вообще может диспетчеризоваться (см.
+                // `inferGenericBoundInterfaceCall`).
                 if (self.isComparableInterface(bound)) continue;
                 return bound;
             }
@@ -5075,16 +4951,17 @@ const Checker = struct {
         if (actual.eql(self.result.types.builtins.never)) return true;
         if (actual_type.* == .process and self.isPoison(actual_type.process)) return true;
         if (self.result.types.eql(actual, expected)) return true;
-        // An EMPTY array/map literal (`массив()`/`соответствие()`) infers
-        // as `Массив(poison)`/`Соответствие(poison, poison)` (`inferBinary`'s
-        // `.array`/`.map` cases have no elements to infer a real type
-        // from) — `eql` above already rejects that against any concretely
-        // -typed array/map (poison isn't structurally equal to anything),
-        // so a completely ordinary `это.поле = массив()` (reset a typed
-        // field/variable to empty) failed "присваивание несовместимых
-        // типов", a real gap found auditing panosiki's `std/tempfiles.ps`.
-        // Recursing through `assignable` itself (not `eql`) lets the
-        // top-of-function poison short-circuit fire for the ELEMENT type.
+        // ПУСТОЙ литерал массива/соответствия (`массив()`/
+        // `соответствие()`) выводится как `Массив(poison)`/
+        // `Соответствие(poison, poison)` (веткам `.array`/`.map` в
+        // `inferBinary` не из чего вывести настоящий тип) — `eql` выше
+        // уже отклоняет это против любого конкретно типизированного
+        // массива/соответствия (poison структурно не равен ничему), так
+        // что совершенно обычное `это.поле = массив()` (сброс
+        // типизированного поля/переменной в пустое) проваливалось бы с
+        // "присваивание несовместимых типов". Рекурсия через сам
+        // `assignable` (не `eql`) позволяет сработать проверке poison в
+        // начале функции для типа ЭЛЕМЕНТА.
         switch (actual_type.*) {
             .array => |actual_element| switch (expected_type.*) {
                 .array => |expected_element| return self.assignable(actual_element, expected_element),
@@ -5120,18 +4997,10 @@ const Checker = struct {
             if (interface.parameters.len != expected_nominal.arguments.len) return false;
             return self.interfaceImplementation(expected_nominal.symbol, expected_nominal.arguments, actual_nominal.symbol, actual_nominal.arguments) != null;
         }
-        // Same generic struct/enum, argument-wise assignable (not `eql`)
-        // type arguments — e.g. `Селектор(poison)` vs the declared
-        // `Селектор(T)`. Mirrors the array/map elementwise-assignable
-        // recursion just above; real gap found auditing panosiki's
-        // `cli-selector` (`функ новый_селектор[T](...) -> Селектор(T)`
-        // whose body constructs `Селектор(заголовок, массив())` — the
-        // struct's own `T` can't be inferred from an EMPTY array
-        // argument, so `fillUnknownWithPoison` substitutes `poison`
-        // there; without this case, `eql`'s exact-match requirement
-        // rejected `Селектор(poison)` against the declared `Селектор(T)`
-        // return type even though `poison` is assignable to/from
-        // anything, including `T`).
+        // Одна и та же генерик-структура/перечисление, аргументы типа
+        // совместимы поэлементно (не `eql`) — например `Селектор(poison)`
+        // против объявленного `Селектор(T)`. Отражает поэлементную
+        // рекурсию массива/соответствия чуть выше.
         const same_declaration = if (actual_nominal.identity != 0 or expected_nominal.identity != 0)
             actual_nominal.identity != 0 and actual_nominal.identity == expected_nominal.identity
         else
@@ -5186,21 +5055,16 @@ const Checker = struct {
         return null;
     }
 
-    // `target_arguments` — the ACTUAL/instantiated generic arguments of
-    // `target` at THIS call site (e.g. `Отображённый(Число, Строка)`'s
-    // `[Число, Строка]`), separate from `implementation.arguments`
-    // (`interface_implementations`'s stored entry — an EXPRESSION over
-    // `target`'s OWN declared placeholders, e.g. `[U_of_Отображённый]`
-    // for `реализация Итерируемое для Отображённый`, since Отображённый's
-    // OWN `U` is what unified against Итерируемое's `T`). Real gap
-    // found building a generic wrapper struct implementing a generic
-    // interface polymorphically: the OLD exact-`eql` match compared
-    // DIFFERENT TypeIds that only happen to be semantically the same
-    // AFTER substitution (`Отображённый`'s own `U` vs some OTHER
-    // call site's `U`) — always failed for any generic struct/generic
-    // interface pairing. Fast path (exact match) stays first — covers
-    // the overwhelmingly common non-generic case without the extra
-    // work; the substitution fallback only runs when that fails.
+    // `target_arguments` — ФАКТИЧЕСКИЕ/инстанцированные генерик-аргументы
+    // `target` в ЭТОЙ точке вызова (например, `[Число, Строка]` для
+    // `Отображённый(Число, Строка)`), отдельно от `implementation.
+    // arguments` (сохранённой записи в `interface_implementations` —
+    // ВЫРАЖЕНИЯ над СОБСТВЕННЫМИ объявленными заглушками `target`,
+    // например `[U_of_Отображённый]` для `реализация Итерируемое для
+    // Отображённый`). Быстрый путь (точное совпадение) идёт первым —
+    // покрывает подавляющее большинство не-генерик случаев без лишней
+    // работы; резервный путь с подстановкой запускается только когда
+    // это не сработало.
     fn interfaceImplementation(self: *const Checker, interface: symbols.SymbolId, arguments: []const types.TypeId, target: symbols.SymbolId, target_arguments: []const types.TypeId) ?InterfaceImplementation {
         return findInterfaceImplementation(self.result, interface, arguments, target, target_arguments, null);
     }
@@ -5291,46 +5155,39 @@ const Checker = struct {
         }
         const index = method_index orelse return null;
         const method = definition.methods[index];
-        // Deliberately deferred to HERE (not the top of the function) —
-        // this dispatcher is tried speculatively for every `.property`
-        // call and falls through to the next candidate (constructor
-        // call, ordinary method call, ...) on `null`; reporting eagerly
-        // at the top fired as a side effect for calls that AREN'T
-        // interface calls at all and get resolved by a later fallback —
-        // real bug found via a qualified struct constructor with named
-        // args (`модуль.Тип(поле = x, ...)`), wrongly rejected even
-        // though it never reaches this point as an actual interface
-        // dispatch.
+        // Намеренно отложено ДО ЭТОГО МОМЕНТА (не в начало функции) —
+        // этот диспетчер пробуется спекулятивно для каждого вызова
+        // `.property` и проваливается к следующему кандидату (вызов
+        // конструктора, обычный вызов метода, ...) при `null`; отчёт в
+        // начале срабатывал бы побочным эффектом для вызовов, которые
+        // ВООБЩЕ не интерфейсные и разрешаются более поздним резервным
+        // путём.
         if (call.argument_names != null) try self.report(call.span, "Type Error: именованные аргументы не поддержаны для интерфейсного вызова", .{});
         if (call.arguments.len != method.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов метода", .{});
         var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
         defer substitutions.deinit();
         for (definition.parameters, nominal.arguments) |parameter, argument| try substitutions.put(parameter.typ, argument);
-        // Self-typed method (`сравнить(другое: Сравниваемое) -> Число`,
-        // `равно`, the 4 arithmetic ops, `клонировать() -> Копируемое`)
-        // dispatched through an INTERFACE-typed value (not a concrete
-        // struct) — there's no concrete type to resolve "Self" to here
-        // (the value could be any implementor), so the only sound
-        // substitution is the interface type itself; `assignable` already
-        // accepts a concrete argument against an interface-typed expected
-        // type via `interfaceImplementation` lookup. See
-        // `interface_self_placeholders`'s doc comment for the regression
-        // this fixes.
+        // Метод Self-типа (`сравнить(другое: Сравниваемое) -> Число`,
+        // `равно`, 4 арифметических операции, `клонировать() ->
+        // Копируемое`), диспетчеризуемый через значение ИНТЕРФЕЙСНОГО
+        // типа (не конкретная структура) — здесь нет конкретного типа,
+        // к которому можно разрешить "Self" (значением может быть любой
+        // реализующий тип), так что единственная корректная подстановка
+        // — сам тип интерфейса; `assignable` уже принимает конкретный
+        // аргумент против ожидаемого интерфейсного типа через поиск
+        // `interfaceImplementation`.
         const self_type = self.result.interface_self_placeholders.get(nominal.symbol);
         if (self_type) |placeholder| try substitutions.put(placeholder, object_type);
         const shared = @min(call.arguments.len, method.parameters.len);
-        // A default method may declare ITS OWN generic parameters
-        // (`отобразить[U](это: Итерируемое(T), ф: функ(T) -> U) ->
-        // Итерируемое(U)`) — separate from the interface's own `T`
-        // (already bound above via `definition.parameters`). Same
-        // pre-pass `inferMethodCall` already uses for an ordinary
-        // struct method's own generics: infer each argument's RAW type
-        // first and unify against the (still-unsubstituted) parameter
-        // type, so `U` is bound before anything below needs it. Real
-        // gap found building `отобразить`: without this, `U` stayed an
-        // unresolved bare placeholder in the callback parameter's
-        // expected type, and again in the return type — a lambda
-        // argument could never match either.
+        // Метод по умолчанию может объявлять СОБСТВЕННЫЕ генерик-
+        // параметры (`отобразить[U](это: Итерируемое(T), ф: функ(T) ->
+        // U) -> Итерируемое(U)`) — отдельно от собственного `T`
+        // интерфейса (уже связан выше через `definition.parameters`).
+        // Тот же предпроход, что уже использует `inferMethodCall` для
+        // собственных генериков обычного метода структуры: сначала
+        // вывести СЫРОЙ тип каждого аргумента и унифицировать против
+        // (ещё не подставленного) типа параметра, чтобы `U` был связан
+        // до того, как что-либо ниже в нём нуждается.
         if (method.default_symbol) |default_symbol| {
             if (self.methodBySymbol(default_symbol)) |definition_info| {
                 for (call.arguments[0..shared], method.parameters[0..shared]) |argument, parameter| {
@@ -5347,28 +5204,27 @@ const Checker = struct {
             if (!self.assignable(actual, expected)) {
                 try self.report(call.span, "Type Error: аргумент метода не совпадает с типом параметра", .{});
             } else if ((self_type == null or !parameter.eql(self_type.?)) and !self.isSelfReference(nominal.symbol, parameter)) {
-                // A Self-typed PARAMETER is the one case where boxing
-                // must NOT happen: the vtable-resolved concrete method
-                // (`callInterface`, `vm.zig`) expects the SAME raw
-                // concrete value the receiver itself carries (it was
-                // compiled as e.g. `сравнить(это: Точка, другое: Точка)`,
-                // not `другое: <interface>`) — casting the argument to
-                // the interface type here would hand it a boxed
-                // `.interface` value at the call site, which then fails
-                // ordinary field access inside the callee ("доступ к
-                // полю поддержан только для структуры"). Real regression
-                // found fixing the call site's type (see
-                // `interface_self_placeholders`): the TYPE substitution
-                // is still needed (so an unrelated non-implementing
-                // value is rejected), just not the runtime cast. `!self.
-                // isSelfReference(...)` covers the SAME footgun for a
-                // REAL (non-hardcoded) interface declaration, where Self
-                // is written as the interface's own bare name directly
-                // (`другое: Равнозначное`) rather than a synthesized
-                // placeholder — `interface_self_placeholders` is empty
-                // for those (nothing minted one), so the placeholder
-                // check alone isn't enough once `preludePass`'s hardcode
-                // is skipped.
+                // ПАРАМЕТР Self-типа — единственный случай, когда
+                // упаковка НЕ ДОЛЖНА происходить: разрешённый через
+                // vtable конкретный метод (`callInterface`, `vm.zig`)
+                // ожидает ТО ЖЕ сырое конкретное значение, что несёт сам
+                // получатель (он был скомпилирован как, например,
+                // `сравнить(это: Точка, другое: Точка)`, а не `другое:
+                // <интерфейс>`) — приведение аргумента к интерфейсному
+                // типу здесь передало бы в точку вызова упакованное
+                // `.interface` значение, которое затем провалило бы
+                // обычный доступ к полю внутри вызываемого ("доступ к
+                // полю поддержан только для структуры"). Подстановка
+                // ТИПА всё ещё нужна (чтобы отклонять посторонние
+                // нереализующие значения), просто не рантайм-приведение.
+                // `!self.isSelfReference(...)` покрывает ТУ ЖЕ ловушку
+                // для НАСТОЯЩЕГО (не захардкоженного) объявления
+                // интерфейса, где Self записан прямо как голое имя
+                // самого интерфейса (`другое: Равнозначное`), а не
+                // синтезированная заглушка — `interface_self_placeholders`
+                // для таких пуста (никто её не чеканил), так что одной
+                // проверки заглушки недостаточно, когда захардкоженный
+                // путь `preludePass` пропущен.
                 try self.registerInterfaceCast(argument, actual, expected);
             }
         }
@@ -5380,36 +5236,36 @@ const Checker = struct {
         return @as(?types.TypeId, try self.substituteGeneric(method.return_type, &substitutions));
     }
 
-    // `a.взять(3)` where `a`'s static type is a CONCRETE struct/enum
-    // (not the interface itself, not a bound generic parameter) that
-    // implements an interface declaring `взять` as a DEFAULT method,
-    // not overridden — the whole point of default methods (fluent
-    // chaining starting from an ordinary concrete value, e.g.
-    // `коллекции.итератор(массив).отобразить(f)`) needs this: neither
-    // `inferInterfaceCall` (object isn't the interface type) nor
-    // `inferMethodCall` (no inherent method by this name) fire.
-    // Boxes the receiver (`registerInterfaceCast`, same mechanism a
-    // `пер x: Интерфейс = a` cast already uses) and delegates the rest
-    // to `inferInterfaceCall` — no duplicated parameter/return
-    // substitution logic. Any FURTHER call in a chain
-    // (`.взять(3).отобразить(g)`) needs no special handling here at
-    // all: the previous default method's return type is the ABSTRACT
-    // interface type (via `interface_self_placeholders`/
-    // `isSelfReference`), so it goes through the ordinary
-    // `inferInterfaceCall` path directly.
+    // `a.взять(3)`, где статический тип `a` — КОНКРЕТНАЯ структура/
+    // перечисление (не сам интерфейс, не ограниченный генерик-параметр),
+    // реализующая интерфейс, объявляющий `взять` как метод ПО УМОЛЧАНИЮ,
+    // не переопределённый — в этом весь смысл методов по умолчанию
+    // (цепочки вызовов, начинающиеся с обычного конкретного значения,
+    // например `коллекции.итератор(массив).отобразить(f)`): не
+    // срабатывает ни `inferInterfaceCall` (объект не интерфейсного
+    // типа), ни `inferMethodCall` (нет собственного метода с этим
+    // именем). Упаковывает получателя (`registerInterfaceCast`, тот же
+    // механизм, что уже использует приведение `пер x: Интерфейс = a`) и
+    // делегирует остальное `inferInterfaceCall` — без дублирования
+    // логики подстановки параметров/возврата. Любой ДАЛЬНЕЙШИЙ вызов в
+    // цепочке (`.взять(3).отобразить(g)`) не требует здесь особой
+    // обработки вообще: тип возврата предыдущего метода по умолчанию —
+    // АБСТРАКТНЫЙ интерфейсный тип (через `interface_self_placeholders`/
+    // `isSelfReference`), так что он идёт напрямую через обычный путь
+    // `inferInterfaceCall`.
     fn inferDefaultInterfaceMethodCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
         const object = self.result.types.get(object_type) orelse return null;
         const nominal = switch (object.*) {
             .nominal => |value| value,
             else => return null,
         };
-        // Scan the FULL implementation list before deciding — a value
-        // whose concrete struct implements two DIFFERENT interfaces that
-        // both declare a default method of the same name must be
-        // rejected as ambiguous, not silently resolved to whichever
-        // interface happens to appear first in `interface_implementations`
-        // (an emergent, typechecker-pass-order artifact the user has no
-        // control over).
+        // Сканируем ПОЛНЫЙ список реализаций перед принятием решения —
+        // значение, чья конкретная структура реализует два РАЗНЫХ
+        // интерфейса, оба объявляющих метод по умолчанию с одинаковым
+        // именем, должно быть отклонено как неоднозначное, а не молча
+        // разрешено в тот интерфейс, что первым оказался в
+        // `interface_implementations` (случайный артефакт порядка
+        // проходов тайпчекера, никак не контролируемый пользователем).
         var matched_interface_type: ?types.TypeId = null;
         for (self.result.interface_implementations.items) |implementation| {
             if (implementation.target != nominal.symbol) continue;
@@ -5422,17 +5278,15 @@ const Checker = struct {
                 }
             }
             if (!has_default_method) continue;
-            // `implementation.arguments` are expressed in terms of
-            // `nominal.symbol`'s OWN declared placeholders (e.g.
-            // `МассивИт[T]`'s own `T`, unified against `Ит`'s `T` when
-            // the impl was checked) — NOT concrete types, whenever the
-            // target itself is generic. Must substitute through
-            // `nominal.arguments` (THIS call site's actual, concrete
-            // instantiation) to get the real interface type — using
-            // `implementation.arguments` as-is left `interface_type`
-            // still abstract, so argument type-checking against it
-            // (e.g. a lambda parameter inferred from `функ(T) -> ...`)
-            // failed even for the simplest non-generic-method case.
+            // `implementation.arguments` выражены через СОБСТВЕННЫЕ
+            // объявленные заглушки `nominal.symbol` (например,
+            // собственный `T` у `МассивИт[T]`, унифицированный с `T` у
+            // `Ит` при проверке импла) — НЕ конкретные типы, если сам
+            // target генерик. Нужно подставить через `nominal.arguments`
+            // (фактическую, конкретную инстанциацию ЭТОЙ точки вызова),
+            // чтобы получить настоящий интерфейсный тип — использование
+            // `implementation.arguments` как есть оставляло бы
+            // `interface_type` всё ещё абстрактным.
             const target_params = self.nominalParameters(nominal.symbol);
             var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
             defer substitutions.deinit();
@@ -5455,20 +5309,19 @@ const Checker = struct {
         return try self.inferInterfaceCall(expression, call, property, interface_type);
     }
 
-    // `это.метод()` where `это`'s static type is a bare GENERIC
-    // PARAMETER bound by a user-defined interface (inside the body of a
-    // generic function like `функ разобрать_в[T: ИзTOML](это: T, ...)`
-    // in `std/кодирование/toml.ps`) — real gap found auditing panosiki's
-    // `configor` package. Panos generics are never monomorphized, so
-    // there is no concrete type available here to resolve `.метод`
-    // against; this compiles the call exactly like `inferInterfaceCall`
-    // (an ordinary `call_interface`/vtable dispatch) against whichever
-    // bound interface declares the method — safe ONLY because callers
-    // are required (see `interfaceBoundOf`, used at every generic
-    // function-call site) to have already cast their concrete argument
-    // to that SAME interface type before it reaches this parameter, so
-    // the runtime value here already carries a real vtable to dispatch
-    // through.
+    // `это.метод()`, где статический тип `это` — голый ГЕНЕРИК-ПАРАМЕТР,
+    // ограниченный пользовательским интерфейсом (внутри тела
+    // генерик-функции вроде `функ разобрать_в[T: ИзTOML](это: T, ...)`).
+    // Генерики панос никогда не мономорфизируются, так что здесь нет
+    // конкретного типа для разрешения `.метод`; компилирует вызов точно
+    // как `inferInterfaceCall` (обычная диспетчеризация
+    // `call_interface`/vtable) против того ограничивающего интерфейса,
+    // что объявляет метод — безопасно ТОЛЬКО потому, что вызывающие
+    // обязаны (см. `interfaceBoundOf`, используется в каждой точке
+    // вызова генерик-функции) уже привести свой конкретный аргумент к
+    // ТОМУ ЖЕ интерфейсному типу до того, как он достигнет этого
+    // параметра, так что рантайм-значение здесь уже несёт настоящую
+    // vtable для диспетчеризации.
     fn inferGenericBoundInterfaceCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
         const object = self.result.types.get(object_type) orelse return null;
         if (object.* != .generic_parameter) return null;
@@ -5494,10 +5347,10 @@ const Checker = struct {
                 continue;
             };
             const method = definition.methods[index];
-            // Deferred here (not the top of the function), same reason as
-            // `inferInterfaceCall`'s identical fix — this dispatcher is
-            // also tried speculatively per bound and falls through on
-            // `null`.
+            // Отложено сюда (не в начало функции), по той же причине,
+            // что и у идентичного исправления в `inferInterfaceCall` —
+            // этот диспетчер тоже пробуется спекулятивно по каждому
+            // ограничению и проваливается дальше при `null`.
             if (call.argument_names != null) try self.report(call.span, "Type Error: именованные аргументы не поддержаны для интерфейсного вызова", .{});
             if (call.arguments.len != method.parameters.len) try self.report(call.span, "Type Error: неверное количество аргументов метода", .{});
             const shared = @min(call.arguments.len, method.parameters.len);
@@ -5525,10 +5378,10 @@ const Checker = struct {
         if (object.* != .process) return null;
         if (!std.mem.eql(u8, property.property, "номер")) return null;
         try self.checkMethodArity(call, "номер", 0);
-        // Discrete process id — must match `получить_сигнал()`'s `id`
-        // (also `Целое`, see that builtin's handling above) so
-        // `id == p.номер()` type-checks; both are the same u64 process
-        // id at runtime regardless.
+        // Дискретный идентификатор процесса — должен совпадать с `id` из
+        // `получить_сигнал()` (тоже `Целое`), чтобы `id == p.номер()`
+        // проходил тайпчек; оба всё равно один и тот же u64
+        // идентификатор процесса во время выполнения.
         return self.result.types.builtins.integer;
     }
 
@@ -5980,31 +5833,30 @@ const Checker = struct {
         return expected;
     }
 
-    // Structurally walks `type_id`, filling `poison` into `substitutions`
-    // for every bare generic-parameter reached that isn't already
-    // constrained — used when `inferGenericSubstitution` hits a shape it
-    // can't unify against (most commonly an EMPTY array/map literal,
-    // `массив()`/`соответствие()`, whose element type is already
-    // `poison` per its own inference rule — see `assignable`'s array/map
-    // cases). Real gap found auditing panosiki's `cli-selector`
-    // (`Селектор(заголовок, массив())` inside `новый_селектор[T]`,
-    // constructing `Селектор[T]{пункты: Массив(Пункт(T))}` from an empty
-    // array): without this, `T` was NEVER added to `substitutions` at
-    // all (the old code just silently `return`ed on the shape mismatch),
-    // so the very next pass reported "не удалось вывести type-параметр"
-    // even though the missing type is provably safe to leave as
-    // `poison` (assignable to/from anything, same reasoning `assignable`
-    // already applies to empty-literal elements directly).
-    // `placeholder` is whichever of `poison()`/`unconstrained()` the
-    // ORIGINAL argument that triggered this fill already was (see the
-    // call site in `inferGenericSubstitution`) — a single TypeId
-    // instance, reused for every nested generic-parameter position
-    // found by this walk (both variants carry a `void` payload, so one
-    // instance is structurally interchangeable with a fresh one
-    // everywhere `.eql`/`assignable` look at it). This propagates the
-    // SAME kind (real error vs deliberately-unconstrained) all the way
-    // through, instead of collapsing every fill back to a hardcoded
-    // `.poison`.
+    // Структурно обходит `type_id`, заполняя `substitutions` значением
+    // `poison` для каждого достигнутого голого генерик-параметра, ещё не
+    // ограниченного — используется, когда `inferGenericSubstitution`
+    // натыкается на форму, с которой не может унифицироваться (чаще
+    // всего ПУСТОЙ литерал массива/соответствия, `массив()`/
+    // `соответствие()`, чей тип элемента уже `poison` по собственному
+    // правилу вывода — см. случаи массива/соответствия в `assignable`).
+    // Без этого `T` вообще НИКОГДА не добавлялся бы в `substitutions`
+    // (старый код просто молча делал `return` при несовпадении формы),
+    // так что самый следующий проход сообщал бы "не удалось вывести
+    // type-параметр", хотя недостающий тип доказуемо безопасно оставить
+    // как `poison` (совместим с чем угодно в обе стороны, та же логика,
+    // что `assignable` уже применяет к элементам пустого литерала
+    // напрямую).
+    // `placeholder` — тот из `poison()`/`unconstrained()`, которым уже
+    // был ИСХОДНЫЙ аргумент, вызвавший это заполнение (см. точку вызова
+    // в `inferGenericSubstitution`) — единственный экземпляр TypeId,
+    // переиспользуемый для каждой вложенной позиции генерик-параметра,
+    // найденной этим обходом (оба варианта несут `void`-полезную
+    // нагрузку, так что один экземпляр структурно взаимозаменяем со
+    // свежим везде, где на него смотрят `.eql`/`assignable`). Это
+    // распространяет ОДИН И ТОТ ЖЕ вид (настоящая ошибка против
+    // намеренно-неограниченного) до самого конца, вместо схлопывания
+    // каждого заполнения обратно в захардкоженный `.poison`.
     fn fillUnknownWithPoison(self: *Checker, type_id: types.TypeId, substitutions: *std.AutoHashMap(types.TypeId, types.TypeId), placeholder: types.TypeId) !void {
         const entry = self.result.types.get(type_id) orelse return;
         switch (entry.*) {
@@ -6028,24 +5880,15 @@ const Checker = struct {
         switch (parameter_type.*) {
             .generic_parameter => {
                 if (substitutions.get(parameter)) |existing| {
-                    // Число/Целое share ONE f64 runtime representation
-                    // (see `Целое(x)`/`Число(x)` casts — `Число` is a
-                    // pure no-op precisely because of this) — unifying a
-                    // generic parameter across TWO occurrences where one
-                    // argument is an untyped numeric literal (`0`,
-                    // inferred as plain `Число` with no expected-type
-                    // context to narrow it) and the other is a real
-                    // `Целое` (e.g. `.длина()`) is completely safe, not
-                    // a genuine ambiguity. Real regression found while
-                    // fixing cross-module generic-bound dispatch: every
-                    // cross-module generic call USED to skip this check
-                    // entirely (silently permissive, via the "T always
-                    // degrades to poison" gap this session's OTHER fix
-                    // just closed) — `std/тест.ps`'s `т.равны[T](a, b:
-                    // T, ...)`, called all over panosiki as `т.равны(...,
-                    // массив.длина(), 0, ...)`, only started hitting
-                    // this path once cross-module generics actually
-                    // started tracking `T` for real.
+                    // Число/Целое разделяют ОДНО рантайм-представление
+                    // f64 (см. приведения `Целое(x)`/`Число(x)` — `Число`
+                    // именно поэтому чистый no-op) — унификация
+                    // генерик-параметра между ДВУМЯ вхождениями, где один
+                    // аргумент — нетипизированный числовой литерал (`0`,
+                    // выведенный как обычное `Число` без контекста
+                    // ожидаемого типа для сужения) а другой — настоящее
+                    // `Целое` (например, `.длина()`), полностью
+                    // безопасна, не настоящая неоднозначность.
                     if (self.isNumeric(argument) and self.isNumeric(existing)) {
                         if (self.isType(existing, self.result.types.builtins.integer) or self.isType(argument, self.result.types.builtins.integer)) {
                             try substitutions.put(parameter, self.result.types.builtins.integer);
@@ -6072,14 +5915,11 @@ const Checker = struct {
                 try self.inferGenericSubstitution(map.key, argument_type.map.key, substitutions, span);
                 try self.inferGenericSubstitution(map.value, argument_type.map.value, substitutions, span);
             },
-            // Real gap found building a generic combinator struct that
-            // stores a callback field (`ф: функ(T) -> U`) — a struct
-            // constructor call unifies each ARGUMENT's type against its
-            // FIELD's declared type via this same function, but with no
-            // `.function` case, a type parameter appearing ONLY inside
-            // a function-typed field/argument (like `U` here — it never
-            // occurs anywhere else in the struct) could never be
-            // inferred at all ("не удалось вывести type-параметр").
+            // Без ветки `.function` параметр типа, встречающийся ТОЛЬКО
+            // внутри поля/аргумента функционального типа (например, `U`
+            // здесь — он никогда не встречается больше нигде в
+            // структуре), никогда не мог бы быть выведен ("не удалось
+            // вывести type-параметр").
             .function => |parameter_function| {
                 const argument_type = self.result.types.get(argument) orelse return;
                 if (argument_type.* != .function or argument_type.function.parameters.len != parameter_function.parameters.len) return;
@@ -6213,40 +6053,33 @@ pub fn checkWithImportContextForTarget(
     try checker.preludePass();
     try checker.enumPass();
     try checker.interfacePass();
-    // `nominalPass` (struct field types, INCLUDING qualified ones like
-    // `слог.Логгер`) must run AFTER `importIdentityPass`, for the exact
-    // same reason `importIdentityPass`'s own doc comment already
-    // documents for `signaturePass`: `nominalType` reads
-    // `imported_nominal_identities`, and a qualified annotation resolved
-    // before that map is populated silently gets identity=0 instead of
-    // the real cross-module identity. Real gap found auditing panosiki's
-    // `std/слог.ps`: a struct field (`логгер: слог.Логгер`, resolved by
-    // the OLD earlier `nominalPass`) and a method parameter of the
-    // IDENTICAL declared type (resolved later, by `signaturePass`, AFTER
-    // `importIdentityPass` already ran) ended up with two DIFFERENT
-    // identities for "the same" type — assigning one to the other then
-    // failed "присваивание несовместимых типов" even though both sides
-    // were declared with the exact same annotation.
+    // `nominalPass` (типы полей структур, ВКЛЮЧАЯ квалифицированные вроде
+    // `слог.Логгер`) должна запускаться ПОСЛЕ `importIdentityPass`, по
+    // той же причине, что уже задокументирована в doc-комментарии
+    // `importIdentityPass` для `signaturePass`: `nominalType` читает
+    // `imported_nominal_identities`, и квалифицированная аннотация,
+    // разрешённая до заполнения этой карты, молча получает identity=0
+    // вместо настоящей межмодульной идентичности.
     try checker.importIdentityPass(imports, &owner_remaps, &owner_parameters_by_symbol);
     try checker.nominalPass();
     try checker.nativeNominalPass();
-    // Must run BEFORE `signaturePass` — a `реализация Интерфейс для
-    // Модуль.Тип` (qualified impl TARGET) is processed by `signaturePass`
-    // and needs `nominal_fields`/`generic_nominal_fields` for the
-    // IMPORTED target symbol already populated (via `isImplementableNominal`,
-    // called from `defineInterfaceImplementation`) — `importSignaturePass`
-    // is exactly what populates those maps for imported nominals. Running
-    // it after `signaturePass` (the old order) meant EVERY qualified impl
-    // target failed `isImplementableNominal` unconditionally (nominal_fields
-    // was still empty for it at that point), rejecting all such `реализация`
-    // blocks with "интерфейс может реализовать только структура или
-    // перечисление" even for a real struct — real gap found while building
-    // codegen's json generator (a `_gen.ps` file implementing
-    // `json.ВJSON для Модуль.Тип` is EXACTLY this shape). `importSignaturePass`
-    // itself only depends on `owner_remaps`/`owner_parameters_by_symbol`
-    // (from `importIdentityPass`, already run) and `imports.nominals`
-    // (static input) — nothing `signaturePass` produces, so this reorder
-    // is safe.
+    // Должна запускаться ДО `signaturePass` — `реализация Интерфейс для
+    // Модуль.Тип` (квалифицированная ЦЕЛЬ импла) обрабатывается
+    // `signaturePass` и нуждается в уже заполненных `nominal_fields`/
+    // `generic_nominal_fields` для ИМПОРТИРОВАННОГО символа цели (через
+    // `isImplementableNominal`, вызываемую из
+    // `defineInterfaceImplementation`) — именно `importSignaturePass`
+    // заполняет эти карты для импортированных номинальных типов. Запуск
+    // её после `signaturePass` означал бы, что КАЖДАЯ квалифицированная
+    // цель импла безусловно проваливала бы `isImplementableNominal`
+    // (nominal_fields на тот момент всё ещё была бы для неё пуста),
+    // отклоняя все такие блоки `реализация` с "интерфейс может
+    // реализовать только структура или перечисление" даже для настоящей
+    // структуры. `importSignaturePass` сама зависит только от
+    // `owner_remaps`/`owner_parameters_by_symbol` (из `importIdentityPass`,
+    // уже выполнена) и `imports.nominals` (статический вход) — ничего из
+    // того, что производит `signaturePass`, так что этот порядок
+    // безопасен.
     try checker.importSignaturePass(imports, &owner_remaps, &owner_parameters_by_symbol);
     try checker.signaturePass();
     try checker.constantPass();
@@ -6355,12 +6188,6 @@ test "type checker infers collection elements through indexing" {
     try std.testing.expectEqual(checked.types.builtins.number, checked.expression_types.get(index).?);
 }
 
-// Real gap found this session: `Строка` had `.есть()`/`.получить()`/etc
-// counterparts nowhere, but specifically `.длина()` was missing while
-// Массив/Соответствие both have it AND the free function `длина(x)`
-// already worked fine on strings — a confusing asymmetry, not a
-// deliberate omission. Fixed by adding a `.primitive == .string` arm
-// alongside the existing `.array`/`.map` arms in the same dispatch.
 test "type checker allows .длина() as a method on Строка, matching Массив/Соответствие" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -6521,26 +6348,20 @@ test "type checker rejects loop control outside a loop" {
     var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
     defer checked.deinit();
 
-    // 3, not 2: `продолжить` (unconditionally diverges-for-reachability)
-    // is immediately followed by `прервать` in the same block — a real
-    // "недостижимый код" warning, ported from Odin's `check_unreachable_
-    // code` (`core/type_cheker.odin`) alongside these two pre-existing
-    // errors. Confirmed Odin produces the exact same warning text for the
-    // equivalent program before adding this assertion.
+    // 3, а не 2: `продолжить` (безусловно расходится для достижимости)
+    // сразу следует `прервать` в том же блоке — настоящее предупреждение
+    // "недостижимый код" вдобавок к этим двум изначальным ошибкам.
     try std.testing.expectEqual(@as(usize, 3), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("Type Error: 'продолжить' можно использовать только внутри цикла", checked.diagnostics.items.items[0].message);
     try std.testing.expectEqualStrings("Type Error: 'прервать' можно использовать только внутри цикла", checked.diagnostics.items.items[1].message);
     try std.testing.expectEqualStrings("недостижимый код", checked.diagnostics.items.items[2].message);
 }
 
-// NOTE: this test's original premise ("type checker narrows integer
-// literals in an expected context") no longer applies now that bare
-// integer literals are unconditionally Целое and there is no implicit
-// Целое<->Число coercion — there is nothing left to narrow. The old
-// "дробный литерал несовместим с Целое" diagnostic message was removed;
-// `пер дробь: Целое = 1.5` now fails through the generic assignability
-// check instead ("значение переменной не совпадает с аннотацией").
-// Assertion rewritten to check error count/type only, not message text.
+// Название теста устарело: голые целочисленные литералы теперь
+// безусловно Целое, неявного приведения Целое<->Число нет — сужать
+// нечего. `пер дробь: Целое = 1.5` теперь проваливается через обычную
+// проверку совместимости ("значение переменной не совпадает с
+// аннотацией").
 test "type checker narrows integer literals in an expected context" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -6775,17 +6596,11 @@ test "type checker warns on code after an if/else where both branches return" {
     try std.testing.expectEqualStrings("недостижимый код", checked.diagnostics.items.items[0].message);
 }
 
-// Real bug found running `pan`'s own `семвер.pns` module (this session):
-// a nested if-expression used as the TAIL of an else-branch, with no
-// type annotation anywhere propagating an `expected` type down to it,
-// wrongly reported "ветви 'если' возвращают разные типы" — even though
-// both branches produced the exact same nominal struct type. Root cause:
-// `inferBlockExpected`'s trailing statement dispatch used
-// `expected_value == null` as a proxy for "discard this if-expression's
-// value" (the correct, cheap path for loop bodies / bare-`если`-as-
-// statement sub-blocks), but that's also exactly what a normal
-// annotation-less block tail looks like — the nested `если`'s branches
-// never got unified at all, silently inferred as `Пусто`.
+// Вложенное if-выражение, используемое как ХВОСТ else-ветви, без
+// аннотации типа где-либо, доводящей ожидаемый тип до этой точки — обе
+// ветви должны унифицироваться в один и тот же номинальный тип
+// структуры, а не молча выводиться как `Пусто` через путь отбрасывания
+// для тел циклов/голого `если`-как-оператора.
 test "type checker unifies branches of a nested if-expression used as an else-branch's tail, with no type annotation anywhere" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -6801,17 +6616,11 @@ test "type checker unifies branches of a nested if-expression used as an else-br
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
-// Pre-emptive coverage, not a fix — an older memory of a bug report
-// claimed `массив()` (empty array literal) inside a `выбор` arm doesn't
-// inherit its element type from the enclosing function's declared `->
-// Массив(T)` return type. Re-tested directly this session: NOT
-// reproducible, on this commit or on the one right before `5515580`'s
-// nested-if-expression fix — `inferMatchExpected` already threads
-// `expected` correctly into each arm via `inferBlockExpected(arm.body,
-// expected, false)`. Zero prior test coverage of this exact shape
-// existed, though, and it's the same "trailing value type propagation"
-// category `5515580` fixed a real bug in — this locks the behavior in
-// so a future regression here doesn't go unnoticed the same way.
+// `inferMatchExpected` уже прокидывает `expected` корректно в каждую
+// ветку через `inferBlockExpected(arm.body, expected, false)` — пустой
+// литерал `массив()` внутри ветки `выбор` должен наследовать тип
+// элемента от объявленного типа возврата `-> Массив(T)` охватывающей
+// функции.
 test "type checker infers массив() element type inside a выбор arm from the function's declared return type" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -6827,11 +6636,10 @@ test "type checker infers массив() element type inside a выбор arm fr
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
-// Regression: two `выбор` arms for the SAME enum variant with DIFFERENT
-// field patterns (one literal-narrowed, one a plain binder) used to be
-// flagged as "вариант перечисления повторён" even though the second arm
-// only catches what the first didn't — the old check compared variant
-// SYMBOLS only, ignoring field narrowing entirely.
+// Две ветки `выбор` для ОДНОГО варианта перечисления с РАЗНЫМИ
+// шаблонами полей (одна сужена литералом, другая — обычное связывание)
+// не должны считаться дубликатом — вторая ловит только то, что не
+// поймала первая.
 test "type checker allows a literal-narrowed match arm followed by a plain binder for the same variant" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -6847,9 +6655,8 @@ test "type checker allows a literal-narrowed match arm followed by a plain binde
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
-// Two FULLY GENERIC (unnarrowed) arms for the same variant are still a
-// genuine duplicate/unreachable-arm error — the fix above must not
-// swallow this case.
+// Две ПОЛНОСТЬЮ УНИВЕРСАЛЬНЫЕ (несуженные) ветки для одного варианта
+// всё ещё настоящая ошибка дубликата/недостижимой ветки.
 test "type checker still rejects two fully generic match arms for the same variant" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -6866,10 +6673,10 @@ test "type checker still rejects two fully generic match arms for the same varia
     try std.testing.expectEqualStrings("Type Error: вариант перечисления повторён в выборе", checked.diagnostics.items.items[0].message);
 }
 
-// Regression: `Сравниваемое` (`<`) used to only work inside a
-// `[T: Сравниваемое]`-bounded generic (`isComparableGeneric`) — a
-// CONCRETE type's own `реализация Сравниваемое` used directly, no
-// generic involved, fell through to the plain `isNumeric` rejection.
+// `Сравниваемое` (`<`) должен работать не только внутри генерика,
+// ограниченного `[T: Сравниваемое]` (`isComparableGeneric`), но и для
+// собственной `реализация Сравниваемое` у КОНКРЕТНОГО типа,
+// используемой напрямую, без всякого генерика.
 test "type checker allows Сравниваемое comparison on a concrete type outside any generic context" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -6885,11 +6692,11 @@ test "type checker allows Сравниваемое comparison on a concrete type
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
-// Regression: calling a Self-typed interface method (`сравнить(другое:
-// Сравниваемое) -> Число`) directly through an interface-TYPED variable
-// (`x: Сравниваемое`) left the Self placeholder unsubstituted at the
-// call site, so a concrete argument of the implementing type was never
-// assignable to it — fixed via `interface_self_placeholders`.
+// Вызов метода Self-типа (`сравнить(другое: Сравниваемое) -> Число`)
+// напрямую через переменную ИНТЕРФЕЙСНОГО типа (`x: Сравниваемое`)
+// должен разрешать заглушку Self в точке вызова (см.
+// `interface_self_placeholders`), иначе конкретный аргумент
+// реализующего типа никогда не был бы совместим с ней.
 test "type checker allows a self-typed interface method call through an interface-typed variable" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
@@ -6956,13 +6763,10 @@ test "type checker rejects a default-method call ambiguous between two interface
 test "type checker does not warn when an if has no else (false path falls through)" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
-    // `если x тогда паника("boom") конец` — `Никогда`-typed then-branch,
-    // no `иначе`, so the whole `если` never claims to always diverge (the
-    // false-condition path falls straight through) — the trailing `2`
-    // must NOT be flagged unreachable. `паника` avoids an unrelated,
-    // pre-existing if-expression-value-type inference limitation this
-    // exact shape hits with `возврат` in a lone then-branch (separate
-    // from what this test is checking).
+    // `если x тогда паника("boom") конец` — then-ветвь типа `Никогда`,
+    // без `иначе`, так что весь `если` никогда не утверждает, что всегда
+    // расходится (путь при ложном условии проходит насквозь) — хвостовой
+    // `2` НЕ должен помечаться как недостижимый.
     var lexed = try lexer.tokenize(std.testing.allocator, "функ f(x: Булево) -> Число\nесли x тогда\nпаника(\"boom\")\nконец\n2.0\nконец", 0);
     defer lexed.deinit();
     var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
@@ -6974,11 +6778,11 @@ test "type checker does not warn when an if has no else (false path falls throug
 
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
-// specs/013-explicit-generic-args — `ф[Тип](...)` explicit generic-argument
-// calls. `Никогда`-returning `паника(...)` bodies keep these fixtures
-// minimal (directionally assignable to any declared return type) — the
-// call SITE's explicit-argument handling is what's under test, not the
-// generic function's own body.
+// `ф[Тип](...)` — вызовы с явным генерик-аргументом. Тела с
+// возвращающим `Никогда` `паника(...)` держат эти фикстуры минимальными
+// (совместимы с любым объявленным типом возврата) — под тестом именно
+// обработка явного аргумента в ТОЧКЕ ВЫЗОВА, а не собственное тело
+// генерик-функции.
 
 test "explicit generic argument resolves a type parameter absent from any inferrable context" {
     const lexer = @import("lexer.zig");
@@ -7030,22 +6834,21 @@ test "without an explicit generic argument, an unconstrained type parameter stil
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
-// A real cross-module (`module_loader`/`module_compiler`) test for
-// `либ.ф[Тип](...)` was deliberately dropped here: pulling
-// `module_compiler.zig` into `type_checker_unit_tests` transitively
-// drags in `vm.zig`'s native SQL/FFI code, which THIS test binary (see
-// `build.zig`'s `type_checker_unit_tests`) is not linked against
-// (unlike `vm_unit_tests`) — a real, reproducible link failure, not a
-// flake (confirmed by isolating on a clean `.zig-cache` against
-// unmodified `HEAD` first). Not worth wiring a new link dependency into
-// this binary for one test: the qualified-call detection path
-// (`self.resolution.expr_symbols.get(index.object)` where
-// `index.object` is a `Property_Expr`) is the EXACT SAME lookup the
-// pre-existing, already-proven-working ORDINARY qualified generic call
-// path uses (`callee_symbol = self.resolution.expr_symbols.get(call.callee)`
-// for `модуль.ф(...)`, unchanged by this feature) — qualified explicit
-// calls are structurally covered by that existing behavior, not
-// separately re-verified end-to-end here.
+// Настоящий межмодульный (`module_loader`/`module_compiler`) тест для
+// `либ.ф[Тип](...)` намеренно опущен здесь: подключение
+// `module_compiler.zig` в `type_checker_unit_tests` транзитивно тянет за
+// собой нативный SQL/FFI код `vm.zig`, с которым ЭТОТ тестовый бинарник
+// не слинкован (в отличие от `vm_unit_tests`) — настоящий,
+// воспроизводимый сбой линковки, не флейк. Не стоит подключать новую
+// зависимость линковки в этот бинарник ради одного теста: путь
+// обнаружения квалифицированного вызова (`self.resolution.expr_symbols.
+// get(index.object)`, где `index.object` — `Property_Expr`) — ТОТ ЖЕ
+// поиск, что уже использует существующий, доказанно работающий путь
+// ОБЫЧНОГО квалифицированного генерик-вызова (`callee_symbol =
+// self.resolution.expr_symbols.get(call.callee)` для `модуль.ф(...)`,
+// не изменённый этой возможностью) — квалифицированные явные вызовы
+// структурно покрыты этим существующим поведением, отдельно end-to-end
+// здесь не перепроверяются.
 
 test "explicit generic argument conflicting with the actual argument type is a Type Error" {
     const lexer = @import("lexer.zig");
@@ -7208,20 +7011,17 @@ test "indexing an array of functions and calling the result is unaffected by exp
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
-// specs/015-typechecker-metamorphic-tests — hardening-plan Phase C's
-// "metamorphic testing" item. Crash-oracle fuzzing (`zig build fuzz`)
-// only asks "did it panic" — the real bug class this project has
-// actually hit (false duplicate-variant, `Сравниваемое` outside
-// generic, wrong `получить()` type, ...) is a QUIETLY WRONG answer,
-// never a crash. The oracle here instead is: two source forms that are
-// semantically equivalent MUST produce the same diagnostic count and
-// severity multiset. No unparser/pretty-printer exists in this codebase
-// (`grep` confirmed, see hardening plan) — these are literal SOURCE-TEXT
-// pairs, not AST-mutate-and-reprint; each pair below is a direct,
-// deliberately minimal encoding of one of the plan's 5 documented
-// invariants (not a byte-mutated fuzzer — `zig build fuzz --fuzz`'s
-// continuous mode is broken on this Zig toolchain regardless, see
-// project_panos_zig_fuzz_continuous_broken memory).
+// Метаморфное тестирование. Фаззинг по краш-оракулу (`zig build fuzz`)
+// спрашивает только "запаниковало ли" — реальный класс багов, с которым
+// на практике сталкивался этот проект (ложный дубликат варианта,
+// `Сравниваемое` вне генерика, неверный тип `получить()`, ...) — это
+// ТИХО НЕВЕРНЫЙ ответ, никогда не крах. Оракул здесь вместо этого: две
+// формы исходного текста, семантически эквивалентные, ДОЛЖНЫ давать
+// одинаковое число диагностик и одинаковый мультисет уровней серьёзности.
+// В этой кодовой базе нет анпарсера/pretty-printer'а — это буквальные
+// пары ИСХОДНОГО ТЕКСТА, не мутация-AST-и-перепечать; каждая пара ниже —
+// прямая, намеренно минимальная кодировка одного из 5 задокументированных
+// инвариантов.
 fn expectEquivalentDiagnostics(comptime label: []const u8, variant_a: []const u8, variant_b: []const u8) !void {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");

@@ -3,29 +3,21 @@ const panos = @import("panos_core");
 const manifest = @import("manifest.zig");
 const outcome = @import("outcome.zig");
 
-// T053 — runs every case in `tests/conformance/manifest.json` against the
-// ZIG side and asserts the outcome matches EXACTLY what was recorded there.
-// The manifest's `expected` values were determined by actually running BOTH
-// toolchains (Odin reference + this Zig port) side by side and comparing —
-// see each case's `deviation` field (or absence of one) for what that
-// comparison found. This is the automated, ongoing HALF of that gate: it
-// catches a future Zig regression against the already-approved values. It
-// does NOT re-run Odin itself — `zig/conformance/reference.zig` (the old
-// odin-shell-out helper) was retired in T058, since it only ever existed to
-// support the manual, one-time comparison used to populate this manifest,
-// not an ongoing per-CI-run check.
+// Прогоняет каждый случай из `tests/conformance/manifest.json` и сверяет
+// результат ТОЧНО с тем, что там записано в качестве ожидаемого. Значения
+// `expected` в манифесте — это утверждённый эталон, а не то, что можно
+// пересчитать заново: это единственный автоматический контроль регрессий.
 //
-// Split into per-TIER entry points (`runTier`/`runAot` below, each called
-// from its OWN tiny `test` file/build artifact — see `build.zig`) instead of
-// one `test` block looping over the whole manifest sequentially: Zig's build
-// graph only parallelizes across separate `addTest`/`Run` steps, never
-// across `test` declarations inside one binary, and the "runtime" tier in
-// particular embeds the `tests/conformance/benchmarks/*.ps` fixtures
-// (`фиб(30)` recursion, a 5-million-iteration loop, 20k string
-// concatenations) — genuinely slow in a Debug-mode bytecode VM, and were
-// dragging down `zig build test`'s everyday dev loop by being bundled into
-// it at all (see `build.zig`'s `test_step`, which no longer depends on any
-// tier of this).
+// Разбито на отдельные точки входа по TIER (`runTier`/`runAot` ниже, каждая
+// вызывается из СВОЕГО маленького `test`-файла/build-артефакта — см.
+// `build.zig`), а не один `test`-блок, перебирающий весь манифест
+// последовательно: граф сборки Zig распараллеливает только отдельные шаги
+// `addTest`/`Run`, но не `test`-декларации внутри одного бинарника, а
+// уровень "runtime" отдельно включает фикстуры `tests/conformance/
+// benchmarks/*.ps` (рекурсия `фиб(30)`, цикл на 5 млн итераций, 20 тыс.
+// конкатенаций строк) — по-настоящему медленные в байткод-VM в Debug-сборке,
+// поэтому вынесены из повседневного цикла `zig build test` (см. `test_step`
+// в `build.zig` — он не зависит ни от одного из уровней здесь).
 
 pub fn computeOutcome(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !outcome.Outcome {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
@@ -80,11 +72,10 @@ fn freeOutcome(allocator: std.mem.Allocator, value: outcome.Outcome) void {
     if (value.diagnostics.len != 0) allocator.free(value.diagnostics);
 }
 
-// Runs every manifest case whose `tier` matches `tier_name` (one of
-// "semantic"/"runtime"/"native" — `aot` has its own, completely different
-// execution path, see `runAot` below) through `runner.runSource` (the
-// ordinary bytecode-VM pipeline) and asserts the outcome matches the
-// manifest's recorded expectation exactly.
+// Прогоняет каждый случай манифеста с `tier`, равным `tier_name` (один из
+// "semantic"/"runtime"/"native" — у `aot` совсем другой путь выполнения, см.
+// `runAot` ниже) через `runner.runSource` (обычный конвейер байткод-VM) и
+// сверяет результат с записанным в манифесте ожиданием.
 pub fn runTier(allocator: std.mem.Allocator, tier_name: []const u8) !void {
     var io = std.Io.Threaded.init(allocator, .{});
     defer io.deinit();
@@ -113,15 +104,14 @@ pub fn runTier(allocator: std.mem.Allocator, tier_name: []const u8) !void {
     }
 }
 
-// `computeOutcome`/`runSource` above reject `импорт` outright (see
-// `runner.zig`'s `reportUnsupportedImports`) — every fixture that's
-// genuinely multi-file (interfaces/generics/qualified-names/spawn across
-// files, and plain multi-file programs generally) needs the REAL
-// multi-file pipeline instead: `module_loader.Graph` + `module_compiler.
-// compileGraph`, the same one `cli/main.zig` uses for a real `panos`
-// invocation. `FileReader` is a verbatim copy of `cli/main.zig`'s own
-// private struct (not exported from `panos_core`) — same reasoning `cli/
-// main.zig` already established for reading module files off real disk.
+// `computeOutcome`/`runSource` выше отвергают `импорт` целиком (см.
+// `reportUnsupportedImports` в `runner.zig`) — любой фикстуре, которая
+// реально многофайловая (интерфейсы/дженерики/квалифицированные имена/spawn
+// между файлами и просто многофайловые программы), нужен НАСТОЯЩИЙ
+// многофайловый конвейер: `module_loader.Graph` + `module_compiler.
+// compileGraph`, тот же, что использует `cli/main.zig` при реальном запуске
+// `panos`. `FileReader` — дословная копия приватной структуры из
+// `cli/main.zig` (она не экспортируется из `panos_core`).
 const FileReader = struct {
     io: std.Io,
 
@@ -133,17 +123,15 @@ const FileReader = struct {
 pub fn computeOutcomeGraph(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !outcome.Outcome {
     var graph = panos.module_loader.Graph.init(allocator);
     defer graph.deinit();
-    // Stdlib-search root, relative to the repo root (`zig build test`'s
-    // cwd) — same relative path `tests/conformance/docs_examples_test.zig`
-    // already uses for the same reason (a fixture importing e.g.
-    // `математика`/`слог`/`супервизор` needs the REAL `std/` tree, not
-    // just `модули/`-next-to-importer resolution).
+    // Корень поиска stdlib, относительно корня репозитория (cwd `zig build
+    // test`) — фикстуре с `импорт` модулей вида `математика`/`слог`/
+    // `супервизор` нужно настоящее дерево `std/`, а не только резолюция
+    // `модули/`-рядом-с-импортёром.
     graph.global_search_roots = &.{"std"};
-    // `path` in the manifest is a real `.pns`/`.ps` file path (WITH
-    // extension) — `Graph.load` accepts that directly (an entry path is
-    // tried as-is before the extension-guessing search used for `импорт`
-    // targets), matching how every other tier's `input` field already
-    // works.
+    // `path` в манифесте — реальный путь к `.pns`/`.ps`-файлу (С
+    // расширением) — `Graph.load` принимает его как есть (входной путь
+    // сначала пробуется буквально, до поиска с подбором расширения,
+    // применяемого для целей `импорт`).
     try graph.load(&FileReader{ .io = io }, path);
     _ = try graph.appendPreludeModule(panos.prelude.SOURCE);
 
@@ -203,9 +191,9 @@ pub fn computeOutcomeGraph(allocator: std.mem.Allocator, io: std.Io, path: []con
     };
 }
 
-// Same case-matching/assertion shape as `runTier`, just calling
-// `computeOutcomeGraph` — a SEPARATE tier name (`"graph"`, never `"native"`)
-// so this never touches the 11 already-passing single-file cases at all.
+// Та же форма сопоставления случаев/проверок, что и `runTier`, но с вызовом
+// `computeOutcomeGraph` — под ОТДЕЛЬНЫМ именем уровня (`"graph"`, никогда
+// `"native"`), чтобы не затрагивать однофайловые случаи других уровней.
 pub fn runTierGraph(allocator: std.mem.Allocator, tier_name: []const u8) !void {
     var io = std.Io.Threaded.init(allocator, .{});
     defer io.deinit();
@@ -249,14 +237,12 @@ fn computeAotOutcome(allocator: std.mem.Allocator, io: std.Io, path: []const u8)
 
     var module = try panos.mir_lowering.lowerModule(allocator, &parsed.ast, &resolved, &checked);
     defer module.deinit(allocator);
-    // Same expansion pipeline `cli/main.zig`'s real `panos build
-    // --target=wasm` always runs, in the same order — skipping straight
-    // to `emitModule` (as this used to do) only worked for cases that
-    // never touched structs/strings/interfaces/first-class function
-    // values/actors; `.call_value` now ALWAYS depends on
-    // `wasm_interfaces.expand` having rewritten `.function_ref` into a
-    // real WASM table index first (see `wasm_interfaces.zig`'s own doc
-    // comment), so even a plain recursive function call needs this now.
+    // Тот же конвейер расширений и в том же порядке, что и реальный `panos
+    // build --target=wasm` в `cli/main.zig` — `.call_value` всегда зависит
+    // от того, что `wasm_interfaces.expand` уже переписал `.function_ref` в
+    // настоящий индекс таблицы WASM (см. doc-комментарий `wasm_interfaces.
+    // zig`), так что даже обычный рекурсивный вызов функции требует этого
+    // шага.
     try panos.wasm_objects.expand(allocator, &module, &checked.types);
     try panos.wasm_strings.expand(allocator, &module, &checked.types);
     const iface_result = try panos.wasm_interfaces.expand(allocator, &module, &checked.types);
@@ -271,10 +257,9 @@ fn computeAotOutcome(allocator: std.mem.Allocator, io: std.Io, path: []const u8)
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = wasm_path, .data = wasm_bytes });
     defer std.Io.Dir.cwd().deleteFile(io, wasm_path) catch {};
 
-    // `.environ = std.testing.environ` — `Io.Threaded`'s own default is
-    // EMPTY, which makes `expand_arg0`'s `$PATH` search silently useless
-    // (see `wasm_emit.zig`'s own tests and `specs/010-zig-migration`
-    // T051's progress-report.md entry for the real bug this caused there).
+    // `.environ = std.testing.environ` обязателен — собственное значение по
+    // умолчанию у `Io.Threaded` ПУСТОЕ, из-за чего поиск `$PATH` в
+    // `expand_arg0` молча не находит ничего.
     var wasmtime_io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
     defer wasmtime_io.deinit();
     const result = try std.process.run(allocator, wasmtime_io.io(), .{

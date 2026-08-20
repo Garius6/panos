@@ -9,30 +9,28 @@ const resolver = @import("resolver.zig");
 const source = @import("source.zig");
 const type_checker = @import("type_checker.zig");
 
-// Real multi-file `module_loader.Graph`-backed analysis for the LSP —
-// unlike `runner.analyzeSource` (single-file only, explicitly REJECTS any
-// `импорт`), this is what makes `textDocument/definition`/`references`
-// actually cross document boundaries. Before this file, any document
-// containing `импорт` got ZERO LSP support at all (every handler used
-// `analyzeSource`, which returns no tree/resolution for such a document) —
-// cross-document navigation was a strict SUBSET of a bigger, pre-existing
-// gap, not a separate one.
+// Настоящий многофайловый анализ для LSP на основе `module_loader.Graph` —
+// в отличие от `runner.analyzeSource` (только один файл, явно ОТВЕРГАЕТ
+// любой `импорт`), именно это позволяет `textDocument/definition`/
+// `references` реально пересекать границы документов.
 //
-// Deliberately scoped to `definition`/`references` only for now (see
-// `zig/lsp/main.zig`'s doc comments at their call sites) — swapping EVERY
-// handler (hover/completion/foldingRange/documentSymbol/codeLens/
+// Намеренно ограничено пока только `definition`/`references` (см.
+// doc-комментарии `zig/lsp/main.zig` у мест их вызова) — перевод КАЖДОГО
+// обработчика (hover/completion/foldingRange/documentSymbol/codeLens/
 // signatureHelp/selectionRange/semanticTokensFull/prepareRename/rename/
-// documentHighlight/workspace symbol) to this backend is a much bigger,
-// separately-verifiable change, not bundled in here.
+// documentHighlight/workspace symbol) на этот бэкенд — гораздо более
+// крупное, отдельно проверяемое изменение, сюда не входит.
 
-// `Reader` implements `module_loader.Graph.load`'s duck-typed `reader`
-// interface — checks OPEN, possibly-unsaved documents FIRST (the LSP
-// contract's own words: "a graph built with all currently open unsaved-
-// source overrides"), falls back to real disk I/O for files that aren't
-// open. `path` here is always the STRIPPED absolute filesystem path (see
-// `uriToPath`) — `module_loader.resolveImportPath` join/normalize logic
-// only ever produces one from the entry path's own shape, so this stays
-// consistent for every import in the graph, not just the entry file.
+// `Reader` реализует duck-typed интерфейс `reader`, ожидаемый
+// `module_loader.Graph.load` — сначала проверяет ОТКРЫТЫЕ, возможно
+// несохранённые документы (по контракту LSP: "граф строится с учётом всех
+// открытых несохранённых переопределений исходника"), для файлов не
+// открытых в редакторе падает обратно на настоящий дисковый I/O. `path`
+// здесь всегда ОЧИЩЕННЫЙ абсолютный путь файловой системы (см.
+// `uriToPath`) — логика join/normalize в `module_loader.resolveImportPath`
+// производит именно такой путь из формы входного пути, поэтому это
+// остаётся согласованным для каждого импорта в графе, а не только для
+// входного файла.
 const Reader = struct {
     io: std.Io,
     documents: *const lsp.DocumentStore,
@@ -56,10 +54,11 @@ pub fn uriToPath(uri: []const u8) ?[]const u8 {
     return uri[prefix.len..];
 }
 
-// LSP clients normally percent-encode file URIs (`%20`, UTF-8 bytes, ...).
-// Keep `uriToPath` as the zero-allocation fast path for existing callers, and
-// use this owned variant whenever the path is passed to the filesystem or
-// compared with graph module paths.
+// LSP-клиенты обычно percent-кодируют file URI (`%20`, байты UTF-8, ...).
+// `uriToPath` остаётся быстрым путём без аллокаций для существующих
+// вызывающих сторон, а этот вариант с владением используется всюду, где
+// путь передаётся файловой системе или сравнивается с путями модулей
+// графа.
 pub fn uriToPathAlloc(allocator: std.mem.Allocator, uri: []const u8) !?[]u8 {
     const raw = uriToPath(uri) orelse return null;
     const buffer = try allocator.dupe(u8, raw);
@@ -128,10 +127,10 @@ pub const GraphAnalysis = struct {
         return source.SourceFile.init(module.file.id, module.file.path, module.file.bytes);
     }
 
-    // Entry module (the document the request was made against) is always
-    // index 0 — `Graph.load` appends it first, before any import; the
-    // prelude module (appended separately, see `analyze` below) always
-    // comes after every real module.
+    // Входной модуль (документ, для которого сделан запрос) всегда имеет
+    // индекс 0 — `Graph.load` добавляет его первым, до любого импорта;
+    // модуль prelude (добавляется отдельно, см. `analyze` ниже) всегда
+    // идёт после всех настоящих модулей.
     pub fn entryTree(self: *const GraphAnalysis) *const ast.Ast {
         return self.moduleTree(0);
     }
@@ -146,16 +145,14 @@ pub fn analyze(allocator: std.mem.Allocator, io: std.Io, documents: *const lsp.D
     defer allocator.free(entry_path);
     var graph = module_loader.Graph.init(allocator);
     errdefer graph.deinit();
-    // Without this, any import resolved via `$PANOS_STDLIB`/exe-relative
-    // `std/` (not a same-directory relative `./...` import) never loads at
-    // all — `Module Loader Error: не удалось загрузить модуль`, silently
-    // caught by every caller (`definition`/`references` in `lsp/main.zig`
-    // return `null` on ANY `analyze` error), surfacing to the user as a
-    // bare "не найдено определение" for the target symbol, with no
-    // diagnostic ever shown. Real gap found: `cli/main.zig`'s real `panos`
-    // binary sets this (`$PANOS_STDLIB` then exe-relative `std/`, see its
-    // own comment) before every `graph.load`; this LSP-side graph builder
-    // never did, for ANY caller, since the day this file was added.
+    // Без этого любой импорт, резолвящийся через `$PANOS_STDLIB`/
+    // относительный к exe `std/` (не относительный `./...` импорт из той
+    // же директории), вообще не загружается — `Module Loader Error: не
+    // удалось загрузить модуль`, молча проглатывается каждым вызывающим
+    // кодом (`definition`/`references` в `lsp/main.zig` возвращают `null`
+    // при ЛЮБОЙ ошибке `analyze`), для пользователя это выглядит как
+    // просто "не найдено определение" для целевого символа, без единой
+    // показанной диагностики.
     graph.global_search_roots = global_search_roots;
     const reader = Reader{ .io = io, .documents = documents };
     try graph.load(&reader, entry_path);

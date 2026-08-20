@@ -9,13 +9,11 @@ pub const Manifest = struct {
     cases: []const Case,
 };
 
-// `input`/`expected` complete the shape `specs/010-zig-migration/contracts/
-// conformance.md` documents (`Case record`/`Outcome record`) — the original
-// skeleton (`id`/`tier`/`profile` only) predates any populated case (T053
-// is the first task to actually fill `manifest.json`). `input` is always a
-// real `.ps` FILE PATH relative to the repo root (read via `Io.Dir.cwd()`
-// at matrix-run time, not `@embedFile` — a manifest-driven case list is
-// runtime data, `@embedFile` needs a comptime-known path).
+// `input` — всегда реальный ПУТЬ к .ps-файлу относительно корня репозитория
+// (читается через `Io.Dir.cwd()` во время прогона матрицы, а не
+// `@embedFile` — список случаев управляется манифестом, то есть это данные
+// времени выполнения, а `@embedFile` требует путь, известный на этапе
+// компиляции).
 pub const Case = struct {
     id: []const u8,
     tier: []const u8,

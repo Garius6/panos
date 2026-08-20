@@ -8,33 +8,33 @@ const symbols = @import("symbols.zig");
 const wasm_module = @import("wasm_module.zig");
 const wasm_heap = @import("wasm_heap.zig");
 
-// Turns `mir_cps.zig`'s CPS-rewritten step functions into a REAL,
-// self-contained WASM program: builds the generic mailbox/signal/alloc
-// runtime functions those step functions call into, rewires the
-// placeholder `call_builtin{"@runtime::..."}` names `mir_cps.zig` emits
-// into real in-module `.call`s (no new host imports — this must run
-// under plain wasmtime), expands `.spawn`/`.send` into concrete
-// alloc/frame-store sequences, and replaces the entry point with a
-// scheduler wrapper.
+// Превращает CPS-переписанные шаговые функции `mir_cps.zig` в РЕАЛЬНУЮ
+// самодостаточную WASM-программу: строит общие рантайм-функции
+// mailbox/signal/alloc, которые эти шаговые функции вызывают, перепрошивает
+// плейсхолдерные имена `call_builtin{"@runtime::..."}`, испускаемые
+// `mir_cps.zig`, в реальные внутримодульные `.call` (без новых host-импортов —
+// это должно работать под обычным wasmtime), разворачивает `.spawn`/`.send`
+// в конкретные последовательности alloc/frame-store и заменяет точку входа
+// на обёртку-планировщик.
 //
-// Phase-1 MVP constraint, enforced here (not assumed): at most ONE
-// `.spawn` in the whole module, and it must be reachable from `старт`'s
-// own (CPS-rewritten) body — `старт` itself MUST call `получить()` at
-// least once (this is what lets it double as "process 0" the scheduler
-// drives). Anything wider (multiple actor types, spawning from inside a
-// spawned actor, a non-suspending entry point that only spawns
-// fire-and-forget) is Phase 2+; `expand` returns a clean `unsupported`
-// error rather than silently producing a program that only handles the
-// narrower case.
+// Ограничение Phase-1 MVP, обеспечиваемое здесь (не предполагаемое): не более
+// ОДНОГО `.spawn` во всём модуле, и он должен быть достижим из собственного
+// (CPS-переписанного) тела `старт` — сам `старт` ОБЯЗАН вызвать `получить()`
+// хотя бы раз (это позволяет ему выступать "процессом 0", которым управляет
+// планировщик). Всё более широкое (несколько типов акторов, spawn изнутри
+// заспавненного актора, неприостанавливающаяся точка входа, которая только
+// спавнит и не ждёт ответа) — Phase 2+; `expand` возвращает чистую ошибку
+// `unsupported`, а не молча производит программу, которая обрабатывает
+// только более узкий случай.
 //
-// Scheduler shape: no real WASM `loop` at all — a fixed, UNROLLED
-// sequence of round-trip attempts (`scheduler_rounds`), each an ordinary
-// if/else diamond calling process 0's and process 1's step function once
-// if not already done. This is deliberately simpler (and lower-risk to
-// hand-author correctly) than a genuine dynamic loop: Phase-1's own
-// scope (one spawned actor, one request/reply exchange) converges in a
-// handful of rounds; exceeding the bound traps instead of silently
-// returning an incomplete result.
+// Форма планировщика: никакого настоящего WASM `loop` — фиксированная,
+// РАЗВЁРНУТАЯ последовательность попыток раунд-трипа (`scheduler_rounds`),
+// каждая — обычный if/else-ромб, вызывающий шаговую функцию процесса 0 и
+// процесса 1 по одному разу, если ещё не завершены. Это намеренно проще (и
+// менее рискованно при ручном написании), чем настоящий динамический цикл:
+// собственная область применения Phase-1 (один заспавненный актор, один
+// обмен запрос/ответ) сходится за несколько раундов; превышение границы
+// приводит к trap вместо молчаливого возврата неполного результата.
 
 fn unsupported(comptime what: []const u8) error{ActorExpandUnsupported} {
     std.debug.print("panos build: AOT (wasm) акторы — " ++ what ++ "\n", .{});
@@ -43,7 +43,7 @@ fn unsupported(comptime what: []const u8) error{ActorExpandUnsupported} {
 
 const scheduler_rounds: u32 = 16;
 
-// --- Generic runtime functions ----------------------------------------
+// --- Общие рантайм-функции ----------------------------------------
 
 fn buildHas(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, name: []const u8, count_slot: u32) !mir.FunctionId {
     const id = try mir_builder.newFunction(module, allocator, name, wasm_heap.dummy_symbol, layout.bool_type, wasm_heap.dummy_span);
@@ -61,10 +61,11 @@ fn buildHas(allocator: std.mem.Allocator, module: *mir.Module, type_store: *cons
     return id;
 }
 
-// `payload_type` — pop must be built once per WASM value category (i32
-// handle vs f64 number), since a plain WASM function has ONE fixed
-// result type and message payloads vary by actor (see the file doc
-// comment's `mailbox_pop_f64`/`_i32` split).
+// `payload_type` — pop нужно строить отдельно для каждой категории
+// WASM-значений (i32-хэндл vs f64-число), поскольку обычная WASM-функция
+// имеет ОДИН фиксированный тип результата, а полезная нагрузка сообщения
+// различается по актору (см. разделение `mailbox_pop_f64`/`_i32` в
+// doc-комментарии файла).
 fn buildPop(
     allocator: std.mem.Allocator,
     module: *mir.Module,
@@ -86,7 +87,7 @@ fn buildPop(
     const frame1 = try wasm_heap.frameValue(&builder, frame_local, layout.ptr_type);
     const head = try builder.newValue(layout.idx_type);
     try builder.emit(.{ .frame_load = .{ .dst = head, .frame = frame1, .slot = head_slot } });
-    const head_local = try wasm_heap.storeLocal(&builder, "head", layout.idx_type, head); // used twice below (addr math, head+1)
+    const head_local = try wasm_heap.storeLocal(&builder, "head", layout.idx_type, head); // используется дважды ниже (адресная арифметика, head+1)
 
     // addr = frame + ring_base_slot*8 + head*8
     const frame2 = try wasm_heap.frameValue(&builder, frame_local, layout.ptr_type);
@@ -148,12 +149,11 @@ fn buildRuntime(allocator: std.mem.Allocator, module: *mir.Module, type_store: *
     };
 }
 
-// Finds `mir_cps.zig`'s placeholder `call_builtin{"@runtime::..."}`
-// instructions (see that file's `suspendKind`) across every function and
-// replaces them with a real `.call` to the matching function built
-// above — the pop variant is chosen from the CALL SITE's own `dst` type
-// (the message's real payload type), never from the runtime function
-// itself.
+// Находит плейсхолдерные инструкции `call_builtin{"@runtime::..."}`
+// `mir_cps.zig` (см. `suspendKind` в том файле) во всех функциях и
+// заменяет их реальным `.call` на подходящую функцию, построенную выше —
+// вариант pop выбирается по типу `dst` МЕСТА ВЫЗОВА (реальному типу
+// полезной нагрузки сообщения), а не по самой рантайм-функции.
 fn rewireSuspendCalls(module: *mir.Module, runtime: Runtime) void {
     for (module.functions.items) |*function| {
         for (function.blocks.items) |*block| {
@@ -162,43 +162,37 @@ fn rewireSuspendCalls(module: *mir.Module, runtime: Runtime) void {
                     .call_builtin => |c| c,
                     else => continue,
                 };
-                // `себя()` (`mir_lowering.zig`'s `"@runtime::current_process"`)
-                // — in this design a process's "handle" IS its own frame
-                // pointer, so this is just reading local 0 back (`mir_cps.zig`
-                // always makes the frame pointer local 0 of a rewritten
-                // function), not a call at all.
+                // `себя()` (`"@runtime::current_process"` из `mir_lowering.zig`)
+                // — в этой конструкции "хэндл" процесса И ЕСТЬ указатель на
+                // его собственный фрейм, так что это просто чтение обратно
+                // local 0 (`mir_cps.zig` всегда делает указатель на фрейм
+                // local 0 переписанной функции), а не настоящий вызов.
                 if (std.mem.eql(u8, call.name, "@runtime::current_process")) {
                     instruction.* = .{ .load_local = .{ .dst = call.dst.?, .local = @enumFromInt(0) } };
                     continue;
                 }
-                // Real bug found running actual code, not just reading:
-                // this loop matches EVERY `.call_builtin` in the function,
-                // not just the 4 suspend-related ones below — a function
-                // that's CPS-suspending (calls `получить()`) can ALSO
-                // contain a completely unrelated VOID `call_builtin` (e.g.
-                // `DOM.на_клик(...)`, registered from inside `старт()`
-                // AFTER it has already suspended once — see
-                // `specs/016-actor-dom-persistence/`) with `call.dst ==
-                // null`. `is_i32`/`call.dst.?` used to be computed
-                // UNCONDITIONALLY for every match, before checking whether
-                // `call.name` was even one of the 4 relevant names — a
-                // guaranteed null-deref for any OTHER void call_builtin
-                // sharing a suspending function's body. No prior fixture
-                // combined "CPS-suspending function" with "an unrelated
-                // void call_builtin in the same body", so this was never
-                // exercised before. Fixed: match the name FIRST, only
-                // compute `is_i32` for the two variants that actually use
-                // it (`mailbox_has`/`signal_has` return a fixed `Булево`,
-                // never need the payload-type check at all).
+                // Этот цикл матчит КАЖДЫЙ `.call_builtin` в функции, а не
+                // только 4 связанных с приостановкой ниже — CPS-
+                // приостанавливающаяся функция (вызывающая `получить()`)
+                // может ТАКЖЕ содержать совершенно не связанный VOID
+                // `call_builtin` (например, `DOM.на_клик(...)`,
+                // регистрируемый изнутри `старт()` уже ПОСЛЕ того, как та
+                // однажды приостановилась) с `call.dst == null`. Поэтому
+                // `is_i32`/`call.dst.?` вычисляются только ПОСЛЕ проверки,
+                // что `call.name` вообще одно из 4 нужных имён —
+                // `mailbox_has`/`signal_has` возвращают фиксированный
+                // `Булево` и вообще не нуждаются в проверке типа полезной
+                // нагрузки.
                 //
-                // The `is_i32` check itself checks equality against ONLY
-                // `builtins.string`/`.boolean` misses every nominal
-                // (struct/enum), array, and process type — ALL of which
-                // ALSO map to i32 per `wasm_module.wasmValTypeForStore`
-                // (which also now special-cases `поison`/`unconstrained`
-                // as i32 — see its own doc comment — covering
-                // `получить()`'s otherwise-unresolved type for the common
-                // `-> Пусто` actor idiom).
+                // Сама проверка `is_i32` на равенство ТОЛЬКО с
+                // `builtins.string`/`.boolean` пропускает любой номинальный
+                // тип (структура/перечисление), массив и тип процесса — ВСЕ
+                // они ТОЖЕ отображаются в i32 согласно
+                // `wasm_module.wasmValTypeForStore` (которая также
+                // специально обрабатывает `poison`/`unconstrained` как i32
+                // — см. её собственный doc-комментарий — покрывая
+                // иначе-неразрешённый тип `получить()` для обычной
+                // акторной идиомы `-> Пусто`).
                 const callee: ?mir.FunctionId = blk: {
                     if (std.mem.eql(u8, call.name, "@runtime::mailbox_has")) break :blk runtime.mailbox_has;
                     if (std.mem.eql(u8, call.name, "@runtime::signal_has")) break :blk runtime.signal_has;
@@ -217,10 +211,11 @@ fn rewireSuspendCalls(module: *mir.Module, runtime: Runtime) void {
     }
 }
 
-// --- `.spawn`/`.send` expansion ----------------------------------------
+// --- Развёртка `.spawn`/`.send` -----------------------------------------
 
-// A function_ref immediately preceding `.spawn` — the same convention
-// `wasm_emit.zig`'s own `value_to_function` relies on for `call_value`.
+// function_ref, идущий непосредственно перед `.spawn` — то же соглашение,
+// на которое опирается собственный `value_to_function` в `wasm_emit.zig`
+// для `call_value`.
 fn resolveSpawnTarget(function: *const mir.Function, callee: mir.ValueId) ?mir.FunctionId {
     for (function.blocks.items) |block| {
         for (block.instructions.items) |instruction| {
@@ -230,14 +225,14 @@ fn resolveSpawnTarget(function: *const mir.Function, callee: mir.ValueId) ?mir.F
     return null;
 }
 
-// Rewrites the SINGLE `.spawn` inside `function` (already located by the
-// caller) in place: allocates a fresh frame sized for `target`, copies
-// `args` into it positionally, and stashes the new frame pointer into
-// `child_frame_slot` of the CURRENT function's own frame (for the
-// scheduler to find) — reusing `.spawn`'s own `dst` ValueId as "the
-// process handle" everywhere it's already used downstream (the ordinary
-// `пер proc = запусти ...` local-store that follows needs no rewriting
-// at all).
+// Переписывает ЕДИНСТВЕННЫЙ `.spawn` внутри `function` (уже найденный
+// вызывающей стороной) на месте: выделяет новый фрейм под размер `target`,
+// копирует `args` в него позиционно и сохраняет новый указатель на фрейм в
+// `child_frame_slot` фрейма ТЕКУЩЕЙ функции (чтобы планировщик мог его
+// найти) — переиспользуя собственный ValueId `.spawn`'а `dst` как "хэндл
+// процесса" везде, где он уже используется ниже по коду (обычное
+// сохранение в локал `пер proc = запусти ...`, следующее за spawn, вообще
+// не нуждается в переписывании).
 fn expandSpawn(
     allocator: std.mem.Allocator,
     builder: *mir_builder.Builder,
@@ -258,47 +253,46 @@ fn expandSpawn(
     var replacement: std.ArrayList(mir.Instruction) = .empty;
     try replacement.appendSlice(allocator, original.instructions.items[0..spawn_index]);
 
-    // dst = alloc(target_total_slots * 8) — reuses the ORIGINAL dst
-    // ValueId directly, so every later instruction that already expects
-    // "the spawn result" keeps working unmodified.
+    // dst = alloc(target_total_slots * 8) — переиспользует ИСХОДНЫЙ
+    // ValueId dst напрямую, так что каждая последующая инструкция,
+    // ожидающая "результат spawn", продолжает работать без изменений.
     builder.setCurrentBlock(block_id);
     builder.currentFunction().block(block_id).instructions = replacement;
     builder.terminated = false;
 
     const size_const = try wasm_heap.addressConst(builder, layout.idx_type, target_total_slots * 8);
-    // A `Процесс` captured by a DOM closure (see
-    // `specs/016-actor-dom-persistence/`) must survive the arena reset
-    // between separate JS-invoked calls — allocate its frame (mailbox
-    // included, it lives inline in the same block) in the PERMANENT
-    // region from the start instead of the ordinary resettable arena.
-    // `mir_lowering.zig`'s `lowerDomClickClosure` sets this flag; at
-    // most one `.spawn` exists per module (Phase-1 constraint), so a
-    // single module-wide flag is unambiguous — there is no OTHER spawn
-    // this could apply to instead.
+    // `Процесс`, захваченный DOM-замыканием, должен пережить сброс арены
+    // между отдельными JS-вызовами — выделять его фрейм (mailbox включена,
+    // она лежит inline в том же блоке) сразу в ПОСТОЯННОЙ области, а не в
+    // обычной сбрасываемой арене. Флаг выставляет `lowerDomClickClosure` в
+    // `mir_lowering.zig`; на модуль приходится не более одного `.spawn`
+    // (ограничение Phase-1), так что единый флаг на весь модуль
+    // однозначен — другого spawn, к которому это могло бы относиться, нет.
     const alloc_id = if (builder.module.actor_captured_by_dom_closure)
         try wasm_heap.findOrBuildAllocPermanent(allocator, builder.module, builder.currentFunction().type_store.?, layout)
     else
-        // Guaranteed already built — `expand()` calls `buildRuntime`
-        // (which creates it) before `expandSpawn` ever runs.
+        // Гарантированно уже построена — `expand()` вызывает `buildRuntime`
+        // (которая её создаёт) до того, как вообще запускается `expandSpawn`.
         wasm_heap.findFunctionByName(builder.module, wasm_heap.alloc_function_name).?;
     try builder.emit(.{ .call = .{ .dst = dst, .callee = alloc_id, .args = try wasm_heap.dupeOne(builder.module, size_const) } });
-    // `dst` is used below for EVERY arg's `frame_store`, the child-slot
-    // stash, AND possibly further downstream (the user's own `пер proc =
-    // запусти ...`) — single-use invariant, same fix as `mir_cps.zig`'s
-    // `Redirect`: store once, reload fresh at each use.
+    // `dst` используется ниже для `frame_store` КАЖДОГО аргумента, для
+    // сохранения в child-slot И, возможно, дальше по коду (собственный
+    // `пер proc = запусти ...` пользователя) — инвариант "одно
+    // использование", тот же приём, что и в `Redirect` из `mir_cps.zig`:
+    // сохранить один раз, при каждом использовании перечитывать заново.
     const dst_local = try wasm_heap.storeLocal(builder, "@spawned", layout.ptr_type, dst);
 
-    // Iterate args in REVERSE. `args` are all PRE-EXISTING values
-    // (`.spawn`'s own arguments, each evaluated adjacent to the
-    // ORIGINAL, unexpanded `.spawn` instruction, in order) — by the
-    // time this loop runs they're ALL already sitting on the real WASM
-    // stack in production order, with the LAST arg topmost. Storing
-    // arg 0 first (ascending) would grab the wrong (topmost, last-
-    // produced) value as `src` — same bug class already found and fixed
-    // in `wasm_objects.zig`'s `build_variant`/`new_aggregate` field
-    // loops (`888a0c0`). Never exercised until now since every actor
-    // fixture built so far spawns a function with 0 or 1 parameters —
-    // 2+ genuinely needs this fix.
+    // Обходим args В ОБРАТНОМ порядке. `args` — все УЖЕ СУЩЕСТВУЮЩИЕ
+    // значения (собственные аргументы `.spawn`, каждый вычислен рядом с
+    // ИСХОДНОЙ, ещё не развёрнутой инструкцией `.spawn`, по порядку) — к
+    // моменту, когда этот цикл выполняется, они ВСЕ уже лежат на реальном
+    // WASM-стеке в порядке производства, причём ПОСЛЕДНИЙ аргумент —
+    // самый верхний. Сохранение arg 0 первым (по возрастанию) захватило бы
+    // не то (самое верхнее, последним произведённое) значение как `src` —
+    // тот же класс бага, что и в циклах по полям `build_variant`/
+    // `new_aggregate` в `wasm_objects.zig`. Ни одна из ранее построенных
+    // фикстур акторов не спавнила функцию с 2+ параметрами — этот фикс
+    // реально нужен именно для такого случая.
     var ai = args.len;
     while (ai > 0) {
         ai -= 1;
@@ -306,44 +300,46 @@ fn expandSpawn(
         try builder.emit(.{ .frame_store = .{ .frame = dst_for_arg, .slot = mir_cps.frame_prefix_slots + @as(u32, @intCast(ai)), .src = args[ai] } });
     }
 
-    // `src` computed BEFORE `frame` — see `wasm_emit.zig`'s
-    // `EmitContext.frame_store_scratch_frame` doc comment (stack order
-    // `frame_store` codegen expects is `[src, frame]`).
+    // `src` вычисляется ДО `frame` — см. doc-комментарий
+    // `EmitContext.frame_store_scratch_frame` в `wasm_emit.zig` (порядок
+    // стека, который ожидает кодогенерация `frame_store`, — `[src, frame]`).
     const dst_for_stash = try wasm_heap.loadLocal(builder, dst_local, layout.ptr_type);
     const own_frame = try wasm_heap.frameValue(builder, frame_local, layout.ptr_type);
     try builder.emit(.{ .frame_store = .{ .frame = own_frame, .slot = child_frame_slot, .src = dst_for_stash } });
 
-    // Downstream instructions (the user's own code after `запусти ...`,
-    // e.g. `пер proc = ...`) may reference `dst` too — redirect exactly
-    // like `mir_cps.zig`'s suspend-point handling does.
+    // Инструкции ниже по коду (собственный код пользователя после
+    // `запусти ...`, например `пер proc = ...`) тоже могут ссылаться на
+    // `dst` — перенаправляем точно так же, как это делает обработка точек
+    // приостановки в `mir_cps.zig`.
     //
-    // `.frame_store` needs special handling here, not just a blind
-    // substitute: by the time `expandSpawn` runs (AFTER `mir_cps.
-    // prepare`), the user's `пер proc = запусти ...` has ALREADY been
-    // rewritten by `mir_cps.zig`'s own `.store_local` case into
-    // `load_local{dst=F,local=frame_local}` (frame pointer reload,
-    // emitted FIRST, unchanged by the substitution below since it
-    // doesn't reference `dst`) followed by `frame_store{frame=F,...,
-    // src=dst}`. A blind substitute here inserts a FRESH `loadLocal
-    // (dst_local)` for `src` right before the (rewritten) frame_store —
-    // making `src` the freshest value, with `frame`(F) produced earlier/
-    // buried — backwards from `frame_store` codegen's `[src, frame]`
-    // convention (frame must be freshest). Confirmed via wasmtime: `proc`
-    // ended up reading garbage (0) instead of the real spawned handle,
-    // since the write actually happened at the WRONG address. Fix:
-    // detect this exact `load_local(frame_local)` + `frame_store{src=
-    // dst}` pair and re-synthesize it in the correct order — dropping
-    // the stale frame reload (now dead) and emitting a fresh one AFTER
-    // the fresh src reload.
+    // `.frame_store` здесь требует особой обработки, а не слепой
+    // подстановки: к моменту запуска `expandSpawn` (ПОСЛЕ `mir_cps.
+    // prepare`) пользовательский `пер proc = запусти ...` УЖЕ переписан
+    // собственным случаем `.store_local` из `mir_cps.zig` в
+    // `load_local{dst=F,local=frame_local}` (перезагрузка указателя на
+    // фрейм, испускается ПЕРВОЙ, не затрагивается подстановкой ниже, так
+    // как не ссылается на `dst`), за которой следует
+    // `frame_store{frame=F,...,src=dst}`. Слепая подстановка здесь
+    // вставила бы СВЕЖИЙ `loadLocal(dst_local)` для `src` прямо перед
+    // (переписанным) frame_store — делая `src` самым свежим значением, а
+    // `frame`(F), произведённый раньше, погребённым — наоборот тому, что
+    // требует соглашение кодогенерации `frame_store` `[src, frame]`
+    // (frame должен быть самым свежим). Итог: `proc` читал мусор (0)
+    // вместо реального заспавненного хэндла, поскольку запись фактически
+    // происходила по НЕВЕРНОМУ адресу. Фикс: распознаём именно эту пару
+    // `load_local(frame_local)` + `frame_store{src=dst}` и пересобираем
+    // её в правильном порядке — отбрасывая устаревшую (теперь мёртвую)
+    // перезагрузку фрейма и испуская свежую ПОСЛЕ свежей перезагрузки src.
     var ti: usize = 0;
     const tail = original.instructions.items[spawn_index + 1 ..];
     while (ti < tail.len) : (ti += 1) {
         const tail_instruction = tail[ti];
-        // Lookahead: is THIS a frame-pointer reload whose sole purpose
-        // (per mir_cps.zig's `.store_local` rewrite) is feeding the VERY
-        // NEXT instruction's `frame_store{src=dst}`? If so, DON'T emit
-        // it — its value would be dead-but-unconsumed once the next
-        // iteration re-synthesizes a fresh one in the correct order.
+        // Заглядываем вперёд: является ли ЭТО перезагрузкой указателя на
+        // фрейм, единственная цель которой (согласно переписыванию
+        // `.store_local` в mir_cps.zig) — накормить `frame_store{src=dst}`
+        // САМОЙ СЛЕДУЮЩЕЙ инструкции? Если да, НЕ испускаем её — её
+        // значение оказалось бы мёртвым-но-непотреблённым, как только
+        // следующая итерация пересоберёт свежую версию в правильном порядке.
         if (tail_instruction == .load_local and tail_instruction.load_local.local == frame_local and
             ti + 1 < tail.len and tail[ti + 1] == .frame_store and tail[ti + 1].frame_store.src == dst and
             tail[ti + 1].frame_store.frame == tail_instruction.load_local.dst)
@@ -365,45 +361,40 @@ fn expandSpawn(
         try builder.emit(rewritten);
     }
     builder.terminate(original.terminator);
-    // `.deinit`, not `allocator.free(.items)` — see `mir_cps.zig`'s
-    // identical comment on its own equivalent free.
+    // `.deinit`, а не `allocator.free(.items)` — см. идентичный комментарий
+    // в `mir_cps.zig` про её собственный эквивалентный free.
     original.instructions.deinit(allocator);
 }
 
-// specs/016-actor-dom-persistence — `отправить` from ANYWHERE OTHER than
-// `старт()`'s own (CPS-rewritten, scheduler-driven) body has no outer
-// loop driving the target actor's step function afterward — `старт()`
-// gets that for free from `buildScheduler`'s unrolled round-trip, but a
-// DOM handler calling `отправить` after `старт()` has already returned
-// is on its own. Mirrors `emitSchedulerRound`'s "process 1" half (same
-// `scheduler_rounds` bound, same "staying not-done forever is normal"
-// contract, see this file's own `emitSendRoundDriving` doc comment
-// below) — deliberately NOT a real WASM `loop`, matching this whole
-// backend's existing "unrolled, hand-verifiable rounds" choice over a
-// genuine dynamic loop.
-// `actor_step`'s `Булево` return means "the function itself genuinely
-// RETURNED" (`mir_cps.zig`'s own doc comment: "true = really finished
-// ..., false = suspended, call again once the mailbox/signal is
-// ready") — NOT "the message that was just sent got processed". A
-// persistent server actor like a typical `счётчик`-shaped
-// `выбор получить() ... конец` loop (every branch tail-recurses back
-// into another `получить()`) NEVER returns `true` — it suspends again
-// the instant its mailbox goes empty, by design, forever. Confirmed via
-// wasmtime: an earlier version of this function looped until `true` and
-// trapped ("превышен лимит раундов") if it never came, which meant ANY
-// persistent actor receiving a message through this path trapped
-// EVERY time, 100% reproducible, not an edge case — `buildScheduler`'s
-// own `emitSchedulerRound` already established the right precedent
-// (process 1, the spawned background actor, is driven every round but
-// its `done1` staying `false` forever is normal, untested at the end).
-// Mirrors that: drive up to `scheduler_rounds` calls (stopping early
-// only if the step function genuinely finishes), no trap either way —
-// each call that finds a non-empty mailbox pops and processes AT LEAST
-// the message just sent (`mir_cps.zig`'s dispatch loops back to the
-// mailbox check in place after each `получить()`, not via a fresh WASM
-// call), so a single round already guarantees the send is handled
-// before this function returns; the remaining rounds are pure
-// defensive slack, not a correctness requirement.
+// `отправить` из ЛЮБОГО МЕСТА, кроме собственного (CPS-переписанного,
+// управляемого планировщиком) тела `старт()`, не имеет внешнего цикла,
+// который бы после этого прогонял шаговую функцию целевого актора —
+// `старт()` получает это бесплатно из развёрнутого раунд-трипа
+// `buildScheduler`, а DOM-обработчик, вызывающий `отправить` после того,
+// как `старт()` уже вернулся, предоставлен сам себе. Зеркалит половину
+// "процесс 1" из `emitSchedulerRound` (та же граница `scheduler_rounds`,
+// тот же контракт "оставаться незавершённым навсегда — это нормально", см.
+// doc-комментарий `emitSendRoundDriving` этого файла ниже) — намеренно НЕ
+// настоящий WASM `loop`, в духе общего для этого бэкенда выбора
+// "развёрнутые, проверяемые вручную раунды" вместо настоящего
+// динамического цикла.
+// Возврат `Булево` из `actor_step` означает "функция САМА ПО СЕБЕ реально
+// ЗАВЕРШИЛАСЬ" (собственный doc-комментарий `mir_cps.zig`: "true = реально
+// завершилась ..., false = приостановилась, вызвать снова, когда
+// mailbox/signal будут готовы") — а НЕ "только что отправленное сообщение
+// обработано". Персистентный сервер-актор вроде типичного цикла
+// `счётчик`-формы `выбор получить() ... конец` (каждая ветка хвостово
+// рекурсирует обратно в очередной `получить()`) НИКОГДА не возвращает
+// `true` — он снова приостанавливается в момент опустошения mailbox, по
+// design, навсегда. Зеркалим этот же контракт: прогоняем до
+// `scheduler_rounds` вызовов (останавливаясь раньше только если шаговая
+// функция реально завершилась), trap не нужен в любом случае — каждый
+// вызов, находящий непустую mailbox, извлекает и обрабатывает КАК МИНИМУМ
+// только что отправленное сообщение (диспетчер `mir_cps.zig` возвращается
+// к проверке mailbox на месте после каждого `получить()`, а не через
+// свежий WASM-вызов), так что уже одного раунда достаточно, чтобы
+// гарантировать обработку отправки до возврата из этой функции; остальные
+// раунды — чистый защитный запас, а не требование корректности.
 fn emitSendRoundDriving(builder: *mir_builder.Builder, layout: wasm_heap.PtrLayout, process_local: mir.LocalId, actor_step: mir.FunctionId) !void {
     const done_local = try builder.newLocal(wasm_heap.dummy_symbol, "@send_done", layout.bool_type);
     const false_init = try wasm_heap.boolConst(builder, layout.bool_type, false);
@@ -416,10 +407,11 @@ fn emitSendRoundDriving(builder: *mir_builder.Builder, layout: wasm_heap.PtrLayo
         const not_done = try wasm_heap.notOp(builder, layout.bool_type, d);
 
         const call_block = try builder.newBlock();
-        // `skip_block` MUST be a distinct block from `after_block` — see
-        // `emitSchedulerRound`'s own comment on the exact same pitfall
-        // (`wasm_stackify.findMerge` exponential blowup if the branch's
-        // own else-target IS the merge point).
+        // `skip_block` ОБЯЗАН быть отдельным блоком, отличным от
+        // `after_block` — см. собственный комментарий `emitSchedulerRound`
+        // про ту же самую ловушку (экспоненциальный взрыв
+        // `wasm_stackify.findMerge`, если собственная else-цель ветвления
+        // и есть точка слияния).
         const skip_block = try builder.newBlock();
         const after_block = try builder.newBlock();
         builder.terminate(.{ .branch = .{ .cond = not_done, .then_block = call_block, .else_block = skip_block } });
@@ -436,17 +428,18 @@ fn emitSendRoundDriving(builder: *mir_builder.Builder, layout: wasm_heap.PtrLayo
 
         builder.setCurrentBlock(after_block);
     }
-    // No trap on `done_local` staying `false` — see this function's own
-    // doc comment above. Caller continues emitting the ORIGINAL tail
-    // instructions/terminator in whatever block is now current.
+    // Trap не нужен, если `done_local` так и остался `false` — см.
+    // собственный doc-комментарий этой функции выше. Вызывающая сторона
+    // продолжает испускать ИСХОДНЫЕ хвостовые инструкции/терминатор в
+    // том блоке, который сейчас текущий.
 }
 
-// Rewrites the SINGLE `.send` in place: pushes `message` into `process`'s
-// mailbox ring buffer, then — UNLESS this send lives in `старт()`'s own
-// body (which already gets rounds driven by `buildScheduler`'s outer
-// loop) — drives the target actor's step function via
-// `emitSendRoundDriving` so the message is genuinely PROCESSED before
-// this function returns, not merely enqueued.
+// Переписывает ЕДИНСТВЕННЫЙ `.send` на месте: кладёт `message` в кольцевой
+// буфер mailbox процесса `process`, затем — ЕСЛИ этот send не находится в
+// собственном теле `старт()` (которое уже получает раунды от внешнего
+// цикла `buildScheduler`) — прогоняет шаговую функцию целевого актора через
+// `emitSendRoundDriving`, чтобы сообщение было реально ОБРАБОТАНО до
+// возврата из этой функции, а не просто поставлено в очередь.
 fn expandSend(
     allocator: std.mem.Allocator,
     builder: *mir_builder.Builder,
@@ -466,25 +459,25 @@ fn expandSend(
     builder.currentFunction().block(block_id).instructions = prefix;
     builder.terminated = false;
 
-    // `send.process` and `send.message` are BOTH pre-existing values
-    // (`отправить(process_expr, message_expr)` evaluates left to right,
-    // so `process` is produced FIRST and `message` SECOND/freshest —
-    // `message` is very often itself a `build_variant` result, an
-    // entire construction sequence deep). Consuming `process` first (the
-    // original code's order) blindly popped whatever was ACTUALLY on
-    // top of the real WASM stack at that point — `message`, not
-    // `process` — since `store_local`'s codegen is just a raw
-    // `local.set`, it doesn't care what the MIR's `src` field claims,
-    // only what's really on top. Confirmed via wasmtime: this silently
-    // swapped `message`/`process`. Fix: consume in REVERSE-of-production
-    // (LIFO) order, same class of bug already found and fixed in
-    // `wasm_objects.zig`'s `build_variant`/`new_aggregate` field loops —
-    // store `message` first (it's topmost), THEN `process` (now exposed).
+    // `send.process` и `send.message` — ОБА уже существующие значения
+    // (`отправить(process_expr, message_expr)` вычисляется слева направо,
+    // так что `process` производится ПЕРВЫМ, а `message` — ВТОРЫМ/самым
+    // свежим — `message` очень часто сам является результатом
+    // `build_variant`, целой цепочкой конструирования). Потребление
+    // `process` первым слепо снимало бы с реального WASM-стека то, что на
+    // нём РЕАЛЬНО лежит сверху в этот момент — `message`, а не `process` —
+    // поскольку кодогенерация `store_local` это простой `local.set`,
+    // которому всё равно, что утверждает поле `src` MIR, важно только то,
+    // что реально на вершине. Фикс: потребляем в порядке, ОБРАТНОМ порядку
+    // производства (LIFO) — тот же класс бага, что уже был найден и
+    // исправлен в циклах по полям `build_variant`/`new_aggregate` в
+    // `wasm_objects.zig`: сохраняем `message` первым (он на вершине), ЗАТЕМ
+    // `process` (теперь обнажившийся).
     const message_type = function.valueType(send.message);
     const message_local = try wasm_heap.storeLocal(builder, "@message", message_type, send.message);
-    // `process`/`count` are each used more than once below — single-use
-    // invariant, same fix as everywhere else in this file: store once,
-    // reload fresh per use.
+    // `process`/`count` используются ниже более одного раза — инвариант
+    // одного использования, тот же фикс, что и везде в этом файле:
+    // сохранить один раз, при каждом использовании перечитывать заново.
     const process_local = try wasm_heap.storeLocal(builder, "@target", layout.ptr_type, send.process);
     const message = try wasm_heap.loadLocal(builder, message_local, message_type);
 
@@ -500,19 +493,21 @@ fn expandSend(
     const tail_pre = try wasm_heap.binOp(builder, layout.idx_type, .add, head, count_for_tail);
     const mask = try wasm_heap.addressConst(builder, layout.idx_type, mir_cps.mailbox_cap - 1);
     const tail = try wasm_heap.binOp(builder, layout.idx_type, .bit_and, tail_pre, mask);
-    // `eight` produced IMMEDIATELY after `tail` (adjacent — no other
-    // value's producer runs between them) so `tail_bytes` consumes
-    // exactly `[tail, eight]`, then `base`'s own two operands
-    // (`ring_base_bytes`/`process_for_base`) are produced and consumed
-    // together right before `addr`'s own add — `tail_bytes` sits safely
-    // buried underneath that net-stack-neutral pair the whole time.
-    // Originally `eight` was produced between `head` and `count_for_tail`
-    // — `.binary`'s i32 codegen does ZERO stack manipulation (just emits
-    // the raw opcode, `wasm_emit.zig` ~line 545: assumes `lhs`/`rhs` are
-    // ALREADY the top two stack values, pushed back-to-back with nothing
-    // interposed) — so the wedged `eight` made `tail_pre`'s `i32.add`
-    // silently compute `8 + count` instead of `head + count`, orphaning
-    // `head` on the stack to corrupt everything emitted after it.
+    // `eight` производится СРАЗУ ЖЕ после `tail` (смежно — между ними не
+    // работает производитель никакого другого значения), так что
+    // `tail_bytes` потребляет ровно `[tail, eight]`, а затем оба
+    // собственных операнда `base` (`ring_base_bytes`/`process_for_base`)
+    // производятся и потребляются вместе прямо перед собственным add
+    // `addr` — всё это время `tail_bytes` благополучно погребён под этой
+    // нейтральной по стеку парой. Кодогенерация i32 для `.binary` НЕ
+    // делает никакой манипуляции стеком (просто испускает сырой опкод,
+    // `wasm_emit.zig` ~строка 545: предполагает, что `lhs`/`rhs` УЖЕ
+    // являются двумя верхними значениями стека, положенными подряд без
+    // ничего между ними) — поэтому важно не производить `eight` между
+    // `head` и `count_for_tail`: вклинившееся значение заставило бы
+    // `i32.add` у `tail_pre` молча вычислить `8 + count` вместо `head +
+    // count`, осиротив `head` на стеке и повредив всё, что испускается
+    // после него.
     const eight = try wasm_heap.addressConst(builder, layout.idx_type, 8);
     const tail_bytes = try wasm_heap.binOp(builder, layout.idx_type, .multiply, tail, eight);
     const ring_base_bytes = try wasm_heap.addressConst(builder, layout.ptr_type, mir_cps.mailbox_ring_base * 8);
@@ -526,20 +521,21 @@ fn expandSend(
     const process_for_store = try wasm_heap.loadLocal(builder, process_local, layout.ptr_type);
     try builder.emit(.{ .frame_store = .{ .frame = process_for_store, .slot = mir_cps.mailbox_count_slot, .src = count_new } });
 
-    // Tail instructions/terminator land in whichever block is CURRENT
-    // after this point — `emitSendRoundDriving` (when applicable) leaves
-    // the builder positioned in its own `finish_block`, not `block_id`.
+    // Хвостовые инструкции/терминатор попадают в тот блок, который
+    // является ТЕКУЩИМ после этой точки — `emitSendRoundDriving` (если
+    // применимо) оставляет builder позиционированным в своём собственном
+    // `finish_block`, а не в `block_id`.
     if (round_driving) |actor_step| {
         try emitSendRoundDriving(builder, layout, process_local, actor_step);
     }
     try builder.currentBlock().instructions.appendSlice(allocator, original.instructions.items[send_index + 1 ..]);
     builder.terminate(original.terminator);
-    // `.deinit`, not `allocator.free(.items)` — see `mir_cps.zig`'s
-    // identical comment on its own equivalent free.
+    // `.deinit`, а не `allocator.free(.items)` — см. идентичный комментарий
+    // в `mir_cps.zig` про её собственный эквивалентный free.
     original.instructions.deinit(allocator);
 }
 
-// --- Entry-point scheduler wrapper --------------------------------------
+// --- Обёртка-планировщик точки входа --------------------------------------
 
 fn buildScheduler(
     allocator: std.mem.Allocator,
@@ -559,27 +555,28 @@ fn buildScheduler(
 
     const size0 = try wasm_heap.addressConst(&builder, layout.idx_type, old_start_total_slots * 8);
     const frame0 = try builder.newValue(layout.ptr_type);
-    // `старт`'s OWN frame (process 0) — reachable from a DOM closure not
-    // just through a spawned CHILD actor, but directly via `себя()`
-    // (self-reference to the currently-running process's own frame). If
-    // ANY DOM closure in this module captures ANY `Процесс` value, EITHER
-    // origin could be what got captured — Phase-1's "at most one
-    // `.spawn`, reachable from `старт`" constraint means there are only
-    // ever at most two frames in the whole module (this one, and the one
-    // `expandSpawn` allocates for the spawned child, which applies the
-    // SAME condition) — promoting both unconditionally is simpler and
-    // safer than tracing which specific captured symbol resolves to
-    // which origin. See `specs/016-actor-dom-persistence/`.
+    // СОБСТВЕННЫЙ фрейм `старт` (процесс 0) — достижим из DOM-замыкания не
+    // только через заспавненного ДОЧЕРНЕГО актора, но и напрямую через
+    // `себя()` (self-ссылка на собственный фрейм текущего выполняющегося
+    // процесса). Если ЛЮБОЕ DOM-замыкание в этом модуле захватывает ЛЮБОЕ
+    // значение `Процесс`, захвачен мог быть ЛЮБОЙ из двух origin —
+    // ограничение Phase-1 "не более одного `.spawn`, достижимого из
+    // `старт`" означает, что во всём модуле никогда не бывает больше двух
+    // фреймов (этот и тот, что `expandSpawn` выделяет для заспавненного
+    // потомка, к которому применяется ТО ЖЕ условие) — безусловное
+    // повышение обоих проще и безопаснее, чем отслеживание, какой именно
+    // захваченный символ к какому origin относится.
     const alloc_id = if (module.actor_captured_by_dom_closure)
         try wasm_heap.findOrBuildAllocPermanent(allocator, module, type_store, layout)
     else
         wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
     try builder.emit(.{ .call = .{ .dst = frame0, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, size0) } });
-    // `frame0` used more than once below — store once, reload fresh per use.
+    // `frame0` используется ниже более одного раза — сохранить один раз,
+    // при каждом использовании перечитывать заново.
     const frame0_local = try wasm_heap.storeLocal(&builder, "frame0", layout.ptr_type, frame0);
-    // `src` computed BEFORE `frame` — see `wasm_emit.zig`'s
-    // `EmitContext.frame_store_scratch_frame` doc comment (stack order
-    // `frame_store` codegen expects is `[src, frame]`).
+    // `src` вычисляется ДО `frame` — см. doc-комментарий
+    // `EmitContext.frame_store_scratch_frame` в `wasm_emit.zig` (порядок
+    // стека, который ожидает кодогенерация `frame_store`, — `[src, frame]`).
     const zero_addr = try wasm_heap.addressConst(&builder, layout.ptr_type, 0);
     const frame0_for_init = try wasm_heap.loadLocal(&builder, frame0_local, layout.ptr_type);
     try builder.emit(.{ .frame_store = .{ .frame = frame0_for_init, .slot = child_frame_slot, .src = zero_addr } });
@@ -587,17 +584,15 @@ fn buildScheduler(
     const done1_local = try builder.newLocal(wasm_heap.dummy_symbol, "done1", layout.bool_type);
     const false0 = try wasm_heap.boolConst(&builder, layout.bool_type, false);
     try builder.emit(.{ .store_local = .{ .local = done0_local, .src = false0 } });
-    // process 1 (the spawned actor) doesn't exist until process 0's own
-    // step function reaches its `.spawn` — `emitSchedulerRound`'s own
-    // `spawned` check (frame pointer at `child_frame_slot` non-zero)
-    // already gates against running it before that point, so `done1`
-    // itself must start `false`: initializing it `true` here meant
-    // `not_done1` was permanently `false`, so `should_run = spawned AND
-    // not_done1` could NEVER become true even after spawning — process 1
-    // never ran a single step, ever. Confirmed via wasmtime: the actor
-    // round-trip compiled and ran without trapping/crashing but always
-    // returned the receiver's zero-initialized mailbox slot instead of
-    // the real reply, because the reply was never actually produced.
+    // Процесс 1 (заспавненный актор) не существует, пока собственная
+    // шаговая функция процесса 0 не дойдёт до своего `.spawn` —
+    // собственная проверка `spawned` в `emitSchedulerRound` (указатель на
+    // фрейм в `child_frame_slot` не равен нулю) уже не даёт запустить его
+    // раньше этой точки, поэтому `done1` обязан стартовать со значения
+    // `false`: инициализация `true` здесь означала бы, что `not_done1`
+    // навсегда останется `false`, так что `should_run = spawned AND
+    // not_done1` НИКОГДА не станет истинным даже после спавна — процесс 1
+    // не выполнит ни одного шага вообще.
     const false1 = try wasm_heap.boolConst(&builder, layout.bool_type, false);
     try builder.emit(.{ .store_local = .{ .local = done1_local, .src = false1 } });
 
@@ -606,17 +601,18 @@ fn buildScheduler(
         try emitSchedulerRound(&builder, allocator, layout, frame0_local, done0_local, done1_local, old_start, actor_step, child_frame_slot);
     }
 
-    // Termination only waits on `done0` (`старт`, the "main" process) —
-    // NOT `done1` (the spawned background actor) too. A spawned actor is
-    // routinely a persistent server that loops forever by design (this
-    // fixture's own `счётчик`: every `получить()` immediately recurses
-    // into another `получить()`, never actually returning) — requiring
-    // it to ALSO finish before the program can end made every such
-    // (entirely normal, "fire and forget" background actor) program
-    // trap on "превышен лимит раундов" after `старт` had already
-    // produced its real result. `старт` finishing is what the program's
-    // own result depends on; a still-suspended background actor at that
-    // point is ordinary, expected actor semantics, not an error.
+    // Завершение ждёт ТОЛЬКО `done0` (`старт`, "главный" процесс) — а НЕ
+    // `done1` (заспавненный фоновый актор) тоже. Заспавненный актор часто
+    // является персистентным сервером, который по design крутится
+    // бесконечно (собственный `счётчик` этой фикстуры: каждый `получить()`
+    // сразу рекурсирует в очередной `получить()`, реально никогда не
+    // возвращаясь) — требование, чтобы он ТОЖЕ завершился до окончания
+    // программы, приводило бы к trap "превышен лимит раундов" для любой
+    // такой (совершенно нормальной, "fire and forget") программы с
+    // фоновым актором, даже после того, как `старт` уже произвёл свой
+    // реальный результат. Собственный результат программы зависит от
+    // завершения `старт`; всё ещё приостановленный фоновый актор в этой
+    // точке — обычная, ожидаемая семантика актора, а не ошибка.
     const d0 = try builder.newValue(layout.bool_type);
     try builder.emit(.{ .load_local = .{ .dst = d0, .local = done0_local } });
 
@@ -637,10 +633,11 @@ fn buildScheduler(
         builder.terminate(.{ .return_value = .{ .value = result } });
     }
 
-    // Old entry point is no longer externally reachable (no export named
-    // "старт" refers to it any more) — renamed so `emitModule`'s
-    // "export every function by name" doesn't produce a second export
-    // literally named "старт" colliding with the new one above.
+    // Старая точка входа больше не достижима извне (никакой экспорт с
+    // именем "старт" больше на неё не ссылается) — переименована, чтобы
+    // "экспортировать каждую функцию по имени" в `emitModule` не породило
+    // второй экспорт, буквально названный "старт", конфликтующий с новым
+    // выше.
     module.functions.items[@intFromEnum(old_start)].name = "@старт_шаг";
     module.functions.items[@intFromEnum(actor_step)].name = "@актор_шаг";
 }
@@ -657,24 +654,21 @@ fn emitSchedulerRound(
     child_frame_slot: u32,
 ) !void {
     _ = allocator;
-    // Process 0.
+    // Процесс 0.
     {
         const d0 = try builder.newValue(layout.bool_type);
         try builder.emit(.{ .load_local = .{ .dst = d0, .local = done0_local } });
         const not_done0 = try wasm_heap.notOp(builder, layout.bool_type, d0);
         const call_block = try builder.newBlock();
-        // `skip_block` is a REAL, distinct block — not `after_block`
-        // itself. `wasm_stackify.findMerge` looks for a merge block
-        // OTHER than the branch's own then/else targets; making
-        // `else_block` literally BE the merge point (as an earlier
-        // version of this code did) makes every merge search fail,
-        // which makes `processFrom` fall back to re-walking the ENTIRE
-        // rest of the function from scratch down BOTH the then and else
-        // paths instead of stopping at a shared point — with
-        // `scheduler_rounds` copies of this diamond chained together,
-        // that's real exponential blowup, not a hang: confirmed by
-        // timing 1..11 rounds directly (8=4s, 9=7s, 10=20s, 11 exceeded
-        // a 60s budget) before finding this, not by reading alone.
+        // `skip_block` — НАСТОЯЩИЙ, отдельный блок, не сам `after_block`.
+        // `wasm_stackify.findMerge` ищет блок слияния, ОТЛИЧНЫЙ от
+        // собственных then/else-целей ветвления; если `else_block`
+        // буквально И ЕСТЬ точка слияния, поиск слияния проваливается
+        // каждый раз, из-за чего `processFrom` откатывается к повторному
+        // обходу ВСЕЙ оставшейся части функции с нуля по ОБОИМ путям
+        // (then и else), вместо остановки в общей точке — при
+        // `scheduler_rounds` таких ромбов, сцепленных подряд, это реальный
+        // экспоненциальный взрыв, а не просто зависание.
         const skip_block = try builder.newBlock();
         const after_block = try builder.newBlock();
         builder.terminate(.{ .branch = .{ .cond = not_done0, .then_block = call_block, .else_block = skip_block } });
@@ -691,8 +685,8 @@ fn emitSchedulerRound(
 
         builder.setCurrentBlock(after_block);
     }
-    // Process 1 (the spawned actor) — only if spawned (frame pointer
-    // non-zero) AND not already done.
+    // Процесс 1 (заспавненный актор) — только если заспавнен (указатель
+    // на фрейм не равен нулю) И ещё не завершён.
     {
         const frame0 = try wasm_heap.frameValue(builder, frame0_local, layout.ptr_type);
         const frame1 = try builder.newValue(layout.ptr_type);
@@ -705,7 +699,7 @@ fn emitSchedulerRound(
         const should_run = try wasm_heap.binOp(builder, layout.bool_type, .bit_and, spawned, not_done1);
 
         const call_block = try builder.newBlock();
-        const skip_block = try builder.newBlock(); // see the `Process 0` comment above — must be distinct from `after_block`
+        const skip_block = try builder.newBlock(); // см. комментарий "Процесс 0" выше — должен быть отличен от `after_block`
         const after_block = try builder.newBlock();
         builder.terminate(.{ .branch = .{ .cond = should_run, .then_block = call_block, .else_block = skip_block } });
 
@@ -731,8 +725,8 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     const start_id = wasm_heap.findFunctionByName(module, "старт") orelse return unsupported("модуль без функции старт()");
     const start_info = frame_info.get(start_id) orelse return unsupported("старт() должен вызывать получить() хотя бы раз, чтобы использовать акторы (Phase 1)");
 
-    // Locate the single `.spawn` inside старт's (already CPS-rewritten)
-    // body, and its target — Phase 1's one supported shape.
+    // Находим единственный `.spawn` внутри (уже CPS-переписанного) тела
+    // старт и его цель — единственная форма, поддерживаемая Phase 1.
     var spawn_block: ?mir.BlockId = null;
     var spawn_index: usize = 0;
     var spawn_target: ?mir.FunctionId = null;
@@ -764,18 +758,19 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     const runtime = try buildRuntime(allocator, module, type_store, layout);
     rewireSuspendCalls(module, runtime);
 
-    // старт's own frame gains one EXTRA slot (beyond what `mir_cps.zig`
-    // already sized it to) purely for `wasm_actors.zig`'s own bookkeeping
-    // — the spawned child's frame pointer, which the user's own `пер proc
-    // = запусти ...` local (already a normal frame slot) also holds, but
-    // under a slot number this pass doesn't otherwise know without deeper
-    // analysis. Simpler to reserve a dedicated one.
+    // Собственный фрейм старт получает один ДОПОЛНИТЕЛЬНЫЙ слот (сверх
+    // того, под что его уже рассчитал `mir_cps.zig`) исключительно для
+    // собственной бухгалтерии `wasm_actors.zig` — указатель на фрейм
+    // заспавненного потомка, который также хранит собственный локал
+    // пользователя `пер proc = запусти ...` (уже обычный слот фрейма), но
+    // под номером слота, который этот проход иначе не знает без более
+    // глубокого анализа. Проще зарезервировать отдельный.
     const child_frame_slot = start_info.total_slots;
     const old_start_total_slots = start_info.total_slots + 1;
 
     {
         var builder = mir_builder.Builder{ .module = module, .allocator = allocator, .function_id = start_id };
-        const frame_local: mir.LocalId = @enumFromInt(0); // `mir_cps.zig` always makes the frame pointer local 0
+        const frame_local: mir.LocalId = @enumFromInt(0); // `mir_cps.zig` всегда делает указатель на фрейм local 0
         try expandSpawn(allocator, &builder, spawn_block.?, spawn_index, layout, frame_local, actor_info.total_slots, child_frame_slot);
     }
 
@@ -794,17 +789,16 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
             }
             const target = found orelse break;
             var builder = mir_builder.Builder{ .module = module, .allocator = allocator, .function_id = function.id };
-            // Only inject round-driving for a `отправить` OUTSIDE both
-            // `старт()` (already covered by `buildScheduler`'s outer
-            // loop) AND the actor's OWN body (`actor_id` — a real bug
-            // found running the existing actor tests: `счётчик` replying
-            // to its caller via `отправить(отвечающему, ...)` is a send
-            // TARGETING `старт()`, not the actor itself — driving
-            // `actor_id`'s OWN step function again there ran it against
-            // the WRONG frame, corrupting state and trapping. Only a DOM
-            // handler (neither `старт()` nor the actor) has no OTHER
-            // mechanism to process what it just sent — see
-            // `specs/016-actor-dom-persistence/`.
+            // Прогон раундов добавляется ТОЛЬКО для `отправить` вне и
+            // `старт()` (уже покрыт внешним циклом `buildScheduler`), и
+            // СОБСТВЕННОГО тела актора (`actor_id`) — например,
+            // `счётчик`, отвечающий своему вызывающему через
+            // `отправить(отвечающему, ...)`, — это send, НАЦЕЛЕННЫЙ на
+            // `старт()`, а не на сам актор: прогон СОБСТВЕННОЙ шаговой
+            // функции `actor_id` там выполнял бы её против НЕВЕРНОГО
+            // фрейма, повреждая состояние и вызывая trap. Только у
+            // DOM-обработчика (не `старт()` и не актор) нет ДРУГОГО
+            // механизма обработать то, что он только что отправил.
             const round_driving: ?mir.FunctionId = if (function.id == start_id or function.id == actor_id) null else actor_id;
             try expandSend(allocator, &builder, target.block, target.index, layout, round_driving);
             index += 1;
@@ -812,12 +806,13 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
         }
     }
 
-    const original_result_type = start_function.result_type; // already rewritten to Булево by mir_cps — see below
+    const original_result_type = start_function.result_type; // уже переписан в Булево через mir_cps — см. ниже
     _ = original_result_type;
-    // The TRUE original return type isn't recoverable from `result_type`
-    // any more (`mir_cps.zig` already overwrote it) — `FrameInfo` doesn't
-    // carry it either (Phase-1 gap: assumed `Число` here, matching every
-    // fixture this backend currently targets). A real fix threads the
-    // pre-rewrite type through `FrameInfo` instead of guessing.
+    // ИСТИННЫЙ исходный тип возврата больше не восстановим из
+    // `result_type` (`mir_cps.zig` уже перезаписал его) — `FrameInfo` тоже
+    // его не хранит (пробел Phase-1: здесь предполагается `Число`, что
+    // совпадает с каждой фикстурой, на которую сейчас нацелен этот
+    // бэкенд). Настоящий фикс должен протаскивать исходный, до
+    // переписывания, тип через `FrameInfo`, а не угадывать его.
     try buildScheduler(allocator, module, type_store, layout, start_id, old_start_total_slots, child_frame_slot, actor_id, type_store.builtins.number);
 }

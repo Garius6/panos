@@ -146,11 +146,10 @@ pub const Expr = union(enum) {
     number: struct {
         span: source.Span,
         value: f64,
-        // True when the source lexeme has no `.` — a purely syntactic
-        // fact, set by the parser from the raw lexeme text. Drives the
-        // literal's static type directly (`Целое` when true, `Число`
-        // when false) — see `type_checker.zig`'s `.number` case. No
-        // longer inferred from surrounding context.
+        // true, если в лексеме исходника нет `.` — чисто синтаксический
+        // факт, устанавливается парсером по сырому тексту лексемы.
+        // Напрямую определяет статический тип литерала (`Целое` при true,
+        // `Число` при false) — см. случай `.number` в `type_checker.zig`.
         is_integer_literal: bool,
     },
     boolean: struct {
@@ -170,12 +169,12 @@ pub const Expr = union(enum) {
         operator: token.TokenKind,
         operand: ExprId,
     },
-    // `x как Тип` — explicit numeric cast (currently Число<->Целое
-    // only, see `type_checker.zig`'s `.cast` inference case). Binds
-    // tighter than binary operators but looser than unary (matches
-    // Rust's `as`: `-x как Целое` is `(-x) как Целое`, `x как Число +
-    // 1` is `(x как Число) + 1`) — parsed as a suffix loop right after
-    // `parseUnary()`, before entering binary precedence-climbing.
+    // `x как Тип` — явное числовое приведение (пока только Число<->Целое,
+    // см. случай инференса `.cast` в `type_checker.zig`). Связывает крепче
+    // бинарных операторов, но слабее унарных (как `as` в Rust: `-x как
+    // Целое` это `(-x) как Целое`, `x как Число + 1` это `(x как Число) +
+    // 1`) — разбирается как суффиксный цикл сразу после `parseUnary()`,
+    // до входа в разбор бинарных операторов по приоритетам.
     cast: struct {
         span: source.Span,
         operand: ExprId,
@@ -198,12 +197,12 @@ pub const Expr = union(enum) {
         span: source.Span,
         call: ExprId,
     },
-    // `выбор ожидание(источник) ... конец` — the "subject" slot of an
-    // ordinary `match_expr`, produced only by that special-cased parse
-    // path. `source` (`Массив(Процесс(R))`) is the extra set of processes
-    // to watch for completion alongside the process's own mailbox/signal
-    // queues. Evaluating this expression IS the suspend point — see
-    // `Vm.selectWait`.
+    // `выбор ожидание(источник) ... конец` — слот "субъекта" обычного
+    // `match_expr`, производится только этим специальным путём разбора.
+    // `source` (`Массив(Процесс(R))`) — дополнительный набор процессов,
+    // за завершением которых нужно следить наряду с собственными
+    // почтовым ящиком/очередями сигналов процесса. Вычисление этого
+    // выражения И ЕСТЬ точка приостановки — см. `Vm.selectWait`.
     select_wait: struct {
         span: source.Span,
         source: ExprId,
@@ -288,12 +287,8 @@ pub fn exprSpan(expression: Expr) source.Span {
 pub const Stmt = union(enum) {
     return_stmt: struct {
         span: source.Span,
-        // `null` — bare `возврат` (void return, no expression at all,
-        // e.g. an early exit inside a `Пусто`-returning function) — real
-        // gap found auditing panosiki's `std/слог.ps`: the parser used to
-        // REQUIRE an expression unconditionally, so `если x тогда возврат
-        // конец` (a completely ordinary early-return-with-no-value
-        // pattern) was a syntax error.
+        // `null` — голый `возврат` (пустой возврат без выражения,
+        // например ранний выход из функции, возвращающей `Пусто`).
         value: ?ExprId,
     },
     let: struct {
@@ -370,12 +365,12 @@ pub const Decl = union(enum) {
         doc: []const u8,
         type_parameters: []const []const u8,
         methods: []const MethodSignature,
-        // Default methods — full `.function` decls (receiver `это:
-        // Интерфейс(...)` written explicitly, like any other method),
-        // parsed alongside the abstract-signature-only entries above
-        // whenever a method has a body. Each also gets a matching
-        // (receiver-stripped) entry in `methods` for the existing
-        // signature-shape machinery.
+        // Методы по умолчанию — полноценные декларации `.function`
+        // (получатель `это: Интерфейс(...)` указан явно, как у любого
+        // другого метода), разбираются наряду с чисто абстрактными
+        // сигнатурами выше всякий раз, когда у метода есть тело. Для
+        // каждого также создаётся соответствующая запись (без получателя)
+        // в `methods` — для существующей машинерии работы с сигнатурами.
         default_methods: []const DeclId = &.{},
         is_exported: bool,
         annotations: []const Annotation = &.{},

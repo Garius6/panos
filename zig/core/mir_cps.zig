@@ -28,11 +28,12 @@ pub const FunctionPlan = struct {
     resume_edges: []const ResumeEdge,
 };
 
-// Fixed frame-prefix layout, IDENTICAL for every actor frame regardless
-// of the owning function's own locals/suspend-point count — this is what
-// lets `wasm_actors.zig` implement mailbox_has/pop/signal_has/pop/result
-// access ONCE, generically, as ordinary MIR functions taking a bare frame
-// pointer, instead of needing one specialized per actor function.
+// Фиксированный префикс кадра, ОДИНАКОВЫЙ для каждого кадра актора вне
+// зависимости от числа собственных локальных переменных/точек остановки
+// владеющей функции — это позволяет `wasm_actors.zig` реализовать доступ
+// mailbox_has/pop/signal_has/pop/result ОДИН раз, обобщённо, как обычные
+// MIR-функции, принимающие голый указатель на кадр, вместо отдельной
+// специализации на каждую функцию-актора.
 pub const mailbox_cap: u32 = 4;
 pub const signal_cap: u32 = 2;
 pub const state_slot: u32 = 0;
@@ -42,27 +43,28 @@ pub const mailbox_ring_base: u32 = 3;
 pub const signal_count_slot: u32 = mailbox_ring_base + mailbox_cap;
 pub const signal_head_slot: u32 = signal_count_slot + 1;
 pub const signal_ring_base: u32 = signal_head_slot + 1;
-// Holds the function's REAL return value (whatever `Тип` it originally
-// declared) once it actually completes — the function's own WASM result
-// type is overridden to `Булево` (done/still-suspended status, see
-// `rewriteFunction`), so the real value can't travel through the normal
-// WASM return channel any more; the scheduler reads it from here after
-// seeing `done`.
+// Хранит РЕАЛЬНОЕ возвращаемое значение функции (каким бы `Тип` она ни
+// объявляла изначально) после фактического завершения — собственный тип
+// результата функции в WASM заменён на `Булево` (статус done/ещё
+// приостановлена, см. `rewriteFunction`), поэтому реальное значение больше
+// не может пройти через обычный канал возврата WASM; планировщик читает
+// его отсюда, увидев `done`.
 pub const result_slot: u32 = signal_ring_base + signal_cap;
 pub const frame_prefix_slots: u32 = result_slot + 1;
 
-// Per-function sizing `wasm_actors.zig`'s `.spawn` expansion needs to
-// allocate and initialize a fresh frame: how many bytes to bump-allocate,
-// and how many of the callee's original parameters must be copied in
-// (positionally, slots `[frame_prefix_slots, frame_prefix_slots +
-// param_count)`) from `.spawn`'s own `args`.
+// Размеры для конкретной функции, нужные раскрытию `.spawn` в
+// `wasm_actors.zig` для выделения и инициализации нового кадра: сколько
+// байт выделить bump-аллокатором и сколько исходных параметров вызываемой
+// функции нужно скопировать (позиционно, слоты `[frame_prefix_slots,
+// frame_prefix_slots + param_count)`) из собственных `args` `.spawn`.
 pub const FrameInfo = struct {
     param_count: u32,
     total_slots: u32,
 };
 
-// Groups the two analyses into the exact unit the rewrite consumes: one
-// function, one durable frame, and monotonically numbered resume states.
+// Объединяет два анализа в ровно ту единицу, которую потребляет
+// переписывание: одна функция, один долгоживущий кадр и монотонно
+// пронумерованные состояния возобновления.
 pub fn plans(allocator: std.mem.Allocator, module: *const mir.Module) !std.ArrayList(FunctionPlan) {
     var all_points = try collectSuspendPoints(allocator, module);
     defer all_points.deinit(allocator);
@@ -84,16 +86,15 @@ pub fn plans(allocator: std.mem.Allocator, module: *const mir.Module) !std.Array
         for (all_points.items) |point| {
             if (point.function == layout.function) {
                 points[at] = point;
-                // The mutating phase splits this block immediately after
-                // the receive and replaces this placeholder with the new
-                // continuation block id.
+                // Мутирующая фаза разбивает этот блок сразу после receive
+                // и заменяет заглушку на id нового блока продолжения.
                 edges[at] = .{ .state = point.resume_state, .suspend_block = point.block, .resume_block = mir.invalid_block };
                 at += 1;
             }
         }
         try out.append(allocator, .{ .function = layout.function, .frame = layout, .suspend_points = points, .resume_edges = edges });
     }
-    // ownership of locals moved into `out`.
+    // владение локальными переменными перешло в `out`.
     layouts.clearRetainingCapacity();
     layouts.deinit(allocator);
     return out;
@@ -108,10 +109,11 @@ pub fn deinitPlans(allocator: std.mem.Allocator, value: *std.ArrayList(FunctionP
     value.deinit(allocator);
 }
 
-// All MIR locals are frame slots for a suspending function. This is larger
-// than liveness-minimal spilling, but gives the first CPS backend a simple,
-// correct invariant: any value that was materialized into a local survives
-// every receive/resume boundary.
+// Все локальные переменные MIR для приостанавливаемой функции — это слоты
+// кадра. Это больше, чем минимально необходимая по анализу живости выгрузка,
+// но даёт первому CPS-бэкенду простой и корректный инвариант: любое
+// значение, материализованное в локальную переменную, переживает любую
+// границу receive/resume.
 pub fn frameLayouts(allocator: std.mem.Allocator, module: *const mir.Module) !std.ArrayList(FrameLayout) {
     var layouts: std.ArrayList(FrameLayout) = .empty;
     errdefer layouts.deinit(allocator);
@@ -129,8 +131,9 @@ pub fn frameLayouts(allocator: std.mem.Allocator, module: *const mir.Module) !st
     return layouts;
 }
 
-// This scan is the stable input to the mutating CPS rewrite. State zero is
-// normal entry; every receive-like instruction gets one later resume state.
+// Этот проход — стабильные входные данные для мутирующего CPS-переписывания.
+// Состояние ноль — обычный вход; каждая receive-подобная инструкция получает
+// одно последующее состояние возобновления.
 pub fn collectSuspendPoints(allocator: std.mem.Allocator, module: *const mir.Module) !std.ArrayList(SuspendPoint) {
     var points: std.ArrayList(SuspendPoint) = .empty;
     errdefer points.deinit(allocator);
@@ -147,9 +150,9 @@ pub fn collectSuspendPoints(allocator: std.mem.Allocator, module: *const mir.Mod
     return points;
 }
 
-// CPS phase boundary. It is deliberately separate from AST lowering: the
-// pass will turn spawn/receive into resumable process frames before WASM
-// emission, preserving the regular MIR for non-suspending functions.
+// Граница CPS-фазы. Намеренно отделена от понижения из AST: проход
+// превращает spawn/receive в возобновляемые кадры процессов перед
+// генерацией WASM, сохраняя обычный MIR для неприостанавливаемых функций.
 pub fn hasActorInstructions(module: *const mir.Module) bool {
     for (module.functions.items) |function| for (function.blocks.items) |block|
         for (block.instructions.items) |instruction| switch (instruction) {
@@ -159,18 +162,15 @@ pub fn hasActorInstructions(module: *const mir.Module) bool {
     return false;
 }
 
-// Unlike `hasActorInstructions`, still true AFTER `wasm_actors.zig` has
-// run — `.expand()` rewrites away every `.spawn`/`.send`/`.receive`/
-// `.receive_signal` into `frame_load`/`frame_store`/`global_get`/
-// `global_set`/`mem_load`/`mem_store`, so by the time `wasm_emit.zig`'s
-// `emitModule` runs, `hasActorInstructions` alone would (WRONGLY) report
-// no actor code at all — found by actually running the full pipeline:
-// `emitModule` skipped the memory/global sections entirely and wasmtime
-// rejected the module ("unknown memory 0") the moment a function tried
-// to use one of those instructions. These five are exclusively
-// `mir_cps.zig` output — never emitted by ordinary `mir_lowering.zig`
-// lowering — so their presence is an unambiguous "this module needs the
-// actor heap/global" signal.
+// В отличие от `hasActorInstructions`, остаётся истинным ПОСЛЕ прохода
+// `wasm_actors.zig` — `.expand()` переписывает каждую `.spawn`/`.send`/
+// `.receive`/`.receive_signal` в `frame_load`/`frame_store`/`global_get`/
+// `global_set`/`mem_load`/`mem_store`, поэтому к моменту вызова
+// `emitModule` из `wasm_emit.zig` одного `hasActorInstructions` уже
+// недостаточно, чтобы обнаружить код актора. Эти пять инструкций —
+// исключительно результат `mir_cps.zig`, обычное понижение
+// `mir_lowering.zig` их никогда не порождает, так что их наличие —
+// однозначный сигнал "этому модулю нужны куча/глобали актора".
 pub fn usesActorMemory(module: *const mir.Module) bool {
     for (module.functions.items) |function| for (function.blocks.items) |block|
         for (block.instructions.items) |instruction| switch (instruction) {
@@ -180,71 +180,80 @@ pub fn usesActorMemory(module: *const mir.Module) bool {
     return false;
 }
 
-// --- Mutating rewrite ------------------------------------------------
+// --- Мутирующее переписывание -----------------------------------------
 //
-// Turns a suspend-capable function's LOCALS from ordinary WASM locals
-// (reset to zero on every fresh call — useless across a suspend, which is
-// by definition a SEPARATE later call into the function) into slots inside
-// an opaque, caller-allocated frame blob living in WASM linear memory
-// (`wasm_actors.zig` owns the actual allocator — this pass only assigns
-// LOGICAL slot numbers, never byte offsets). After rewrite:
+// Превращает ЛОКАЛЬНЫЕ ПЕРЕМЕННЫЕ приостанавливаемой функции из обычных
+// локальных переменных WASM (обнуляются при каждом новом вызове —
+// бесполезны через границу приостановки, которая по определению является
+// ОТДЕЛЬНЫМ последующим вызовом функции) в слоты внутри непрозрачного
+// блока кадра, выделяемого вызывающей стороной в линейной памяти WASM
+// (реальным аллокатором владеет `wasm_actors.zig` — этот проход назначает
+// только ЛОГИЧЕСКИЕ номера слотов, никогда байтовые смещения). После
+// переписывания:
 //
-//   - The function has exactly ONE real local/parameter left: the frame
-//     pointer itself (opaque i32 handle — see `ptr_type`'s own comment
-//     below for why it's typed the way it is).
-//   - The function's OWN result type becomes `Булево` — `true` = really
-//     finished (the real value, if any, is in the frame's `result_slot`),
-//     `false` = suspended (call again once the mailbox/signal is ready).
-//     This is what lets a plain WASM `call` (no exceptions/multi-value
-//     tricks) tell the scheduler apart from a genuine completion,
-//     INCLUDING a genuine `Пусто` one — seeread `result_slot`'s comment.
-//   - Every ORIGINAL local (index 0..N-1) becomes frame slot
-//     `[frame_prefix_slots, frame_prefix_slots + N)` — `load_local`/
-//     `store_local` become `frame_load`/`frame_store` at that same
-//     (offset) slot number.
-//   - Slot `frame_prefix_slots + N` is the resume-dispatch state (0 =
-//     fresh start, K = "resume right after suspend point K") — NOT
-//     `state_slot`, which is a DIFFERENT, always-zero slot the scheduler
-//     itself never touches; kept for symmetry/documentation only, actual
-//     dispatch uses the function-relative slot computed below.
-//   - Slots `[frame_prefix_slots + N + 1, frame_prefix_slots + N + 1 + S)`
-//     hold each suspend point's OWN received value (`получить()`'s/
-//     `получить_сигнал()`'s own `dst`) — the ONE value ALWAYS guaranteed
-//     to be live across its own suspend boundary (the overwhelmingly
-//     common `выбор получить() ... конец` shape uses it immediately as
-//     the match scrutinee, never through a named local at all). This is
-//     a REAL, explicitly accepted Phase-1 gap beyond what `frameLayouts`'s
-//     "every local" policy alone covers: a value computed BEFORE a
-//     receive from something OTHER than a local and used AFTER it
-//     (bypassing both a local binding and the receive's own dst) is NOT
-//     preserved — bind it to `пер` first. General cross-suspend liveness
-//     analysis is Phase 2+.
+//   - У функции остаётся ровно ОДНА настоящая локальная переменная/
+//     параметр: сам указатель на кадр (непрозрачный дескриптор i32 — см.
+//     комментарий к `ptr_type` ниже про выбор типа).
+//   - СОБСТВЕННЫЙ тип результата функции становится `Булево` — `true` =
+//     действительно завершена (реальное значение, если есть, лежит в
+//     `result_slot` кадра), `false` = приостановлена (вызвать снова, как
+//     только почта/сигнал будут готовы). Это позволяет обычному вызову
+//     WASM `call` (без исключений/трюков с multi-value) отличить для
+//     планировщика настоящее завершение от приостановки, ВКЛЮЧАЯ
+//     настоящее завершение с результатом `Пусто` — см. комментарий к
+//     `result_slot`.
+//   - Каждая ИСХОДНАЯ локальная переменная (индекс 0..N-1) становится
+//     слотом кадра `[frame_prefix_slots, frame_prefix_slots + N)` —
+//     `load_local`/`store_local` превращаются в `frame_load`/`frame_store`
+//     по тому же (со смещением) номеру слота.
+//   - Слот `frame_prefix_slots + N` — состояние диспетчеризации
+//     возобновления (0 = свежий старт, K = "возобновить сразу после точки
+//     остановки K") — это НЕ `state_slot`, который является ДРУГИМ, всегда
+//     нулевым слотом, которого планировщик никогда не касается; оставлен
+//     только для симметрии/документации, реальная диспетчеризация
+//     использует слот, вычисляемый относительно функции ниже.
+//   - Слоты `[frame_prefix_slots + N + 1, frame_prefix_slots + N + 1 + S)`
+//     хранят СОБСТВЕННОЕ полученное значение каждой точки остановки
+//     (`dst` вызова `получить()`/`получить_сигнал()`) — единственное
+//     значение, живость которого через собственную границу остановки
+//     гарантирована ВСЕГДА (подавляющее большинство случаев формы `выбор
+//     получить() ... конец` использует его немедленно как объект
+//     сопоставления, вообще без именованной локальной переменной). Это
+//     РЕАЛЬНЫЙ, осознанно принятый пробел Фазы 1 сверх того, что покрывает
+//     политика `frameLayouts` "каждая локальная переменная": значение,
+//     вычисленное ДО receive из чего-то, отличного от локальной
+//     переменной, и использованное ПОСЛЕ него (минуя и привязку к
+//     локальной переменной, и собственный dst receive), НЕ сохраняется —
+//     сначала привяжите его через `пер`. Общий анализ живости через
+//     границы остановки — Фаза 2+.
 //
-// Each `.receive`/`.receive_signal` becomes a mailbox/signal check
-// (`@runtime::mailbox_has`/`@runtime::signal_has`, real in-module
-// functions `wasm_actors.zig` builds against the fixed prefix layout
-// above — NOT host imports, this must run under plain wasmtime with no
-// new host code) — empty means save state and `.suspend_return`; non-empty
-// means pop (`@runtime::mailbox_pop`/`@runtime::signal_pop`) and fall
-// straight through, mirroring the native VM's ip-rollback suspend
-// contract (`vm.zig`'s `runProcessSlice`) semantically, reimplemented for
-// WASM's structured (no goto) control flow instead of a bytecode
-// instruction pointer.
+// Каждая `.receive`/`.receive_signal` становится проверкой почты/сигнала
+// (`@runtime::mailbox_has`/`@runtime::signal_has`, реальные функции внутри
+// модуля, которые строит `wasm_actors.zig` относительно фиксированного
+// префикса кадра выше — НЕ хостовые импорты, это должно работать под
+// обычным wasmtime без нового хостового кода) — пусто означает сохранить
+// состояние и `.suspend_return`; непусто означает извлечь
+// (`@runtime::mailbox_pop`/`@runtime::signal_pop`) и провалиться дальше,
+// семантически отражая контракт приостановки нативной VM с откатом ip
+// (`runProcessSlice` в `vm.zig`), переосмысленный для структурированного
+// (без goto) потока управления WASM вместо указателя байткод-инструкции.
 
 fn frameValue(builder: *mir_builder.Builder, frame_local: mir.LocalId, ptr_type: anytype) !mir.ValueId {
-    // Reloaded fresh at every use site, never cached across blocks — a
-    // WASM local is always safely re-readable from any block in its own
-    // function, sidestepping any cross-block SSA-liveness question this
-    // rewrite would otherwise have to answer for a single shared value.
+    // Каждый раз перечитывается заново в месте использования, никогда не
+    // кэшируется между блоками — локальная переменная WASM всегда
+    // безопасно перечитываема из любого блока своей функции, что снимает
+    // вопрос межблоковой SSA-живости, который иначе пришлось бы решать
+    // для одного общего значения.
     const dst = try builder.newValue(ptr_type);
     try builder.emit(.{ .load_local = .{ .dst = dst, .local = frame_local } });
     return dst;
 }
 
 fn intConstant(builder: *mir_builder.Builder, ptr_type: anytype, value: u32) !mir.ValueId {
-    // Real i32 literal (`mir.ConstValue.address`) — resume-state tags and
-    // frame/heap pointers are never meant to be a user-visible `Число`,
-    // so this skips `.number`'s f64 representation entirely.
+    // Настоящий литерал i32 (`mir.ConstValue.address`) — метки состояний
+    // возобновления и указатели на кадр/кучу никогда не предназначены
+    // быть видимым пользователю `Число`, так что f64-представление
+    // `.number` здесь полностью не нужно.
     const dst = try builder.newValue(ptr_type);
     try builder.emit(.{ .const_value = .{ .dst = dst, .value = .{ .address = value } } });
     return dst;
@@ -285,20 +294,20 @@ fn rewriteOrdinaryInstruction(builder: *mir_builder.Builder, instruction: mir.In
     }
 }
 
-// Applies to whatever terminator a rewritten instruction stream ends
-// with (whether or not it ever hit a suspend point) — the ONLY place a
-// suspend-capable function's control flow may leave the function for
-// real. `.return_value{null}`/`{value}` becomes: (optionally) stash the
-// real value in `result_slot`, then `return_value{true}` (done).
-// `.jump`/`.branch`/`.unreachable_term` pass through unchanged (they
-// stay INSIDE the function, no frame/status bookkeeping needed).
-// `.none`/`.suspend_return` can't legally appear in a pre-rewrite
-// function body and are asserted against.
-// `instruction`, if it's a call (direct `.call` or `function_ref`+
-// `.call_value`) to `self_function`, returns its args — `preceding` is
-// searched backward for the `function_ref` a `.call_value.callee`
-// resolves through (same convention `wasm_emit.zig`'s own
-// `value_to_function` map relies on).
+// Применяется к тому терминатору, которым заканчивается переписанный
+// поток инструкций (независимо от того, встретилась ли точка остановки) —
+// ЕДИНСТВЕННОЕ место, откуда поток управления приостанавливаемой функции
+// может по-настоящему покинуть функцию. `.return_value{null}`/`{value}`
+// становится: (опционально) сохранить реальное значение в `result_slot`,
+// затем `return_value{true}` (готово). `.jump`/`.branch`/
+// `.unreachable_term` проходят без изменений (они остаются ВНУТРИ функции,
+// учёт кадра/статуса не нужен). `.none`/`.suspend_return` не могут законно
+// встретиться в теле функции до переписывания — на них стоит assert.
+// Если `instruction` — вызов (прямой `.call` или `function_ref`+
+// `.call_value`) `self_function`, возвращает его аргументы — `preceding`
+// просматривается назад в поисках `function_ref`, через который
+// разрешается `.call_value.callee` (то же соглашение, на которое
+// опирается собственная карта `value_to_function` в `wasm_emit.zig`).
 fn selfCallArgs(instruction: mir.Instruction, preceding: []const mir.Instruction, self_function: mir.FunctionId) ?[]const mir.ValueId {
     switch (instruction) {
         .call => |c| return if (c.callee == self_function) c.args else null,
@@ -348,20 +357,21 @@ pub fn prepare(allocator: std.mem.Allocator, module: *mir.Module) !std.AutoHashM
 fn rewriteFunction(allocator: std.mem.Allocator, module: *mir.Module, plan: FunctionPlan) !FrameInfo {
     const function_index: usize = @intFromEnum(plan.function);
     const type_store = module.functions.items[function_index].type_store orelse return error.MissingTypeStore;
-    // Need a type that maps to a real WASM i32
-    // (`wasm_module.wasmValTypeForStore`) — required, not cosmetic:
-    // `frame_load`/`frame_store` codegen emits raw `i32.add` for the
-    // slot-offset arithmetic assuming the frame value is ALREADY i32 on
-    // the stack (`Целое` would be f64, Phase-1a's numeric convention,
-    // producing an invalid module). `Type.process` would need a NEW
-    // entry via the mutating `TypeStore.process(payload)` constructor —
-    // wrong tool this late in compilation for a plain opaque-handle
-    // marker. `builtins.string` already maps to i32 and is guaranteed to
-    // exist in every `TypeStore`; reused here purely as "opaque i32
-    // handle", never through any string-specific codegen path (no
-    // `.binary` add, no property/index access — every frame-pointer
-    // operation goes through `frame_load`/`frame_store`/`.address`
-    // consts, none of which special-case this type).
+    // Нужен тип, отображаемый в настоящий i32 WASM
+    // (`wasm_module.wasmValTypeForStore`) — это требование, а не
+    // косметика: кодогенерация `frame_load`/`frame_store` выдаёт голый
+    // `i32.add` для арифметики смещения слота, предполагая, что значение
+    // кадра УЖЕ i32 на стеке (`Целое` было бы f64 — числовое соглашение
+    // Фазы 1a — что дало бы невалидный модуль). `Type.process` потребовал
+    // бы НОВОЙ записи через мутирующий конструктор `TypeStore.process(payload)`
+    // — не тот инструмент на этой поздней стадии компиляции для простой
+    // метки непрозрачного дескриптора. `builtins.string` уже отображается
+    // в i32 и гарантированно существует в каждом `TypeStore`; переиспользован
+    // здесь исключительно как "непрозрачный дескриптор i32", никогда через
+    // строкоспецифичный путь кодогенерации (нет `.binary`-сложения, нет
+    // доступа к свойству/индексу — каждая операция с указателем кадра идёт
+    // через `frame_load`/`frame_store`/константы `.address`, ни одна из
+    // которых не выделяет этот тип особым образом).
     const ptr_type = type_store.builtins.string;
     const bool_type = type_store.builtins.boolean;
 
@@ -371,19 +381,21 @@ fn rewriteFunction(allocator: std.mem.Allocator, module: *mir.Module, plan: Func
     const message_slot_base: u32 = local_state_slot + 1;
     const total_slots: u32 = message_slot_base + @as(u32, @intCast(plan.suspend_points.len));
 
-    // Snapshot BEFORE any mutation — `plan.suspend_points`/`.block`/
-    // `.instruction_index` describe the function as it was when `plans`
-    // ran, and every subsequent split/rewrite below is keyed off this
-    // frozen list, never re-derived mid-rewrite.
+    // Снимок ДО любой мутации — `plan.suspend_points`/`.block`/
+    // `.instruction_index` описывают функцию такой, какой она была на
+    // момент работы `plans`, и каждое последующее разбиение/переписывание
+    // ниже опирается на этот замороженный список, никогда не выводится
+    // заново по ходу переписывания.
     const original_blocks = try allocator.alloc(mir.BlockId, module.functions.items[function_index].blocks.items.len);
     for (original_blocks, 0..) |*id, i| id.* = @enumFromInt(i);
     defer allocator.free(original_blocks);
     const original_entry = module.functions.items[function_index].entry;
 
-    // Step 1: replace `.locals`/`.parameters`/`.result_type` — the frame
-    // pointer is the function's ONLY real local/parameter from here on,
-    // and its result becomes a plain done/suspended status (see the file
-    // doc comment's `result_slot` paragraph).
+    // Шаг 1: заменить `.locals`/`.parameters`/`.result_type` — указатель
+    // на кадр отныне ЕДИНСТВЕННАЯ настоящая локальная переменная/параметр
+    // функции, а её результат становится простым статусом
+    // готово/приостановлено (см. абзац про `result_slot` в комментарии к
+    // файлу).
     const frame_local: mir.LocalId = @enumFromInt(0);
     module.functions.items[function_index].locals.clearRetainingCapacity();
     try module.functions.items[function_index].locals.append(allocator, .{ .id = frame_local, .symbol = @enumFromInt(0), .name = "@frame", .type_id = ptr_type });
@@ -395,25 +407,26 @@ fn rewriteFunction(allocator: std.mem.Allocator, module: *mir.Module, plan: Func
 
     var builder = mir_builder.Builder{ .module = module, .allocator = allocator, .function_id = plan.function };
 
-    // Entry dispatch's id is reserved NOW (content filled in later, step
-    // 3) so a self-tail-call (found while splitting, step 2) can target
-    // it directly. This matters, not just convenience: jumping straight
-    // to `original_entry` instead would give that block TWO incoming
-    // edges from unrelated places (the dispatch's own "fresh start"
-    // fallback, AND the tail-call's own loop-back) with NEITHER being
-    // the block wasm_stackify treats as the function's entry — an
-    // irreducible-looking shape it can't reconstruct (found by actually
-    // running it and hitting unbounded recursion in `wasm_stackify.zig`,
-    // not by reading alone). Routing the tail-call through
-    // `dispatch_entry` instead makes it the loop's sole header — the
-    // ONE block with an incoming edge from outside the function AND from
-    // the back-edge, exactly the shape ordinary structured control flow
-    // already knows how to fold into a real WASM `loop`.
+    // Id входной диспетчеризации резервируется УЖЕ СЕЙЧАС (содержимое
+    // заполняется позже, шаг 3), чтобы собственный хвостовой вызов
+    // (обнаруживается при разбиении, шаг 2) мог указывать на него напрямую.
+    // Это принципиально, а не просто удобство: прыжок сразу на
+    // `original_entry` дал бы этому блоку ДВА входящих ребра из
+    // несвязанных мест (собственный откат диспетчеризации на "свежий
+    // старт" И собственную обратную петлю хвостового вызова), причём НИ
+    // ОДНО из них не тот блок, который `wasm_stackify` считает входом
+    // функции — неприводимая на вид форма, которую он не может
+    // восстановить. Направление хвостового вызова через `dispatch_entry`
+    // вместо этого делает его единственным заголовком цикла — ЕДИНСТВЕННЫМ
+    // блоком с входящим ребром снаружи функции И с обратного ребра, ровно
+    // той формой, которую обычный структурированный поток управления уже
+    // умеет сворачивать в настоящий `loop` WASM.
     const dispatch_entry = try builder.newBlock();
 
-    // Step 2: rewrite + split every ORIGINAL block. A suspend point's
-    // resume block id is only known once we actually build it — recorded
-    // here so step 3 (entry dispatch) can jump straight to it.
+    // Шаг 2: переписать и разбить каждый ИСХОДНЫЙ блок. Id блока
+    // возобновления точки остановки известен только после его фактического
+    // построения — записывается здесь, чтобы шаг 3 (входная
+    // диспетчеризация) мог прыгнуть прямо на него.
     var resume_blocks = std.AutoHashMap(u32, mir.BlockId).init(allocator);
     defer resume_blocks.deinit();
 
@@ -421,21 +434,21 @@ fn rewriteFunction(allocator: std.mem.Allocator, module: *mir.Module, plan: Func
         try splitBlockAtSuspends(&builder, allocator, block_id, plan, frame_local, ptr_type, bool_type, local_state_slot, message_slot_base, &resume_blocks, dispatch_entry, plan.function);
     }
 
-    // Step 3: entry dispatch — branching on `frame.state`: 0 -> the
-    // (rewritten) original entry block, K -> suspend point K's resume
-    // block.
+    // Шаг 3: входная диспетчеризация — ветвление по `frame.state`:
+    // 0 -> (переписанный) исходный входной блок, K -> блок возобновления
+    // точки остановки K.
     module.functions.items[function_index].entry = dispatch_entry;
     try emitDispatch(&builder, dispatch_entry, frame_local, ptr_type, local_state_slot, plan.suspend_points, &resume_blocks, original_entry);
 
     return .{ .param_count = original_param_count, .total_slots = total_slots };
 }
 
-// One `.equal` compare + `.branch` per candidate state, chained through
-// fresh blocks — a linear scan, not a jump table (`br_table`'s WASM
-// encoding needs a dense, compile-time-known range; Phase 1 has no more
-// than a handful of suspend points per function, so the linear form is
-// simplest and cheap enough — revisit only if profiling ever says
-// otherwise).
+// По одному сравнению `.equal` + `.branch` на каждое состояние-кандидат,
+// сцепленных через новые блоки — линейный проход, а не таблица переходов
+// (кодировка `br_table` в WASM требует плотного, известного на этапе
+// компиляции диапазона; в Фазе 1 не больше горстки точек остановки на
+// функцию, так что линейная форма проще всего и достаточно дёшева —
+// пересмотреть только если профилирование когда-нибудь скажет иначе).
 fn emitDispatch(
     builder: *mir_builder.Builder,
     entry: mir.BlockId,
@@ -460,18 +473,19 @@ fn emitDispatch(
         builder.terminate(.{ .branch = .{ .cond = is_this_state, .then_block = resume_block, .else_block = next } });
         current = next;
     }
-    // Nothing matched — state must be 0 (fresh start).
+    // Ничего не совпало — состояние должно быть 0 (свежий старт).
     builder.setCurrentBlock(current);
     builder.terminate(.{ .jump = .{ .target = original_entry } });
 }
 
-// Splits `block_id` at every `.receive`/`.receive_signal` it contains, in
-// order. The block keeps its own id for its FIRST segment (every other
-// block's Jump/Branch targeting it stays valid unchanged); later segments
-// are fresh blocks. Ordinary instructions are frame-ified in place
-// (`load_local`/`store_local` -> `frame_load`/`frame_store`) as they're
-// copied across; the ORIGINAL terminator, once no more suspend points
-// remain in the stream, is rewritten via `rewriteReturnTerminator`.
+// Разбивает `block_id` по каждой содержащейся в нём `.receive`/
+// `.receive_signal`, по порядку. Блок сохраняет свой id для ПЕРВОГО
+// сегмента (Jump/Branch любого другого блока, указывающие на него,
+// остаются валидными без изменений); последующие сегменты — новые блоки.
+// Обычные инструкции переводятся на кадр на месте (`load_local`/
+// `store_local` -> `frame_load`/`frame_store`) по мере копирования;
+// ИСХОДНЫЙ терминатор, когда в потоке больше не остаётся точек остановки,
+// переписывается через `rewriteReturnTerminator`.
 fn splitBlockAtSuspends(
     builder: *mir_builder.Builder,
     allocator: std.mem.Allocator,
@@ -491,13 +505,12 @@ fn splitBlockAtSuspends(
     const original_instructions = try allocator.dupe(mir.Instruction, original.instructions.items);
     defer allocator.free(original_instructions);
     const original_terminator = original.terminator;
-    // `.deinit`, NOT `allocator.free(.items)` — `.items` is `ptr[0..len]`,
-    // but the REAL allocation is `ptr[0..capacity]`
-    // (`ArrayList.allocatedSlice()`); freeing the shorter `.items` slice
-    // directly hands a debug allocator a length that doesn't match its
-    // own bucket bookkeeping and panics ("Invalid free") the moment
-    // `len != capacity` — found by actually running a real multi-
-    // instruction block through this, not by reading alone.
+    // `.deinit`, а НЕ `allocator.free(.items)` — `.items` это `ptr[0..len]`,
+    // а РЕАЛЬНОЕ выделение — `ptr[0..capacity]` (`ArrayList.allocatedSlice()`);
+    // освобождение более короткого среза `.items` напрямую передаёт
+    // отладочному аллокатору длину, не совпадающую с его собственным учётом
+    // бакетов, и вызывает панику ("Invalid free"), как только
+    // `len != capacity`.
     function.block(block_id).instructions.deinit(allocator);
     function.block(block_id).instructions = .empty;
 
@@ -524,21 +537,18 @@ fn splitBlockAtSuspends(
     );
 }
 
-// Shared implementation for both the FIRST segment of an original block
-// (`splitBlockAtSuspends`) and every segment AFTER a split
-// (`rewriteRemainingInstructions`'s old separate copy) — unified here so
-// there's exactly one place that decides "found a suspend -> split" vs
-// "ran out of instructions -> apply the (rewritten) original terminator".
-// A receive's own `dst`, once resumed, is redirected to an ordinary WASM
-// local (NOT a repeated `frame_load` from `message_slot`) — the same
-// value can't be handed to two-or-more later instructions directly (the
-// single-use invariant `mir_validate.zig` enforces: a `ValueId` is a
-// stack value, consumed once), so every later REFERENCE gets its OWN
-// fresh `load_local` from this local instead. Found by actually running
-// `mir_validate.zig` over real output (`Сообщение.Вариант(a, b)` binds
-// TWO fields off the same `получить()` result — `match_tag`'s subject
-// AND two `get_variant_field`s all reference the receive's `dst`, three
-// separate uses that a single shared replacement value can't satisfy).
+// Общая реализация как для ПЕРВОГО сегмента исходного блока
+// (`splitBlockAtSuspends`), так и для каждого сегмента ПОСЛЕ разбиения —
+// объединено здесь так, чтобы существовало ровно одно место, решающее
+// "найдена точка остановки -> разбить" против "инструкции закончились ->
+// применить (переписанный) исходный терминатор". Собственный `dst`
+// receive, после возобновления, перенаправляется на обычную локальную
+// переменную WASM (а НЕ на повторный `frame_load` из `message_slot`) —
+// одно и то же значение нельзя передать напрямую в две и более
+// последующих инструкции (инвариант единственного использования,
+// который навязывает `mir_validate.zig`: `ValueId` — это значение стека,
+// потребляемое один раз), поэтому каждая последующая ССЫЛКА получает
+// СОБСТВЕННЫЙ свежий `load_local` из этой локальной переменной.
 pub const Redirect = struct { old: mir.ValueId, local: mir.LocalId, type_id: types.TypeId };
 
 fn rewriteInstructionStream(
@@ -568,53 +578,55 @@ fn rewriteInstructionStream(
                 if (!referencesValue(instruction, redirect.old)) continue;
                 const fresh = try builder.newValue(redirect.type_id);
                 try builder.emit(.{ .load_local = .{ .dst = fresh, .local = redirect.local } });
-                // Module arena, NOT the `allocator` parameter — a
-                // substituted array field gets stored into a PERSISTED
-                // instruction living in `module`, so it needs the same
-                // module-owned lifetime every other instruction-owned
-                // slice in this codebase uses (e.g. `wasm_heap.dupeOne`),
-                // not a scratch allocator that may get freed out from
-                // under it once this function returns.
+                // Арена модуля, а НЕ параметр `allocator` — заменённое
+                // поле-массив сохраняется в СОХРАНЯЕМУЮ инструкцию,
+                // живущую в `module`, поэтому ему нужно то же время
+                // жизни, принадлежащее модулю, что использует любой
+                // другой срез, принадлежащий инструкции, в этой кодовой
+                // базе (например, `wasm_heap.dupeOne`), а не временный
+                // аллокатор, который может освободиться из-под него
+                // после возврата этой функции.
                 instruction = try substituteValue(builder.module.arena.allocator(), instruction, redirect.old, fresh);
             }
 
-            // Self-tail-call: `функ ф(...) -> Т \n ... \n ф(new_args) \n
-            // конец` (panos's own documented actor idiom — see
-            // docs/processes.md's `счётчик`) — the recursive call's
-            // result flows straight into this function's OWN return, no
-            // further use. Compiling it as an ordinary call would be
-            // doubly wrong here: (1) the callee's signature was already
-            // rewritten to take a frame pointer, not the original args,
-            // and (2) even fixed up, a real nested call would grow the
-            // WASM call stack for what's semantically an unbounded loop.
-            // Instead: write the new arguments into THIS SAME frame's
-            // param slots and jump back to the entry-dispatch block —
-            // turning recursion into an ordinary single-entry loop at
-            // the CFG level, avoiding the irreducible (multi-entry) loop
-            // a `получить()` inside a real `пока` produces (found by
-            // actually running that shape through `wasm_stackify.zig`
-            // and hitting unbounded recursion there, not by reading
-            // alone — a `пока`-bodied receive is Phase-2+ until that
-            // structured-control-flow gap is closed).
+            // Само-хвостовой вызов: `функ ф(...) -> Т \n ... \n
+            // ф(new_args) \n конец` (документированная идиома акторов
+            // паноса — см. `счётчик` в docs/processes.md) — результат
+            // рекурсивного вызова течёт напрямую в СОБСТВЕННЫЙ возврат
+            // этой функции, других использований нет. Компилировать это
+            // как обычный вызов было бы дважды неверно: (1) сигнатура
+            // callee уже переписана на приём указателя на кадр, а не
+            // исходных аргументов, и (2) даже после исправления,
+            // настоящий вложенный вызов растил бы стек вызовов WASM для
+            // того, что семантически является неограниченным циклом.
+            // Вместо этого: записываем новые аргументы в слоты параметров
+            // ЭТОГО ЖЕ САМОГО кадра и прыгаем обратно на блок диспетчеризации
+            // входа — превращая рекурсию в обычный цикл с одной точкой
+            // входа на уровне CFG, избегая несводимого (с несколькими
+            // точками входа) цикла, который производит `получить()`
+            // внутри настоящего `пока` (`пока`-тело с receive — задача
+            // Фазы 2+, пока этот пробел в структурированном потоке
+            // управления не закрыт).
             //
-            // A plain-named self-call (`ф(...)`, not `x.ф(...)`) never
-            // lowers to a direct `.call` — `mir_lowering.zig` always goes
-            // through `function_ref` (recorded earlier in this SAME
-            // instruction stream) + `.call_value`, exactly the shape
-            // `wasm_emit.zig`'s own `value_to_function` resolves at
-            // codegen time (confirmed by actually dumping pre-CPS MIR,
-            // not assumed). Detected as "last instruction of this
-            // segment, resolves to `self_function`" — deliberately NOT
-            // requiring `original_terminator == return_value`: the
-            // typical `выбор`/`тогда` compiled shape jumps to a shared
-            // join block that just forwards the (here, `Пусто`, unused)
-            // result to the real return; being the segment's LAST
-            // instruction already rules out anything ELSE meaningful
-            // happening on this path, so skipping straight to the loop
-            // header instead of visiting that trivial join block is
-            // equivalent. A join block that does REAL extra work after
-            // a tail-position recursive call is a real, undetected edge
-            // case this heuristic accepts for Phase 1.
+            // Обычный само-вызов по имени (`ф(...)`, не `x.ф(...)`)
+            // никогда не опускается напрямую в `.call` —
+            // `mir_lowering.zig` всегда идёт через `function_ref`
+            // (записанный ранее в ЭТОМ ЖЕ потоке инструкций) +
+            // `.call_value` — именно ту форму, которую `value_to_function`
+            // из `wasm_emit.zig` разрешает во время кодогенерации.
+            // Определяется как "последняя инструкция этого сегмента,
+            // разрешается в `self_function`" — намеренно БЕЗ требования
+            // `original_terminator == return_value`: типичная
+            // скомпилированная форма `выбор`/`тогда` прыгает в общий
+            // join-блок, который просто пробрасывает (здесь — `Пусто`,
+            // неиспользуемый) результат в реальный возврат; будучи
+            // ПОСЛЕДНЕЙ инструкцией сегмента, это уже исключает
+            // что-либо ЕЩЁ значимое на этом пути, поэтому переход сразу
+            // к заголовку цикла вместо посещения этого тривиального
+            // join-блока эквивалентен. Join-блок, выполняющий РЕАЛЬНУЮ
+            // дополнительную работу после рекурсивного вызова в
+            // хвостовой позиции — реальный, необнаруживаемый граничный
+            // случай, который эта эвристика допускает для Фазы 1.
             if (index == instructions.len - 1) {
                 if (selfCallArgs(instruction, instructions[0..index], self_function)) |args| {
                     for (args, 0..) |arg, i| {
@@ -631,11 +643,12 @@ fn rewriteInstructionStream(
             continue;
         }
 
-        // Found a suspend point — locate its recorded resume_state (the
-        // frozen `plan.suspend_points` list is keyed by ORIGINAL block +
-        // instruction_index, unaffected by this rewrite since instructions
-        // before it are only ever REWRITTEN in place, never reordered or
-        // removed).
+        // Найдена точка остановки — находим её записанный resume_state
+        // (замороженный список `plan.suspend_points` ключуется по
+        // ИСХОДНОМУ блоку + instruction_index, не затрагивается этим
+        // переписыванием, поскольку инструкции перед ним только
+        // ПЕРЕПИСЫВАЮТСЯ на месте, никогда не переупорядочиваются и не
+        // удаляются).
         var resume_state: ?u32 = null;
         for (plan.suspend_points) |point| {
             if (point.block == original_block and point.instruction_index == index) {
@@ -648,23 +661,16 @@ fn rewriteInstructionStream(
         const message_slot = message_slot_base + (state - 1);
         const function = builder.currentFunction();
 
-        // Mailbox/signal check — lives in its OWN block (`recheck_block`),
-        // not inlined into whatever block was current when this suspend
-        // point was reached. This block is BOTH the natural fallthrough
-        // from the code above AND (via `resume_blocks`, below) the entry
-        // dispatch's OWN jump target for this state — the has()-check
-        // must be genuinely RE-RUN on every resume, not skipped, because
-        // `wasm_actors.zig`'s scheduler calls a suspended function's step
-        // repeatedly, on every round, with NO guarantee a new message
-        // has actually arrived by the time it's called again. Originally
-        // the dispatch target was `have_block` directly (skipping the
-        // check) — matching the file's own documented intent ("mirroring
-        // the native VM's ip-rollback suspend contract", i.e. resuming
-        // rolls back to BEFORE the check, not past it) but not what the
-        // code actually did. Confirmed via wasmtime: this made a resumed
-        // function unconditionally pop the mailbox even when empty,
-        // underflowing the unsigned `count` field to a huge value that
-        // then poisoned address arithmetic into an out-of-bounds write.
+        // Проверка почты/сигнала — живёт в СОБСТВЕННОМ блоке
+        // (`recheck_block`), не встроена в тот блок, что был текущим,
+        // когда эта точка остановки была достигнута. Этот блок — ОДНОВРЕМЕННО
+        // естественный fallthrough из кода выше И (через `resume_blocks`
+        // ниже) СОБСТВЕННАЯ цель прыжка диспетчеризации входа для этого
+        // состояния — проверка has() должна ДЕЙСТВИТЕЛЬНО ПЕРЕЗАПУСКАТЬСЯ
+        // при каждом возобновлении, не пропускаться, потому что
+        // планировщик `wasm_actors.zig` вызывает шаг приостановленной
+        // функции многократно, на каждом раунде, БЕЗ гарантии, что новое
+        // сообщение действительно придёт к моменту следующего вызова.
         const recheck_block = try builder.newBlock();
         builder.terminate(.{ .jump = .{ .target = recheck_block } });
         builder.setCurrentBlock(recheck_block);
@@ -677,47 +683,51 @@ fn rewriteInstructionStream(
         const have_block = try builder.newBlock();
         builder.terminate(.{ .branch = .{ .cond = has, .then_block = have_block, .else_block = suspend_block } });
 
-        // Suspend path: save state, return "not done".
+        // Путь приостановки: сохранить состояние, вернуть "не завершено".
         builder.setCurrentBlock(suspend_block);
-        // `src` computed BEFORE `frame` — `frame_store` codegen expects
-        // stack order `[src, frame]` (see `wasm_emit.zig`'s
-        // `EmitContext.frame_store_scratch_frame` doc comment).
+        // `src` вычисляется ПЕРЕД `frame` — кодогенерация `frame_store`
+        // ожидает порядок стека `[src, frame]` (см. doc-комментарий
+        // `EmitContext.frame_store_scratch_frame` в `wasm_emit.zig`).
         const state_value = try intConstant(builder, ptr_type, state);
         const suspend_frame = try frameValue(builder, frame_local, ptr_type);
         try builder.emit(.{ .frame_store = .{ .frame = suspend_frame, .slot = local_state_slot, .src = state_value } });
         builder.terminate(.suspend_return);
 
-        // Resume path: pop the message, keep going with the REST of this
-        // original instruction stream in `have_block` — this is both the
-        // fallthrough (message was already there) AND the block the
-        // entry dispatch jumps to when the scheduler resumes this exact
-        // state later. The popped value goes straight into an ordinary
-        // local (see the `Redirect` comment below) — `message_slot`
-        // itself is reserved in the frame layout but otherwise unused now
-        // (kept simple rather than reclaiming the slot).
+        // Путь возобновления: снять сообщение с очереди, продолжить с
+        // ОСТАВШЕЙСЯ частью исходного потока инструкций в `have_block` —
+        // это одновременно fallthrough (сообщение уже было) И блок,
+        // на который прыгает диспетчеризация входа, когда планировщик
+        // позже возобновляет это точное состояние. Снятое значение идёт
+        // напрямую в обычную локальную переменную (см. комментарий
+        // `Redirect` ниже) — сам `message_slot` зарезервирован в
+        // раскладке кадра, но сейчас больше не используется (оставлено
+        // просто, вместо переиспользования слота).
         builder.setCurrentBlock(have_block);
         _ = message_slot;
-        // `получить()`'s own declared type stays `poison` unless the
-        // enclosing function is declared `-> Сообщение(T)`
-        // (`type_checker.zig`, ~line 4146 — a real, separate limitation:
-        // it never infers from match-arm narrowing for the far more
-        // common `-> Пусто` idiom). Safe to use directly here —
-        // `wasm_module.wasmValTypeForStore` now special-cases
-        // `поison`/`unconstrained` as i32 (see its own doc comment),
-        // consistently, everywhere this TypeId's WASM representation is
-        // decided (this value's own local, every `frame_load`/
-        // `frame_store` derived from it, `wasm_actors.zig`'s pop-variant
-        // selection).
+        // Собственный объявленный тип `получить()` остаётся `poison`,
+        // если только охватывающая функция не объявлена как
+        // `-> Сообщение(T)` (реальное, отдельное ограничение
+        // `type_checker.zig`: он никогда не выводит тип из сужения по
+        // ветке match для гораздо более распространённой идиомы
+        // `-> Пусто`). Здесь безопасно использовать напрямую —
+        // `wasm_module.wasmValTypeForStore` теперь особо обрабатывает
+        // `poison`/`unconstrained` как i32 (см. его собственный
+        // doc-комментарий), последовательно, везде, где решается WASM-
+        // представление этого TypeId (собственная локальная переменная
+        // этого значения, каждый `frame_load`/`frame_store`, производный
+        // от неё, выбор pop-варианта в `wasm_actors.zig`).
         const message_type = function.valueType(dst);
         const pop_frame = try frameValue(builder, frame_local, ptr_type);
         const popped = try builder.newValue(message_type);
         try builder.emit(.{ .call_builtin = .{ .dst = popped, .name = kind.?.pop, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{pop_frame}) } });
         try resume_blocks.put(state, recheck_block);
 
-        // The ORIGINAL `dst` (the receive's own ValueId) is redirected to
-        // an ordinary WASM local — every later instruction referencing it
-        // gets its OWN fresh `load_local` (see `Redirect`'s doc comment;
-        // a single shared reload can't satisfy more than one later use).
+        // ИСХОДНЫЙ `dst` (собственный ValueId receive) перенаправляется
+        // на обычную локальную переменную WASM — каждая последующая
+        // инструкция, ссылающаяся на него, получает СОБСТВЕННЫЙ свежий
+        // `load_local` (см. doc-комментарий `Redirect`; одна общая
+        // перезагрузка не может удовлетворить более одного последующего
+        // использования).
         const redirect_local = try builder.newLocal(@enumFromInt(0), "@msg", message_type);
         try builder.emit(.{ .store_local = .{ .local = redirect_local, .src = popped } });
 
@@ -726,11 +736,12 @@ fn rewriteInstructionStream(
         @memcpy(new_redirects[0..redirects.len], redirects);
         new_redirects[redirects.len] = .{ .old = dst, .local = redirect_local, .type_id = message_type };
 
-        // `plan.suspend_points` matching (above, on the NEXT recursive
-        // call) compares against ORIGINAL absolute indices — keep
-        // recursing over the SAME (unsliced) `instructions` array with
-        // `start_index = index + 1`, so a later suspend point's own
-        // `instruction_index` still lines up.
+        // Сопоставление `plan.suspend_points` (выше, при СЛЕДУЮЩЕМ
+        // рекурсивном вызове) сравнивает с ИСХОДНЫМИ абсолютными
+        // индексами — продолжаем рекурсию по ТОМУ ЖЕ (не нарезанному)
+        // массиву `instructions` с `start_index = index + 1`, чтобы
+        // собственный `instruction_index` более поздней точки остановки
+        // по-прежнему совпадал.
         try rewriteInstructionStream(
             builder,
             allocator,
@@ -749,22 +760,24 @@ fn rewriteInstructionStream(
             original_entry,
             self_function,
         );
-        // The recursive call already applied (a rewritten form of) the
-        // original terminator to whatever block it finished on — nothing
-        // left to do for this call.
+        // Рекурсивный вызов уже применил (переписанную форму) исходного
+        // терминатора к тому блоку, на котором он завершился — для
+        // этого вызова больше ничего не остаётся сделать.
         return;
     }
     builder.terminate(try rewriteReturnTerminator(builder, frame_local, ptr_type, bool_type, original_terminator));
 }
 
-// Same field list as `substituteValue` below — kept in sync manually
-// (both are small and rarely touched). NOTE: if `old` appears in TWO OR
-// MORE fields of the SAME instruction (e.g. a hypothetical `binary{lhs =
-// v, rhs = v}`), `substituteValue` maps both occurrences to the SAME
-// fresh reload, which is itself a single-use violation — not hit by any
-// current lowering shape (no MIR instruction happens to repeat one
-// receive-result value across two of its own operand fields), but a
-// real residual gap in this mechanism, not a solved case.
+// Тот же список полей, что у `substituteValue` ниже — поддерживается в
+// синхронизации вручную (оба маленькие и редко меняются). ПРИМЕЧАНИЕ:
+// если `old` встречается в ДВУХ ИЛИ БОЛЕЕ полях ОДНОЙ И ТОЙ ЖЕ инструкции
+// (например, гипотетический `binary{lhs = v, rhs = v}`), `substituteValue`
+// отображает оба вхождения на ОДНУ И ТУ ЖЕ свежую перезагрузку, что само
+// по себе — нарушение инварианта единственного использования — ни одна
+// текущая форма опускания этого не порождает (ни одна MIR-инструкция не
+// повторяет одно значение-результат receive в двух своих полях-
+// операндах), но это реальный, необнаруженный пробел этого механизма,
+// а не решённый случай.
 pub fn referencesValue(instruction: mir.Instruction, target: mir.ValueId) bool {
     return switch (instruction) {
         .copy => |i| i.src == target,
@@ -785,16 +798,16 @@ pub fn referencesValue(instruction: mir.Instruction, target: mir.ValueId) bool {
         .send => |i| i.process == target or i.message == target,
         .try_unwrap => |i| i.src == target,
         .frame_store => |i| i.src == target,
-        // The RAW receive result (before any pattern-match field
-        // extraction) flowing directly into a call/aggregate/spawn's
-        // own argument list — no current fixture does this (every
-        // actor idiom this codebase exercises destructures via
-        // match_tag/get_variant_field first, both already covered
-        // above), but it's the same class of gap the two ACTUALLY-HIT
-        // bugs this session came from (wasm_objects.zig's build_variant/
-        // new_aggregate field-order bug, wasm_actors.zig's expandSpawn
-        // arg-order bug) — closing it defensively rather than waiting
-        // for a third occurrence.
+        // СЫРОЙ результат receive (до какого-либо извлечения полей через
+        // сопоставление с образцом), текущий напрямую в собственный
+        // список аргументов call/aggregate/spawn — ни один текущий
+        // фикстур этого не делает (каждая идиома акторов, задействованная
+        // в этой кодовой базе, сначала деструктурирует через
+        // match_tag/get_variant_field, оба уже покрыты выше), но это тот
+        // же класс пробела, что и баги с build_variant/new_aggregate
+        // (порядок полей, `wasm_objects.zig`) и expandSpawn (порядок
+        // аргументов, `wasm_actors.zig`) — закрывается защитно, не
+        // дожидаясь третьего случая.
         .call => |i| for (i.args) |a| {
             if (a == target) break true;
         } else false,
@@ -820,11 +833,12 @@ pub fn referencesValue(instruction: mir.Instruction, target: mir.ValueId) bool {
     };
 }
 
-// `allocator` is ONLY needed for the array-field cases (`.call`/
-// `.call_value`/`.new_aggregate`/`.new_array`/`.build_variant`/
-// `.spawn`'s `args`/`elements`/`fields`) — substituting inside a `[]const
-// ValueId` needs a fresh owned copy, unlike every other case here which
-// just reassigns a single `ValueId` field in place.
+// `allocator` нужен ТОЛЬКО для случаев с полями-массивами (`args`/
+// `elements`/`fields` у `.call`/`.call_value`/`.new_aggregate`/
+// `.new_array`/`.build_variant`/`.spawn`) — замена внутри `[]const
+// ValueId` требует свежей владеемой копии, в отличие от любого другого
+// случая здесь, который просто переприсваивает одно поле `ValueId` на
+// месте.
 pub fn substituteValue(allocator: std.mem.Allocator, instruction: mir.Instruction, old: mir.ValueId, new: mir.ValueId) !mir.Instruction {
     if (old == new) return instruction;
     const sub = struct {

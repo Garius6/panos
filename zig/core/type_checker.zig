@@ -6236,28 +6236,35 @@ pub fn checkWithImportContextForTarget(
     var owner_parameters_by_symbol = std.AutoHashMap(symbols.SymbolId, []const GenericParameter).init(allocator);
     defer owner_parameters_by_symbol.deinit();
     try checker.typeAliasPass();
-    try checker.eagerAliasResolutionPass();
     try checker.preludePass();
     try checker.enumPass();
-    // `interfacePass` (сигнатуры методов интерфейса, ВКЛЮЧАЯ
-    // квалифицированные типы вроде `json.Значение`) должна запускаться
-    // ПОСЛЕ `importIdentityPass` — та же причина, что уже
+    // `interfacePass`/`eagerAliasResolutionPass` (сигнатуры методов
+    // интерфейса И псевдонимы типа функции, ВКЛЮЧАЯ квалифицированные
+    // типы вроде `json.Значение`/`http.ОтветСервера`) должны
+    // запускаться ПОСЛЕ `importIdentityPass` — та же причина, что уже
     // задокументирована ниже для `nominalPass` (`nominalType` читает
-    // `imported_nominal_identities`). До этой правки метод интерфейса,
-    // объявленный С КВАЛИФИЦИРОВАННЫМ ТИПОМ в своей сигнатуре (например
-    // `тип X = интерфейс \n функ м() -> чужой_модуль.Тип \n конец`),
-    // получал identity=0 для этого типа — а любая РЕАЛИЗАЦИЯ этого
-    // метода (обрабатывается позже, `importSignaturePass`/`signaturePass`,
+    // `imported_nominal_identities`). До этой правки метод интерфейса
+    // ИЛИ псевдоним функционального типа, объявленный С
+    // КВАЛИФИЦИРОВАННЫМ ТИПОМ (например `тип X = интерфейс \n функ м()
+    // -> чужой_модуль.Тип \n конец` или `тип Далее = функ(Запрос) ->
+    // чужой_модуль.Тип`), получал identity=0 для этого типа — а любая
+    // РЕАЛИЗАЦИЯ метода/значение того же квалифицированного типа
+    // (обрабатывается позже, `importSignaturePass`/`signaturePass`,
     // ОБЕ уже после `importIdentityPass`) получала настоящую identity —
     // `TypeStore.eql`'s `.nominal`-ветка переключается на СТРОГОЕ
     // сравнение по identity, как только у ЛЮБОЙ стороны она ненулевая,
     // так что совпадающий (тот же символ) тип отклонялся как
-    // "сигнатура метода не совпадает с интерфейсом" ИСКЛЮЧИТЕЛЬНО
-    // из-за этой рассинхронизации, не реального несовпадения типов.
-    // Найдено при реализации `быстряга` (panosiki) — `ОтветJSON =
-    // интерфейс \n функ в_json() -> json.Значение \n конец`.
+    // "сигнатура метода не совпадает с интерфейсом"/"тело лямбды не
+    // совпадает с типом возврата" ИСКЛЮЧИТЕЛЬНО из-за этой
+    // рассинхронизации, не реального несовпадения типов. Найдено при
+    // реализации `быстряга` (panosiki) — интерфейсный случай сначала
+    // (`ОтветJSON = интерфейс \n функ в_json() -> json.Значение \n
+    // конец`), псевдонимный случай позже (`тип Далее = функ(Запрос) ->
+    // http.ОтветСервера`, использованный как явный тип локальной
+    // переменной с лямбда-инициализатором).
     try checker.importIdentityPass(imports, &owner_remaps, &owner_parameters_by_symbol);
     try checker.interfacePass();
+    try checker.eagerAliasResolutionPass();
     try checker.nominalPass();
     try checker.nativeNominalPass();
     // Должна запускаться ДО `signaturePass` — `реализация Интерфейс для

@@ -4115,8 +4115,8 @@ const Checker = struct {
                 if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
                     try self.report(call.span, "Type Error: сеть.подключиться() ожидает хост типа Строка первым аргументом", .{});
                 }
-                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.number), self.result.types.builtins.number)) {
-                    try self.report(call.span, "Type Error: сеть.подключиться() ожидает порт типа Число вторым аргументом", .{});
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.integer), self.result.types.builtins.integer)) {
+                    try self.report(call.span, "Type Error: сеть.подключиться() ожидает порт типа Целое вторым аргументом", .{});
                 }
                 return result_type;
             }
@@ -4194,8 +4194,8 @@ const Checker = struct {
                     for (call.arguments) |argument| _ = try self.infer(argument);
                     return result_type;
                 }
-                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.number), self.result.types.builtins.number)) {
-                    try self.report(call.span, "Type Error: сеть.http_сервер_слушать() ожидает порт типа Число", .{});
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.integer), self.result.types.builtins.integer)) {
+                    try self.report(call.span, "Type Error: сеть.http_сервер_слушать() ожидает порт типа Целое", .{});
                 }
                 return result_type;
             }
@@ -5831,8 +5831,8 @@ const Checker = struct {
             if (std.mem.eql(u8, property.property, "ответить")) {
                 try self.checkMethodArity(call, "ответить", 3);
                 if (call.arguments.len == 3) {
-                    if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.number), self.result.types.builtins.number)) {
-                        try self.report(call.span, "Type Error: Запрос.ответить() ожидает статус типа Число первым аргументом", .{});
+                    if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.integer), self.result.types.builtins.integer)) {
+                        try self.report(call.span, "Type Error: Запрос.ответить() ожидает статус типа Целое первым аргументом", .{});
                     }
                     if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
                         try self.report(call.span, "Type Error: Запрос.ответить() ожидает тип содержимого типа Строка вторым аргументом", .{});

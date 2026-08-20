@@ -4361,7 +4361,7 @@ const Checker = struct {
                 if (try self.inferPreludeEnumMethod(call, property, object_type)) |method_type| return method_type;
                 if (try self.inferInterfaceCall(expression, call, property, object_type)) |method_type| return method_type;
                 if (try self.inferGenericBoundInterfaceCall(expression, call, property, object_type)) |method_type| return method_type;
-                if (try self.inferMethodCall(expression, call, property, object_type)) |method_type| return method_type;
+                if (try self.inferMethodCall(expression, call, property, object_type, null)) |method_type| return method_type;
                 if (try self.inferDefaultInterfaceMethodCall(expression, call, property, object_type)) |method_type| return method_type;
                 const object = self.result.types.get(object_type) orelse return self.result.types.poison();
                 switch (object.*) {
@@ -4463,6 +4463,28 @@ const Checker = struct {
                 }
             },
             else => {},
+        }
+        // `о.метод[Тип](...)` — тот же паттерн, что `ф[Тип](...)` ниже,
+        // только callee — `Index{ object: Property{object, property} }`
+        // (метод), не `Index{ object: identifier }` (свободная функция).
+        // Если `property.property` называет generic-МЕТОД получателя,
+        // `[Тип]` — явные type-аргументы метода, не индексирование.
+        if (self.tree.expr(call.callee).* == .index) {
+            const index = self.tree.expr(call.callee).index;
+            if (self.tree.expr(index.object).* == .property) {
+                const inner_property = self.tree.expr(index.object).property;
+                const receiver_type = try self.infer(inner_property.object);
+                if (self.result.types.get(receiver_type)) |receiver_entry| {
+                    if (receiver_entry.* == .nominal) {
+                        if (self.inherentMethod(receiver_entry.nominal.symbol, inner_property.property)) |method| {
+                            if (method.function_parameters.len != 0) {
+                                const explicit_types = try self.resolveExplicitGenericArguments(index.index, method.function_parameters, call.span);
+                                if (try self.inferMethodCall(expression, call, inner_property, receiver_type, explicit_types)) |method_type| return method_type;
+                            }
+                        }
+                    }
+                }
+            }
         }
         // `ф[Тип](...)` — вызов с явным генерик-аргументом — парсится
         // как `Call_Expr{ callee: Index_Expr{ object, index } }` (та же
@@ -5487,7 +5509,7 @@ const Checker = struct {
         return self.result.types.builtins.integer;
     }
 
-    fn inferMethodCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
+    fn inferMethodCall(self: *Checker, expression: ast.ExprId, call: anytype, property: anytype, object_type: types.TypeId, explicit_type_arguments: ?[]const types.TypeId) !?types.TypeId {
         const object = self.result.types.get(object_type) orelse return null;
         const nominal = switch (object.*) {
             .nominal => |value| value,
@@ -5520,6 +5542,16 @@ const Checker = struct {
         var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
         defer substitutions.deinit();
         for (method.owner_parameters, nominal.arguments) |parameter, argument| try substitutions.put(parameter.typ, argument);
+        // Явные генерик-аргументы (`о.метод[Тип](...)`) затравливаются
+        // ПЕРВЫМИ, до всего, выведенного из аргументов — симметрично
+        // свободным generic-функциям (см. `ф[Тип](...)` в `inferCall`).
+        if (explicit_type_arguments) |explicit_types| {
+            if (explicit_types.len == method.function_parameters.len) {
+                for (method.function_parameters, explicit_types) |parameter, resolved| {
+                    try substitutions.put(parameter.typ, resolved);
+                }
+            }
+        }
         const shared = @min(arguments.len, function.parameters.len - 1);
         for (arguments[0..shared], function.parameters[1 .. shared + 1]) |argument, parameter| {
             try self.inferGenericSubstitution(parameter, try self.infer(argument), &substitutions, call.span);

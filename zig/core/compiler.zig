@@ -650,8 +650,16 @@ const FunctionCompiler = struct {
             return;
         }
         if (self.compiler.checked.method_calls.get(expression)) |method| {
+            // `о.метод[Тип](...)` — callee `Index{object: Property{...}}`,
+            // не голый `Property` (явные generic-аргументы метода, см.
+            // одноимённую ветку в type_checker.zig's `inferCall`) —
+            // настоящий property-узел лежит на один уровень глубже.
             const property = switch (self.compiler.tree.expr(call.callee).*) {
                 .property => |value| value,
+                .index => |index| switch (self.compiler.tree.expr(index.object).*) {
+                    .property => |value| value,
+                    else => return self.unsupportedExpression(call.span),
+                },
                 else => return self.unsupportedExpression(call.span),
             };
             const function_id = self.compiler.result.function_ids.get(method) orelse {

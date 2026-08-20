@@ -557,11 +557,13 @@ pub const Graph = struct {
             // нативный встроенный таргет и т.п.) молча пропускает этот
             // impl — так же, как неквалифицированный случай ниже
             // (`orelse continue`).
-            const owner_module = if (implementation.target_module) |alias|
+            const owner_lookup_module = if (implementation.target_module) |alias|
                 self.resolveImportedModule(module, alias) orelse continue
             else
                 module;
-            const owner_declaration = self.findExportedTypeDeclaration(owner_module, implementation.target_type) orelse continue;
+            const owner_location = self.findExportedTypeDeclaration(owner_lookup_module, implementation.target_type) orelse continue;
+            const owner_module = owner_location.module;
+            const owner_declaration = owner_location.declaration;
             for (implementation.methods) |method_declaration| {
                 const function = tree.decl(method_declaration).function;
                 try self.methods.append(self.allocator, .{
@@ -584,9 +586,9 @@ pub const Graph = struct {
                 var interface_declaration: ?ast.DeclId = null;
                 if (implementation.interface_module) |alias| {
                     const resolved = self.resolveImportedModule(module, alias) orelse continue;
-                    const interface_decl = self.findExportedTypeDeclaration(resolved, interface_name) orelse continue;
-                    interface_module = resolved;
-                    interface_declaration = interface_decl;
+                    const interface_location = self.findExportedTypeDeclaration(resolved, interface_name) orelse continue;
+                    interface_module = interface_location.module;
+                    interface_declaration = interface_location.declaration;
                 }
                 try self.impls.append(self.allocator, .{
                     .module = module,
@@ -616,10 +618,38 @@ pub const Graph = struct {
         return null;
     }
 
-    fn findExportedTypeDeclaration(self: *const Graph, module: usize, name: []const u8) ?ast.DeclId {
+    pub const ExportedTypeLocation = struct { module: usize, declaration: ast.DeclId };
+
+    // `module` — квалифицирующий алиас, разрешённый вызывающей стороной
+    // (`реализация X для Модуль.Тип`/`реализация Модуль.Интерфейс для
+    // ...`) — может оказаться barrel-файлом (`экспорт "путь"`, только
+    // реэкспорты, ни одной собственной декларации), а не модулем, где
+    // ТИП/ИНТЕРФЕЙС физически объявлен. Возвращаемый `.module` —
+    // ФИЗИЧЕСКИЙ модуль declaration (для реэкспортированного случая —
+    // НЕ совпадает с переданным `module`), нужен вызывающей стороне
+    // (`owner_module`/`interface_module` в graph.impls/graph.methods)
+    // именно физический, а не barrel — иначе последующий поиск методов/
+    // полей в `modules[barrel].checked` находит пустоту (barrel не
+    // содержит проверенных деклараций, только реэкспорт-рёбра).
+    // `visited` — защита от цикла, тот же приём, что
+    // `buildExportsForTargetTransitive` в module_linker.zig.
+    fn findExportedTypeDeclaration(self: *const Graph, module: usize, name: []const u8) ?ExportedTypeLocation {
+        var visited: std.AutoHashMap(usize, void) = .init(self.allocator);
+        defer visited.deinit();
+        return self.findExportedTypeDeclarationTransitive(module, name, &visited);
+    }
+
+    fn findExportedTypeDeclarationTransitive(self: *const Graph, module: usize, name: []const u8, visited: *std.AutoHashMap(usize, void)) ?ExportedTypeLocation {
+        if (visited.contains(module)) return null;
+        visited.put(module, {}) catch return null;
         for (self.exports.items) |exported| {
             if (exported.module != module or exported.kind != .type) continue;
-            if (std.mem.eql(u8, exported.name, name)) return exported.declaration;
+            if (std.mem.eql(u8, exported.name, name)) return .{ .module = module, .declaration = exported.declaration };
+        }
+        for (self.reexports.items) |reexport| {
+            if (reexport.module != module) continue;
+            const target = reexport.target orelse continue;
+            if (self.findExportedTypeDeclarationTransitive(target, name, visited)) |found| return found;
         }
         return null;
     }

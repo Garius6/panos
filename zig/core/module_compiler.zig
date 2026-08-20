@@ -101,7 +101,16 @@ const ImportContext = struct {
         self.constants.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.impls.deinit(self.allocator);
-        for (self.methods.items) |method| if (method.parameter_names.len != 0) self.allocator.free(method.parameter_names);
+        for (self.methods.items) |method| {
+            if (method.parameter_names.len != 0) self.allocator.free(method.parameter_names);
+            // `translateGenericParameterBounds` всегда выделяет заново
+            // (`self.allocator.dupe`, не заимствует из arena) — и внешний
+            // массив параметров, и `.bounds` каждого параметра отдельно.
+            if (method.generic_parameters) |parameters| {
+                for (parameters) |parameter| self.allocator.free(parameter.bounds);
+                self.allocator.free(parameters);
+            }
+        }
         self.methods.deinit(self.allocator);
         self.nominals.deinit(self.allocator);
         self.type_aliases.deinit(self.allocator);
@@ -277,6 +286,62 @@ const ImportContext = struct {
         }
     }
 
+    // Переводит bounds генерик-параметров МЕТОДА (`получить[Ответ:
+    // валидация.ОтветJSON]`) из пространства символов модуля, где физически
+    // объявлен метод (`owner_resolution`), в пространство символов модуля,
+    // где ФИЗИЧЕСКИ объявлен интерфейс-ограничение — двухходовой случай:
+    // приложение.pns ссылается на "валидация.ОтветJSON" через СОБСТВЕННЫЙ
+    // локальный символ (свой `imported_symbols`-импорт валидация.pns), а
+    // главный цикл `collect()` строит `imports.nominals` для ТОГО ЖЕ
+    // интерфейса через СВОЙ собственный локальный импорт (main.pns может
+    // импортировать валидация.pns напрямую или транзитивно через
+    // реэкспорт) — сравнение сырых SymbolId между этими двумя НИКОГДА не
+    // совпадает, хотя физически это один и тот же интерфейс в одном и том
+    // же модуле. Без перевода bound молча считался неудовлетворённым
+    // ("полный контракт или ничего" в checkWithImportContextForTarget),
+    // метод пропускался целиком — `Type Error: у типа нет поля` при
+    // обычном вызове `.метод(...)`, не диагностика про несовпадение
+    // ограничения.
+    fn translateGenericParameterBounds(
+        self: *ImportContext,
+        owner_resolution: *const resolver.Resolution,
+        nominal_identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
+        next_nominal_identity: *u32,
+        parameters: []const type_checker.GenericParameter,
+    ) ![]const type_checker.GenericParameter {
+        var translated: std.ArrayList(type_checker.GenericParameter) = .empty;
+        defer translated.deinit(self.allocator);
+        for (parameters) |parameter| {
+            var bounds: std.ArrayList(symbols.SymbolId) = .empty;
+            defer bounds.deinit(self.allocator);
+            for (parameter.bounds) |bound| {
+                // Сырое сравнение SymbolId между модулями небезопасно — это
+                // per-модульный индекс, не глобально уникальный (символ #1
+                // существует почти в КАЖДОМ модуле). identity —
+                // единственный УЖЕ существующий механизм, однозначно
+                // связывающий origin{module, declaration} с конкретным
+                // ImportedNominal независимо от того, через сколько
+                // хопов/алиасов до него дошли — тот же механизм, что уже
+                // используют интерфейсы (см. checkWithImportContextForTarget).
+                const translated_bound = blk: {
+                    const origin = owner_resolution.imported_symbols.get(bound) orelse break :blk bound;
+                    const identity = nominalIdentity(nominal_identities, next_nominal_identity, origin) catch break :blk bound;
+                    for (self.nominals.items) |nominal| {
+                        if (nominal.identity == identity) break :blk nominal.local_symbol;
+                    }
+                    break :blk bound;
+                };
+                try bounds.append(self.allocator, translated_bound);
+            }
+            try translated.append(self.allocator, .{
+                .name = parameter.name,
+                .typ = parameter.typ,
+                .bounds = try self.allocator.dupe(symbols.SymbolId, bounds.items),
+            });
+        }
+        return self.allocator.dupe(type_checker.GenericParameter, translated.items);
+    }
+
     // Пересаживает КОНКРЕТНЫЕ (не интерфейсные) методы для `owner_symbol`
     // — аналог `appendMatchingImpls` выше для `graph.methods` (та же
     // схема "сканировать ВЕСЬ граф по owner_module/owner_declaration, а
@@ -299,6 +364,8 @@ const ImportContext = struct {
         graph: *const module_loader.Graph,
         modules: []const ModuleCompilation,
         resolution: *resolver.Resolution,
+        nominal_identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
+        next_nominal_identity: *u32,
         own_module: usize,
         origin_module: usize,
         origin_declaration: ast.DeclId,
@@ -343,7 +410,7 @@ const ImportContext = struct {
             var method_generic_parameters: ?[]const type_checker.GenericParameter = null;
             for (method_checked.methods.items) |definition| {
                 if (definition.symbol == source_method_symbol and definition.function_parameters.len != 0) {
-                    method_generic_parameters = definition.function_parameters;
+                    method_generic_parameters = try self.translateGenericParameterBounds(method_resolution, nominal_identities, next_nominal_identity, definition.function_parameters);
                     break;
                 }
             }
@@ -509,7 +576,7 @@ const ImportContext = struct {
             var method_generic_parameters: ?[]const type_checker.GenericParameter = null;
             for (target_checked.methods.items) |definition| {
                 if (definition.symbol == target_symbol and definition.function_parameters.len != 0) {
-                    method_generic_parameters = definition.function_parameters;
+                    method_generic_parameters = try self.translateGenericParameterBounds(target_resolution, nominal_identities, next_nominal_identity, definition.function_parameters);
                     break;
                 }
             }
@@ -717,7 +784,7 @@ const ImportContext = struct {
                 // модуль типа никогда не импортирует свой аналог
                 // `_gen.ps` в третьем файле) — см. doc-комментарий
                 // `appendMatchingMethods`.
-                try self.appendMatchingMethods(graph, modules, resolution, own_module, origin.module, origin.declaration, local_symbol);
+                try self.appendMatchingMethods(graph, modules, resolution, nominal_identities, next_nominal_identity, own_module, origin.module, origin.declaration, local_symbol);
             },
             .array => |element| try self.collectTransitiveNominals(resolution, modules, nominal_identities, next_nominal_identity, graph, own_module, external_store, element),
             .map => |map| {

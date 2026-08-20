@@ -869,12 +869,30 @@ const Checker = struct {
                     defer local_bounds.deinit(self.result.allocator);
                     for (target_parameter.bounds) |target_bound| {
                         var remapped = false;
+                        // Двухходовой bound (интерфейс объявлен в ТРЕТЬЕМ
+                        // модуле относительно и метода, и потребителя) уже
+                        // переведён в ЛОКАЛЬНЫЙ символ ЭТОГО потребителя
+                        // module_compiler.zig's translateGenericParameterBounds
+                        // (identity-based, надёжно через любое число хопов/
+                        // реэкспортов) — совпадение по local_symbol
+                        // проверяется первым и не требует дополнительно
+                        // store/source_symbol. Одноходовой (локально
+                        // объявленный в том же файле, что и метод) bound
+                        // остаётся непереведённым — совпадает по старому
+                        // пути ниже.
                         for (imports.nominals) |nominal| {
+                            if (nominal.local_symbol == target_bound) {
+                                try local_bounds.append(self.result.allocator, nominal.local_symbol);
+                                remapped = true;
+                                break;
+                            }
+                        }
+                        if (!remapped) for (imports.nominals) |nominal| {
                             if (nominal.store != imported.store or nominal.source_symbol != target_bound) continue;
                             try local_bounds.append(self.result.allocator, nominal.local_symbol);
                             remapped = true;
                             break;
-                        }
+                        };
                         // Тот же принцип "полный контракт или ничего", что
                         // и у свободных generic-функций выше — отбросить
                         // ограничение значило бы позволить неприведённому

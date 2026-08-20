@@ -742,6 +742,27 @@ const ImportContext = struct {
                     .is_exported = true,
                     .span = source_symbol.span,
                 });
+                // Записываем мостик и в `imported_symbols` этого модуля,
+                // не только в `self.nominals` (видимый только ВНУТРИ этого
+                // прохода `collect()`) — иначе ВТОРОЙ, независимый
+                // потребитель (например, модуль, импортирующий И этот
+                // модуль напрямую, И ещё один модуль, который транзитивно
+                // ссылается на этот же номинальный тип через сигнатуру
+                // функции этого модуля) не находит происхождение при
+                // СВОЁМ собственном `collectTransitiveNominals`-обходе
+                // (строка ниже, `target_resolution.imported_symbols.get`)
+                // — символ технически never `импорт`-ирован буквально,
+                // только структурно унаследован, поэтому без этой записи
+                // резолвер ошибочно принимал бы его за builtin-тип без
+                // AST-объявления (тот же fallback, что для `Массив`/
+                // `Запрос` выше) и не находил бы одноимённый ЛОКАЛЬНЫЙ
+                // символ у ВТОРОГО потребителя — `UnsupportedImportedType`
+                // на совершенно валидной программе (найдено вживую:
+                // `быстряга`'s `авторизация.pns` транзитивно ссылается на
+                // `http.ОтветСервера` через `приложение.Middleware`, а
+                // потребитель, импортирующий и `приложение.pns`, и
+                // `авторизация.pns` напрямую, ловил эту ошибку).
+                try resolution.imported_symbols.put(local_symbol, origin);
                 const identity = try nominalIdentity(nominal_identities, next_nominal_identity, origin);
                 const enum_definition = definition_checked.enum_definitions.get(definition_symbol);
                 const generic_struct = definition_checked.generic_nominal_fields.get(definition_symbol);

@@ -1,0 +1,10 @@
+импорт "transitive_nominal_diamond_lib.pns" как lib
+
+/// Никогда не импортирует `transitive_nominal_diamond_dep.pns` напрямую
+/// — достигает `dep.Значение` только СТРУКТУРНО, через lib.Функция,
+/// поэтому lib.Функция's origin для `Значение` никогда не попадает в
+/// `imported_symbols` ЭТОГО модуля обычным путём, только транзитивным
+/// мостиком (см. `module_compiler.zig`'s `collectTransitiveNominals`).
+экспорт функ проба(ф: lib.Функция) -> Целое
+	1
+конец

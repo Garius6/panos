@@ -122,7 +122,7 @@ pub const SourceAnalysis = struct {
             .enum_decl => |value_| value_.doc,
             .constant => |value_| value_.doc,
             .type_alias => |value_| value_.doc,
-            .import, .impl, .foreign, .error_node => return null,
+            .import, .reexport, .impl, .foreign, .error_node => return null,
         };
         return if (doc.len == 0) null else doc;
     }

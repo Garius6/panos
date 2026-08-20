@@ -811,7 +811,7 @@ const Resolver = struct {
                     const function = tree.decl(method).function;
                     _ = try self.registerMethod(method, function.name, function.span);
                 },
-                .import, .error_node => {},
+                .import, .reexport, .error_node => {},
             }
         }
     }
@@ -1037,7 +1037,7 @@ const Resolver = struct {
                     const function = tree.decl(method).function;
                     try self.resolveFunction(method, function.parameters, function.body);
                 },
-                .import, .struct_decl, .enum_decl, .foreign, .type_alias, .error_node => {},
+                .import, .reexport, .struct_decl, .enum_decl, .foreign, .type_alias, .error_node => {},
             }
         }
     }

@@ -81,6 +81,24 @@ pub const ImportScope = struct {
     }
 
     fn buildExportsForTarget(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator, graph: *const module_loader.Graph, target: usize, importer: usize) ![]const resolver.ImportedExport {
+        var visited: std.AutoHashMap(usize, void) = .init(allocator);
+        defer visited.deinit();
+        return buildExportsForTargetTransitive(allocator, arena, graph, target, importer, &visited);
+    }
+
+    // `экспорт "путь"` (Dart-style реэкспорт, `graph.reexports`) — рёбра
+    // модуля `target`, помеченные как реэкспорт, ТОЖЕ вносят свой вклад
+    // в набор экспортов, видимых под алиасом `target` для `importer`,
+    // ПОД РОДНЫМИ ИМЕНАМИ реэкспортированного модуля, плоско (не через
+    // вложенный псевдоним) — рекурсивно, реэкспорт реэкспорта тоже
+    // работает. `visited` — защита от цикла (А реэкспортирует Б
+    // реэкспортирует А); первое посещение модуля молча выигрывает при
+    // конфликте имён между несколькими реэкспортами (не проверяется
+    // отдельно — тот же уровень строгости, что резолвер уже применяет к
+    // обычным столкновениям имён символов).
+    fn buildExportsForTargetTransitive(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator, graph: *const module_loader.Graph, target: usize, importer: usize, visited: *std.AutoHashMap(usize, void)) anyerror![]const resolver.ImportedExport {
+        if (visited.contains(target)) return &.{};
+        try visited.put(target, {});
         var exports: std.ArrayList(resolver.ImportedExport) = .empty;
         defer exports.deinit(allocator);
         for (graph.exports.items) |exported| {
@@ -131,6 +149,12 @@ pub const ImportScope = struct {
                 .methods = try arena.allocator().dupe(resolver.ImportedMethodExport, methods.items),
                 .variants = try arena.allocator().dupe(resolver.ImportedVariantExport, variants.items),
             });
+        }
+        for (graph.reexports.items) |reexport| {
+            if (reexport.module != target) continue;
+            const reexported_target = reexport.target orelse continue;
+            const transitive = try buildExportsForTargetTransitive(allocator, arena, graph, reexported_target, importer, visited);
+            try exports.appendSlice(allocator, transitive);
         }
         return arena.allocator().dupe(resolver.ImportedExport, exports.items);
     }

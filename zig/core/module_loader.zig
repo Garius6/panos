@@ -33,6 +33,20 @@ pub const Import = struct {
     native_module: ?[]const u8 = null,
 };
 
+// `экспорт "путь"` (стиль Dart `export`) — граф-ребро, ОТДЕЛЬНОЕ от
+// обычного `Import`: не даёт `module` локального доступа к символам
+// `target` (resolver.zig не должен предобъявлять их в области видимости
+// `module`), но `module_linker.zig`'s `buildExportsForTarget` обходит
+// эти рёбра ТРАНЗИТИВНО, чтобы вынести экспорты `target` наружу под
+// собственными именами (плоско, без алиаса) для ЛЮБОГО модуля,
+// импортирующего `module`.
+pub const Reexport = struct {
+    module: usize,
+    declaration: ast.DeclId,
+    target: ?usize,
+    span: source.Span,
+};
+
 pub const ExportKind = enum {
     function,
     constant,
@@ -123,6 +137,7 @@ pub const Graph = struct {
     loading: std.StringHashMap(void),
     order: std.ArrayList(usize) = .empty,
     imports: std.ArrayList(Import) = .empty,
+    reexports: std.ArrayList(Reexport) = .empty,
     exports: std.ArrayList(Export) = .empty,
     methods: std.ArrayList(MethodExport) = .empty,
     variants: std.ArrayList(VariantExport) = .empty,
@@ -154,6 +169,7 @@ pub const Graph = struct {
         self.variants.deinit(self.allocator);
         self.methods.deinit(self.allocator);
         self.exports.deinit(self.allocator);
+        self.reexports.deinit(self.allocator);
         self.imports.deinit(self.allocator);
         self.order.deinit(self.allocator);
         self.loading.deinit();
@@ -341,19 +357,32 @@ pub const Graph = struct {
 
         const declarations = self.modules.items[index].tree.program.?.declarations;
         for (declarations) |declaration| {
-            const import = switch (self.modules.items[index].tree.decl(declaration).*) {
-                .import => |value| value,
+            switch (self.modules.items[index].tree.decl(declaration).*) {
+                .import => |import| {
+                    const resolved = try self.resolveAndLoadImport(reader, import.path, stored_path, import.span);
+                    try self.imports.append(self.allocator, .{
+                        .importer = index,
+                        .declaration = declaration,
+                        .target = resolved.target,
+                        .alias = import.alias orelse moduleBaseName(import.path),
+                        .span = import.span,
+                        .native_module = resolved.native_module,
+                    });
+                },
+                .reexport => |reexport| {
+                    const resolved = try self.resolveAndLoadImport(reader, reexport.path, stored_path, reexport.span);
+                    if (resolved.native_module != null) {
+                        try self.report(reexport.span, "Module Loader Error: реэкспорт нативного встроенного модуля не поддержан", .{});
+                    }
+                    try self.reexports.append(self.allocator, .{
+                        .module = index,
+                        .declaration = declaration,
+                        .target = resolved.target,
+                        .span = reexport.span,
+                    });
+                },
                 else => continue,
-            };
-            const resolved = try self.resolveAndLoadImport(reader, import.path, stored_path, import.span);
-            try self.imports.append(self.allocator, .{
-                .importer = index,
-                .declaration = declaration,
-                .target = resolved.target,
-                .alias = import.alias orelse moduleBaseName(import.path),
-                .span = import.span,
-                .native_module = resolved.native_module,
-            });
+            }
         }
         // Должно выполняться ПОСЛЕ цикла импортов выше — квалифицированный
         // таргет impl'а (`реализация X для Модуль.Тип`) разрешает

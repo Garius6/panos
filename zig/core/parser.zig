@@ -135,13 +135,19 @@ const Parser = struct {
                 _ = self.next();
             }
 
+            if (exported and self.at(.string)) {
+                if (annotations.len != 0) try self.report(self.peek().span, "Синтаксическая ошибка: аннотации недопустимы для реэкспорта");
+                try declarations.append(self.result.allocator, try self.parseReexport());
+                continue;
+            }
+
             if (self.at(.function)) {
                 try declarations.append(self.result.allocator, try self.parseFunction(exported, doc, annotations));
                 continue;
             }
 
             if (self.at(.import)) {
-                if (exported) try self.report(self.peek().span, "Синтаксическая ошибка: 'экспорт' недопустим для импорта");
+                if (exported) try self.report(self.peek().span, "Синтаксическая ошибка: 'экспорт' недопустим для импорта (для реэкспорта используйте 'экспорт \"путь\"' без 'импорт')");
                 if (annotations.len != 0) try self.report(self.peek().span, "Синтаксическая ошибка: аннотации недопустимы для импорта");
                 try declarations.append(self.result.allocator, try self.parseImport());
                 continue;
@@ -272,6 +278,21 @@ const Parser = struct {
             .span = spanFrom(value.span, parameters.end.?),
             .name = name,
             .parameters = parameters.values,
+        } });
+    }
+
+    // `экспорт "путь"` (стиль Dart `export`) — НЕ 'как алиас': реэкспорт
+    // переносит имена ЦЕЛЕВОГО модуля как есть, плоско, не даёт
+    // локального доступа в этом файле вообще (для этого пишется
+    // отдельный обычный `импорт` того же пути) — см. doc-комментарий
+    // `ast.Decl.reexport`.
+    fn parseReexport(self: *Parser) !ast.DeclId {
+        const start = self.peek().span;
+        const path = try self.expect(.string, "Синтаксическая ошибка: после 'экспорт' ожидается строка пути (реэкспорт) или 'функ'/'тип'/'конст'");
+        self.consumeSemicolons();
+        return self.result.ast.addDecl(.{ .reexport = .{
+            .span = spanFrom(start, path.span),
+            .path = try self.result.ast.copyText(path.lexeme),
         } });
     }
 

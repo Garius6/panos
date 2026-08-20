@@ -329,6 +329,17 @@ pub const Decl = union(enum) {
         path: []const u8,
         alias: ?[]const u8 = null,
     },
+    // `экспорт "путь"` — реэкспорт (стиль Dart `export`): символы,
+    // экспортированные ЦЕЛЕВЫМ модулем, становятся видны ПОД ИХ
+    // РОДНЫМИ ИМЕНАМИ, ПЛОСКО (не через вложенный алиас) любому
+    // модулю, импортирующему ЭТОТ файл — но НЕ дают локального
+    // доступа в файле, где написана эта директива (для этого — отдельно
+    // обычный `импорт` того же пути). См. `buildExportsForTarget` в
+    // module_linker.zig.
+    reexport: struct {
+        span: source.Span,
+        path: []const u8,
+    },
     function: struct {
         span: source.Span,
         name: []const u8,

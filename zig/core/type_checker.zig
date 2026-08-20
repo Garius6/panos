@@ -151,6 +151,21 @@ pub const ImportedMethod = struct {
     store: *const types.TypeStore,
     type_id: types.TypeId,
     parameter_names: []const []const u8 = &.{},
+    // Собственные (не владельца-структуры) generic-параметры МЕТОДА —
+    // например `Тело`/`Ответ` в `функ отправить_пост[Тело: ИзJSON,
+    // Ответ: ВJSON](это: Приложение, ...)`. Симметрично `ImportedSymbolType.
+    // generic_parameters` (тот же перенос нужен для импортированных
+    // СВОБОДНЫХ generic-функций) — до появления этого поля метод,
+    // ссылающийся на СОБСТВЕННЫЙ generic-параметр где угодно, кроме
+    // непосредственно самого себя (например, ВНУТРИ типа функции —
+    // `функ() -> Тело` как тип параметра), при импорте молча
+    // вырождался в `poison` (`copyImportedType`'s `.generic_parameter`
+    // ветка: `generic_remap orelse return error.UnsupportedImportedType`,
+    // а `owner_remap` покрывает только generic-параметры ВЛАДЕЮЩЕЙ
+    // структуры, не собственные параметры метода) — найдено при
+    // реализации `быстряга` (panosiki), где `Приложение.отправить_пост`
+    // именно такой формы.
+    generic_parameters: ?[]const GenericParameter = null,
 };
 
 // Реализация интерфейса владельцем, перенесённая из исходного модуля.
@@ -821,7 +836,72 @@ const Checker = struct {
             try self.result.type_aliases.put(imported.symbol, copied);
         }
         for (imports.methods) |imported| {
-            const owner_remap = owner_remaps.getPtr(imported.owner);
+            // Собственные generic-параметры МЕТОДА (`отправить_пост[Тело:
+            // ИзJSON, ...]`) переносятся ОТДЕЛЬНО от `owner_remap` (тот
+            // покрывает только generic-параметры ВЛАДЕЮЩЕЙ структуры,
+            // например `Коробка[T]`) — тот же приём, что уже применяется
+            // чуть выше для импортированных СВОБОДНЫХ generic-функций
+            // (`imports.symbols`, см. `local_generic_remap`), просто
+            // объединённый с `owner_remap` в ОДНУ карту, потому что метод
+            // может одновременно ссылаться на generic-параметры и
+            // владельца, и свои собственные. Без этого `Тело`, встреченный
+            // ВНУТРИ типа параметра-функции (`функ() -> Тело`), молча
+            // вырождался в `poison` — `owner_remap` не содержал для него
+            // записи (см. `ImportedMethod.generic_parameters`'s
+            // doc-комментарий).
+            var combined_remap: ?std.AutoHashMap(types.TypeId, types.TypeId) = null;
+            defer if (combined_remap) |*map| map.deinit();
+            var method_parameters: []const GenericParameter = &.{};
+            if (imported.generic_parameters) |target_parameters| method_build: {
+                var remap = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
+                if (owner_remaps.getPtr(imported.owner)) |existing| {
+                    var it = existing.iterator();
+                    while (it.next()) |entry| try remap.put(entry.key_ptr.*, entry.value_ptr.*);
+                }
+                var local_parameters: std.ArrayList(GenericParameter) = .empty;
+                defer local_parameters.deinit(self.result.allocator);
+                var unsupported_contract = false;
+                for (target_parameters) |target_parameter| {
+                    const local_typ = try self.result.types.genericParameter(self.next_generic_parameter);
+                    self.next_generic_parameter += 1;
+                    try remap.put(target_parameter.typ, local_typ);
+                    var local_bounds: std.ArrayList(symbols.SymbolId) = .empty;
+                    defer local_bounds.deinit(self.result.allocator);
+                    for (target_parameter.bounds) |target_bound| {
+                        var remapped = false;
+                        for (imports.nominals) |nominal| {
+                            if (nominal.store != imported.store or nominal.source_symbol != target_bound) continue;
+                            try local_bounds.append(self.result.allocator, nominal.local_symbol);
+                            remapped = true;
+                            break;
+                        }
+                        // Тот же принцип "полный контракт или ничего", что
+                        // и у свободных generic-функций выше — отбросить
+                        // ограничение значило бы позволить неприведённому
+                        // значению дойти до интерфейсной диспетчеризации
+                        // исходного модуля во время выполнения.
+                        if (!remapped) {
+                            unsupported_contract = true;
+                            break;
+                        }
+                    }
+                    if (unsupported_contract) break;
+                    try local_parameters.append(self.result.allocator, .{
+                        .name = target_parameter.name,
+                        .typ = local_typ,
+                        .bounds = try self.result.arena.allocator().dupe(symbols.SymbolId, local_bounds.items),
+                    });
+                }
+                if (unsupported_contract) {
+                    remap.deinit();
+                    try self.result.unsupported_imports.put(imported.symbol, {});
+                    continue;
+                }
+                method_parameters = try self.result.arena.allocator().dupe(GenericParameter, local_parameters.items);
+                combined_remap = remap;
+                break :method_build;
+            }
+            const owner_remap = if (combined_remap) |*map| map else owner_remaps.getPtr(imported.owner);
             const copied = self.copyImportedType(imported.store, imported.type_id, imports.nominals, owner_remap) catch |err| switch (err) {
                 error.UnsupportedImportedType => continue,
                 else => return err,
@@ -829,14 +909,18 @@ const Checker = struct {
             try self.result.symbol_types.put(imported.symbol, copied);
             try self.result.imported_method_parameter_names.put(imported.symbol, imported.parameter_names);
             const owner_parameters = owner_parameters_by_symbol.get(imported.owner) orelse &.{};
+            var all_parameters: std.ArrayList(GenericParameter) = .empty;
+            defer all_parameters.deinit(self.result.allocator);
+            try all_parameters.appendSlice(self.result.allocator, owner_parameters);
+            try all_parameters.appendSlice(self.result.allocator, method_parameters);
             try self.result.methods.append(self.result.allocator, .{
                 .owner = imported.owner,
                 .interface = null,
                 .symbol = imported.symbol,
                 .name = imported.name,
                 .owner_parameters = owner_parameters,
-                .function_parameters = &.{},
-                .all_parameters = owner_parameters,
+                .function_parameters = method_parameters,
+                .all_parameters = try self.result.arena.allocator().dupe(GenericParameter, all_parameters.items),
             });
         }
         for (imports.impls) |imported| {
@@ -5425,6 +5509,28 @@ const Checker = struct {
         for (method.function_parameters) |parameter| {
             if (!substitutions.contains(parameter.typ)) try self.report(call.span, "Type Error: не удалось вывести type-параметр '{s}'", .{parameter.name});
         }
+        // Симметрично свободным generic-функциям (см. основной путь
+        // `.call` чуть выше в файле) — без этой проверки interface-bound
+        // (`[T: Интерфейс]`) на МЕТОДЕ молча не проверялся вообще: тип
+        // аргумента мог не реализовывать заявленный интерфейс, и об этом
+        // не сообщалось на этапе тайпчека (нашлось только в рантайме,
+        // как `Runtime Error: попытка вызвать интерфейсный метод у
+        // не-интерфейса` — компилятор ниже эмитил `call_interface`
+        // против аргумента, для которого так и не был сгенерирован
+        // `cast_interface`, потому что до этой правки единственная ветка
+        // ниже (`registerInterfaceCast`) молча ничего не делала для
+        // generic-параметра — actual/expected совпадали после подстановки
+        // T -> сам конкретный тип аргумента).
+        for (method.function_parameters) |parameter| {
+            const actual = substitutions.get(parameter.typ) orelse continue;
+            if (self.isPoison(actual)) continue;
+            for (parameter.bounds) |bound| {
+                if (!self.satisfiesInterfaceBound(actual, bound)) {
+                    const interface = self.resolution.symbols.get(bound) orelse continue;
+                    try self.report(call.span, "Type Error: тип аргумента не реализует ограничение '{s}'", .{interface.name});
+                }
+            }
+        }
         const receiver = try self.substituteGeneric(function.parameters[0], &substitutions);
         if (!self.assignable(object_type, receiver)) try self.report(call.span, "Type Error: получатель метода имеет неверный тип", .{});
         for (arguments[0..shared], function.parameters[1 .. shared + 1]) |argument, parameter| {
@@ -5432,12 +5538,78 @@ const Checker = struct {
             const actual = try self.inferExpected(argument, expected);
             if (!self.assignable(actual, expected)) {
                 try self.report(call.span, "Type Error: аргумент метода не совпадает с типом параметра", .{});
+            } else if (try self.genericInterfaceBounds(parameter, method.function_parameters)) |bounds| {
+                // Метод, чей type-параметр ограничен интерфейсом,
+                // вызванный с конкретным аргументом-структурой — та же
+                // причина, что у идентичной ветки в свободных
+                // generic-функциях (см. комментарий там): приведение
+                // АРГУМЕНТА к интерфейсу, а не к `expected` (который
+                // после подстановки — тот же конкретный тип, приведение-
+                // заглушка), позволяет `Cast_Interface`/`Invoke_Interface`
+                // диспетчеризовать вызов без мономорфизации.
+                try self.registerGenericInterfaceCasts(argument, actual, bounds);
             } else {
                 try self.registerInterfaceCast(argument, actual, expected);
             }
+            // Аргумент сам ФУНКЦИОНАЛЬНОГО типа (`нулевое_тело: функ() ->
+            // Тело`, `обработчик: функ(Тело) -> Отклик(Ответ)`), чья
+            // позиция ВОЗВРАТА — bound generic-параметр этого метода:
+            // ветка выше кастует АРГУМЕНТ целиком (саму функцию/
+            // замыкание) только когда generic-параметр — ТИП аргумента
+            // напрямую; она не применяется здесь (тип аргумента —
+            // `.function`, не сам bound generic-параметр). Значение,
+            // которое ВЕРНЁТ вызов этого замыкания ВНУТРИ ТЕЛА метода,
+            // никогда не приводится к интерфейсу — там оно всё ещё
+            // абстрактно (метод компилируется ОДИН раз, не мономорфно),
+            // конкретный тип известен ТОЛЬКО здесь, в точке ВЫЗОВА
+            // метода, где `actual`/аргумент — реальное замыкание с
+            // конкретным типом возврата. См. `registerNestedFunctionReturnInterfaceCasts`.
+            try self.registerNestedFunctionReturnInterfaceCasts(argument, parameter, method.function_parameters);
         }
         try self.result.method_calls.put(expression, method.symbol);
         return @as(?types.TypeId, try self.substituteGeneric(function.return_type, &substitutions));
+    }
+
+    // Находит СОБСТВЕННОЕ возвращаемое ВЫРАЖЕНИЕ лямбды-аргумента
+    // (`argument`), когда параметр метода, которому она соответствует
+    // (`raw_parameter`, ДО подстановки), — функциональный тип, чья
+    // позиция возврата ограничена интерфейсом (bound generic-параметр
+    // окружающего generic-метода/функции, `generic_parameters`) — и
+    // приводит ЭТО выражение к интерфейсу тем же `registerGenericInterfaceCasts`,
+    // что уже используется для АРГУМЕНТОВ, ограниченных напрямую.
+    // Реальный, найденный вживую (не вычитыванием кода) пробел: значение,
+    // ВОЗВРАЩЁННОЕ вызовом замыкания-параметра ВНУТРИ generic-тела
+    // (`панос build: аргумент.метод()` там, где `аргумент = нулевое_тело()`
+    // или `обработчик(x)`), никогда не оборачивалось интерфейсом — только
+    // значения, поступившие в generic-функцию НАПРЯМУЮ параметром,
+    // оборачивались (на этой, ВНЕШНЕЙ, конкретной стороне вызова).
+    // Обрабатывает только САМЫЙ частый практический случай — тело лямбды
+    // из ОДНОГО statement'а (обычный `функ(...) -> Т выражение конец`,
+    // без промежуточных `пер`/if/match) — оператор `возврат` где угодно
+    // внутри произвольного тела остаётся неподдержанным (см. research.md/
+    // tasks.md пакета `быстряга`, panosiki — там и была найдена вся эта
+    // цепочка).
+    fn registerNestedFunctionReturnInterfaceCasts(self: *Checker, argument: ast.ExprId, raw_parameter: types.TypeId, generic_parameters: []const GenericParameter) !void {
+        const parameter_entry = self.result.types.get(raw_parameter) orelse return;
+        const function_type = switch (parameter_entry.*) {
+            .function => |value| value,
+            else => return,
+        };
+        const bounds = try self.genericInterfaceBounds(function_type.return_type, generic_parameters) orelse return;
+        const lambda = switch (self.tree.expr(argument).*) {
+            .lambda => |value| value,
+            else => return,
+        };
+        if (lambda.body.len == 0) return;
+        const last_statement = self.tree.stmt(lambda.body[lambda.body.len - 1]).*;
+        const value_expression = switch (last_statement) {
+            .expr => |value| value.value,
+            .return_stmt => |value| value.value orelse return,
+            else => return,
+        };
+        const value_type = self.result.expression_types.get(value_expression) orelse return;
+        if (self.isPoison(value_type)) return;
+        try self.registerGenericInterfaceCasts(value_expression, value_type, bounds);
     }
 
     fn inferPreludeEnumMethod(self: *Checker, call: anytype, property: anytype, object_type: types.TypeId) !?types.TypeId {
@@ -5678,10 +5850,25 @@ const Checker = struct {
             var seen_bounds = std.AutoHashMap(symbols.SymbolId, void).init(self.result.allocator);
             defer seen_bounds.deinit();
             for (parameter.bounds) |bound_name| {
-                const bound = self.findTypeSymbol(bound_name) orelse {
-                    try self.report(self.resolution.symbols.get(symbol).?.span, "Type Error: неизвестный интерфейс '{s}'", .{bound_name});
-                    continue;
-                };
+                // Квалифицированное ограничение (`json.ВJSON`, см.
+                // `parser.zig`'s `parseTypeParameters`) закодировано как
+                // одна строка "модуль.Имя" через точку — разрешается
+                // через `findQualifiedTypeSymbol`, а не обычный
+                // `findTypeSymbol`, чтобы указывать НАПРЯМУЮ на реальный
+                // символ интерфейса исходного модуля, а не на локальный
+                // алиас-обходной путь (тот транзитивно ломал разрешение
+                // символа при межмодульном импорте метода, чей bound на
+                // него ссылается).
+                const bound = if (std.mem.indexOfScalar(u8, bound_name, '.')) |dot_index|
+                    self.findQualifiedTypeSymbol(bound_name[0..dot_index], bound_name[dot_index + 1 ..]) orelse {
+                        try self.report(self.resolution.symbols.get(symbol).?.span, "Type Error: неизвестный интерфейс '{s}'", .{bound_name});
+                        continue;
+                    }
+                else
+                    self.findTypeSymbol(bound_name) orelse {
+                        try self.report(self.resolution.symbols.get(symbol).?.span, "Type Error: неизвестный интерфейс '{s}'", .{bound_name});
+                        continue;
+                    };
                 if (!self.result.interface_definitions.contains(bound)) {
                     try self.report(self.resolution.symbols.get(symbol).?.span, "Type Error: ограничение '{s}' должно быть интерфейсом", .{bound_name});
                     continue;
@@ -6052,15 +6239,25 @@ pub fn checkWithImportContextForTarget(
     try checker.eagerAliasResolutionPass();
     try checker.preludePass();
     try checker.enumPass();
-    try checker.interfacePass();
-    // `nominalPass` (типы полей структур, ВКЛЮЧАЯ квалифицированные вроде
-    // `слог.Логгер`) должна запускаться ПОСЛЕ `importIdentityPass`, по
-    // той же причине, что уже задокументирована в doc-комментарии
-    // `importIdentityPass` для `signaturePass`: `nominalType` читает
-    // `imported_nominal_identities`, и квалифицированная аннотация,
-    // разрешённая до заполнения этой карты, молча получает identity=0
-    // вместо настоящей межмодульной идентичности.
+    // `interfacePass` (сигнатуры методов интерфейса, ВКЛЮЧАЯ
+    // квалифицированные типы вроде `json.Значение`) должна запускаться
+    // ПОСЛЕ `importIdentityPass` — та же причина, что уже
+    // задокументирована ниже для `nominalPass` (`nominalType` читает
+    // `imported_nominal_identities`). До этой правки метод интерфейса,
+    // объявленный С КВАЛИФИЦИРОВАННЫМ ТИПОМ в своей сигнатуре (например
+    // `тип X = интерфейс \n функ м() -> чужой_модуль.Тип \n конец`),
+    // получал identity=0 для этого типа — а любая РЕАЛИЗАЦИЯ этого
+    // метода (обрабатывается позже, `importSignaturePass`/`signaturePass`,
+    // ОБЕ уже после `importIdentityPass`) получала настоящую identity —
+    // `TypeStore.eql`'s `.nominal`-ветка переключается на СТРОГОЕ
+    // сравнение по identity, как только у ЛЮБОЙ стороны она ненулевая,
+    // так что совпадающий (тот же символ) тип отклонялся как
+    // "сигнатура метода не совпадает с интерфейсом" ИСКЛЮЧИТЕЛЬНО
+    // из-за этой рассинхронизации, не реального несовпадения типов.
+    // Найдено при реализации `быстряга` (panosiki) — `ОтветJSON =
+    // интерфейс \n функ в_json() -> json.Значение \n конец`.
     try checker.importIdentityPass(imports, &owner_remaps, &owner_parameters_by_symbol);
+    try checker.interfacePass();
     try checker.nominalPass();
     try checker.nativeNominalPass();
     // Должна запускаться ДО `signaturePass` — `реализация Интерфейс для

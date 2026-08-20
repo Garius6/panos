@@ -474,6 +474,10 @@ fn runGraph(
         .global_search_roots = global_search_roots,
         .program_args = program_args,
         .foreign_profile_enabled = profile_ffi,
+        // Одноразовый CLI-процесс — завершается сразу после этого запуска,
+        // не переиспользует `runtime`/`machine` для дальнейших вызовов —
+        // см. doc-комментарий `Vm.abandon_background_async_on_root_exit`.
+        .abandon_background_async_on_root_exit = true,
     });
     defer runtime.deinit();
     try runtime.load(&reader, entry_path);

@@ -19,6 +19,7 @@ pub const Runtime = struct {
     machine: ?panos_core.vm.Vm = null,
     program_args: []const []const u8,
     foreign_profile_enabled: bool,
+    abandon_background_async_on_root_exit: bool,
     stage: Stage = .empty,
 
     const Stage = enum {
@@ -34,6 +35,12 @@ pub const Runtime = struct {
         /// Значения, доступные скрипту через `ос.аргументы()` во время выполнения.
         program_args: []const []const u8 = &.{},
         foreign_profile_enabled: bool = false,
+        /// `true` только для настоящего одноразового CLI-запуска, где
+        /// процесс завершается сразу после `runStart()` — см. doc-комментарий
+        /// `Vm.abandon_background_async_on_root_exit` (vm.zig). Держите
+        /// `false` (умолчание), если `Runtime` переживёт `runStart()`/`call()`
+        /// и может быть использован снова.
+        abandon_background_async_on_root_exit: bool = false,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Runtime {
@@ -44,6 +51,7 @@ pub const Runtime = struct {
             .graph_state = graph_result,
             .program_args = config.program_args,
             .foreign_profile_enabled = config.foreign_profile_enabled,
+            .abandon_background_async_on_root_exit = config.abandon_background_async_on_root_exit,
         };
     }
 
@@ -80,6 +88,7 @@ pub const Runtime = struct {
         var machine = panos_core.vm.Vm.init(self.allocator, &compile_result.program);
         machine.program_args = self.program_args;
         machine.foreign_profile_enabled = self.foreign_profile_enabled;
+        machine.abandon_background_async_on_root_exit = self.abandon_background_async_on_root_exit;
         self.machine = machine;
     }
 

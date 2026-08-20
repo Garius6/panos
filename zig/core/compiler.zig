@@ -202,6 +202,31 @@ const Compiler = struct {
         }
     }
 
+    // Заполняет `Program.interface_methods` — резервный (interface_name,
+    // method_name, type_name) -> FunctionId путь диспетчеризации
+    // `call_interface` для значений, вошедших в generic-область БЕЗ
+    // Cast_Interface-обёртки (например, поле generic-типизированной
+    // структуры/перечисления, построенное СНАРУЖИ generic-контекста и
+    // никогда не прошедшее ни через один из известных compile-time
+    // cast-injection путей — `registerInterfaceCast`/
+    // `registerGenericInterfaceCasts`/`registerNestedFunctionReturnInterfaceCasts`
+    // в type_checker.zig). В отличие от `registerSingleMethodInterface`
+    // выше (один-единственный жёстко заданный интерфейс, `methods[0]`),
+    // здесь регистрируются ВСЕ методы ВСЕХ `реализация Интерфейс для Т` —
+    // общий, не завязанный на конкретный интерфейс, аналог того же
+    // приёма, что уже проверен в бою на Сравниваемое/Копируемое.
+    fn registerInterfaceMethods(self: *Compiler) !void {
+        for (self.checked.interface_implementations.items) |implementation| {
+            const interface = self.resolution.symbols.get(implementation.interface) orelse continue;
+            const target = self.resolution.symbols.get(implementation.target) orelse continue;
+            for (implementation.methods) |method_symbol| {
+                const method_entry = self.resolution.symbols.get(method_symbol) orelse continue;
+                const function_id = self.result.function_ids.get(method_symbol) orelse continue;
+                try self.program().addInterfaceMethod(interface.name, method_entry.name, target.name, function_id);
+            }
+        }
+    }
+
     fn registerComparableMethods(self: *Compiler) !void {
         try self.registerSingleMethodInterface("Сравниваемое", bytecode.Program.addComparableMethod);
     }
@@ -609,10 +634,18 @@ const FunctionCompiler = struct {
             };
             try self.compileExpression(property.object);
             for (call.arguments) |argument| try self.compileExpression(argument);
+            const interface_name = if (self.compiler.resolution.symbols.get(interface_call.interface)) |symbol| symbol.name else "";
+            const method_name = blk: {
+                const definition = self.compiler.checked.interface_definitions.get(interface_call.interface) orelse break :blk "";
+                if (interface_call.method_index >= definition.methods.len) break :blk "";
+                break :blk definition.methods[interface_call.method_index].name;
+            };
             try self.function.emit(self.compiler.result.allocator, .{ .call_interface = .{
                 .method_index = interface_call.method_index,
                 .vtable_index = interface_call.vtable_index,
                 .argument_count = @intCast(call.arguments.len),
+                .interface_name = interface_name,
+                .method_name = method_name,
             } });
             return;
         }
@@ -873,7 +906,15 @@ const FunctionCompiler = struct {
         }
         if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "спать_мс")) {
             try self.compileExpression(call.arguments[0]);
-            try self.function.emit(self.compiler.result.allocator, .{ .time_sleep = {} });
+            // Неблокирующий I/O (см. compileFilesystemBuiltin выше) — синхронный
+            // std.Io.sleep() блокировал бы ЕДИНСТВЕННЫЙ OS-поток интерпретатора
+            // целиком, останавливая планировщик кооперативных процессов вместе
+            // с ним: `запусти другой_процесс()` перед время.спать_мс(N) никогда
+            // не получал ни одного такта, пока текущий процесс спал (найдено
+            // вживую — HTTP-сервер, запущенный через `запусти`, не успевал
+            // забиндить порт за время сна вызывающего процесса).
+            try self.function.emit(self.compiler.result.allocator, .{ .time_sleep_submit = {} });
+            try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
             return true;
         }
         return false;
@@ -2304,6 +2345,7 @@ pub fn compileWithOptions(
     try compiler.predeclareLambdas();
     try compiler.registerComparableMethods();
     try compiler.registerCopyableMethods();
+    try compiler.registerInterfaceMethods();
     try compiler.compileFunctions();
     try compiler.compileLambdas();
     return result;

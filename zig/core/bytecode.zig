@@ -135,6 +135,7 @@ pub const Opcode = enum {
     time_now,
     time_monotonic,
     time_sleep,
+    time_sleep_submit,
     io_print,
     io_println,
     io_read_line,
@@ -237,6 +238,17 @@ pub const Instruction = union(Opcode) {
         method_index: u16,
         vtable_index: u16 = 0,
         argument_count: u16,
+        // Резервный путь для значения, вошедшего в generic-область БЕЗ
+        // Cast_Interface-обёртки (например, поле generic-типизированной
+        // структуры, построенной снаружи и не прошедшее через известную
+        // точку "оборачивания" — см. Vm.callInterface): если получатель на
+        // стеке — сырой `.aggregate`, а не `.interface`, ищем метод НАПРЯМУЮ
+        // по имени интерфейса/метода/структуры через
+        // `Program.interfaceMethod`, вместо паники "не-интерфейс". Пустая
+        // строка = нет имени (не должно происходить для реального
+        // generic-bound вызова, но безопасный fallback на старый фейл).
+        interface_name: []const u8 = "",
+        method_name: []const u8 = "",
     },
     spawn: u16,
     send: void,
@@ -304,6 +316,7 @@ pub const Instruction = union(Opcode) {
     time_now: void,
     time_monotonic: void,
     time_sleep: void,
+    time_sleep_submit: void,
     io_print: void,
     io_println: void,
     io_read_line: void,
@@ -427,11 +440,25 @@ pub const SingleMethodInterface = struct {
     function_id: FunctionId,
 };
 
+// Общая таблица (interface_name, method_name, type_name) -> FunctionId для
+// ЛЮБОЙ `реализация Интерфейс для Т` (не только Сравниваемое/Копируемое,
+// в отличие от `SingleMethodInterface` выше) — резервный путь диспетчеризации
+// `call_interface`, когда получатель НЕ обёрнут в `.interface` (см.
+// doc-комментарий поля `interface_name` у `call_interface` и
+// `Vm.callInterface`).
+pub const InterfaceMethod = struct {
+    interface_name: []const u8,
+    method_name: []const u8,
+    type_name: []const u8,
+    function_id: FunctionId,
+};
+
 pub const Program = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     functions: std.ArrayList(Function) = .empty,
     single_method_interfaces: std.ArrayList(SingleMethodInterface) = .empty,
+    interface_methods: std.ArrayList(InterfaceMethod) = .empty,
     entry: FunctionId = invalid_function,
 
     pub fn init(allocator: std.mem.Allocator) Program {
@@ -444,6 +471,7 @@ pub const Program = struct {
     pub fn deinit(self: *Program) void {
         for (self.functions.items) |*compiled_function| compiled_function.deinit(self.allocator);
         self.single_method_interfaces.deinit(self.allocator);
+        self.interface_methods.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.arena.deinit();
         self.* = undefined;
@@ -491,6 +519,27 @@ pub const Program = struct {
         const owner = type_name[0..separator];
         for (self.single_method_interfaces.items) |method| {
             if (std.mem.eql(u8, method.interface_name, interface_name) and std.mem.eql(u8, method.type_name, owner)) return method.function_id;
+        }
+        return null;
+    }
+
+    pub fn addInterfaceMethod(self: *Program, interface_name: []const u8, method_name: []const u8, type_name: []const u8, function_id: FunctionId) !void {
+        try self.interface_methods.append(self.allocator, .{
+            .interface_name = try self.copyString(interface_name),
+            .method_name = try self.copyString(method_name),
+            .type_name = try self.copyString(type_name),
+            .function_id = function_id,
+        });
+    }
+
+    pub fn interfaceMethod(self: *const Program, interface_name: []const u8, method_name: []const u8, type_name: []const u8) ?FunctionId {
+        for (self.interface_methods.items) |method| {
+            if (std.mem.eql(u8, method.interface_name, interface_name) and std.mem.eql(u8, method.method_name, method_name) and std.mem.eql(u8, method.type_name, type_name)) return method.function_id;
+        }
+        const separator = std.mem.indexOfScalar(u8, type_name, '.') orelse return null;
+        const owner = type_name[0..separator];
+        for (self.interface_methods.items) |method| {
+            if (std.mem.eql(u8, method.interface_name, interface_name) and std.mem.eql(u8, method.method_name, method_name) and std.mem.eql(u8, method.type_name, owner)) return method.function_id;
         }
         return null;
     }

@@ -821,7 +821,27 @@ const Parser = struct {
                 _ = self.next();
                 while (true) {
                     const bound = try self.expect(.ident, "Синтаксическая ошибка: ожидается интерфейс-ограничение");
-                    try bounds.append(self.result.allocator, try self.result.ast.copyText(bound.lexeme));
+                    // Квалифицированное ограничение (`[T: json.ВJSON]`) —
+                    // символ хранится как ОДНА строка "модуль.Имя" (через
+                    // точку), не отдельная AST-форма — `defineGenericParameters`
+                    // (type_checker.zig) распознаёт точку в имени и
+                    // переключается на `findQualifiedTypeSymbol` вместо
+                    // обычного `findTypeSymbol`. До этого квалифицированные
+                    // bound'ы были синтаксической ошибкой вовсе — единственным
+                    // обходным путём был локальный `тип X = модуль.Интерфейс`
+                    // псевдоним, который транзитивно ломал разрешение символа
+                    // при межмодульном импорте МЕТОДА, чей bound на него
+                    // ссылается (найдено при реализации `быстряга`,
+                    // panosiki).
+                    if (self.at(.dot)) {
+                        _ = self.next();
+                        const member = try self.expect(.ident, "Синтаксическая ошибка: ожидается имя интерфейса после '.'");
+                        const qualified = try std.fmt.allocPrint(self.result.allocator, "{s}.{s}", .{ bound.lexeme, member.lexeme });
+                        try bounds.append(self.result.allocator, try self.result.ast.copyText(qualified));
+                        self.result.allocator.free(qualified);
+                    } else {
+                        try bounds.append(self.result.allocator, try self.result.ast.copyText(bound.lexeme));
+                    }
                     if (!self.at(.plus)) break;
                     _ = self.next();
                 }

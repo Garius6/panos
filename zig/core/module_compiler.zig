@@ -334,6 +334,19 @@ const ImportContext = struct {
                 for (parameters, names) |parameter, *name| name.* = method_resolution.symbols.get(parameter).?.name;
                 break :blk names;
             };
+            // Собственные generic-параметры МЕТОДА (не владельца-структуры)
+            // — `отправить_пост[Тело: ИзJSON, ...]` — переносятся отдельно
+            // от `signature`/`store` выше (см. `ImportedMethod.
+            // generic_parameters`'s doc-комментарий: без этого `Тело`,
+            // встреченный ВНУТРИ типа параметра типа функции, молча
+            // вырождался в `poison` при импорте).
+            var method_generic_parameters: ?[]const type_checker.GenericParameter = null;
+            for (method_checked.methods.items) |definition| {
+                if (definition.symbol == source_method_symbol and definition.function_parameters.len != 0) {
+                    method_generic_parameters = definition.function_parameters;
+                    break;
+                }
+            }
             try self.methods.append(self.allocator, .{
                 .owner = owner_symbol,
                 .name = source_method.name,
@@ -341,6 +354,7 @@ const ImportContext = struct {
                 .store = &method_checked.types,
                 .type_id = signature,
                 .parameter_names = parameter_names,
+                .generic_parameters = method_generic_parameters,
             });
             try self.functions.append(self.allocator, .{ .symbol = local_method, .function_id = function_id });
         }
@@ -486,6 +500,19 @@ const ImportContext = struct {
                 for (parameters, names) |parameter, *name| name.* = target_resolution.symbols.get(parameter).?.name;
                 break :blk names;
             };
+            // См. идентичный комментарий в `appendMatchingMethods` —
+            // собственные generic-параметры МЕТОДА (не владельца-структуры)
+            // теряются без этого при прямом импорте (это ТОТ путь, что
+            // реально используется для `объект.метод(...)`, в отличие от
+            // `appendMatchingMethods`, который только для транзитивного
+            // ре-экспорта через промежуточный модуль).
+            var method_generic_parameters: ?[]const type_checker.GenericParameter = null;
+            for (target_checked.methods.items) |definition| {
+                if (definition.symbol == target_symbol and definition.function_parameters.len != 0) {
+                    method_generic_parameters = definition.function_parameters;
+                    break;
+                }
+            }
             try self.methods.append(self.allocator, .{
                 .owner = binding.owner,
                 .name = binding.name,
@@ -493,6 +520,7 @@ const ImportContext = struct {
                 .store = &target_checked.types,
                 .type_id = signature,
                 .parameter_names = parameter_names,
+                .generic_parameters = method_generic_parameters,
             });
             try self.functions.append(self.allocator, .{
                 .symbol = binding.symbol,

@@ -159,6 +159,7 @@ const AsyncPayload = union(enum) {
     // одновременных закреплений одного значения — в отличие от единственного
     // флага `in_flight` у Connection/FileHandle/SqlConnection.
     http_accept: struct { listener: *value.Listener, stream: ?std.Io.net.Stream, method: ?[]u8, path: ?[]u8, body: ?[]u8, headers: []HttpHeaderPair, err_message: ?[]u8 },
+    time_sleep: struct { millis: f64 },
 };
 
 const AsyncCompletion = struct {
@@ -239,6 +240,7 @@ fn freeAsyncPayload(payload: AsyncPayload) void {
             std.heap.page_allocator.free(data.headers);
             if (data.err_message) |message| std.heap.page_allocator.free(message);
         },
+        .time_sleep => {},
     }
 }
 
@@ -386,6 +388,25 @@ fn submitFileRead(vm: *Vm, path: []const u8, target_id: u64) void {
         }
     };
     const thread = std.Thread.spawn(.{}, Job.run, .{Job{ .queue = &vm.async_queue, .target_id = target_id, .path = owned_path }}) catch @panic("не удалось запустить фоновый поток фс.прочитать");
+    thread.detach();
+}
+
+fn submitTimeSleep(vm: *Vm, millis: f64, target_id: u64) void {
+    vm.async_queue.beginSubmit();
+    const Job = struct {
+        queue: *AsyncQueue,
+        target_id: u64,
+        millis: f64,
+
+        fn run(job: @This()) void {
+            const clamped: i64 = if (job.millis > 0) @intFromFloat(job.millis) else 0;
+            var io: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+            defer io.deinit();
+            std.Io.sleep(io.io(), .fromMilliseconds(clamped), .awake) catch {};
+            job.queue.push(.{ .target_id = job.target_id, .payload = .{ .time_sleep = .{ .millis = job.millis } } });
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Job.run, .{Job{ .queue = &vm.async_queue, .target_id = target_id, .millis = millis }}) catch @panic("не удалось запустить фоновый поток время.спать_мс");
     thread.detach();
 }
 
@@ -1407,6 +1428,22 @@ pub const Vm = struct {
     // "миллисекунды с момента старта VM" без нужды в отдельном хуке "старт
     // VM".
     monotonic_baseline_ns: ?i96 = null,
+    // По умолчанию false — при завершении корневого процесса runScheduler
+    // блокируется на joinAsyncPool(), пока не отчитаются ВСЕ отправленные
+    // async-задачи (см. AsyncQueue.joinAll). Это необходимо для встраивания
+    // (Runtime может звать call()/runStart() ПОВТОРНО на том же machine —
+    // осиротевший поток, дописывающий в уже переиспользуемую/освобождённую
+    // структуру после этого момента, был бы use-after-free) и для
+    // тестового харнесса (много run_code/run_module_file в ОДНОМ процессе
+    // `zig build test`). Но для настоящего одноразового CLI-запуска
+    // (`panos <скрипт>`, процесс завершается сразу после этого вызова)
+    // это же ожидание превращается в вечный дедлок: фоновый актор,
+    // запущенный через `запусти`, чей http.обслуживать(...) документированно
+    // "никогда не возвращается" (accept() навсегда в полёте, если больше не
+    // придёт ни одного соединения), не даёт joinAll() увидеть outstanding
+    // == 0. CLI выставляет этот флаг в true — ОС и так убьёт все detached-
+    // потоки мгновенно при завершении процесса, join там просто не нужен.
+    abandon_background_async_on_root_exit: bool = false,
     // `ввод_вывод.печать`/`.строка` накапливают здесь, а не пишут напрямую
     // в реальный fd — на freestanding wasm32 browser-интерпретаторе
     // РЕАЛЬНОГО fd вообще нет (см. пакетную модель "выполнить до конца,
@@ -1648,6 +1685,7 @@ pub const Vm = struct {
             .time_now => try self.timeNow(),
             .time_monotonic => try self.timeMonotonic(),
             .time_sleep => try self.timeSleep(),
+            .time_sleep_submit => try self.timeSleepSubmit(),
             .io_print => try self.ioPrint(false),
             .io_println => try self.ioPrint(true),
             .io_read_line => try self.ioReadLine(),
@@ -2463,6 +2501,33 @@ pub const Vm = struct {
         defer io.deinit();
         std.Io.sleep(io.io(), .fromMilliseconds(clamped), .awake) catch {};
         try self.stack.append(self.allocator, .{ .number = millis });
+    }
+
+    // Неблокирующий вариант timeSleep() выше — submit кладёт задачу в
+    // воркер-пул и возвращает управление немедленно, await_async
+    // (эмитится компилятором сразу после) — единственная точка настоящей
+    // приостановки процесса. См. compiler.zig compileTimeBuiltin: без
+    // этого `запусти другой_процесс()` перед время.спать_мс(N) никогда
+    // не получал такта планировщика, пока текущий процесс "спал", потому
+    // что синхронный std.Io.sleep() блокировал единственный OS-поток
+    // целиком.
+    fn timeSleepSubmit(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("время::спать_мс", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "время::спать_мс", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const millis = try self.number(try self.pop());
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: время.спать_мс() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'время::спать_мс' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        submitTimeSleep(self, millis, process.id);
     }
 
     // Блокирующее построчное чтение реального stdin — `native_only` по
@@ -5025,6 +5090,33 @@ pub const Vm = struct {
         const interface_index = self.stack.items.len - argument_count - 1;
         const interface = switch (self.stack.items[interface_index]) {
             .interface => |interface_value| interface_value,
+            .aggregate => |aggregate| {
+                // Значение вошло в generic-область БЕЗ Cast_Interface-обёртки
+                // (например, поле generic-типизированной структуры,
+                // построенное СНАРУЖИ generic-контекста, не через один из
+                // известных compile-time cast-injection путей — найдено
+                // вживую на `быстряга`: `Отклик(Ответ).тело`, где `Ответ`
+                // — generic-bound поле, построенное внутри лямбды-обработчика
+                // до пересечения generic-границы). Резервная диспетчеризация
+                // напрямую по имени (interface_name, method_name, type_name)
+                // — тот же проверенный приём, что уже используют
+                // Сравниваемое/Копируемое (`Program.comparableMethod` и
+                // т.п.), просто обобщённый на любой интерфейс. `call_info`
+                // без имён (пустые строки, см. bytecode.zig) — единственный
+                // существующий вызывающий это `for ... в` для Итерируемое —
+                // просто не найдёт совпадения и провалится в исходный fault
+                // ниже, поведение не меняется.
+                if (aggregate.name) |type_name| {
+                    if (self.program.interfaceMethod(call_info.interface_name, call_info.method_name, type_name)) |target_function_id| {
+                        self.stack.items[interface_index] = .{ .function_ref = target_function_id };
+                        try self.stack.insert(self.allocator, interface_index + 1, .{ .aggregate = aggregate });
+                        try self.call(@intCast(argument_count + 1));
+                        return;
+                    }
+                }
+                try self.fault("Runtime Error: попытка вызвать интерфейсный метод у не-интерфейса", .{});
+                return;
+            },
             else => {
                 try self.fault("Runtime Error: попытка вызвать интерфейсный метод у не-интерфейса", .{});
                 return;
@@ -5540,14 +5632,14 @@ pub const Vm = struct {
                         process.status = .completed;
                         completeTask(process, .{ .completed = result });
                         if (process == root) {
-                            self.joinAsyncPool();
+                            if (!self.abandon_background_async_on_root_exit) self.joinAsyncPool();
                             return .{ .success = result };
                         }
                         try self.notifyWatchers(process, null);
                     },
                     .failed => {
                         if (process == root) {
-                            self.joinAsyncPool();
+                            if (!self.abandon_background_async_on_root_exit) self.joinAsyncPool();
                             return .{ .runtime_error = if (self.failure) |failure| failure.bytes else "Runtime Error: неизвестная ошибка" };
                         }
                         try self.terminateFailedProcess(process);
@@ -5754,6 +5846,7 @@ pub const Vm = struct {
                 const request = try self.heap.createHttpRequest(data.stream.?, method, path, body, headers);
                 return self.buildSuccessResultValue(.{ .http_request = request });
             },
+            .time_sleep => |data| return .{ .number = data.millis },
         }
     }
 
@@ -6190,7 +6283,18 @@ pub const Vm = struct {
 
     fn getProperty(self: *Vm, field: u16) anyerror!void {
         const object = try self.pop();
-        const aggregate = switch (object) {
+        // `.interface` — та же ситуация, что и раскрытая в `callInterface`
+        // (см. её doc-комментарий): значение, пересёкшее generic-границу,
+        // МОГЛО получить Cast_Interface-обёртку, даже когда компилятор в
+        // ТОЧКЕ ДОСТУПА к полю уже знает конкретный тип (например,
+        // параметр лямбды с явной конкретной аннотацией типа) и ожидает
+        // сырую структуру. Обёртка всё ещё несёт исходную структуру в
+        // `.receiver` — прозрачно разворачиваем вместо паники.
+        const unwrapped = switch (object) {
+            .interface => |interface_value| interface_value.receiver,
+            else => object,
+        };
+        const aggregate = switch (unwrapped) {
             .aggregate => |aggregate| aggregate,
             else => {
                 try self.fault("Runtime Error: доступ к полю поддержан только для структуры", .{});
@@ -6207,7 +6311,11 @@ pub const Vm = struct {
     fn setProperty(self: *Vm, field: u16) anyerror!void {
         const replacement = try self.pop();
         const object = try self.pop();
-        const aggregate = switch (object) {
+        const unwrapped = switch (object) {
+            .interface => |interface_value| interface_value.receiver,
+            else => object,
+        };
+        const aggregate = switch (unwrapped) {
             .aggregate => |aggregate| aggregate,
             else => {
                 try self.fault("Runtime Error: доступ к полю поддержан только для структуры", .{});

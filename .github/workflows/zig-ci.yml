@@ -52,11 +52,21 @@ jobs:
       # проверяемое, стабильное поведение) сам PATH не расширяет за
       # пределы своего собственного шага — `$GITHUB_PATH` дописывается
       # явно ниже.
+      #
+      # ВЕРСИЯ ЗАФИКСИРОВАНА (--version), не "latest" — их install.sh без
+      # аргумента резолвит "latest" через НЕаутентифицированный GitHub API
+      # (`api.github.com/.../releases/latest`), который на shared-раннерах
+      # GitHub Actions периодически хватает rate-limit/пустой ответ; сам
+      # install.sh на этот случай не проверяет ошибку и подставляет пустую
+      # строку как версию — `curl` затем валится на "nested brace in URL"
+      # (реальный, воспроизведённый инцидент). Фиксированная версия убирает
+      # сетевой запрос к их API целиком — обновлять здесь вручную по мере
+      # выхода новых релизов wasmtime, не автоматически.
       - name: Установить wasmtime
         shell: bash
         run: |
           set -euo pipefail
-          curl https://wasmtime.dev/install.sh -sSf | bash
+          curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version v48.0.0
           # Официальный установщик только пишет PATH-экспорт в shell-профиль
           # (`~/.bashrc` и т.п.) — следующий шаг workflow это не прочитает,
           # нужно явно продлить `$GITHUB_PATH` на весь остаток job'а.
@@ -142,15 +152,21 @@ jobs:
       # (needs `msiexec`, a real system-level install, registry lookups
       # to find where it landed) — the release also ships a plain `.zip`
       # with just `wasmtime.exe` inside, matching the same "download,
-      # extract, extend PATH" shape the Linux/macOS step uses. Resolves
-      # "latest" via the GitHub API at run time instead of pinning a
-      # version here.
+      # extract, extend PATH" shape the Linux/macOS step uses.
+      #
+      # Version PINNED (not "latest" resolved via the GitHub API) — the
+      # macOS/Linux job hit a real incident where the unauthenticated
+      # `releases/latest` API call from a shared GitHub Actions runner IP
+      # got rate-limited/empty, and the installer had no error handling
+      # for that, silently breaking the whole CI run. Same API call here,
+      # same exposure — pinned to avoid the network dependency entirely.
+      # Update this tag by hand when bumping the macOS/Linux pin above.
       - name: Установить wasmtime
         shell: pwsh
         run: |
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/bytecodealliance/wasmtime/releases/latest"
-          $asset = $release.assets | Where-Object { $_.name -like "wasmtime-*-x86_64-windows.zip" } | Select-Object -First 1
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\wasmtime.zip"
+          $version = "v48.0.0"
+          $assetUrl = "https://github.com/bytecodealliance/wasmtime/releases/download/$version/wasmtime-$version-x86_64-windows.zip"
+          Invoke-WebRequest -Uri $assetUrl -OutFile "$env:RUNNER_TEMP\wasmtime.zip"
           Expand-Archive -Path "$env:RUNNER_TEMP\wasmtime.zip" -DestinationPath "$env:RUNNER_TEMP\wasmtime" -Force
           $extractedDir = Get-ChildItem -Path "$env:RUNNER_TEMP\wasmtime" -Directory | Select-Object -First 1
           Add-Content -Path $env:GITHUB_PATH -Value $extractedDir.FullName

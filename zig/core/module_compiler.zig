@@ -114,6 +114,20 @@ const ImportContext = struct {
         self.methods.deinit(self.allocator);
         self.nominals.deinit(self.allocator);
         self.type_aliases.deinit(self.allocator);
+        for (self.imported_types.items) |imported| {
+            // Тот же паттерн высвобождения, что и у `self.methods` выше —
+            // free-функция верхнего уровня (`jwt_извлечь[Т: ...]`) хранит
+            // свои переотображённые generic-параметры здесь, не в
+            // `self.methods`, и `translateGenericParameterBounds` для НЕЁ
+            // тоже всегда выделяет заново (см. её же комментарий) — без
+            // этой пары свободных этот путь тихо тёк на каждую
+            // скомпилированную генерик-функцию, импортированную напрямую
+            // (`.function`-ветка в `collect()` выше).
+            if (imported.generic_parameters) |parameters| {
+                for (parameters) |parameter| self.allocator.free(parameter.bounds);
+                self.allocator.free(parameters);
+            }
+        }
         self.imported_types.deinit(self.allocator);
         self.* = undefined;
     }
@@ -525,11 +539,27 @@ const ImportContext = struct {
                 .function => {
                     const signature = target_checked.symbol_types.get(target_symbol) orelse continue;
                     const function_id = target_compiled.function_ids.get(target_symbol) orelse continue;
+                    // Тот же двухходовой перевод bounds, что уже применяется
+                    // к МЕТОДАМ ниже (`translateGenericParameterBounds`,
+                    // см. её doc-комментарий) — без него генерик-ограничение
+                    // свободной функции (`jwt_извлечь[Т: валидация.ТелоJSON]`),
+                    // объявленное в ТРЕТЬЕМ модуле относительно и функции, и
+                    // потребителя, сравнивалось по сырому SymbolId и никогда
+                    // не совпадало с собственным импортом потребителя того
+                    // же интерфейса — "полный контракт или ничего" молча
+                    // помечало функцию unsupported (`Type Error:
+                    // импортированный экспорт '...' использует пока
+                    // неподдерживаемый тип`) при первом же вызове.
+                    const raw_generic_parameters = target_checked.generic_function_parameters.get(target_symbol);
+                    const translated_generic_parameters = if (raw_generic_parameters) |value|
+                        try self.translateGenericParameterBounds(target_resolution, nominal_identities, next_nominal_identity, value)
+                    else
+                        null;
                     try self.imported_types.append(self.allocator, .{
                         .symbol = imported_symbol,
                         .store = &target_checked.types,
                         .type_id = signature,
-                        .generic_parameters = target_checked.generic_function_parameters.get(target_symbol),
+                        .generic_parameters = translated_generic_parameters,
                     });
                     try self.functions.append(self.allocator, .{
                         .symbol = imported_symbol,

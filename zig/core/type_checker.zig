@@ -777,12 +777,28 @@ const Checker = struct {
                     defer local_bounds.deinit(self.result.allocator);
                     for (target_parameter.bounds) |target_bound| {
                         var remapped = false;
+                        // Двухходовой bound (интерфейс объявлен в ТРЕТЬЕМ
+                        // модуле относительно и функции, и потребителя) уже
+                        // переведён в ЛОКАЛЬНЫЙ символ ЭТОГО потребителя
+                        // module_compiler.zig's translateGenericParameterBounds
+                        // (identity-based) — совпадение по local_symbol
+                        // проверяется первым, тот же порядок, что и у
+                        // импортированных МЕТОДОВ ниже. Одноходовой (bound
+                        // объявлен в том же модуле, что и функция) остаётся
+                        // непереведённым — совпадает по старому пути.
                         for (imports.nominals) |nominal| {
+                            if (nominal.local_symbol == target_bound) {
+                                try local_bounds.append(self.result.allocator, nominal.local_symbol);
+                                remapped = true;
+                                break;
+                            }
+                        }
+                        if (!remapped) for (imports.nominals) |nominal| {
                             if (nominal.store != imported.store or nominal.source_symbol != target_bound) continue;
                             try local_bounds.append(self.result.allocator, nominal.local_symbol);
                             remapped = true;
                             break;
-                        }
+                        };
                         // Ограничение — часть контракта экспортируемой
                         // функции. Отбросить его — значит превратить
                         // `[T: Интерфейс]` в `[T]` и позволить неприведённому

@@ -535,6 +535,18 @@
       }
     },
     {
+      "id": "graph-generic-function-two-hop-bound",
+      "tier": "graph",
+      "profile": "native",
+      "input": "fixtures/generic_function_two_hop_bound_main.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "result": "true",
+        "stdout": "true"
+      }
+    },
+    {
       "id": "graph-json",
       "tier": "graph",
       "profile": "native",

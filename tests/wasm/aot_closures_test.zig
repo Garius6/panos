@@ -777,3 +777,116 @@ test "DOM.на_клик's отправить() actually drives the actor to proc
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("2", result.stdout);
 }
+
+// До этой правки `DOM.на_клик` требовал, чтобы второй аргумент был
+// ЛИТЕРАЛЬНЫМ `.lambda`-выражением непосредственно на месте вызова
+// (`lowerDomClickClosure`) — обработчик, пришедший ИЗДАЛЕКА (параметр,
+// поле структуры, элемент Опция), падал компиляцией. Настоящий фикс —
+// promoteClosureBoxToPermanent теперь вызывается УНИВЕРСАЛЬНО при
+// ПОСТРОЕНИИ любого замыкания (`lowerLambda`/`lowerSymbolValueRef`), не
+// только для литерала прямо в DOM.на_клик — так что к моменту, когда
+// хендлер, прошедший через Опция(функ(...)->Пусто) поле структуры,
+// понижается здесь, он уже лежит в постоянной памяти, откуда бы ни
+// пришёл. Тест — реальный марьяшка-паттерн (обычная именованная
+// функция, обёрнутая в Опция.Есть, извлечённая через выбор/Есть,
+// переданная в DOM.на_клик), проверенный через РЕАЛЬНЫЙ сброс арены
+// (`@invoke_click` вызван ОТДЕЛЬНО от старт(), как и остальные тесты
+// этого файла).
+test "DOM.на_клик accepts a handler stored in a struct field's Опция, not just a lambda literal" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\импорт DOM
+        \\
+        \\тип Узел = структура
+        \\    обработчик: Опция(функ(DOM.СобытиеКлика) -> Пусто)
+        \\конец
+        \\
+        \\функ мой_обработчик(_: DOM.СобытиеКлика) -> Пусто
+        \\    DOM.установить_текст("#результат", 42.0)
+        \\конец
+        \\
+        \\функ монтировать(у: Узел) -> Пусто
+        \\    выбор у.обработчик
+        \\        Есть(обработчик) тогда
+        \\            DOM.на_клик("#кнопка", обработчик)
+        \\        конец
+        \\        Нет тогда
+        \\        конец
+        \\    конец
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    монтировать(Узел(Опция.Есть(мой_обработчик)))
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_closure_via_option_field.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const script =
+        \\const fs = require("fs");
+        \\(async () => {
+        \\  let handler = 0;
+        \\  let observed = 0;
+        \\  const bytes = fs.readFileSync(process.argv[1]);
+        \\  const imports = { env: {
+        \\    dom_on_click: (_selector, box) => { handler = box; },
+        \\    dom_set_text_num: (_selector, value) => { observed = value; },
+        \\  } };
+        \\  const { instance } = await WebAssembly.instantiate(bytes, imports);
+        \\  instance.exports["старт"]();
+        \\  if (handler === 0) throw new Error("handler was never registered");
+        \\  instance.exports["@invoke_click"](handler, 0, 0, 0, 0, 0, 0, 0);
+        \\  if (observed !== 42) throw new Error(`expected 42, got ${observed}`);
+        \\  process.stdout.write(String(observed));
+        \\})().catch((error) => { console.error(error); process.exit(1); });
+    ;
+    const result = try std.process.run(allocator, io.io(), .{
+        .argv = &.{ "node", "-e", script, wasm_path },
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("42", result.stdout);
+}
+
+// Верхнеуровневая `конст` компилируется ПОДСТАНОВКОЙ на месте
+// использования (см. `compiler.zig`'s `predeclareConstants` —
+// байткод-путь) — у AOT-пути раньше не было параллельной логики
+// вообще, и ЛЮБАЯ ссылка на такую константу как на обычное значение
+// (не в тривиальном контексте, который typechecker мог развернуть
+// иначе) падала в `lowerSymbolValueRef`'s catch-all с "символ не
+// является локалью или функцией". Найдено при разработке
+// panosiki/марьяшка (константа, переданная аргументом функции).
+test "a top-level конст referenced as a function argument lowers correctly under AOT WASM" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\экспорт конст ШИРИНА = 21.0
+        \\
+        \\функ удвоить(x: Число) -> Число
+        \\x * 2.0
+        \\конец
+        \\
+        \\функ старт() -> Число
+        \\удвоить(ШИРИНА)
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_toplevel_const_as_arg.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRun(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+}

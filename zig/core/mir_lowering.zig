@@ -1618,6 +1618,42 @@ fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytyp
     return ctx.unsupported("неизвестное поле структуры");
 }
 
+// Раскладка box/env-указателей замыкания — одна и та же тройка
+// builtin-типов везде, где строится этот box (было продублировано в
+// нескольких местах до этой функции: `lowerDomClickClosure`,
+// `promoteClosureBoxToPermanent`'s caller). `ptr_type`/`idx_type`/
+// `bool_type` — не буквально то, чем управляют по смыслу (все три поля
+// box'а — i32-адреса), просто сколько builtin `TypeId` нужно
+// `wasm_heap.PtrLayout`'у, чтобы получить нужные WASM-типы через
+// `wasmValTypeForStore` не завися от Zig-констант напрямую.
+fn closureBoxLayout(ctx: *LoweringContext) wasm_heap.PtrLayout {
+    return .{
+        .ptr_type = ctx.checked.types.builtins.string,
+        .idx_type = ctx.checked.types.builtins.boolean,
+        .bool_type = ctx.checked.types.builtins.boolean,
+    };
+}
+
+// Линейный обход — константы верхнего уровня редки (обычно единицы на
+// файл), тот же порядок стоимости, что и у `predeclareConstants` в
+// `compiler.zig`, которая делает ровно такой же проход один раз на
+// компиляцию. Возвращает выражение-значение объявления `конст`, если
+// `symbol` — символ ЭТОЙ константы в ТЕКУЩЕМ модуле (`ctx.tree`) —
+// см. doc-комментарий места вызова про то, почему подстановка
+// достаточна вместо отдельного хранилища значений.
+fn findConstantValueExpr(ctx: *LoweringContext, symbol: symbols.SymbolId) ?ast.ExprId {
+    const program = ctx.tree.program orelse return null;
+    for (program.declarations) |declaration| {
+        const constant = switch (ctx.tree.decl(declaration).*) {
+            .constant => |value| value,
+            else => continue,
+        };
+        const decl_symbol = ctx.resolution.decl_symbols.get(declaration) orelse continue;
+        if (decl_symbol == symbol) return constant.value;
+    }
+    return null;
+}
+
 fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: source.Span) !mir.ValueId {
     // Захваченный символ, разрешаемый ВНУТРИ тела лямбды — см.
     // собственный doc-комментарий `CaptureEnv`. Проверяется ПЕРЕД
@@ -1640,6 +1676,24 @@ fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: so
         try ctx.builder.emit(.{ .load_local = .{ .dst = dst, .local = local } });
         return dst;
     }
+    // Константа верхнего уровня (`[экспорт] конст ИМЯ = <литерал>`) — не
+    // локаль и не функция, компилируется ПОДСТАНОВКОЙ значения на месте
+    // использования (см. `compiler.zig`'s `predeclareConstants`/
+    // `topLevelConstant` — байткод-путь). У AOT-пути не было
+    // параллельной логики вообще — ЛЮБАЯ ссылка на такую константу как
+    // на обычное значение (аргумент вызова, элемент структуры и т.п.)
+    // падала здесь с невнятным "символ не является локалью или
+    // функцией". Typechecker ограничивает константу верхнего уровня
+    // числовым/строковым/булевым литералом (`isTopLevelConstantLiteral`,
+    // `type_checker.zig`), так что просто повторно понижаем
+    // ОПРЕДЕЛЯЮЩЕЕ выражение константы — тот же литерал, что байткод-
+    // путь заранее посчитал один раз и закэшировал, без отдельного
+    // AOT-хранилища значений.
+    if (findConstantValueExpr(ctx, symbol)) |value_expr| {
+        const outcome = try lowerExpr(ctx, value_expr);
+        if (outcome.flow == .terminates) return ctx.unsupported("константа с нетерминирующимся определяющим выражением");
+        return outcome.value;
+    }
     if (ctx.symbol_to_function.get(symbol)) |function_id| {
         // Обычная именованная функция, используемая как обычное ЗНАЧЕНИЕ
         // (не вызываемая немедленно — собственный быстрый путь
@@ -1652,7 +1706,13 @@ fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: so
         // обёртку с игнорируемым `env_ptr`.
         const dst = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
         try ctx.builder.emit(.{ .build_closure = .{ .dst = dst, .function = function_id, .captured = &.{}, .already_env_aware = false } });
-        return dst;
+        // Продвигаем в постоянную память СРАЗУ при построении — см.
+        // doc-комментарий `promoteEveryClosureAtConstruction` ниже:
+        // функция-значение, использованная как ОБЫЧНЫЕ данные (аргумент,
+        // поле структуры, элемент Опция/перечисления), должна пережить
+        // сброс per-call арены, где бы она в итоге ни была ИСПОЛЬЗОВАНА —
+        // не только при непосредственной передаче в DOM.на_клик.
+        return try promoteClosureBoxToPermanent(ctx, closureBoxLayout(ctx), dst, &.{}, 0);
     }
     _ = span;
     return ctx.unsupported("символ не является локалью или функцией");
@@ -1682,6 +1742,25 @@ fn lambdaReturnType(checked: *const type_checker.CheckResult, expression: ast.Ex
 fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) anyerror!ExprOutcome {
     const captures = ctx.resolution.lambda_captures.get(expression) orelse &.{};
     if (captures.len > std.math.maxInt(u16)) return ctx.unsupported("лямбда захватывает слишком много значений");
+
+    // КАЖДАЯ лямбда теперь продвигается в постоянную память сразу при
+    // построении (см. вызов promoteClosureBoxToPermanent ниже) — раньше
+    // эта проверка (и флаг `actor_captured_by_dom_closure`) жила только
+    // в `lowerDomClickClosure`, потому что только ТАМ действительно
+    // происходило продвижение. Теперь продвижение универсально, значит
+    // и проверка/флаг должны быть универсальны — Процесс, захваченный
+    // ЛЮБОЙ лямбдой (не только буквально вторым аргументом DOM.на_клик),
+    // одинаково нуждается в том, чтобы `expandSpawn` (wasm_actors.zig)
+    // с самого начала выделил его базовый фрейм в постоянной памяти.
+    for (captures) |capture_symbol| {
+        const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
+        if (isProcessCapture(ctx.checked, capture_type)) {
+            ctx.builder.module.actor_captured_by_dom_closure = true;
+        }
+        if (classifyCapture(ctx.checked, capture_type) == .unsupported) {
+            return ctx.unsupported("лямбда захватывает рекурсивный/обобщённый агрегат или иной неподдержанный тип");
+        }
+    }
 
     const arena = ctx.builder.module.arena.allocator();
     var captured_values: std.ArrayList(mir.ValueId) = .empty;
@@ -1740,7 +1819,16 @@ fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) a
 
     const dst = try ctx.builder.newValue(ctx.checked.expression_types.get(expression) orelse ctx.checked.types.builtins.boolean);
     try ctx.builder.emit(.{ .build_closure = .{ .dst = dst, .function = lambda_function_id, .captured = captured_slice, .already_env_aware = true } });
-    return continuesWith(dst);
+    // См. `promoteEveryClosureAtConstruction` (doc-комментарий у
+    // `closureBoxLayout`/`lowerSymbolValueRef`) — КАЖДАЯ лямбда,
+    // независимо от того, куда её значение в итоге попадёт (передана
+    // как аргумент, сохранена в поле структуры, обёрнута в Опция),
+    // должна пережить сброс per-call арены. Раньше это гарантировалось
+    // только для лямбды, буквально стоящей ВТОРЫМ аргументом
+    // DOM.на_клик (`lowerDomClickClosure`) — любое иное использование
+    // замыкания как обычного значения падало компиляцией.
+    const promoted = try promoteClosureBoxToPermanent(ctx, closureBoxLayout(ctx), dst, captures, 0);
+    return continuesWith(promoted);
 }
 
 fn emitFunctionRef(ctx: *LoweringContext, function_id: mir.FunctionId) !mir.ValueId {
@@ -3028,18 +3116,21 @@ fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayo
     return try wasm_heap.loadLocal(&ctx.builder, new_box_local, layout.ptr_type);
 }
 
-// `DOM.на_клик(selector, обработчик)` сознательно требует, чтобы
-// аргумент обработчика был литеральным выражением `.lambda` ПРЯМО НА
-// МЕСТЕ ВЫЗОВА (не произвольным значением типа замыкания откуда-то ещё)
-// — именно это делает список захватов статически инспектируемым здесь
-// через `lambda_captures`.
+// `DOM.на_клик(selector, обработчик)` раньше требовал, чтобы
+// `обработчик` был литеральным выражением `.lambda` ПРЯМО НА МЕСТЕ
+// ВЫЗОВА — единственный способ статически знать список захватов ДЛЯ
+// ПРОМОУШЕНА в постоянную память. С тех пор, как продвижение стало
+// свойством ПОСТРОЕНИЯ любого замыкания (`lowerLambda`/
+// `lowerSymbolValueRef` вызывают `promoteClosureBoxToPermanent` сами,
+// сразу при `.build_closure`), к моменту, когда `handler_expr`
+// понижается здесь через обычный `lowerExpr`, результат УЖЕ лежит в
+// постоянной памяти, откуда бы он ни пришёл — лямбда-литерал, простая
+// именованная функция, параметр, поле структуры, элемент Опция. Эта
+// функция больше не строит и не продвигает box сама — только проверяет
+// сигнатуру обработчика и вызывает builtin.
 fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutcome {
     if (call.arguments.len != 2) return ctx.unsupported("DOM.на_клик() ожидает 2 аргумента");
     const handler_expr = call.arguments[1];
-    switch (ctx.tree.expr(handler_expr).*) {
-        .lambda => {},
-        else => return ctx.unsupported("DOM.на_клик() ожидает лямбда-выражение непосредственно на месте вызова"),
-    }
     const handler_type = ctx.checked.expression_types.get(handler_expr) orelse return ctx.unsupported("DOM.на_клик(): не удалось определить тип обработчика");
     const handler_signature = switch ((ctx.checked.types.get(handler_type) orelse return ctx.unsupported("DOM.на_клик(): неизвестный тип обработчика")).*) {
         .function => |function| function,
@@ -3047,28 +3138,7 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     };
     if (handler_signature.parameters.len != 1) return ctx.unsupported("DOM.на_клик(): обработчик должен принимать DOM.СобытиеКлика");
     const event_type = handler_signature.parameters[0];
-    const captures = ctx.resolution.lambda_captures.get(handler_expr) orelse &.{};
-    for (captures) |capture_symbol| {
-        const capture_type = ctx.checked.symbol_types.get(capture_symbol) orelse ctx.checked.types.builtins.void;
-        // Захваченному `Процесс` нужно, чтобы его базовый фрейм был
-        // выделен в ПОСТОЯННОЙ памяти — помечаем это для последующего
-        // чтения `expandSpawn` в `wasm_actors.zig`; `.process => .scalar`
-        // в `classifyCaptureDepth` уже трактует сам захват как обычное
-        // копирование указателя, безопасное, как только этот флаг делает
-        // базовую аллокацию постоянной.
-        if (isProcessCapture(ctx.checked, capture_type)) {
-            ctx.builder.module.actor_captured_by_dom_closure = true;
-        }
-        if (classifyCapture(ctx.checked, capture_type) == .unsupported) {
-            return ctx.unsupported("DOM.на_клик(): захват рекурсивного/обобщённого агрегата или иного неподдержанного типа");
-        }
-    }
-
-    const layout = wasm_heap.PtrLayout{
-        .ptr_type = ctx.checked.types.builtins.string,
-        .idx_type = ctx.checked.types.builtins.boolean,
-        .bool_type = ctx.checked.types.builtins.boolean,
-    };
+    const layout = closureBoxLayout(ctx);
 
     // Сохраняем порядок вычисления как в исходнике: сначала селектор,
     // затем обработчик. Оба результата пересекают возможный `if/else`
@@ -3084,16 +3154,15 @@ fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutco
     if (handler_outcome.flow == .terminates) return terminated;
 
     _ = try findOrBuildInvokeClickTrampoline(ctx.allocator, ctx.builder.module, &ctx.checked.types, layout, event_type);
-    const promoted_box = try promoteClosureBoxToPermanent(ctx, layout, handler_outcome.value, captures, 0);
-    const promoted_box_local = try wasm_heap.storeLocal(&ctx.builder, "@click_promoted_box", layout.ptr_type, promoted_box);
+    const handler_local = try wasm_heap.storeLocal(&ctx.builder, "@click_handler", layout.ptr_type, handler_outcome.value);
 
     const selector_for_call = try wasm_heap.loadLocal(&ctx.builder, selector_local, ctx.checked.types.builtins.string);
-    const promoted_box_for_call = try wasm_heap.loadLocal(&ctx.builder, promoted_box_local, layout.ptr_type);
+    const handler_for_call = try wasm_heap.loadLocal(&ctx.builder, handler_local, layout.ptr_type);
 
     const arena = ctx.builder.module.arena.allocator();
     var args: std.ArrayList(mir.ValueId) = .empty;
     try args.append(arena, selector_for_call);
-    try args.append(arena, promoted_box_for_call);
+    try args.append(arena, handler_for_call);
     try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = "DOM::на_клик", .args = try args.toOwnedSlice(arena) } });
     return continuesWith(mir.invalid_value);
 }

@@ -1000,3 +1000,46 @@ test "DOM.на_клик declared in an IMPORTED (non-entry) module produces a va
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("30.75", result.stdout);
 }
+
+// `lowerCall`'s `.property`-callee branch (qualified call, `модуль.
+// Имя(...)`) checked `symbol_to_function` and `lowerEnumConstructor`
+// but never `lowerStructConstructor` — unlike the `.ident`-callee
+// branch just above it, which DOES call all three. Any qualified
+// struct constructor call from a DIFFERENT file than the one declaring
+// the struct (`библиотека.Тип(a, b, c)`) fell through every branch to
+// the generic `lowerExpr(call.callee)` catch-all, which sees a bare
+// unconsumed property expression and rejects it. Found while building
+// panosiki/марьяшка (a serializer constructing a struct type directly,
+// not only through the declaring module's own wrapper functions).
+test "a qualified struct constructor call from another module lowers correctly" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const library_source =
+        \\экспорт тип Точка = структура
+        \\    x: Число
+        \\    y: Число
+        \\конец
+    ;
+    const entry_source =
+        \\импорт "библиотека.ps" как библиотека
+        \\
+        \\функ старт() -> Число
+        \\    пер р = библиотека.Точка(3.0, 4.0)
+        \\    р.x + р.y
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytesMulti(allocator, entry_source, "библиотека.ps", library_source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_qualified_struct_ctor.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const result = try wasmtimeInvoke(allocator, io.io(), wasm_path, "старт");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("7\n", result.stdout);
+}

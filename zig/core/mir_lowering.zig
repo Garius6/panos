@@ -2198,6 +2198,21 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
                 return emitCallValue(ctx, function_ref, args, result_type);
             }
             if (try lowerEnumConstructor(ctx, symbol, call, result_type)) |outcome| return outcome;
+            // Симметрично ветке `.ident` выше (строка ~2136) — квалифи-
+            // цированный конструктор структуры (`модуль.Тип(...)`, символ
+            // разрешён как `.type`, не как функция/enum-вариант) раньше
+            // НЕ обрабатывался здесь вообще — падал через все проверки
+            // ниже до общего `callee_outcome = lowerExpr(call.callee)`
+            // catch-all, которое видит голое выражение-свойство
+            // `модуль.Тип` (не потреблённое ни одной веткой выше) и
+            // отклоняет его как "свойство-модуль вне вызова". Реальный,
+            // 100% воспроизводимый пробел — ЛЮБОЙ вызов вида
+            // `модуль.Структура(a, b, c)` из ДРУГОГО файла (не там, где
+            // структура объявлена) падал компиляцией, найдено при
+            // разработке panosiki/марьяшка (состояние_кадра.pns строит
+            // узел.Узел(...) напрямую, не только через узел.pns's
+            // собственные конструкторы-обёртки).
+            if (try lowerStructConstructor(ctx, expression, symbol, call, result_type)) |outcome| return outcome;
         }
         if (try lowerTimeBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerNetworkBuiltinCall(ctx, call, result_type)) |outcome| return outcome;

@@ -478,6 +478,11 @@ fn runGraph(
         // не переиспользует `runtime`/`machine` для дальнейших вызовов —
         // см. doc-комментарий `Vm.abandon_background_async_on_root_exit`.
         .abandon_background_async_on_root_exit = true,
+        // Настоящий терминал/лог — печать должна быть видна ПОКА
+        // программа выполняется (особенно для `http.обслуживать` и
+        // другого кода, который никогда не возвращается на успехе), не
+        // только одним блоком после возврата `runStart()`.
+        .live_stdout = true,
     });
     defer runtime.deinit();
     try runtime.load(&reader, entry_path);
@@ -531,11 +536,11 @@ fn runGraph(
             const output = try panos_core.runner.renderValue(init.gpa, runtime_value);
             defer init.gpa.free(output);
             if (verbose) try stdout.print("EXECUTION\n--------------------------\n", .{});
-            // `machine.output` — накопленные вызовы `ввод_вывод.печать`/
-            // `.строка`, сделанные ВО ВРЕМЯ исполнения — печатаются первыми,
-            // в том же порядке, в каком реальная запись в stdout появилась
-            // бы во время самого запуска программы.
-            try stdout.print("{s}{s}\n", .{ runtime.output(), output });
+            // `ввод_вывод.печать`/`.строка` УЖЕ ушли в реальный stdout по
+            // ходу выполнения (`live_stdout = true` выше, `Vm.ioPrint`) —
+            // здесь печатается ТОЛЬКО итоговое значение, не
+            // `runtime.output()` повторно (иначе — дубликат всего вывода).
+            try stdout.print("{s}\n", .{output});
             try stdout.flush();
             // `stderr` буферизован (`stderr_buffer` выше) и иначе флашится
             // только на путях выхода с ошибкой — диагностика, состоящая
@@ -548,10 +553,9 @@ fn runGraph(
             try stderr.flush();
         },
         .runtime_error => |message| {
-            if (runtime.output().len != 0) {
-                try stdout.print("{s}", .{runtime.output()});
-                try stdout.flush();
-            }
+            // `runtime.output()` уже ушёл в реальный stdout по ходу
+            // выполнения (`live_stdout = true`) — здесь повторно НЕ
+            // печатается, та же причина, что у пути `.success` выше.
             try stderr.print("{s}\n", .{message});
             try stderr.flush();
             std.process.exit(1);

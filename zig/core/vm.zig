@@ -1444,17 +1444,28 @@ pub const Vm = struct {
     // == 0. CLI выставляет этот флаг в true — ОС и так убьёт все detached-
     // потоки мгновенно при завершении процесса, join там просто не нужен.
     abandon_background_async_on_root_exit: bool = false,
-    // `ввод_вывод.печать`/`.строка` накапливают здесь, а не пишут напрямую
-    // в реальный fd — на freestanding wasm32 browser-интерпретаторе
-    // РЕАЛЬНОГО fd вообще нет (см. пакетную модель "выполнить до конца,
-    // затем прочитать буфер результата" в `zig/browser/main.zig`), поэтому
-    // обе цели делят один механизм: ВЫЗЫВАЮЩАЯ сторона (нативный путь
-    // запуска `zig/cli/main.zig`, `runSourceWithVerboseForTarget` в
-    // `runner.zig`, через который тоже проходит `zig/browser/main.zig`)
-    // читает `output.items` после возврата из `run()` и выводит/добавляет
-    // его перед финальной строкой возвращаемого значения — порядок всё
-    // равно верен, т.к. ничто не читает это в процессе выполнения.
+    // `ввод_вывод.печать`/`.строка` ВСЕГДА накапливают здесь (не только
+    // пишут напрямую в реальный fd) — на freestanding wasm32 browser-
+    // интерпретаторе РЕАЛЬНОГО fd вообще нет (см. пакетную модель
+    // "выполнить до конца, затем прочитать буфер результата" в
+    // `zig/browser/main.zig`); embed/LSP/conformance тоже читают
+    // `output.items` программно после возврата из `run()` — тот же
+    // механизм. Для настоящего одноразового native CLI-запуска ЭТОГО
+    // одного недостаточно (см. `live_stdout` ниже).
     output: std.ArrayList(u8) = .empty,
+    // `true` только для настоящего одноразового native CLI-запуска
+    // (`zig/cli/main.zig` `runGraph`) — печать пишет напрямую в реальный
+    // stdout СРАЗУ (не только в `output` выше). Без этого `ввод_вывод.
+    // печать` внутри `http.обслуживать` (блокирующий, никогда не
+    // возвращается на успехе) НИКОГДА не становится видимой — весь
+    // накопленный `output` печатается ЦЕЛИКОМ ТОЛЬКО когда `run()`
+    // возвращается, что для живого сервера значит "никогда" (найдено при
+    // разработке `дозорный`: FR-011 требует напечатать bootstrap-пароль
+    // в лог при старте — молча копился в буфере, реально ничего не
+    // печаталось, пока сервер не убит). Остаётся `false` (умолчание) для
+    // embed/LSP/WASM/conformance — они читают `output` программно после
+    // `run()`, у WASM к тому же нет реального fd для немедленной записи.
+    live_stdout: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, program: *const bytecode.Program) Vm {
         return .{
@@ -2595,6 +2606,21 @@ pub const Vm = struct {
         defer self.allocator.free(rendered);
         try self.output.appendSlice(self.allocator, rendered);
         if (newline) try self.output.append(self.allocator, '\n');
+        if (self.live_stdout and comptime builtin.target.os.tag != .freestanding) {
+            // `.writer()` (positional/pwrite-style) starts EACH new
+            // `Writer` instance's position at 0 — a fresh instance per
+            // call (as here) would overwrite at offset 0 instead of
+            // appending, silently clobbering earlier output on a real
+            // terminal/pipe fd. `.writerStreaming()` has no independent
+            // position tracking, always appends — confirmed by a live
+            // regression: positional dropped every print but the last.
+            var io = std.Io.Threaded.init(self.allocator, .{});
+            defer io.deinit();
+            var writer = std.Io.File.stdout().writerStreaming(io.io(), &.{});
+            writer.interface.writeAll(rendered) catch {};
+            if (newline) writer.interface.writeAll("\n") catch {};
+            writer.interface.flush() catch {};
+        }
         try self.stack.append(self.allocator, .{ .void = {} });
     }
 

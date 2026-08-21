@@ -20,6 +20,7 @@ pub const Runtime = struct {
     program_args: []const []const u8,
     foreign_profile_enabled: bool,
     abandon_background_async_on_root_exit: bool,
+    live_stdout: bool,
     stage: Stage = .empty,
 
     const Stage = enum {
@@ -41,6 +42,15 @@ pub const Runtime = struct {
         /// `false` (умолчание), если `Runtime` переживёт `runStart()`/`call()`
         /// и может быть использован снова.
         abandon_background_async_on_root_exit: bool = false,
+        /// `true` только для настоящего native CLI-запуска на реальном
+        /// терминале/логе — `ввод_вывод.печать` пишет напрямую в
+        /// реальный stdout СРАЗУ, а не только в буфер, читаемый через
+        /// `output()` после возврата из `runStart()` (см. `Vm.
+        /// live_stdout`, vm.zig — без этого печать внутри блокирующего
+        /// `http.обслуживать` никогда не становится видимой). `false`
+        /// (умолчание) для встраивающих хостов, читающих `output()`
+        /// программно.
+        live_stdout: bool = false,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Runtime {
@@ -52,6 +62,7 @@ pub const Runtime = struct {
             .program_args = config.program_args,
             .foreign_profile_enabled = config.foreign_profile_enabled,
             .abandon_background_async_on_root_exit = config.abandon_background_async_on_root_exit,
+            .live_stdout = config.live_stdout,
         };
     }
 
@@ -89,6 +100,7 @@ pub const Runtime = struct {
         machine.program_args = self.program_args;
         machine.foreign_profile_enabled = self.foreign_profile_enabled;
         machine.abandon_background_async_on_root_exit = self.abandon_background_async_on_root_exit;
+        machine.live_stdout = self.live_stdout;
         self.machine = machine;
     }
 

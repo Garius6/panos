@@ -186,6 +186,7 @@ pub const Opcode = enum {
     crypto_timing_safe_eq,
     crypto_sha256_b64url,
     crypto_pbkdf2_sha256_b64url,
+    crypto_random_bytes_b64url,
     // Неблокирующий I/O: submit-опкоды кладут задачу в воркер-пул и
     // возвращают управление сразу (не блокируют) — компилятор ВСЕГДА
     // эмитит await_async сразу после (compiler.zig, compileFilesystemBuiltin).
@@ -381,6 +382,7 @@ pub const Instruction = union(Opcode) {
     crypto_timing_safe_eq: void,
     crypto_sha256_b64url: void,
     crypto_pbkdf2_sha256_b64url: void,
+    crypto_random_bytes_b64url: void,
     file_read_submit: void,
     file_write_submit: void,
     net_connect_submit: void,

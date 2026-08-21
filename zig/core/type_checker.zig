@@ -4308,6 +4308,17 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.string;
             }
+            if (self.isBuiltinModule(symbol, "криптография", "случайные_байты_base64url")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: криптография.случайные_байты_base64url() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.integer), self.result.types.builtins.integer)) {
+                    try self.report(call.span, "Type Error: криптография.случайные_байты_base64url() ожидает количество байт типа Целое", .{});
+                }
+                return self.result.types.builtins.string;
+            }
             if (self.isBuiltin(symbol, "получить")) {
                 if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить() не принимает аргументы", .{});
                 for (call.arguments) |argument| _ = try self.infer(argument);

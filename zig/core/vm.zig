@@ -1738,6 +1738,7 @@ pub const Vm = struct {
             .crypto_timing_safe_eq => try self.cryptoTimingSafeEq(),
             .crypto_sha256_b64url => try self.cryptoSha256Base64Url(),
             .crypto_pbkdf2_sha256_b64url => try self.cryptoPbkdf2Sha256Base64Url(),
+            .crypto_random_bytes_b64url => try self.cryptoRandomBytesBase64Url(),
             .http_request_respond_headers => try self.httpRequestRespondHeaders(),
             .http_listen => try self.httpListen(),
             .http_accept_submit => try self.httpAcceptSubmit(),
@@ -4201,6 +4202,44 @@ pub const Vm = struct {
         const encoded = try self.allocator.alloc(u8, encoder.calcSize(digest.len));
         defer self.allocator.free(encoded);
         _ = encoder.encode(encoded, &digest);
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, encoded));
+        try self.stack.append(self.allocator, .{ .heap_string = heap_string });
+    }
+
+    // Единственный источник криптографически стойкой случайности во всей
+    // VM — `математика.*` (Lehmer/Park-Miller PRNG) угадываем по
+    // построению, годится для геймплея/джиттера, но НЕ для OAuth2
+    // authorization code/access/refresh-токенов и соли пароля (RFC 6819
+    // §5.1.5.2 — угадываемый code напрямую взламывает весь flow).
+    // `std.crypto.random` — тот же источник, что уже используют
+    // Zig-стандартные `std.crypto.random.bytes` реализации (ОС CSPRNG,
+    // getrandom/arc4random), ничего не вендорится.
+    fn cryptoRandomBytesBase64Url(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("криптография::случайные_байты_base64url", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "криптография::случайные_байты_base64url", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const count_value = try self.number(try self.pop());
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'криптография::случайные_байты_base64url' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        if (count_value < 1 or !std.math.isFinite(count_value) or count_value > 65536) {
+            try self.fault("Runtime Error: криптография.случайные_байты_base64url() ожидает количество байт от 1 до 65536", .{});
+            return;
+        }
+        const count: usize = @intFromFloat(count_value);
+        const raw = try self.allocator.alloc(u8, count);
+        defer self.allocator.free(raw);
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        io.io().random(raw);
+        const encoder = std.base64.url_safe_no_pad.Encoder;
+        const encoded = try self.allocator.alloc(u8, encoder.calcSize(raw.len));
+        defer self.allocator.free(encoded);
+        _ = encoder.encode(encoded, raw);
         const heap_string = try self.heap.createString(try self.allocator.dupe(u8, encoded));
         try self.stack.append(self.allocator, .{ .heap_string = heap_string });
     }

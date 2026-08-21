@@ -1172,6 +1172,11 @@ const FunctionCompiler = struct {
             try self.function.emit(self.compiler.result.allocator, .{ .crypto_pbkdf2_sha256_b64url = {} });
             return true;
         }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "случайные_байты_base64url")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_random_bytes_b64url = {} });
+            return true;
+        }
         return false;
     }
 

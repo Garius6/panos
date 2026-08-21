@@ -1062,6 +1062,7 @@ fn hostImportNameForBuiltin(name: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "время::сейчас_мс")) return "pw_now_ms";
     if (std.mem.eql(u8, name, "время::монотонно_мс")) return "pw_monotonic_ms";
     if (std.mem.eql(u8, name, "сеть::http_запрос_sync")) return "pw_http_request_sync";
+    if (std.mem.eql(u8, name, "сеть::http_запрос_sync_с_заголовками")) return "pw_http_request_sync_with_headers";
     // Строковые аргументы `DOM::*` — непрозрачные i32-хэндлы, которые
     // поддерживает JS-хост. `@runtime::строка_литерал` преобразует смещения
     // в data-секции в эти хэндлы, а `@runtime::строка_сложить` создаёт
@@ -1102,6 +1103,8 @@ fn builtinSignature(name: []const u8) !BuiltinSignature {
         return .{ .params = &.{}, .result = wasm_module.wasm_f64 };
     if (std.mem.eql(u8, name, "сеть::http_запрос_sync"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = wasm_module.wasm_i32 };
+    if (std.mem.eql(u8, name, "сеть::http_запрос_sync_с_заголовками"))
+        return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "DOM::текст"))
         return .{ .params = &.{wasm_module.wasm_i32}, .result = wasm_module.wasm_f64 };
     if (std.mem.eql(u8, name, "DOM::установить_текст"))

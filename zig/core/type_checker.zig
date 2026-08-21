@@ -4226,6 +4226,27 @@ const Checker = struct {
                 }
                 return option_type;
             }
+            if (self.isBuiltinModule(symbol, "сеть", "http_запрос_sync_с_заголовками")) {
+                // Симметрично http_запрос_sync — четвёртый аргумент:
+                // дополнительные заголовки одной строкой, "Имя: значение"
+                // на строку, разделённые "\n" (не Соответствие — тот же
+                // "плоские данные" принцип, что и у самого http_запрос_sync;
+                // хост-функция (JS) сама разбирает и добавляет через
+                // setRequestHeader). Нужен для авторизованных вызовов
+                // admin API из WASM-фронтенда (Authorization: Bearer ...).
+                const option_type = self.optionOf(self.result.types.builtins.string) orelse return self.result.types.poison();
+                if (call.arguments.len != 4) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос_sync_с_заголовками() ожидает 4 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return option_type;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: сеть.http_запрос_sync_с_заголовками() ожидает метод, url, тело и заголовки типа Строка", .{});
+                    }
+                }
+                return option_type;
+            }
             if (self.isBuiltinModule(symbol, "сеть", "http_сервер_слушать")) {
                 const listener_symbol = self.findTypeSymbol("Слушатель") orelse return self.result.types.poison();
                 const listener_type = try self.nominalType(listener_symbol, &.{});

@@ -1138,6 +1138,11 @@ const FunctionCompiler = struct {
             try self.emitVoid();
             return true;
         }
+        if (call.arguments.len == 4 and std.mem.eql(u8, property.property, "http_запрос_sync_с_заголовками")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.emitVoid();
+            return true;
+        }
         if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "http_сервер_слушать")) {
             try self.compileExpression(call.arguments[0]);
             try self.function.emit(self.compiler.result.allocator, .{ .http_listen = {} });

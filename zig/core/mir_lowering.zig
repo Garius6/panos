@@ -2506,12 +2506,15 @@ fn lowerNetworkBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: ty
     if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "сеть")) return null;
 
     const property = ctx.tree.expr(call.callee).property;
-    if (!std.mem.eql(u8, property.property, "http_запрос_sync")) {
+    const builtin_name = if (std.mem.eql(u8, property.property, "http_запрос_sync"))
+        "сеть::http_запрос_sync"
+    else if (std.mem.eql(u8, property.property, "http_запрос_sync_с_заголовками"))
+        "сеть::http_запрос_sync_с_заголовками"
+    else
         return ctx.unsupported("сеть.свойство вызов (неподдерживаемая сетевая операция в AOT WASM)");
-    }
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     const dst = try ctx.builder.newValue(result_type);
-    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = "сеть::http_запрос_sync", .args = args } });
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = builtin_name, .args = args } });
     return continuesWith(dst);
 }
 

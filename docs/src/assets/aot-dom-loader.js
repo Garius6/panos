@@ -235,6 +235,33 @@ export async function loadAotDomProgram(programWasmUrl) {
 			}
 			return buildStringOption(null)
 		},
+		// Same as pw_http_request_sync, plus a 4th arg: extra headers as
+		// "Name: value" lines separated by "\n" (сеть.
+		// http_запрос_sync_с_заголовками panos side) — needed for
+		// Authorization: Bearer <token> on admin-API calls from a WASM
+		// frontend, which pw_http_request_sync has no way to express.
+		pw_http_request_sync_with_headers: (methodPtr, urlPtr, bodyPtr, headersPtr) => {
+			try {
+				const request = new XMLHttpRequest()
+				request.open(readString(methodPtr), readString(urlPtr), false)
+				request.setRequestHeader("Content-Type", "application/json")
+				const headersText = readString(headersPtr)
+				if (headersText) {
+					for (const line of headersText.split("\n")) {
+						const separator = line.indexOf(":")
+						if (separator < 0) continue
+						const name = line.slice(0, separator).trim()
+						const value = line.slice(separator + 1).trim()
+						if (name) request.setRequestHeader(name, value)
+					}
+				}
+				request.send(readString(bodyPtr))
+				if (request.status >= 200 && request.status < 300) return buildStringOption(request.responseText)
+			} catch (_) {
+				// Network failures are represented by Опция.Нет().
+			}
+			return buildStringOption(null)
+		},
 	}
 
 	const response = await fetch(programWasmUrl)

@@ -43,11 +43,35 @@ fn uniqueInternalName(module: *mir.Module, original_name: []const u8) ![]const u
     return std.fmt.allocPrint(module.arena.allocator(), "@arena_impl_{s}", .{original_name});
 }
 
-fn wrapEntryPoint(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, original_id: mir.FunctionId) !void {
+fn wrapEntryPoint(allocator: std.mem.Allocator, module: *mir.Module, fallback_type_store: *const types.TypeStore, original_id: mir.FunctionId) !void {
     const original_name = try module.arena.allocator().dupe(u8, module.functions.items[@intFromEnum(original_id)].name);
     const internal_name = try uniqueInternalName(module, original_name);
 
     const original = &module.functions.items[@intFromEnum(original_id)];
+    // `original`'s params/result carry `TypeId`s minted against ITS OWN
+    // module's `TypeStore` (`TypeId.owner` is store-specific — a numeric
+    // index that means something ELSE, or nothing, in a different store's
+    // table). `@invoke_click` in particular is always built by
+    // `findOrBuildInvokeClickTrampoline` using the LOWERING module's own
+    // `ctx.checked.types` — for a `DOM.на_клик` call inside an IMPORTED
+    // library (not the entry file), that's a DIFFERENT `TypeStore`
+    // instance than `fallback_type_store` (always the ENTRY module's,
+    // per this pass's one caller in `mir_lowering.zig`/`cli/main.zig`).
+    // Using the wrong store here silently mis-mapped every non-obvious
+    // `TypeId` to the WASM `f64` fallback — confirmed via `wasm2wat`:
+    // `@invoke_click`'s wrapper ended up with `(param f64 f64 f64 f64
+    // f64 f64 f64 f64)` instead of the real `(i32 f64 f64 i32 i32 i32
+    // i32 i32)`, an invalid module that failed to even INSTANTIATE in a
+    // real browser (`panos build`'s own success doesn't run a WASM
+    // validator as strict as `WebAssembly.Module()`). `function.
+    // type_store` (set once, per-function, at the point each function was
+    // originally lowered — see `lowerLambda`/`findOrBuildInvokeClickTrampoline`
+    // themselves setting it) is the one true source of truth for
+    // interpreting a GIVEN function's own locals; only fall back to the
+    // entry module's store for a function that never had one set (there
+    // shouldn't be any in practice, but this pass ran with `orelse
+    // fallback_type_store`-shaped mistakes before, better safe here too).
+    const type_store = original.type_store orelse fallback_type_store;
     const result_type = original.result_type;
     const original_params = original.parameters;
 

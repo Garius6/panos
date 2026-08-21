@@ -890,3 +890,113 @@ test "a top-level конст referenced as a function argument lowers correctly 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("42\n", result.stdout);
 }
+
+// `wasm_gc_arena.zig`'s `wrapEntryPoint` (arena-checkpoint wrapper for
+// `старт`/`@invoke_click`) read `local.type_id` off the ORIGINAL
+// function's locals but then set the NEW wrapper function's OWN
+// `type_store` to the caller-supplied `type_store` argument — always
+// the ENTRY module's store in every real caller. For `DOM.на_клик`
+// declared inside an IMPORTED library (not the entry file), `@invoke_click`
+// itself was built (`findOrBuildInvokeClickTrampoline`) against the
+// LIBRARY's own `TypeStore` — a DIFFERENT instance. `TypeId`s are only
+// meaningful relative to the store that minted them; reading them
+// against the wrong store silently mis-mapped `Целое`/`Булево` params
+// to the WASM `f64` fallback. Confirmed with `wasm2wat`: the wrapper
+// ended up `(param f64 f64 f64 f64 f64 f64 f64 f64)` instead of the
+// real `(i32 f64 f64 i32 i32 i32 i32 i32)` — a module that fails to
+// even INSTANTIATE in a real engine (`panos build`'s own success
+// doesn't validate this — confirmed the bug only by actually loading
+// the module with `WebAssembly.Module()`). Fixed by preferring
+// `original.type_store` (set once, per-function, when each function
+// was originally lowered) over the caller-supplied fallback.
+fn buildGraphBytesMulti(allocator: std.mem.Allocator, entry_source: []const u8, library_path: []const u8, library_source: []const u8) ![]u8 {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "программа.ps", .bytes = entry_source },
+        .{ .path = library_path, .bytes = library_source },
+    } };
+    var graph = panos.module_loader.Graph.init(allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "программа");
+    _ = try graph.appendPreludeModule(panos.prelude.SOURCE);
+    try std.testing.expectEqual(@as(usize, 0), graph.diagnostics.items.items.len);
+
+    var compiled = try panos.module_compiler.compileGraphForTarget(allocator, &graph, .aot_js_wasm);
+    defer compiled.deinit();
+    try std.testing.expect(!compiled.hasErrors());
+
+    var module = try panos.mir_lowering.lowerGraph(allocator, &graph, &compiled);
+    defer module.deinit(allocator);
+
+    const type_store = &compiled.modules[0].checked.?.types;
+    try panos.wasm_objects.expand(allocator, &module, type_store);
+    try panos.wasm_strings.expand(allocator, &module, type_store);
+    const iface_result = try panos.wasm_interfaces.expand(allocator, &module, type_store);
+    defer allocator.free(iface_result.table);
+    var frame_info = try panos.mir_cps.prepare(allocator, &module);
+    defer frame_info.deinit();
+    try panos.wasm_actors.expand(allocator, &module, type_store, &frame_info);
+    try panos.wasm_gc_arena.expand(allocator, &module, type_store);
+
+    return panos.wasm_emit.emitModule(allocator, &compiled.modules[0].checked.?, &module, iface_result.table);
+}
+
+test "DOM.на_клик declared in an IMPORTED (non-entry) module produces a valid, instantiable module" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const library_source =
+        \\импорт DOM
+        \\
+        \\экспорт функ подключить(селектор: Строка, обработчик: функ(DOM.СобытиеКлика) -> Пусто) -> Пусто
+        \\    DOM.на_клик(селектор, обработчик)
+        \\конец
+    ;
+    const entry_source =
+        \\импорт "библиотека.ps" как библиотека
+        \\импорт DOM
+        \\
+        \\функ обработчик(событие: DOM.СобытиеКлика) -> Пусто
+        \\    пер сумма: Число = событие.клиент_x + событие.клиент_y
+        \\    DOM.установить_текст("#результат", сумма)
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    библиотека.подключить("#кнопка", обработчик)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytesMulti(allocator, entry_source, "библиотека.ps", library_source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_click_in_library_module.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const script =
+        \\const fs = require("fs");
+        \\(async () => {
+        \\  let handler = 0;
+        \\  let observed = 0;
+        \\  const bytes = fs.readFileSync(process.argv[1]);
+        \\  const imports = { env: {
+        \\    dom_on_click: (_selector, box) => { handler = box; },
+        \\    dom_set_text_num: (_selector, value) => { observed = value; },
+        \\  } };
+        \\  const { instance } = await WebAssembly.instantiate(bytes, imports);
+        \\  instance.exports["старт"]();
+        \\  if (handler === 0) throw new Error("handler was never registered");
+        \\  instance.exports["@invoke_click"](handler, 10.5, 20.25, 2, 1, 0, 1, 1);
+        \\  if (observed !== 30.75) throw new Error(`expected 30.75, got ${observed}`);
+        \\  process.stdout.write(String(observed));
+        \\})().catch((error) => { console.error(error); process.exit(1); });
+    ;
+    const result = try std.process.run(allocator, io.io(), .{
+        .argv = &.{ "node", "-e", script, wasm_path },
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("30.75", result.stdout);
+}

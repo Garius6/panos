@@ -1078,6 +1078,9 @@ fn hostImportNameForBuiltin(name: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "DOM::после_кадра")) return "dom_after_frame";
     if (std.mem.eql(u8, name, "DOM::атрибут")) return "dom_get_attribute";
     if (std.mem.eql(u8, name, "DOM::установить_атрибут")) return "dom_set_attribute";
+    if (std.mem.eql(u8, name, "DOM::удалить")) return "dom_remove";
+    if (std.mem.eql(u8, name, "DOM::путь")) return "dom_get_path";
+    if (std.mem.eql(u8, name, "DOM::перейти")) return "dom_navigate";
     if (std.mem.eql(u8, name, "состояние::прочитать")) return "state_read";
     if (std.mem.eql(u8, name, "состояние::записать")) return "state_write";
     if (std.mem.eql(u8, name, "строки::длина")) return "pw_string_length";
@@ -1123,6 +1126,12 @@ fn builtinSignature(name: []const u8) !BuiltinSignature {
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "DOM::установить_атрибут"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
+    if (std.mem.eql(u8, name, "DOM::удалить"))
+        return .{ .params = &.{wasm_module.wasm_i32}, .result = null };
+    if (std.mem.eql(u8, name, "DOM::путь"))
+        return .{ .params = &.{}, .result = wasm_module.wasm_i32 };
+    if (std.mem.eql(u8, name, "DOM::перейти"))
+        return .{ .params = &.{wasm_module.wasm_i32}, .result = null };
     if (std.mem.eql(u8, name, "состояние::прочитать"))
         return .{ .params = &.{}, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "состояние::записать"))

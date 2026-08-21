@@ -3127,6 +3127,12 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
         "DOM::атрибут"
     else if (std.mem.eql(u8, property.property, "установить_атрибут"))
         "DOM::установить_атрибут"
+    else if (std.mem.eql(u8, property.property, "удалить"))
+        "DOM::удалить"
+    else if (std.mem.eql(u8, property.property, "путь"))
+        "DOM::путь"
+    else if (std.mem.eql(u8, property.property, "перейти"))
+        "DOM::перейти"
     else
         return ctx.unsupported("DOM.свойство вызов (неподдерживаемый DOM-метод)");
 

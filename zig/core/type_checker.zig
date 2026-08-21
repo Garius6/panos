@@ -3776,6 +3776,44 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.void;
             }
+            // `DOM.удалить` — единственный способ убрать ОДИН узел (до
+            // этого — только `установить_текст_строка(родитель, "")`,
+            // стирающее ВСЁ содержимое родителя). Нужен vdom-diff'у для
+            // удаления узлов, переставших существовать в новом дереве.
+            if (self.isBuiltinModule(symbol, "DOM", "удалить")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: DOM.удалить() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: DOM.удалить() ожидает CSS-селектор типа Строка", .{});
+                }
+                return self.result.types.builtins.void;
+            }
+            // `DOM.путь`/`DOM.перейти` — маршрутизация. Отдельно от
+            // `состояние.*` намеренно: текущий путь браузера — факт
+            // окружения, не поле модели приложения, смешивать со
+            // строкой `состояние.записать` означало бы каждому фреймворку
+            // самому парсить путь из чужого формата состояния.
+            if (self.isBuiltinModule(symbol, "DOM", "путь")) {
+                if (call.arguments.len != 0) {
+                    try self.report(call.span, "Type Error: DOM.путь() не принимает аргументы", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "DOM", "перейти")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: DOM.перейти() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: DOM.перейти() ожидает путь типа Строка", .{});
+                }
+                return self.result.types.builtins.void;
+            }
             // `состояние.прочитать`/`.записать` — модель, хранимая JS-
             // загрузчиком (собственная замыкающая переменная `heldModel`
             // из aot-dom-loader.js), НЕ атрибут DOM: в отличие от
@@ -6768,6 +6806,59 @@ test "type checker requires an exact DOM click event handler signature" {
     for (checked.diagnostics.items.items) |item| {
         try std.testing.expectEqualStrings("Type Error: DOM.на_клик() ожидает обработчик (функ(DOM.СобытиеКлика) -> Пусто) вторым аргументом", item.message);
     }
+}
+
+test "type checker accepts DOM.удалить/путь/перейти with correct usage" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "импорт DOM\n" ++
+            "функ старт() -> Пусто\n" ++
+            "DOM.удалить(\"#строка\")\n" ++
+            "пер путь = DOM.путь()\n" ++
+            "DOM.перейти(путь)\n" ++
+            "конец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try checkWithImportsForTarget(std.testing.allocator, &parsed.ast, &resolved, &.{}, .aot_js_wasm);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
+}
+
+test "type checker rejects wrong arity/types for DOM.удалить/путь/перейти" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var lexed = try lexer.tokenize(
+        std.testing.allocator,
+        "импорт DOM\n" ++
+            "функ старт() -> Пусто\n" ++
+            "DOM.удалить(1.0)\n" ++
+            "DOM.путь(\"лишний\")\n" ++
+            "DOM.перейти(1.0)\n" ++
+            "конец",
+        0,
+    );
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try checkWithImportsForTarget(std.testing.allocator, &parsed.ast, &resolved, &.{}, .aot_js_wasm);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 3), checked.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("Type Error: DOM.удалить() ожидает CSS-селектор типа Строка", checked.diagnostics.items.items[0].message);
+    try std.testing.expectEqualStrings("Type Error: DOM.путь() не принимает аргументы", checked.diagnostics.items.items[1].message);
+    try std.testing.expectEqualStrings("Type Error: DOM.перейти() ожидает путь типа Строка", checked.diagnostics.items.items[2].message);
 }
 
 test "type checker preserves nominal user types in function signatures" {

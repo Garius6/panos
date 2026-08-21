@@ -6292,8 +6292,29 @@ const Checker = struct {
             },
             .nominal => |nominal| {
                 const argument_type = self.result.types.get(argument) orelse return;
-                if (argument_type.* != .nominal or argument_type.nominal.symbol != nominal.symbol or argument_type.nominal.arguments.len != nominal.arguments.len) return;
-                for (nominal.arguments, argument_type.nominal.arguments) |nested_parameter, nested_argument| {
+                if (argument_type.* != .nominal or argument_type.nominal.arguments.len != nominal.arguments.len) return;
+                const argument_nominal = argument_type.nominal;
+                // Тот же `identity`-приоритетный fallback, что уже `assignable`
+                // (выше в этом файле) и `TypeStore.eql` (types.zig) — та же
+                // структура, импортированная в ТЕКУЩИЙ модуль ДВУМЯ разными
+                // путями (например, обычный `импорт "lib.pns" как lib` для
+                // сигнатуры метода И транзитивный барrel-реэкспорт для
+                // отдельно импортированной функции-аргумента), заводит ДВА
+                // РАЗНЫХ локальных `Symbol_Id` в `self.resolution.symbols` —
+                // валидных внутри своего модуля, но НЕ взаимно сравнимых
+                // напрямую. Раньше эта ветка сравнивала только `.symbol`,
+                // из-за чего generic-параметр, встречающийся ТОЛЬКО внутри
+                // такого номинального типа (например, `Ответ` в
+                // `функ(Данные, Тело) -> Отклик(Ответ)`), никогда не
+                // выводился при межмодульном вызове — "не удалось вывести
+                // type-параметр" на полностью корректном коде (найдено при
+                // реализации дозорного, см. отдельную memory-запись).
+                const same_declaration = if (nominal.identity != 0 or argument_nominal.identity != 0)
+                    nominal.identity != 0 and nominal.identity == argument_nominal.identity
+                else
+                    nominal.symbol == argument_nominal.symbol;
+                if (!same_declaration) return;
+                for (nominal.arguments, argument_nominal.arguments) |nested_parameter, nested_argument| {
                     try self.inferGenericSubstitution(nested_parameter, nested_argument, substitutions, span);
                 }
             },

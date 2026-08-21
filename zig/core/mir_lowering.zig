@@ -1596,9 +1596,23 @@ fn fieldsForNominalSymbol(ctx: *LoweringContext, symbol: symbols.SymbolId) ?[]co
 
 fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytype) anyerror!ExprOutcome {
     // Члены модуля и варианты enum — это разрешённые символы, и ими
-    // занимаются вызывающие стороны. Оставшееся выражение-свойство — это
-    // поле структуры.
-    if (ctx.resolution.expr_symbols.contains(expression)) return ctx.unsupported("свойство-модуль или вариант перечисления вне вызова");
+    // ОБЫЧНО занимаются вызывающие стороны (lowerCall, для вариантов С
+    // ПОЛЯМИ — те синтаксически всегда вызов, `Тип.Вариант(поля...)`).
+    // Вариант БЕЗ полей (`Тип.Вариант`, без скобок — стандартная
+    // конвенция во ВСЁМ std/, см. `Уровень.Отладка`/`Стратегия.
+    // ОдинЗаОдного`, никогда не через `Тип.Вариант()`) — это НЕ вызов
+    // синтаксически, никогда не доходит до lowerCall вообще, попадает
+    // СЮДА напрямую. Раньше не было отдельной ветки для этого случая —
+    // падало тем же "свойство-модуль... вне вызова" ниже, что и
+    // настоящая ошибка использования (реальный, чистый AOT-пробел,
+    // никогда не задетый ни одним существующим тестом — все они либо
+    // используют builtin `Опция`/`Результат`, которые ВЕЗДЕ пишутся с
+    // явными `()`, либо не строят безполевые кастомные варианты под
+    // AOT вообще).
+    if (ctx.resolution.expr_symbols.get(expression)) |symbol| {
+        if (try lowerEnumConstructorValue(ctx, symbol, expression)) |outcome| return outcome;
+        return ctx.unsupported("свойство-модуль или вариант перечисления вне вызова");
+    }
     const object = try lowerExpr(ctx, property.object);
     if (object.flow == .terminates) return terminated;
     const object_type = ctx.checked.expression_types.get(property.object) orelse return ctx.unsupported("свойство без типа объекта");
@@ -2230,6 +2244,32 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
     const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
     const callee = try reloadCalleeLocal(ctx, callee_local);
     return emitCallValue(ctx, callee, args, result_type);
+}
+
+// Строит вариант перечисления БЕЗ полей (`Тип.Вариант`, синтаксически
+// не вызов) — та же `.build_variant`-инструкция, что `lowerEnumConstructor`
+// использует для вариантов С полями, просто `fields = &.{}`. Раздельная
+// функция, а не переиспользование `lowerEnumConstructor` под фиктивным
+// `call` — та ожидает `result_type`, вычисленный ВЫЗЫВАЮЩЕЙ стороной
+// (`lowerCall`'s `ctx.checked.expression_types.get(expression)` на
+// САМОМ выражении вызова); здесь то же самое читается по `expression`
+// САМОГО свойства (`Тип.Вариант`, без вызова его нет).
+fn lowerEnumConstructorValue(ctx: *LoweringContext, symbol: symbols.SymbolId, expression: ast.ExprId) anyerror!?ExprOutcome {
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .enum_variant) return null;
+    const definition = ctx.checked.enum_definitions.get(entry.owner_type) orelse return null;
+    var tag: ?u32 = null;
+    for (definition.variants, 0..) |variant, index| {
+        if (variant.symbol == symbol) {
+            tag = @intCast(index);
+            break;
+        }
+    }
+    const variant_tag = tag orelse return null;
+    const result_type = ctx.checked.expression_types.get(expression) orelse return null;
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .build_variant = .{ .dst = dst, .type_name = "", .variant_name = entry.name, .tag = variant_tag, .fields = &.{} } });
+    return continuesWith(dst);
 }
 
 fn lowerEnumConstructor(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {

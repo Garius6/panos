@@ -1043,3 +1043,39 @@ test "a qualified struct constructor call from another module lowers correctly" 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("7\n", result.stdout);
 }
+
+test "a payload-less custom enum variant lowers correctly outside call position" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const entry_source =
+        \\тип Msg = перечисление
+        \\    Иди
+        \\    Стой
+        \\конец
+        \\
+        \\функ метка(m: Msg) -> Число
+        \\    выбор m
+        \\        Иди тогда 1.0 конец
+        \\        Стой тогда 0.0 конец
+        \\    конец
+        \\конец
+        \\
+        \\функ старт() -> Число
+        \\    метка(Msg.Иди)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, entry_source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_payloadless_enum_variant.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const result = try wasmtimeInvoke(allocator, io.io(), wasm_path, "старт");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1\n", result.stdout);
+}

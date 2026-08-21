@@ -1116,6 +1116,18 @@ const FunctionCompiler = struct {
             try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
             return true;
         }
+        // Симметрично http_запрос, но с redirect_behavior=.unhandled
+        // (Zig std.http.Client) — 3xx возвращается КАК ЕСТЬ (Location в
+        // заголовках), не следуется автоматически. Нужен вызывающему,
+        // которому нужен сам факт/цель редиректа (например, OAuth2
+        // authorization code в query редиректа), а не итоговая страница
+        // после перехода.
+        if (call.arguments.len == 4 and std.mem.eql(u8, property.property, "http_запрос_без_редиректа")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .http_request_no_redirect_submit = {} });
+            try self.function.emit(self.compiler.result.allocator, .{ .await_async = {} });
+            return true;
+        }
         // Синхронный HTTP только для браузера опускается напрямую AOT MIR
         // бэкендом. `compileGraphForTarget` всё равно вызывает этот общий
         // байткод-компилятор для диагностики, но VM-таргет отклоняет этот

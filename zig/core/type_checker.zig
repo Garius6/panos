@@ -4187,6 +4187,31 @@ const Checker = struct {
                 }
                 return result_type;
             }
+            if (self.isBuiltinModule(symbol, "сеть", "http_запрос_без_редиректа")) {
+                const pair_type = try self.result.types.tuple(&.{ self.result.types.builtins.string, self.result.types.builtins.string });
+                const headers_array = try self.result.types.array(pair_type);
+                const success_type = try self.result.types.tuple(&.{ self.result.types.builtins.integer, headers_array, self.result.types.builtins.string });
+                const result_type = self.resultOfString(success_type) orelse return self.result.types.poison();
+                if (call.arguments.len != 4) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос_без_редиректа() ожидает 4 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return result_type;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос_без_редиректа() ожидает метод типа Строка первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос_без_редиректа() ожидает url типа Строка вторым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[2], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос_без_редиректа() ожидает тело типа Строка третьим аргументом", .{});
+                }
+                const headers_map_type = try self.result.types.map(self.result.types.builtins.string, self.result.types.builtins.string);
+                if (!self.assignable(try self.inferExpected(call.arguments[3], headers_map_type), headers_map_type)) {
+                    try self.report(call.span, "Type Error: сеть.http_запрос_без_редиректа() ожидает Соответствие(Строка, Строка) четвёртым аргументом", .{});
+                }
+                return result_type;
+            }
             if (self.isBuiltinModule(symbol, "сеть", "http_запрос_sync")) {
                 const option_type = self.optionOf(self.result.types.builtins.string) orelse return self.result.types.poison();
                 if (call.arguments.len != 3) {

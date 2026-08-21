@@ -60,6 +60,7 @@ pub fn builtinAvailability(name: []const u8) BuiltinAvailability {
         "ввод_вывод::поток",
         "сеть::подключиться",
         "сеть::http_запрос",
+        "сеть::http_запрос_без_редиректа",
         "сеть::http_сервер_слушать",
     };
     for (native_only) |builtin| {

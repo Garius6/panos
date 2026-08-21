@@ -514,7 +514,7 @@ fn submitNetConnect(vm: *Vm, host: []const u8, port: u16, target_id: u64) void {
 // (httpRequestSubmit, на главном потоке) — эта функция забирает владение им
 // (сама освобождает на стороне воркера) вместе с клонами method/url/body,
 // которые делает здесь же.
-fn submitHttpRequest(vm: *Vm, method_text: []const u8, url: []const u8, body: []const u8, owned_headers: []HttpHeaderPair, target_id: u64) void {
+fn submitHttpRequest(vm: *Vm, method_text: []const u8, url: []const u8, body: []const u8, owned_headers: []HttpHeaderPair, target_id: u64, follow_redirects: bool) void {
     vm.async_queue.beginSubmit();
     const Job = struct {
         queue: *AsyncQueue,
@@ -523,6 +523,7 @@ fn submitHttpRequest(vm: *Vm, method_text: []const u8, url: []const u8, body: []
         url: []u8,
         body: []u8,
         headers: []HttpHeaderPair,
+        follow_redirects: bool,
 
         fn fail(job: @This(), comptime format: []const u8, args: anytype) void {
             const message = std.fmt.allocPrint(std.heap.page_allocator, format, args) catch @panic("OOM");
@@ -560,7 +561,10 @@ fn submitHttpRequest(vm: *Vm, method_text: []const u8, url: []const u8, body: []
             defer io.deinit();
             var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = io.io() };
             defer client.deinit();
-            var request = client.request(method, uri, .{ .extra_headers = extra_headers.items }) catch |err| {
+            var request = client.request(method, uri, .{
+                .extra_headers = extra_headers.items,
+                .redirect_behavior = if (job.follow_redirects) std.http.Client.Request.RedirectBehavior.init(3) else .unhandled,
+            }) catch |err| {
                 return job.fail("{s}", .{@errorName(err)});
             };
             defer request.deinit();
@@ -620,6 +624,7 @@ fn submitHttpRequest(vm: *Vm, method_text: []const u8, url: []const u8, body: []
         .url = std.heap.page_allocator.dupe(u8, url) catch @panic("OOM"),
         .body = std.heap.page_allocator.dupe(u8, body) catch @panic("OOM"),
         .headers = owned_headers,
+        .follow_redirects = follow_redirects,
     };
     const thread = std.Thread.spawn(.{}, Job.run, .{job}) catch @panic("не удалось запустить фоновый поток сеть.http_запрос");
     thread.detach();
@@ -1739,6 +1744,7 @@ pub const Vm = struct {
             .url_encode => try self.urlEncode(),
             .url_decode => try self.urlDecode(),
             .http_request_submit => try self.httpRequestSubmit(),
+            .http_request_no_redirect_submit => try self.httpRequestNoRedirectSubmit(),
             .sql_open_submit => try self.sqlOpenSubmit(),
             .sql_exec_submit => try self.sqlExecSubmit(),
             .sql_query_submit => try self.sqlQuerySubmit(),
@@ -3793,6 +3799,70 @@ pub const Vm = struct {
             body,
             shrunk_headers,
             process.id,
+            true,
+        );
+    }
+
+    // Симметрично httpRequestSubmit выше, кроме follow_redirects=false —
+    // 3xx возвращается КАК ЕСТЬ (Location доступен через .заголовок(...)
+    // результата), не следуется автоматически. Отдельная функция, не
+    // параметр на существующей — сеть.http_запрос() уже выпущен и
+    // используется без этого аргумента.
+    fn httpRequestNoRedirectSubmit(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("сеть::http_запрос_без_редиректа", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "сеть::http_запрос_без_редиректа", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const headers_value = try self.pop();
+        const headers_map = switch (headers_value) {
+            .map => |map| map,
+            else => {
+                try self.fault("Runtime Error: сеть.http_запрос_без_редиректа() ожидает Соответствие(Строка, Строка) четвёртым аргументом", .{});
+                return;
+            },
+        };
+        const body = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: сеть.http_запрос_без_редиректа() ожидает тело типа Строка", .{});
+            return;
+        };
+        const url = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: сеть.http_запрос_без_редиректа() ожидает url типа Строка", .{});
+            return;
+        };
+        const method_text = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: сеть.http_запрос_без_редиректа() ожидает метод типа Строка", .{});
+            return;
+        };
+        const process = self.current_process orelse {
+            try self.fault("Runtime Error: сеть.http_запрос_без_редиректа() вызвано вне процесса", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'сеть::http_запрос_без_редиректа' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const owned_headers = std.heap.page_allocator.alloc(HttpHeaderPair, headers_map.entries.items.len) catch @panic("OOM");
+        var header_count: usize = 0;
+        for (headers_map.entries.items) |map_entry| {
+            const name = map_entry.key.stringBytes() orelse continue;
+            const header_value = map_entry.value.stringBytes() orelse continue;
+            owned_headers[header_count] = .{
+                .name = std.heap.page_allocator.dupe(u8, name) catch @panic("OOM"),
+                .value = std.heap.page_allocator.dupe(u8, header_value) catch @panic("OOM"),
+            };
+            header_count += 1;
+        }
+        const shrunk_headers = std.heap.page_allocator.realloc(owned_headers, header_count) catch unreachable;
+        submitHttpRequest(
+            self,
+            method_text,
+            url,
+            body,
+            shrunk_headers,
+            process.id,
+            false,
         );
     }
 

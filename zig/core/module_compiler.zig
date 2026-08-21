@@ -637,8 +637,8 @@ const ImportContext = struct {
             const target_resolution = if (target.resolution) |*value| value else return error.ImportNotCompiled;
             const target_checked = if (target.checked) |*value| value else return error.ImportNotChecked;
             for (prelude_type_names) |name| {
-                const source_symbol = findLocalTypeSymbol(target_resolution, name) orelse continue;
-                const local_symbol = findLocalTypeSymbol(resolution, name) orelse continue;
+                const source_symbol = findLocalTypeSymbol(target_resolution, name, null) orelse continue;
+                const local_symbol = findLocalTypeSymbol(resolution, name, null) orelse continue;
                 // Намеренно только identity — запись с полными данными
                 // (как в обычном межмодульном случае `.type` выше) была
                 // бы ДУБЛИРУЮЩЕЙ регистрацией: раз в графе есть настоящий
@@ -749,7 +749,7 @@ const ImportContext = struct {
                     // прелюдии; их операции распознаются локальным
                     // checker'ом.
                     const source_symbol = target_resolution.symbols.get(nominal.symbol) orelse return error.UnsupportedImportedType;
-                    const local_symbol = findLocalTypeSymbol(resolution, source_symbol.name) orelse return error.UnsupportedImportedType;
+                    const local_symbol = findLocalTypeSymbol(resolution, source_symbol.name, source_symbol.module_path) orelse return error.UnsupportedImportedType;
                     try self.nominals.append(self.allocator, .{
                         .store = external_store,
                         .definition_store = external_store,
@@ -866,11 +866,29 @@ fn declarationForSymbol(resolution: *const resolver.Resolution, symbol: symbols.
     return null;
 }
 
-fn findLocalTypeSymbol(resolution: *const resolver.Resolution, name: []const u8) ?symbols.SymbolId {
+// `expected_module_path` distinguishes an UNQUALIFIED builtin/prelude
+// type (`Опция`, `Результат`, `module_path == null`, mixed into every
+// module without qualification) from a QUALIFIED builtin type accessed
+// through a module import (`DOM.СобытиеКлика`, `module_path ==
+// "DOM"`). Matching on name alone (the old behavior) silently matched
+// the FIRST same-named local type regardless of which module it came
+// from — for `null` that's harmless (there IS only ever one), but for
+// a qualified name it could never match anything (a local module's own
+// `DOM.SobytieKlika` import also carries `module_path == "DOM"`, never
+// `null`), producing `error.UnsupportedImportedType` for ANY struct
+// field whose type transitively references a qualified builtin type
+// declared in a THIRD module (e.g. a library's `Опция(функ(DOM.
+// СобытиеКлика) -> Пусто)` struct field, imported by an application
+// that itself also imports `DOM` — confirmed via a real crash, not
+// speculative).
+fn findLocalTypeSymbol(resolution: *const resolver.Resolution, name: []const u8, expected_module_path: ?[]const u8) ?symbols.SymbolId {
     for (resolution.symbols.symbols.items[1..], 1..) |entry, index| {
-        if (entry.kind == .type and entry.module_path == null and std.mem.eql(u8, entry.name, name)) {
-            return @enumFromInt(index);
-        }
+        if (entry.kind != .type or !std.mem.eql(u8, entry.name, name)) continue;
+        const module_paths_match = switch (entry.module_path == null) {
+            true => expected_module_path == null,
+            false => expected_module_path != null and std.mem.eql(u8, entry.module_path.?, expected_module_path.?),
+        };
+        if (module_paths_match) return @enumFromInt(index);
     }
     return null;
 }

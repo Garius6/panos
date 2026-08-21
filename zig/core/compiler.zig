@@ -1194,6 +1194,20 @@ const FunctionCompiler = struct {
             try self.function.emit(self.compiler.result.allocator, .{ .crypto_random_bytes_b64url = {} });
             return true;
         }
+        if (call.arguments.len == 0 and std.mem.eql(u8, property.property, "es256_сгенерировать_ключи")) {
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_es256_generate_keys = {} });
+            return true;
+        }
+        if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "es256_подписать")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_es256_sign = {} });
+            return true;
+        }
+        if (call.arguments.len == 4 and std.mem.eql(u8, property.property, "es256_проверить")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_es256_verify = {} });
+            return true;
+        }
         return false;
     }
 

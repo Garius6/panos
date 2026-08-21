@@ -1756,6 +1756,9 @@ pub const Vm = struct {
             .crypto_sha256_b64url => try self.cryptoSha256Base64Url(),
             .crypto_pbkdf2_sha256_b64url => try self.cryptoPbkdf2Sha256Base64Url(),
             .crypto_random_bytes_b64url => try self.cryptoRandomBytesBase64Url(),
+            .crypto_es256_generate_keys => try self.cryptoEs256GenerateKeys(),
+            .crypto_es256_sign => try self.cryptoEs256Sign(),
+            .crypto_es256_verify => try self.cryptoEs256Verify(),
             .http_request_respond_headers => try self.httpRequestRespondHeaders(),
             .http_listen => try self.httpListen(),
             .http_accept_submit => try self.httpAcceptSubmit(),
@@ -4338,6 +4341,182 @@ pub const Vm = struct {
         _ = encoder.encode(encoded, raw);
         const heap_string = try self.heap.createString(try self.allocator.dupe(u8, encoded));
         try self.stack.append(self.allocator, .{ .heap_string = heap_string });
+    }
+
+    // ES256 (ECDSA P-256 + SHA-256, RFC 7518 §3.4) — единственная
+    // асимметричная схема доступная без вендоринга: у Zig 0.16 std.crypto
+    // НЕТ RSA вообще (RS256 было бы недостижимо без стороннего кода), а
+    // `std.crypto.sign.ecdsa.EcdsaP256Sha256` уже есть в стандартной
+    // библиотеке. Даёт публичным OAuth2-клиентам верифицировать id_token
+    // через JWKS вместо общего HS256-секрета.
+    fn cryptoEs256GenerateKeys(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("криптография::es256_сгенерировать_ключи", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "криптография::es256_сгенерировать_ключи", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'криптография::es256_сгенерировать_ключи' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        const key_pair = Ecdsa.KeyPair.generate(io.io());
+        const encoder = std.base64.url_safe_no_pad.Encoder;
+        const d_bytes = key_pair.secret_key.toBytes();
+        const point = key_pair.public_key.toUncompressedSec1();
+        // `point` — 0x04 || x(32) || y(32) (SEC1 несжатый формат).
+        const x_bytes = point[1..33];
+        const y_bytes = point[33..65];
+        const d_encoded = try self.allocator.alloc(u8, encoder.calcSize(d_bytes.len));
+        defer self.allocator.free(d_encoded);
+        _ = encoder.encode(d_encoded, &d_bytes);
+        const x_encoded = try self.allocator.alloc(u8, encoder.calcSize(x_bytes.len));
+        defer self.allocator.free(x_encoded);
+        _ = encoder.encode(x_encoded, x_bytes);
+        const y_encoded = try self.allocator.alloc(u8, encoder.calcSize(y_bytes.len));
+        defer self.allocator.free(y_encoded);
+        _ = encoder.encode(y_encoded, y_bytes);
+        const d_string = try self.heap.createString(try self.allocator.dupe(u8, d_encoded));
+        const x_string = try self.heap.createString(try self.allocator.dupe(u8, x_encoded));
+        const y_string = try self.heap.createString(try self.allocator.dupe(u8, y_encoded));
+        const tuple_elements = try self.allocator.alloc(value.Value, 3);
+        tuple_elements[0] = .{ .heap_string = d_string };
+        tuple_elements[1] = .{ .heap_string = x_string };
+        tuple_elements[2] = .{ .heap_string = y_string };
+        const tuple = try self.heap.createAggregate(null, tuple_elements);
+        try self.stack.append(self.allocator, .{ .aggregate = tuple });
+    }
+
+    fn cryptoEs256Sign(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("криптография::es256_подписать", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "криптография::es256_подписать", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const message_text = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: криптография.es256_подписать() ожидает сообщение типа Строка вторым аргументом", .{});
+            return;
+        };
+        const d_b64url = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: криптография.es256_подписать() ожидает приватный ключ типа Строка первым аргументом", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'криптография::es256_подписать' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const d_len = decoder.calcSizeForSlice(d_b64url) catch {
+            try self.fault("Runtime Error: криптография.es256_подписать() ожидает валидный base64url приватный ключ", .{});
+            return;
+        };
+        if (d_len != Ecdsa.SecretKey.encoded_length) {
+            try self.fault("Runtime Error: криптография.es256_подписать() ожидает приватный ключ длиной {d} байт", .{Ecdsa.SecretKey.encoded_length});
+            return;
+        }
+        var d_bytes: [Ecdsa.SecretKey.encoded_length]u8 = undefined;
+        decoder.decode(&d_bytes, d_b64url) catch {
+            try self.fault("Runtime Error: криптография.es256_подписать() ожидает валидный base64url приватный ключ", .{});
+            return;
+        };
+        const secret_key = Ecdsa.SecretKey.fromBytes(d_bytes) catch {
+            try self.fault("Runtime Error: криптография.es256_подписать() получил недействительный приватный ключ", .{});
+            return;
+        };
+        const key_pair = Ecdsa.KeyPair.fromSecretKey(secret_key) catch {
+            try self.fault("Runtime Error: криптография.es256_подписать() получил недействительный приватный ключ", .{});
+            return;
+        };
+        const signature = key_pair.sign(message_text, null) catch {
+            try self.fault("Runtime Error: криптография.es256_подписать() не смог подписать сообщение", .{});
+            return;
+        };
+        const sig_bytes = signature.toBytes();
+        const encoder = std.base64.url_safe_no_pad.Encoder;
+        const encoded = try self.allocator.alloc(u8, encoder.calcSize(sig_bytes.len));
+        defer self.allocator.free(encoded);
+        _ = encoder.encode(encoded, &sig_bytes);
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, encoded));
+        try self.stack.append(self.allocator, .{ .heap_string = heap_string });
+    }
+
+    fn cryptoEs256Verify(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("криптография::es256_проверить", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "криптография::es256_проверить", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const signature_b64url = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: криптография.es256_проверить() ожидает подпись типа Строка четвёртым аргументом", .{});
+            return;
+        };
+        const message_text = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: криптография.es256_проверить() ожидает сообщение типа Строка третьим аргументом", .{});
+            return;
+        };
+        const y_b64url = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: криптография.es256_проверить() ожидает y-координату типа Строка вторым аргументом", .{});
+            return;
+        };
+        const x_b64url = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: криптография.es256_проверить() ожидает x-координату типа Строка первым аргументом", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'криптография::es256_проверить' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const false_result: value.Value = .{ .boolean = false };
+        const coord_len = (Ecdsa.PublicKey.uncompressed_sec1_encoded_length - 1) / 2;
+        const x_len = decoder.calcSizeForSlice(x_b64url) catch {
+            try self.stack.append(self.allocator, false_result);
+            return;
+        };
+        const y_len = decoder.calcSizeForSlice(y_b64url) catch {
+            try self.stack.append(self.allocator, false_result);
+            return;
+        };
+        const sig_len = decoder.calcSizeForSlice(signature_b64url) catch {
+            try self.stack.append(self.allocator, false_result);
+            return;
+        };
+        if (x_len != coord_len or y_len != coord_len or sig_len != Ecdsa.Signature.encoded_length) {
+            try self.stack.append(self.allocator, false_result);
+            return;
+        }
+        var sec1: [Ecdsa.PublicKey.uncompressed_sec1_encoded_length]u8 = undefined;
+        sec1[0] = 0x04;
+        decoder.decode(sec1[1 .. 1 + coord_len], x_b64url) catch {
+            try self.stack.append(self.allocator, false_result);
+            return;
+        };
+        decoder.decode(sec1[1 + coord_len ..], y_b64url) catch {
+            try self.stack.append(self.allocator, false_result);
+            return;
+        };
+        var sig_bytes: [Ecdsa.Signature.encoded_length]u8 = undefined;
+        decoder.decode(&sig_bytes, signature_b64url) catch {
+            try self.stack.append(self.allocator, false_result);
+            return;
+        };
+        const public_key = Ecdsa.PublicKey.fromSec1(&sec1) catch {
+            try self.stack.append(self.allocator, false_result);
+            return;
+        };
+        const signature = Ecdsa.Signature.fromBytes(sig_bytes);
+        signature.verify(message_text, public_key) catch {
+            try self.stack.append(self.allocator, false_result);
+            return;
+        };
+        try self.stack.append(self.allocator, .{ .boolean = true });
     }
 
     fn callForeign(self: *Vm, compiled: *const bytecode.Function, constant_index: u16, argument_count: u16) anyerror!void {

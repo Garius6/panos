@@ -4365,6 +4365,47 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.string;
             }
+            if (self.isBuiltinModule(symbol, "криптография", "es256_сгенерировать_ключи")) {
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                if (call.arguments.len != 0) {
+                    try self.report(call.span, "Type Error: криптография.es256_сгенерировать_ключи() не принимает аргументы", .{});
+                }
+                return try self.result.types.tuple(&.{ self.result.types.builtins.string, self.result.types.builtins.string, self.result.types.builtins.string });
+            }
+            if (self.isBuiltinModule(symbol, "криптография", "es256_подписать")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: криптография.es256_подписать() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: криптография.es256_подписать() ожидает приватный ключ типа Строка первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: криптография.es256_подписать() ожидает сообщение типа Строка вторым аргументом", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "криптография", "es256_проверить")) {
+                if (call.arguments.len != 4) {
+                    try self.report(call.span, "Type Error: криптография.es256_проверить() ожидает 4 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.boolean;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: криптография.es256_проверить() ожидает x-координату типа Строка первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: криптография.es256_проверить() ожидает y-координату типа Строка вторым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[2], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: криптография.es256_проверить() ожидает сообщение типа Строка третьим аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[3], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: криптография.es256_проверить() ожидает подпись типа Строка четвёртым аргументом", .{});
+                }
+                return self.result.types.builtins.boolean;
+            }
             if (self.isBuiltin(symbol, "получить")) {
                 if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить() не принимает аргументы", .{});
                 for (call.arguments) |argument| _ = try self.infer(argument);

@@ -1141,7 +1141,7 @@ const FunctionCompiler = struct {
         };
         const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
         const entry = self.compiler.resolution.symbols.get(symbol) orelse return false;
-        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "крипто")) return false;
+        if (entry.kind != .builtin or entry.module_path == null or !std.mem.eql(u8, entry.module_path.?, "криптография")) return false;
         if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "hmac_sha256_base64url")) {
             for (call.arguments) |argument| try self.compileExpression(argument);
             try self.function.emit(self.compiler.result.allocator, .{ .crypto_hmac_sha256_b64url = {} });
@@ -1160,6 +1160,16 @@ const FunctionCompiler = struct {
         if (call.arguments.len == 2 and std.mem.eql(u8, property.property, "сравнить_константное_время")) {
             for (call.arguments) |argument| try self.compileExpression(argument);
             try self.function.emit(self.compiler.result.allocator, .{ .crypto_timing_safe_eq = {} });
+            return true;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, property.property, "sha256_base64url")) {
+            try self.compileExpression(call.arguments[0]);
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_sha256_b64url = {} });
+            return true;
+        }
+        if (call.arguments.len == 3 and std.mem.eql(u8, property.property, "pbkdf2_sha256_base64url")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_pbkdf2_sha256_b64url = {} });
             return true;
         }
         return false;
@@ -1641,6 +1651,15 @@ const FunctionCompiler = struct {
                 try self.compileExpression(call.arguments[1]);
                 try self.compileExpression(call.arguments[2]);
                 try self.function.emit(self.compiler.result.allocator, .{ .http_request_respond = {} });
+                return true;
+            }
+            if (std.mem.eql(u8, property.property, "ответить_с_заголовками") and call.arguments.len == 4) {
+                try self.compileExpression(property.object);
+                try self.compileExpression(call.arguments[0]);
+                try self.compileExpression(call.arguments[1]);
+                try self.compileExpression(call.arguments[2]);
+                try self.compileExpression(call.arguments[3]);
+                try self.function.emit(self.compiler.result.allocator, .{ .http_request_respond_headers = {} });
                 return true;
             }
         }

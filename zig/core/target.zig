@@ -44,7 +44,7 @@ pub fn builtinAvailability(name: []const u8) BuiltinAvailability {
         std.mem.startsWith(u8, name, "сжатие::") or
         std.mem.startsWith(u8, name, "синтаксис::") or
         std.mem.startsWith(u8, name, "бд::") or
-        std.mem.startsWith(u8, name, "крипто::"))
+        std.mem.startsWith(u8, name, "криптография::"))
     {
         return .native_only;
     }
@@ -121,7 +121,7 @@ test "builtin availability matches the expected classification per builtin" {
     try std.testing.expectEqual(BuiltinAvailability.all, builtinAvailability("массив::длина"));
     try std.testing.expectEqual(BuiltinAvailability.native_only, builtinAvailability("фс::есть"));
     try std.testing.expectEqual(BuiltinAvailability.native_only, builtinAvailability("сеть::http_запрос"));
-    try std.testing.expectEqual(BuiltinAvailability.native_only, builtinAvailability("крипто::hmac_sha256_base64url"));
+    try std.testing.expectEqual(BuiltinAvailability.native_only, builtinAvailability("криптография::hmac_sha256_base64url"));
     try std.testing.expectEqual(BuiltinAvailability.aot_wasm_only, builtinAvailability("DOM::текст"));
     try std.testing.expectEqual(BuiltinAvailability.aot_wasm_only, builtinAvailability("сеть::http_запрос_sync"));
 }

@@ -184,6 +184,8 @@ pub const Opcode = enum {
     crypto_base64url_encode,
     crypto_base64url_decode,
     crypto_timing_safe_eq,
+    crypto_sha256_b64url,
+    crypto_pbkdf2_sha256_b64url,
     // Неблокирующий I/O: submit-опкоды кладут задачу в воркер-пул и
     // возвращают управление сразу (не блокируют) — компилятор ВСЕГДА
     // эмитит await_async сразу после (compiler.zig, compileFilesystemBuiltin).
@@ -201,6 +203,7 @@ pub const Opcode = enum {
     http_request_body,
     http_request_header,
     http_request_respond,
+    http_request_respond_headers,
     str_to_bytes,
     str_to_runes,
     str_from_runes,
@@ -376,6 +379,8 @@ pub const Instruction = union(Opcode) {
     crypto_base64url_encode: void,
     crypto_base64url_decode: void,
     crypto_timing_safe_eq: void,
+    crypto_sha256_b64url: void,
+    crypto_pbkdf2_sha256_b64url: void,
     file_read_submit: void,
     file_write_submit: void,
     net_connect_submit: void,
@@ -387,6 +392,7 @@ pub const Instruction = union(Opcode) {
     http_request_body: void,
     http_request_header: void,
     http_request_respond: void,
+    http_request_respond_headers: void,
     str_to_bytes: void,
     str_to_runes: void,
     str_from_runes: void,

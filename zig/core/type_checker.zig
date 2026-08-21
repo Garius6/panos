@@ -3273,7 +3273,7 @@ const Checker = struct {
     }
 
     // Общая для `отправить`/`отправить_или` — проверяет аргумент
-    // сообщения против T из `Процесс(T)` дескриптора (`inferExpected`,
+    // сообщения против T из `Процесс(T)` дескриптографияра (`inferExpected`,
     // тот же механизм, что использует привязка `пер x: T = ...`, так что
     // конструктор варианта перечисления вроде `Команда.Пинг(...)`,
     // отправленный напрямую, всё равно выводится корректно). T
@@ -4229,56 +4229,84 @@ const Checker = struct {
                 }
                 return result_type;
             }
-            if (self.isBuiltinModule(symbol, "крипто", "hmac_sha256_base64url")) {
+            if (self.isBuiltinModule(symbol, "криптография", "hmac_sha256_base64url")) {
                 if (call.arguments.len != 2) {
-                    try self.report(call.span, "Type Error: крипто.hmac_sha256_base64url() ожидает 2 аргумента", .{});
+                    try self.report(call.span, "Type Error: криптография.hmac_sha256_base64url() ожидает 2 аргумента", .{});
                     for (call.arguments) |argument| _ = try self.infer(argument);
                     return self.result.types.builtins.string;
                 }
                 if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
-                    try self.report(call.span, "Type Error: крипто.hmac_sha256_base64url() ожидает ключ типа Строка первым аргументом", .{});
+                    try self.report(call.span, "Type Error: криптография.hmac_sha256_base64url() ожидает ключ типа Строка первым аргументом", .{});
                 }
                 if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
-                    try self.report(call.span, "Type Error: крипто.hmac_sha256_base64url() ожидает сообщение типа Строка вторым аргументом", .{});
+                    try self.report(call.span, "Type Error: криптография.hmac_sha256_base64url() ожидает сообщение типа Строка вторым аргументом", .{});
                 }
                 return self.result.types.builtins.string;
             }
-            if (self.isBuiltinModule(symbol, "крипто", "base64url_кодировать")) {
+            if (self.isBuiltinModule(symbol, "криптография", "base64url_кодировать")) {
                 if (call.arguments.len != 1) {
-                    try self.report(call.span, "Type Error: крипто.base64url_кодировать() ожидает 1 аргумент", .{});
+                    try self.report(call.span, "Type Error: криптография.base64url_кодировать() ожидает 1 аргумент", .{});
                     for (call.arguments) |argument| _ = try self.infer(argument);
                     return self.result.types.builtins.string;
                 }
                 if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
-                    try self.report(call.span, "Type Error: крипто.base64url_кодировать() ожидает Строку", .{});
+                    try self.report(call.span, "Type Error: криптография.base64url_кодировать() ожидает Строку", .{});
                 }
                 return self.result.types.builtins.string;
             }
-            if (self.isBuiltinModule(symbol, "крипто", "base64url_декодировать")) {
+            if (self.isBuiltinModule(symbol, "криптография", "base64url_декодировать")) {
                 const result_type = self.resultOfString(self.result.types.builtins.string) orelse return self.result.types.poison();
                 if (call.arguments.len != 1) {
-                    try self.report(call.span, "Type Error: крипто.base64url_декодировать() ожидает 1 аргумент", .{});
+                    try self.report(call.span, "Type Error: криптография.base64url_декодировать() ожидает 1 аргумент", .{});
                     for (call.arguments) |argument| _ = try self.infer(argument);
                     return result_type;
                 }
                 if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
-                    try self.report(call.span, "Type Error: крипто.base64url_декодировать() ожидает Строку", .{});
+                    try self.report(call.span, "Type Error: криптография.base64url_декодировать() ожидает Строку", .{});
                 }
                 return result_type;
             }
-            if (self.isBuiltinModule(symbol, "крипто", "сравнить_константное_время")) {
+            if (self.isBuiltinModule(symbol, "криптография", "сравнить_константное_время")) {
                 if (call.arguments.len != 2) {
-                    try self.report(call.span, "Type Error: крипто.сравнить_константное_время() ожидает 2 аргумента", .{});
+                    try self.report(call.span, "Type Error: криптография.сравнить_константное_время() ожидает 2 аргумента", .{});
                     for (call.arguments) |argument| _ = try self.infer(argument);
                     return self.result.types.builtins.boolean;
                 }
                 if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
-                    try self.report(call.span, "Type Error: крипто.сравнить_константное_время() ожидает Строку первым аргументом", .{});
+                    try self.report(call.span, "Type Error: криптография.сравнить_константное_время() ожидает Строку первым аргументом", .{});
                 }
                 if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
-                    try self.report(call.span, "Type Error: крипто.сравнить_константное_время() ожидает Строку вторым аргументом", .{});
+                    try self.report(call.span, "Type Error: криптография.сравнить_константное_время() ожидает Строку вторым аргументом", .{});
                 }
                 return self.result.types.builtins.boolean;
+            }
+            if (self.isBuiltinModule(symbol, "криптография", "sha256_base64url")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: криптография.sha256_base64url() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: криптография.sha256_base64url() ожидает Строку", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "криптография", "pbkdf2_sha256_base64url")) {
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: криптография.pbkdf2_sha256_base64url() ожидает 3 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: криптография.pbkdf2_sha256_base64url() ожидает пароль типа Строка первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: криптография.pbkdf2_sha256_base64url() ожидает соль типа Строка вторым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[2], self.result.types.builtins.number), self.result.types.builtins.number)) {
+                    try self.report(call.span, "Type Error: криптография.pbkdf2_sha256_base64url() ожидает итерации типа Число третьим аргументом", .{});
+                }
+                return self.result.types.builtins.string;
             }
             if (self.isBuiltin(symbol, "получить")) {
                 if (call.arguments.len != 0) try self.report(call.span, "Type Error: получить() не принимает аргументы", .{});
@@ -5906,6 +5934,25 @@ const Checker = struct {
                     }
                     if (!self.assignable(try self.inferExpected(call.arguments[2], self.result.types.builtins.string), self.result.types.builtins.string)) {
                         try self.report(call.span, "Type Error: Запрос.ответить() ожидает тело типа Строка третьим аргументом", .{});
+                    }
+                }
+                return @as(?types.TypeId, self.result.types.builtins.void);
+            }
+            if (std.mem.eql(u8, property.property, "ответить_с_заголовками")) {
+                try self.checkMethodArity(call, "ответить_с_заголовками", 4);
+                if (call.arguments.len == 4) {
+                    if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.integer), self.result.types.builtins.integer)) {
+                        try self.report(call.span, "Type Error: Запрос.ответить_с_заголовками() ожидает статус типа Целое первым аргументом", .{});
+                    }
+                    if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: Запрос.ответить_с_заголовками() ожидает тип содержимого типа Строка вторым аргументом", .{});
+                    }
+                    if (!self.assignable(try self.inferExpected(call.arguments[2], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: Запрос.ответить_с_заголовками() ожидает тело типа Строка третьим аргументом", .{});
+                    }
+                    const headers_map_type = try self.result.types.map(self.result.types.builtins.string, self.result.types.builtins.string);
+                    if (!self.assignable(try self.inferExpected(call.arguments[3], headers_map_type), headers_map_type)) {
+                        try self.report(call.span, "Type Error: Запрос.ответить_с_заголовками() ожидает Соответствие(Строка, Строка) четвёртым аргументом", .{});
                     }
                 }
                 return @as(?types.TypeId, self.result.types.builtins.void);

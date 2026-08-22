@@ -1590,11 +1590,28 @@ fn lowerArrayLiteral(ctx: *LoweringContext, expression: ast.ExprId, array: anyty
     try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = array_value } });
     const append_name = if (wasm_module.wasmValTypeForStore(&ctx.checked.types, element_type) == wasm_module.wasm_i32) "@runtime::array_append_i32" else "@runtime::array_append_f64";
     for (array.elements) |element| {
-        const receiver = try ctx.builder.newValue(array_type);
-        try ctx.builder.emit(.{ .load_local = .{ .dst = receiver, .local = local } });
+        // Реальный найденный баг: `receiver` раньше перезагружался ДО
+        // `lowerExpr(element)` — безопасно, ТОЛЬКО ЕСЛИ вычисление
+        // элемента никогда не пересекает границу блока. Элемент,
+        // вычисление которого ветвится (замыкание с захватом типа
+        // `.function_ref` — та же причина, что уже исправлена в
+        // `lowerCallArgs`, — или любое другое условное выражение),
+        // "терял" уже перезагруженный `receiver`: он не переживает
+        // переход в другой блок в этой стек-машинной модели
+        // кодогенерации. Перезагружаем `receiver` ЗАНОВО, вплотную к
+        // append, ПОСЛЕ того, как элемент полностью вычислен — то же
+        // решение, что и в `lowerCallArgs`, только здесь `receiver`
+        // (аккумулятор массива) — не аргумент из `expressions`, а
+        // отдельная величина, специфичная для этого цикла.
         const value = try lowerExpr(ctx, element);
         if (value.flow == .terminates) return terminated;
-        try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = append_name, .args = try valuesInArena(ctx, &.{ receiver, value.value }) } });
+        const value_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$element", element_type);
+        try ctx.builder.emit(.{ .store_local = .{ .local = value_local, .src = value.value } });
+        const receiver = try ctx.builder.newValue(array_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = receiver, .local = local } });
+        const value_reloaded = try ctx.builder.newValue(element_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = value_reloaded, .local = value_local } });
+        try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = append_name, .args = try valuesInArena(ctx, &.{ receiver, value_reloaded }) } });
     }
     const result = try ctx.builder.newValue(array_type);
     try ctx.builder.emit(.{ .load_local = .{ .dst = result, .local = local } });
@@ -1872,13 +1889,10 @@ fn lowerSymbolValueRef(ctx: *LoweringContext, symbol: symbols.SymbolId, span: so
         // обёртку с игнорируемым `env_ptr`.
         const dst = try ctx.builder.newValue(ctx.checked.types.builtins.boolean);
         try ctx.builder.emit(.{ .build_closure = .{ .dst = dst, .function = function_id, .captured = &.{}, .already_env_aware = false } });
-        // Продвигаем в постоянную память СРАЗУ при построении — см.
-        // doc-комментарий `promoteEveryClosureAtConstruction` ниже:
-        // функция-значение, использованная как ОБЫЧНЫЕ данные (аргумент,
-        // поле структуры, элемент Опция/перечисления), должна пережить
-        // сброс per-call арены, где бы она в итоге ни была ИСПОЛЬЗОВАНА —
-        // не только при непосредственной передаче в DOM.на_клик.
-        return try promoteClosureBoxToPermanent(ctx, closureBoxLayout(ctx), dst, &.{}, 0);
+        // Без захватов box полностью константен. `wasm_interfaces`
+        // заменит его на дедуплицированную запись data-секции,
+        // которая уже переживает любой сброс арены без permanent-аллокации.
+        return dst;
     }
     _ = span;
     return ctx.unsupported("символ не является локалью или функцией");
@@ -1909,8 +1923,8 @@ fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) a
     const captures = ctx.resolution.lambda_captures.get(expression) orelse &.{};
     if (captures.len > std.math.maxInt(u16)) return ctx.unsupported("лямбда захватывает слишком много значений");
 
-    // КАЖДАЯ лямбда теперь продвигается в постоянную память сразу при
-    // построении (см. вызов promoteClosureBoxToPermanent ниже) — раньше
+    // Каждая лямбда С ЗАХВАТАМИ продвигается в постоянную память сразу
+    // при построении (см. вызов promoteClosureBoxToPermanent ниже) — раньше
     // эта проверка (и флаг `actor_captured_by_dom_closure`) жила только
     // в `lowerDomClickClosure`, потому что только ТАМ действительно
     // происходило продвижение. Теперь продвижение универсально, значит
@@ -1985,14 +1999,14 @@ fn lowerLambda(ctx: *LoweringContext, expression: ast.ExprId, lambda: anytype) a
 
     const dst = try ctx.builder.newValue(ctx.checked.expression_types.get(expression) orelse ctx.checked.types.builtins.boolean);
     try ctx.builder.emit(.{ .build_closure = .{ .dst = dst, .function = lambda_function_id, .captured = captured_slice, .already_env_aware = true } });
-    // См. `promoteEveryClosureAtConstruction` (doc-комментарий у
-    // `closureBoxLayout`/`lowerSymbolValueRef`) — КАЖДАЯ лямбда,
-    // независимо от того, куда её значение в итоге попадёт (передана
-    // как аргумент, сохранена в поле структуры, обёрнута в Опция),
-    // должна пережить сброс per-call арены. Раньше это гарантировалось
+    // Лямбда С ЗАХВАТАМИ, независимо от того, куда её значение в итоге
+    // попадёт (передана как аргумент, сохранена в поле структуры,
+    // обёрнута в Опция), должна пережить сброс per-call арены. Раньше
+    // это гарантировалось
     // только для лямбды, буквально стоящей ВТОРЫМ аргументом
     // DOM.на_клик (`lowerDomClickClosure`) — любое иное использование
     // замыкания как обычного значения падало компиляцией.
+    if (captures.len == 0) return continuesWith(dst);
     const promoted = try promoteClosureBoxToPermanent(ctx, closureBoxLayout(ctx), dst, captures, 0);
     return continuesWith(promoted);
 }
@@ -2485,6 +2499,26 @@ fn lowerEnumConstructor(ctx: *LoweringContext, symbol: symbols.SymbolId, call: a
     return continuesWith(dst);
 }
 
+// Значение, произведённое до ветвления (например, evaluation следующего
+// аргумента промотирует closure через promoteFunctionRefCapture, который
+// сам содержит runtime-branch), теряется при пересечении границы блока в
+// WASM-кодогенерации, если не проведено через Local — тот же паттерн,
+// что и в lowerCallArgs/lowerArrayLiteral выше.
+const ProtectedValue = struct { local: mir.LocalId, type_id: types.TypeId };
+
+fn protectValue(ctx: *LoweringContext, value: mir.ValueId) anyerror!ProtectedValue {
+    const type_id = ctx.builder.currentFunction().valueType(value);
+    const local = try ctx.builder.newLocal(symbols.invalid_symbol, "$val", type_id);
+    try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = value } });
+    return .{ .local = local, .type_id = type_id };
+}
+
+fn reloadProtected(ctx: *LoweringContext, protected: ProtectedValue) anyerror!mir.ValueId {
+    const value = try ctx.builder.newValue(protected.type_id);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = value, .local = protected.local } });
+    return value;
+}
+
 fn lowerArrayMethodCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const property = ctx.tree.expr(call.callee).property;
     const object_type = ctx.checked.expression_types.get(property.object) orelse return null;
@@ -2505,13 +2539,18 @@ fn lowerArrayMethodCall(ctx: *LoweringContext, call: anytype, result_type: types
 
     const receiver = try lowerExpr(ctx, property.object);
     if (receiver.flow == .terminates) return terminated;
-    var values: std.ArrayList(mir.ValueId) = .empty;
-    defer values.deinit(ctx.allocator);
-    try values.append(ctx.allocator, receiver.value);
+    var protected: std.ArrayList(ProtectedValue) = .empty;
+    defer protected.deinit(ctx.allocator);
+    try protected.append(ctx.allocator, try protectValue(ctx, receiver.value));
     for (call.arguments) |argument| {
         const value = try lowerExpr(ctx, argument);
         if (value.flow == .terminates) return terminated;
-        try values.append(ctx.allocator, value.value);
+        try protected.append(ctx.allocator, try protectValue(ctx, value.value));
+    }
+    var values: std.ArrayList(mir.ValueId) = .empty;
+    defer values.deinit(ctx.allocator);
+    for (protected.items) |item| {
+        try values.append(ctx.allocator, try reloadProtected(ctx, item));
     }
     const is_void = ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);
     const dst = if (is_void) null else try ctx.builder.newValue(result_type);
@@ -2548,13 +2587,18 @@ fn lowerMapMethodCall(ctx: *LoweringContext, call: anytype, result_type: types.T
 
     const receiver = try lowerExpr(ctx, property.object);
     if (receiver.flow == .terminates) return terminated;
-    var values: std.ArrayList(mir.ValueId) = .empty;
-    defer values.deinit(ctx.allocator);
-    try values.append(ctx.allocator, receiver.value);
+    var protected: std.ArrayList(ProtectedValue) = .empty;
+    defer protected.deinit(ctx.allocator);
+    try protected.append(ctx.allocator, try protectValue(ctx, receiver.value));
     for (call.arguments) |argument| {
         const value = try lowerExpr(ctx, argument);
         if (value.flow == .terminates) return terminated;
-        try values.append(ctx.allocator, value.value);
+        try protected.append(ctx.allocator, try protectValue(ctx, value.value));
+    }
+    var values: std.ArrayList(mir.ValueId) = .empty;
+    defer values.deinit(ctx.allocator);
+    for (protected.items) |item| {
+        try values.append(ctx.allocator, try reloadProtected(ctx, item));
     }
     const is_void = ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);
     const dst = if (is_void) null else try ctx.builder.newValue(result_type);
@@ -3460,14 +3504,13 @@ fn promoteClosureBoxToPermanent(ctx: *LoweringContext, layout: wasm_heap.PtrLayo
 // `DOM.на_клик(selector, обработчик)` раньше требовал, чтобы
 // `обработчик` был литеральным выражением `.lambda` ПРЯМО НА МЕСТЕ
 // ВЫЗОВА — единственный способ статически знать список захватов ДЛЯ
-// ПРОМОУШЕНА в постоянную память. С тех пор, как продвижение стало
-// свойством ПОСТРОЕНИЯ любого замыкания (`lowerLambda`/
-// `lowerSymbolValueRef` вызывают `promoteClosureBoxToPermanent` сами,
-// сразу при `.build_closure`), к моменту, когда `handler_expr`
-// понижается здесь через обычный `lowerExpr`, результат УЖЕ лежит в
-// постоянной памяти, откуда бы он ни пришёл — лямбда-литерал, простая
-// именованная функция, параметр, поле структуры, элемент Опция. Эта
-// функция больше не строит и не продвигает box сама — только проверяет
+// ПРОМОУШЕНА в постоянную память. Теперь captureful-лямбды продвигаются
+// при построении, а captureless-функции получают статический box в
+// data-секции (`wasm_interfaces.zig`). Поэтому к моменту, когда
+// `handler_expr` понижается здесь через обычный `lowerExpr`, результат
+// уже переживает сброс арены, откуда бы он ни пришёл — лямбда-литерал,
+// простая именованная функция, параметр, поле структуры, элемент Опция.
+// Эта функция больше не строит и не продвигает box сама — только проверяет
 // сигнатуру обработчика и вызывает builtin.
 fn lowerDomClickClosure(ctx: *LoweringContext, call: anytype) anyerror!ExprOutcome {
     if (call.arguments.len != 2) return ctx.unsupported("DOM.на_клик() ожидает 2 аргумента");
@@ -3521,6 +3564,10 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
         "DOM::текст"
     else if (std.mem.eql(u8, property.property, "установить_текст"))
         "DOM::установить_текст"
+    else if (std.mem.eql(u8, property.property, "данные_клика"))
+        "DOM::данные_клика"
+    else if (std.mem.eql(u8, property.property, "атрибут_клика"))
+        "DOM::атрибут_клика"
     else if (std.mem.eql(u8, property.property, "текст_строка"))
         "DOM::текст_строка"
     else if (std.mem.eql(u8, property.property, "установить_текст_строка"))
@@ -3531,12 +3578,16 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
         "DOM::установить_значение_поля"
     else if (std.mem.eql(u8, property.property, "создать_и_добавить"))
         "DOM::создать_и_добавить"
+    else if (std.mem.eql(u8, property.property, "переместить"))
+        "DOM::переместить"
     else if (std.mem.eql(u8, property.property, "после_кадра"))
         "DOM::после_кадра"
     else if (std.mem.eql(u8, property.property, "атрибут"))
         "DOM::атрибут"
     else if (std.mem.eql(u8, property.property, "установить_атрибут"))
         "DOM::установить_атрибут"
+    else if (std.mem.eql(u8, property.property, "удалить_атрибут"))
+        "DOM::удалить_атрибут"
     else if (std.mem.eql(u8, property.property, "удалить"))
         "DOM::удалить"
     else if (std.mem.eql(u8, property.property, "путь"))
@@ -3619,16 +3670,50 @@ fn lowerStateBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: type
     return continuesWith(dst);
 }
 
+// Реальный найденный баг: раньше каждый аргумент оставался голым SSA-
+// значением от момента своего вычисления до финального использования в
+// `args` — корректно, ТОЛЬКО ЕСЛИ ничего между вычислением ЭТОГО
+// аргумента и следующего не пересекает границу блока (ветвление).
+// Аргумент, чьё ВЫЧИСЛЕНИЕ ветвится (условное выражение, короткое
+// замыкание и/или, замыкание с захватом типа `.function_ref` —
+// `promoteFunctionRefCapture` в этом же файле эмитит настоящую
+// runtime-проверку is_plain/ловушку), незаметно "съедал" уже
+// вычисленные, но ещё не потреблённые более РАННИЕ аргументы — они
+// просто не переживают переход в другой блок в этой стек-машинной
+// модели кодогенерации (`wasm_emit.zig` реплеит инструкции как чистый
+// стек, значения не пересекают границы блока сами по себе). Найдено
+// на `внешняя(1, функ(...) -> Пусто показать(ид) конец)` — вызов
+// `показать` внутри тела замыкания захватывает саму `показать` как
+// `.function_ref`-капчур, и её промоушен ветвится; литерал `1`,
+// вычисленный раньше, терялся — "not enough arguments on the stack"
+// при валидации в реальном браузере (wasmtime CLI это не ловил).
+// Теперь КАЖДЫЙ аргумент немедленно уходит в свою Local сразу после
+// вычисления (переживает любое последующее ветвление), и все
+// перезагружаются заново непосредственно перед сборкой `args` — тот
+// же приём "произведи заново рядом с потреблением", что используется
+// по всему `wasm_maps.zig`/`wasm_strings.zig` для той же категории
+// проблемы, просто здесь — на уровне ОБЩЕГО понижения вызовов, не
+// вручную написанного рантайма.
 fn lowerCallArgs(ctx: *LoweringContext, expressions: []const ast.ExprId) anyerror!?[]const mir.ValueId {
     // Выделяется в арене — этот срез хранится постоянно внутри
     // инструкции `call_value`, в отличие от временных значений на
     // `ctx.allocator`, которые освобождаются в рамках этого вызова.
     const arena = ctx.builder.module.arena.allocator();
-    var args: std.ArrayList(mir.ValueId) = .empty;
+    var arg_locals: std.ArrayList(struct { local: mir.LocalId, type_id: types.TypeId }) = .empty;
+    defer arg_locals.deinit(ctx.allocator);
     for (expressions) |expression| {
         const outcome = try lowerExpr(ctx, expression);
         if (outcome.flow == .terminates) return null;
-        try args.append(arena, outcome.value);
+        const type_id = ctx.builder.currentFunction().valueType(outcome.value);
+        const local = try ctx.builder.newLocal(symbols.invalid_symbol, "$arg", type_id);
+        try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = outcome.value } });
+        try arg_locals.append(ctx.allocator, .{ .local = local, .type_id = type_id });
+    }
+    var args: std.ArrayList(mir.ValueId) = .empty;
+    for (arg_locals.items) |entry| {
+        const value = try ctx.builder.newValue(entry.type_id);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = value, .local = entry.local } });
+        try args.append(arena, value);
     }
     return try args.toOwnedSlice(arena);
 }

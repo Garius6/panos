@@ -168,6 +168,18 @@
       }
     },
     {
+      "id": "aot-function-value-argument-order",
+      "tier": "aot",
+      "profile": "aot_wasi",
+      "input": "tests/conformance/aot/function_value_argument_order.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "27\n",
+        "result": "27"
+      }
+    },
+    {
       "id": "graph-impl-qualified-target",
       "tier": "graph",
       "profile": "native",

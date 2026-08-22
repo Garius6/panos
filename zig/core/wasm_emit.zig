@@ -109,6 +109,9 @@ const EmitContext = struct {
     // `collectStringConstants`) — пусто для любого модуля без строковых
     // литералов вообще.
     string_offsets: *const std.StringHashMap(u32),
+    // Базовый адрес массива 8-байтных captureless closure-box'ов
+    // в data-секции; `static_closure_ref.slot` выбирает запись.
+    static_closure_base: u32,
     // `signatureShapeKey(params, result) -> общий индекс в секции типов` —
     // заполняется только для модулей с непустой таблицей функций
     // интерфейса; собственная кодогенерация `.call_indirect` ищет здесь
@@ -196,7 +199,7 @@ const EmitContext = struct {
         return index;
     }
 
-    fn init(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, function: *const mir.Function, func_index: *const std.AutoHashMap(mir.FunctionId, u32), builtin_index: *const std.StringHashMap(u32), string_offsets: *const std.StringHashMap(u32), interface_type_index: *const std.StringHashMap(u32)) !EmitContext {
+    fn init(allocator: std.mem.Allocator, checked: *const type_checker.CheckResult, function: *const mir.Function, func_index: *const std.AutoHashMap(mir.FunctionId, u32), builtin_index: *const std.StringHashMap(u32), string_offsets: *const std.StringHashMap(u32), static_closure_base: u32, interface_type_index: *const std.StringHashMap(u32)) !EmitContext {
         var cfg = try mir_cfg.computeCfgInfo(allocator, function);
         errdefer cfg.deinit();
         var rpo_index = try wasm_stackify.buildRpoIndex(allocator, &cfg);
@@ -218,6 +221,7 @@ const EmitContext = struct {
             .use_count = use_count,
             .builtin_index = builtin_index,
             .string_offsets = string_offsets,
+            .static_closure_base = static_closure_base,
             .interface_type_index = interface_type_index,
         };
     }
@@ -315,7 +319,7 @@ fn computeUseCount(allocator: std.mem.Allocator, function: *const mir.Function) 
                     try countUse(&counts, store.addr);
                     try countUse(&counts, store.src);
                 },
-                .const_value, .load_local, .function_ref, .global_get, .memory_size => {},
+                .const_value, .load_local, .function_ref, .static_closure_ref, .global_get, .memory_size => {},
                 else => return unsupported("вид MIR-инструкции при подсчёте использований"),
             }
         }
@@ -731,6 +735,11 @@ fn emitMirInstr(ctx: *EmitContext, instruction: mir.Instruction) !?mir.ValueId {
             try ctx.value_to_function.put(function_ref.dst, function_ref.function);
             return null;
         },
+        .static_closure_ref => |closure| {
+            try code.append(allocator, 0x41); // i32.const
+            try wasm_module.writeSleb128(code, allocator, @intCast(ctx.static_closure_base + closure.slot * 8));
+            return closure.dst;
+        },
         // Сюда попадают две формы: (1) СТАТИЧЕСКИ известный вызов именованной
         // функции (обычный случай — быстрые пути ident/method_calls/module-
         // import в `mir_lowering.zig`) — `callee` восходит к `.function_ref`
@@ -985,9 +994,10 @@ pub fn emitFunctionWasm(
     func_index: *const std.AutoHashMap(mir.FunctionId, u32),
     builtin_index: *const std.StringHashMap(u32),
     string_offsets: *const std.StringHashMap(u32),
+    static_closure_base: u32,
     interface_type_index: *const std.StringHashMap(u32),
 ) ![]u8 {
-    var ctx = try EmitContext.init(allocator, checked, function, func_index, builtin_index, string_offsets, interface_type_index);
+    var ctx = try EmitContext.init(allocator, checked, function, func_index, builtin_index, string_offsets, static_closure_base, interface_type_index);
     defer ctx.deinit();
 
     _ = try processFrom(&ctx, function.entry, mir.invalid_block);
@@ -1070,14 +1080,18 @@ fn hostImportNameForBuiltin(name: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "DOM::текст")) return "dom_get_text_num";
     if (std.mem.eql(u8, name, "DOM::установить_текст")) return "dom_set_text_num";
     if (std.mem.eql(u8, name, "DOM::на_клик")) return "dom_on_click";
+    if (std.mem.eql(u8, name, "DOM::данные_клика")) return "dom_get_click_data";
+    if (std.mem.eql(u8, name, "DOM::атрибут_клика")) return "dom_get_click_attribute";
     if (std.mem.eql(u8, name, "DOM::текст_строка")) return "dom_get_text_string";
     if (std.mem.eql(u8, name, "DOM::установить_текст_строка")) return "dom_set_text_string";
     if (std.mem.eql(u8, name, "DOM::значение_поля")) return "dom_get_input_value";
     if (std.mem.eql(u8, name, "DOM::установить_значение_поля")) return "dom_set_input_value";
     if (std.mem.eql(u8, name, "DOM::создать_и_добавить")) return "dom_create_append";
+    if (std.mem.eql(u8, name, "DOM::переместить")) return "dom_move";
     if (std.mem.eql(u8, name, "DOM::после_кадра")) return "dom_after_frame";
     if (std.mem.eql(u8, name, "DOM::атрибут")) return "dom_get_attribute";
     if (std.mem.eql(u8, name, "DOM::установить_атрибут")) return "dom_set_attribute";
+    if (std.mem.eql(u8, name, "DOM::удалить_атрибут")) return "dom_remove_attribute";
     if (std.mem.eql(u8, name, "DOM::удалить")) return "dom_remove";
     if (std.mem.eql(u8, name, "DOM::путь")) return "dom_get_path";
     if (std.mem.eql(u8, name, "DOM::перейти")) return "dom_navigate";
@@ -1114,11 +1128,17 @@ fn builtinSignature(name: []const u8) !BuiltinSignature {
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_f64 }, .result = null };
     if (std.mem.eql(u8, name, "DOM::на_клик"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
+    if (std.mem.eql(u8, name, "DOM::данные_клика"))
+        return .{ .params = &.{}, .result = wasm_module.wasm_i32 };
+    if (std.mem.eql(u8, name, "DOM::атрибут_клика"))
+        return .{ .params = &.{wasm_module.wasm_i32}, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "DOM::текст_строка") or std.mem.eql(u8, name, "DOM::значение_поля"))
         return .{ .params = &.{wasm_module.wasm_i32}, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "DOM::установить_текст_строка") or std.mem.eql(u8, name, "DOM::установить_значение_поля"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
     if (std.mem.eql(u8, name, "DOM::создать_и_добавить"))
+        return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
+    if (std.mem.eql(u8, name, "DOM::переместить"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
     if (std.mem.eql(u8, name, "DOM::после_кадра"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
@@ -1126,6 +1146,8 @@ fn builtinSignature(name: []const u8) !BuiltinSignature {
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "DOM::установить_атрибут"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
+    if (std.mem.eql(u8, name, "DOM::удалить_атрибут"))
+        return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
     if (std.mem.eql(u8, name, "DOM::удалить"))
         return .{ .params = &.{wasm_module.wasm_i32}, .result = null };
     if (std.mem.eql(u8, name, "DOM::путь"))
@@ -1447,16 +1469,20 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     defer allocator.free(strings.data);
     defer strings.offsets.deinit();
     const has_actors = mir_cps.usesActorMemory(module);
-    const needs_memory = strings.data.len != 0 or has_actors;
+    const static_closure_base: u32 = @max(@as(u32, @intCast(std.mem.alignForward(usize, strings.data.len, 8))), 8);
+    const static_closure_bytes: u32 = @intCast(module.static_closure_table_indices.items.len * 8);
+    const static_data_len: u32 = if (static_closure_bytes == 0) @intCast(strings.data.len) else static_closure_base + static_closure_bytes;
+    const needs_memory = static_data_len != 0 or has_actors;
     // Записи actor-процесса/фрейма/почтового ящика живут в ТОЙ ЖЕ линейной
-    // памяти, что и строковые литералы, сразу после blob строковых данных
+    // памяти, что и статические данные (строки и captureless closure-box'ы),
+    // сразу после data blob
     // (выровнено по 8 байт — достаточно и для i32-хэндла, и для f64-числа
     // в каждом слоте `frame_load`/`frame_store`). `@max(_, 8)` — планировщик
     // `wasm_actors.zig` использует адрес 0 как сторожевое значение "ещё не
     // порождён" для единственного слота дочернего процесса; модуль с нулём
-    // строковых литералов иначе начал бы кучу буквально с байта 0, сделав
+    // статических данных иначе начал бы кучу буквально с байта 0, сделав
     // реальное первое выделение неотличимым от "ничего ещё не выделено".
-    const actor_heap_base: u32 = @max(@as(u32, @intCast(std.mem.alignForward(usize, strings.data.len, 8))), 8);
+    const actor_heap_base: u32 = @max(@as(u32, @intCast(std.mem.alignForward(usize, static_data_len, 8))), 8);
 
     var func_index: std.AutoHashMap(mir.FunctionId, u32) = .init(allocator);
     defer func_index.deinit();
@@ -1623,14 +1649,25 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
         try memory_section.append(allocator, 0x00); // limits: min only, no max
         try wasm_module.writeUleb128(&memory_section, allocator, @max(pages, 1));
 
-        if (strings.data.len != 0) {
+        if (static_data_len != 0) {
             try wasm_module.writeUleb128(&data_section, allocator, 1); // 1 active segment
             try data_section.append(allocator, 0x00); // flags: active, memory 0
             try data_section.append(allocator, 0x41); // i32.const
             try wasm_module.writeSleb128(&data_section, allocator, 0); // offset 0
             try data_section.append(allocator, 0x0B); // end
-            try wasm_module.writeUleb128(&data_section, allocator, strings.data.len);
+            try wasm_module.writeUleb128(&data_section, allocator, static_data_len);
             try data_section.appendSlice(allocator, strings.data);
+            if (static_closure_bytes != 0) {
+                var padding = @as(usize, static_closure_base) - strings.data.len;
+                while (padding > 0) : (padding -= 1) try data_section.append(allocator, 0);
+                for (module.static_closure_table_indices.items) |table_index| {
+                    try data_section.append(allocator, @truncate(table_index));
+                    try data_section.append(allocator, @truncate(table_index >> 8));
+                    try data_section.append(allocator, @truncate(table_index >> 16));
+                    try data_section.append(allocator, @truncate(table_index >> 24));
+                    try data_section.appendSlice(allocator, &.{ 0, 0, 0, 0 }); // env_ptr = 0
+                }
+            }
         }
     }
 
@@ -1720,7 +1757,7 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     defer code_section.deinit(allocator);
     try wasm_module.writeUleb128(&code_section, allocator, module.functions.items.len);
     for (module.functions.items) |function| {
-        const body = try emitFunctionWasm(allocator, checked, &function, &func_index, &builtin_index, &strings.offsets, &interface_type_index);
+        const body = try emitFunctionWasm(allocator, checked, &function, &func_index, &builtin_index, &strings.offsets, static_closure_base, &interface_type_index);
         defer allocator.free(body);
         try wasm_module.writeUleb128(&code_section, allocator, body.len);
         try code_section.appendSlice(allocator, body);
@@ -1746,7 +1783,7 @@ pub fn emitModule(allocator: std.mem.Allocator, checked: *const type_checker.Che
     // в WASM, но запись её с ПУСТЫМ содержимым (даже без счётчика
     // "0 сегментов") даёт усечённую секцию, которую реальный парсер
     // отвергает ("unable to read u32 leb128: data segment count").
-    if (strings.data.len != 0) try wasm_module.writeSection(&out, allocator, 11, data_section.items);
+    if (static_data_len != 0) try wasm_module.writeSection(&out, allocator, 11, data_section.items);
     return try out.toOwnedSlice(allocator);
 }
 

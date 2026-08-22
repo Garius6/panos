@@ -308,13 +308,13 @@ fn closureWrapperFor(module: *mir.Module, allocator: std.mem.Allocator, fallback
     return wrapper_id;
 }
 
-// Раскрывает `.build_closure{dst, function, captured, already_env_aware}`
-// в: аллокацию ОКРУЖЕНИЯ (по одному 8-байтовому слоту `frame_store` на
+// Раскрывает `.build_closure{dst, function, captured, already_env_aware}`.
+// Без захватов выбирается дедуплицированный статический box
+// `{table_index, 0}` из data-секции. С захватами строится аллокация
+// ОКРУЖЕНИЯ (по одному 8-байтовому слоту `frame_store` на
 // захваченное значение, та же форма обычной структуры, что уже
 // использует `wasm_objects.zig` — разнородные захваты i32/f64
-// одинаково подходят, в отличие от побайтовой упаковки) — полностью
-// пропускается (env_ptr = константа 0) для общего случая без захватов
-// (обычная ссылка на функцию, используемая как значение) — затем BOX
+// одинаково подходят, в отличие от побайтовой упаковки), затем BOX
 // ИЗ 2 ПОЛЕЙ, `mem_load`/`mem_store` по смещениям байт 0 и 4 (НЕ слоты
 // фрейма — оба поля box всегда обычные i32, никогда напрямую
 // захваченный f64, в точности совпадает с формой box `{receiver,
@@ -327,6 +327,30 @@ fn closureWrapperFor(module: *mir.Module, allocator: std.mem.Allocator, fallback
 fn expandBuildClosure(builder: *mir_builder.Builder, allocator: std.mem.Allocator, v: anytype, ctx: ExpandCtx, table: *std.ArrayList(mir.FunctionId), table_index_of: *std.AutoHashMap(mir.FunctionId, u32), closure_wrapper_of: *std.AutoHashMap(mir.FunctionId, mir.FunctionId)) !void {
     const layout = ctx.layout;
     const module = builder.module;
+    const callee = if (v.already_env_aware) v.function else try closureWrapperFor(module, allocator, ctx.type_store, closure_wrapper_of, v.function);
+    const table_index = try tableIndexFor(table, table_index_of, allocator, callee);
+
+    // Captureless closure не содержит никакого рантайм-состояния:
+    // её box — константа `{table_index, 0}`. Одна статическая
+    // запись на индекс таблицы живёт в data-секции WASM и может
+    // безопасно пережить любое число arena-reset'ов. Это убирает
+    // permanent-heap из hot path передачи named function как callback.
+    if (v.captured.len == 0) {
+        var slot: ?u32 = null;
+        for (module.static_closure_table_indices.items, 0..) |known, index| {
+            if (known == table_index) {
+                slot = @intCast(index);
+                break;
+            }
+        }
+        if (slot == null) {
+            slot = @intCast(module.static_closure_table_indices.items.len);
+            try module.static_closure_table_indices.append(allocator, table_index);
+        }
+        try builder.emit(.{ .static_closure_ref = .{ .dst = v.dst, .slot = slot.? } });
+        return;
+    }
+
     const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
 
     // `v.captured` — предсуществующие значения (произведены раньше в
@@ -348,10 +372,6 @@ fn expandBuildClosure(builder: *mir_builder.Builder, allocator: std.mem.Allocato
     }
 
     const env_local: mir.LocalId = env_blk: {
-        if (v.captured.len == 0) {
-            const zero = try wasm_heap.addressConst(builder, layout.ptr_type, 0);
-            break :env_blk try wasm_heap.storeLocal(builder, "@env", layout.ptr_type, zero);
-        }
         const env_size = try wasm_heap.addressConst(builder, layout.idx_type, @intCast(v.captured.len * 8));
         const env = try builder.newValue(layout.ptr_type);
         try builder.emit(.{ .call = .{ .dst = env, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, env_size) } });
@@ -370,9 +390,6 @@ fn expandBuildClosure(builder: *mir_builder.Builder, allocator: std.mem.Allocato
         }
         break :env_blk local;
     };
-
-    const callee = if (v.already_env_aware) v.function else try closureWrapperFor(module, allocator, ctx.type_store, closure_wrapper_of, v.function);
-    const table_index = try tableIndexFor(table, table_index_of, allocator, callee);
 
     const box_size = try wasm_heap.addressConst(builder, layout.idx_type, 8);
     const box = try builder.newValue(layout.ptr_type);
@@ -416,8 +433,16 @@ fn expandCallValue(builder: *mir_builder.Builder, allocator: std.mem.Allocator, 
 
     const box_local = try wasm_heap.storeLocal(builder, "@call_box", layout.ptr_type, v.callee);
     const arg_locals = try module.arena.allocator().alloc(mir.LocalId, v.args.len);
-    for (v.args, arg_locals) |arg, *local| {
-        local.* = try wasm_heap.storeLocal(builder, "@call_arg", builder.currentFunction().valueType(arg), arg);
+    // Callee был произведён после аргументов и уже снят выше;
+    // на стеке осталось `[arg0, arg1, ...]`, где последний arg —
+    // на вершине. `local.set` снимает именно вершину, поэтому сохраняем
+    // в обратном порядке. Прямой цикл незаметно менял `f(a, b)` на
+    // `f(b, a)` для любого динамического function-value с двумя аргументами.
+    var arg_index = v.args.len;
+    while (arg_index > 0) {
+        arg_index -= 1;
+        const arg = v.args[arg_index];
+        arg_locals[arg_index] = try wasm_heap.storeLocal(builder, "@call_arg", builder.currentFunction().valueType(arg), arg);
     }
 
     const box_for_table = try wasm_heap.loadLocal(builder, box_local, layout.ptr_type);

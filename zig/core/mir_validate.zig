@@ -138,6 +138,7 @@ fn instrRefs(allocator: std.mem.Allocator, instruction: mir.Instruction) !struct
             dst = v.dst;
             try operands.appendSlice(allocator, v.captured);
         },
+        .static_closure_ref => |v| dst = v.dst,
         .function_ref => |v| dst = v.dst,
         .spawn => |v| {
             dst = v.dst;

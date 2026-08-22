@@ -319,6 +319,7 @@ const ImportContext = struct {
     fn translateGenericParameterBounds(
         self: *ImportContext,
         owner_resolution: *const resolver.Resolution,
+        owner_module: usize,
         nominal_identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
         next_nominal_identity: *u32,
         parameters: []const type_checker.GenericParameter,
@@ -338,7 +339,17 @@ const ImportContext = struct {
                 // хопов/алиасов до него дошли — тот же механизм, что уже
                 // используют интерфейсы (см. checkWithImportContextForTarget).
                 const translated_bound = blk: {
-                    const origin = owner_resolution.imported_symbols.get(bound) orelse break :blk bound;
+                    const origin = owner_resolution.imported_symbols.get(bound) orelse local: {
+                        // Bound может быть объявлен в ТОМ ЖЕ модуле, что и
+                        // generic-функция (`json.сериализовать_из[T:
+                        // ВJSON]`). Тогда `imported_symbols` законно пуст, но
+                        // сырой per-module SymbolId всё равно нельзя переносить
+                        // в потребитель: тот же числовой ID там может означать
+                        // совсем другой тип. Приводим локальный bound к той же
+                        // глобальной origin-паре, что и настоящий импорт.
+                        const declaration = declarationForSymbol(owner_resolution, bound) orelse break :blk bound;
+                        break :local resolver.ImportedSymbolOrigin{ .module = owner_module, .declaration = declaration };
+                    };
                     const identity = nominalIdentity(nominal_identities, next_nominal_identity, origin) catch break :blk bound;
                     for (self.nominals.items) |nominal| {
                         if (nominal.identity == identity) break :blk nominal.local_symbol;
@@ -424,7 +435,7 @@ const ImportContext = struct {
             var method_generic_parameters: ?[]const type_checker.GenericParameter = null;
             for (method_checked.methods.items) |definition| {
                 if (definition.symbol == source_method_symbol and definition.function_parameters.len != 0) {
-                    method_generic_parameters = try self.translateGenericParameterBounds(method_resolution, nominal_identities, next_nominal_identity, definition.function_parameters);
+                    method_generic_parameters = try self.translateGenericParameterBounds(method_resolution, method_export.module, nominal_identities, next_nominal_identity, definition.function_parameters);
                     break;
                 }
             }
@@ -552,7 +563,7 @@ const ImportContext = struct {
                     // неподдерживаемый тип`) при первом же вызове.
                     const raw_generic_parameters = target_checked.generic_function_parameters.get(target_symbol);
                     const translated_generic_parameters = if (raw_generic_parameters) |value|
-                        try self.translateGenericParameterBounds(target_resolution, nominal_identities, next_nominal_identity, value)
+                        try self.translateGenericParameterBounds(target_resolution, origin.module, nominal_identities, next_nominal_identity, value)
                     else
                         null;
                     try self.imported_types.append(self.allocator, .{
@@ -606,7 +617,7 @@ const ImportContext = struct {
             var method_generic_parameters: ?[]const type_checker.GenericParameter = null;
             for (target_checked.methods.items) |definition| {
                 if (definition.symbol == target_symbol and definition.function_parameters.len != 0) {
-                    method_generic_parameters = try self.translateGenericParameterBounds(target_resolution, nominal_identities, next_nominal_identity, definition.function_parameters);
+                    method_generic_parameters = try self.translateGenericParameterBounds(target_resolution, binding.origin.module, nominal_identities, next_nominal_identity, definition.function_parameters);
                     break;
                 }
             }
@@ -1655,6 +1666,54 @@ test "module compiler preserves a prelude bound on an imported generic function"
     switch (try machine.run(start, &.{})) {
         .success => |result| switch (result) {
             .number => |number| try std.testing.expectEqual(@as(f64, 40), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "module compiler remaps a local interface bound on an imported generic function" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./библиотека\" как библиотека\nтип Шум = структура\nтекст: Строка\nконец\nтип Модель = структура\nчисло: Число\nконец\nреализация библиотека.Читаемое для Модель\nфунк прочитать(это: Модель) -> Число\nэто.число\nконец\nконец\nэкспорт функ старт() -> Число\nбиблиотека.значение(Модель(42.0))\nконец" },
+        .{ .path = "проект/библиотека.ps", .bytes = "экспорт тип Читаемое = интерфейс\nфунк прочитать() -> Число\nконец\nэкспорт функ значение[T: Читаемое](это: T) -> Число\nэто.прочитать()\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "module compiler infers an imported generic struct constructor from return context" {
+    const reader = MemoryReader{ .files = &.{
+        .{ .path = "проект/main.ps", .bytes = "импорт \"./тея\" как тея\nтип Сообщение = перечисление\nНачать\nконец\nфунк обновить() -> тея.Обновление(Число, Сообщение)\nтея.Обновление(42.0, тея.Команда.Нет())\nконец\nэкспорт функ старт() -> Число\nпер результат = обновить()\nвыбор результат.команда\nНет -> результат.модель\nПерейти(_) -> 0.0\nконец\nконец" },
+        .{ .path = "проект/тея.ps", .bytes = "экспорт тип Команда[M] = перечисление\nНет\nПерейти(Строка)\nконец\nэкспорт тип Обновление[A, M] = структура\nмодель: A\nкоманда: Команда(M)\nконец" },
+    } };
+    var graph = module_loader.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.load(&reader, "проект/main");
+
+    var compiled = try compileGraph(std.testing.allocator, &graph);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compiled.diagnostics.items.items.len);
+    const start = compiled.start orelse return error.TestUnexpectedResult;
+    var machine = vm.Vm.init(std.testing.allocator, &compiled.program);
+    defer machine.deinit();
+    switch (try machine.run(start, &.{})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42), number),
             else => return error.TestUnexpectedResult,
         },
         .runtime_error => return error.TestUnexpectedResult,

@@ -3698,6 +3698,24 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.void;
             }
+            if (self.isBuiltinModule(symbol, "DOM", "данные_клика")) {
+                if (call.arguments.len != 0) {
+                    try self.report(call.span, "Type Error: DOM.данные_клика() не принимает аргументы", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "DOM", "атрибут_клика")) {
+                if (call.arguments.len != 1) {
+                    try self.report(call.span, "Type Error: DOM.атрибут_клика() ожидает 1 аргумент", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: DOM.атрибут_клика() ожидает имя атрибута типа Строка", .{});
+                }
+                return self.result.types.builtins.string;
+            }
             if (self.isBuiltinModule(symbol, "DOM", "текст_строка") or self.isBuiltinModule(symbol, "DOM", "значение_поля")) {
                 const name = if (self.isBuiltinModule(symbol, "DOM", "текст_строка")) "текст_строка" else "значение_поля";
                 if (call.arguments.len != 1) {
@@ -3737,6 +3755,21 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.void;
             }
+            // Пустой третий селектор означает append в конец
+            // родителя; непустой — insertBefore перед опорным узлом.
+            if (self.isBuiltinModule(symbol, "DOM", "переместить")) {
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: DOM.переместить() ожидает 3 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: DOM.переместить() ожидает селектор узла, родителя и опорного узла типа Строка", .{});
+                    }
+                }
+                return self.result.types.builtins.void;
+            }
             if (self.isBuiltinModule(symbol, "DOM", "атрибут")) {
                 if (call.arguments.len != 2) {
                     try self.report(call.span, "Type Error: DOM.атрибут() ожидает 2 аргумента", .{});
@@ -3759,6 +3792,24 @@ const Checker = struct {
                 for (call.arguments) |argument| {
                     if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
                         try self.report(call.span, "Type Error: DOM.установить_атрибут() ожидает селектор, имя и значение атрибута типа Строка", .{});
+                    }
+                }
+                return self.result.types.builtins.void;
+            }
+            // `DOM.удалить_атрибут` — симметрично `DOM.установить_атрибут`,
+            // но без 3-го (значение) аргумента. Нужен диф.pns'у: атрибут,
+            // пропавший из нового дерева, раньше не мог быть снят с
+            // реального DOM-элемента вообще (никакого builtin'а для этого
+            // не было) и молча оставался висеть навсегда.
+            if (self.isBuiltinModule(symbol, "DOM", "удалить_атрибут")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: DOM.удалить_атрибут() ожидает 2 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                for (call.arguments) |argument| {
+                    if (!self.assignable(try self.inferExpected(argument, self.result.types.builtins.string), self.result.types.builtins.string)) {
+                        try self.report(call.span, "Type Error: DOM.удалить_атрибут() ожидает селектор и имя атрибута типа Строка", .{});
                     }
                 }
                 return self.result.types.builtins.void;
@@ -4913,8 +4964,41 @@ const Checker = struct {
                     const shared = @min(arguments.len, generic_nominal.fields.len);
                     var substitutions = std.AutoHashMap(types.TypeId, types.TypeId).init(self.result.allocator);
                     defer substitutions.deinit();
+                    var seeded_from_expected = false;
+                    // Конструктор generic-структуры участвует в том же
+                    // двунаправленном выводе, что generic-функция выше.
+                    // Без этой затравки `Обновление(модель,
+                    // Команда.Нет())` не могло вывести `Сообщение`, хотя
+                    // окружающий return уже ожидал
+                    // `Обновление(Модель, Сообщение)`: внутренний
+                    // `Команда.Нет()` получал poison вместо конкретного
+                    // expected-типа поля. Сопоставляем декларации через
+                    // стабильный nominal identity, как `assignable` и
+                    // `inferGenericSubstitution`, чтобы это работало и
+                    // для импортированных типов.
+                    if (expected_return) |expected_type| {
+                        if (self.result.types.get(expected_type)) |expected_entry| {
+                            if (expected_entry.* == .nominal) {
+                                const expected_nominal = expected_entry.nominal;
+                                const same_declaration = if (nominal.identity != 0 or expected_nominal.identity != 0)
+                                    nominal.identity != 0 and nominal.identity == expected_nominal.identity
+                                else
+                                    nominal.symbol == expected_nominal.symbol;
+                                if (same_declaration and generic_nominal.parameters.len == expected_nominal.arguments.len) {
+                                    for (generic_nominal.parameters, expected_nominal.arguments) |parameter, argument| {
+                                        try substitutions.put(parameter.typ, argument);
+                                    }
+                                    seeded_from_expected = true;
+                                }
+                            }
+                        }
+                    }
                     for (arguments[0..shared], generic_nominal.fields[0..shared]) |argument, field| {
-                        try self.inferGenericSubstitution(field.typ, try self.infer(argument), &substitutions, call.span);
+                        const actual = if (seeded_from_expected)
+                            try self.inferExpected(argument, try self.substituteGeneric(field.typ, &substitutions))
+                        else
+                            try self.infer(argument);
+                        try self.inferGenericSubstitution(field.typ, actual, &substitutions, call.span);
                     }
                     var type_arguments: std.ArrayList(types.TypeId) = .empty;
                     defer type_arguments.deinit(self.result.allocator);
@@ -6808,7 +6892,7 @@ test "type checker requires an exact DOM click event handler signature" {
     }
 }
 
-test "type checker accepts DOM.удалить/путь/перейти with correct usage" {
+test "type checker accepts DOM.удалить/переместить/click-data/путь/перейти with correct usage" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
     var lexed = try lexer.tokenize(
@@ -6816,6 +6900,11 @@ test "type checker accepts DOM.удалить/путь/перейти with corre
         "импорт DOM\n" ++
             "функ старт() -> Пусто\n" ++
             "DOM.удалить(\"#строка\")\n" ++
+            "DOM.переместить(\"#строка\", \"#список\", \"\")\n" ++
+            "пер данные = DOM.данные_клика()\n" ++
+            "пер сообщение = DOM.атрибут_клика(\"data-message\")\n" ++
+            "DOM.установить_текст_строка(\"#данные\", данные)\n" ++
+            "DOM.установить_текст_строка(\"#сообщение\", сообщение)\n" ++
             "пер путь = DOM.путь()\n" ++
             "DOM.перейти(путь)\n" ++
             "конец",
@@ -6833,7 +6922,7 @@ test "type checker accepts DOM.удалить/путь/перейти with corre
     try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
-test "type checker rejects wrong arity/types for DOM.удалить/путь/перейти" {
+test "type checker rejects wrong arity/types for DOM.удалить/переместить/click-data/путь/перейти" {
     const lexer = @import("lexer.zig");
     const parser = @import("parser.zig");
     var lexed = try lexer.tokenize(
@@ -6841,6 +6930,9 @@ test "type checker rejects wrong arity/types for DOM.удалить/путь/п�
         "импорт DOM\n" ++
             "функ старт() -> Пусто\n" ++
             "DOM.удалить(1.0)\n" ++
+            "DOM.переместить(\"#строка\", \"#список\", 1.0)\n" ++
+            "DOM.данные_клика(\"лишний\")\n" ++
+            "DOM.атрибут_клика(1.0)\n" ++
             "DOM.путь(\"лишний\")\n" ++
             "DOM.перейти(1.0)\n" ++
             "конец",
@@ -6855,10 +6947,13 @@ test "type checker rejects wrong arity/types for DOM.удалить/путь/п�
     defer checked.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.items.items.len);
-    try std.testing.expectEqual(@as(usize, 3), checked.diagnostics.items.items.len);
+    try std.testing.expectEqual(@as(usize, 6), checked.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("Type Error: DOM.удалить() ожидает CSS-селектор типа Строка", checked.diagnostics.items.items[0].message);
-    try std.testing.expectEqualStrings("Type Error: DOM.путь() не принимает аргументы", checked.diagnostics.items.items[1].message);
-    try std.testing.expectEqualStrings("Type Error: DOM.перейти() ожидает путь типа Строка", checked.diagnostics.items.items[2].message);
+    try std.testing.expectEqualStrings("Type Error: DOM.переместить() ожидает селектор узла, родителя и опорного узла типа Строка", checked.diagnostics.items.items[1].message);
+    try std.testing.expectEqualStrings("Type Error: DOM.данные_клика() не принимает аргументы", checked.diagnostics.items.items[2].message);
+    try std.testing.expectEqualStrings("Type Error: DOM.атрибут_клика() ожидает имя атрибута типа Строка", checked.diagnostics.items.items[3].message);
+    try std.testing.expectEqualStrings("Type Error: DOM.путь() не принимает аргументы", checked.diagnostics.items.items[4].message);
+    try std.testing.expectEqualStrings("Type Error: DOM.перейти() ожидает путь типа Строка", checked.diagnostics.items.items[5].message);
 }
 
 test "type checker preserves nominal user types in function signatures" {
@@ -6892,6 +6987,37 @@ test "type checker checks struct constructors and field access" {
     const function = parsed.ast.decl(parsed.ast.program.?.declarations[1]).function;
     const property = parsed.ast.stmt(function.body[1]).expr.value;
     try std.testing.expectEqual(checked.types.builtins.number, checked.expression_types.get(property).?);
+}
+
+test "type checker infers generic struct and nested enum constructors from return context" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const source_text =
+        "тип Команда[M] = перечисление\n" ++
+        "Нет\n" ++
+        "Перейти(Строка)\n" ++
+        "конец\n" ++
+        "тип Обновление[A, M] = структура\n" ++
+        "модель: A\n" ++
+        "команда: Команда(M)\n" ++
+        "конец\n" ++
+        "функ обновить(переход: Булево) -> Обновление(Число, Строка)\n" ++
+        "если переход тогда\n" ++
+        "Обновление(1.0, Команда.Перейти(\"/about\"))\n" ++
+        "иначе\n" ++
+        "Обновление(2.0, Команда.Нет())\n" ++
+        "конец\n" ++
+        "конец";
+    var lexed = try lexer.tokenize(std.testing.allocator, source_text, 0);
+    defer lexed.deinit();
+    var parsed = try parser.parse(std.testing.allocator, lexed.tokens.items);
+    defer parsed.deinit();
+    var resolved = try resolver.resolve(std.testing.allocator, &parsed.ast);
+    defer resolved.deinit();
+    var checked = try check(std.testing.allocator, &parsed.ast, &resolved);
+    defer checked.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), checked.diagnostics.items.items.len);
 }
 
 test "type checker types destructuring and loop binders" {

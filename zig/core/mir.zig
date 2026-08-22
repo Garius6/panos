@@ -167,6 +167,11 @@ pub const Instruction = union(enum) {
     // (по слоту на каждое захваченное значение) плюс 2-слотовую обёртку
     // `{table_index, env_ptr}` — см. doc-комментарий того файла.
     build_closure: struct { dst: ValueId, function: FunctionId, captured: []const ValueId, already_env_aware: bool },
+    // Стабильный адрес captureless closure-box из data-секции WASM.
+    // Порождается только `wasm_interfaces.zig` вместо
+    // `.build_closure` без захватов; `slot` индексирует
+    // `Module.static_closure_table_indices`.
+    static_closure_ref: struct { dst: ValueId, slot: u32 },
     function_ref: struct { dst: ValueId, function: FunctionId },
     spawn: struct { dst: ValueId, callee: ValueId, args: []const ValueId },
     send: struct { process: ValueId, message: ValueId },
@@ -363,6 +368,9 @@ pub const Module = struct {
     // проход, что её раскрывает позже; этот флаг — способ передать
     // решение через границу проходов.
     actor_captured_by_dom_closure: bool = false,
+    // По одному дедуплицированному 8-байтному static box на индекс
+    // таблицы функций: `[u32 table_index][u32 env=0]`.
+    static_closure_table_indices: std.ArrayList(u32) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Module {
         return .{
@@ -374,6 +382,7 @@ pub const Module = struct {
     pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
         for (self.functions.items) |*function| function.deinit(allocator);
         self.functions.deinit(allocator);
+        self.static_closure_table_indices.deinit(allocator);
         self.generic_instantiations.deinit();
         self.arena.deinit();
         self.* = undefined;

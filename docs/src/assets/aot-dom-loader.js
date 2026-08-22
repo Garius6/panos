@@ -50,6 +50,22 @@ export async function loadAotDomProgram(programWasmUrl) {
 	// functions below. Per-instance (one `loadAotDomProgram` call =
 	// one running program), never global.
 	let heldModel = ""
+	// Opaque payload of the closest clicked VDOM element carrying
+	// `data-click-data`. Read synchronously by `DOM.данные_клика()` from
+	// inside the Panos handler, so no pointer has to survive an arena reset.
+	let currentClickData = ""
+	let currentClickTarget = null
+	let currentClickBoundary = null
+
+	function clickAttribute(name) {
+		let el = currentClickTarget
+		while (el && currentClickBoundary?.contains(el)) {
+			if (el.hasAttribute(name)) return el.getAttribute(name) ?? ""
+			if (el === currentClickBoundary) break
+			el = el.parentElement
+		}
+		return ""
+	}
 
 	// Never cache a `DataView`/`Uint8Array` across calls — WASM memory can
 	// grow (`memory.grow`), which detaches any previously constructed view
@@ -144,18 +160,31 @@ export async function loadAotDomProgram(programWasmUrl) {
 			const el = document.querySelector(readString(selectorPtr))
 			const trampoline = instance.exports["@invoke_click"]
 			if (el && typeof trampoline === "function") {
-				registerClick(el, (event) => trampoline(
-					boxPtr,
-					event.clientX,
-					event.clientY,
-					event.button,
-					event.ctrlKey ? 1 : 0,
-					event.shiftKey ? 1 : 0,
-					event.altKey ? 1 : 0,
-					event.metaKey ? 1 : 0,
-				))
+				registerClick(el, (event) => {
+					currentClickTarget = event.target instanceof Element ? event.target : null
+					currentClickBoundary = el
+					currentClickData = clickAttribute("data-click-data")
+					try {
+						trampoline(
+							boxPtr,
+							event.clientX,
+							event.clientY,
+							event.button,
+							event.ctrlKey ? 1 : 0,
+							event.shiftKey ? 1 : 0,
+							event.altKey ? 1 : 0,
+							event.metaKey ? 1 : 0,
+						)
+					} finally {
+						currentClickData = ""
+						currentClickTarget = null
+						currentClickBoundary = null
+					}
+				})
 			}
 		},
+		dom_get_click_data: () => writeString(currentClickData),
+		dom_get_click_attribute: (namePtr) => writeString(clickAttribute(readString(namePtr))),
 		dom_get_text_string: (selectorPtr) => {
 			const el = document.querySelector(readString(selectorPtr))
 			return writeString(el?.textContent ?? "")
@@ -188,6 +217,14 @@ export async function loadAotDomProgram(programWasmUrl) {
 			const el = document.querySelector(readString(selectorPtr))
 			if (el) el.setAttribute(readString(nameAttrPtr), readString(valuePtr))
 		},
+		// `DOM.удалить_атрибут` — symmetric counterpart to `dom_set_attribute`.
+		// A vdom-diff (`panosiki/марьяшка`) needs this to actually remove an
+		// attribute that disappeared from the new tree — before this, there
+		// was no way to unset a single attribute at all, only overwrite it.
+		dom_remove_attribute: (selectorPtr, nameAttrPtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			if (el) el.removeAttribute(readString(nameAttrPtr))
+		},
 		// `состояние.прочитать`/`.записать` — an Elm-architecture Model
 		// held as a plain JS variable in THIS closure (`heldModel`,
 		// declared below), not a DOM attribute — see
@@ -206,6 +243,21 @@ export async function loadAotDomProgram(programWasmUrl) {
 			const child = document.createElement(readString(tagNamePtr))
 			child.id = readString(idPtr)
 			parent.appendChild(child)
+		},
+		// Move an existing node without recreating it. An empty reference
+		// selector appends it; otherwise it is inserted before that sibling.
+		dom_move: (selectorPtr, parentSelectorPtr, beforeSelectorPtr) => {
+			const el = document.querySelector(readString(selectorPtr))
+			const parent = document.querySelector(readString(parentSelectorPtr))
+			const beforeSelector = readString(beforeSelectorPtr)
+			if (!el || !parent) return
+			if (beforeSelector === "") {
+				parent.appendChild(el)
+				return
+			}
+			const before = document.querySelector(beforeSelector)
+			if (!before || before.parentElement !== parent) return
+			parent.insertBefore(el, before)
 		},
 		// `DOM.удалить` — the ONE node-removal primitive this loader ever
 		// had none of before (every "clear a list" pattern used to be

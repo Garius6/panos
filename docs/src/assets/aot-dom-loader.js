@@ -286,6 +286,15 @@ export async function loadAotDomProgram(programWasmUrl) {
 				requestAnimationFrame(() => handler(contextPtr))
 			}
 		},
+		// Delayed state-machine ticks should not repaint at display refresh
+		// rate. No WASM pointer survives this call, so repeated timers do not
+		// consume the permanent heap.
+		dom_after_delay: (handlerNamePtr, delayMs) => {
+			const handler = instance.exports[readString(handlerNamePtr)]
+			if (typeof handler === "function") {
+				setTimeout(() => handler(), Math.max(0, delayMs))
+			}
+		},
 		// The AOT ABI cannot suspend a Panos frame, so this intentionally uses
 		// synchronous same-origin XHR. HTTP 2xx returns Опция.Есть(body);
 		// every non-2xx or transport failure is Опция.Нет() — both built as

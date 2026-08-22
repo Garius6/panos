@@ -1089,6 +1089,7 @@ fn hostImportNameForBuiltin(name: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "DOM::создать_и_добавить")) return "dom_create_append";
     if (std.mem.eql(u8, name, "DOM::переместить")) return "dom_move";
     if (std.mem.eql(u8, name, "DOM::после_кадра")) return "dom_after_frame";
+    if (std.mem.eql(u8, name, "DOM::через_мс")) return "dom_after_delay";
     if (std.mem.eql(u8, name, "DOM::атрибут")) return "dom_get_attribute";
     if (std.mem.eql(u8, name, "DOM::установить_атрибут")) return "dom_set_attribute";
     if (std.mem.eql(u8, name, "DOM::удалить_атрибут")) return "dom_remove_attribute";
@@ -1142,6 +1143,8 @@ fn builtinSignature(name: []const u8) !BuiltinSignature {
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
     if (std.mem.eql(u8, name, "DOM::после_кадра"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = null };
+    if (std.mem.eql(u8, name, "DOM::через_мс"))
+        return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_f64 }, .result = null };
     if (std.mem.eql(u8, name, "DOM::атрибут"))
         return .{ .params = &.{ wasm_module.wasm_i32, wasm_module.wasm_i32 }, .result = wasm_module.wasm_i32 };
     if (std.mem.eql(u8, name, "DOM::установить_атрибут"))

@@ -3827,6 +3827,20 @@ const Checker = struct {
                 }
                 return self.result.types.builtins.void;
             }
+            if (self.isBuiltinModule(symbol, "DOM", "через_мс")) {
+                if (call.arguments.len != 2) {
+                    try self.report(call.span, "Type Error: DOM.через_мс() ожидает имя обработчика и задержку", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.void;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: DOM.через_мс() ожидает имя обработчика типа Строка", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.integer), self.result.types.builtins.integer)) {
+                    try self.report(call.span, "Type Error: DOM.через_мс() ожидает задержку типа Целое", .{});
+                }
+                return self.result.types.builtins.void;
+            }
             // `DOM.удалить` — единственный способ убрать ОДИН узел (до
             // этого — только `установить_текст_строка(родитель, "")`,
             // стирающее ВСЁ содержимое родителя). Нужен vdom-diff'у для

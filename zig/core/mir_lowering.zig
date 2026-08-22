@@ -747,7 +747,7 @@ fn scanDomHandlerRootsInExpr(
         .call => |call| {
             if (tree.expr(call.callee).* == .property) {
                 const property = tree.expr(call.callee).property;
-                const is_handler_call = std.mem.eql(u8, property.property, "после_кадра");
+                const is_handler_call = std.mem.eql(u8, property.property, "после_кадра") or std.mem.eql(u8, property.property, "через_мс");
                 if (is_handler_call) {
                     for (call.arguments) |argument| {
                         if (tree.expr(argument).* != .string) continue;
@@ -879,6 +879,8 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
     defer worklist.deinit(allocator);
     var mixed: MixedMap = .init(allocator);
     defer mixed.deinit();
+    var dom_handler_names: std.ArrayList([]const u8) = .empty;
+    errdefer dom_handler_names.deinit(allocator);
 
     // Индекс модуля 0 ВСЕГДА является входным модулем — `graph.load(...)`
     // (самый первый вызов, до `appendPreludeModule`/любого импорта)
@@ -898,10 +900,20 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
             .function => |value| value,
             else => continue,
         };
-        if (!std.mem.eql(u8, function.name, "старт")) continue;
+        const is_start = std.mem.eql(u8, function.name, "старт");
+        // `экспорт функ` корневого модуля — явная внешняя точка входа
+        // AOT-модуля. До этого tree-shaking всё равно удалял её, если
+        // она не вызывалась из `старт`, хотя wasm_emit экспортирует все
+        // оставшиеся MIR-функции. Generic-функция не имеет конкретной
+        // ABI-инстанциации и потому не может быть самостоятельным root.
+        const is_external_export = function.is_exported and function.type_parameters.len == 0;
+        if (!is_start and !is_external_export) continue;
         const symbol = entry_resolution.decl_symbols.get(decl_id) orelse continue;
         try markReachable(allocator, &set, &worklist, entry_module_index, symbol);
-        break;
+        // Любой явно экспортированный root может быть вызван хостом
+        // независимо от `старт`, поэтому ему нужна та же arena-wrapper,
+        // что строково зарегистрированному DOM callback.
+        if (is_external_export and !is_start) try dom_handler_names.append(allocator, function.name);
     }
 
     while (worklist.pop()) |item| {
@@ -912,8 +924,6 @@ pub fn computeReachableSymbols(allocator: std.mem.Allocator, graph: anytype, com
         try walkStmts(allocator, compiled, tree, resolution, checked, &set, &worklist, &mixed, item.module_index, body);
     }
 
-    var dom_handler_names: std.ArrayList([]const u8) = .empty;
-    errdefer dom_handler_names.deinit(allocator);
     try addDomHandlerRoots(allocator, graph, compiled, &set, &worklist, &dom_handler_names);
     while (worklist.pop()) |item| {
         const resolution = if (compiled.modules[item.module_index].resolution) |*value| value else continue;
@@ -2950,6 +2960,8 @@ fn lowerStringBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: typ
         "строки::разбить"
     else if (std.mem.eql(u8, property.property, "из_числа"))
         "строки::из_числа"
+    else if (std.mem.eql(u8, property.property, "из_целого"))
+        "строки::из_целого"
     else if (std.mem.eql(u8, property.property, "в_число"))
         "строки::в_число"
     else if (std.mem.eql(u8, property.property, "это_цифра"))
@@ -3582,6 +3594,8 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
         "DOM::переместить"
     else if (std.mem.eql(u8, property.property, "после_кадра"))
         "DOM::после_кадра"
+    else if (std.mem.eql(u8, property.property, "через_мс"))
+        "DOM::через_мс"
     else if (std.mem.eql(u8, property.property, "атрибут"))
         "DOM::атрибут"
     else if (std.mem.eql(u8, property.property, "установить_атрибут"))
@@ -3609,7 +3623,12 @@ fn lowerDomBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: types.
     // регион, ровно в той точке, где оно вот-вот будет передано хост-
     // импорту — всё остальное продолжает идти через обычную арену, анализ
     // графа вызовов не нужен.
-    const context_arg_index: ?usize = if (std.mem.eql(u8, name, "DOM::после_кадра"))
+    const context_arg_index: ?usize = if (std.mem.eql(u8, name, "DOM::после_кадра") and
+        // Строковый литерал уже лежит в статической data-секции WASM и
+        // переживает любое число сбросов арены. Его копирование в
+        // постоянную bump-область на каждом animation frame не только
+        // лишнее, но и превращает бесконечный цикл кадров в утечку.
+        ctx.tree.expr(call.arguments[1]).* != .string)
         1
     else
         null;

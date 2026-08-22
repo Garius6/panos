@@ -229,6 +229,28 @@ test "из_числа formats integers, decimals, negatives — practical digit 
     try std.testing.expectEqualStrings("1\n", result.stdout);
 }
 
+test "из_целого formats integer values in AOT WASM" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const source =
+        \\функ старт() -> Булево
+        \\    (строки.из_целого(0) == "0")
+        \\        и (строки.из_целого(42) == "42")
+        \\        и (строки.из_целого(0 - 42) == "-42")
+        \\конец
+    ;
+    const wasm_path = "zzz_aot_str_int.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+    const result = try buildAndRun(allocator, io.io(), source, wasm_path);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1\n", result.stdout);
+}
+
 test "в_число parses integers/decimals/negatives via Успех, rejects garbage via Неудача" {
     const allocator = std.testing.allocator;
     var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });

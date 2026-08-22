@@ -255,6 +255,12 @@ fn expandInstruction(builder: *mir_builder.Builder, instruction: mir.Instruction
                 if (std.mem.eql(u8, v.name, "строки::заменить")) break :blk ctx.runtime.replace;
                 if (std.mem.eql(u8, v.name, "строки::разбить")) break :blk ctx.runtime.split.?;
                 if (std.mem.eql(u8, v.name, "строки::из_числа")) break :blk ctx.runtime.from_number;
+                // `Целое` и `Число` имеют одно f64-представление в AOT;
+                // общий форматтер уже выдаёт для целого ровно десятичные
+                // цифры без дробной части. Старый внутренний `from_int`
+                // не был подключён ни к одному builtin и нарушает
+                // stack-order при возврате строки из ветвящегося CFG.
+                if (std.mem.eql(u8, v.name, "строки::из_целого")) break :blk ctx.runtime.from_number;
                 if (std.mem.eql(u8, v.name, "строки::в_число")) break :blk ctx.runtime.to_number;
                 if (std.mem.eql(u8, v.name, "строки::это_цифра")) break :blk ctx.runtime.is_digit;
                 if (std.mem.eql(u8, v.name, "строки::это_буква")) break :blk ctx.runtime.is_letter;

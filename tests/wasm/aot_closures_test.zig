@@ -306,6 +306,71 @@ test "DOM.на_клик compiles and registers the fixed invoke_click trampoline
     try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_@invoke_click") != null);
 }
 
+test "DOM.после_кадра does not promote a static context on every frame" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\функ кадр(_: Строка) -> Пусто
+        \\    DOM.после_кадра("кадр", "")
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    DOM.после_кадра("кадр", "")
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "dom_after_frame") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@promote_to_permanent") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_кадр") != null);
+}
+
+test "an exported AOT entry point survives tree shaking and gets an arena wrapper" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\экспорт функ кадр(_: Строка) -> Пусто
+        \\конец
+        \\
+        \\функ запланировать(имя: Строка) -> Пусто
+        \\    DOM.после_кадра(имя, "")
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    запланировать("кадр")
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_кадр") != null);
+}
+
+test "DOM.через_мс keeps its named callback reachable" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\импорт DOM
+        \\
+        \\функ таймер() -> Пусто
+        \\конец
+        \\
+        \\функ старт() -> Пусто
+        \\    DOM.через_мс("таймер", 100)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, source);
+    defer allocator.free(wasm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "dom_after_delay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_bytes, "@arena_impl_таймер") != null);
+}
+
 test "DOM.на_клик promotes a captured local closure and its environment" {
     const allocator = std.testing.allocator;
     var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });

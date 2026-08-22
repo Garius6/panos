@@ -245,6 +245,7 @@ fn computeAotOutcome(allocator: std.mem.Allocator, io: std.Io, path: []const u8)
     // шага.
     try panos.wasm_objects.expand(allocator, &module, &checked.types);
     try panos.wasm_strings.expand(allocator, &module, &checked.types);
+    try panos.wasm_maps.expand(allocator, &module, &checked.types);
     const iface_result = try panos.wasm_interfaces.expand(allocator, &module, &checked.types);
     defer allocator.free(iface_result.table);
     var frame_info = try panos.mir_cps.prepare(allocator, &module);

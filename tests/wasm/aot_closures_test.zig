@@ -57,6 +57,7 @@ fn buildGraphBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     const type_store = &compiled.modules[0].checked.?.types;
     try panos.wasm_objects.expand(allocator, &module, type_store);
     try panos.wasm_strings.expand(allocator, &module, type_store);
+    try panos.wasm_maps.expand(allocator, &module, type_store);
     const iface_result = try panos.wasm_interfaces.expand(allocator, &module, type_store);
     defer allocator.free(iface_result.table);
     var frame_info = try panos.mir_cps.prepare(allocator, &module);
@@ -84,6 +85,7 @@ fn buildBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 
     try panos.wasm_objects.expand(allocator, &module, &checked.types);
     try panos.wasm_strings.expand(allocator, &module, &checked.types);
+    try panos.wasm_maps.expand(allocator, &module, &checked.types);
     const iface_result = try panos.wasm_interfaces.expand(allocator, &module, &checked.types);
     defer allocator.free(iface_result.table);
     var frame_info = try panos.mir_cps.prepare(allocator, &module);
@@ -930,6 +932,7 @@ fn buildGraphBytesMulti(allocator: std.mem.Allocator, entry_source: []const u8, 
     const type_store = &compiled.modules[0].checked.?.types;
     try panos.wasm_objects.expand(allocator, &module, type_store);
     try panos.wasm_strings.expand(allocator, &module, type_store);
+    try panos.wasm_maps.expand(allocator, &module, type_store);
     const iface_result = try panos.wasm_interfaces.expand(allocator, &module, type_store);
     defer allocator.free(iface_result.table);
     var frame_info = try panos.mir_cps.prepare(allocator, &module);
@@ -1070,6 +1073,229 @@ test "a payload-less custom enum variant lowers correctly outside call position"
     defer allocator.free(wasm_bytes);
 
     const wasm_path = "zzz_aot_payloadless_enum_variant.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const result = try wasmtimeInvoke(allocator, io.io(), wasm_path, "старт");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1\n", result.stdout);
+}
+
+test "a tuple literal, field access, and an array of tuples lower correctly" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const entry_source =
+        \\функ старт() -> Число
+        \\    пер t = ("a", 3.0)
+        \\    пер массив_пар = массив(("x", 1.0), ("y", 2.0))
+        \\    t.1 + массив_пар[0].1 + массив_пар[1].1
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, entry_source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_tuple_literal.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const result = try wasmtimeInvoke(allocator, io.io(), wasm_path, "старт");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("6\n", result.stdout);
+}
+
+// `Соответствие` под AOT WASM — строго строковые ключи (см.
+// `wasm_maps.zig` doc-комментарий). Покрывает: литерал с начальными
+// записями, `[]=` вставка И перезапись существующего ключа (разные
+// пути в `@map_set_*`), `.получить(key, default)` для присутствующего
+// и отсутствующего ключа, `.есть()`, `.длина()`.
+test "Соответствие literal, []= insert/overwrite, .получить/.есть/.длина all work under AOT WASM" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const entry_source =
+        \\функ старт() -> Число
+        \\    пер м: Соответствие(Строка, Число) = соответствие("исходный" = 1.0)
+        \\    м["a"] = 10.0
+        \\    м["b"] = 20.0
+        \\    м["a"] = 99.0
+        \\    пер сумма = м.получить("исходный", 0.0) + м.получить("a", 0.0) + м.получить("b", 0.0) + м.получить("отсутствует", 5.0)
+        \\    пер флаги = (если м.есть("a") тогда 100.0 иначе 0.0 конец) + (если м.есть("z") тогда 0.0 иначе 1000.0 конец)
+        \\    сумма + флаги + (м.длина() как Число)
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, entry_source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_map_basic.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const result = try wasmtimeInvoke(allocator, io.io(), wasm_path, "старт");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    // сумма = 1 + 99 + 20 + 5 = 125; флаги = 100 + 1000 = 1100; длина = 3
+    try std.testing.expectEqualStrings("1228\n", result.stdout);
+}
+
+// `.записи()` — реальный найденный баг (не гипотетический): в первой
+// версии `@map_entries` `array_runtime.append_i32`'s аргументы
+// (`arr`, `pair`) оказывались произведены в порядке, обратном списку
+// аргументов `.call` — append писал в перепутанные значения, итоговый
+// массив оставался пустым при непустой карте. Регресс специально
+// проверяет и КОЛИЧЕСТВО записей, и извлечение конкретного значения по
+// ключу через `.0`/`.1`, не только длину (длина одна могла бы
+// случайно совпасть при другом классе бага).
+test "Соответствие.записи() returns real (key, value) tuples, not an empty array" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const entry_source =
+        \\функ старт() -> Число
+        \\    пер м: Соответствие(Строка, Число) = соответствие()
+        \\    м["x"] = 7.0
+        \\    м["y"] = 13.0
+        \\    пер записи = м.записи()
+        \\    пер сумма_значений = 0.0
+        \\    пер i: Целое = 0
+        \\    пока i < записи.длина() цикл
+        \\        сумма_значений = сумма_значений + записи[i].1
+        \\        i = i + 1
+        \\    конец
+        \\    (записи.длина() как Число) + сумма_значений
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, entry_source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_map_entries.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const result = try wasmtimeInvoke(allocator, io.io(), wasm_path, "старт");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    // длина=2, сумма=7+13=20 -> 22
+    try std.testing.expectEqualStrings("22\n", result.stdout);
+}
+
+// Реальный найденный баг: `lowerWhile` понижало `loop.condition` через
+// общий `lowerExpr`+`.branch`, а не через `lowerCondition` — короткое
+// замыкание `и`/`или` (`lowerShortCircuit`) строит СОБСТВЕННЫЙ
+// `merge_block`, материализующий bool через Local; итоговый `.branch`
+// цикла оказывался эмитирован в ЭТОТ чужой блок, а не в
+// `header_block` (единственную законную цель обратного ребра) —
+// `wasm_stackify.zig` не находил `header_block` среди открытых loop-
+// scope ("br-цель не найдена"). Минимальный репро — `и` НАПРЯМУЮ как
+// условие `пока`, без продолжить/структур/строк.
+test "пока X и Y цикл — short-circuit AND directly as a while condition lowers correctly" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const entry_source =
+        \\функ старт() -> Число
+        \\    пер поз: Целое = 0
+        \\    пока поз < 10 и поз < 100 цикл
+        \\        поз = поз + 1
+        \\    конец
+        \\    поз как Число
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, entry_source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_while_short_circuit.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const result = try wasmtimeInvoke(allocator, io.io(), wasm_path, "старт");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("10\n", result.stdout);
+}
+
+// Реальный найденный баг: `Строка[i]` (индекс по руне) шло через общий
+// `.get_index` MIR, который `wasm_objects.zig` ВСЕГДА раскрывает как
+// array-get (`array_runtime`, числовой слот×8 байт) — для строки
+// (заголовок `[len][UTF-8 байты]`, совсем другая раскладка) это молча
+// читало мусор по неверному адресу вместо настоящего символа, никогда
+// не падая на валидации (оба типа — просто i32 с точки зрения WASM).
+// Никогда не ловилось раньше, потому что предыдущие тесты проверяли
+// только УСПЕШНУЮ СБОРКУ строковых индексных выражений, не их
+// РЕЗУЛЬТАТ.
+test "Строка[i] (доступ к руне по индексу) возвращает настоящий символ, не мусор" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const entry_source =
+        \\функ старт() -> Число
+        \\    пер текст = "ab"
+        \\    если текст[0] == "a" тогда
+        \\        1.0
+        \\    иначе
+        \\        0.0
+        \\    конец
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, entry_source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_string_index.wasm";
+    try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
+    defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
+
+    const result = try wasmtimeInvoke(allocator, io.io(), wasm_path, "старт");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1\n", result.stdout);
+}
+
+// Реальный найденный баг: `Ошибка` — `.primitive{.error_value}` в
+// `types.zig`, НЕ `.nominal` — `wasmValTypeForStore` (`wasm_module.zig`)
+// не ловила эту ветку вообще (switch по `.get(type_id)` не перечислял
+// `.primitive`), молча проваливаясь в дефолтный `wasm_f64` вместо
+// правильного `wasm_i32` (двухполевой аггрегат-хэндл, та же категория,
+// что обычная структура). Проявлялось только в функциях, возвращающих
+// `Результат(T, Ошибка)` с РАННИМ `возврат Результат.Неудача(...)`
+// внутри `если` (без `иначе`), за которым следует что-то ЕЩЁ в том же
+// блоке — "type mismatch: expected f64, found i32" при валидации
+// wasmtime, не при сборке panos.
+test "функция, возвращающая Результат(T, Ошибка) с ранним возвратом Неудача внутри если, лоуерится корректно" {
+    const allocator = std.testing.allocator;
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.testing.environ });
+    defer io.deinit();
+
+    const entry_source =
+        \\функ f(x: Целое, e: Ошибка) -> Результат(Целое, Ошибка)
+        \\    если x == 2 тогда
+        \\        возврат Результат.Неудача(e)
+        \\    конец
+        \\    Результат.Успех(0)
+        \\конец
+        \\
+        \\функ старт() -> Число
+        \\    пер р = f(1, Ошибка("m", "e"))
+        \\    если р.ошибка() тогда возврат 0.0 конец
+        \\    1.0
+        \\конец
+    ;
+    const wasm_bytes = try buildGraphBytes(allocator, entry_source);
+    defer allocator.free(wasm_bytes);
+
+    const wasm_path = "zzz_aot_error_value_type.wasm";
     try std.Io.Dir.cwd().writeFile(io.io(), .{ .sub_path = wasm_path, .data = wasm_bytes });
     defer std.Io.Dir.cwd().deleteFile(io.io(), wasm_path) catch {};
 

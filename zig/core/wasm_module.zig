@@ -20,11 +20,24 @@ pub fn wasmValTypeForStore(store: *const types.TypeStore, type_id: types.TypeId)
     // которыми владеет JS AOT-рантайм. Все именованные значения используют
     // одно и то же представление.
     if (store.eql(type_id, store.builtins.string)) return wasm_i32;
+    // `Ошибка` — `.primitive{.error_value}` (не `.nominal`, см.
+    // `types.zig`), физически тот же 2-полевой аггрегат-хэндл, что и
+    // обычная структура (`.new_aggregate` в `lowerErrorConstructor`,
+    // `mir_lowering.zig`) — реальный найденный баг: без этой ветки
+    // `store.get(type_id)`'s switch ниже её не ловил вообще (`.primitive`
+    // там не перечислен), она молча проваливалась в дефолтный `wasm_f64`
+    // — любой код, читающий/пишущий значение типа `Ошибка` как локаль/
+    // поле/аргумент через `wasmValTypeForStore`, путал i32-хэндл с f64.
+    if (store.eql(type_id, store.builtins.error_value)) return wasm_i32;
     if (store.get(type_id)) |entry| switch (entry.*) {
         // Функции первого класса — непрозрачные i32-индексы в WASM-таблице
         // (см. `.function_ref` в `wasm_interfaces.zig`) — та же категория
         // "непрозрачный i32-хендл", что и nominal/array/process.
-        .nominal, .array, .process, .function => return wasm_i32,
+        // Кортеж — та же "непрозрачный i32-хендл" категория, что именованная
+        // структура (`.nominal`) — физически один и тот же `.aggregate` в
+        // байткод-VM, `type_name` пустой у кортежа, только и всего.
+        // `Соответствие` — свой отдельный i32-хендл рантайм (`wasm_maps.zig`).
+        .nominal, .array, .process, .function, .tuple, .map => return wasm_i32,
         // Голый неразрешённый параметр generic-типа (`T` без конкретной
         // подстановки на этом этапе) — дженерики панос принципиально
         // никогда не мономорфизируются (см. доккомментарии

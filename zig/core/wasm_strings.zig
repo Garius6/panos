@@ -54,6 +54,10 @@ const StringRuntime = struct {
     from_int: mir.FunctionId,
     from_number: mir.FunctionId,
     to_number: mir.FunctionId,
+    is_digit: mir.FunctionId,
+    is_letter: mir.FunctionId,
+    from_runes: ?mir.FunctionId,
+    to_bytes: ?mir.FunctionId,
 };
 
 const ExpandCtx = struct {
@@ -92,6 +96,19 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
     const from_int = try buildFromInt(allocator, module, type_store, layout, format_digits, concat);
     const from_number = try buildFromNumber(allocator, module, type_store, layout, format_digits, concat);
     const to_number = try buildToNumber(allocator, module, type_store, layout);
+    // `из_рун` возвращает `Строка` из `Массив(Целое)` — подключаем array
+    // runtime только если исходник реально его использует, та же
+    // дисциплина, что и у `разбить` выше (`findOrBuildArrayRuntime`
+    // идемпотентна: если `разбить` уже построил его, здесь просто
+    // находит существующие функции по имени, не строит заново).
+    const from_runes: ?mir.FunctionId = if (usesFromRunes(module)) blk: {
+        const array_runtime = try wasm_objects.findOrBuildArrayRuntime(allocator, module, type_store, layout);
+        break :blk try buildFromRunes(allocator, module, type_store, layout, array_runtime);
+    } else null;
+    const to_bytes: ?mir.FunctionId = if (usesToBytes(module)) blk: {
+        const array_runtime = try wasm_objects.findOrBuildArrayRuntime(allocator, module, type_store, layout);
+        break :blk try buildToBytes(allocator, module, type_store, layout, array_runtime);
+    } else null;
     const runtime = StringRuntime{
         .concat = concat,
         .equal = try buildEqual(allocator, module, type_store, layout),
@@ -108,6 +125,10 @@ pub fn expand(allocator: std.mem.Allocator, module: *mir.Module, type_store: *co
         .from_int = from_int,
         .from_number = from_number,
         .to_number = to_number,
+        .is_digit = try buildIsDigit(allocator, module, type_store, layout),
+        .is_letter = try buildIsLetter(allocator, module, type_store, layout, utf8_width),
+        .from_runes = from_runes,
+        .to_bytes = to_bytes,
     };
     // То же рассуждение «пересканировать module.functions.items заново
     // каждый раз», что и в wasm_objects.zig: buildConcat/buildEqual выше
@@ -165,6 +186,24 @@ fn usesSplit(module: *const mir.Module) bool {
     return false;
 }
 
+fn usesFromRunes(module: *const mir.Module) bool {
+    for (module.functions.items) |function| for (function.blocks.items) |block|
+        for (block.instructions.items) |instruction| switch (instruction) {
+            .call_builtin => |v| if (std.mem.eql(u8, v.name, "строки::из_рун")) return true,
+            else => {},
+        };
+    return false;
+}
+
+fn usesToBytes(module: *const mir.Module) bool {
+    for (module.functions.items) |function| for (function.blocks.items) |block|
+        for (block.instructions.items) |instruction| switch (instruction) {
+            .call_builtin => |v| if (std.mem.eql(u8, v.name, "строки::в_байты")) return true,
+            else => {},
+        };
+    return false;
+}
+
 fn expandBlock(builder: *mir_builder.Builder, allocator: std.mem.Allocator, block_id: mir.BlockId, ctx: ExpandCtx) !void {
     const function = builder.currentFunction();
     var original = function.blockConst(block_id).*;
@@ -217,6 +256,10 @@ fn expandInstruction(builder: *mir_builder.Builder, instruction: mir.Instruction
                 if (std.mem.eql(u8, v.name, "строки::разбить")) break :blk ctx.runtime.split.?;
                 if (std.mem.eql(u8, v.name, "строки::из_числа")) break :blk ctx.runtime.from_number;
                 if (std.mem.eql(u8, v.name, "строки::в_число")) break :blk ctx.runtime.to_number;
+                if (std.mem.eql(u8, v.name, "строки::это_цифра")) break :blk ctx.runtime.is_digit;
+                if (std.mem.eql(u8, v.name, "строки::это_буква")) break :blk ctx.runtime.is_letter;
+                if (std.mem.eql(u8, v.name, "строки::из_рун")) break :blk ctx.runtime.from_runes.?;
+                if (std.mem.eql(u8, v.name, "строки::в_байты")) break :blk ctx.runtime.to_bytes.?;
                 break :blk null;
             };
             if (callee) |fn_id| {
@@ -2336,5 +2379,493 @@ fn buildToNumber(allocator: std.mem.Allocator, module: *mir.Module, type_store: 
     const fail_result = try buildFailResultNamed(&builder, module, layout, "строки", "не удалось разобрать число");
     builder.terminate(.{ .return_value = .{ .value = fail_result } });
 
+    return id;
+}
+
+// `@string_is_digit(s) -> Булево`: пустая строка -> false, иначе сырой
+// первый БАЙТ сравнивается с '0'..'9' напрямую (переиспользует уже
+// существующий `emitIsDigit`, которым пользуется `@string_to_number`
+// выше) — полное UTF-8-декодирование не нужно: ASCII-цифры всегда
+// однобайтовые, а ведущий байт ЛЮБОЙ многобайтовой последовательности
+// (0xC0+) заведомо вне диапазона 0x30-0x39, так что байтовое сравнение
+// даёт тот же результат, что декодирование кодпоинта — соответствует
+// `strIsDigit` в `vm.zig`.
+fn buildIsDigit(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, "@string_is_digit", wasm_heap.dummy_symbol, layout.bool_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const s_local = try builder.newLocal(wasm_heap.dummy_symbol, "s", layout.ptr_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{s_local});
+    builder.currentFunction().type_store = type_store;
+
+    const s1 = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const len = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load = .{ .dst = len, .addr = s1 } });
+    const len_local = try wasm_heap.storeLocal(&builder, "len", layout.idx_type, len);
+
+    const len_for_cmp = try wasm_heap.loadLocal(&builder, len_local, layout.idx_type);
+    const zero_len = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    const is_empty = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, len_for_cmp, zero_len);
+    const empty_block = try builder.newBlock();
+    const check_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = is_empty, .then_block = empty_block, .else_block = check_block } });
+
+    builder.setCurrentBlock(empty_block);
+    const false_val = try wasm_heap.boolConst(&builder, layout.bool_type, false);
+    builder.terminate(.{ .return_value = .{ .value = false_val } });
+
+    builder.setCurrentBlock(check_block);
+    const four = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const s_for_addr = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const addr = try wasm_heap.binOp(&builder, layout.idx_type, .add, s_for_addr, four);
+    const byte0 = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load8 = .{ .dst = byte0, .addr = addr } });
+    const byte0_local = try wasm_heap.storeLocal(&builder, "@byte0", layout.idx_type, byte0);
+
+    const is_digit = try emitIsDigit(&builder, layout, byte0_local);
+    builder.terminate(.{ .return_value = .{ .value = is_digit } });
+    return id;
+}
+
+// a-z/A-Z по сырому байту — оба однобайтовые в UTF-8.
+fn emitIsAsciiLetter(builder: *mir_builder.Builder, layout: wasm_heap.PtrLayout, byte_local: mir.LocalId) !mir.ValueId {
+    const b1 = try wasm_heap.loadLocal(builder, byte_local, layout.idx_type);
+    const a_lo = try wasm_heap.addressConst(builder, layout.idx_type, 'a');
+    const ge_a = try wasm_heap.cmpOp(builder, layout.bool_type, .greater_equal, b1, a_lo);
+    const b2 = try wasm_heap.loadLocal(builder, byte_local, layout.idx_type);
+    const z_hi = try wasm_heap.addressConst(builder, layout.idx_type, 'z');
+    const le_z = try wasm_heap.cmpOp(builder, layout.bool_type, .less_equal, b2, z_hi);
+    const is_lower = try wasm_heap.binOp(builder, layout.bool_type, .bit_and, ge_a, le_z);
+
+    const b3 = try wasm_heap.loadLocal(builder, byte_local, layout.idx_type);
+    const a_upper_lo = try wasm_heap.addressConst(builder, layout.idx_type, 'A');
+    const ge_upper_a = try wasm_heap.cmpOp(builder, layout.bool_type, .greater_equal, b3, a_upper_lo);
+    const b4 = try wasm_heap.loadLocal(builder, byte_local, layout.idx_type);
+    const z_upper_hi = try wasm_heap.addressConst(builder, layout.idx_type, 'Z');
+    const le_upper_z = try wasm_heap.cmpOp(builder, layout.bool_type, .less_equal, b4, z_upper_hi);
+    const is_upper = try wasm_heap.binOp(builder, layout.bool_type, .bit_and, ge_upper_a, le_upper_z);
+
+    return try wasm_heap.binOp(builder, layout.bool_type, .bit_or, is_lower, is_upper);
+}
+
+// `@string_is_letter(s) -> Булево`: ASCII (a-z/A-Z, ширина-1 путь по
+// сырому байту) ИЛИ кириллица (А-Я/а-я/Ё/ё, все ширина-2 в UTF-8 —
+// требуют настоящего декодирования 2-байтовой последовательности, не
+// достаточно посмотреть на ведущий байт) — точно тот же диапазон, что
+// `strIsLetter` в `vm.zig`. Ширина 3/4 никогда не бывает буквой в этом
+// срезе языка (только ASCII+кириллица) -> false без декодирования.
+fn buildIsLetter(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, utf8_width: mir.FunctionId) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, "@string_is_letter", wasm_heap.dummy_symbol, layout.bool_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const s_local = try builder.newLocal(wasm_heap.dummy_symbol, "s", layout.ptr_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{s_local});
+    builder.currentFunction().type_store = type_store;
+
+    const s1 = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const len = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load = .{ .dst = len, .addr = s1 } });
+    const len_local = try wasm_heap.storeLocal(&builder, "len", layout.idx_type, len);
+
+    const len_for_cmp = try wasm_heap.loadLocal(&builder, len_local, layout.idx_type);
+    const zero_len = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    const is_empty = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, len_for_cmp, zero_len);
+    const empty_block = try builder.newBlock();
+    const nonempty_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = is_empty, .then_block = empty_block, .else_block = nonempty_block } });
+
+    builder.setCurrentBlock(empty_block);
+    const false_val1 = try wasm_heap.boolConst(&builder, layout.bool_type, false);
+    builder.terminate(.{ .return_value = .{ .value = false_val1 } });
+
+    builder.setCurrentBlock(nonempty_block);
+    const four = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const s_for_base = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const base = try wasm_heap.binOp(&builder, layout.idx_type, .add, s_for_base, four);
+    const base_local = try wasm_heap.storeLocal(&builder, "base", layout.idx_type, base);
+
+    const base_for_byte0 = try wasm_heap.loadLocal(&builder, base_local, layout.idx_type);
+    const byte0 = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load8 = .{ .dst = byte0, .addr = base_for_byte0 } });
+    const byte0_local = try wasm_heap.storeLocal(&builder, "@byte0", layout.idx_type, byte0);
+
+    const byte0_for_width = try wasm_heap.loadLocal(&builder, byte0_local, layout.idx_type);
+    const width = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .call = .{ .dst = width, .callee = utf8_width, .args = try wasm_heap.dupeOne(module, byte0_for_width) } });
+    const width_local = try wasm_heap.storeLocal(&builder, "@width", layout.idx_type, width);
+
+    const width_for_cmp1 = try wasm_heap.loadLocal(&builder, width_local, layout.idx_type);
+    const one_w = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const is_w1 = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, width_for_cmp1, one_w);
+    const ascii_block = try builder.newBlock();
+    const check2_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = is_w1, .then_block = ascii_block, .else_block = check2_block } });
+
+    builder.setCurrentBlock(ascii_block);
+    const ascii_result = try emitIsAsciiLetter(&builder, layout, byte0_local);
+    builder.terminate(.{ .return_value = .{ .value = ascii_result } });
+
+    builder.setCurrentBlock(check2_block);
+    const width_for_cmp2 = try wasm_heap.loadLocal(&builder, width_local, layout.idx_type);
+    const two_w = try wasm_heap.addressConst(&builder, layout.idx_type, 2);
+    const is_w2 = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, width_for_cmp2, two_w);
+    const two_byte_block = try builder.newBlock();
+    const not_letter_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = is_w2, .then_block = two_byte_block, .else_block = not_letter_block } });
+
+    builder.setCurrentBlock(not_letter_block);
+    const false_val2 = try wasm_heap.boolConst(&builder, layout.bool_type, false);
+    builder.terminate(.{ .return_value = .{ .value = false_val2 } });
+
+    builder.setCurrentBlock(two_byte_block);
+    const byte0_for_cp = try wasm_heap.loadLocal(&builder, byte0_local, layout.idx_type);
+    const mask_1f = try wasm_heap.addressConst(&builder, layout.idx_type, 0x1F);
+    const b0_masked = try wasm_heap.binOp(&builder, layout.idx_type, .bit_and, byte0_for_cp, mask_1f);
+    const six = try wasm_heap.addressConst(&builder, layout.idx_type, 6);
+    const b0_shifted = try wasm_heap.binOp(&builder, layout.idx_type, .shift_left, b0_masked, six);
+
+    const base_for_byte1 = try wasm_heap.loadLocal(&builder, base_local, layout.idx_type);
+    const one_off = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const byte1_addr = try wasm_heap.binOp(&builder, layout.idx_type, .add, base_for_byte1, one_off);
+    const byte1 = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load8 = .{ .dst = byte1, .addr = byte1_addr } });
+    const byte1_local = try wasm_heap.storeLocal(&builder, "@byte1", layout.idx_type, byte1);
+    const byte1_for_cp = try wasm_heap.loadLocal(&builder, byte1_local, layout.idx_type);
+    const mask_3f = try wasm_heap.addressConst(&builder, layout.idx_type, 0x3F);
+    const b1_masked = try wasm_heap.binOp(&builder, layout.idx_type, .bit_and, byte1_for_cp, mask_3f);
+
+    const codepoint = try wasm_heap.binOp(&builder, layout.idx_type, .bit_or, b0_shifted, b1_masked);
+    const codepoint_local = try wasm_heap.storeLocal(&builder, "@cp", layout.idx_type, codepoint);
+
+    // А-Я/а-я — один непрерывный диапазон 0x0410..0x044F; Ё/ё вне его,
+    // проверяются отдельно — те же три условия, что и `strIsLetter`.
+    const cp_for_lo = try wasm_heap.loadLocal(&builder, codepoint_local, layout.idx_type);
+    const range_lo_const = try wasm_heap.addressConst(&builder, layout.idx_type, 0x0410);
+    const ge_lo = try wasm_heap.cmpOp(&builder, layout.bool_type, .greater_equal, cp_for_lo, range_lo_const);
+    const cp_for_hi = try wasm_heap.loadLocal(&builder, codepoint_local, layout.idx_type);
+    const range_hi_const = try wasm_heap.addressConst(&builder, layout.idx_type, 0x044F);
+    const le_hi = try wasm_heap.cmpOp(&builder, layout.bool_type, .less_equal, cp_for_hi, range_hi_const);
+    const in_range = try wasm_heap.binOp(&builder, layout.bool_type, .bit_and, ge_lo, le_hi);
+
+    const cp_for_yo1 = try wasm_heap.loadLocal(&builder, codepoint_local, layout.idx_type);
+    const yo_upper_const = try wasm_heap.addressConst(&builder, layout.idx_type, 0x0401);
+    const eq_yo_upper = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, cp_for_yo1, yo_upper_const);
+    const cp_for_yo2 = try wasm_heap.loadLocal(&builder, codepoint_local, layout.idx_type);
+    const yo_lower_const = try wasm_heap.addressConst(&builder, layout.idx_type, 0x0451);
+    const eq_yo_lower = try wasm_heap.cmpOp(&builder, layout.bool_type, .equal, cp_for_yo2, yo_lower_const);
+
+    const or1 = try wasm_heap.binOp(&builder, layout.bool_type, .bit_or, in_range, eq_yo_upper);
+    const is_cyrillic = try wasm_heap.binOp(&builder, layout.bool_type, .bit_or, or1, eq_yo_lower);
+    builder.terminate(.{ .return_value = .{ .value = is_cyrillic } });
+
+    return id;
+}
+
+// `@string_from_runes(codes: Массив(Целое)) -> Строка`: обратное к
+// декодированию UTF-8 — кодирует каждый элемент массива (кодпоинт,
+// физически Число/f64, как и все элементы Массив(Целое) в этом
+// представлении) обратно в 1-4 байта, конкатенируя результат. Верхняя
+// граница размера аллокации — 4 байта/кодпоинт (реальная длина обычно
+// меньше; лишнее место в bump-куче не освобождается — та же экономия
+// сложности, что и во всём этом файле). Намеренно БЕЗ явной проверки
+// суррогатного диапазона (0xD800-0xDFFF) в отличие от `strFromRunes` в
+// `vm.zig` — единственный вызывающий это в панос-коде (json.pns) уже
+// сам комбинирует суррогатные пары в один настоящий кодпоинт ДО вызова
+// `из_рун`, так что в реальной практике сюда суррогатный codepoint не
+// попадает; несостоятельный ручной вызов извне даст неверные, но не
+// небезопасные байты (не читает/не пишет за пределы аллоцированного).
+fn buildFromRunes(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, array_runtime: wasm_objects.ArrayRuntime) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, "@string_from_runes", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const arr_local = try builder.newLocal(wasm_heap.dummy_symbol, "arr", layout.ptr_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{arr_local});
+    builder.currentFunction().type_store = type_store;
+
+    const arr_for_len = try wasm_heap.loadLocal(&builder, arr_local, layout.ptr_type);
+    const len_f64 = try builder.newValue(type_store.builtins.number);
+    try builder.emit(.{ .call = .{ .dst = len_f64, .callee = array_runtime.length, .args = try wasm_heap.dupeOne(module, arr_for_len) } });
+    const len_i32 = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .unary = .{ .dst = len_i32, .op = .to_i32, .src = len_f64 } });
+    const len_local = try wasm_heap.storeLocal(&builder, "@len", layout.idx_type, len_i32);
+
+    const len_for_size = try wasm_heap.loadLocal(&builder, len_local, layout.idx_type);
+    const four_per = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const max_bytes = try wasm_heap.binOp(&builder, layout.idx_type, .multiply, len_for_size, four_per);
+    const header = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const alloc_size = try wasm_heap.binOp(&builder, layout.idx_type, .add, max_bytes, header);
+    const alloc_id = wasm_heap.findFunctionByName(module, wasm_heap.alloc_function_name).?;
+    const handle = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = handle, .callee = alloc_id, .args = try wasm_heap.dupeOne(module, alloc_size) } });
+    const handle_local = try wasm_heap.storeLocal(&builder, "handle", layout.ptr_type, handle);
+
+    const offset_local = try builder.newLocal(wasm_heap.dummy_symbol, "@offset", layout.idx_type);
+    const zero_off = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    try builder.emit(.{ .store_local = .{ .local = offset_local, .src = zero_off } });
+    const i_local = try builder.newLocal(wasm_heap.dummy_symbol, "@i", layout.idx_type);
+    const zero_i = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    try builder.emit(.{ .store_local = .{ .local = i_local, .src = zero_i } });
+
+    const loop_header = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_header);
+    const i_for_cmp = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const len_for_cmp = try wasm_heap.loadLocal(&builder, len_local, layout.idx_type);
+    const keep_going = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, i_for_cmp, len_for_cmp);
+    const loop_body = try builder.newBlock();
+    const loop_exit = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = keep_going, .then_block = loop_body, .else_block = loop_exit } });
+
+    builder.setCurrentBlock(loop_body);
+    const arr_for_get = try wasm_heap.loadLocal(&builder, arr_local, layout.ptr_type);
+    const i_for_idx = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const idx_f64 = try builder.newValue(type_store.builtins.number);
+    try builder.emit(.{ .unary = .{ .dst = idx_f64, .op = .from_i32, .src = i_for_idx } });
+    const cp_f64 = try builder.newValue(type_store.builtins.number);
+    try builder.emit(.{ .call = .{ .dst = cp_f64, .callee = array_runtime.get_f64, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ arr_for_get, idx_f64 }) } });
+    const cp_i32 = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .unary = .{ .dst = cp_i32, .op = .to_i32, .src = cp_f64 } });
+    const cp_local = try wasm_heap.storeLocal(&builder, "@cp", layout.idx_type, cp_i32);
+
+    // Базовый адрес записи ДЛЯ ЭТОГО кодпоинта — handle+4+offset.
+    const handle_for_base = try wasm_heap.loadLocal(&builder, handle_local, layout.ptr_type);
+    const four_hdr = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const handle_plus4 = try wasm_heap.binOp(&builder, layout.idx_type, .add, handle_for_base, four_hdr);
+    const offset_for_base = try wasm_heap.loadLocal(&builder, offset_local, layout.idx_type);
+    const write_base = try wasm_heap.binOp(&builder, layout.idx_type, .add, handle_plus4, offset_for_base);
+    const write_base_local = try wasm_heap.storeLocal(&builder, "@wbase", layout.idx_type, write_base);
+
+    const width_local = try builder.newLocal(wasm_heap.dummy_symbol, "@width", layout.idx_type);
+    const advance_block = try builder.newBlock();
+
+    const cp_for_c1 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+    const c1_bound = try wasm_heap.addressConst(&builder, layout.idx_type, 0x80);
+    const is_1byte = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, cp_for_c1, c1_bound);
+    const b1_block = try builder.newBlock();
+    const check2_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = is_1byte, .then_block = b1_block, .else_block = check2_block } });
+
+    builder.setCurrentBlock(b1_block);
+    {
+        const cp_r = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+        const addr0 = try wasm_heap.loadLocal(&builder, write_base_local, layout.idx_type);
+        try builder.emit(.{ .mem_store8 = .{ .addr = addr0, .src = cp_r } });
+        const one_w = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+        try builder.emit(.{ .store_local = .{ .local = width_local, .src = one_w } });
+        builder.terminate(.{ .jump = .{ .target = advance_block } });
+    }
+
+    builder.setCurrentBlock(check2_block);
+    const cp_for_c2 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+    const c2_bound = try wasm_heap.addressConst(&builder, layout.idx_type, 0x800);
+    const is_2byte = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, cp_for_c2, c2_bound);
+    const b2_block = try builder.newBlock();
+    const check3_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = is_2byte, .then_block = b2_block, .else_block = check3_block } });
+
+    builder.setCurrentBlock(b2_block);
+    {
+        const cp_for_b0 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+        const shift6 = try wasm_heap.addressConst(&builder, layout.idx_type, 6);
+        const b0_shifted = try wasm_heap.binOp(&builder, layout.idx_type, .shift_right, cp_for_b0, shift6);
+        const c0_tag = try wasm_heap.addressConst(&builder, layout.idx_type, 0xC0);
+        const byte0 = try wasm_heap.binOp(&builder, layout.idx_type, .bit_or, b0_shifted, c0_tag);
+        const addr0 = try wasm_heap.loadLocal(&builder, write_base_local, layout.idx_type);
+        try builder.emit(.{ .mem_store8 = .{ .addr = addr0, .src = byte0 } });
+
+        const cp_for_b1 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+        const mask3f_1 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x3F);
+        const b1_masked = try wasm_heap.binOp(&builder, layout.idx_type, .bit_and, cp_for_b1, mask3f_1);
+        const tag80_1 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x80);
+        const byte1 = try wasm_heap.binOp(&builder, layout.idx_type, .bit_or, b1_masked, tag80_1);
+        const wbase_r1 = try wasm_heap.loadLocal(&builder, write_base_local, layout.idx_type);
+        const one_o1 = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+        const addr1 = try wasm_heap.binOp(&builder, layout.idx_type, .add, wbase_r1, one_o1);
+        try builder.emit(.{ .mem_store8 = .{ .addr = addr1, .src = byte1 } });
+
+        const two_w = try wasm_heap.addressConst(&builder, layout.idx_type, 2);
+        try builder.emit(.{ .store_local = .{ .local = width_local, .src = two_w } });
+        builder.terminate(.{ .jump = .{ .target = advance_block } });
+    }
+
+    builder.setCurrentBlock(check3_block);
+    const cp_for_c3 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+    const c3_bound = try wasm_heap.addressConst(&builder, layout.idx_type, 0x10000);
+    const is_3byte = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, cp_for_c3, c3_bound);
+    const b3_block = try builder.newBlock();
+    const b4_block = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = is_3byte, .then_block = b3_block, .else_block = b4_block } });
+
+    builder.setCurrentBlock(b3_block);
+    {
+        const cp_for_b0 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+        const shift12 = try wasm_heap.addressConst(&builder, layout.idx_type, 12);
+        const b0_shifted = try wasm_heap.binOp(&builder, layout.idx_type, .shift_right, cp_for_b0, shift12);
+        const e0_tag = try wasm_heap.addressConst(&builder, layout.idx_type, 0xE0);
+        const byte0 = try wasm_heap.binOp(&builder, layout.idx_type, .bit_or, b0_shifted, e0_tag);
+        const addr0 = try wasm_heap.loadLocal(&builder, write_base_local, layout.idx_type);
+        try builder.emit(.{ .mem_store8 = .{ .addr = addr0, .src = byte0 } });
+
+        const cp_for_b1 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+        const shift6_2 = try wasm_heap.addressConst(&builder, layout.idx_type, 6);
+        const b1_shifted = try wasm_heap.binOp(&builder, layout.idx_type, .shift_right, cp_for_b1, shift6_2);
+        const mask3f_2 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x3F);
+        const b1_masked = try wasm_heap.binOp(&builder, layout.idx_type, .bit_and, b1_shifted, mask3f_2);
+        const tag80_2 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x80);
+        const byte1 = try wasm_heap.binOp(&builder, layout.idx_type, .bit_or, b1_masked, tag80_2);
+        const wbase_r1 = try wasm_heap.loadLocal(&builder, write_base_local, layout.idx_type);
+        const one_o1 = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+        const addr1 = try wasm_heap.binOp(&builder, layout.idx_type, .add, wbase_r1, one_o1);
+        try builder.emit(.{ .mem_store8 = .{ .addr = addr1, .src = byte1 } });
+
+        const cp_for_b2 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+        const mask3f_3 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x3F);
+        const b2_masked = try wasm_heap.binOp(&builder, layout.idx_type, .bit_and, cp_for_b2, mask3f_3);
+        const tag80_3 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x80);
+        const byte2 = try wasm_heap.binOp(&builder, layout.idx_type, .bit_or, b2_masked, tag80_3);
+        const wbase_r2 = try wasm_heap.loadLocal(&builder, write_base_local, layout.idx_type);
+        const two_o2 = try wasm_heap.addressConst(&builder, layout.idx_type, 2);
+        const addr2 = try wasm_heap.binOp(&builder, layout.idx_type, .add, wbase_r2, two_o2);
+        try builder.emit(.{ .mem_store8 = .{ .addr = addr2, .src = byte2 } });
+
+        const three_w = try wasm_heap.addressConst(&builder, layout.idx_type, 3);
+        try builder.emit(.{ .store_local = .{ .local = width_local, .src = three_w } });
+        builder.terminate(.{ .jump = .{ .target = advance_block } });
+    }
+
+    builder.setCurrentBlock(b4_block);
+    {
+        const cp_for_b0 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+        const shift18 = try wasm_heap.addressConst(&builder, layout.idx_type, 18);
+        const b0_shifted = try wasm_heap.binOp(&builder, layout.idx_type, .shift_right, cp_for_b0, shift18);
+        const f0_tag = try wasm_heap.addressConst(&builder, layout.idx_type, 0xF0);
+        const byte0 = try wasm_heap.binOp(&builder, layout.idx_type, .bit_or, b0_shifted, f0_tag);
+        const addr0 = try wasm_heap.loadLocal(&builder, write_base_local, layout.idx_type);
+        try builder.emit(.{ .mem_store8 = .{ .addr = addr0, .src = byte0 } });
+
+        const cp_for_b1 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+        const shift12_2 = try wasm_heap.addressConst(&builder, layout.idx_type, 12);
+        const b1_shifted = try wasm_heap.binOp(&builder, layout.idx_type, .shift_right, cp_for_b1, shift12_2);
+        const mask3f_4 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x3F);
+        const b1_masked = try wasm_heap.binOp(&builder, layout.idx_type, .bit_and, b1_shifted, mask3f_4);
+        const tag80_4 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x80);
+        const byte1 = try wasm_heap.binOp(&builder, layout.idx_type, .bit_or, b1_masked, tag80_4);
+        const wbase_r1 = try wasm_heap.loadLocal(&builder, write_base_local, layout.idx_type);
+        const one_o1 = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+        const addr1 = try wasm_heap.binOp(&builder, layout.idx_type, .add, wbase_r1, one_o1);
+        try builder.emit(.{ .mem_store8 = .{ .addr = addr1, .src = byte1 } });
+
+        const cp_for_b2 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+        const shift6_3 = try wasm_heap.addressConst(&builder, layout.idx_type, 6);
+        const b2_shifted = try wasm_heap.binOp(&builder, layout.idx_type, .shift_right, cp_for_b2, shift6_3);
+        const mask3f_5 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x3F);
+        const b2_masked = try wasm_heap.binOp(&builder, layout.idx_type, .bit_and, b2_shifted, mask3f_5);
+        const tag80_5 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x80);
+        const byte2 = try wasm_heap.binOp(&builder, layout.idx_type, .bit_or, b2_masked, tag80_5);
+        const wbase_r2 = try wasm_heap.loadLocal(&builder, write_base_local, layout.idx_type);
+        const two_o2 = try wasm_heap.addressConst(&builder, layout.idx_type, 2);
+        const addr2 = try wasm_heap.binOp(&builder, layout.idx_type, .add, wbase_r2, two_o2);
+        try builder.emit(.{ .mem_store8 = .{ .addr = addr2, .src = byte2 } });
+
+        const cp_for_b3 = try wasm_heap.loadLocal(&builder, cp_local, layout.idx_type);
+        const mask3f_6 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x3F);
+        const b3_masked = try wasm_heap.binOp(&builder, layout.idx_type, .bit_and, cp_for_b3, mask3f_6);
+        const tag80_6 = try wasm_heap.addressConst(&builder, layout.idx_type, 0x80);
+        const byte3 = try wasm_heap.binOp(&builder, layout.idx_type, .bit_or, b3_masked, tag80_6);
+        const wbase_r3 = try wasm_heap.loadLocal(&builder, write_base_local, layout.idx_type);
+        const three_o3 = try wasm_heap.addressConst(&builder, layout.idx_type, 3);
+        const addr3 = try wasm_heap.binOp(&builder, layout.idx_type, .add, wbase_r3, three_o3);
+        try builder.emit(.{ .mem_store8 = .{ .addr = addr3, .src = byte3 } });
+
+        const four_w = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+        try builder.emit(.{ .store_local = .{ .local = width_local, .src = four_w } });
+        builder.terminate(.{ .jump = .{ .target = advance_block } });
+    }
+
+    builder.setCurrentBlock(advance_block);
+    const offset_for_inc = try wasm_heap.loadLocal(&builder, offset_local, layout.idx_type);
+    const width_for_inc = try wasm_heap.loadLocal(&builder, width_local, layout.idx_type);
+    const offset_next = try wasm_heap.binOp(&builder, layout.idx_type, .add, offset_for_inc, width_for_inc);
+    try builder.emit(.{ .store_local = .{ .local = offset_local, .src = offset_next } });
+    const i_for_inc = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const one_i = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const i_next = try wasm_heap.binOp(&builder, layout.idx_type, .add, i_for_inc, one_i);
+    try builder.emit(.{ .store_local = .{ .local = i_local, .src = i_next } });
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_exit);
+    const offset_final = try wasm_heap.loadLocal(&builder, offset_local, layout.idx_type);
+    const handle_for_header = try wasm_heap.loadLocal(&builder, handle_local, layout.ptr_type);
+    try builder.emit(.{ .mem_store = .{ .addr = handle_for_header, .src = offset_final } });
+    const handle_final = try wasm_heap.loadLocal(&builder, handle_local, layout.ptr_type);
+    builder.terminate(.{ .return_value = .{ .value = handle_final } });
+    return id;
+}
+
+// `@string_to_bytes(s) -> Массив(Целое)`: обратное к `@string_from_runes`
+// на уровне БАЙТ, не рун — каждый сырой байт строки как отдельный
+// элемент, совпадает с `strToBytes` в `vm.zig`.
+fn buildToBytes(allocator: std.mem.Allocator, module: *mir.Module, type_store: *const types.TypeStore, layout: wasm_heap.PtrLayout, array_runtime: wasm_objects.ArrayRuntime) !mir.FunctionId {
+    const id = try mir_builder.newFunction(module, allocator, "@string_to_bytes", wasm_heap.dummy_symbol, layout.ptr_type, wasm_heap.dummy_span);
+    var builder = try mir_builder.Builder.beginFunction(module, allocator, id);
+    const s_local = try builder.newLocal(wasm_heap.dummy_symbol, "s", layout.ptr_type);
+    builder.currentFunction().parameters = try allocator.dupe(mir.LocalId, &.{s_local});
+    builder.currentFunction().type_store = type_store;
+
+    const s1 = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const len = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load = .{ .dst = len, .addr = s1 } });
+    const len_local = try wasm_heap.storeLocal(&builder, "@len", layout.idx_type, len);
+
+    const four = try wasm_heap.addressConst(&builder, layout.idx_type, 4);
+    const s_for_base = try wasm_heap.loadLocal(&builder, s_local, layout.ptr_type);
+    const base = try wasm_heap.binOp(&builder, layout.idx_type, .add, s_for_base, four);
+    const base_local = try wasm_heap.storeLocal(&builder, "base", layout.idx_type, base);
+
+    const arr = try builder.newValue(layout.ptr_type);
+    try builder.emit(.{ .call = .{ .dst = arr, .callee = array_runtime.new, .args = &.{} } });
+    const arr_local = try wasm_heap.storeLocal(&builder, "arr", layout.ptr_type, arr);
+
+    const i_local = try builder.newLocal(wasm_heap.dummy_symbol, "@i", layout.idx_type);
+    const zero_i = try wasm_heap.addressConst(&builder, layout.idx_type, 0);
+    try builder.emit(.{ .store_local = .{ .local = i_local, .src = zero_i } });
+
+    const loop_header = try builder.newBlock();
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_header);
+    const i_for_cmp = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const len_for_cmp = try wasm_heap.loadLocal(&builder, len_local, layout.idx_type);
+    const keep_going = try wasm_heap.cmpOp(&builder, layout.bool_type, .less, i_for_cmp, len_for_cmp);
+    const loop_body = try builder.newBlock();
+    const loop_exit = try builder.newBlock();
+    builder.terminate(.{ .branch = .{ .cond = keep_going, .then_block = loop_body, .else_block = loop_exit } });
+
+    builder.setCurrentBlock(loop_body);
+    const i_for_addr = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const base_for_addr = try wasm_heap.loadLocal(&builder, base_local, layout.idx_type);
+    const addr = try wasm_heap.binOp(&builder, layout.idx_type, .add, base_for_addr, i_for_addr);
+    const byte = try builder.newValue(layout.idx_type);
+    try builder.emit(.{ .mem_load8 = .{ .dst = byte, .addr = addr } });
+    const byte_f64 = try builder.newValue(type_store.builtins.number);
+    try builder.emit(.{ .unary = .{ .dst = byte_f64, .op = .from_i32, .src = byte } });
+    const byte_f64_local = try wasm_heap.storeLocal(&builder, "@byte_f64", type_store.builtins.number, byte_f64);
+
+    // `.call`'s аргументы протолкнуты в ТОЧНОМ порядке списка — `arr_for_append`
+    // должен быть произведён ПЕРВЫМ (реальный найденный баг, тот же класс,
+    // что в `wasm_maps.zig`'s `buildMapEntries`: `byte_f64` раньше
+    // производился ДО `arr_for_append`, `append_f64` получал аргументы
+    // переставленными местами).
+    const arr_for_append = try wasm_heap.loadLocal(&builder, arr_local, layout.ptr_type);
+    const byte_f64_reload = try wasm_heap.loadLocal(&builder, byte_f64_local, type_store.builtins.number);
+    try builder.emit(.{ .call = .{ .dst = null, .callee = array_runtime.append_f64, .args = try builder.module.arena.allocator().dupe(mir.ValueId, &.{ arr_for_append, byte_f64_reload }) } });
+
+    const i_for_inc = try wasm_heap.loadLocal(&builder, i_local, layout.idx_type);
+    const one_i = try wasm_heap.addressConst(&builder, layout.idx_type, 1);
+    const i_next = try wasm_heap.binOp(&builder, layout.idx_type, .add, i_for_inc, one_i);
+    try builder.emit(.{ .store_local = .{ .local = i_local, .src = i_next } });
+    builder.terminate(.{ .jump = .{ .target = loop_header } });
+
+    builder.setCurrentBlock(loop_exit);
+    const arr_final = try wasm_heap.loadLocal(&builder, arr_local, layout.ptr_type);
+    builder.terminate(.{ .return_value = .{ .value = arr_final } });
     return id;
 }

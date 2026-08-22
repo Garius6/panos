@@ -301,6 +301,11 @@ fn runBuild(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writ
         try stderr.flush();
         std.process.exit(1);
     };
+    panos_core.wasm_maps.expand(init.gpa, &module, &entry_checked.types) catch |err| {
+        try stderr.print("panos build: соответствия: {t}\n", .{err});
+        try stderr.flush();
+        std.process.exit(1);
+    };
     const iface_result = panos_core.wasm_interfaces.expand(init.gpa, &module, &entry_checked.types) catch |err| {
         try stderr.print("panos build: интерфейсы: {t}\n", .{err});
         try stderr.flush();

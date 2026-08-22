@@ -465,6 +465,28 @@ fn recordReference(
         try markReachable(allocator, set, worklist, origin.module, target_symbol);
         return;
     }
+    // Метод, объявленный на импортированном типе-владельце (`точка.
+    // метод()`, диспетчеризуется структурно, не по имени в области
+    // видимости) — заведён `resolver.zig` в ОТДЕЛЬНЫЙ `imported_methods`
+    // (ключ владелец+имя, зеркалит `imported_symbols`, но НЕ хранится в
+    // ЭТОЙ хэш-карте) — реальный найденный пробел: `recordReference`
+    // никогда не заглядывал в этот список, поэтому ЛЮБОЙ вызов метода,
+    // объявленного через `реализация Тип \n функ ...` в ДРУГОМ файле (не
+    // только через интерфейс — это отдельный, уже рабочий путь
+    // `interface_calls`), помечал достижимость с чужим `module_index`
+    // (модуль ВЫЗЫВАЮЩЕГО, а не модуль, где реально объявлен метод) —
+    // `reserveMethods`'s `isReachable` проверяет ПРАВИЛЬНУЮ пару
+    // (родной module_index метода, symbol), которая никогда не
+    // помечалась, так что метод никогда не резервировался и падал под
+    // AOT WASM с "поле generic-структуры" (обманчивое сообщение —
+    // `lowerProperty` просто последний, кто видит непойманный fallback).
+    for (resolution.imported_methods.items) |binding| {
+        if (binding.symbol != symbol) continue;
+        const target_resolution = if (compiled.modules[binding.origin.module].resolution) |*value| value else return;
+        const target_symbol = target_resolution.decl_symbols.get(binding.origin.declaration) orelse return;
+        try markReachable(allocator, set, worklist, binding.origin.module, target_symbol);
+        return;
+    }
     try markReachable(allocator, set, worklist, module_index, symbol);
 }
 
@@ -995,6 +1017,21 @@ pub fn lowerGraphWithDiagnostic(
             const target_function = function_maps.items[origin.module].get(target_symbol) orelse continue;
             try function_maps.items[module_index].put(entry.key_ptr.*, target_function);
         }
+        // Симметрично блоку выше, но для МЕТОДОВ импортированного
+        // типа-владельца (`resolution.imported_methods` — свой отдельный
+        // список, не покрытый `imported_symbols` вообще, см.
+        // doc-комментарий `recordReference`'s аналогичного фикса). Без
+        // этого метод мог быть корректно ЗАРЕЗЕРВИРОВАН (после фикса
+        // reachability выше) в СВОЁМ модуле, но вызывающий модуль всё
+        // равно не находил function_id для СВОЕГО локального,
+        // свежеиспечённого символа метода — тот же класс "исправили
+        // резервирование, забыли подключить к вызывающей стороне".
+        for (resolution.imported_methods.items) |binding| {
+            const target_resolution = if (compiled.modules[binding.origin.module].resolution) |*value| value else continue;
+            const target_symbol = target_resolution.decl_symbols.get(binding.origin.declaration) orelse continue;
+            const target_function = function_maps.items[binding.origin.module].get(target_symbol) orelse continue;
+            try function_maps.items[module_index].put(binding.symbol, target_function);
+        }
     }
 
     for (graph.order.items) |module_index| {
@@ -1417,6 +1454,8 @@ fn lowerExprInner(ctx: *LoweringContext, expression: ast.ExprId) anyerror!ExprOu
             break :blk continuesWith(try emitConstNumber(ctx, 0));
         },
         .lambda => |lambda| lowerLambda(ctx, expression, lambda),
+        .tuple => |tuple| lowerTupleLiteral(ctx, expression, tuple),
+        .map => |map| lowerMapLiteral(ctx, expression, map),
         else => return ctx.unsupported("вид выражения"),
     };
 }
@@ -1562,7 +1601,108 @@ fn lowerArrayLiteral(ctx: *LoweringContext, expression: ast.ExprId, array: anyty
     return continuesWith(result);
 }
 
+// `соответствие(k1: v1, k2: v2, ...)` — та же "построй, потом добавляй по
+// одному" схема, что `lowerArrayLiteral` выше, но через
+// `@runtime::map_new`/`@runtime::map_set_*` (`wasm_maps.zig`) вместо
+// array-рантайма. Строго строковые ключи — см. doc-комментарий файла-
+// заголовка `wasm_maps.zig`.
+fn lowerMapLiteral(ctx: *LoweringContext, expression: ast.ExprId, map: anytype) anyerror!ExprOutcome {
+    const map_type = ctx.checked.expression_types.get(expression) orelse return ctx.unsupported("соответствие без типа");
+    const entry = ctx.checked.types.get(map_type) orelse return ctx.unsupported("соответствие с неизвестным типом");
+    const kv = switch (entry.*) {
+        .map => |value| value,
+        else => return ctx.unsupported("литерал не-соответствия"),
+    };
+    if (!ctx.checked.types.eql(kv.key, ctx.checked.types.builtins.string)) {
+        return ctx.unsupported("Соответствие под AOT WASM поддерживает только строковые ключи");
+    }
+    const map_value = try ctx.builder.newValue(map_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = map_value, .name = "@runtime::map_new", .args = &.{} } });
+    const local = try ctx.builder.newLocal(symbols.invalid_symbol, "$map", map_type);
+    try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = map_value } });
+    const is_i32 = wasm_module.wasmValTypeForStore(&ctx.checked.types, kv.value) == wasm_module.wasm_i32;
+    const set_name = if (is_i32) "@runtime::map_set_i32" else "@runtime::map_set_f64";
+    for (map.entries) |map_entry| {
+        const receiver = try ctx.builder.newValue(map_type);
+        try ctx.builder.emit(.{ .load_local = .{ .dst = receiver, .local = local } });
+        const key = try lowerExpr(ctx, map_entry.key);
+        if (key.flow == .terminates) return terminated;
+        const value = try lowerExpr(ctx, map_entry.value);
+        if (value.flow == .terminates) return terminated;
+        try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = set_name, .args = try valuesInArena(ctx, &.{ receiver, key.value, value.value }) } });
+    }
+    const result = try ctx.builder.newValue(map_type);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = result, .local = local } });
+    return continuesWith(result);
+}
+
+// `Соответствие` использует СВОЙ отдельный i32-хендл рантайм
+// (`wasm_maps.zig`, ключи строго строковые — см. doc-комментарий файла-
+// заголовка `wasm_maps.zig`) — `obj[key]` на карте не может идти через
+// общую `.get_index` (та жёстко предполагает array_runtime в
+// `wasm_objects.zig`, числовой индекс с bounds-check, а не строковый
+// линейный поиск), маршрутизируется через `call_builtin` отдельно, до
+// общего array-путя ниже.
+fn lowerMapIndex(ctx: *LoweringContext, expression: ast.ExprId, index: anytype) anyerror!?ExprOutcome {
+    const object_type = ctx.checked.expression_types.get(index.object) orelse return null;
+    const entry = ctx.checked.types.get(object_type) orelse return null;
+    if (entry.* != .map) return null;
+    const key_type = ctx.checked.expression_types.get(index.index) orelse return ctx.unsupported("ключ карты без типа");
+    if (!ctx.checked.types.eql(key_type, ctx.checked.types.builtins.string)) {
+        return ctx.unsupported("Соответствие под AOT WASM поддерживает только строковые ключи");
+    }
+    const object = try lowerExpr(ctx, index.object);
+    if (object.flow == .terminates) return terminated;
+    const subscript = try lowerExpr(ctx, index.index);
+    if (subscript.flow == .terminates) return terminated;
+    const result_type = ctx.checked.expression_types.get(expression) orelse return ctx.unsupported("индексирование без типа результата");
+    const is_i32 = wasm_module.wasmValTypeForStore(&ctx.checked.types, result_type) == wasm_module.wasm_i32;
+    const name = if (is_i32) "@runtime::map_get_i32" else "@runtime::map_get_f64";
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = name, .args = try valuesInArena(ctx, &.{ object.value, subscript.value }) } });
+    return continuesWith(dst);
+}
+
+// `Строка[i]` (доступ к рУНЕ по позиции, возвращает односимвольную
+// Строка) — реальный, НЕЗАВИСИМЫЙ от карт/кортежей найденный баг: без
+// этого частного случая `.index` на строке падает через общий путь
+// `lowerIndex` ниже, который ВСЕГДА трактует объект как `Массив`
+// (`.get_index` → `wasm_objects.zig`'s `array_runtime.get_i32/f64`,
+// числовое смещение × 8 байт от собственного заголовка array-рантайма)
+// — для строки (заголовок `[len][UTF-8 байты]`, СОВСЕМ другая
+// раскладка кучи) это молча читает произвольный мусор по неверному
+// адресу вместо настоящего символа, никогда не паникуя и не падая на
+// валидации (оба типа — просто i32/f64 с точки зрения WASM) — заметили
+// только когда `json.pns`'s токенизатор (первый реальный код,
+// зависящий от ПРАВИЛЬНОГО результата `текст[i]`, а не просто от
+// успешной сборки) дал неверный результат сравнения под AOT WASM.
+// Раскрывается в `строки::срез(s, i, i+1)` — тот же примитив, что уже
+// использует метод `.срез()`.
+fn lowerStringIndex(ctx: *LoweringContext, expression: ast.ExprId, index: anytype) anyerror!?ExprOutcome {
+    const object_type = ctx.checked.expression_types.get(index.object) orelse return null;
+    if (!ctx.checked.types.eql(object_type, ctx.checked.types.builtins.string)) return null;
+    const object = try lowerExpr(ctx, index.object);
+    if (object.flow == .terminates) return terminated;
+    const idx = try lowerExpr(ctx, index.index);
+    if (idx.flow == .terminates) return terminated;
+    const idx_local = try ctx.builder.newLocal(symbols.invalid_symbol, "$idx", ctx.checked.types.builtins.number);
+    try ctx.builder.emit(.{ .store_local = .{ .local = idx_local, .src = idx.value } });
+    const start = try ctx.builder.newValue(ctx.checked.types.builtins.number);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = start, .local = idx_local } });
+    const end_base = try ctx.builder.newValue(ctx.checked.types.builtins.number);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = end_base, .local = idx_local } });
+    const one = try emitConstNumber(ctx, 1);
+    const end = try ctx.builder.newValue(ctx.checked.types.builtins.number);
+    try ctx.builder.emit(.{ .binary = .{ .dst = end, .op = .add, .lhs = end_base, .rhs = one } });
+    const result_type = ctx.checked.expression_types.get(expression) orelse ctx.checked.types.builtins.string;
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = "строки::срез", .args = try valuesInArena(ctx, &.{ object.value, start, end }) } });
+    return continuesWith(dst);
+}
+
 fn lowerIndex(ctx: *LoweringContext, expression: ast.ExprId, index: anytype) anyerror!ExprOutcome {
+    if (try lowerMapIndex(ctx, expression, index)) |outcome| return outcome;
+    if (try lowerStringIndex(ctx, expression, index)) |outcome| return outcome;
     const object = try lowerExpr(ctx, index.object);
     if (object.flow == .terminates) return terminated;
     const subscript = try lowerExpr(ctx, index.index);
@@ -1617,6 +1757,18 @@ fn lowerProperty(ctx: *LoweringContext, expression: ast.ExprId, property: anytyp
     if (object.flow == .terminates) return terminated;
     const object_type = ctx.checked.expression_types.get(property.object) orelse return ctx.unsupported("свойство без типа объекта");
     const type_entry = ctx.checked.types.get(object_type) orelse return ctx.unsupported("свойство с неизвестным типом объекта");
+    // `.0`/`.1` доступ к полю кортежа — та же `get_property`-инструкция,
+    // что и доступ к полю именованной структуры ниже (обе формы сходятся
+    // в один и тот же `.aggregate` рантайм в байткод-VM), индекс поля —
+    // само числовое имя свойства, тот же разбор, что `tuplePropertyIndex`
+    // в `type_checker.zig`.
+    if (type_entry.* == .tuple) {
+        const index = std.fmt.parseInt(usize, property.property, 10) catch return ctx.unsupported("нечисловое поле кортежа");
+        const result_type = ctx.checked.expression_types.get(expression) orelse return ctx.unsupported("свойство без типа");
+        const dst = try ctx.builder.newValue(result_type);
+        try ctx.builder.emit(.{ .get_property = .{ .dst = dst, .object = object.value, .field_index = @intCast(index) } });
+        return continuesWith(dst);
+    }
     const nominal = switch (type_entry.*) {
         .nominal => |value| value,
         else => return ctx.unsupported("свойство не-структуры"),
@@ -1964,13 +2116,29 @@ fn lowerAssign(ctx: *LoweringContext, binary: anytype) anyerror!ExprOutcome {
             try ctx.builder.emit(.{ .set_property = .{ .object = object.value, .field_index = index, .value = rhs.value } });
         },
         .index => |index| {
+            const map_object_type = ctx.checked.expression_types.get(index.object);
+            const map_entry = if (map_object_type) |t| ctx.checked.types.get(t) else null;
+            const is_map = if (map_entry) |e| e.* == .map else false;
+            if (is_map) {
+                const key_type = ctx.checked.expression_types.get(index.index) orelse return ctx.unsupported("ключ карты без типа");
+                if (!ctx.checked.types.eql(key_type, ctx.checked.types.builtins.string)) {
+                    return ctx.unsupported("Соответствие под AOT WASM поддерживает только строковые ключи");
+                }
+            }
             const object = try lowerExpr(ctx, index.object);
             if (object.flow == .terminates) return terminated;
             const subscript = try lowerExpr(ctx, index.index);
             if (subscript.flow == .terminates) return terminated;
             const rhs = try lowerExpr(ctx, binary.right);
             if (rhs.flow == .terminates) return terminated;
-            try ctx.builder.emit(.{ .set_index = .{ .object = object.value, .index = subscript.value, .value = rhs.value } });
+            if (is_map) {
+                const value_type = ctx.checked.expression_types.get(binary.right) orelse return ctx.unsupported("значение карты без типа");
+                const is_i32 = wasm_module.wasmValTypeForStore(&ctx.checked.types, value_type) == wasm_module.wasm_i32;
+                const name = if (is_i32) "@runtime::map_set_i32" else "@runtime::map_set_f64";
+                try ctx.builder.emit(.{ .call_builtin = .{ .dst = null, .name = name, .args = try valuesInArena(ctx, &.{ object.value, subscript.value, rhs.value }) } });
+            } else {
+                try ctx.builder.emit(.{ .set_index = .{ .object = object.value, .index = subscript.value, .value = rhs.value } });
+            }
         },
         else => return ctx.unsupported("цель присваивания (Фаза 3+)"),
     }
@@ -2113,9 +2281,33 @@ fn lowerWhile(ctx: *LoweringContext, loop: anytype) anyerror!FlowResult {
 
     ctx.builder.terminate(.{ .jump = .{ .target = header_block } });
     ctx.builder.setCurrentBlock(header_block);
-    const cond = try lowerExpr(ctx, loop.condition);
-    if (cond.flow == .terminates) return .terminates;
-    ctx.builder.terminate(.{ .branch = .{ .cond = cond.value, .then_block = body_block, .else_block = exit_block } });
+    // `lowerCondition` (не `lowerExpr`+`.branch` в лоб) — реальный
+    // найденный баг: короткое замыкание `и`/`или` (`lowerShortCircuit`)
+    // строит СОБСТВЕННЫЕ блоки со СВОИМ `merge_block`, материализующим
+    // bool-значение через Local; когда `loop.condition` — `и`/`или` и
+    // понижается через обычный `lowerExpr`, terminator цикла (`.branch`
+    // на body/exit) оказывается эмитирован НЕ в `header_block` (заголовок
+    // цикла, единственная законная цель обратного ребра `продолжить`/
+    // конца тела), а в чужом `merge_block` короткого замыкания —
+    // `wasm_stackify.zig` не находит `header_block` среди открытых loop-
+    // scope при попытке сгенерировать `br` на него ("br-цель не найдена
+    // среди открытых scope"). `lowerCondition` строит рёбра CFG НАПРЯМУЮ
+    // из `header_block` в `body_block`/`exit_block`, без промежуточного
+    // value-блока — ровно то, для чего она и была изначально написана
+    // (см. её собственный doc-комментарий, уже упоминавший `если`/`пока`
+    // до этого фикса, но НИ разу не вызывавшийся оттуда). `lowerIfExpr`
+    // тот же баг не задевает — там нет обратного ребра, любой блок,
+    // произведённый короткозамкнутым понижением, просто становится ещё
+    // одним промежуточным звеном на пути вперёд.
+    try lowerCondition(ctx, loop.condition, body_block, exit_block);
+    // `lowerCondition` всегда завершает СВОЙ последний блок `.branch` при
+    // нормальном пути — `ctx.builder.terminated` тут ВСЕГДА true (любой
+    // блок, который она трогает, кончается терминатором того или иного
+    // рода), так что им нельзя отличить "условие оборвалось" от "условие
+    // нормально дошло до ветвления". Не-`.branch` терминатор последнего
+    // блока (например `.unreachable_term` от паники внутри условия) —
+    // единственный надёжный признак обрыва.
+    if (ctx.builder.currentFunction().blockConst(ctx.builder.current_block_id).terminator != .branch) return .terminates;
 
     ctx.builder.setCurrentBlock(body_block);
     try ctx.loops.append(ctx.allocator, .{ .continue_target = header_block, .break_target = exit_block });
@@ -2148,6 +2340,7 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
             }
             if (try lowerEnumConstructor(ctx, symbol, call, result_type)) |outcome| return outcome;
             if (try lowerStructConstructor(ctx, expression, symbol, call, result_type)) |outcome| return outcome;
+            if (try lowerErrorConstructor(ctx, symbol, call, result_type)) |outcome| return outcome;
             if (try lowerLengthBuiltinCall(ctx, symbol, call, result_type)) |outcome| return outcome;
             if (try lowerPanicBuiltinCall(ctx, symbol, call)) |outcome| return outcome;
             if (try lowerProcessBuiltinCall(ctx, symbol, call, result_type)) |outcome| return outcome;
@@ -2234,6 +2427,7 @@ fn lowerCall(ctx: *LoweringContext, expression: ast.ExprId, call: anytype) anyer
         if (try lowerDomBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerStateBuiltinCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerArrayMethodCall(ctx, call, result_type)) |outcome| return outcome;
+        if (try lowerMapMethodCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerOptionMethodCall(ctx, call, result_type)) |outcome| return outcome;
         if (try lowerResultMethodCall(ctx, call, result_type)) |outcome| return outcome;
     }
@@ -2306,6 +2500,49 @@ fn lowerArrayMethodCall(ctx: *LoweringContext, call: anytype, result_type: types
         if (is_i32) "@runtime::array_append_i32" else "@runtime::array_append_f64"
     else if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 2)
         if (is_i32) "@runtime::array_get_or_i32" else "@runtime::array_get_or_f64"
+    else
+        return null;
+
+    const receiver = try lowerExpr(ctx, property.object);
+    if (receiver.flow == .terminates) return terminated;
+    var values: std.ArrayList(mir.ValueId) = .empty;
+    defer values.deinit(ctx.allocator);
+    try values.append(ctx.allocator, receiver.value);
+    for (call.arguments) |argument| {
+        const value = try lowerExpr(ctx, argument);
+        if (value.flow == .terminates) return terminated;
+        try values.append(ctx.allocator, value.value);
+    }
+    const is_void = ctx.checked.types.eql(result_type, ctx.checked.types.builtins.void);
+    const dst = if (is_void) null else try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .call_builtin = .{ .dst = dst, .name = name, .args = try valuesInArena(ctx, values.items) } });
+    return continuesWith(dst orelse mir.invalid_value);
+}
+
+// `.есть(key)`/`.получить(key, default)`/`.записи()`/`.длина()` на
+// `Соответствие` — тот же паттерн, что `lowerArrayMethodCall` выше.
+// Строго строковые ключи, тот же гейт, что `lowerMapLiteral`/
+// `lowerMapIndex`.
+fn lowerMapMethodCall(ctx: *LoweringContext, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const property = ctx.tree.expr(call.callee).property;
+    const object_type = ctx.checked.expression_types.get(property.object) orelse return null;
+    const entry = ctx.checked.types.get(object_type) orelse return null;
+    const kv = switch (entry.*) {
+        .map => |value| value,
+        else => return null,
+    };
+    if (!ctx.checked.types.eql(kv.key, ctx.checked.types.builtins.string)) {
+        return ctx.unsupported("Соответствие под AOT WASM поддерживает только строковые ключи");
+    }
+    const is_i32 = wasm_module.wasmValTypeForStore(&ctx.checked.types, kv.value) == wasm_module.wasm_i32;
+    const name = if (std.mem.eql(u8, property.property, "длина") and call.arguments.len == 0)
+        "@runtime::map_length"
+    else if (std.mem.eql(u8, property.property, "есть") and call.arguments.len == 1)
+        "@runtime::map_has"
+    else if (std.mem.eql(u8, property.property, "получить") and call.arguments.len == 2)
+        if (is_i32) "@runtime::map_get_or_i32" else "@runtime::map_get_or_f64"
+    else if (std.mem.eql(u8, property.property, "записи") and call.arguments.len == 0)
+        if (is_i32) "@runtime::map_entries_i32" else "@runtime::map_entries_f64"
     else
         return null;
 
@@ -2505,6 +2742,47 @@ fn lowerResultMethodCall(ctx: *LoweringContext, call: anytype, result_type: type
     return null;
 }
 
+// Кортеж `(a, b, c)` — та же runtime-форма, что именованная структура
+// (`.aggregate` с `name = null` в байткод-VM, `vm.zig` `buildAggregate`/
+// `buildStruct` оба сходятся в один и тот же случай) — переиспользует
+// `new_aggregate`/`@runtime::struct_new_*`/`get_property` целиком,
+// просто с пустым `type_name` (у кортежа нет имени и на уровне
+// байткод-VM тоже). Наследует уже существующий предел в 3 элемента у
+// `struct_new_*`-трамплинов (`wasm_emit.zig`), не новое ограничение
+// специально для кортежей.
+fn lowerTupleLiteral(ctx: *LoweringContext, expression: ast.ExprId, tuple: anytype) anyerror!ExprOutcome {
+    if (tuple.elements.len > 3) return ctx.unsupported("кортеж с более чем 3 элементами");
+    const args = try lowerCallArgs(ctx, tuple.elements) orelse return terminated;
+    const result_type = ctx.checked.expression_types.get(expression) orelse return ctx.unsupported("кортеж без типа");
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .new_aggregate = .{ .dst = dst, .type_name = "", .elements = args } });
+    return continuesWith(dst);
+}
+
+// `Ошибка(модуль, сообщение)` — единственный builtin-конструктор
+// значения (не тип, объявленный пользователем — `entry.kind == .builtin`,
+// `fieldsForNominalSymbol` для него пуст, `lowerStructConstructor` его
+// не подхватывает вообще). В байткод-VM компилируется в тот же
+// `build_struct` с именем "Ошибка", 2 поля (`compileErrorConstructor`,
+// `compiler.zig`) — тот же `.new_aggregate`, что и обычная структура.
+// Реальный, 100% воспроизводимый пробел: ЛЮБОЙ вызов `Ошибка(...)` (то
+// есть буквально любой `Результат.Неудача(...)`/`Опция.Есть(...)` с
+// осмысленной диагностикой) падал под AOT WASM — не задет ни одним
+// существующим тестом, потому что ни один из них раньше не заставлял
+// AOT-путь реально СКОНСТРУИРОВАТЬ Ошибку (только распространить уже
+// готовый `Результат`/панику) — вскрылось при первом реальном
+// использовании `std/кодирование/json.pns` под `--target=wasm`
+// (`json.разобрать`'s собственные error-пути).
+fn lowerErrorConstructor(ctx: *LoweringContext, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
+    const entry = ctx.resolution.symbols.get(symbol) orelse return null;
+    if (entry.kind != .builtin or !std.mem.eql(u8, entry.name, "Ошибка")) return null;
+    if (call.arguments.len != 2) return null;
+    const args = try lowerCallArgs(ctx, call.arguments) orelse return terminated;
+    const dst = try ctx.builder.newValue(result_type);
+    try ctx.builder.emit(.{ .new_aggregate = .{ .dst = dst, .type_name = "Ошибка", .elements = args } });
+    return continuesWith(dst);
+}
+
 fn lowerStructConstructor(ctx: *LoweringContext, expression: ast.ExprId, symbol: symbols.SymbolId, call: anytype, result_type: types.TypeId) anyerror!?ExprOutcome {
     const entry = ctx.resolution.symbols.get(symbol) orelse return null;
     if (entry.kind != .type) return null;
@@ -2630,6 +2908,14 @@ fn lowerStringBuiltinCall(ctx: *LoweringContext, call: anytype, result_type: typ
         "строки::из_числа"
     else if (std.mem.eql(u8, property.property, "в_число"))
         "строки::в_число"
+    else if (std.mem.eql(u8, property.property, "это_цифра"))
+        "строки::это_цифра"
+    else if (std.mem.eql(u8, property.property, "это_буква"))
+        "строки::это_буква"
+    else if (std.mem.eql(u8, property.property, "из_рун"))
+        "строки::из_рун"
+    else if (std.mem.eql(u8, property.property, "в_байты"))
+        "строки::в_байты"
     else
         return ctx.unsupported("строки.свойство вызов (неподдерживаемая строковая операция в AOT WASM)");
 

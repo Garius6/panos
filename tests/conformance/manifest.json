@@ -88,6 +88,18 @@
       }
     },
     {
+      "id": "runtime-defer-lifo",
+      "tier": "runtime",
+      "profile": "native",
+      "input": "tests/conformance/defer_lifo.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "7213",
+        "result": "7213"
+      }
+    },
+    {
       "id": "native-file-roundtrip",
       "tier": "native",
       "profile": "native",
@@ -153,6 +165,18 @@
           "id": "DEV-004",
           "rationale": "This tier exercises the SEPARATE MIR->WASM AOT pipeline (panos build --target=wasm, T043/T048), not the bytecode VM the `runtime` tier above uses — same source, same result, but a genuinely different execution path (no Odin equivalent exists to compare against: Odin never built a MIR-based AOT backend for this migration, see docs/src/architecture/toolchain-and-testing.md's MIR/WASM section). `stdout` here is the raw `wasmtime run --invoke старт` process output (includes wasmtime's own trailing newline), not the bytecode VM CLI's rendered value — the two tiers are not byte-for-byte comparable outcomes, only value-equal."
         }
+      }
+    },
+    {
+      "id": "aot-defer-lifo",
+      "tier": "aot",
+      "profile": "aot_wasi",
+      "input": "tests/conformance/defer_lifo.pns",
+      "expected": {
+        "status": "success",
+        "exit_code": 0,
+        "stdout": "7213\n",
+        "result": "7213"
       }
     },
     {

@@ -1910,6 +1910,7 @@ const Checker = struct {
     fn stmtAlwaysDiverges(self: *const Checker, statement: ast.StmtId) bool {
         return switch (self.tree.stmt(statement).*) {
             .return_stmt => true,
+            .defer_stmt => false,
             .expr => |value| self.exprAlwaysDiverges(value.value),
             else => false,
         };
@@ -1962,6 +1963,7 @@ const Checker = struct {
     fn stmtSpan(self: *const Checker, statement: ast.StmtId) source.Span {
         return switch (self.tree.stmt(statement).*) {
             .return_stmt => |value| value.span,
+            .defer_stmt => |value| value.span,
             .let => |value| value.span,
             .expr => |value| value.span,
             .continue_stmt => |span| span,
@@ -2051,6 +2053,16 @@ const Checker = struct {
                 // сработать только если здесь возвращается `Никогда`, а
                 // не `expected_return`.
                 break :blk self.result.types.builtins.never;
+            },
+            .defer_stmt => |defer_statement| blk: {
+                if (self.tree.expr(defer_statement.value).* != .call) {
+                    try self.report(defer_statement.span, "Type Error: 'отложить' ожидает вызов функции или метода", .{});
+                }
+                const value_type = try self.inferExpected(defer_statement.value, self.result.types.builtins.void);
+                if (!self.assignable(value_type, self.result.types.builtins.void)) {
+                    try self.report(defer_statement.span, "Type Error: отложенный вызов должен возвращать Пусто", .{});
+                }
+                break :blk self.result.types.builtins.void;
             },
             .expr => |expression| if (expected_value) |expected| blk: {
                 const actual = try self.inferExpected(expression.value, expected);
@@ -4465,6 +4477,36 @@ const Checker = struct {
                 }
                 if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.integer), self.result.types.builtins.integer)) {
                     try self.report(call.span, "Type Error: криптография.случайные_байты_base64url() ожидает количество байт типа Целое", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            // TOTP (RFC 6238) — целиком инкапсулированный алгоритм, не
+            // отдельный голый hmac_sha1: сырые байты секрета никогда не
+            // покидают native-код (base64url_декодировать выше явно
+            // отклоняет НЕ-UTF8 результат — случайный секрет почти
+            // никогда валидный UTF-8, значит Строка в принципе не может
+            // безопасно нести сырые байты HMAC-ключа панос-стороной).
+            if (self.isBuiltinModule(symbol, "криптография", "totp_секрет")) {
+                for (call.arguments) |argument| _ = try self.infer(argument);
+                if (call.arguments.len != 0) {
+                    try self.report(call.span, "Type Error: криптография.totp_секрет() не принимает аргументы", .{});
+                }
+                return self.result.types.builtins.string;
+            }
+            if (self.isBuiltinModule(symbol, "криптография", "totp_код")) {
+                if (call.arguments.len != 3) {
+                    try self.report(call.span, "Type Error: криптография.totp_код() ожидает 3 аргумента", .{});
+                    for (call.arguments) |argument| _ = try self.infer(argument);
+                    return self.result.types.builtins.string;
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[0], self.result.types.builtins.string), self.result.types.builtins.string)) {
+                    try self.report(call.span, "Type Error: криптография.totp_код() ожидает base32-секрет типа Строка первым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[1], self.result.types.builtins.number), self.result.types.builtins.number)) {
+                    try self.report(call.span, "Type Error: криптография.totp_код() ожидает время (секунды) типа Число вторым аргументом", .{});
+                }
+                if (!self.assignable(try self.inferExpected(call.arguments[2], self.result.types.builtins.number), self.result.types.builtins.number)) {
+                    try self.report(call.span, "Type Error: криптография.totp_код() ожидает шаг (секунды) типа Число третьим аргументом", .{});
                 }
                 return self.result.types.builtins.string;
             }

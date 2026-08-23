@@ -291,6 +291,10 @@ pub const Stmt = union(enum) {
         // например ранний выход из функции, возвращающей `Пусто`).
         value: ?ExprId,
     },
+    defer_stmt: struct {
+        span: source.Span,
+        value: ExprId,
+    },
     let: struct {
         span: source.Span,
         name: ?[]const u8 = null,

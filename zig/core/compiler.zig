@@ -297,6 +297,7 @@ const Compiler = struct {
         }
         for (body[0 .. body.len - 1]) |statement| _ = try context.compileStatement(statement, false);
         const leaves_value = try context.compileStatement(body[body.len - 1], compiled.returns_value);
+        try context.emitDeferredFrom(0);
         if (compiled.returns_value and leaves_value) {
             try compiled.emit(self.result.allocator, .{ .return_value = {} });
         } else {
@@ -309,6 +310,7 @@ const Compiler = struct {
 const LoopContext = struct {
     break_fixups: std.ArrayList(usize) = .empty,
     continue_fixups: std.ArrayList(usize) = .empty,
+    defer_base: usize,
 
     fn deinit(self: *LoopContext, allocator: std.mem.Allocator) void {
         self.continue_fixups.deinit(allocator);
@@ -322,6 +324,7 @@ const FunctionCompiler = struct {
     function: *bytecode.Function,
     locals: std.AutoHashMap(symbols.SymbolId, u16),
     loops: std.ArrayList(LoopContext) = .empty,
+    deferred: std.ArrayList(ast.ExprId) = .empty,
     next_local: u16 = 0,
 
     fn init(compiler: *Compiler, function: *bytecode.Function) FunctionCompiler {
@@ -335,6 +338,7 @@ const FunctionCompiler = struct {
     fn deinit(self: *FunctionCompiler) void {
         for (self.loops.items) |*loop| loop.deinit(self.compiler.result.allocator);
         self.loops.deinit(self.compiler.result.allocator);
+        self.deferred.deinit(self.compiler.result.allocator);
         self.locals.deinit();
         self.* = undefined;
     }
@@ -395,15 +399,25 @@ const FunctionCompiler = struct {
             },
             .return_stmt => |return_statement| blk: {
                 const return_value = return_statement.value orelse {
+                    try self.emitDeferredFrom(0);
                     try self.function.emit(self.compiler.result.allocator, .{ .return_void = {} });
                     break :blk false;
                 };
                 try self.compileExpression(return_value);
+                try self.emitDeferredFrom(0);
                 if (self.function.returns_value) {
                     try self.function.emit(self.compiler.result.allocator, .{ .return_value = {} });
                 } else {
                     try self.function.emit(self.compiler.result.allocator, .{ .pop = {} });
                     try self.function.emit(self.compiler.result.allocator, .{ .return_void = {} });
+                }
+                break :blk false;
+            },
+            .defer_stmt => |defer_statement| blk: {
+                try self.deferred.append(self.compiler.result.allocator, defer_statement.value);
+                if (keep_value) {
+                    try self.emitVoid();
+                    break :blk true;
                 }
                 break :blk false;
             },
@@ -572,6 +586,7 @@ const FunctionCompiler = struct {
         try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
         self.patchJump(return_jump, self.function.instructions.items.len);
         try self.function.emit(self.compiler.result.allocator, .{ .get_local = object_slot });
+        try self.emitDeferredFrom(0);
         try self.function.emit(self.compiler.result.allocator, .{ .return_value = {} });
         self.patchJump(end_jump, self.function.instructions.items.len);
     }
@@ -1206,6 +1221,15 @@ const FunctionCompiler = struct {
         if (call.arguments.len == 4 and std.mem.eql(u8, property.property, "es256_проверить")) {
             for (call.arguments) |argument| try self.compileExpression(argument);
             try self.function.emit(self.compiler.result.allocator, .{ .crypto_es256_verify = {} });
+            return true;
+        }
+        if (call.arguments.len == 0 and std.mem.eql(u8, property.property, "totp_секрет")) {
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_totp_secret = {} });
+            return true;
+        }
+        if (call.arguments.len == 3 and std.mem.eql(u8, property.property, "totp_код")) {
+            for (call.arguments) |argument| try self.compileExpression(argument);
+            try self.function.emit(self.compiler.result.allocator, .{ .crypto_totp_code = {} });
             return true;
         }
         return false;
@@ -2060,16 +2084,38 @@ const FunctionCompiler = struct {
     }
 
     fn compileBlockValue(self: *FunctionCompiler, statements: []const ast.StmtId) !void {
+        const defer_base = self.deferred.items.len;
+        defer self.deferred.shrinkRetainingCapacity(defer_base);
         if (statements.len == 0) {
             try self.emitVoid();
             return;
         }
         for (statements[0 .. statements.len - 1]) |statement| _ = try self.compileStatement(statement, false);
         if (!try self.compileStatement(statements[statements.len - 1], true)) try self.emitVoid();
+        try self.emitDeferredFrom(defer_base);
     }
 
     fn compileBlockStatements(self: *FunctionCompiler, statements: []const ast.StmtId) !void {
+        const defer_base = self.deferred.items.len;
+        defer self.deferred.shrinkRetainingCapacity(defer_base);
         for (statements) |statement| _ = try self.compileStatement(statement, false);
+        try self.emitDeferredFrom(defer_base);
+    }
+
+    fn emitDeferredFrom(self: *FunctionCompiler, defer_base: usize) !void {
+        const saved_len = self.deferred.items.len;
+        var index = saved_len;
+        while (index > defer_base) {
+            index -= 1;
+            const expression = self.deferred.items[index];
+            // Если внутри отложенного вызова сработает `?`, он должен
+            // выполнить только более ранние cleanup, а не рекурсивно
+            // зарегистрировать тот же вызов ещё раз.
+            self.deferred.items.len = index;
+            try self.compileExpression(expression);
+            try self.function.emit(self.compiler.result.allocator, .{ .pop = {} });
+            self.deferred.items.len = saved_len;
+        }
     }
 
     fn compilePatternBindings(self: *FunctionCompiler, pattern: ast.PatternId, value_slot: u16) !void {
@@ -2194,7 +2240,7 @@ const FunctionCompiler = struct {
     }
 
     fn enterLoop(self: *FunctionCompiler) !void {
-        try self.loops.append(self.compiler.result.allocator, .{});
+        try self.loops.append(self.compiler.result.allocator, .{ .defer_base = self.deferred.items.len });
     }
 
     fn leaveLoop(self: *FunctionCompiler, continue_target: usize, break_target: usize) void {
@@ -2209,9 +2255,11 @@ const FunctionCompiler = struct {
             try self.compiler.report(span, "Compiler Error: управление циклом использовано вне цикла", .{});
             return;
         }
+        const loop_index = self.loops.items.len - 1;
+        try self.emitDeferredFrom(self.loops.items[loop_index].defer_base);
         const jump = self.function.instructions.items.len;
         try self.function.emit(self.compiler.result.allocator, .{ .jump = 0 });
-        const loop = &self.loops.items[self.loops.items.len - 1];
+        const loop = &self.loops.items[loop_index];
         if (is_continue) {
             try loop.continue_fixups.append(self.compiler.result.allocator, jump);
         } else {

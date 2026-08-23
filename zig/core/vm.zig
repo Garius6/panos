@@ -1759,6 +1759,8 @@ pub const Vm = struct {
             .crypto_es256_generate_keys => try self.cryptoEs256GenerateKeys(),
             .crypto_es256_sign => try self.cryptoEs256Sign(),
             .crypto_es256_verify => try self.cryptoEs256Verify(),
+            .crypto_totp_secret => try self.cryptoTotpSecret(),
+            .crypto_totp_code => try self.cryptoTotpCode(),
             .http_request_respond_headers => try self.httpRequestRespondHeaders(),
             .http_listen => try self.httpListen(),
             .http_accept_submit => try self.httpAcceptSubmit(),
@@ -2256,7 +2258,7 @@ pub const Vm = struct {
     }
 
     fn osVersion(self: *Vm) anyerror!void {
-        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, "0.4.0"));
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, "0.5.0"));
         try self.stack.append(self.allocator, .{ .heap_string = heap_string });
     }
 
@@ -4517,6 +4519,147 @@ pub const Vm = struct {
             return;
         };
         try self.stack.append(self.allocator, .{ .boolean = true });
+    }
+
+    const base32_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+    // RFC 4648 base32, без паддинга — единственная кодировка, которую
+    // otpauth://-QR и большинство TOTP-приложений принимают в поле
+    // `secret=` (base64url там не годится). Возвращаемая Строка — чистый
+    // ASCII, безопасна как обычный панос-текст (в отличие от сырых байт
+    // секрета, которые Строка вообще не может держать — см.
+    // cryptoBase64UrlDecode's UTF-8-guard).
+    fn base32Encode(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+        const out_len = (raw.len * 8 + 4) / 5;
+        const out = try allocator.alloc(u8, out_len);
+        var bit_buffer: u32 = 0;
+        var bits_in_buffer: u5 = 0;
+        var out_index: usize = 0;
+        for (raw) |byte| {
+            bit_buffer = (bit_buffer << 8) | byte;
+            bits_in_buffer += 8;
+            while (bits_in_buffer >= 5) {
+                bits_in_buffer -= 5;
+                const index: u5 = @truncate((bit_buffer >> bits_in_buffer) & 0x1f);
+                out[out_index] = base32_alphabet[index];
+                out_index += 1;
+            }
+        }
+        if (bits_in_buffer > 0) {
+            const index: u5 = @truncate((bit_buffer << (5 - bits_in_buffer)) & 0x1f);
+            out[out_index] = base32_alphabet[index];
+            out_index += 1;
+        }
+        return out;
+    }
+
+    fn base32DecodeValue(c: u8) ?u5 {
+        if (c >= 'A' and c <= 'Z') return @truncate(c - 'A');
+        if (c >= 'a' and c <= 'z') return @truncate(c - 'a');
+        if (c >= '2' and c <= '7') return @truncate(c - '2' + 26);
+        return null;
+    }
+
+    fn base32Decode(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        const out = try allocator.alloc(u8, (text.len * 5) / 8 + 1);
+        var bit_buffer: u32 = 0;
+        var bits_in_buffer: u6 = 0;
+        var out_index: usize = 0;
+        for (text) |c| {
+            const value5 = base32DecodeValue(c) orelse continue;
+            bit_buffer = (bit_buffer << 5) | value5;
+            bits_in_buffer += 5;
+            if (bits_in_buffer >= 8) {
+                bits_in_buffer -= 8;
+                const shift_amount: u5 = @truncate(bits_in_buffer);
+                out[out_index] = @truncate((bit_buffer >> shift_amount) & 0xff);
+                out_index += 1;
+            }
+        }
+        // `allocator.free` requires the freed slice's length to match the
+        // original allocation exactly (DebugAllocator asserts this) — the
+        // upper-bound `(text.len*5)/8 + 1` allocation is rarely exactly
+        // out_index long, so shrink via realloc instead of just slicing.
+        return allocator.realloc(out, out_index);
+    }
+
+    // TOTP (RFC 6238) секрет — 20 случайных байт (160 бит, стандартный
+    // размер для TOTP), НИКОГДА не покидающих native-код как сырые
+    // байты — сразу base32 для хранения/отображения (см. doc-комментарий
+    // у base32Encode).
+    fn cryptoTotpSecret(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("криптография::totp_секрет", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "криптография::totp_секрет", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'криптография::totp_секрет' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        var raw: [20]u8 = undefined;
+        var io = std.Io.Threaded.init(self.allocator, .{});
+        defer io.deinit();
+        io.io().random(&raw);
+        const encoded = try base32Encode(self.allocator, &raw);
+        defer self.allocator.free(encoded);
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, encoded));
+        try self.stack.append(self.allocator, .{ .heap_string = heap_string });
+    }
+
+    // RFC 4226 (HOTP) + RFC 6238 (TOTP) — счётчик = floor(время_с/шаг_с)
+    // как 8-байтный big-endian, HMAC-SHA1 (НЕ SHA256 — Google
+    // Authenticator и большинство приложений игнорируют algorithm= в
+    // otpauth:// и ВСЕГДА считают по SHA1, см. план фичи), dynamic
+    // truncation, 6-значный десятичный код с ведущими нулями.
+    fn cryptoTotpCode(self: *Vm) anyerror!void {
+        target_policy.ensureRuntimeBuiltinAvailable("криптография::totp_код", self.target_profile) catch {
+            const message = try target_policy.runtimeErrorMessage(self.allocator, "криптография::totp_код", self.target_profile);
+            defer self.allocator.free(message);
+            try self.fault("{s}", .{message});
+            return;
+        };
+        const step_seconds = try self.number(try self.pop());
+        const time_seconds = try self.number(try self.pop());
+        const secret_b32 = (try self.pop()).stringBytes() orelse {
+            try self.fault("Runtime Error: криптография.totp_код() ожидает base32-секрет типа Строка первым аргументом", .{});
+            return;
+        };
+        if (comptime builtin.target.os.tag == .freestanding) {
+            try self.fault("Runtime Panic: 'криптография::totp_код' недоступно в этом runtime-таргете", .{});
+            return;
+        }
+        if (!std.math.isFinite(step_seconds) or step_seconds < 1) {
+            try self.fault("Runtime Error: криптография.totp_код() ожидает шаг >= 1 секунды", .{});
+            return;
+        }
+        const counter: u64 = @intFromFloat(@floor(time_seconds / step_seconds));
+        const secret_raw = try base32Decode(self.allocator, secret_b32);
+        defer self.allocator.free(secret_raw);
+        const code_text = try hotpCodeFromRawSecret(self.allocator, secret_raw, counter);
+        defer self.allocator.free(code_text);
+        const heap_string = try self.heap.createString(try self.allocator.dupe(u8, code_text));
+        try self.stack.append(self.allocator, .{ .heap_string = heap_string });
+    }
+
+    // RFC 4226 §5.3 — вынесено отдельной чистой функцией от cryptoTotpCode
+    // именно ради прямого юнит-теста на известном RFC 6238 Appendix B
+    // тест-векторе, без разворачивания полного VM-стека.
+    fn hotpCodeFromRawSecret(allocator: std.mem.Allocator, secret_raw: []const u8, counter: u64) ![]u8 {
+        var counter_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &counter_bytes, counter, .big);
+
+        var digest: [std.crypto.auth.hmac.HmacSha1.mac_length]u8 = undefined;
+        std.crypto.auth.hmac.HmacSha1.create(&digest, &counter_bytes, secret_raw);
+
+        const offset: usize = digest[digest.len - 1] & 0x0f;
+        const binary: u32 = (@as(u32, digest[offset] & 0x7f) << 24) |
+            (@as(u32, digest[offset + 1]) << 16) |
+            (@as(u32, digest[offset + 2]) << 8) |
+            @as(u32, digest[offset + 3]);
+        const code = binary % 1000000;
+        return std.fmt.allocPrint(allocator, "{d:0>6}", .{code});
     }
 
     fn callForeign(self: *Vm, compiled: *const bytecode.Function, constant_index: u16, argument_count: u16) anyerror!void {
@@ -10129,4 +10272,28 @@ test "VM for-in still dispatches следующий() after Итерируемо
         },
         .runtime_error => return error.TestUnexpectedResult,
     }
+}
+
+test "TOTP hotpCodeFromRawSecret matches RFC 6238 Appendix B test vector (SHA1, T=59)" {
+    // RFC 6238 Appendix B: secret = ASCII "12345678901234567890" (20
+    // bytes, used directly as the raw HMAC key — the RFC's own SHA1
+    // vector), T=59s, X=30s -> counter=1, TOTP(8 digits) = "94287082".
+    // Мы усекаем до 6 цифр (binary % 1_000_000), что равно последним 6
+    // цифрам того же результата — "287082".
+    const secret = "12345678901234567890";
+    const code = try Vm.hotpCodeFromRawSecret(std.testing.allocator, secret, 1);
+    defer std.testing.allocator.free(code);
+    try std.testing.expectEqualStrings("287082", code);
+}
+
+test "TOTP base32Encode/base32Decode round-trip arbitrary raw bytes" {
+    const raw = [_]u8{ 0x00, 0x01, 0xff, 0x7a, 0x9c, 0x3e, 0x11, 0x88, 0x22, 0xab };
+    const encoded = try Vm.base32Encode(std.testing.allocator, &raw);
+    defer std.testing.allocator.free(encoded);
+    for (encoded) |c| {
+        try std.testing.expect((c >= 'A' and c <= 'Z') or (c >= '2' and c <= '7'));
+    }
+    const decoded = try Vm.base32Decode(std.testing.allocator, encoded);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, &raw, decoded);
 }

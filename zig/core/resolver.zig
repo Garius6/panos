@@ -70,7 +70,7 @@ pub fn nativeModuleExports(name: []const u8) ?[]const []const u8 {
         .{ .name = "синтаксис", .exports = &.{ "структуры", "поля", "импорты", "аннотации", "аргумент_аннотации", "аннотации_поля", "аргумент_аннотации_поля" } },
         .{ .name = "сеть", .exports = &.{ "подключиться", "кодировать_url", "декодировать_url", "http_запрос", "http_запрос_без_редиректа", "http_запрос_sync", "http_запрос_sync_с_заголовками", "http_сервер_слушать" } },
         .{ .name = "бд", .exports = &.{"открыть"} },
-        .{ .name = "криптография", .exports = &.{ "hmac_sha256_base64url", "base64url_кодировать", "base64url_декодировать", "сравнить_константное_время", "sha256_base64url", "pbkdf2_sha256_base64url", "случайные_байты_base64url", "es256_сгенерировать_ключи", "es256_подписать", "es256_проверить" } },
+        .{ .name = "криптография", .exports = &.{ "hmac_sha256_base64url", "base64url_кодировать", "base64url_декодировать", "сравнить_константное_время", "sha256_base64url", "pbkdf2_sha256_base64url", "случайные_байты_base64url", "es256_сгенерировать_ключи", "es256_подписать", "es256_проверить", "totp_секрет", "totp_код" } },
     };
     for (table) |entry| {
         if (std.mem.eql(u8, entry.name, name)) return entry.exports;
@@ -529,7 +529,7 @@ const Resolver = struct {
         // через байткод-VM, у AOT WASM-кодогенерации (`wasm_emit.zig`)
         // нет своего пути для них — тот же практический предел, что и у
         // `сеть`/`бд` (быстряга/HTTP-сервер всё равно недоступны в WASM).
-        try self.installBuiltinModule("криптография", &.{ "hmac_sha256_base64url", "base64url_кодировать", "base64url_декодировать", "сравнить_константное_время", "sha256_base64url", "pbkdf2_sha256_base64url", "случайные_байты_base64url", "es256_сгенерировать_ключи", "es256_подписать", "es256_проверить" });
+        try self.installBuiltinModule("криптография", &.{ "hmac_sha256_base64url", "base64url_кодировать", "base64url_декодировать", "сравнить_константное_время", "sha256_base64url", "pbkdf2_sha256_base64url", "случайные_байты_base64url", "es256_сгенерировать_ключи", "es256_подписать", "es256_проверить", "totp_секрет", "totp_код" });
         if (skip_prelude_hardcode) return;
         try self.installPreludeEnum("Опция", &.{ "Нет", "Есть" });
         try self.installPreludeEnum("Результат", &.{ "Успех", "Неудача" });
@@ -1130,6 +1130,7 @@ const Resolver = struct {
                 if (bindings.items.len != 0) try self.result.stmt_bindings.put(statement, try self.result.arena.allocator().dupe(symbols.SymbolId, bindings.items));
             },
             .return_stmt => |return_stmt| if (return_stmt.value) |return_value| try self.resolveExpression(self.tree, return_value),
+            .defer_stmt => |defer_stmt| try self.resolveExpression(self.tree, defer_stmt.value),
             .expr => |expression| try self.resolveExpression(self.tree, expression.value),
             .for_in => |loop| {
                 try self.resolveExpression(self.tree, loop.iterable);

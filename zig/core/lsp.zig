@@ -311,6 +311,7 @@ fn collectDeclarationFolds(tree: *const ast.Ast, declaration: ast.DeclId, result
 fn collectStatementFolds(tree: *const ast.Ast, statements: []const ast.StmtId, result: *FoldingRanges) FoldingError!void {
     for (statements) |statement| switch (tree.stmt(statement).*) {
         .return_stmt => |value| if (value.value) |expr| try collectExpressionFolds(tree, expr, result),
+        .defer_stmt => |value| try collectExpressionFolds(tree, value.value, result),
         .let => |value| try collectExpressionFolds(tree, value.value, result),
         .expr => |value| try collectExpressionFolds(tree, value.value, result),
         .for_in => |value| {

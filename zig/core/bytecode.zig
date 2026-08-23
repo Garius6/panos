@@ -191,6 +191,8 @@ pub const Opcode = enum {
     crypto_es256_generate_keys,
     crypto_es256_sign,
     crypto_es256_verify,
+    crypto_totp_secret,
+    crypto_totp_code,
     // Неблокирующий I/O: submit-опкоды кладут задачу в воркер-пул и
     // возвращают управление сразу (не блокируют) — компилятор ВСЕГДА
     // эмитит await_async сразу после (compiler.zig, compileFilesystemBuiltin).
@@ -391,6 +393,8 @@ pub const Instruction = union(Opcode) {
     crypto_es256_generate_keys: void,
     crypto_es256_sign: void,
     crypto_es256_verify: void,
+    crypto_totp_secret: void,
+    crypto_totp_code: void,
     file_read_submit: void,
     file_write_submit: void,
     net_connect_submit: void,

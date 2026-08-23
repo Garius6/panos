@@ -49,6 +49,7 @@ const terminated: ExprOutcome = .{ .value = mir.invalid_value, .flow = .terminat
 const LoopTargets = struct {
     continue_target: mir.BlockId,
     break_target: mir.BlockId,
+    defer_base: usize,
 };
 
 // Одна попытка понижения останавливается на первой неподдержанной
@@ -104,6 +105,7 @@ const LoweringContext = struct {
     closure_origins: std.AutoHashMap(symbols.SymbolId, ast.ExprId),
     diagnostic: *AotDiagnostic,
     loops: std.ArrayList(LoopTargets) = .empty,
+    deferred: std.ArrayList(ast.ExprId) = .empty,
     capture_env: ?CaptureEnv = null,
 
     fn unsupported(self: *LoweringContext, comptime what: []const u8) error{AotUnsupported} {
@@ -113,6 +115,7 @@ const LoweringContext = struct {
 
     fn deinit(self: *LoweringContext) void {
         self.loops.deinit(self.allocator);
+        self.deferred.deinit(self.allocator);
         self.closure_origins.deinit();
         self.symbol_to_local.deinit();
         if (self.capture_env) |*env| env.deinit();
@@ -631,6 +634,7 @@ fn walkStmts(
     for (statements) |statement| {
         switch (tree.stmt(statement).*) {
             .return_stmt => |v| if (v.value) |value| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, value),
+            .defer_stmt => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.value),
             .let => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.value),
             .expr => |v| try walkExpr(allocator, compiled, tree, resolution, checked, set, worklist, mixed, module_index, v.value),
             .for_in => |v| {
@@ -723,6 +727,7 @@ fn scanDomHandlerRootsInStmts(
     for (statements) |statement| {
         switch (tree.stmt(statement).*) {
             .return_stmt => |v| if (v.value) |value| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, value),
+            .defer_stmt => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.value),
             .let => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.value),
             .expr => |v| try scanDomHandlerRootsInExpr(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.value),
             .for_in => |v| try scanDomHandlerRootsInStmts(allocator, graph, compiled, tree, set, worklist, handler_names, module_index, v.body),
@@ -1137,6 +1142,8 @@ fn lowerFunctionBody(
 // более ранние операторы существуют только ради побочного эффекта.
 // Пустой блок в контексте значения — заглушка 0.0.
 fn lowerBlock(ctx: *LoweringContext, statements: []const ast.StmtId, want_value: bool) anyerror!ExprOutcome {
+    const defer_base = ctx.deferred.items.len;
+    defer ctx.deferred.shrinkRetainingCapacity(defer_base);
     if (statements.len == 0) {
         if (!want_value) return continuesWith(mir.invalid_value);
         return continuesWith(try emitConstNumber(ctx, 0));
@@ -1149,10 +1156,13 @@ fn lowerBlock(ctx: *LoweringContext, statements: []const ast.StmtId, want_value:
                 else => {
                     const flow = try lowerStmt(ctx, statement);
                     if (flow == .terminates) return terminated;
+                    if (try lowerDeferredFrom(ctx, defer_base) == .terminates) return terminated;
                     return continuesWith(try emitConstNumber(ctx, 0));
                 },
             };
-            return lowerExpr(ctx, expression);
+            const outcome = try lowerExpr(ctx, expression);
+            if (outcome.flow == .terminates) return terminated;
+            return preserveValueAcrossDeferred(ctx, outcome.value, defer_base);
         }
         const flow = try lowerStmt(ctx, statement);
         if (flow == .terminates) return terminated;
@@ -1161,7 +1171,35 @@ fn lowerBlock(ctx: *LoweringContext, statements: []const ast.StmtId, want_value:
     // контексте, требующем значение, всегда возвращается изнутри цикла
     // выше (либо через путь извлечённого выражения, либо через ранний
     // возврат для последнего statement, не являющегося выражением).
+    if (try lowerDeferredFrom(ctx, defer_base) == .terminates) return terminated;
     return continuesWith(mir.invalid_value);
+}
+
+fn lowerDeferredFrom(ctx: *LoweringContext, defer_base: usize) anyerror!FlowResult {
+    const saved_len = ctx.deferred.items.len;
+    var index = saved_len;
+    while (index > defer_base) {
+        index -= 1;
+        const expression = ctx.deferred.items[index];
+        const outcome = blk: {
+            ctx.deferred.items.len = index;
+            defer ctx.deferred.items.len = saved_len;
+            break :blk try lowerExpr(ctx, expression);
+        };
+        if (outcome.flow == .terminates) return .terminates;
+    }
+    return .continues;
+}
+
+fn preserveValueAcrossDeferred(ctx: *LoweringContext, value: mir.ValueId, defer_base: usize) anyerror!ExprOutcome {
+    if (ctx.deferred.items.len == defer_base) return continuesWith(value);
+    const value_type = ctx.builder.currentFunction().valueType(value);
+    const local = try ctx.builder.newLocal(symbols.invalid_symbol, "$defer_result", value_type);
+    try ctx.builder.emit(.{ .store_local = .{ .local = local, .src = value } });
+    if (try lowerDeferredFrom(ctx, defer_base) == .terminates) return terminated;
+    const restored = try ctx.builder.newValue(value_type);
+    try ctx.builder.emit(.{ .load_local = .{ .dst = restored, .local = local } });
+    return continuesWith(restored);
 }
 
 fn emitConstNumber(ctx: *LoweringContext, value: f64) !mir.ValueId {
@@ -1191,13 +1229,20 @@ fn lowerStmt(ctx: *LoweringContext, statement: ast.StmtId) anyerror!FlowResult {
         },
         .return_stmt => |return_statement| {
             const return_value = return_statement.value orelse {
+                if (try lowerDeferredFrom(ctx, 0) == .terminates) return .terminates;
                 ctx.builder.terminate(.{ .return_value = .{ .value = null } });
                 return .terminates;
             };
             const outcome = try lowerExpr(ctx, return_value);
             if (outcome.flow == .terminates) return .terminates;
-            ctx.builder.terminate(.{ .return_value = .{ .value = outcome.value } });
+            const preserved = try preserveValueAcrossDeferred(ctx, outcome.value, 0);
+            if (preserved.flow == .terminates) return .terminates;
+            ctx.builder.terminate(.{ .return_value = .{ .value = preserved.value } });
             return .terminates;
+        },
+        .defer_stmt => |defer_statement| {
+            try ctx.deferred.append(ctx.allocator, defer_statement.value);
+            return .continues;
         },
         .expr => |expr_statement| {
             // `если` как голый statement: lowerIfExpr при вызове из
@@ -1222,13 +1267,17 @@ fn lowerStmt(ctx: *LoweringContext, statement: ast.StmtId) anyerror!FlowResult {
         .for_in => |loop| return lowerForIn(ctx, statement, loop),
         .continue_stmt => {
             if (ctx.loops.items.len == 0) return ctx.unsupported("продолжить вне цикла");
-            const target = ctx.loops.items[ctx.loops.items.len - 1].continue_target;
+            const loop = ctx.loops.items[ctx.loops.items.len - 1];
+            if (try lowerDeferredFrom(ctx, loop.defer_base) == .terminates) return .terminates;
+            const target = loop.continue_target;
             ctx.builder.terminate(.{ .jump = .{ .target = target } });
             return .terminates;
         },
         .break_stmt => {
             if (ctx.loops.items.len == 0) return ctx.unsupported("прервать вне цикла");
-            const target = ctx.loops.items[ctx.loops.items.len - 1].break_target;
+            const loop = ctx.loops.items[ctx.loops.items.len - 1];
+            if (try lowerDeferredFrom(ctx, loop.defer_base) == .terminates) return .terminates;
+            const target = loop.break_target;
             ctx.builder.terminate(.{ .jump = .{ .target = target } });
             return .terminates;
         },
@@ -1262,7 +1311,7 @@ fn lowerForRange(ctx: *LoweringContext, statement: ast.StmtId, range: anytype) a
     const cond = try emitCompare(ctx, .less_equal, index_value, end_value);
     ctx.builder.terminate(.{ .branch = .{ .cond = cond, .then_block = body, .else_block = exit } });
     ctx.builder.setCurrentBlock(body);
-    try ctx.loops.append(ctx.allocator, .{ .continue_target = step, .break_target = exit });
+    try ctx.loops.append(ctx.allocator, .{ .continue_target = step, .break_target = exit, .defer_base = ctx.deferred.items.len });
     const body_outcome = try lowerBlock(ctx, range.body, false);
     _ = ctx.loops.pop();
     if (body_outcome.flow == .continues) ctx.builder.terminate(.{ .jump = .{ .target = step } });
@@ -1344,7 +1393,7 @@ fn lowerForIn(ctx: *LoweringContext, statement: ast.StmtId, loop: anytype) anyer
     const element = try ctx.builder.newValue(element_type);
     try ctx.builder.emit(.{ .get_index = .{ .dst = element, .object = array_for_index, .index = index_for_get } });
     try ctx.builder.emit(.{ .store_local = .{ .local = element_local, .src = element } });
-    try ctx.loops.append(ctx.allocator, .{ .continue_target = step, .break_target = exit });
+    try ctx.loops.append(ctx.allocator, .{ .continue_target = step, .break_target = exit, .defer_base = ctx.deferred.items.len });
     const body_outcome = try lowerBlock(ctx, loop.body, false);
     _ = ctx.loops.pop();
     if (body_outcome.flow == .continues) ctx.builder.terminate(.{ .jump = .{ .target = step } });
@@ -2334,7 +2383,7 @@ fn lowerWhile(ctx: *LoweringContext, loop: anytype) anyerror!FlowResult {
     if (ctx.builder.currentFunction().blockConst(ctx.builder.current_block_id).terminator != .branch) return .terminates;
 
     ctx.builder.setCurrentBlock(body_block);
-    try ctx.loops.append(ctx.allocator, .{ .continue_target = header_block, .break_target = exit_block });
+    try ctx.loops.append(ctx.allocator, .{ .continue_target = header_block, .break_target = exit_block, .defer_base = ctx.deferred.items.len });
     const body_outcome = try lowerBlock(ctx, loop.body, false);
     _ = ctx.loops.pop();
     if (body_outcome.flow == .continues) {

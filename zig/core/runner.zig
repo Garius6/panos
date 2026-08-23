@@ -413,6 +413,112 @@ test "runner executes an exported start function" {
     }
 }
 
+test "runner executes deferred calls in LIFO order before return" {
+    const source_text =
+        \\функ добавить(значения: Массив(Целое), значение: Целое) -> Пусто
+        \\    значения.добавить(значение)
+        \\конец
+        \\функ вычислить(значения: Массив(Целое)) -> Целое
+        \\    отложить добавить(значения, 1)
+        \\    отложить добавить(значения, 2)
+        \\    возврат 7
+        \\конец
+        \\функ обычный_блок(значения: Массив(Целое)) -> Пусто
+        \\    если истина тогда
+        \\        отложить добавить(значения, 3)
+        \\    конец
+        \\конец
+        \\экспорт функ старт() -> Целое
+        \\    пер значения: Массив(Целое) = массив()
+        \\    пер результат = вычислить(значения)
+        \\    обычный_блок(значения)
+        \\    результат * 1000 + значения[0] * 100 + значения[1] * 10 + значения[2]
+        \\конец
+    ;
+    var result = try runSource(std.testing.allocator, "отложить.ps", source_text);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
+    switch (result.execution orelse return error.TestUnexpectedResult) {
+        .success => |output| try std.testing.expectEqualStrings("7213", output),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "runner executes block deferred calls on continue and break" {
+    const source_text =
+        \\функ добавить(значения: Массив(Целое), значение: Целое) -> Пусто
+        \\    значения.добавить(значение)
+        \\конец
+        \\экспорт функ старт() -> Целое
+        \\    пер значения: Массив(Целое) = массив()
+        \\    для i = 1 по 3 цикл
+        \\        отложить добавить(значения, i)
+        \\        если i == 1 тогда продолжить конец
+        \\        прервать
+        \\    конец
+        \\    значения[0] * 10 + значения[1]
+        \\конец
+    ;
+    var result = try runSource(std.testing.allocator, "отложить_цикл.ps", source_text);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
+    switch (result.execution orelse return error.TestUnexpectedResult) {
+        .success => |output| try std.testing.expectEqualStrings("12", output),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "runner executes deferred calls before question propagation" {
+    const source_text =
+        \\функ добавить(значения: Массив(Целое), значение: Целое) -> Пусто
+        \\    значения.добавить(значение)
+        \\конец
+        \\функ провал(значения: Массив(Целое)) -> Опция(Целое)
+        \\    отложить добавить(значения, 9)
+        \\    пер пусто: Опция(Целое) = Опция.Нет()
+        \\    пер значение = пусто?
+        \\    Опция.Есть(значение)
+        \\конец
+        \\экспорт функ старт() -> Целое
+        \\    пер значения: Массив(Целое) = массив()
+        \\    провал(значения)
+        \\    значения[0]
+        \\конец
+    ;
+    var result = try runSource(std.testing.allocator, "отложить_вопрос.ps", source_text);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
+    switch (result.execution orelse return error.TestUnexpectedResult) {
+        .success => |output| try std.testing.expectEqualStrings("9", output),
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "checker rejects a deferred non-call and a value-returning call" {
+    const source_text =
+        \\функ число() -> Число 1 конец
+        \\функ старт() -> Пусто
+        \\    отложить 1
+        \\    отложить число()
+        \\конец
+    ;
+    var result = try checkSource(std.testing.allocator, "неверное_отложить.ps", source_text);
+    defer result.deinit();
+
+    try std.testing.expect(result.hasErrors());
+    var saw_non_call = false;
+    var saw_non_void = false;
+    for (result.diagnostics.items.items) |item| {
+        saw_non_call = saw_non_call or std.mem.indexOf(u8, item.message, "ожидает вызов функции или метода") != null;
+        saw_non_void = saw_non_void or std.mem.indexOf(u8, item.message, "должен возвращать Пусто") != null;
+    }
+    try std.testing.expect(saw_non_call);
+    try std.testing.expect(saw_non_void);
+}
+
 test "runner accumulates frontend diagnostics without executing" {
     var result = try runSource(std.testing.allocator, "ошибка.ps", "функ старт() -> Число\nнеизвестно\nконец");
     defer result.deinit();
@@ -798,7 +904,7 @@ test "runner returns the embedded panos version string" {
 
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.items.len);
     switch (result.execution orelse return error.TestUnexpectedResult) {
-        .success => |output| try std.testing.expect(output.len > 0),
+        .success => |output| try std.testing.expectEqualStrings("0.5.0", output),
         .runtime_error => return error.TestUnexpectedResult,
     }
 }

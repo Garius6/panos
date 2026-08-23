@@ -950,6 +950,7 @@ const Parser = struct {
         return switch (self.peek().kind) {
             .let, .constant => self.parseLet(),
             .return_expr => self.parseReturn(),
+            .defer_expr => self.parseDefer(),
             .continue_expr => self.parseMarker(.continue_stmt),
             .break_expr => self.parseMarker(.break_stmt),
             .for_expr => self.parseForIn(),
@@ -1105,6 +1106,15 @@ const Parser = struct {
         }
         const value = try self.parseExpression(0);
         return self.result.ast.addStmt(.{ .return_stmt = .{
+            .span = spanFrom(start.span, self.astExprSpan(value)),
+            .value = value,
+        } });
+    }
+
+    fn parseDefer(self: *Parser) !ast.StmtId {
+        const start = self.next();
+        const value = try self.parseExpression(0);
+        return self.result.ast.addStmt(.{ .defer_stmt = .{
             .span = spanFrom(start.span, self.astExprSpan(value)),
             .value = value,
         } });

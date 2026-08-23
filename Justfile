@@ -27,6 +27,10 @@ build-all: build build-lsp build-wasm
 test:
 	zig build test
 
+# Активирует версионируемый pre-push hook. После клонирования выполнить один раз.
+setup-hooks:
+	git config core.hooksPath .githooks
+
 # Обновляет версию (zig/core/vm.zig's osVersion), собирает+тестирует,
 # коммитит "chore: версия X.Y.Z", тегирует vX.Y.Z, пушит main и тег.
 # Версию передавать БЕЗ "v": just bump-and-push 0.2.9

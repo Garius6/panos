@@ -1,0 +1,18 @@
+#!/bin/sh
+
+set -eu
+
+# Проверяем только публикацию main: feature-ветки можно отправлять быстрее,
+# а merge в main всё равно обязан пройти полный локальный gate.
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_ref" = "refs/heads/main" ] || continue
+    [ "$remote_ref" = "refs/heads/main" ] || continue
+
+    printf '%s\n' 'pre-push: проверка main (test, conformance, aot, lsp, browser)…'
+    zig build test
+    zig build conformance
+    zig build aot
+    zig build lsp
+    zig build browser
+    printf '%s\n' 'pre-push: все проверки main пройдены.'
+done

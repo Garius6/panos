@@ -1,237 +1,158 @@
-# Компилятор и VM
-> **Odin-era.** Этот раздел документирует внутреннее устройство ODIN-
-> реализации интерпретатора (`core/*.odin`), которая полностью удалена
-> `specs/010-zig-migration` T059 — Zig (`zig/core/`) теперь единственный
-> тулчейн. Файлы/структуры/функции, упомянутые ниже, в текущем дереве
-> НЕ существуют. Оставлено как историческая справка (архитектурные
-> решения и их обоснования часто перенеслись в Zig-реализацию без
-> изменений) — полный Zig-native рефреш этого раздела не сделан,
-> отдельная задача.
+# Компилятор, байткод и VM
 
-Компилятор и VM документируются ОДНОЙ главой — типичное изменение (новый
-оператор, новый opcode) трогает оба файла как одну логическую операцию,
-раздельные главы создали бы ложное впечатление, что они независимы (см.
-`plan.md` → Structure Decision).
+Эта глава описывает текущую Zig-реализацию Panos. Старое описание Odin
+удалено вместе с Odin-пайплайном в рамках миграции `specs/010-zig-migration`.
 
-## Что
+## Общая схема
 
-**`Opcode :: enum u8`** (`core/compiler.odin:291`) — 49 вариантов, ключевые
-группы: арифметика (`Add`/`Subtract`/`Multiply`/`Divide`/`Int_Divide`/`Modulo`),
-сравнение (`Less`/`Greater`/`Equal`/`Negate`), локальные переменные
-(`Get_Local`/`Set_Local`), управление потоком (`Jump`/`Jump_If_False`/`Call`/
-`Return`), структуры данных (`Build_Aggregate`/`Get_Property`/`Set_Property`/
-`Build_Array`/`Build_Map`/`Get_Index`/`Set_Index`), интерфейсы
-(`Cast_Interface`/`Invoke_Interface`), ADT (`Match_Tag`/`Get_Variant_Field`/
-`Build_Variant`/`Match_Fail`), акторы (`Spawn`/`Receive`/`Receive_Signal`),
-неблокирующий I/O (`Call_Builtin_Async`/`Invoke_Collection_Async`/
-`Await_Async` — см. ниже), FFI (`Call_Foreign`), замыкания
-(`Build_Closure`/`Get_Captured`), битовые операции (`BitAnd`/`BitOr`/
-`BitXor`/`BitNot`/`ShiftLeft`/`ShiftRight`).
+У Panos есть два независимых backend-пути после type checking:
 
-**`Compiled_Function`** — `name`, `instructions: [dynamic]u8` (байткод),
-`constants: [dynamic]Value` (пул констант функции), `frame_size`,
-`returns_value`.
+```text
+исходный текст
+  → lexer → parser → resolver → type checker
+                                ├─→ AST → bytecode compiler → bytecode VM
+                                └─→ AST → MIR lowering → WASM emitter
+```
 
-**`compile_program`** (`core/compiler.odin:540`) —
-`(res: ^Resolver_Ctx, tc: ^Type_Ctx, program: ^Program, registry: ...) -> map[string]^Compiled_Function`.
-Два прохода: Pass 1 (hoisting — пустые заглушки `Compiled_Function` для
-всех функций/методов, даёт forward-references), Pass 2 (компиляция тел).
-Между проходами вызывается `monomorphize_program` (см.
-[дженерики](./generics-and-monomorphization.md)) — инстанциации bounded
-generic-функций должны попасть в registry ДО того, как обычная компиляция
-дойдёт до их call site'ов.
+Нативный запуск CLI использует bytecode VM. `panos build --target=wasm`
+использует MIR→WASM и не запускает bytecode VM. Поэтому изменение языка,
+которое должно работать на обеих целях, обычно требует правки и
+`zig/core/compiler.zig`, и `zig/core/mir_lowering.zig`.
 
-**`GC_Header`** (`core/gc.odin:46`) — `{marked: bool}`. Комментарий в
-начале `compiler.odin`: ВСЕ heap-managed варианты `Value` (кроме `f64`/
-`bool`/`^Compiled_Function`) встраивают `GC_Header` ПЕРВЫМ полем —
-`Aggregate_Value`, `Array_Value`, `Map_Value`, `Error_Value`,
-`Option_Value`, `Result_Value`, `Interface_Value`, `Variant_Value`,
-`File_Value`, `Socket_Value`, `Process_Value`, `Closure_Value`,
-`Pointer_Value`.
+Основные файлы:
 
-**`execute`** (`core/vm.odin:1542`) — `(vm: ^VM) -> Exec_Result`, главный
-цикл VM: пока есть кадры (`vm.frames`), берёт текущий `CallFrame`, читает
-байт по `frame.ip`, кастит в `Opcode`, `#partial switch opcode` — 40+
-кейсов, каждый читает операнды из `instructions[frame.ip±N]`, работает с
-`vm.stack`, продвигает `frame.ip`.
-
-**`CallFrame`** — `function: ^Compiled_Function`, `ip: int`,
-`frame_pointer: int` (индекс в `vm.stack`, откуда начинаются локали этого
-кадра), `closure: ^Closure_Value` (не-nil только для вызовов замыкания).
-
-**Неблокирующий I/O** (`core/vm_async.odin`, `core/vm_async_io_native.odin`/
-`_wasm.odin`, `core/gc.odin`): планировщик (`run_scheduler`, ниже) — строго
-single-OS-thread, кооперативный round-robin по `vm.processes`. Раньше ЛЮБОЙ
-блокирующий вызов (`сеть.http_запрос`, `фс.прочитать`, `.получить_строку()`
-и т.п.) исполнялся синхронно ПРЯМО внутри `execute()` — останавливал
-планировщик целиком, ни один другой процесс не выполнялся, пока I/O не
-завершится. Сейчас такие вызовы компилируются в пару опкодов вместо одного
-`Call_Builtin`/`Invoke_Collection`:
-
-- `Call_Builtin_Async`/`Invoke_Collection_Async` — та же операнд-форма, что
-  у синхронных версий (имя-константа + `arg_count`, у `Invoke_Collection_*`
-  ещё receiver со стека), но НЕ исполняют вызов сами — кладут задачу в
-  `VM.async_pool` (`core:thread.Pool`, 4 потока, `new_vm`) через
-  `submit_async_io`/`submit_async_io_method` (`vm_async_io_native.odin`) и
-  СРАЗУ идут дальше (submit не блокирует).
-- `Await_Async` — suspend/resume механика, зеркалящая `Receive_Signal`, но
-  над ОТДЕЛЬНОЙ очередью `Process_Value.async_results` (не `mailbox`) —
-  если очередь пуста, `return .Suspended` без сдвига `ip` (следующий вызов
-  `execute()` для этого процесса перезаходит в ТУ ЖЕ инструкцию); отдельная
-  очередь нужна, чтобы результат СВОЕГО async-вызова не перепутался с
-  обычным сообщением, пришедшим, пока процесс ждал (тот же мотив, что у
-  `signals`/`Receive_Signal` для DOWN-сигналов).
-
-Компилятор решает, для КАКИХ builtin'ов/методов эмитить async-пару —
-`is_async_builtin_name`/`is_async_stream_method` (`compiler.odin`,
-`case .Builtin:`/`case .Method_Collection:`). Для методов выбор идёт по
-СТАТИЧЕСКОМУ типу receiver'а (`ctx.tc.node_types[prop_expr.object]` ==
-`TY_FILE`/`TY_CONNECTION`), а не только по имени метода — `"получить"`
-одновременно метод `Option`/`Result`/`Array`/`Map` (чистый get-with-default,
-диспетчится рантайм-типом в `invoke_collection_method`) и `Socket_Value`
-(блокирующий сетевой read) — без проверки типа компилятор не отличил бы их.
-
-Воркер физически касается ТОЛЬКО простых Odin-типов (`string`/`int`/
-`Maybe`) — никогда не вызывает `gc_new*`/строит `Value` — GC (`core/gc.odin`)
-не имеет НИ ОДНОЙ блокировки, предполагает эксклюзивный однопоточный
-доступ. Единственное исключение — стриминговые методы над уже открытым
-хендлом: чтение (`File_Value.прочитать`/`.прочитать_строку`,
-`Socket_Value.получить`/`.получить_строку`) — воркер физически читает
-`&file.reader`/`&sock.reader`, поле GC-managed объекта; запись
-(`File_Value.записать`, `Socket_Value.отправить`) — воркер пишет через сам
-`.handle`/`.socket` (`os.write`/`net.send_tcp`), reader не трогает. Оба
-случая безопасны ТОЛЬКО благодаря `gc_pin`/`gc_unpin` (`core/gc.odin`, см.
-[память и сборщик мусора](./memory-and-gc.md)), которые держат объект
-искусственным GC-корнем весь полёт, плюс `in_flight`/`close_requested` на
-самом объекте (`file_value_native.odin`) — ОДИН общий флаг на чтение И
-запись (не отдельные read/write-флаги): блокирует ЛЮБУЮ вторую
-конкурентную операцию (в т.ч. запись во время чужого чтения и наоборот) и
-откладывает `.закрыть()` до завершения воркера.
-
-**HTTP-сервер** (`core/vm_http_server_native.odin`/`_wasm.odin`,
-specs/009-http-server): мост между уже вендоренным (раньше только
-клиентским) `external/odin-http/server.odin` и однопоточным VM/GC. Четыре
-ограничения вендоренной библиотеки (найдены чтением её реального кода, не
-предположены) определяют весь дизайн:
-
-1. `http.serve`/`listen_and_serve` БЛОКИРУЮТ вызывающий поток НАВСЕГДА (свой
-   `nbio.tick()`-цикл до shutdown) — нельзя отдать `vm.async_pool` (4
-   короткоживущих воркера были бы исчерпаны навсегда) — нужен отдельный
-   `thread.create_and_start` на весь срок жизни слушателя.
-2. `http.respond()` требует (`assert_has_td`, thread-local проверка) вызова
-   с ТОГО ЖЕ потока odin-http, что вызвал `Handler` — исключает design
-   "вернуться сразу, ответить асинхронно откуда-то ещё": `Handler` обязан
-   синхронно дождаться ответа, самому вызвать `respond()`, и только потом
-   вернуться.
-3. Тело запроса читается через СОБСТВЕННЫЙ callback-based `http.body(...)`
-   внутри событийного цикла odin-http, не синхронно — синхронное ожидание
-   моста может начаться только ВНУТРИ этого callback'а, не в самом
-   `Handler_Proc`.
-4. `http.listen()` привязывает event loop (`nbio.acquire_thread_event_loop`)
-   к ОС-потоку, который его вызвал, а `http.serve()` (через
-   `server_date_start`) читает именно этот thread-local event loop — `listen()`
-   и `serve()` ДОЛЖНЫ вызываться с ОДНОГО потока (найдено эмпирически —
-   `EXC_BAD_ACCESS` на nil event loop при первом e2e-прогоне, если
-   `listen()` вызвать синхронно на главном потоке VM, а `serve()` — на
-   выделенном).
-
-Отсюда: `сеть.http_сервер_слушать(порт)` — синхронный builtin, который
-СРАЗУ спавнит выделенный поток (`run_http_listener_thread`, там же
-`context.allocator = vm_heap_allocator()` — иначе odin-http'евы
-собственные `thread_count`-под-потоки, порождаемые ВНУТРИ `serve()` с
-context, унаследовали бы однопоточную арену главного потока, см.
-[память и сборщик мусора](./memory-and-gc.md)); этот поток сам вызывает
-`http.listen()`, шлёт результат (успех/текст ошибки порта-занят) через
-одноразовый `Http_Listen_Result`-канал (cap=1) обратно builtin'у, который
-синхронно, но коротко (`listen()` — просто bind, не accept-цикл) на нём
-блокируется, и только потом (при успехе) переходит в `http.serve()`.
-`Слушатель.принять_запрос()` — ОБЫЧНЫЙ `Await_Async`-метод (та же пара
-опкодов, что File/Socket-стриминг выше): воркер `vm.async_pool` делает
-`chan.recv` на `Http_Listener_Value.incoming` (`chan.Chan(rawptr)`) — БЕЗ
-`gc_pin`, в отличие от File/Socket-стриминга, т.к. воркер копирует только
-плоское значение канала, никогда не трогает сам GC-объект слушателя, и
-несколько параллельных `принять_запрос()` от разных процессов — штатный
-случай (распределение запросов), а не гонка, которую нужно предотвращать.
-`Запрос.ответить(статус, тип, тело)` — синхронный метод, `chan.try_send`
-(не блокирующий `send`) на per-request `response_chan`, которого дожидается
-`Handler`'ов callback внутри odin-http-потока — `try_send`, а не `send`,
-специально: клиент мог уже отключиться, тогда получатель не читает канал
-никогда, а блокирующий `send` подвесил бы вызывающий panos-процесс
-навсегда.
-
-Найденная во время написания e2e-тестов деталь, не специфичная для этой
-фичи, а общая для планировщика (см. `run_scheduler` ниже): когда главный
-процесс (`старт()`, индекс 0) завершается, `run_scheduler` возвращается
-НЕМЕДЛЕННО, не дожидаясь спавненных (`запусти`) дочерних процессов, даже
-если те всё ещё ждут async-результата — задокументированное, а не новое
-поведение (см. `test_actor_spawn_send_start_exits_without_waiting_for_child`),
-но означает, что HTTP-сервер, который спавнит обработчики и сразу
-завершает `старт()`, оборвёт их на середине: `старт()` либо сам должен
-быть одним из обработчиков (типичный паттерн для реального сервера —
-см. `quickstart.md`), либо дождаться сигнала от каждого спавненного
-процесса через `получить()`/`отправить()` (типичный паттерн для теста с
-фиксированным числом запросов).
-
-`deliver_async_result`/`drain_async_completions` (`core/vm.odin`) — на
-ГЛАВНОМ потоке, в момент дренирования канала `VM.async_completions`
-(`core:sync/chan`), строят `Value` из результата и кладут в
-`process.async_results` того процесса, что инициировал вызов (по
-`target_id`, НЕ указателю — процесс мог завершиться/быть убит, пока I/O
-было в полёте; тот же silent-drop, что у `отправить()` на мёртвый процесс,
-ресурсы всё равно освобождаются). `run_scheduler`'s дедлок-guard различает
-настоящий дедлок и "все ждут I/O в полёте" через
-`thread.pool_num_outstanding(&vm.async_pool)` (атомарный счётчик пула).
-
-## Зачем
-
-Компиляция в байткод вместо прямого обхода AST — типы уже полностью
-проверены к моменту кодогенерации, значит выбор конкретного opcode
-(например `Int_Divide` vs `Divide`) можно сделать ОДИН РАЗ на этапе
-компиляции, а не на каждом вызове во время исполнения. `GC_Header`
-встроен в каждый heap-управляемый вариант `Value`, чтобы у сборщика мусора
-был единый способ найти mark-бит для ЛЮБОГО heap-объекта без отдельной
-параллельной таблицы метаданных, индексированной по адресу (см.
-[память и сборщик мусора](./memory-and-gc.md)).
-
-## Почему так, а не иначе
-
-**`Int_Divide` — отдельный от `Divide` opcode** (`vm.odin:1624`,
-комментарий): `Целое`/`Целое` — усечение к нулю (как в C/Rust/Go, НЕ floor
-как в Python); `Число`/`Число` — обычное деление. Оба типа на рантайме —
-`f64` (у `Целое` нет отдельного `Value`-варианта, см.
-`Type_Kind.Integer`) — VM физически не может отличить их в момент
-исполнения, поэтому выбор opcode — статический, делает его КОМПИЛЯТОР по
-`ctx.tc.node_types[e.left] == TY_INT` (`compiler.odin:1061`), не VM по
-значению.
-
-**Битовые операторы — только для `Целое`**, проверено ЕЩЁ тайпчекером
-(`infer_binary_expr`/`infer_unary_expr`, см. [тайпчекер](./type-checker.md)) —
-VM конвертирует `f64`→`i64`, делает битовую операцию, конвертирует обратно
-(рантайм-представление всё равно `f64`, отдельного целочисленного
-`Value`-варианта нет).
-
-**`.And`/`.Or` не предкомпилируют оба операнда заранее** (`compiler.odin:1043-1046`,
-комментарий): правый операнд может не выполниться (short-circuit) — для
-левоассоциативной цепочки `и`/`или` (где `e.left` сам `Binary_Expr`)
-предкомпиляция дала бы `O(2^n)` инструкций плюс мусор на стеке VM. Вместо
-этого `.And`/`.Or` компилируются СПЕЦИАЛЬНО: `compile_expr(e.left)`,
-`Jump_If_False`, `compile_expr(e.right)`, с патчем прыжков.
-
-## Точки входа для типичной правки
-
-Для нового бинарного оператора (например ещё одного арифметического) —
-трогать ВСЕ три места сразу, они образуют одну логическую операцию (общий
-[рецепт](./recipes/new-binary-operator.md)):
-
-| Шаг | Файл/функция |
+| Стадия | Реализация |
 |---|---|
-| 1. Объявить opcode | `Opcode :: enum u8` (`compiler.odin:291`) |
-| 2. Эмиссия на стороне компилятора | `compile_expr`, кейс `^Binary_Expr` (`compiler.odin:973`), внутренний `#partial switch e.op` (строки 1019+) — `emit_opcode(ctx, .НовыйOpcode)`; если выбор opcode зависит от статического типа (как `Int_Divide`/`Divide`) — проверка `ctx.tc.node_types[e.left]` |
-| 3. Обработчик на стороне VM | `execute`, `#partial switch opcode` (`vm.odin:1542`+) — новый `case .НовыйOpcode:`, снять операнды с `vm.stack` через `pop`, положить результат через `append` |
+| Лексер | `zig/core/lexer.zig`, `zig/core/token.zig` |
+| AST и parser | `zig/core/ast.zig`, `zig/core/parser.zig` |
+| Связывание имён | `zig/core/resolver.zig` |
+| Типы и type checking | `zig/core/types.zig`, `zig/core/type_checker.zig` |
+| Bytecode | `zig/core/bytecode.zig`, `zig/core/compiler.zig` |
+| Исполнение | `zig/core/vm.zig`, `zig/core/value.zig`, `zig/core/gc.zig` |
+| MIR/AOT | `zig/core/mir.zig`, `zig/core/mir_lowering.zig`, `zig/core/wasm_emit.zig` |
 
-| Другое изменение | Файл/функция |
-|---|---|
-| Новый heap-управляемый `Value`-вариант | ОБЯЗАТЕЛЬНО первым полем `GC_Header` (`gc.odin:46`) — иначе сборщик мусора не найдёт mark-бит, см. [память и сборщик мусора](./memory-and-gc.md) |
-| Новый builtin (`ввод_вывод.печать` и т.п.) | `Call_Builtin`-кейс в `execute` (не новый opcode на каждый builtin — один универсальный `Call_Builtin` с именем-константой) |
-| Сделать builtin/метод неблокирующим для планировщика | добавить имя в `is_async_builtin_name`/`is_async_stream_method` (`compiler.odin`) + `case` в `submit_async_io`/`submit_async_io_method` (`vm_async_io_native.odin`, воркер строит ТОЛЬКО простые типы) + `case` в `deliver_async_result` (`vm.odin`, `Value` строится ЗДЕСЬ, на главном потоке) — новый суспенд-примитив не нужен, `Await_Async` уже общий |
-| Изменить формат FFI-вызова | `Call_Foreign`-кейс, `core/vm_ffi_native.odin` |
+## Типизированная программа
+
+`resolver.zig` превращает имена в стабильные `SymbolId`, связывает импорты,
+методы, generic-инстанциации и builtin-модули. `type_checker.zig` затем
+заполняет `CheckResult` типами узлов, проверяет возвращаемые значения,
+интерфейсы, ADT, коллекции, `Опция`/`Результат` и управление потоком.
+
+Обе backend-стадии получают уже разрешённую и типизированную программу.
+Они не должны заново выводить типы или разрешать имена. Это важная граница
+для будущей формализации в Lean: первым формальным представлением лучше
+сделать typed AST, а не текстовый язык с лексером.
+
+## Bytecode compiler
+
+`compiler.zig` строит `bytecode.Program` и набор `bytecode.Function`.
+Функция содержит инструкции, константы, размер frame, признак возвращаемого
+значения и метаданные, необходимые для вызовов. `bytecode.Opcode` включает:
+
+- арифметику, сравнение и логические операции;
+- локальные переменные и переходы;
+- вызовы, замыкания и интерфейсную диспетчеризацию;
+- массивы, соответствия, структуры, туплы и ADT;
+- процессы, сообщения, сигналы и отмену;
+- файловые, сетевые, HTTP, SQLite и DOM builtin-инструкции;
+- FFI и операции со строками.
+
+Компилятор сначала регистрирует функции, чтобы разрешить forward references,
+затем компилирует тела и лямбды. Вызовы builtin выбираются по уже известному
+типу и символу, поэтому VM не обязана повторять всю логику type checker.
+
+`отложить` реализован как структурный cleanup stack компилятора. Cleanup
+исполняется в обратном порядке при выходе из блока, функции, цикла,
+`возврат`, `прервать`, `продолжить` и успешном разворачивании `?`. Для
+возврата значения compiler сохраняет результат на стеке, исполняет cleanup,
+затем возвращает значение.
+
+## Bytecode VM
+
+`Vm.run()` (`zig/core/vm.zig`) создаёт корневой процесс и выполняет его через
+планировщик. `step()` исполняет одну инструкцию текущего frame и возвращает
+`StepOutcome`:
+
+- `completed` — инструкция завершилась;
+- `suspended` — процесс ждёт mailbox, signal или async-результат;
+- `none` — обычное продолжение выполнения.
+
+Frame хранит функцию, instruction pointer, локальные слоты и состояние
+замыкания. Значения представлены `value.Value`; heap-объекты принадлежат
+`gc.Heap`. VM владеет heap и создаёт GC-managed значения только на основном
+потоке.
+
+Асинхронные builtin-операции используют плоские payload-структуры и worker
+threads. Worker не обращается к `Value` и `gc.Heap`; результат возвращается
+в основной поток и только там превращается в Panos-значение. Если операция
+ещё не завершена, инструкция остаётся на том же `ip` и процесс будет
+передиспетчеризован позже.
+
+Ошибки делятся на диагностические ошибки до запуска и runtime errors. `паника`
+и runtime error останавливают текущий запуск; VM сейчас не выполняет
+универсальное stack unwinding, поэтому `отложить` не является обработчиком
+паники.
+
+## MIR и WASM AOT
+
+`mir_lowering.zig` понижает типизированный AST в MIR с явными `ValueId`,
+блоками и control-flow. MIR валидируется перед emission; среди проверок есть
+валидность блоков/значений и single-use-инварианты, необходимые текущему
+представлению MIR.
+
+`wasm_emit.zig` превращает MIR в самостоятельный WASM-модуль. Этот путь
+имеет собственные runtime-модули (`zig/wasm_runtime/`) и не использует
+байткодную VM. `zig build aot` проверяет реальные WASM-объекты через
+wasmtime, а `zig build browser` проверяет freestanding browser-сборку.
+
+## Точки изменения
+
+Изменение синтаксиса проходит вертикальным срезом:
+
+1. token/lexer;
+2. AST/parser;
+3. resolver;
+4. type checker;
+5. bytecode compiler;
+6. MIR lowering, если функция доступна в AOT;
+7. VM или WASM emitter/runtime;
+8. `zig/core/runner.zig` и conformance fixture.
+
+Новый opcode требует обработки в `bytecode.Opcode`, emission в
+`compiler.zig` и dispatch в `Vm.step()`. Для AOT предпочтительнее добавлять
+MIR-инструкцию или существующий MIR-паттерн, а не пытаться вызвать bytecode
+VM из WASM.
+
+## Основа для Lean 4
+
+Lean-модель следует строить вокруг typed AST и отдельной семантики bytecode:
+
+```text
+Typed AST → source semantics
+Typed AST → bytecode → bytecode semantics
+```
+
+Первая полезная теорема — preservation/progress для чистого подмножества
+(числа, boolean, `если`, локальные переменные, функции, ADT). Затем можно
+доказать compiler simulation для bytecode. FFI, сеть, async, GC, процессы,
+DOM и WASM следует подключать как отдельные effect-модели с явно указанными
+предположениями.
+
+До полного доказательства полезно экспортировать из Zig typed AST,
+bytecode и детерминированные VM-трассы в тестовый формат. Lean-интерпретатор
+сможет сравнивать эти артефакты с эталонной семантикой, а `zig build
+conformance` — запускать те же программы на реальной VM и AOT backend.
+
+## Проверки
+
+Перед изменением compiler/VM/AOT должны проходить:
+
+```sh
+zig build test
+zig build conformance
+zig build lsp
+zig build browser
+```
+
+Для изменений WASM дополнительно используется `zig build aot`; для
+интеграций с реальными ресурсами — `zig build integration`.

@@ -337,6 +337,17 @@ pub fn build(b: *std.Build) void {
     });
     // `внешний "хост"` resolves symbols from the test executable itself.
     embed_host_tests.rdynamic = true;
+    // specs/017-native-host-function-registry: deliberately NO `rdynamic`
+    // here — proves the native host-function registry path needs neither
+    // `pub export fn` nor `rdynamic`, unlike `embed_host_tests` above.
+    const embed_host_registry_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/embed_host_registry_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "panos_embed", .module = embed_module }},
+        }),
+    });
     const cli_tests = b.addTest(.{ .root_module = panos.root_module });
     const lsp_tests = b.addTest(.{ .root_module = lsp.root_module });
     const browser_tests = b.addTest(.{
@@ -539,6 +550,7 @@ pub fn build(b: *std.Build) void {
     const run_runner_unit_tests = b.addRunArtifact(runner_unit_tests);
     const run_embed_tests = b.addRunArtifact(embed_tests);
     const run_embed_host_tests = b.addRunArtifact(embed_host_tests);
+    const run_embed_host_registry_tests = b.addRunArtifact(embed_host_registry_tests);
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const run_lsp_tests = b.addRunArtifact(lsp_tests);
     const run_browser_tests = b.addRunArtifact(browser_tests);
@@ -696,6 +708,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_runner_unit_tests.step);
     test_step.dependOn(&run_embed_tests.step);
     test_step.dependOn(&run_embed_host_tests.step);
+    test_step.dependOn(&run_embed_host_registry_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_lsp_tests.step);
     test_step.dependOn(&run_browser_tests.step);

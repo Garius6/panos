@@ -6,6 +6,7 @@ pub const bytecode = @import("bytecode.zig");
 pub const compiler = @import("compiler.zig");
 pub const diagnostic = @import("diagnostic.zig");
 pub const gc = @import("gc.zig");
+pub const host_registry = @import("host_registry.zig");
 pub const lexer = @import("lexer.zig");
 pub const lsp = @import("lsp.zig");
 pub const lsp_graph = @import("lsp_graph.zig");

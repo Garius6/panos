@@ -8,5 +8,6 @@
         "build.zig.zon",
         "zig",
         "tests",
+        "external",
     },
 }

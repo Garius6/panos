@@ -982,7 +982,7 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
         // каждый ДРУГОЙ модуль получает их через неявный неквалифицированный
         // импорт выше, так что вручную установленные дубликаты
         // конфликтовали бы с любым из путей, не только с самой прелюдией.
-        result.modules[module_index].resolution = try resolver.resolveModuleForTarget(allocator, &module.tree, scope.modules, prelude_module != null, target_profile, module.file.path);
+        result.modules[module_index].resolution = try resolver.resolveModuleForTarget(allocator, &module.tree, scope.modules, prelude_module != null, target_profile, module.file.path, graph.host_registry);
         const resolution = &result.modules[module_index].resolution.?;
         try result.appendDiagnostics(&resolution.diagnostics);
         if (result.hasErrors()) return result;

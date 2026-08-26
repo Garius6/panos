@@ -1,6 +1,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const diagnostic = @import("diagnostic.zig");
+const host_registry = @import("host_registry.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const resolver = @import("resolver.zig");
@@ -152,6 +153,15 @@ pub const Graph = struct {
     // 4-уровневый контракт поиска модулей документирован в
     // `docs/src/getting-started/installation.md` §"Поиск модулей".
     global_search_roots: []const []const u8 = &.{},
+    // Зарегистрированные встраивающим Zig-приложением host-функции
+    // (`panos.hostFunctions(...)`, specs/017-native-host-function-
+    // registry) — задаётся `Runtime.init` (`zig/embed.zig`) перед
+    // компиляцией, тем же паттерном, что `global_search_roots` выше.
+    // Пусто по умолчанию — CLI/LSP/browser/тесты, ничего не встраивающие,
+    // не затронуты. Прокидывается в `resolver.resolveModuleForTarget`
+    // через `module_compiler.compileGraphForTarget`, без изменения их
+    // публичных сигнатур (см. `host_registry.zig`).
+    host_registry: []const host_registry.HostFunctionEntry = &.{},
 
     pub fn init(allocator: std.mem.Allocator) Graph {
         return .{

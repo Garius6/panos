@@ -1,6 +1,6 @@
 # panos Development Guidelines
 
-Auto-generated from feature plans. Last updated: 2026-07-27.
+Auto-generated from feature plans. Last updated: 2026-08-26.
 
 ## Active Technologies
 - mdBook (docs/) — internal architecture documentation, no new dependency (002-interpreter-architecture-docs)
@@ -17,6 +17,7 @@ Auto-generated from feature plans. Last updated: 2026-07-27.
 - interface vtables (not a speckit feature — see Recent Changes): `Cast_Interface` (`core/vm.odin`) now resolves the method vtable at COMPILE TIME via exact `Symbol_Id` lookups, not a runtime name-prefix scan — the old scan silently produced an empty vtable for any `реализация Интерфейс для Т` declared outside the entry file (100% broken for real multi-module programs, not an edge case). No new dependency, `core/compiler.odin` + `core/vm.odin` only.
 - время.спать_мс (not a speckit feature — see Recent Changes): new native-only builtin, `core:time.sleep` (cross-platform) — sole motivation was `../panosiki/codegen`'s new `--watch` mode needing a poll interval; panos had no sleep primitive at all before this.
 - SQLite support (not a speckit feature — built via plan-mode, see Recent Changes): vendored, statically-linked `external/sqlite3/` amalgamation (same pattern as `external/libffi/`), new native-only `бд` module (`бд.открыть`/`Соединение_БД.выполнить`/`.запрос`/`.закрыть`), query rows returned as `Массив(Соответствие(Строка, Строка))` — no typed-value or BLOB support in v1.
+- native host-function registry (017-native-host-function-registry, in planning): `внешний "хост"` gets an alternative resolve source — `panos.hostFunctions(comptime table)` registered via `Runtime.Config.host_functions` — no `pub export fn`/`rdynamic` needed, calls go through a comptime-generated type-erased trampoline instead of `ffi_prep_cif`/`ffi_call`. `.pns` syntax unchanged; existing `dlopen(NULL)`/`dlsym`/libffi path stays as fallback. Motivated by `../jijka` (FPS engine embedding panos for gameplay scripting).
 
 ## Project Structure
 
@@ -65,6 +66,7 @@ history of how the code came to exist — that belongs in commit messages,
 not source comments.
 
 ## Recent Changes
+- 017-native-host-function-registry (planning, not yet implemented): design for calling engine functions from panos scripts without `pub export fn`/`rdynamic` and without libffi on the call path — see `specs/017-native-host-function-registry/` (spec/research/data-model/contracts/quickstart).
 - qualified impl target (not a speckit feature — found while fixing a
   `../panosiki/codegen` bug, built via plan-mode): `реализация Интерфейс
   для Модуль.Тип` — the TARGET side of an impl block can now be

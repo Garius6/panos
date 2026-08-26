@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ast = @import("ast.zig");
 const diagnostic = @import("diagnostic.zig");
+const host_registry_mod = @import("host_registry.zig");
 const source = @import("source.zig");
 const symbols = @import("symbols.zig");
 const target_policy = @import("target.zig");
@@ -194,6 +195,13 @@ pub const Resolution = struct {
     // должна пережить этот проход разрешения — как и `module_graph.
     // foreign_libraries` в Odin, тоже никогда явно не выгружаемая).
     foreign_functions: std.AutoHashMap(symbols.SymbolId, usize),
+    // Параллельно `foreign_functions`, но для `внешний`-символов,
+    // разрешённых через native host-function registry
+    // (specs/017-native-host-function-registry), а не dynlib/`dlsym` —
+    // непересекающиеся ключи: символ попадает ровно в одну из двух карт,
+    // никогда в обе (см. `resolveForeignFunction`). `compiler.zig`
+    // проверяет эту карту первой при построении `ForeignFunctionConstant`.
+    native_foreign_functions: std.AutoHashMap(symbols.SymbolId, host_registry_mod.NativeCallFn),
 
     pub fn init(allocator: std.mem.Allocator) !Resolution {
         return .{
@@ -210,10 +218,12 @@ pub const Resolution = struct {
             .lambda_captures = .init(allocator),
             .imported_symbols = .init(allocator),
             .foreign_functions = .init(allocator),
+            .native_foreign_functions = .init(allocator),
         };
     }
 
     pub fn deinit(self: *Resolution) void {
+        self.native_foreign_functions.deinit();
         self.foreign_functions.deinit();
         self.imported_methods.deinit(self.allocator);
         for (self.enum_variants.items) |*variants| variants.values.deinit();
@@ -318,6 +328,12 @@ const Resolver = struct {
     // рядом с `.pns`-файлом, продолжает работать независимо от того,
     // откуда запущен `panos`.
     source_path: []const u8 = "",
+    // Зарегистрированные встраивающим приложением host-функции
+    // (specs/017-native-host-function-registry) — проверяется
+    // `resolveForeignFunction` ПЕРЕД `dlopen(NULL)`/`dlsym` для
+    // `foreign.library == "хост"`. Пусто по умолчанию — не встраивающие
+    // вызывающие стороны (CLI/LSP/browser/тесты) ведут себя как раньше.
+    host_registry: []const host_registry_mod.HostFunctionEntry = &.{},
     // См. `popScopeAndWarnUnused` — фактическое предупреждение.
     used_symbols: std.AutoHashMap(symbols.SymbolId, void),
     unused_check_symbols: std.AutoHashMap(symbols.SymbolId, void),
@@ -897,6 +913,21 @@ const Resolver = struct {
         return false;
     }
 
+    // Линейный поиск по `self.host_registry` (обычно — низкие десятки
+    // записей, см. specs/017-native-host-function-registry/plan.md
+    // "Scale/Scope") — вызывается один раз на `внешний`-декларацию, во
+    // время резолва, не на горячем пути выполнения. `null`, если
+    // `library` — не `"хост"`, или зарегистрированной записи с таким
+    // именем нет (в обоих случаях резолв падает в существующий
+    // dlopen/dlsym-путь ниже — см. `resolveForeignFunction`).
+    fn findHostRegistryEntry(self: *const Resolver, library: []const u8, name: []const u8) ?host_registry_mod.HostFunctionEntry {
+        if (!std.mem.eql(u8, library, "хост")) return null;
+        for (self.host_registry) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
+    }
+
     // Загружает `foreign.library` (ПРОИЗВОЛЬНУЮ, заданную пользователем
     // разделяемую библиотеку — не одну из собственных вендоренных
     // зависимостей проекта) и разрешает в ней `foreign.name`, кэшируя
@@ -919,6 +950,28 @@ const Resolver = struct {
             try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
         } else if (self.target_profile != .native) {
             try self.report(foreign.span, "Resolve Error: 'внешний' недоступно в этом runtime-таргете", .{});
+        } else if (self.findHostRegistryEntry(foreign.library, foreign.name)) |entry| {
+            // native host-function registry (specs/017-native-host-function-
+            // registry) — проверяется ПЕРЕД dlopen(NULL)/dlsym ниже, чтобы
+            // явно зарегистрированная Zig-функция всегда побеждала над
+            // случайным совпадением экспортированного символа (см. spec.md,
+            // User Story 4, FR-010). Несовпадение сигнатуры — Resolve Error,
+            // не крэш/UB (см. spec.md, User Story 2, FR-005).
+            if (foreign.parameters.len != entry.param_kinds.len) {
+                try self.report(foreign.span, "Resolve Error: 'внешний \"хост\" функ {s}' — несовпадение сигнатуры: объявлено {d} параметр(ов), зарегистрировано {d}", .{ foreign.name, foreign.parameters.len, entry.param_kinds.len });
+                return;
+            }
+            for (foreign.parameters, entry.param_kinds, 0..) |parameter, expected_kind, index| {
+                if (parameter.marshal != expected_kind) {
+                    try self.report(foreign.span, "Resolve Error: 'внешний \"хост\" функ {s}' — несовпадение типа параметра {d}: объявлено {s}, зарегистрировано {s}", .{ foreign.name, index, @tagName(parameter.marshal), @tagName(expected_kind) });
+                    return;
+                }
+            }
+            if (foreign.return_marshal != entry.return_kind) {
+                try self.report(foreign.span, "Resolve Error: 'внешний \"хост\" функ {s}' — несовпадение типа возврата: объявлено {s}, зарегистрировано {s}", .{ foreign.name, @tagName(foreign.return_marshal), @tagName(entry.return_kind) });
+                return;
+            }
+            try self.result.native_foreign_functions.put(symbol, entry.call);
         } else if ((comptime builtin.target.os.tag != .windows and builtin.link_libc) and
             (std.mem.eql(u8, foreign.library, "libc") or std.mem.eql(u8, foreign.library, "хост")))
         {
@@ -1337,10 +1390,10 @@ pub fn resolveWithImports(allocator: std.mem.Allocator, tree: *const ast.Ast, im
 }
 
 pub fn resolveModule(allocator: std.mem.Allocator, tree: *const ast.Ast, imports: []const ImportedModule, skip_prelude_hardcode: bool) !Resolution {
-    return resolveModuleForTarget(allocator, tree, imports, skip_prelude_hardcode, .native, "");
+    return resolveModuleForTarget(allocator, tree, imports, skip_prelude_hardcode, .native, "", &.{});
 }
 
-pub fn resolveModuleForTarget(allocator: std.mem.Allocator, tree: *const ast.Ast, imports: []const ImportedModule, skip_prelude_hardcode: bool, target_profile: target_policy.TargetProfile, source_path: []const u8) !Resolution {
+pub fn resolveModuleForTarget(allocator: std.mem.Allocator, tree: *const ast.Ast, imports: []const ImportedModule, skip_prelude_hardcode: bool, target_profile: target_policy.TargetProfile, source_path: []const u8, host_registry: []const host_registry_mod.HostFunctionEntry) !Resolution {
     var result = try Resolution.init(allocator);
     errdefer result.deinit();
     var resolver = try Resolver.init(&result);
@@ -1348,6 +1401,7 @@ pub fn resolveModuleForTarget(allocator: std.mem.Allocator, tree: *const ast.Ast
     resolver.tree = tree;
     resolver.target_profile = target_profile;
     resolver.source_path = source_path;
+    resolver.host_registry = host_registry;
 
     try resolver.installBuiltins(skip_prelude_hardcode);
     try resolver.predeclareImports(imports);

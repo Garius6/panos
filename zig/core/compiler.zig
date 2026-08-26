@@ -1285,13 +1285,20 @@ const FunctionCompiler = struct {
             else => null,
         } else null;
         const return_struct_layout: []const ast.ForeignMarshalKind = if (foreign.return_marshal != .struct_value) &.{} else self.ffiStructLayoutFor(return_type);
+        // native host-function registry (specs/017-native-host-function-
+        // registry) проверяется первой — символ попадает либо сюда, либо
+        // в `foreign_functions` ниже, никогда в обе карты (см.
+        // `resolver.zig`'s `resolveForeignFunction`).
+        const native_call = self.compiler.resolution.native_foreign_functions.get(symbol);
         // `0` (никогда не валидный указатель на функцию), если резолвер
         // уже не смог загрузить библиотеку/символ — диагностика об этом
         // уже выдана на этом этапе, этот код недостижим для программы,
         // которая реально прошла резолвинг без ошибок.
         const fn_ptr = self.compiler.resolution.foreign_functions.get(symbol) orelse 0;
         const constant_index = try self.function.addConstant(self.compiler.result.allocator, .{ .foreign_function = .{
+            .call_kind = if (native_call != null) .native_registry else .dynlib_libffi,
             .fn_ptr = fn_ptr,
+            .native_call = native_call,
             .name = try self.compiler.program().copyString(foreign.name),
             .param_kinds = param_kinds,
             .param_struct_layouts = param_struct_layouts,

@@ -1,7 +1,6 @@
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
-const sqlite3 = @import("sqlite3_bindings.zig");
 
 const Object = union(enum) {
     string: *value.HeapString,
@@ -30,6 +29,13 @@ pub const Heap = struct {
     // не мешают друг другу: каждый добавляет и удаляет только свою запись,
     // независимо от того, сколько уже висит чужих.
     pinned: std.ArrayList(value.Value) = .empty,
+    // Инжектируется владельцем `Heap` (`Vm.init`, `vm.zig`) — `Heap` сама
+    // сознательно не знает про sqlite3/`sqlite3_bindings.zig` (держит граф
+    // импортов лёгких core-модулей чистым от native sqlite-линковки, см.
+    // specs/017-native-host-function-registry). `null` по умолчанию —
+    // безопасно для любого `Heap`, не создающего `Соединение_БД`
+    // (собственные тесты этого файла, любой embed-хост без `бд`).
+    sql_close_fn: ?*const fn (db: ?*anyopaque) void = null,
 
     pub fn init(allocator: std.mem.Allocator) Heap {
         return .{ .allocator = allocator };
@@ -290,7 +296,7 @@ pub const Heap = struct {
             .sql_connection => |connection| {
                 if (connection.is_open) {
                     if (comptime @import("builtin").target.os.tag != .freestanding) {
-                        _ = sqlite3.sqlite3_close_v2(connection.db);
+                        if (self.sql_close_fn) |close| close(connection.db);
                     }
                 }
                 self.allocator.destroy(connection);

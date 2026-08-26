@@ -9,9 +9,12 @@ const panos_core = @import("panos_core");
 /// VM и действителен до следующего вызова или `deinit`.
 ///
 /// Нативные возможности хоста описываются в панос как
-/// `внешний "хост" функ ...`. Встраивающее приложение экспортирует
-/// соответствующие C-ABI `pub export fn` и включает `rdynamic` в своей
-/// Zig-сборке; это намеренно не требует вносить игровой API в VM панос.
+/// `внешний "хост" функ ...`. Два способа опубликовать реализацию,
+/// сочетаемые в одном приложении: `panos.hostFunctions(...)` (см. ниже) —
+/// без `pub export fn`/`rdynamic`, без libffi на пути вызова; либо
+/// экспорт C-ABI `pub export fn` + `rdynamic` в Zig-сборке (старый путь,
+/// через `dlopen`/`dlsym`+libffi). Оба намеренно не требуют вносить
+/// игровой API в VM панос.
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     graph_state: panos_core.module_loader.Graph,
@@ -51,11 +54,20 @@ pub const Runtime = struct {
         /// (умолчание) для встраивающих хостов, читающих `output()`
         /// программно.
         live_stdout: bool = false,
+        /// Host-функции, зарегистрированные через `panos.hostFunctions(...)`
+        /// (specs/017-native-host-function-registry) — делает их видимыми
+        /// `.pns`-скрипту через `внешний "хост" функ ...`, без `pub export
+        /// fn`/`rdynamic`. Пусто по умолчанию — не встраивающие сценарии не
+        /// затронуты; можно сочетать со старым `pub export fn`+`rdynamic`
+        /// путём (см. `docs/src/architecture/embedding.md`) — при коллизии
+        /// имени регистрация здесь имеет приоритет.
+        host_functions: []const panos_core.host_registry.HostFunctionEntry = &.{},
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Runtime {
         var graph_result = panos_core.module_loader.Graph.init(allocator);
         graph_result.global_search_roots = config.global_search_roots;
+        graph_result.host_registry = config.host_functions;
         return .{
             .allocator = allocator,
             .graph_state = graph_result,
@@ -192,6 +204,151 @@ pub const Runtime = struct {
 
 pub const Value = panos_core.value.Value;
 pub const Execution = panos_core.vm.Execution;
+pub const HostFunctionEntry = panos_core.host_registry.HostFunctionEntry;
+
+/// Регистрирует обычные Zig-функции как host-функции, видимые `.pns`-
+/// скрипту через `внешний "хост" функ имя(...)` — БЕЗ `pub export fn`/
+/// `rdynamic` (specs/017-native-host-function-registry). `table` — анонимный
+/// структ, имя каждого поля становится именем host-функции, значение —
+/// обычная Zig-функция:
+///
+/// ```zig
+/// const entries = panos.hostFunctions(.{
+///     .scale = struct {
+///         fn call(x: f64) f64 { return x * 2.0; }
+///     }.call,
+/// });
+/// var runtime = panos.Runtime.init(allocator, .{ .host_functions = entries });
+/// ```
+///
+/// Несовместимый Zig-тип параметра/возврата (вне `u8`/`i32`/`i64`/`f32`/
+/// `f64`/`[]const u8`/`void`, либо struct со скалярными полями того же
+/// набора) — `@compileError` здесь, в месте вызова `hostFunctions(...)`, не
+/// рантайм-ошибка панос (см. `host_registry.zig`, набор НЕ расширяет
+/// существующие FFI marshal-kinds — `Указатель(T)` не поддерживается).
+pub fn hostFunctions(comptime table: anytype) []const HostFunctionEntry {
+    // Явный `comptime`-блок обязателен: сам по себе вызов `hostFunctions(...)`
+    // в обычной (не comptime) позиции — например, прямо внутри
+    // `Runtime.Config`-литерала — НЕ гарантирует comptime-вычисление всего
+    // тела только потому, что `table` помечен `comptime` (это фиксирует
+    // только сам параметр, не форсирует comptime-выполнение вызывающей
+    // функции целиком) — без этой обёртки `entries[index] = ...` падает с
+    // "cannot store runtime value in compile time variable".
+    return comptime blk: {
+        const table_fields = @typeInfo(@TypeOf(table)).@"struct".fields;
+        var entries: [table_fields.len]HostFunctionEntry = undefined;
+        for (table_fields, 0..) |field, index| {
+            entries[index] = buildHostFunctionEntry(field.name, @field(table, field.name));
+        }
+        const frozen = entries;
+        break :blk &frozen;
+    };
+}
+
+fn buildHostFunctionEntry(comptime name: []const u8, comptime func: anytype) HostFunctionEntry {
+    const registry = panos_core.host_registry;
+    const FuncType = @TypeOf(func);
+    const func_info = @typeInfo(FuncType).@"fn";
+    const ArgsTuple = std.meta.ArgsTuple(FuncType);
+    const ReturnType = func_info.return_type.?;
+
+    var param_kinds: [func_info.params.len]panos_core.ast.ForeignMarshalKind = undefined;
+    var param_struct_layouts: [func_info.params.len][]const panos_core.ast.ForeignMarshalKind = undefined;
+    for (func_info.params, 0..) |param, index| {
+        param_kinds[index] = registry.marshalKindFor(param.type.?);
+        param_struct_layouts[index] = registry.structLayoutFor(param.type.?);
+    }
+    const frozen_param_kinds = param_kinds;
+    const frozen_param_struct_layouts = param_struct_layouts;
+    const return_kind = registry.marshalKindFor(ReturnType);
+    const return_struct_layout = registry.structLayoutFor(ReturnType);
+
+    const Trampoline = struct {
+        fn call(heap: *panos_core.gc.Heap, args: []const Value) anyerror!Value {
+            if (args.len != func_info.params.len) return error.ForeignArgumentCountMismatch;
+            var arguments: ArgsTuple = undefined;
+            inline for (func_info.params, 0..) |param, index| {
+                arguments[index] = unpackHostArg(param.type.?, args[index]);
+            }
+            const result = @call(.auto, func, arguments);
+            return packHostResult(ReturnType, heap, result);
+        }
+    };
+
+    return .{
+        .name = name,
+        .param_kinds = &frozen_param_kinds,
+        .param_struct_layouts = &frozen_param_struct_layouts,
+        .return_kind = return_kind,
+        .return_struct_layout = return_struct_layout,
+        .call = &Trampoline.call,
+    };
+}
+
+// `source`/`T` уже гарантированно совместимы к моменту вызова —
+// `resolver.zig`'s `findHostRegistryEntry`-ветка сверяет marshal kinds
+// `.pns`-декларации с этой же зарегистрированной сигнатурой ДО того, как
+// компилятор вообще выпускает `.call_foreign` на эту константу (см.
+// `resolveForeignFunction`, specs/017-native-host-function-registry/
+// spec.md, User Story 2) — несовпадение здесь означало бы дыру в той
+// проверке, не штатный случай.
+fn unpackHostArg(comptime T: type, source: Value) T {
+    return switch (@typeInfo(T)) {
+        .@"struct" => unpackHostStruct(T, source),
+        else => switch (T) {
+            void => {},
+            u8, i32, i64 => @intFromFloat(source.number),
+            f32 => @floatCast(source.number),
+            f64 => source.number,
+            []const u8 => source.stringBytes() orelse "",
+            else => unreachable,
+        },
+    };
+}
+
+fn unpackHostStruct(comptime T: type, source: Value) T {
+    const aggregate = switch (source) {
+        .aggregate => |a| a,
+        else => unreachable,
+    };
+    var result: T = undefined;
+    const fields = @typeInfo(T).@"struct".fields;
+    inline for (fields, 0..) |field, index| {
+        @field(result, field.name) = unpackHostArg(field.type, aggregate.elements[index]);
+    }
+    return result;
+}
+
+// Возврат `[]const u8`/`ff_структура`-совместимого struct всегда копируется
+// в новую GC-отслеживаемую панос-строку/структуру через `heap` — та же
+// конвенция, что уже использует dynlib-FFI путь в `vm.zig`'s
+// `invokeForeign` для `КСтрока`/`ff_структура`-возвратов (panos никогда не
+// заимствует чужую память для возвращаемых значений).
+fn packHostResult(comptime T: type, heap: *panos_core.gc.Heap, result: T) anyerror!Value {
+    return switch (@typeInfo(T)) {
+        .@"struct" => packHostStruct(T, heap, result),
+        else => switch (T) {
+            void => .{ .void = {} },
+            u8, i32, i64 => .{ .number = @floatFromInt(result) },
+            f32, f64 => .{ .number = result },
+            []const u8 => blk: {
+                const heap_string = try heap.createString(try heap.allocator.dupe(u8, result));
+                break :blk .{ .heap_string = heap_string };
+            },
+            else => unreachable,
+        },
+    };
+}
+
+fn packHostStruct(comptime T: type, heap: *panos_core.gc.Heap, result: T) anyerror!Value {
+    const fields = @typeInfo(T).@"struct".fields;
+    const elements = try heap.allocator.alloc(Value, fields.len);
+    inline for (fields, 0..) |field, index| {
+        elements[index] = try packHostResult(field.type, heap, @field(result, field.name));
+    }
+    const aggregate = try heap.createAggregate(null, elements);
+    return .{ .aggregate = aggregate };
+}
 
 pub fn renderValue(allocator: std.mem.Allocator, runtime_value: Value) ![]const u8 {
     return panos_core.runner.renderValue(allocator, runtime_value);

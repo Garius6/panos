@@ -1,9 +1,21 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const value_mod = @import("value.zig");
+const gc = @import("gc.zig");
 
 pub const FunctionId = enum(u32) { _ };
 
 pub const invalid_function: FunctionId = @enumFromInt(std.math.maxInt(u32));
+
+// Различает два источника вызова `внешний`-константы (см. `ForeignCallKind`
+// doc-комментарий) — `.dynlib_libffi` резолвится через `std.DynLib`/
+// `dlopen`+`ffi_call` (`fn_ptr`), `.native_registry` — через
+// `panos.hostFunctions()`-таблицу встраивающего приложения (`native_call`),
+// без libffi на пути вызова (specs/017-native-host-function-registry).
+pub const ForeignCallKind = enum {
+    dynlib_libffi,
+    native_registry,
+};
 
 // Цель вызова `внешний` — `fn_ptr` резолвится один раз, во время resolve
 // (`resolver.zig`'s `resolveForeignFunction`, через `std.DynLib`), и
@@ -14,10 +26,23 @@ pub const invalid_function: FunctionId = @enumFromInt(std.math.maxInt(u32));
 // `vm.zig` трактует это как runtime panic, недостижимый, если программа
 // прошла типизацию чисто.
 pub const ForeignFunctionConstant = struct {
-    fn_ptr: usize,
-    // Имя C-символа сохраняется рядом с адресом только для диагностик и
-    // опционального профиля FFI в VM. Это arena-owned строка Program, как
-    // остальные строковые константы байткода.
+    call_kind: ForeignCallKind = .dynlib_libffi,
+    // Используется только при `call_kind == .dynlib_libffi`.
+    fn_ptr: usize = 0,
+    // Используется только при `call_kind == .native_registry` —
+    // type-erased trampoline из `panos.hostFunctions()`
+    // (specs/017-native-host-function-registry/research.md, "Как VM зовёт
+    // зарегистрированную функцию, не используя libffi"). Вызывается
+    // напрямую из `vm.zig`'s `invokeForeign`, минуя `ffi_prep_cif`/
+    // `ffi_call`. `*gc.Heap` безопасен здесь: `gc.zig` больше не
+    // импортирует `sqlite3_bindings.zig` напрямую (закрытие
+    // `Соединение_БД` инжектируется через `Heap.sql_close_fn`, см.
+    // `gc.zig`/`vm.zig`) — граф импортов лёгких per-file test-таргетов
+    // (`bytecode_unit_tests` и т.д.) остаётся чистым от sqlite3.
+    native_call: ?*const fn (heap: *gc.Heap, args: []const value_mod.Value) anyerror!value_mod.Value = null,
+    // Имя C-символа/host-функции сохраняется рядом с адресом только для
+    // диагностик и опционального профиля FFI в VM. Это arena-owned строка
+    // Program, как остальные строковые константы байткода.
     name: []const u8,
     param_kinds: []const ast.ForeignMarshalKind,
     // Параллельно `param_kinds` — пустой срез для любого параметра, не

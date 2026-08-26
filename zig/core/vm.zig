@@ -1473,13 +1473,29 @@ pub const Vm = struct {
     live_stdout: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, program: *const bytecode.Program) Vm {
-        return .{
+        var result: Vm = .{
             .allocator = allocator,
             .heap = gc.Heap.init(allocator),
             .program = program,
             .foreign_call_cache = .init(allocator),
             .foreign_profile = .init(allocator),
         };
+        // `comptime`-исключено на wasm32-freestanding — `closeSqlConnection`
+        // не должен становиться референсируемым там же, где sqlite3 не
+        // линкуется (`core_module`/`browser`, см. `build.zig`), тот же
+        // паттерн, что уже используют остальные sqlite3-точки этого файла.
+        if (comptime builtin.target.os.tag != .freestanding) {
+            result.heap.sql_close_fn = &closeSqlConnection;
+        }
+        return result;
+    }
+
+    // Инжектируется в `Heap.sql_close_fn` — `gc.zig` сознательно не знает
+    // про sqlite3 (specs/017-native-host-function-registry), эта функция —
+    // единственная точка, что переводит `?*anyopaque` обратно в реальный
+    // `*sqlite3.sqlite3` и закрывает соединение.
+    fn closeSqlConnection(db: ?*anyopaque) void {
+        _ = sqlite3.sqlite3_close_v2(@ptrCast(@alignCast(db)));
     }
 
     pub fn initForTarget(allocator: std.mem.Allocator, program: *const bytecode.Program, target_profile: target_policy.TargetProfile) Vm {
@@ -4683,9 +4699,21 @@ pub const Vm = struct {
             null;
         const arguments = try self.popValues(argument_count);
         defer self.allocator.free(arguments);
-        if (info.fn_ptr == 0) {
-            try self.fault("Runtime Panic: 'внешний' функция не была разрешена при резолве", .{});
-            return;
+        // `fn_ptr == 0`/`native_call == null` — резолвер уже не смог найти
+        // символ/registry-запись, диагностика об этом уже выдана на этапе
+        // резолва; недостижимо для программы, реально прошедшей резолвинг
+        // без ошибок. Проверяется только релевантное поле для своего
+        // `call_kind` — `.native_registry`-константа никогда не получает
+        // `fn_ptr` (см. `compiler.zig`), это не признак ошибки резолва.
+        switch (info.call_kind) {
+            .dynlib_libffi => if (info.fn_ptr == 0) {
+                try self.fault("Runtime Panic: 'внешний' функция не была разрешена при резолве", .{});
+                return;
+            },
+            .native_registry => if (info.native_call == null) {
+                try self.fault("Runtime Panic: 'внешний' функция не была разрешена при резолве", .{});
+                return;
+            },
         }
         if (comptime builtin.target.os.tag == .freestanding) {
             try self.fault("Runtime Panic: 'внешний' недоступно в этом runtime-таргете", .{});
@@ -4888,6 +4916,14 @@ pub const Vm = struct {
     // расчёт layout и выделение хранилища кэшируются `prepareForeignCall`;
     // только сами значения — работа на горячем пути.
     fn invokeForeign(self: *Vm, info: *const bytecode.ForeignFunctionConstant, arguments: []const value.Value) anyerror!value.Value {
+        if (info.call_kind == .native_registry) {
+            // native host-function registry (specs/017-native-host-function-
+            // registry) — прямой Zig-вызов через trampoline, зарегистрированный
+            // `panos.hostFunctions()` (`zig/embed.zig`), минуя
+            // `ffi_prep_cif`/`ffi_call` полностью (см. `research.md`, "Как VM
+            // зовёт зарегистрированную функцию, не используя libffi").
+            return info.native_call.?(&self.heap, arguments);
+        }
         const prepared = (try self.cachedForeignCall(info)) orelse return .{ .void = {} };
         const nargs = info.param_kinds.len;
         const arg_types = prepared.arg_types.?;

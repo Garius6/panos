@@ -831,7 +831,7 @@ const Resolver = struct {
                 },
                 .enum_decl => |value| try self.registerEnumDeclaration(declaration, value),
                 .foreign => |value| {
-                    const symbol = try self.registerDeclaration(declaration, value.name, .function, value.span, false, false);
+                    const symbol = try self.registerDeclaration(declaration, value.name, .function, value.span, value.is_exported, false);
                     try self.resolveForeignFunction(symbol, value);
                 },
                 .impl => |value| for (value.methods) |method| {

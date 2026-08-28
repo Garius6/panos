@@ -178,3 +178,76 @@ test "registry path never touches the libffi cif cache" {
     try std.testing.expect(std.mem.indexOf(u8, profile_text, "ffi_call=0 us") != null);
     try std.testing.expect(std.mem.indexOf(u8, profile_text, "cache hit/miss=5/0") != null);
 }
+
+// Многофайловый reader (тот же паттерн, что `module_loader.zig`'s
+// собственные тесты) — доказывает "экспорт внешний "хост" функ ..."
+// (жалоба живым тестом из jijka: "нельзя было переиспользовать
+// внешний-декларации между .pns-файлами уровня") реально работающим
+// сквозь `импорт`, не просто резолвится синтаксически.
+const MultiFileReader = struct {
+    files: []const File,
+
+    const File = struct {
+        path: []const u8,
+        bytes: []const u8,
+    };
+
+    pub fn read(self: *const MultiFileReader, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        for (self.files) |file| {
+            if (std.mem.eql(u8, file.path, path)) return allocator.dupe(u8, file.bytes);
+        }
+        return error.FileNotFound;
+    }
+};
+
+test "экспорт внешний \"хост\" функ ... is callable through импорт with a real registered host function" {
+    const reader = MultiFileReader{ .files = &.{
+        .{
+            .path = "проект/main.pns",
+            .bytes = "импорт \"./host\" как хост\n" ++
+                "экспорт функ обновить(дельта: Число) -> Число\n" ++
+                "хост.scale(дельта)\n" ++
+                "конец",
+        },
+        .{
+            .path = "проект/host.pns",
+            .bytes = "экспорт внешний \"хост\" функ scale(значение: Число(64)) -> Число(64)\n",
+        },
+    } };
+
+    var runtime = panos.Runtime.init(std.testing.allocator, .{
+        .host_functions = panos.hostFunctions(.{
+            .scale = scale,
+        }),
+    });
+    defer runtime.deinit();
+    try runtime.load(&reader, "проект/main.pns");
+    try std.testing.expect(!runtime.hasGraphErrors());
+    try runtime.compile();
+    try std.testing.expect(!runtime.hasCompilationErrors());
+
+    switch (try runtime.call("обновить", &.{.{ .number = 21.0 }})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42.0), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+test "'внешний' still cannot be exported for a real dynlib library (\"libc\")" {
+    const reader = MultiFileReader{ .files = &.{
+        .{
+            .path = "проект/main.pns",
+            .bytes = "экспорт внешний \"libc\" функ getpid() -> Целое(32)\n" ++
+                "экспорт функ старт() -> Целое\n" ++
+                "0\n" ++
+                "конец",
+        },
+    } };
+
+    var runtime = panos.Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    try runtime.load(&reader, "проект/main.pns");
+    try std.testing.expect(runtime.hasGraphErrors());
+}

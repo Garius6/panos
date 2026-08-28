@@ -2,6 +2,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const bytecode = @import("bytecode.zig");
 const diagnostic = @import("diagnostic.zig");
+const host_registry = @import("host_registry.zig");
 const resolver = @import("resolver.zig");
 const source = @import("source.zig");
 const symbols = @import("symbols.zig");
@@ -17,6 +18,15 @@ pub const CompileResult = struct {
     function_ids: std.AutoHashMap(symbols.SymbolId, bytecode.FunctionId),
     lambda_ids: std.AutoHashMap(ast.ExprId, bytecode.FunctionId),
     top_level_constants: std.AutoHashMap(symbols.SymbolId, bytecode.Constant),
+    // Импортированные `внешний "хост"` (мост из другого модуля) — ключ по
+    // ЛОКАЛЬНОМУ (импортирующего модуля) `SymbolId`, populated из
+    // `CompileOptions.foreign_functions` в `compileWithOptions` (тот же
+    // паттерн предзаполнения, что `function_ids`/`top_level_constants`
+    // выше из `options.functions`/`options.constants`). `compileForeignCall`
+    // проверяет эту карту ПЕРЕД `findForeignDecl` (тот ищет ТОЛЬКО среди
+    // ЛОКАЛЬНЫХ AST-деклараций текущего модуля — импортированный `внешний`
+    // не имеет своего узла AST в дереве импортирующего модуля вообще).
+    imported_foreign_functions: std.AutoHashMap(symbols.SymbolId, ImportedForeignFunction),
 
     pub fn init(allocator: std.mem.Allocator) CompileResult {
         return .{
@@ -26,6 +36,7 @@ pub const CompileResult = struct {
             .function_ids = .init(allocator),
             .lambda_ids = .init(allocator),
             .top_level_constants = .init(allocator),
+            .imported_foreign_functions = .init(allocator),
         };
     }
 
@@ -34,6 +45,7 @@ pub const CompileResult = struct {
     }
 
     pub fn deinit(self: *CompileResult) void {
+        self.imported_foreign_functions.deinit();
         self.top_level_constants.deinit();
         self.lambda_ids.deinit();
         self.function_ids.deinit();
@@ -54,10 +66,31 @@ pub const ImportedConstant = struct {
     value: bytecode.Constant,
 };
 
+// Мост для импортированной `экспорт внешний "хост" функ ...` —
+// собранный ОДИН раз в `module_compiler.zig`'s `ImportContext.collect`
+// (там доступны `target_checked`/`target_resolution`/AST исходного
+// модуля, которых у `compiler.zig`'s `FunctionCompiler` для чужого
+// модуля попросту нет) и скопированный сюда как готовые к использованию
+// плоские данные — `compileForeignCall` просто читает эти поля напрямую,
+// без повторного резолва marshal kind'ов/layout'ов `ff_структура` во
+// время компиляции ЭТОГО (импортирующего) модуля.
+pub const ImportedForeignFunction = struct {
+    symbol: symbols.SymbolId,
+    name: []const u8,
+    param_kinds: []const ast.ForeignMarshalKind,
+    param_struct_layouts: []const []const ast.ForeignMarshalKind,
+    return_kind: ast.ForeignMarshalKind,
+    return_struct_layout: []const ast.ForeignMarshalKind,
+    call_kind: bytecode.ForeignCallKind,
+    fn_ptr: usize,
+    native_call: ?host_registry.NativeCallFn,
+};
+
 pub const CompileOptions = struct {
     program: ?*bytecode.Program = null,
     functions: []const ImportedFunction = &.{},
     constants: []const ImportedConstant = &.{},
+    foreign_functions: []const ImportedForeignFunction = &.{},
 };
 
 const Compiler = struct {
@@ -1254,6 +1287,15 @@ const FunctionCompiler = struct {
 
     fn compileForeignCall(self: *FunctionCompiler, call: anytype) !bool {
         const symbol = self.compiler.resolution.expr_symbols.get(call.callee) orelse return false;
+        // Импортированный `экспорт внешний "хост" функ ...` — проверяется
+        // ПЕРВЫМ: `findForeignDecl` ниже ищет ТОЛЬКО среди AST-деклараций
+        // ТЕКУЩЕГО (импортирующего) модуля, у импортированного символа
+        // такого узла попросту нет (он живёт в дереве исходного модуля,
+        // см. `module_compiler.zig`'s `ImportContext.collect`, которая и
+        // заполняет эту карту, минуя AST вовсе).
+        if (self.compiler.result.imported_foreign_functions.get(symbol)) |imported| {
+            return try self.compileImportedForeignCall(call, imported);
+        }
         const foreign = self.findForeignDecl(symbol) orelse return false;
         if (call.arguments.len != foreign.parameters.len) {
             try self.compiler.report(call.span, "Compiler Error: неверное количество аргументов 'внешний'-вызова", .{});
@@ -1304,6 +1346,36 @@ const FunctionCompiler = struct {
             .param_struct_layouts = param_struct_layouts,
             .return_kind = foreign.return_marshal,
             .return_struct_layout = return_struct_layout,
+        } });
+        if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
+        try self.function.emit(self.compiler.result.allocator, .{ .call_foreign = .{
+            .constant_index = constant_index,
+            .argument_count = @intCast(call.arguments.len),
+        } });
+        return true;
+    }
+
+    // Зеркалит хвост `compileForeignCall` выше (аргументы + константа +
+    // `call_foreign`), но БЕЗ повторного резолва marshal kind'ов/layout'ов
+    // `ff_структура` — `imported` уже несёт их готовыми, посчитанными ОДИН
+    // раз в `module_compiler.zig`'s `ImportContext.collect` при исходном
+    // резолве экспортирующего модуля.
+    fn compileImportedForeignCall(self: *FunctionCompiler, call: anytype, imported: ImportedForeignFunction) !bool {
+        if (call.arguments.len != imported.param_kinds.len) {
+            try self.compiler.report(call.span, "Compiler Error: неверное количество аргументов 'внешний'-вызова", .{});
+            try self.emitVoid();
+            return true;
+        }
+        for (call.arguments) |argument| try self.compileExpression(argument);
+        const constant_index = try self.function.addConstant(self.compiler.result.allocator, .{ .foreign_function = .{
+            .call_kind = imported.call_kind,
+            .fn_ptr = imported.fn_ptr,
+            .native_call = imported.native_call,
+            .name = try self.compiler.program().copyString(imported.name),
+            .param_kinds = imported.param_kinds,
+            .param_struct_layouts = imported.param_struct_layouts,
+            .return_kind = imported.return_kind,
+            .return_struct_layout = imported.return_struct_layout,
         } });
         if (call.arguments.len > std.math.maxInt(u16)) return error.ArgumentLimitReached;
         try self.function.emit(self.compiler.result.allocator, .{ .call_foreign = .{
@@ -2488,6 +2560,7 @@ pub fn compileWithOptions(
     result.shared_program = options.program;
     for (options.functions) |function| try result.function_ids.put(function.symbol, function.function_id);
     for (options.constants) |constant| try result.top_level_constants.put(constant.symbol, constant.value);
+    for (options.foreign_functions) |foreign_function| try result.imported_foreign_functions.put(foreign_function.symbol, foreign_function);
     var compiler = Compiler.init(tree, resolution, checked, &result);
     defer compiler.deinit();
     try compiler.predeclareConstants();

@@ -83,6 +83,7 @@ const ImportContext = struct {
     impls: std.ArrayList(type_checker.ImportedImpl) = .empty,
     functions: std.ArrayList(compiler.ImportedFunction) = .empty,
     constants: std.ArrayList(compiler.ImportedConstant) = .empty,
+    foreign_functions: std.ArrayList(compiler.ImportedForeignFunction) = .empty,
     // `ImportedNominal.default_method_symbols` (когда не null) — это
     // свежая аллокация, которую делает `bridgeDefaultMethodSymbols` через
     // `self.allocator` (в отличие от большинства того, что `nominals`
@@ -100,6 +101,12 @@ const ImportContext = struct {
         self.default_method_symbol_arrays.deinit(self.allocator);
         self.constants.deinit(self.allocator);
         self.functions.deinit(self.allocator);
+        // Сами структуры — `self.allocator` (короткоживущий, освобождается
+        // здесь), но их СОДЕРЖИМОЕ (`param_kinds`/`param_struct_layouts`/
+        // `name`) выделено через `program_arena` (см. doc-комментарий
+        // `collect`'s параметра) — байткод `Program` хранит эти срезы
+        // напрямую, они обязаны пережить сам `ImportContext`.
+        self.foreign_functions.deinit(self.allocator);
         self.impls.deinit(self.allocator);
         for (self.methods.items) |method| {
             if (method.parameter_names.len != 0) self.allocator.free(method.parameter_names);
@@ -460,6 +467,15 @@ const ImportContext = struct {
         next_nominal_identity: *u32,
         graph: *const module_loader.Graph,
         own_module: usize,
+        // Только для `.foreign_function`-моста ниже — `param_kinds`/
+        // `param_struct_layouts`/скопированное имя должны пережить
+        // `ImportContext.deinit()` (тот освобождается ДО того, как
+        // скомпилированная `Program` будет реально исполнена VM,
+        // `call_foreign`-байткод хранит эти срезы напрямую, не копирует
+        // их снова) — `GraphCompileResult.arena`, тот же аллокатор, что
+        // уже используют другие "должно пережить один модуль" копии в
+        // этом файле (см. `appendDiagnostics`).
+        program_arena: std.mem.Allocator,
     ) !void {
         // `Результат`/`Опция` — типы прелюдии: КАЖДЫЙ модуль получает
         // СВОЙ собственный свежечеканенный символ для них (встроенный
@@ -549,6 +565,62 @@ const ImportContext = struct {
                 },
                 .function => {
                     const signature = target_checked.symbol_types.get(target_symbol) orelse continue;
+                    // `экспорт внешний "хост" функ ...` регистрирует свой
+                    // символ как `.function` (`resolver.zig`'s `predeclare`,
+                    // та же ветка, что обычная функция) — `module_linker.
+                    // zig` тоже коллапсирует `.foreign_function` в `.function`
+                    // при переносе в ЭТОТ модуль, так что различить их
+                    // здесь можно только по АСТ исходного объявления, не по
+                    // `exported.kind` (тот уже не несёт этого различия).
+                    // `внешний` НИКОГДА не компилируется в обычный байткод
+                    // (`target_compiled.function_ids` для неё пусто) —
+                    // мостит другой набор данных: сырые marshal kind'ы
+                    // параметров/возврата из AST исходного модуля
+                    // (`origin_foreign`, недоступны через `types.TypeId`
+                    // систему одни без ff_структура-layout'ов) плюс уже
+                    // резолвленную цель вызова (`native_call`/`fn_ptr` из
+                    // `target_resolution`, посчитаны один раз резолвером
+                    // исходного модуля, ЗДЕСЬ не пересчитываются).
+                    // Layout'ы `ff_структура`-параметров/возврата всё же
+                    // нужно посчитать здесь (не при компиляции
+                    // ИМПОРТИРУЮЩЕГО модуля — `compiler.zig`'s
+                    // `FunctionCompiler` для чужого модуля не видит
+                    // `target_checked` вообще).
+                    if (graph.modules.items[origin.module].tree.decl(origin.declaration).* == .foreign) {
+                        const origin_foreign = graph.modules.items[origin.module].tree.decl(origin.declaration).foreign;
+                        const function_type_entry = target_checked.types.get(signature) orelse continue;
+                        const function_type = switch (function_type_entry.*) {
+                            .function => |f| f,
+                            else => continue,
+                        };
+                        try self.imported_types.append(self.allocator, .{
+                            .symbol = imported_symbol,
+                            .store = &target_checked.types,
+                            .type_id = signature,
+                        });
+                        const param_kinds = try program_arena.alloc(ast.ForeignMarshalKind, origin_foreign.parameters.len);
+                        const param_struct_layouts = try program_arena.alloc([]const ast.ForeignMarshalKind, origin_foreign.parameters.len);
+                        for (origin_foreign.parameters, param_kinds, param_struct_layouts, 0..) |parameter, *kind, *layout, index| {
+                            kind.* = parameter.marshal;
+                            const parameter_type = if (index < function_type.parameters.len) function_type.parameters[index] else null;
+                            layout.* = if (parameter.marshal != .struct_value) &.{} else ffiStructLayoutForChecked(target_checked, parameter_type);
+                        }
+                        const return_struct_layout: []const ast.ForeignMarshalKind = if (origin_foreign.return_marshal != .struct_value) &.{} else ffiStructLayoutForChecked(target_checked, function_type.return_type);
+                        const native_call = target_resolution.native_foreign_functions.get(target_symbol);
+                        const fn_ptr = target_resolution.foreign_functions.get(target_symbol) orelse 0;
+                        try self.foreign_functions.append(self.allocator, .{
+                            .symbol = imported_symbol,
+                            .name = try program_arena.dupe(u8, origin_foreign.name),
+                            .param_kinds = param_kinds,
+                            .param_struct_layouts = param_struct_layouts,
+                            .return_kind = origin_foreign.return_marshal,
+                            .return_struct_layout = return_struct_layout,
+                            .call_kind = if (native_call != null) .native_registry else .dynlib_libffi,
+                            .fn_ptr = fn_ptr,
+                            .native_call = native_call,
+                        });
+                        continue;
+                    }
                     const function_id = target_compiled.function_ids.get(target_symbol) orelse continue;
                     // Тот же двухходовой перевод bounds, что уже применяется
                     // к МЕТОДАМ ниже (`translateGenericParameterBounds`,
@@ -934,6 +1006,21 @@ fn isPreludeTypeName(name: []const u8) bool {
     return false;
 }
 
+// Зеркалит `compiler.zig`'s `FunctionCompiler.ffiStructLayoutFor` — та же
+// логика (`.struct_value`-параметр/возврат -> layout полей его
+// `ff_структура`), но берёт `checked` явным параметром (не методом с
+// `self.compiler.checked`): здесь мы читаем `target_checked`
+// ЭКСПОРТИРУЮЩЕГО модуля, не модуля, который сейчас компилируется.
+fn ffiStructLayoutForChecked(checked: *const type_checker.CheckResult, type_id: ?types.TypeId) []const ast.ForeignMarshalKind {
+    const id = type_id orelse return &.{};
+    const entry = checked.types.get(id) orelse return &.{};
+    const nominal_symbol = switch (entry.*) {
+        .nominal => |n| n.symbol,
+        else => return &.{},
+    };
+    return checked.ffi_struct_layouts.get(nominal_symbol) orelse &.{};
+}
+
 fn nominalIdentity(
     identities: *std.AutoHashMap(resolver.ImportedSymbolOrigin, u32),
     next_identity: *u32,
@@ -1034,7 +1121,7 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
             const resolution = &result.modules[module_index].resolution.?;
             var imports = ImportContext.init(allocator);
             defer imports.deinit();
-            try imports.collect(resolution, result.modules, &result.nominal_identities, &result.next_nominal_identity, graph, module_index);
+            try imports.collect(resolution, result.modules, &result.nominal_identities, &result.next_nominal_identity, graph, module_index, result.arena.allocator());
             unreachable;
         }
 
@@ -1044,7 +1131,7 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
 
         var imports = ImportContext.init(allocator);
         defer imports.deinit();
-        imports.collect(resolution, result.modules, &result.nominal_identities, &result.next_nominal_identity, graph, module_index) catch |err| switch (err) {
+        imports.collect(resolution, result.modules, &result.nominal_identities, &result.next_nominal_identity, graph, module_index, result.arena.allocator()) catch |err| switch (err) {
             error.ImportNotCompiled, error.ImportNotChecked => {
                 try queue.append(allocator, module_index);
                 stalled += 1;
@@ -1070,6 +1157,7 @@ pub fn compileGraphForTarget(allocator: std.mem.Allocator, graph: *const module_
             .program = &result.program,
             .functions = imports.functions.items,
             .constants = imports.constants.items,
+            .foreign_functions = imports.foreign_functions.items,
         });
         const compiled = &result.modules[module_index].compiled.?;
         try result.appendDiagnostics(&compiled.diagnostics);

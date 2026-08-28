@@ -408,6 +408,11 @@ pub const Decl = union(enum) {
         return_pointee: ?TypeId = null,
         return_struct_type_name: ?[]const u8 = null,
         return_owned: bool = false,
+        // `экспорт внешний "хост" функ ...` — только для `"хост"`
+        // (нативный in-process registry, не настоящий dlopen/dlsym), см.
+        // doc-комментарий у ограничения в `parser.zig`'s
+        // `parseTopLevelDeclarations`.
+        is_exported: bool = false,
     },
     constant: struct {
         span: source.Span,

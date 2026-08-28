@@ -226,6 +226,22 @@ pub const HostFunctionEntry = panos_core.host_registry.HostFunctionEntry;
 /// набора) — `@compileError` здесь, в месте вызова `hostFunctions(...)`, не
 /// рантайм-ошибка панос (см. `host_registry.zig`, набор НЕ расширяет
 /// существующие FFI marshal-kinds — `Указатель(T)` не поддерживается).
+///
+/// Поле таблицы — либо обычная функция (имя host-функции = имя поля,
+/// как выше), либо `alias("своё_имя", func)` — тогда имя, видимое
+/// `.pns`-скрипту, берётся из `alias(...)`, а НЕ из имени Zig-поля.
+/// Практический случай: встраивающее приложение хочет держать сами
+/// Zig-идентификаторы латиницей (обычный код), но выставить скрипту
+/// имя на другом языке (кириллица и т.п.) — `.pns`-идентификаторы не
+/// обязаны совпадать с Zig-стороной вообще.
+///
+/// ```zig
+/// const entries = panos.hostFunctions(.{
+///     .scale = panos.alias("удвоить", struct {
+///         fn call(x: f64) f64 { return x * 2.0; }
+///     }.call),
+/// });
+/// ```
 pub fn hostFunctions(comptime table: anytype) []const HostFunctionEntry {
     // Явный `comptime`-блок обязателен: сам по себе вызов `hostFunctions(...)`
     // в обычной (не comptime) позиции — например, прямо внутри
@@ -238,11 +254,41 @@ pub fn hostFunctions(comptime table: anytype) []const HostFunctionEntry {
         const table_fields = @typeInfo(@TypeOf(table)).@"struct".fields;
         var entries: [table_fields.len]HostFunctionEntry = undefined;
         for (table_fields, 0..) |field, index| {
-            entries[index] = buildHostFunctionEntry(field.name, @field(table, field.name));
+            const value = @field(table, field.name);
+            entries[index] = if (isAlias(@TypeOf(value)))
+                buildHostFunctionEntry(value.name, value.func)
+            else
+                buildHostFunctionEntry(field.name, value);
         }
         const frozen = entries;
         break :blk &frozen;
     };
+}
+
+/// Оборачивает `func` под ИМЕНЕМ, отличным от имени Zig-поля в таблице
+/// `hostFunctions(...)` — см. её doc-комментарий выше.
+pub fn alias(comptime name: []const u8, comptime func: anytype) Alias(@TypeOf(func)) {
+    return .{ .name = name, .func = func };
+}
+
+fn Alias(comptime Func: type) type {
+    return struct {
+        name: []const u8,
+        func: Func,
+    };
+}
+
+// Отличает результат `alias(...)` (структ с полями `name`/`func`) от
+// голой функции, переданной как значение поля напрямую — обычные
+// Zig-функции никогда не имеют `.@"struct"` typeInfo, так что это
+// безопасно как единственная проверка (не полагается на конкретное имя
+// generic-типа `Alias(Func)`, тот меняется с каждым `Func`).
+fn isAlias(comptime ValueType: type) bool {
+    const info = @typeInfo(ValueType);
+    if (info != .@"struct") return false;
+    const fields = info.@"struct".fields;
+    if (fields.len != 2) return false;
+    return std.mem.eql(u8, fields[0].name, "name") and std.mem.eql(u8, fields[1].name, "func");
 }
 
 fn buildHostFunctionEntry(comptime name: []const u8, comptime func: anytype) HostFunctionEntry {

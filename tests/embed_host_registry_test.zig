@@ -251,3 +251,57 @@ test "'внешний' still cannot be exported for a real dynlib library (\"lib
     try runtime.load(&reader, "проект/main.pns");
     try std.testing.expect(runtime.hasGraphErrors());
 }
+
+// `panos.alias(...)` — Zig-сторона держит латиницу (`scale`, обычный
+// Zig-идентификатор поля таблицы), а `.pns`-скрипт видит кириллическое
+// имя (`удвоить`) — не совпадает с именем Zig-поля вообще.
+test "hostFunctions: panos.alias exposes a name different from the Zig field name" {
+    const reader = MemoryReader{
+        .source = "внешний \"хост\" функ удвоить(значение: Число(64)) -> Число(64)\n" ++
+            "экспорт функ обновить(дельта: Число) -> Число\n" ++
+            "удвоить(дельта)\n" ++
+            "конец",
+    };
+
+    var runtime = panos.Runtime.init(std.testing.allocator, .{
+        .host_functions = panos.hostFunctions(.{
+            .scale = panos.alias("удвоить", scale),
+        }),
+    });
+    defer runtime.deinit();
+    try runtime.load(&reader, "сценарий.pns");
+    try std.testing.expect(!runtime.hasGraphErrors());
+    try runtime.compile();
+    try std.testing.expect(!runtime.hasCompilationErrors());
+
+    switch (try runtime.call("обновить", &.{.{ .number = 21.0 }})) {
+        .success => |result| switch (result) {
+            .number => |number| try std.testing.expectEqual(@as(f64, 42.0), number),
+            else => return error.TestUnexpectedResult,
+        },
+        .runtime_error => return error.TestUnexpectedResult,
+    }
+}
+
+// Именем, под которым скрипт видит функцию, ДОЛЖНО быть имя из
+// `alias(...)` — под родным Zig-именем поля (`scale`, латиницей) она
+// не должна быть видна вообще.
+test "hostFunctions: the Zig field name itself is NOT exposed when aliased" {
+    const reader = MemoryReader{
+        .source = "внешний \"хост\" функ scale(значение: Число(64)) -> Число(64)\n" ++
+            "экспорт функ старт() -> Число\n" ++
+            "0\n" ++
+            "конец",
+    };
+
+    var runtime = panos.Runtime.init(std.testing.allocator, .{
+        .host_functions = panos.hostFunctions(.{
+            .scale = panos.alias("удвоить", scale),
+        }),
+    });
+    defer runtime.deinit();
+    try runtime.load(&reader, "сценарий.pns");
+    try std.testing.expect(!runtime.hasGraphErrors());
+    try runtime.compile();
+    try std.testing.expect(runtime.hasCompilationErrors());
+}

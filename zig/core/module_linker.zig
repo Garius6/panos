@@ -140,6 +140,13 @@ pub const ImportScope = struct {
                     .function => .function,
                     .constant => .constant,
                     .type => .type,
+                    // Символ импортированной `внешний`-функции регистрируется
+                    // как обычная функция (`resolver.zig`'s `predeclare`
+                    // тоже регистрирует ЛОКАЛЬНУЮ `внешний`-декларацию как
+                    // `.function` symbols.SymbolKind) — вызывающий код на
+                    // стороне выражения не должен отличать импортированный
+                    // `внешний` от обычной функции.
+                    .foreign_function => .function,
                 },
                 .span = exported.span,
                 .origin = .{

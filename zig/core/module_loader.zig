@@ -52,6 +52,13 @@ pub const ExportKind = enum {
     function,
     constant,
     type,
+    // `экспорт внешний "хост" функ ...` — отдельный вид, не `.function`:
+    // `внешний`-декларация никогда не компилируется в обычный байткод
+    // (`function_id`), кросс-модульный импорт для неё мостит другие
+    // данные (`resolver.Resolution.native_foreign_functions`/
+    // `.foreign_functions`, сырые marshal-kind'ы параметров/возврата из
+    // AST), см. `module_compiler.zig`'s `ImportContext.collect`.
+    foreign_function,
 };
 
 pub const Export = struct {
@@ -531,6 +538,13 @@ pub const Graph = struct {
                     .declaration = declaration,
                     .name = value.name,
                     .kind = .type,
+                    .span = value.span,
+                } else null,
+                .foreign => |value| if (value.is_exported) .{
+                    .module = module,
+                    .declaration = declaration,
+                    .name = value.name,
+                    .kind = .foreign_function,
                     .span = value.span,
                 } else null,
                 else => null,

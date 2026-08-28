@@ -172,9 +172,8 @@ const Parser = struct {
             }
 
             if (self.at(.foreign)) {
-                if (exported) try self.report(self.peek().span, "Синтаксическая ошибка: 'внешний' не может быть экспортирован");
                 if (annotations.len != 0) try self.report(self.peek().span, "Синтаксическая ошибка: аннотации недопустимы для 'внешний'");
-                try declarations.append(self.result.allocator, try self.parseForeignDeclaration());
+                try declarations.append(self.result.allocator, try self.parseForeignDeclaration(exported));
                 continue;
             }
 
@@ -511,9 +510,22 @@ const Parser = struct {
         struct_type_name: ?[]const u8 = null,
     };
 
-    fn parseForeignDeclaration(self: *Parser) !ast.DeclId {
+    fn parseForeignDeclaration(self: *Parser, exported: bool) !ast.DeclId {
         const start = try self.expect(.foreign, "Синтаксическая ошибка: ожидается 'внешний'");
         const library = try self.expect(.string, "Синтаксическая ошибка: после 'внешний' ожидается имя библиотеки строкой");
+        const library_name = try self.result.ast.copyText(library.lexeme);
+        // Только `"хост"` (нативный in-process registry, `host_registry.
+        // zig` — резолвится один раз во время резолва по имени+сигнатуре
+        // против таблицы, зарегистрированной встраивающим приложением, БЕЗ
+        // dlopen/dlsym) может быть экспортирован и импортирован через
+        // границу модуля — у настоящего dlopen/dlsym FFI (`"libc"` и
+        // произвольные пользовательские библиотеки) действительно нет
+        // "владеющего" модуля в обычном смысле: каждый файл, которому
+        // нужна такая функция, объявляет её сам (см. docs/src/language/
+        // ffi.md).
+        if (exported and !std.mem.eql(u8, library_name, "хост")) {
+            try self.report(library.span, "Синтаксическая ошибка: 'внешний' можно экспортировать только для библиотеки \"хост\"");
+        }
         _ = try self.expect(.function, "Синтаксическая ошибка: после имени библиотеки ожидается 'функ'");
         const name = try self.expect(.ident, "Синтаксическая ошибка: после 'функ' ожидается имя");
 
@@ -546,13 +558,14 @@ const Parser = struct {
 
         return self.result.ast.addDecl(.{ .foreign = .{
             .span = spanFrom(start.span, return_type.span),
-            .library = try self.result.ast.copyText(library.lexeme),
+            .library = library_name,
             .name = try self.result.ast.copyText(name.lexeme),
             .parameters = try self.result.ast.copySlice(ast.ForeignParam, parameters.items),
             .return_marshal = return_type.marshal,
             .return_pointee = return_type.pointee,
             .return_struct_type_name = return_type.struct_type_name,
             .return_owned = return_owned,
+            .is_exported = exported,
         } });
     }
 
